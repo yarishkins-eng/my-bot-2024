@@ -77,9 +77,10 @@ services:
       # Логотип для сообщений
       - ./vpn_logo.png:/app/vpn_logo.png:ro
     ports:
-      - '${WEB_API_PORT:-8080}:8080'
+      - '127.0.0.1:${WEB_API_PORT:-8080}:8080'
     networks:
       - bot_network
+      - remnawave-network
     healthcheck:
       test:
         [
@@ -98,6 +99,8 @@ volumes:
     driver: local
 
 networks:
+  remnawave-network:
+    external: true
   bot_network:
     driver: bridge
     ipam:
