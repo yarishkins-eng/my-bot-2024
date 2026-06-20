@@ -358,6 +358,7 @@ class MonitoringService:
                 await self._check_trial_expiring_soon(db)
                 await self._check_trial_channel_subscriptions(db)
                 await self._check_expired_subscription_followups(db)
+                await self._check_trial_expired_discount(db)
                 await self._check_traffic_warnings(db)
                 await self._check_low_balance_alerts(db)
                 await self._retry_stuck_guest_purchases(db)
@@ -1277,6 +1278,86 @@ class MonitoringService:
         except Exception as e:
             logger.error('Ошибка проверки напоминаний об истекшей подписке', error=e)
 
+    async def _check_trial_expired_discount(self, db: AsyncSession):
+        """Скидка-крючок для пользователей, у которых закончился ТРИАЛ (платной не было).
+
+        Через trigger_days дней после окончания триала создаёт персональный промо-оффер
+        и шлёт предложение со скидкой. Под отдельным флагом (по умолчанию ВЫКЛ).
+        Платные подписки НЕ затрагивает (фильтр is_trial==True + has_had_paid==False).
+        """
+        if not NotificationSettingsService.are_notifications_globally_enabled():
+            return
+        if not NotificationSettingsService.is_trial_expired_discount_enabled():
+            return
+        if not self.bot:
+            return
+
+        try:
+            now = datetime.now(UTC)
+            lookback = now - timedelta(days=30)
+            trigger_days = NotificationSettingsService.get_trial_expired_discount_trigger_days()
+            percent = NotificationSettingsService.get_trial_expired_discount_percent()
+            if percent <= 0:
+                return
+            valid_hours = NotificationSettingsService.get_trial_expired_discount_valid_hours()
+
+            result = await db.execute(
+                select(Subscription)
+                .join(User, Subscription.user_id == User.id)
+                .options(
+                    selectinload(Subscription.user),
+                    selectinload(Subscription.tariff),
+                )
+                .where(
+                    and_(
+                        Subscription.is_trial == True,
+                        Subscription.status == SubscriptionStatus.EXPIRED.value,
+                        Subscription.end_date <= now,
+                        Subscription.end_date >= lookback,
+                        User.status == UserStatus.ACTIVE.value,
+                        User.has_had_paid_subscription == False,
+                    )
+                )
+            )
+            subscriptions = result.scalars().all()
+
+            sent = 0
+            for subscription in subscriptions:
+                user = subscription.user
+                if not user or subscription.end_date is None:
+                    continue
+                if not getattr(user, 'telegram_id', None):
+                    continue
+
+                days_since = (now - subscription.end_date).total_seconds() / 86400
+                if not (trigger_days <= days_since < trigger_days + 1):
+                    continue
+
+                if await notification_sent(db, user.id, subscription.id, 'trial_expired_discount'):
+                    continue
+
+                offer = await upsert_discount_offer(
+                    db,
+                    user_id=user.id,
+                    subscription_id=subscription.id,
+                    notification_type='trial_expired_discount',
+                    discount_percent=percent,
+                    bonus_amount_kopeks=0,
+                    valid_hours=valid_hours,
+                    effect_type='percent_discount',
+                )
+                success = await self._send_trial_expired_discount_notification(
+                    user, subscription, percent, offer.expires_at, offer.id
+                )
+                if success:
+                    await record_notification(db, user.id, subscription.id, 'trial_expired_discount')
+                    sent += 1
+
+            if sent:
+                logger.info('Отправлены скидочные предложения после триала', count=sent)
+        except Exception as e:
+            logger.error('Ошибка проверки скидок после триала', error=e)
+
     async def _get_expiring_paid_subscriptions(self, db: AsyncSession, days_before: int) -> list[Subscription]:
         current_time = datetime.now(UTC)
         threshold_date = current_time + timedelta(days=days_before)
@@ -2186,6 +2267,73 @@ class MonitoringService:
             return False
         except Exception as e:
             logger.error('Ошибка отправки скидочного уведомления пользователю', telegram_id=user.telegram_id, e=e)
+            return False
+
+    async def _send_trial_expired_discount_notification(
+        self,
+        user: User,
+        subscription: Subscription,
+        percent: int,
+        expires_at: datetime,
+        offer_id: int,
+    ) -> bool:
+        try:
+            texts = get_texts(user.language)
+
+            template = texts.t(
+                'TRIAL_EXPIRED_DISCOUNT',
+                (
+                    '🎁 <b>Персональная скидка {percent}%</b>\n\n'
+                    'Ваш пробный период закончился. Оформите первую подписку со скидкой — '
+                    'предложение действует до {expires_at}.'
+                ),
+            )
+            message = template.format(
+                percent=percent,
+                expires_at=format_local_datetime(expires_at, '%d.%m.%Y %H:%M'),
+            )
+
+            from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup  # noqa: F401
+
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        build_miniapp_or_callback_button(
+                            text='🎁 Получить скидку', callback_data=f'claim_discount_{offer_id}'
+                        )
+                    ],
+                    [
+                        build_miniapp_or_callback_button(
+                            text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
+                            callback_data='menu_buy',
+                            cabinet_path='/subscription',
+                        )
+                    ],
+                ]
+            )
+
+            await self._send_message_with_logo(
+                chat_id=user.telegram_id,
+                text=message,
+                parse_mode='HTML',
+                reply_markup=keyboard,
+            )
+            return True
+
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            if await self._handle_unreachable_user(user, exc, 'скидку после триала'):
+                return True
+            logger.error(
+                'Ошибка Telegram API при отправке скидки после триала',
+                telegram_id=user.telegram_id,
+                exc=exc,
+            )
+            return False
+        except TelegramNetworkError as e:
+            logger.warning('Таймаут отправки скидки после триала', telegram_id=user.telegram_id, e=e)
+            return False
+        except Exception as e:
+            logger.error('Ошибка отправки скидки после триала', telegram_id=user.telegram_id, e=e)
             return False
 
     async def _send_autopay_success_notification(

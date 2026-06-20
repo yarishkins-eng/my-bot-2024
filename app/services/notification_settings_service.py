@@ -32,6 +32,14 @@ class NotificationSettingsService:
             'valid_hours': 24,
             'trigger_days': 5,
         },
+        # Скидка-крючок для тех, у кого закончился ТРИАЛ (платной не было).
+        # По умолчанию ВЫКЛЮЧЕНО — включается вручную в админке (создаёт реальные офферы).
+        'trial_expired_discount': {
+            'enabled': False,
+            'discount_percent': 10,
+            'valid_hours': 24,
+            'trigger_days': 1,
+        },
     }
 
     @classmethod
@@ -233,6 +241,63 @@ class NotificationSettingsService:
         except (TypeError, ValueError):
             return False
         return cls._set_field('expired_third_wave', 'trigger_days', days_int)
+
+    # Скидка после окончания триала
+    @classmethod
+    def is_trial_expired_discount_enabled(cls) -> bool:
+        return bool(cls._get('trial_expired_discount').get('enabled', False))
+
+    @classmethod
+    def set_trial_expired_discount_enabled(cls, enabled: bool) -> bool:
+        return cls.set_enabled('trial_expired_discount', enabled)
+
+    @classmethod
+    def get_trial_expired_discount_percent(cls) -> int:
+        value = cls._get('trial_expired_discount').get('discount_percent', 10)
+        try:
+            return max(0, min(100, int(value)))
+        except (TypeError, ValueError):
+            return 10
+
+    @classmethod
+    def set_trial_expired_discount_percent(cls, percent: int) -> bool:
+        try:
+            percent_int = max(0, min(100, int(percent)))
+        except (TypeError, ValueError):
+            return False
+        return cls._set_field('trial_expired_discount', 'discount_percent', percent_int)
+
+    @classmethod
+    def get_trial_expired_discount_valid_hours(cls) -> int:
+        value = cls._get('trial_expired_discount').get('valid_hours', 24)
+        try:
+            return max(1, min(168, int(value)))
+        except (TypeError, ValueError):
+            return 24
+
+    @classmethod
+    def set_trial_expired_discount_valid_hours(cls, hours: int) -> bool:
+        try:
+            hours_int = max(1, min(168, int(hours)))
+        except (TypeError, ValueError):
+            return False
+        return cls._set_field('trial_expired_discount', 'valid_hours', hours_int)
+
+    @classmethod
+    def get_trial_expired_discount_trigger_days(cls) -> int:
+        value = cls._get('trial_expired_discount').get('trigger_days', 1)
+        try:
+            return max(1, min(60, int(value)))
+        except (TypeError, ValueError):
+            return 1
+
+    @classmethod
+    def set_trial_expired_discount_trigger_days(cls, days: int) -> bool:
+        try:
+            days_int = max(1, min(60, int(days)))
+        except (TypeError, ValueError):
+            return False
+        return cls._set_field('trial_expired_discount', 'trigger_days', days_int)
 
     @classmethod
     def are_notifications_globally_enabled(cls) -> bool:
