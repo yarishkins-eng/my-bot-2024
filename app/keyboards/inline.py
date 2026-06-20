@@ -196,6 +196,13 @@ _LANGUAGE_DISPLAY_NAMES = {
 }
 
 
+# Какие языки показывать на экранах выбора языка ВНУТРИ бота
+# (первый запуск + кнопка «🌐 Язык» в меню). Остальные языки остаются
+# в коде и переводах, но в этих двух экранах не показываются.
+# Это НЕ затрагивает мини-приложение/кабинет — оно берёт языки отдельно.
+BOT_LANGUAGE_SELECTION_CODES: tuple[str, ...] = ('ru', 'en')
+
+
 def get_rules_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
     texts = get_texts(language)
     return InlineKeyboardMarkup(
@@ -297,6 +304,15 @@ def get_language_selection_keyboard(
     language: str = DEFAULT_LANGUAGE,
 ) -> InlineKeyboardMarkup:
     available_languages = settings.get_available_languages()
+
+    # Ограничиваем выбор языка в боте белым списком (BOT_LANGUAGE_SELECTION_CODES).
+    # Если после фильтра ничего не осталось (например, кто-то убрал ru/en из
+    # настроек) — откатываемся к полному списку, чтобы экран не оказался пустым.
+    filtered_languages = [
+        lang for lang in available_languages if lang.lower() in BOT_LANGUAGE_SELECTION_CODES
+    ]
+    if filtered_languages:
+        available_languages = filtered_languages
 
     buttons: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
