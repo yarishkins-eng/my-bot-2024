@@ -1,3 +1,5 @@
+<!-- Форк Teplo VPN (@teplo_VPN_bot). Автодеплой на сервер при push в main — см. .github/workflows/deploy.yml -->
+
 <div align="center">
 
 <img src=".github/assets/logo.png" alt="Bedolaga Bot" width="800" />
