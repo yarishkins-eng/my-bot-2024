@@ -31,7 +31,10 @@ def _get_redis() -> aioredis.Redis | None:
     if _redis_initialized:
         return _redis_client
     try:
-        _redis_client = aioredis.from_url(settings.REDIS_URL)
+        # Таймауты, чтобы зависший Redis не тормозил горячий путь /start.
+        _redis_client = aioredis.from_url(
+            settings.REDIS_URL, socket_timeout=2, socket_connect_timeout=2
+        )
     except Exception as exc:
         logger.warning('Не удалось создать Redis-клиент для funnel-меню', error=exc)
         _redis_client = None

@@ -617,6 +617,8 @@ async def show_funnel_tariffs(
     с кнопкой «Назад» в главное меню. Если тарифов несколько или тариф суточный/
     кастомный — отдаём в стандартный список (там корректная обработка).
     """
+    from app.utils.photo_message import edit_or_answer_photo
+
     texts = get_texts(db_user.language)
     await state.clear()
 
@@ -624,11 +626,13 @@ async def show_funnel_tariffs(
     tariffs = await get_tariffs_for_user(db, promo_group_id)
 
     if not tariffs:
-        await callback.message.edit_text(
-            '😔 <b>Нет доступных тарифов</b>\n\nК сожалению, сейчас нет тарифов для покупки.',
-            reply_markup=InlineKeyboardMarkup(
+        await edit_or_answer_photo(
+            callback=callback,
+            caption='😔 <b>Нет доступных тарифов</b>\n\nК сожалению, сейчас нет тарифов для покупки.',
+            keyboard=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')]]
             ),
+            parse_mode='HTML',
         )
         await callback.answer()
         return
@@ -644,9 +648,10 @@ async def show_funnel_tariffs(
         return
 
     await state.update_data(selected_tariff_id=tariff.id)
-    await callback.message.edit_text(
-        format_tariff_info_for_user(tariff, db_user.language),
-        reply_markup=get_tariff_periods_keyboard(tariff, db_user.language, db_user=db_user, back_callback='back_to_menu'),
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=format_tariff_info_for_user(tariff, db_user.language),
+        keyboard=get_tariff_periods_keyboard(tariff, db_user.language, db_user=db_user, back_callback='back_to_menu'),
         parse_mode='HTML',
     )
     await callback.answer()

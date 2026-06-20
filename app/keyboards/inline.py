@@ -111,11 +111,16 @@ async def get_main_menu_keyboard_async(
         and not is_admin
         and not is_moderator
     ):
-        from app.utils.funnel_state import classify_funnel_state
+        try:
+            from app.utils.funnel_state import classify_funnel_state
 
-        funnel_keyboard = build_funnel_menu_keyboard(classify_funnel_state(user), language, get_texts(language))
-        if funnel_keyboard is not None:
-            return funnel_keyboard
+            funnel_keyboard = build_funnel_menu_keyboard(classify_funnel_state(user), language, get_texts(language))
+            if funnel_keyboard is not None:
+                return funnel_keyboard
+        except Exception as exc:
+            # Защита: при любой ошибке (напр. ленивая загрузка subscriptions вне greenlet)
+            # — не падаем, отдаём обычное меню.
+            logger.warning('Funnel-меню не построено, fallback на обычное меню', error=exc)
 
     if settings.MENU_LAYOUT_ENABLED:
         from app.services.menu_layout_service import MenuContext, MenuLayoutService

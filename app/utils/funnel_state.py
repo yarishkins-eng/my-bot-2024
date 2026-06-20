@@ -21,8 +21,10 @@ class FunnelState(str, Enum):
 
 # Активные статусы (подписка ещё «живая»)
 _ALIVE_STATUSES = {'active', 'trial', 'limited'}
-# Статусы «закончилась»
-_DEAD_STATUSES = {'expired', 'disabled'}
+# Статусы «закончилась». ВАЖНО: 'disabled' сюда НЕ входит — это обратимое
+# состояние (напр. временное отключение за отписку от канала), подписка ещё жива
+# и реактивируется. Считать его «триал закончился» нельзя.
+_DEAD_STATUSES = {'expired'}
 
 
 def classify_funnel_state(user) -> FunnelState:

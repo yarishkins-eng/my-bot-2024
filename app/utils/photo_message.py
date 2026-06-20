@@ -90,7 +90,7 @@ async def _answer_text(
     keyboard: types.InlineKeyboardMarkup | None,
     parse_mode: str | None,
     error: TelegramBadRequest | None = None,
-) -> None:
+) -> types.Message | None:
     language = _get_language(callback)
     kwargs = _build_base_kwargs(keyboard, parse_mode)
 
@@ -100,7 +100,7 @@ async def _answer_text(
 
     kwargs.setdefault('parse_mode', parse_mode or 'HTML')
 
-    await callback.message.answer(
+    return await callback.message.answer(
         caption,
         **kwargs,
     )
@@ -113,7 +113,10 @@ async def edit_or_answer_photo(
     parse_mode: str | None = 'HTML',
     *,
     force_text: bool = False,
-) -> None:
+) -> types.Message | None:
+    """Возвращает фактически показанное сообщение (отправленное/отредактированное)
+    или None, если показать не удалось. Возврат нужен, чтобы вызывающий код мог
+    запомнить message_id реального меню (см. funnel-удаление старого меню)."""
     resolved_parse_mode = parse_mode or 'HTML'
 
     # Если сообщение недоступно, отправляем новое сообщение
@@ -127,57 +130,56 @@ async def edit_or_answer_photo(
                     parse_mode=resolved_parse_mode,
                 )
                 _cache_logo_file_id(result)
-            else:
-                await callback.message.answer(
-                    caption,
-                    reply_markup=keyboard,
-                    parse_mode=resolved_parse_mode,
-                )
+                return result
+            return await callback.message.answer(
+                caption,
+                reply_markup=keyboard,
+                parse_mode=resolved_parse_mode,
+            )
         except Exception as e:
             logger.warning('Не удалось отправить новое сообщение для InaccessibleMessage', e=e)
             try:
-                await callback.message.answer(
+                return await callback.message.answer(
                     caption,
                     reply_markup=keyboard,
                     parse_mode=resolved_parse_mode,
                 )
             except Exception:
-                pass
-        return
+                return None
 
     # Если режим логотипа выключен или требуется текстовое сообщение — работаем текстом
     if force_text or not settings.ENABLE_LOGO_MODE:
         try:
             if callback.message.photo:
                 await callback.message.delete()
-                await _answer_text(callback, caption, keyboard, resolved_parse_mode)
-            else:
-                await callback.message.edit_text(
-                    caption,
-                    reply_markup=keyboard,
-                    parse_mode=resolved_parse_mode,
-                )
+                return await _answer_text(callback, caption, keyboard, resolved_parse_mode)
+            await callback.message.edit_text(
+                caption,
+                reply_markup=keyboard,
+                parse_mode=resolved_parse_mode,
+            )
+            return callback.message
         except TelegramForbiddenError:
             logger.debug('Пользователь заблокировал бота, пропускаем')
+            return None
         except TelegramBadRequest as error:
             try:
                 await callback.message.delete()
             except Exception:
                 pass
-            await _answer_text(callback, caption, keyboard, resolved_parse_mode, error)
-        return
+            return await _answer_text(callback, caption, keyboard, resolved_parse_mode, error)
 
     # Если текст слишком длинный для caption — отправим как текст
     if caption_exceeds_telegram_limit(caption):
         try:
             if callback.message.photo:
                 await callback.message.delete()
-            await _answer_text(callback, caption, keyboard, resolved_parse_mode)
+            return await _answer_text(callback, caption, keyboard, resolved_parse_mode)
         except TelegramForbiddenError:
             logger.debug('Пользователь заблокировал бота, пропускаем')
+            return None
         except TelegramBadRequest as error:
-            await _answer_text(callback, caption, keyboard, resolved_parse_mode, error)
-        return
+            return await _answer_text(callback, caption, keyboard, resolved_parse_mode, error)
 
     media = _resolve_media(callback.message)
 
@@ -188,8 +190,7 @@ async def edit_or_answer_photo(
             await callback.message.delete()
         except Exception:
             pass
-        await _answer_text(callback, caption, keyboard, resolved_parse_mode)
-        return
+        return await _answer_text(callback, caption, keyboard, resolved_parse_mode)
 
     # Retry logic для сетевых ошибок
     for attempt in range(MAX_RETRIES):
@@ -198,7 +199,7 @@ async def edit_or_answer_photo(
                 InputMediaPhoto(media=media, caption=caption, parse_mode=(parse_mode or 'HTML')),
                 reply_markup=keyboard,
             )
-            return  # Успешно — выходим
+            return callback.message  # Успешно — отредактировано на месте, id не изменился
         except TelegramNetworkError as net_error:
             if attempt < MAX_RETRIES - 1:
                 logger.warning(
@@ -215,8 +216,7 @@ async def edit_or_answer_photo(
                 await callback.message.delete()
             except Exception:
                 pass
-            await _answer_text(callback, caption, keyboard, resolved_parse_mode)
-            return
+            return await _answer_text(callback, caption, keyboard, resolved_parse_mode)
         except OSError as os_error:
             # Logo file became unreadable mid-flight (deleted/replaced by directory).
             # No point retrying — fall back to text. See #586617.
@@ -228,20 +228,18 @@ async def edit_or_answer_photo(
                 await callback.message.delete()
             except Exception:
                 pass
-            await _answer_text(callback, caption, keyboard, resolved_parse_mode)
-            return
+            return await _answer_text(callback, caption, keyboard, resolved_parse_mode)
         except TelegramForbiddenError:
             # Пользователь заблокировал бота — молча игнорируем
             logger.debug('Пользователь заблокировал бота, пропускаем edit_media')
-            return
+            return None
         except TelegramBadRequest as error:
             if is_privacy_restricted_error(error):
                 try:
                     await callback.message.delete()
                 except Exception:
                     pass
-                await _answer_text(callback, caption, keyboard, resolved_parse_mode, error)
-                return
+                return await _answer_text(callback, caption, keyboard, resolved_parse_mode, error)
             # Фоллбек: если не удалось обновить фото — отправим текст
             try:
                 await callback.message.delete()
@@ -249,8 +247,7 @@ async def edit_or_answer_photo(
                 pass
             logo_media = get_logo_media()
             if logo_media is None:
-                await _answer_text(callback, caption, keyboard, resolved_parse_mode)
-                return
+                return await _answer_text(callback, caption, keyboard, resolved_parse_mode)
             try:
                 # Отправим как фото с логотипом
                 result = await callback.message.answer_photo(
@@ -260,9 +257,10 @@ async def edit_or_answer_photo(
                     parse_mode=resolved_parse_mode,
                 )
                 _cache_logo_file_id(result)
+                return result
             except (TelegramBadRequest, TelegramForbiddenError) as photo_error:
-                await _answer_text(callback, caption, keyboard, resolved_parse_mode, photo_error)
+                return await _answer_text(callback, caption, keyboard, resolved_parse_mode, photo_error)
             except Exception:
                 # Последний фоллбек — обычный текст
-                await _answer_text(callback, caption, keyboard, resolved_parse_mode)
-            return
+                return await _answer_text(callback, caption, keyboard, resolved_parse_mode)
+    return None

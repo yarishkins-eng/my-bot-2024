@@ -1322,11 +1322,15 @@ class MonitoringService:
             subscriptions = result.scalars().all()
 
             sent = 0
+            processed_users: set[int] = set()
             for subscription in subscriptions:
                 user = subscription.user
                 if not user or subscription.end_date is None:
                     continue
                 if not getattr(user, 'telegram_id', None):
+                    continue
+                # Один оффер на пользователя за цикл (у юзера может быть >1 истёкшего триала)
+                if user.id in processed_users:
                     continue
 
                 days_since = (now - subscription.end_date).total_seconds() / 86400
@@ -1336,6 +1340,7 @@ class MonitoringService:
                 if await notification_sent(db, user.id, subscription.id, 'trial_expired_discount'):
                     continue
 
+                processed_users.add(user.id)
                 offer = await upsert_discount_offer(
                     db,
                     user_id=user.id,
@@ -1345,6 +1350,9 @@ class MonitoringService:
                     bonus_amount_kopeks=0,
                     valid_hours=valid_hours,
                     effect_type='percent_discount',
+                    # Срок скидки ПОСЛЕ нажатия «Получить скидку» = тот же valid_hours,
+                    # чтобы скидка не была бессрочной (совпадает с текстом «действует до …»).
+                    extra_data={'active_discount_hours': valid_hours},
                 )
                 success = await self._send_trial_expired_discount_notification(
                     user, subscription, percent, offer.expires_at, offer.id

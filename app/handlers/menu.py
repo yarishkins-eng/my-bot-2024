@@ -238,7 +238,7 @@ async def show_main_menu(
         custom_buttons=custom_buttons,
     )
 
-    await edit_or_answer_photo(
+    _menu_msg = await edit_or_answer_photo(
         callback=callback,
         caption=menu_text,
         keyboard=keyboard,
@@ -246,7 +246,7 @@ async def show_main_menu(
     )
     from app.utils.funnel_notify import remember_funnel_menu_message
 
-    await remember_funnel_menu_message(db_user, callback.message)
+    await remember_funnel_menu_message(db_user, _menu_msg or callback.message)
     if not skip_callback_answer:
         await callback.answer()
 
@@ -1232,7 +1232,7 @@ async def handle_back_to_menu(callback: types.CallbackQuery, state: FSMContext, 
         custom_buttons=custom_buttons,
     )
 
-    await edit_or_answer_photo(
+    _menu_msg = await edit_or_answer_photo(
         callback=callback,
         caption=menu_text,
         keyboard=keyboard,
@@ -1240,7 +1240,7 @@ async def handle_back_to_menu(callback: types.CallbackQuery, state: FSMContext, 
     )
     from app.utils.funnel_notify import remember_funnel_menu_message
 
-    await remember_funnel_menu_message(db_user, callback.message)
+    await remember_funnel_menu_message(db_user, _menu_msg or callback.message)
     await callback.answer()
 
 
@@ -1264,7 +1264,7 @@ def _get_subscription_status(user: User, texts, is_daily_tariff: bool = False) -
         getattr(settings, 'FUNNEL_MENU_ENABLED', False)
         and settings.is_cabinet_mode()
         and getattr(subscription, 'is_trial', False)
-        and actual_status in {'expired', 'disabled'}
+        and actual_status == 'expired'
         and not getattr(user, 'has_had_paid_subscription', False)
     ):
         return texts.t('SUB_STATUS_TRIAL_EXPIRED', '⛔ Пробный период закончился')
