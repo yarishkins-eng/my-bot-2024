@@ -26,7 +26,11 @@ _redis_initialized: bool = False
 
 
 def _get_redis() -> aioredis.Redis | None:
-    """Возвращает общий Redis-клиент (тот же инстанс, что у остальных сервисов)."""
+    """Возвращает кэшированный Redis-клиент (свой инстанс этого модуля, с таймаутами).
+
+    Подключается к тому же settings.REDIS_URL / БД, что и остальные сервисы, поэтому
+    запись (из бот-хендлера) и чтение (из webapi) видят одни и те же ключи.
+    """
     global _redis_client, _redis_initialized
     if _redis_initialized:
         return _redis_client
