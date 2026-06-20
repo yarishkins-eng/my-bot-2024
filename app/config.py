@@ -909,6 +909,9 @@ class Settings(BaseSettings):
     ETOPLATEZHI_CARD_DISPLAY_NAME: str = 'Карта (Etoplatezhi)'
 
     MAIN_MENU_MODE: str = 'default'  # 'default' | 'cabinet'
+    # Меню по состояниям воронки (новичок/триал) для ОБЫЧНЫХ пользователей (не админ/модератор).
+    # Работает только в cabinet-режиме. Аварийный выключатель: меняешь на false → меню возвращается к обычному.
+    FUNNEL_MENU_ENABLED: bool = False
     # Стиль кнопок Cabinet: primary (синий), success (зелёный), danger (красный), '' (по умолчанию для каждой секции)
     CABINET_BUTTON_STYLE: str = ''
     CONNECT_BUTTON_MODE: str = 'miniapp_subscription'

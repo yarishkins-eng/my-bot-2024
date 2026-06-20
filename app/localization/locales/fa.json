@@ -1144,6 +1144,8 @@
   "MENU_SUBSCRIPTION": "📱 اشتراک من",
   "MENU_SUPPORT": "🛠️ پشتیبانی",
   "MENU_TRIAL": "🧪 اشتراک آزمایشی",
+  "FUNNEL_TRY_FREE": "🎁 امتحان رایگان",
+  "FUNNEL_TARIFFS": "💳 تعرفه‌ها",
   "MINIAPP_PURCHASE_BREAKDOWN_BASE": "پلن پایه",
   "MINIAPP_PURCHASE_BREAKDOWN_DEVICES": "دستگاه‌ها",
   "MINIAPP_PURCHASE_BREAKDOWN_DISCOUNT_NOTE": "تخفیف: -{amount} ({percent}%)",

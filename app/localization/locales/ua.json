@@ -1061,6 +1061,8 @@
   "MENU_SUBSCRIPTION": "📱 Підписка",
   "MENU_SUPPORT": "🛠️ Техпідтримка",
   "MENU_TRIAL": "🧪 Тестова підписка",
+  "FUNNEL_TRY_FREE": "🎁 Спробувати безкоштовно",
+  "FUNNEL_TARIFFS": "💳 Тарифи",
   "MINIAPP_PURCHASE_BREAKDOWN_BASE": "Базовий план",
   "MINIAPP_PURCHASE_BREAKDOWN_DEVICES": "Пристрої",
   "MINIAPP_PURCHASE_BREAKDOWN_DISCOUNT_NOTE": "Знижка: -{amount} ({percent}%)",

@@ -25,6 +25,36 @@ from app.utils.subscription_utils import (
 logger = structlog.get_logger(__name__)
 
 
+def _build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMarkup | None:
+    """Строит меню воронки по состоянию пользователя (новичок/триал/триал-истёк).
+
+    Возвращает None, если для состояния funnel-меню не задано — тогда вызывающий
+    код использует обычное меню. На этапе «кусок A» реализован только NEWBIE.
+    """
+    from app.utils.funnel_state import FunnelState
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    if state == FunnelState.NEWBIE:
+        rows: list[list[InlineKeyboardButton]] = []
+
+        # «Попробовать бесплатно» показываем только если триал реально доступен
+        trial_available = settings.TRIAL_DURATION_DAYS > 0 and settings.TRIAL_DISABLED_FOR != 'all'
+        if trial_available:
+            trial_text = texts.t('FUNNEL_TRY_FREE', '🎁 Попробовать бесплатно')
+            cabinet_url = build_cabinet_url('/')
+            if cabinet_url:
+                rows.append([InlineKeyboardButton(text=trial_text, web_app=types.WebAppInfo(url=cabinet_url))])
+            else:
+                # Нет URL мини-аппа — fallback на бот-флоу триала
+                rows.append([InlineKeyboardButton(text=trial_text, callback_data='menu_trial')])
+
+        rows.append([InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs')])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    # TRIAL_ACTIVE / TRIAL_EXPIRED — добавятся в кусках B и C
+    return None
+
+
 async def get_main_menu_keyboard_async(
     db: AsyncSession,
     language: str = DEFAULT_LANGUAGE,
@@ -47,6 +77,21 @@ async def get_main_menu_keyboard_async(
     Если MENU_LAYOUT_ENABLED=True, использует конфигурацию из БД.
     Иначе делегирует в синхронную версию.
     """
+    # --- Меню по состояниям воронки (только обычные пользователи, cabinet-режим, под флагом) ---
+    # Админ/модератор всегда получают обычное полное меню (не теряют вход в админку).
+    if (
+        getattr(settings, 'FUNNEL_MENU_ENABLED', False)
+        and settings.is_cabinet_mode()
+        and user is not None
+        and not is_admin
+        and not is_moderator
+    ):
+        from app.utils.funnel_state import classify_funnel_state
+
+        funnel_keyboard = _build_funnel_menu_keyboard(classify_funnel_state(user), language, get_texts(language))
+        if funnel_keyboard is not None:
+            return funnel_keyboard
+
     if settings.MENU_LAYOUT_ENABLED:
         from app.services.menu_layout_service import MenuContext, MenuLayoutService
 

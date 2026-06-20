@@ -1059,6 +1059,8 @@
   "MENU_SUBSCRIPTION": "📱订阅",
   "MENU_SUPPORT": "🛠️技术支持",
   "MENU_TRIAL": "🧪试用订阅",
+  "FUNNEL_TRY_FREE": "🎁 免费试用",
+  "FUNNEL_TARIFFS": "💳 套餐",
   "MINIAPP_PURCHASE_BREAKDOWN_BASE": "基础套餐",
   "MINIAPP_PURCHASE_BREAKDOWN_DEVICES": "设备",
   "MINIAPP_PURCHASE_BREAKDOWN_DISCOUNT_NOTE": "折扣：-{amount}({percent}%)",

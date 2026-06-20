@@ -202,8 +202,13 @@ def get_tariff_periods_keyboard(
     tariff: Tariff,
     language: str,
     db_user: User | None = None,
+    back_callback: str = 'tariff_list',
 ) -> InlineKeyboardMarkup:
-    """Создает клавиатуру выбора периода для тарифа с учетом скидок по периодам."""
+    """Создает клавиатуру выбора периода для тарифа с учетом скидок по периодам.
+
+    ``back_callback`` — куда ведёт кнопка «Назад» (по умолчанию список тарифов;
+    для меню воронки передаётся 'back_to_menu', чтобы вернуть в funnel-меню).
+    """
     texts = get_texts(language)
     buttons = []
 
@@ -226,7 +231,7 @@ def get_tariff_periods_keyboard(
         button_text = f'{format_period(period)} — {price_text}'
         buttons.append([InlineKeyboardButton(text=button_text, callback_data=f'tariff_period:{tariff.id}:{period}')])
 
-    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data='tariff_list')])
+    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=back_callback)])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -596,6 +601,54 @@ async def show_tariffs_list(
         reply_markup=get_tariffs_keyboard(tariffs, db_user.language, purchased_tariff_ids),
     )
 
+    await callback.answer()
+
+
+@error_handler
+async def show_funnel_tariffs(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    """Кнопка «Тарифы» из меню воронки (новичок/триал).
+
+    Если активный тариф один и он обычный (периодный) — сразу показываем периоды
+    с кнопкой «Назад» в главное меню. Если тарифов несколько или тариф суточный/
+    кастомный — отдаём в стандартный список (там корректная обработка).
+    """
+    texts = get_texts(db_user.language)
+    await state.clear()
+
+    promo_group_id = getattr(db_user, 'promo_group_id', None)
+    tariffs = await get_tariffs_for_user(db, promo_group_id)
+
+    if not tariffs:
+        await callback.message.edit_text(
+            '😔 <b>Нет доступных тарифов</b>\n\nК сожалению, сейчас нет тарифов для покупки.',
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')]]
+            ),
+        )
+        await callback.answer()
+        return
+
+    if len(tariffs) > 1:
+        await show_tariffs_list(callback, db_user, db, state)
+        return
+
+    tariff = tariffs[0]
+
+    if getattr(tariff, 'is_daily', False) or tariff.can_purchase_custom_days() or tariff.can_purchase_custom_traffic():
+        await show_tariffs_list(callback, db_user, db, state)
+        return
+
+    await state.update_data(selected_tariff_id=tariff.id)
+    await callback.message.edit_text(
+        format_tariff_info_for_user(tariff, db_user.language),
+        reply_markup=get_tariff_periods_keyboard(tariff, db_user.language, db_user=db_user, back_callback='back_to_menu'),
+        parse_mode='HTML',
+    )
     await callback.answer()
 
 
@@ -4583,6 +4636,8 @@ def register_tariff_purchase_handlers(dp: Dispatcher):
     # Список тарифов (для режима tariffs)
     dp.callback_query.register(show_tariffs_list, F.data == 'tariff_list')
     dp.callback_query.register(show_tariffs_list, F.data == 'buy_subscription_tariffs')
+    # Кнопка «Тарифы» из меню воронки (новичок/триал)
+    dp.callback_query.register(show_funnel_tariffs, F.data == 'funnel_tariffs')
 
     # Выбор тарифа
     dp.callback_query.register(select_tariff, F.data.startswith('tariff_select:'))
