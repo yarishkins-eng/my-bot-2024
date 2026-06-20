@@ -17,9 +17,14 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            set -e
             cd /opt/remnawave-bedolaga-telegram-bot
             git pull origin main
-            docker stop remnawave_bot || true
-            docker rm remnawave_bot || true
-            docker compose up -d --build bot
-            echo "Deploy completed at $(date)"
+            # Сначала собираем новый образ. Если сборка упадёт — set -e прервёт скрипт,
+            # и СТАРЫЙ работающий контейнер останется нетронутым (бот не ляжет).
+            docker compose build bot
+            # Только после успешной сборки переключаемся на новую версию.
+            docker compose up -d bot
+            # Чистим устаревшие образы, чтобы не забивать диск.
+            docker image prune -f || true
+            echo "Deploy OK: $(git rev-parse --short HEAD) at $(date)"
