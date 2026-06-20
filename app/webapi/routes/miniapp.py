@@ -4040,6 +4040,40 @@ async def activate_subscription_trial_endpoint(
         )
     )
 
+    # Авто-обновление меню в Telegram: после УСПЕШНОЙ активации триала шлём
+    # пользователю новое меню (3 кнопки) — чтобы оно обновилось, не дожидаясь /start.
+    # Только при включённом funnel-меню и только telegram-пользователям.
+    # Ошибка отправки НЕ должна ломать активацию триала (оборачиваем в try/except).
+    if (
+        getattr(settings, 'FUNNEL_MENU_ENABLED', False)
+        and settings.is_cabinet_mode()
+        and getattr(user, 'telegram_id', None)
+    ):
+        try:
+            from app.keyboards.inline import build_funnel_menu_keyboard
+            from app.localization.texts import get_texts
+            from app.utils.funnel_state import FunnelState
+
+            menu_texts = get_texts(user.language)
+            funnel_keyboard = build_funnel_menu_keyboard(FunnelState.TRIAL_ACTIVE, user.language, menu_texts)
+            if funnel_keyboard is not None:
+                activated_text = menu_texts.t(
+                    'FUNNEL_TRIAL_ACTIVATED',
+                    '🎉 Готово! Пробный период активирован.',
+                )
+                bot = create_bot()
+                try:
+                    await bot.send_message(
+                        chat_id=user.telegram_id,
+                        text=activated_text,
+                        reply_markup=funnel_keyboard,
+                        parse_mode='HTML',
+                    )
+                finally:
+                    await bot.session.close()
+        except Exception as exc:  # авто-обновление не критично — логируем и идём дальше
+            logger.warning('Не удалось отправить funnel-меню после активации триала', error=exc)
+
     return MiniAppSubscriptionTrialResponse(
         message=message,
         subscription_id=getattr(subscription, 'id', None),

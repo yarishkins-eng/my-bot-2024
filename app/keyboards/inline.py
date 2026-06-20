@@ -25,11 +25,12 @@ from app.utils.subscription_utils import (
 logger = structlog.get_logger(__name__)
 
 
-def _build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMarkup | None:
+def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMarkup | None:
     """Строит меню воронки по состоянию пользователя (новичок/триал/триал-истёк).
 
     Возвращает None, если для состояния funnel-меню не задано — тогда вызывающий
-    код использует обычное меню. На этапе «кусок A» реализован только NEWBIE.
+    код использует обычное меню. Кусок A — NEWBIE; кусок B — TRIAL_ACTIVE.
+    Вызывается также из мини-аппа (авто-обновление меню после активации триала).
     """
     from app.utils.funnel_state import FunnelState
     from app.utils.miniapp_buttons import build_cabinet_url
@@ -51,7 +52,30 @@ def _build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMa
         rows.append([InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs')])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    # TRIAL_ACTIVE / TRIAL_EXPIRED — добавятся в кусках B и C
+    if state == FunnelState.TRIAL_ACTIVE:
+        rows = []
+
+        # CTA «Оформить подписку» — во всю ширину, открывает экран покупки в мини-аппе
+        cta_text = texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку')
+        subscribe_url = build_cabinet_url('/subscription')
+        if subscribe_url:
+            rows.append([InlineKeyboardButton(text=cta_text, web_app=types.WebAppInfo(url=subscribe_url))])
+        else:
+            rows.append([InlineKeyboardButton(text=cta_text, callback_data='menu_buy')])
+
+        # Второй ряд: Личный кабинет (корень мини-аппа) + Тарифы (периоды в боте)
+        second_row: list[InlineKeyboardButton] = []
+        cabinet_text = texts.t('FUNNEL_CABINET', '👤 Личный кабинет')
+        cabinet_url = build_cabinet_url('/')
+        if cabinet_url:
+            second_row.append(InlineKeyboardButton(text=cabinet_text, web_app=types.WebAppInfo(url=cabinet_url)))
+        else:
+            second_row.append(InlineKeyboardButton(text=cabinet_text, callback_data='menu_subscription'))
+        second_row.append(InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs'))
+        rows.append(second_row)
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    # TRIAL_EXPIRED — добавится в куске C
     return None
 
 
@@ -88,7 +112,7 @@ async def get_main_menu_keyboard_async(
     ):
         from app.utils.funnel_state import classify_funnel_state
 
-        funnel_keyboard = _build_funnel_menu_keyboard(classify_funnel_state(user), language, get_texts(language))
+        funnel_keyboard = build_funnel_menu_keyboard(classify_funnel_state(user), language, get_texts(language))
         if funnel_keyboard is not None:
             return funnel_keyboard
 
