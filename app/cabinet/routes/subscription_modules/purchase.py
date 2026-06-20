@@ -1436,4 +1436,10 @@ async def activate_trial(
             error=str(yconv_err),
         )
 
+    # Авто-обновление меню в Telegram: после успешной активации триала шлём
+    # пользователю новое меню (3 кнопки), чтобы оно обновилось не дожидаясь /start.
+    from app.utils.funnel_notify import send_funnel_trial_menu
+
+    await send_funnel_trial_menu(user)
+
     return _subscription_to_response(subscription, user=user)
