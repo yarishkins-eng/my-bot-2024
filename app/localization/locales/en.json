@@ -1524,6 +1524,7 @@
   "SUB_STATUS_ACTIVE_TOMORROW": "💎 Active\n⚠️ expires tomorrow!",
   "SUB_STATUS_DAILY_ACTIVE": "💎 Active",
   "SUB_STATUS_EXPIRED": "🔴 Expired\n📅 {end_date}",
+  "SUB_STATUS_TRIAL_EXPIRED": "⛔ Your trial period has ended\nGet a subscription to restore access.",
   "SUB_STATUS_DISABLED": "⚫ Disabled",
   "SUB_STATUS_PENDING": "⏳ Pending activation",
   "SUB_STATUS_NONE": "❌ Not available",

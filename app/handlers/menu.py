@@ -1255,8 +1255,19 @@ def _get_subscription_status(user: User, texts, is_daily_tariff: bool = False) -
     end_date_text = format_local_datetime(end_date, '%d.%m.%Y') if end_date else None
     days_left = 0
 
-    if subscription.end_date > current_time:
+    if subscription.end_date and subscription.end_date > current_time:
         days_left = (subscription.end_date - current_time).days
+
+    # Funnel: истёкший триал (платной никогда не было) — отдельный понятный баннер
+    # вместо общего «🔴 Истекла». Только под флагом и в cabinet-режиме.
+    if (
+        getattr(settings, 'FUNNEL_MENU_ENABLED', False)
+        and settings.is_cabinet_mode()
+        and getattr(subscription, 'is_trial', False)
+        and actual_status in {'expired', 'disabled'}
+        and not getattr(user, 'has_had_paid_subscription', False)
+    ):
+        return texts.t('SUB_STATUS_TRIAL_EXPIRED', '⛔ Пробный период закончился')
 
     if actual_status == 'pending':
         return texts.t('SUBSCRIPTION_NONE', '❌ Нет активной подписки')

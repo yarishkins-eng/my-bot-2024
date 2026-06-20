@@ -52,7 +52,9 @@ def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMar
         rows.append([InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs')])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    if state == FunnelState.TRIAL_ACTIVE:
+    if state in (FunnelState.TRIAL_ACTIVE, FunnelState.TRIAL_EXPIRED):
+        # Меню одинаковое: на триале — чтобы оформить заранее; после триала —
+        # чтобы вернуть доступ. Отличается только баннер-текст над меню.
         rows = []
 
         # CTA «Оформить подписку» — во всю ширину, открывает экран покупки в мини-аппе
@@ -75,7 +77,6 @@ def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMar
         rows.append(second_row)
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    # TRIAL_EXPIRED — добавится в куске C
     return None
 
 

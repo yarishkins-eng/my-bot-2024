@@ -1451,6 +1451,7 @@
   "SUB_STATUS_ACTIVE_TOMORROW": "💎活跃\n⚠️明天过期！",
   "SUB_STATUS_DAILY_ACTIVE": "💎活跃",
   "SUB_STATUS_EXPIRED": "🔴已过期\n📅{end_date}",
+  "SUB_STATUS_TRIAL_EXPIRED": "⛔ 您的试用期已结束\n请购买订阅以恢复访问。",
   "SUB_STATUS_DISABLED": "⚫已禁用",
   "SUB_STATUS_PENDING": "⏳等待激活",
   "SUB_STATUS_NONE": "❌无",

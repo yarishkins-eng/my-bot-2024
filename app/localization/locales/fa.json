@@ -1546,6 +1546,7 @@
   "SUB_STATUS_ACTIVE_TOMORROW": "💎 فعال\n⚠️ فردا منقضی می‌شود!",
   "SUB_STATUS_DAILY_ACTIVE": "💎 فعال",
   "SUB_STATUS_EXPIRED": "🔴 منقضی شده\n📅 {end_date}",
+  "SUB_STATUS_TRIAL_EXPIRED": "⛔ دوره آزمایشی شما به پایان رسید\nبرای بازگرداندن دسترسی اشتراک تهیه کنید.",
   "SUB_STATUS_DISABLED": "🚫 غیرفعال",
   "SUB_STATUS_PENDING": "⏳ در انتظار",
   "SUB_STATUS_NONE": "❌ بدون اشتراک",

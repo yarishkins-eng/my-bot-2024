@@ -1455,6 +1455,7 @@
   "SUB_STATUS_ACTIVE_TOMORROW": "💎 Активна\n⚠️ закінчується завтра!",
   "SUB_STATUS_DAILY_ACTIVE": "💎 Активна",
   "SUB_STATUS_EXPIRED": "🔴 Закінчилася\n📅 {end_date}",
+  "SUB_STATUS_TRIAL_EXPIRED": "⛔ Ваш пробний період закінчився\nОформіть підписку, щоб повернути доступ.",
   "SUB_STATUS_DISABLED": "⚫ Вимкнена",
   "SUB_STATUS_PENDING": "⏳ Очікує активації",
   "SUB_STATUS_NONE": "❌ Відсутня",
