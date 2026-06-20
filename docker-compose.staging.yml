@@ -1,0 +1,83 @@
+# Тестовый (staging) стек Teplo VPN.
+# Полностью изолирован от боевого бота: свой токен, своя база, свой redis.
+# Бот работает в режиме polling (не нужен домен/webhook).
+# Запуск на сервере: docker compose -f docker-compose.staging.yml up -d --build
+# Требует файлы рядом: .env.staging (настройки бота) и .env (только STAGING_DB_PASSWORD).
+
+services:
+  postgres_staging:
+    image: postgres:15-alpine
+    container_name: teplo_staging_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: teplo_staging
+      POSTGRES_USER: staging_user
+      POSTGRES_PASSWORD: ${STAGING_DB_PASSWORD:-staging_local_only}
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+    volumes:
+      - staging_postgres_data:/var/lib/postgresql/data
+    networks:
+      - staging_net
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U staging_user -d teplo_staging']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis_staging:
+    image: redis:7-alpine
+    container_name: teplo_staging_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    networks:
+      - staging_net
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  bot_staging:
+    build: .
+    container_name: teplo_staging_bot
+    restart: unless-stopped
+    depends_on:
+      postgres_staging:
+        condition: service_healthy
+      redis_staging:
+        condition: service_healthy
+    env_file:
+      - .env.staging
+    environment:
+      # Подключение к ИЗОЛИРОВАННОЙ тестовой базе и redis (перекрывает .env.staging)
+      DOCKER_ENV: 'true'
+      DATABASE_MODE: 'auto'
+      POSTGRES_HOST: 'postgres_staging'
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: 'teplo_staging'
+      POSTGRES_USER: 'staging_user'
+      POSTGRES_PASSWORD: '${STAGING_DB_PASSWORD:-staging_local_only}'
+      DATABASE_URL: 'postgresql+asyncpg://staging_user:${STAGING_DB_PASSWORD:-staging_local_only}@postgres_staging:5432/teplo_staging'
+      REDIS_URL: 'redis://redis_staging:6379/0'
+      TZ: 'Europe/Moscow'
+      LOCALES_PATH: '/app/locales'
+    volumes:
+      - ./logs:/app/logs:rw
+      - ./data:/app/data:rw
+      - ./locales:/app/locales:rw
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./uploads:/app/uploads:rw
+      - ./vpn_logo.png:/app/vpn_logo.png:ro
+    networks:
+      - staging_net
+    # Портов нет и web-healthcheck нет: бот в режиме polling, WEB_API выключен.
+
+volumes:
+  staging_postgres_data:
+    driver: local
+
+networks:
+  staging_net:
+    driver: bridge

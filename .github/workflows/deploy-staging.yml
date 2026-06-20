@@ -1,0 +1,28 @@
+name: Deploy to staging
+
+on:
+  push:
+    branches:
+      - staging
+  workflow_dispatch:
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy staging via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /opt/teplo-bot-staging
+            git fetch origin staging
+            git reset --hard origin/staging
+            # Собираем тестового бота. При ошибке сборки старый тестовый бот продолжит работать.
+            docker compose -f docker-compose.staging.yml build bot_staging
+            docker compose -f docker-compose.staging.yml up -d
+            docker image prune -f || true
+            echo "Staging deploy OK: $(git rev-parse --short HEAD) at $(date)"
