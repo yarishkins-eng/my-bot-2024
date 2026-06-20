@@ -244,6 +244,9 @@ async def show_main_menu(
         keyboard=keyboard,
         parse_mode='HTML',
     )
+    from app.utils.funnel_notify import remember_funnel_menu_message
+
+    await remember_funnel_menu_message(db_user, callback.message)
     if not skip_callback_answer:
         await callback.answer()
 
@@ -1235,6 +1238,9 @@ async def handle_back_to_menu(callback: types.CallbackQuery, state: FSMContext, 
         keyboard=keyboard,
         parse_mode='HTML',
     )
+    from app.utils.funnel_notify import remember_funnel_menu_message
+
+    await remember_funnel_menu_message(db_user, callback.message)
     await callback.answer()
 
 

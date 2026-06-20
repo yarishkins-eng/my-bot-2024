@@ -1114,7 +1114,10 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
             is_moderator=is_moderator,
             custom_buttons=custom_buttons,
         )
-        await message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+        _sent_menu = await message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+        from app.utils.funnel_notify import remember_funnel_menu_message
+
+        await remember_funnel_menu_message(user, _sent_menu)
 
         if pinned_message and not pinned_message.send_before_menu:
             await _send_pinned_message(message.bot, db, user, pinned_message)
@@ -2016,7 +2019,10 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
             )
             if pinned_message and pinned_message.send_before_menu:
                 await _send_pinned_message(callback.bot, db, user, pinned_message)
-            await callback.message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+            _sent_menu = await callback.message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+            from app.utils.funnel_notify import remember_funnel_menu_message
+
+            await remember_funnel_menu_message(user, _sent_menu)
             if pinned_message and not pinned_message.send_before_menu:
                 await _send_pinned_message(callback.bot, db, user, pinned_message)
             logger.info('✅ Главное меню показано пользователю', telegram_id=user.telegram_id)
@@ -2372,7 +2378,10 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
             )
             if pinned_message and pinned_message.send_before_menu:
                 await _send_pinned_message(message.bot, db, user, pinned_message)
-            await message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+            _sent_menu = await message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+            from app.utils.funnel_notify import remember_funnel_menu_message
+
+            await remember_funnel_menu_message(user, _sent_menu)
             logger.info('✅ Главное меню показано пользователю', telegram_id=user.telegram_id)
             if pinned_message and not pinned_message.send_before_menu:
                 await _send_pinned_message(message.bot, db, user, pinned_message)
