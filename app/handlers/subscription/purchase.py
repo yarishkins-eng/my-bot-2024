@@ -198,13 +198,22 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
     await db.refresh(db_user)
 
     texts = get_texts(db_user.language)
+    # Фото-безопасный рендер: экран достижим из фото-меню (ENABLE_LOGO_MODE).
+    from app.utils.photo_message import edit_or_answer_photo
+
     # Multi-tariff: this branch is only reached in single-tariff mode (multi-tariff
     # is redirected to show_my_subscriptions above). db_user.subscription returns
     # the first active or most recent subscription, which is correct here.
     subscription = db_user.subscription
 
     if not subscription:
-        await callback.message.edit_text(texts.SUBSCRIPTION_NONE, reply_markup=get_back_keyboard(db_user.language))
+        await edit_or_answer_photo(
+            callback=callback,
+            caption=texts.SUBSCRIPTION_NONE,
+            keyboard=get_back_keyboard(db_user.language),
+            parse_mode='HTML',
+            force_text=True,
+        )
         await callback.answer()
         return
 
@@ -583,10 +592,7 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
             '📱 Скопируйте ссылку и добавьте в ваше VPN приложение',
         )
 
-    # Фото-безопасно: экран достижим из фото-меню (напр. «Продлить» суточного тарифа в
-    # меню подписчика → resume сюда), а edit_text по фото-сообщению падает.
-    from app.utils.photo_message import edit_or_answer_photo
-
+    # Фото-безопасно (импорт выше): «Продлить» суточного тарифа в меню подписчика → resume сюда.
     await edit_or_answer_photo(
         callback=callback,
         caption=message,

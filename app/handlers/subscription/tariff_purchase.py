@@ -2214,7 +2214,6 @@ async def show_tariff_extend(
     db: AsyncSession,
 ):
     """Показывает экран продления по текущему тарифу."""
-    get_texts(db_user.language)
     # Фото-безопасно: меню в боте — фото (ENABLE_LOGO_MODE). force_text переводит экран
     # в текст, дальше шаги продления (edit_text) работают по текстовому сообщению.
     from app.utils.photo_message import edit_or_answer_photo
