@@ -1061,14 +1061,18 @@ async def show_info_page(
     await callback.answer()
 
 
-async def cmd_language(message: types.Message, db_user: User):
+async def cmd_language(message: types.Message, db_user: User, state: FSMContext):
     """Команда /language (из меню команд ☰) — тот же выбор языка, что и кнопка menu_language.
 
     Переиспользует get_language_selection_keyboard (callback language_select:XX обрабатывает
     существующий process_language_change). Команда шлёт НОВОЕ сообщение → message.answer.
+    ВАЖНО: ☰-команда доступна из любого контекста, в т.ч. посреди FSM-флоу (ввод промокода/тикета/
+    суммы). process_language_change гейтится StateFilter(None) — без сброса состояния выбор языка
+    молча не сработает. Поэтому сбрасываем FSM перед показом (как «Назад в меню»).
     """
     if db_user is None:
         return
+    await state.clear()
     texts = get_texts(db_user.language)
     if not settings.is_language_selection_enabled():
         await message.answer(texts.t('LANGUAGE_SELECTION_DISABLED', '⚙️ Выбор языка временно недоступен.'))
