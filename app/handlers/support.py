@@ -1,6 +1,5 @@
 import structlog
 from aiogram import Dispatcher, F, types
-from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 
 from app.database.models import User
@@ -53,4 +52,4 @@ async def cmd_support(message: types.Message, db_user: User, state: FSMContext):
 
 def register_handlers(dp: Dispatcher):
     dp.callback_query.register(show_support_info, F.data == 'menu_support')
-    dp.message.register(cmd_support, Command('support'))
+    # cmd_support (/support) регистрируется РАНЬШЕ — в app/bot.py, до FSM-обработчиков ввода.

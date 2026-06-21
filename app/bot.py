@@ -176,6 +176,14 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     dp.message.middleware(SubscriptionStatusMiddleware())
     dp.callback_query.middleware(SubscriptionStatusMiddleware())
     dp.pre_checkout_query.middleware(SubscriptionStatusMiddleware())
+    # Командные хендлеры меню ☰ (/language, /support) регистрируем ПЕРВЫМИ: иначе FSM-обработчики
+    # ввода (промокод/вывод средств/тикеты) перехватывают команду как «ввод» и она не срабатывает.
+    # /start уже идёт первым внутри start.register_handlers. Команды должны иметь приоритет.
+    from aiogram.filters import Command as _CmdFilter
+
+    dp.message.register(menu.cmd_language, _CmdFilter('language'))
+    dp.message.register(support.cmd_support, _CmdFilter('support'))
+
     start.register_handlers(dp)
     menu.register_handlers(dp)
     subscription.register_handlers(dp)

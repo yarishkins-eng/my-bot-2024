@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import structlog
 from aiogram import Dispatcher, F, types
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1790,7 +1790,7 @@ def register_handlers(dp: Dispatcher):
     )
 
     dp.callback_query.register(show_language_menu, F.data == 'menu_language')
-    dp.message.register(cmd_language, Command('language'))
+    # cmd_language (/language) регистрируется РАНЬШЕ — в app/bot.py, до FSM-обработчиков ввода.
 
     dp.callback_query.register(process_language_change, F.data.startswith('language_select:'), StateFilter(None))
 
