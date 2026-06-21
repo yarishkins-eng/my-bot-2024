@@ -26,10 +26,11 @@ logger = structlog.get_logger(__name__)
 
 
 def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMarkup | None:
-    """Строит меню воронки по состоянию пользователя (новичок/триал/триал-истёк).
+    """Строит меню воронки по состоянию пользователя.
 
     Возвращает None, если для состояния funnel-меню не задано — тогда вызывающий
-    код использует обычное меню. Кусок A — NEWBIE; кусок B — TRIAL_ACTIVE.
+    код использует обычное меню. Кусок A — NEWBIE; кусок B — TRIAL_ACTIVE/TRIAL_EXPIRED;
+    кусок C — платный подписчик PAID_ACTIVE/PAID_EXPIRING/PAID_EXPIRED.
     Вызывается также из мини-аппа (авто-обновление меню после активации триала).
     """
     from app.utils.funnel_state import FunnelState

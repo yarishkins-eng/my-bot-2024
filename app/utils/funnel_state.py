@@ -1,12 +1,13 @@
 """Классификатор состояния пользователя в воронке (для меню по состояниям).
 
-Единый источник истины: и клавиатура главного меню, и (в будущем) текст-баннер
-должны опираться на эту функцию, чтобы кнопки и подпись не расходились.
+Единый источник истины: клавиатура главного меню и текст-статус опираются на ОДНУ
+подписку (``user.subscription`` через ``get_subscriber_state``), чтобы кнопки и подпись
+не расходились.
 
 ВАЖНО: активный триал в БД хранится со status=ACTIVE (не TRIAL), поэтому
-``Subscription.actual_status`` для него возвращает 'active'. Различать триал и
-платную можно ТОЛЬКО по флагу ``is_trial``. Поэтому классификация идёт по флагу
-``is_trial`` + ``actual_status`` + ``has_had_paid_subscription``.
+``Subscription.actual_status`` для него возвращает 'active'. Различать триал и платную
+можно ТОЛЬКО по флагу ``is_trial``. Платное под-состояние (PAID_*) считается по
+``actual_status`` выбранной подписки; триал-ветки — по списку ``user.subscriptions``.
 """
 
 from enum import Enum
@@ -44,8 +45,10 @@ def get_subscriber_state(user):
 
     Гейты: свой флаг FUNNEL_SUBSCRIBER_MENU_ENABLED + защита от мультитарифа
     (одна «Моя ссылка» не отражает несколько подписок).
-    Тонкости: триал (is_trial) — не наша зона; 'disabled' обратимо → обычное меню;
-    'limited' (исчерпан трафик) → активное меню без форс-CTA «Продлить».
+    Тонкости: триал (is_trial) — не наша зона; НЕ-триальную подписку классифицируем
+    ПО СТАТУСУ (флаг has_had_paid не требуется — активная/истёкшая платная = подписчик):
+    'disabled' обратимо → обычное меню; 'limited' (исчерпан трафик) → активное меню без
+    форс-CTA «Продлить»; 'active'/'limited' → active/expiring по порогу; 'expired' → expired.
     """
     if user is None:
         return None, None
@@ -61,13 +64,11 @@ def get_subscriber_state(user):
         return None, sub
 
     status = (getattr(sub, 'actual_status', '') or '').lower()
-    has_had_paid = bool(getattr(user, 'has_had_paid_subscription', False))
 
     if status == 'disabled':
         return None, sub
     if status == 'expired':
-        # PAID_EXPIRED только для реального платного пути; иначе обычное меню
-        return (FunnelState.PAID_EXPIRED, sub) if has_had_paid else (None, sub)
+        return FunnelState.PAID_EXPIRED, sub
     if status in ('active', 'limited'):
         if status == 'limited':
             # трафик исчерпан, период ещё идёт — продление периода не лечит проблему
@@ -123,7 +124,8 @@ def classify_funnel_state(user) -> FunnelState:
     # Активный триал имеет приоритет
     if trial_active:
         return FunnelState.TRIAL_ACTIVE
-    # Есть активная НЕ-триальная подписка без paid-флага — редкий случай, не трогаем
+    # Активная НЕ-триальная подписка доходит сюда лишь когда меню подписчика выключено
+    # (при включённом флаге её раньше перехватывает get_subscriber_state). Отдаём обычное меню.
     if has_any_alive:
         return FunnelState.OTHER
     # Только закончившийся триал

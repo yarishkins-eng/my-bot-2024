@@ -307,6 +307,12 @@ async def handle_open_subscription_link(
             redirect_link=redirect_link,
         )
 
+        # Фото-меню (ENABLE_LOGO_MODE) удаляем, иначе под ним повиснет дубль-сообщение.
+        if getattr(callback.message, 'photo', None):
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
         await callback.message.answer(
             happ_message,
             parse_mode='HTML',

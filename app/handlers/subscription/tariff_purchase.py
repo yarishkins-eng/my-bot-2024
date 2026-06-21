@@ -2251,10 +2251,12 @@ async def show_tariff_extend(
                         ]
                     )
                 keyboard.append([InlineKeyboardButton(text='◀️ Назад', callback_data='back_to_menu')])
-                await callback.message.edit_text(
-                    '🔄 <b>Продление подписки</b>\n\nВыберите подписку для продления:',
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+                await edit_or_answer_photo(
+                    callback=callback,
+                    caption='🔄 <b>Продление подписки</b>\n\nВыберите подписку для продления:',
+                    keyboard=InlineKeyboardMarkup(inline_keyboard=keyboard),
                     parse_mode='HTML',
+                    force_text=True,
                 )
                 await callback.answer()
                 return
