@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import structlog
 from aiogram import Dispatcher, F, types
-from aiogram.filters import StateFilter
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1061,6 +1061,29 @@ async def show_info_page(
     await callback.answer()
 
 
+async def cmd_language(message: types.Message, db_user: User):
+    """Команда /language (из меню команд ☰) — тот же выбор языка, что и кнопка menu_language.
+
+    Переиспользует get_language_selection_keyboard (callback language_select:XX обрабатывает
+    существующий process_language_change). Команда шлёт НОВОЕ сообщение → message.answer.
+    """
+    if db_user is None:
+        return
+    texts = get_texts(db_user.language)
+    if not settings.is_language_selection_enabled():
+        await message.answer(texts.t('LANGUAGE_SELECTION_DISABLED', '⚙️ Выбор языка временно недоступен.'))
+        return
+    await message.answer(
+        texts.t('LANGUAGE_PROMPT', '🌐 Выберите язык интерфейса:'),
+        reply_markup=get_language_selection_keyboard(
+            current_language=db_user.language,
+            include_back=True,
+            language=db_user.language,
+        ),
+        parse_mode='HTML',
+    )
+
+
 async def show_language_menu(
     callback: types.CallbackQuery,
     db_user: User,
@@ -1763,6 +1786,7 @@ def register_handlers(dp: Dispatcher):
     )
 
     dp.callback_query.register(show_language_menu, F.data == 'menu_language')
+    dp.message.register(cmd_language, Command('language'))
 
     dp.callback_query.register(process_language_change, F.data.startswith('language_select:'), StateFilter(None))
 
