@@ -301,7 +301,7 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     # В меню команд можно только команда + текст-описание с эмодзи (картинку/логотип Telegram
     # не поддерживает). Ставим для default + ru + en (Telegram берёт язык клиента). best-effort.
     try:
-        from aiogram.types import BotCommand
+        from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
 
         _cmds_ru = [
             BotCommand(command='start', description='🔄 Перезагрузить бота'),
@@ -313,9 +313,17 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
             BotCommand(command='language', description='🌐 Language'),
             BotCommand(command='support', description='🛠️ Support'),
         ]
+        # default scope
         await bot.set_my_commands(_cmds_ru)
         await bot.set_my_commands(_cmds_ru, language_code='ru')
         await bot.set_my_commands(_cmds_en, language_code='en')
+        # ВАЖНО: в личных чатах приоритет у scope all_private_chats (он перебивает default).
+        # Старое «/start Меню Бота» из BotFather сидело именно в этом скоупе — перезаписываем,
+        # иначе пользователи в личке продолжают видеть старое одиночное меню.
+        _scope_pm = BotCommandScopeAllPrivateChats()
+        await bot.set_my_commands(_cmds_ru, scope=_scope_pm)
+        await bot.set_my_commands(_cmds_ru, scope=_scope_pm, language_code='ru')
+        await bot.set_my_commands(_cmds_en, scope=_scope_pm, language_code='en')
         logger.info('Команды бота (меню ☰) установлены')
     except Exception as e:
         logger.warning('Не удалось установить команды бота', error=e)
