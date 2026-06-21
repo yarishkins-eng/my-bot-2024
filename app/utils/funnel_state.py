@@ -55,6 +55,10 @@ def get_subscriber_state(user):
         return None, None
     if not settings.is_funnel_subscriber_menu_enabled():
         return None, None
+    # Самодостаточность: меню по состояниям живёт только в cabinet-режиме (не полагаемся
+    # на cabinet-гейт вызывающего — функцию могут дёрнуть и из других мест).
+    if not settings.is_cabinet_mode():
+        return None, None
     if settings.is_multi_tariff_enabled():
         return None, None
 

@@ -1767,7 +1767,7 @@ class Settings(BaseSettings):
         if val > 0:
             return val
         days = self.get_autopay_warning_days() or [3]
-        return max(days) if days else 3
+        return max(days)
 
     def is_autopay_enabled_by_default(self) -> bool:
         value = getattr(self, 'DEFAULT_AUTOPAY_ENABLED', True)
