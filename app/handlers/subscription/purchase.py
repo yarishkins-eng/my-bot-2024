@@ -583,12 +583,18 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
             '📱 Скопируйте ссылку и добавьте в ваше VPN приложение',
         )
 
-    await callback.message.edit_text(
-        message,
-        reply_markup=get_subscription_keyboard(
+    # Фото-безопасно: экран достижим из фото-меню (напр. «Продлить» суточного тарифа в
+    # меню подписчика → resume сюда), а edit_text по фото-сообщению падает.
+    from app.utils.photo_message import edit_or_answer_photo
+
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=message,
+        keyboard=get_subscription_keyboard(
             db_user.language, has_subscription=True, is_trial=subscription.is_trial, subscription=subscription
         ),
         parse_mode='HTML',
+        force_text=True,
     )
     await callback.answer()
 
