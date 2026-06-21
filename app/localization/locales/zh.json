@@ -1064,6 +1064,7 @@
   "FUNNEL_SUBSCRIBE_CTA": "💎 购买订阅",
   "FUNNEL_CABINET": "👤 个人中心",
   "FUNNEL_TRIAL_ACTIVATED": "🎉 完成！试用期已激活。",
+  "FUNNEL_NEWBIE_MENU_TEXT": "🔥 离自由上网只差一步。\n\n还没有订阅 — 但 {trial_days} 的 Teplo 免费。30 秒即可开启 👇",
   "MINIAPP_PURCHASE_BREAKDOWN_BASE": "基础套餐",
   "MINIAPP_PURCHASE_BREAKDOWN_DEVICES": "设备",
   "MINIAPP_PURCHASE_BREAKDOWN_DISCOUNT_NOTE": "折扣：-{amount}({percent}%)",

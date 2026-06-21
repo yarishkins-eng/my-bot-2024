@@ -1399,6 +1399,25 @@ async def _get_multi_tariff_status(user, texts, db: AsyncSession) -> tuple[str, 
 async def get_main_menu_text(user, texts, db: AsyncSession):
     from app.config import settings
 
+    # Funnel: новичку — короткий продающий текст вместо сухого «Подписка: ❌ Отсутствует».
+    # Срок триала {trial_days} подставляется из настройки (со склонением: 1 день / 3 дня / 7 дней).
+    if getattr(settings, 'FUNNEL_MENU_ENABLED', False) and settings.is_cabinet_mode():
+        try:
+            from app.utils.funnel_state import FunnelState, classify_funnel_state
+
+            if classify_funnel_state(user) == FunnelState.NEWBIE:
+                from app.utils.pricing_utils import format_period_description
+
+                language = getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE
+                trial_days = format_period_description(settings.TRIAL_DURATION_DAYS, language)
+                return texts.t(
+                    'FUNNEL_NEWBIE_MENU_TEXT',
+                    '🔥 Остался один шаг до свободного интернета.\n\n'
+                    'Подписки пока нет — но {trial_days} с Тепло бесплатно. Включается за 30 секунд 👇',
+                ).format(trial_days=trial_days)
+        except Exception as exc:
+            logger.debug('Funnel newbie text failed, fallback на обычный', error=exc)
+
     # Multi-tariff: show summary of all subscriptions
     if settings.is_multi_tariff_enabled():
         subscriptions_status, tariff_info_block = await _get_multi_tariff_status(user, texts, db)

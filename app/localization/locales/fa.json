@@ -1149,6 +1149,7 @@
   "FUNNEL_SUBSCRIBE_CTA": "💎 خرید اشتراک",
   "FUNNEL_CABINET": "👤 حساب کاربری",
   "FUNNEL_TRIAL_ACTIVATED": "🎉 انجام شد! دوره آزمایشی فعال شد.",
+  "FUNNEL_NEWBIE_MENU_TEXT": "🔥 یک قدم تا اینترنت آزاد.\n\nهنوز اشتراکی ندارید — اما {trial_days} با Teplo رایگان است. در ۳۰ ثانیه فعال می‌شود 👇",
   "MINIAPP_PURCHASE_BREAKDOWN_BASE": "پلن پایه",
   "MINIAPP_PURCHASE_BREAKDOWN_DEVICES": "دستگاه‌ها",
   "MINIAPP_PURCHASE_BREAKDOWN_DISCOUNT_NOTE": "تخفیف: -{amount} ({percent}%)",

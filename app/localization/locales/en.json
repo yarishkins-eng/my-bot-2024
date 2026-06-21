@@ -1127,6 +1127,7 @@
   "FUNNEL_SUBSCRIBE_CTA": "💎 Get a subscription",
   "FUNNEL_CABINET": "👤 My account",
   "FUNNEL_TRIAL_ACTIVATED": "🎉 Done! Your trial period is active.",
+  "FUNNEL_NEWBIE_MENU_TEXT": "🔥 One step away from a free internet.\n\nNo subscription yet — but {trial_days} with Teplo are free. Ready in 30 seconds 👇",
   "MINIAPP_PURCHASE_BREAKDOWN_BASE": "Base plan",
   "MINIAPP_PURCHASE_BREAKDOWN_DEVICES": "Devices",
   "MINIAPP_PURCHASE_BREAKDOWN_DISCOUNT_NOTE": "Discount: -{amount} ({percent}%)",

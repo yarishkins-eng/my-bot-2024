@@ -1066,6 +1066,7 @@
   "FUNNEL_SUBSCRIBE_CTA": "💎 Оформити підписку",
   "FUNNEL_CABINET": "👤 Особистий кабінет",
   "FUNNEL_TRIAL_ACTIVATED": "🎉 Готово! Пробний період активовано.",
+  "FUNNEL_NEWBIE_MENU_TEXT": "🔥 Залишився один крок до вільного інтернету.\n\nПідписки поки немає — але {trial_days} з Тепло безкоштовно. Вмикається за 30 секунд 👇",
   "MINIAPP_PURCHASE_BREAKDOWN_BASE": "Базовий план",
   "MINIAPP_PURCHASE_BREAKDOWN_DEVICES": "Пристрої",
   "MINIAPP_PURCHASE_BREAKDOWN_DISCOUNT_NOTE": "Знижка: -{amount} ({percent}%)",
