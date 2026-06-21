@@ -5933,14 +5933,6 @@ async def confirm_admin_tariff_change(callback: types.CallbackQuery, db_user: Us
         subscription.connected_squads = tariff.allowed_squads or []
         subscription.updated_at = datetime.now(UTC)
 
-        # Смена тарифа админом делает подписку РЕАЛЬНОЙ (не пробной): снимаем флаг «пробный»,
-        # иначе бот/мини-апп показывают «Пробный период» на платном тарифе (показ зависит от is_trial).
-        # ВАЖНО: has_had_paid_subscription НАМЕРЕННО НЕ трогаем — это факт оплаты, а админ выдал тариф
-        # без платежа (иначе исказятся аналитика конверсии и реф-начисления). Повторный триал при этом
-        # невозможен: его блокирует само наличие подписки (User.is_trial_already_used).
-        if subscription.is_trial:
-            subscription.is_trial = False
-
         # Сбрасываем докупленный трафик при смене тарифа
         from sqlalchemy import delete as sql_delete
 
