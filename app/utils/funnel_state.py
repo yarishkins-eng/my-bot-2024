@@ -74,8 +74,16 @@ def get_subscriber_state(user):
         # 'limited' (исчерпан трафик) и СУТОЧНЫЙ тариф (списывается ежедневно, days_left≈0)
         # → активное меню без форс-CTA «Продлить»: продление периода тут не по адресу
         # (для суточного это совпадает с текстом-статусом SUB_STATUS_DAILY_ACTIVE).
-        if status == 'limited' or bool(getattr(sub, 'is_daily_tariff', False)):
+        try:
+            is_daily = bool(getattr(sub, 'is_daily_tariff', False))
+        except Exception:
+            # sub.tariff не выгружен (ленивая загрузка вне greenlet) — считаем не-суточным
+            is_daily = False
+        if status == 'limited' or is_daily:
             return FunnelState.PAID_ACTIVE, sub
+        # Порог «Продлить» (RENEW_THRESHOLD, по умолч. 3) намеренно уже тревожного тона
+        # текста-статуса (тот включается с ≤7 дн.): текст информирует заранее, а кнопку
+        # показываем в зоне реального риска (продление также доступно из «Личного кабинета»).
         threshold = settings.get_subscriber_menu_renew_threshold_days()
         days_left = int(getattr(sub, 'days_left', 0) or 0)
         if days_left <= threshold:
