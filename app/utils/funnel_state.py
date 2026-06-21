@@ -53,10 +53,12 @@ def get_subscriber_state(user):
     """
     if user is None:
         return None, None
+    # Самодостаточные гейты (не полагаемся на проверки вызывающего — функцию могут дёрнуть
+    # и из других мест): мастер-флаг воронки + свой флаг подписчик-меню + cabinet-режим.
+    if not getattr(settings, 'FUNNEL_MENU_ENABLED', False):
+        return None, None
     if not settings.is_funnel_subscriber_menu_enabled():
         return None, None
-    # Самодостаточность: меню по состояниям живёт только в cabinet-режиме (не полагаемся
-    # на cabinet-гейт вызывающего — функцию могут дёрнуть и из других мест).
     if not settings.is_cabinet_mode():
         return None, None
     if settings.is_multi_tariff_enabled():
