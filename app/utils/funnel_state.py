@@ -47,8 +47,9 @@ def get_subscriber_state(user):
     (одна «Моя ссылка» не отражает несколько подписок).
     Тонкости: триал (is_trial) — не наша зона; НЕ-триальную подписку классифицируем
     ПО СТАТУСУ (флаг has_had_paid не требуется — активная/истёкшая платная = подписчик):
-    'disabled' обратимо → обычное меню; 'limited' (исчерпан трафик) → активное меню без
-    форс-CTA «Продлить»; 'active'/'limited' → active/expiring по порогу; 'expired' → expired.
+    'disabled' обратимо → обычное меню; 'expired' → PAID_EXPIRED;
+    'active' обычного тарифа → PAID_ACTIVE/PAID_EXPIRING по порогу дней;
+    'limited' (исчерпан трафик) и СУТОЧНЫЙ тариф → всегда PAID_ACTIVE (без форс-CTA «Продлить»).
     """
     if user is None:
         return None, None
@@ -70,8 +71,10 @@ def get_subscriber_state(user):
     if status == 'expired':
         return FunnelState.PAID_EXPIRED, sub
     if status in ('active', 'limited'):
-        if status == 'limited':
-            # трафик исчерпан, период ещё идёт — продление периода не лечит проблему
+        # 'limited' (исчерпан трафик) и СУТОЧНЫЙ тариф (списывается ежедневно, days_left≈0)
+        # → активное меню без форс-CTA «Продлить»: продление периода тут не по адресу
+        # (для суточного это совпадает с текстом-статусом SUB_STATUS_DAILY_ACTIVE).
+        if status == 'limited' or bool(getattr(sub, 'is_daily_tariff', False)):
             return FunnelState.PAID_ACTIVE, sub
         threshold = settings.get_subscriber_menu_renew_threshold_days()
         days_left = int(getattr(sub, 'days_left', 0) or 0)
