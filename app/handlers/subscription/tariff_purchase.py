@@ -2215,6 +2215,9 @@ async def show_tariff_extend(
 ):
     """Показывает экран продления по текущему тарифу."""
     get_texts(db_user.language)
+    # Фото-безопасно: меню в боте — фото (ENABLE_LOGO_MODE). force_text переводит экран
+    # в текст, дальше шаги продления (edit_text) работают по текстовому сообщению.
+    from app.utils.photo_message import edit_or_answer_photo
 
     if settings.is_multi_tariff_enabled():
         sub_id = None
@@ -2283,12 +2286,16 @@ async def show_tariff_extend(
             return
         keyboard.append([InlineKeyboardButton(text='◀️ Назад', callback_data='back_to_menu')])
 
-        await callback.message.edit_text(
-            '🔄 <b>Выберите тариф для продления</b>\n\n'
-            'Для продления подписки необходимо выбрать тариф.\n'
-            'Подписка будет обновлена с параметрами выбранного тарифа.',
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        await edit_or_answer_photo(
+            callback=callback,
+            caption=(
+                '🔄 <b>Выберите тариф для продления</b>\n\n'
+                'Для продления подписки необходимо выбрать тариф.\n'
+                'Подписка будет обновлена с параметрами выбранного тарифа.'
+            ),
+            keyboard=InlineKeyboardMarkup(inline_keyboard=keyboard),
             parse_mode='HTML',
+            force_text=True,
         )
         await callback.answer()
         return
@@ -2313,12 +2320,16 @@ async def show_tariff_extend(
             keyboard.append([InlineKeyboardButton(text=f'📦 {t.name}', callback_data=f'tariff_select:{t.id}')])
         keyboard.append([InlineKeyboardButton(text='◀️ Назад', callback_data='back_to_menu')])
 
-        await callback.message.edit_text(
-            '🔄 <b>Выберите тариф для продления</b>\n\n'
-            'Для продления подписки необходимо выбрать тариф.\n'
-            'Подписка будет обновлена с параметрами выбранного тарифа.',
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        await edit_or_answer_photo(
+            callback=callback,
+            caption=(
+                '🔄 <b>Выберите тариф для продления</b>\n\n'
+                'Для продления подписки необходимо выбрать тариф.\n'
+                'Подписка будет обновлена с параметрами выбранного тарифа.'
+            ),
+            keyboard=InlineKeyboardMarkup(inline_keyboard=keyboard),
             parse_mode='HTML',
+            force_text=True,
         )
         await callback.answer()
         return
@@ -2341,16 +2352,20 @@ async def show_tariff_extend(
 
     actual_device_limit = subscription.device_limit or tariff.device_limit
 
-    await callback.message.edit_text(
-        f'🔄 <b>Продление подписки</b>{discount_hint}\n\n'
-        f'📦 Тариф: <b>{html.escape(tariff.name)}</b>\n'
-        f'📊 Трафик: {traffic}\n'
-        f'📱 Устройств: {actual_device_limit}\n\n'
-        'Выберите период продления:',
-        reply_markup=get_tariff_extend_keyboard(
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=(
+            f'🔄 <b>Продление подписки</b>{discount_hint}\n\n'
+            f'📦 Тариф: <b>{html.escape(tariff.name)}</b>\n'
+            f'📊 Трафик: {traffic}\n'
+            f'📱 Устройств: {actual_device_limit}\n\n'
+            'Выберите период продления:'
+        ),
+        keyboard=get_tariff_extend_keyboard(
             tariff, db_user.language, db_user=db_user, subscription_device_limit=actual_device_limit
         ),
         parse_mode='HTML',
+        force_text=True,
     )
     await callback.answer()
 

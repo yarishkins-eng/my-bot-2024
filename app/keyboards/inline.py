@@ -77,6 +77,42 @@ def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMar
         rows.append(second_row)
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
+    if state in (FunnelState.PAID_ACTIVE, FunnelState.PAID_EXPIRING, FunnelState.PAID_EXPIRED):
+        # Меню платного подписчика. Кнопки ведут на готовые внутрибот-обработчики
+        # (open_subscription_link / menu_referrals / subscription_extend) — они сделаны
+        # фото-безопасными (edit_or_answer_photo), т.к. главное меню в боте — это фото.
+        rows = []
+        cabinet_url = build_cabinet_url('/')
+        renew_text = texts.t('FUNNEL_RENEW_CTA', '💎 Продлить подписку')
+        link_text = texts.t('FUNNEL_MY_CONNECTION_LINK', '🔗 Моя ссылка для подключения')
+        invite_text = texts.t('FUNNEL_INVITE_FRIEND', '🎁 Привести друга — получить бонус')
+        referral_on = settings.is_referral_program_enabled()
+
+        def _cabinet_button() -> InlineKeyboardButton:
+            cabinet_text = texts.t('FUNNEL_CABINET', '👤 Личный кабинет')
+            if cabinet_url:
+                return InlineKeyboardButton(text=cabinet_text, web_app=types.WebAppInfo(url=cabinet_url))
+            return InlineKeyboardButton(text=cabinet_text, callback_data='menu_subscription')
+
+        if state == FunnelState.PAID_EXPIRED:
+            # Закончилась: акцент на продление. «Моя ссылка» прячем (без активной
+            # подписки сервер не пускает по ней). Рефералку оставляем — на ней зарабатывают.
+            rows.append([InlineKeyboardButton(text=renew_text, callback_data='subscription_extend')])
+            rows.append([_cabinet_button()])
+            if referral_on:
+                rows.append([InlineKeyboardButton(text=invite_text, callback_data='menu_referrals')])
+            return InlineKeyboardMarkup(inline_keyboard=rows)
+
+        # PAID_ACTIVE / PAID_EXPIRING: «Продлить» сверху только когда заканчивается
+        if state == FunnelState.PAID_EXPIRING:
+            rows.append([InlineKeyboardButton(text=renew_text, callback_data='subscription_extend')])
+        rows.append([_cabinet_button()])
+        second_row = [InlineKeyboardButton(text=link_text, callback_data='open_subscription_link')]
+        if referral_on:
+            second_row.append(InlineKeyboardButton(text=invite_text, callback_data='menu_referrals'))
+        rows.append(second_row)
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     return None
 
 

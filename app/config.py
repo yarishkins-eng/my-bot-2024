@@ -912,6 +912,13 @@ class Settings(BaseSettings):
     # Меню по состояниям воронки (новичок/триал) для ОБЫЧНЫХ пользователей (не админ/модератор).
     # Работает только в cabinet-режиме. Аварийный выключатель: меняешь на false → меню возвращается к обычному.
     FUNNEL_MENU_ENABLED: bool = False
+    # Отдельная воронка-меню для ПЛАТНОГО подписчика (3 состояния: активна/заканчивается/закончилась).
+    # Работает поверх FUNNEL_MENU_ENABLED + cabinet-режим. Свой выключатель для независимого отката:
+    # false → платный подписчик снова видит обычное кабинетное меню.
+    FUNNEL_SUBSCRIBER_MENU_ENABLED: bool = False
+    # За сколько дней до конца подписки в меню подписчика появляется кнопка «Продлить».
+    # 0 → берётся из AUTOPAY_WARNING_DAYS (синхронно с пуш-уведомлениями «скоро истекает»).
+    SUBSCRIBER_MENU_RENEW_THRESHOLD_DAYS: int = 0
     # Стиль кнопок Cabinet: primary (синий), success (зелёный), danger (красный), '' (по умолчанию для каждой секции)
     CABINET_BUTTON_STYLE: str = ''
     CONNECT_BUTTON_MODE: str = 'miniapp_subscription'
@@ -1743,6 +1750,24 @@ class Settings(BaseSettings):
             return [3, 1]
         except (ValueError, AttributeError):
             return [3, 1]
+
+    def is_funnel_subscriber_menu_enabled(self) -> bool:
+        return bool(getattr(self, 'FUNNEL_SUBSCRIBER_MENU_ENABLED', False))
+
+    def get_subscriber_menu_renew_threshold_days(self) -> int:
+        """Порог (в днях) появления кнопки «Продлить» в меню подписчика.
+
+        0/пусто → берём максимум из AUTOPAY_WARNING_DAYS, чтобы кнопка в меню и
+        пуш-уведомление «скоро истекает» срабатывали на одном пороге.
+        """
+        try:
+            val = int(getattr(self, 'SUBSCRIBER_MENU_RENEW_THRESHOLD_DAYS', 0) or 0)
+        except (ValueError, TypeError):
+            val = 0
+        if val > 0:
+            return val
+        days = self.get_autopay_warning_days() or [3]
+        return max(days) if days else 3
 
     def is_autopay_enabled_by_default(self) -> bool:
         value = getattr(self, 'DEFAULT_AUTOPAY_ENABLED', True)

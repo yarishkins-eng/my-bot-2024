@@ -349,21 +349,28 @@ async def handle_open_subscription_link(
         )
     )
 
-    await callback.message.edit_text(
-        link_text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        callback_data=f'subscription_connect:{sub_id}'
-                        if settings.is_multi_tariff_enabled()
-                        else 'subscription_connect',
-                    )
-                ],
-                [InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)],
-            ]
-        ),
+    link_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
+                    callback_data=f'subscription_connect:{sub_id}'
+                    if settings.is_multi_tariff_enabled()
+                    else 'subscription_connect',
+                )
+            ],
+            [InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)],
+        ]
+    )
+    # Фото-безопасно: главное меню в боте — это фото (ENABLE_LOGO_MODE), а edit_text по фото
+    # падает. force_text → если сообщение фото, удаляем его и шлём текст со ссылкой.
+    from app.utils.photo_message import edit_or_answer_photo
+
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=link_text,
+        keyboard=link_keyboard,
         parse_mode='HTML',
+        force_text=True,
     )
     await callback.answer()
