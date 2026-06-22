@@ -76,6 +76,17 @@ def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMar
             second_row.append(InlineKeyboardButton(text=cabinet_text, callback_data='menu_subscription'))
         second_row.append(InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs'))
         rows.append(second_row)
+        # Рефералку показываем и триальщику (во всю ширину): попробовал VPN в 1-й день —
+        # на 2-3-й может рекомендовать. «Моя ссылка» триалу НЕ нужна (он подключается через кабинет).
+        if settings.is_referral_program_enabled():
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=texts.t('FUNNEL_INVITE_FRIEND', '🎁 Привести друга — получить бонус'),
+                        callback_data='menu_referrals',
+                    )
+                ]
+            )
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     if state in (FunnelState.PAID_ACTIVE, FunnelState.PAID_EXPIRING, FunnelState.PAID_EXPIRED):
