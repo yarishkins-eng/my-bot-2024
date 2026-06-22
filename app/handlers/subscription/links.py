@@ -261,7 +261,9 @@ async def handle_open_subscription_link(
     if subscription is None:
         return
     subscription_link = get_display_subscription_link(subscription)
-    back_cb = f'sm:{sub_id}' if settings.is_multi_tariff_enabled() else 'menu_subscription'
+    # «Назад» возвращает в ГЛАВНОЕ меню (откуда зашли через меню подписчика), а не на страницу
+    # деталей «Моя подписка» (в кабинет-режиме она иначе не открывается → выглядела «чужой»).
+    back_cb = f'sm:{sub_id}' if settings.is_multi_tariff_enabled() else 'back_to_menu'
 
     if not subscription_link:
         await callback.answer(
@@ -358,16 +360,27 @@ async def handle_open_subscription_link(
         )
     )
 
+    # «Подключиться» — в ОДИН тап на экран подключения мини-аппа (Happ/INCY + QR), без
+    # промежуточного экрана бота. Telegram не открывает happ://-схемы из inline-кнопки —
+    # только через HTTPS-страницу (мини-апп). Fallback (нет URL мини-аппа) — старый callback.
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    _connect_url = build_cabinet_url('/connection')
+    if _connect_url:
+        connect_button = InlineKeyboardButton(
+            text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
+            web_app=types.WebAppInfo(url=_connect_url),
+        )
+    else:
+        connect_button = InlineKeyboardButton(
+            text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
+            callback_data=f'subscription_connect:{sub_id}'
+            if settings.is_multi_tariff_enabled()
+            else 'subscription_connect',
+        )
     link_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                    callback_data=f'subscription_connect:{sub_id}'
-                    if settings.is_multi_tariff_enabled()
-                    else 'subscription_connect',
-                )
-            ],
+            [connect_button],
             [InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)],
         ]
     )
