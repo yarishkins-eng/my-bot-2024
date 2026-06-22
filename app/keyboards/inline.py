@@ -108,14 +108,13 @@ def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMar
         if state == FunnelState.PAID_EXPIRING:
             rows.append([InlineKeyboardButton(text=renew_text, callback_data='subscription_extend')])
         rows.append([_cabinet_button()])
-        second_row = []
+        # Каждая кнопка — отдельным рядом (во всю ширину): длинные подписи «Моя ссылка для
+        # подключения» / «Привести друга — получить бонус» в два столбца обрезались.
         # «Моя ссылка» уважает настройку HIDE_SUBSCRIPTION_LINK: если ссылку прячут — кнопки нет
         if not settings.should_hide_subscription_link():
-            second_row.append(InlineKeyboardButton(text=link_text, callback_data='open_subscription_link'))
+            rows.append([InlineKeyboardButton(text=link_text, callback_data='open_subscription_link')])
         if referral_on:
-            second_row.append(InlineKeyboardButton(text=invite_text, callback_data='menu_referrals'))
-        if second_row:
-            rows.append(second_row)
+            rows.append([InlineKeyboardButton(text=invite_text, callback_data='menu_referrals')])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     return None
