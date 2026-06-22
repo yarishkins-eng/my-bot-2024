@@ -1981,5 +1981,6 @@
   "REFERRAL_LIST_STATS_HEADER": "💎 درآمد: <b>{total}</b> (این ماه {month})",
   "REFERRAL_LIST_ITEM_JOINED_TODAY": "   📅 امروز پیوست",
   "REFERRAL_LIST_ITEM_JOINED_YESTERDAY": "   📅 دیروز پیوست",
-  "REFERRAL_LIST_LEGEND": "💰 — شارژ کرده · ⏳ — هنوز نه"
+  "REFERRAL_LIST_LEGEND": "💰 — شارژ کرده · ⏳ — هنوز نه",
+  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ اشتراک فعال است! این هم منوی تو:"
 }

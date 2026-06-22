@@ -1981,5 +1981,6 @@
   "REFERRAL_LIST_STATS_HEADER": "💎 Earned: <b>{total}</b> (this month {month})",
   "REFERRAL_LIST_ITEM_JOINED_TODAY": "   📅 Joined today",
   "REFERRAL_LIST_ITEM_JOINED_YESTERDAY": "   📅 Joined yesterday",
-  "REFERRAL_LIST_LEGEND": "💰 — topped up · ⏳ — not yet"
+  "REFERRAL_LIST_LEGEND": "💰 — topped up · ⏳ — not yet",
+  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ Subscription active! Here's your menu:"
 }

@@ -1013,6 +1013,11 @@ async def purchase_tariff(
         await db.refresh(user)
         await db.refresh(subscription)
 
+        # Авто-обновление меню подписчика в Telegram (без /start) после активации платной. best-effort.
+        from app.utils.funnel_notify import notify_subscriber_menu
+
+        await notify_subscriber_menu(db, user)
+
         # Yandex.Metrika offline conversion — see /purchase endpoint for context (#558449).
         try:
             from app.services import yandex_offline_conv_service as yandex_conv

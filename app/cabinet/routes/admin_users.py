@@ -1244,6 +1244,11 @@ async def update_user_subscription(
 
         logger.info('Admin created subscription for user', admin_id=admin.id, user_id=user_id)
 
+        # Авто-обновление меню подписчика в Telegram (без /start), best-effort.
+        from app.utils.funnel_notify import notify_subscriber_menu
+
+        await notify_subscriber_menu(db, user)
+
         return UpdateSubscriptionResponse(
             success=True,
             message=f'Subscription created for {days} days',

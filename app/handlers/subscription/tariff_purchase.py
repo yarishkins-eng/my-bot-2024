@@ -1197,6 +1197,14 @@ async def handle_custom_confirm(
 
         await state.clear()
 
+        # Авто-обновление меню подписчика (без /start) после покупки. best-effort.
+        try:
+            from app.utils.funnel_notify import notify_subscriber_menu
+
+            await notify_subscriber_menu(db, db_user)
+        except Exception:
+            pass
+
         traffic_display = format_traffic(traffic_limit)
 
         await callback.message.edit_text(
@@ -1803,6 +1811,14 @@ async def confirm_tariff_purchase(
 
     await state.clear()
 
+    # Авто-обновление меню подписчика в Telegram (без /start) после покупки тарифа. best-effort.
+    try:
+        from app.utils.funnel_notify import notify_subscriber_menu
+
+        await notify_subscriber_menu(db, db_user)
+    except Exception:
+        pass
+
     traffic = format_traffic(tariff.traffic_limit_gb)
 
     await callback.message.edit_text(
@@ -2094,6 +2110,14 @@ async def confirm_daily_tariff_purchase(
         logger.error('Ошибка очистки корзины', error=e)
 
     await state.clear()
+
+    # Авто-обновление меню подписчика (без /start) после покупки суточного. best-effort.
+    try:
+        from app.utils.funnel_notify import notify_subscriber_menu
+
+        await notify_subscriber_menu(db, db_user)
+    except Exception:
+        pass
 
     traffic = format_traffic(tariff.traffic_limit_gb)
 
@@ -2644,6 +2668,14 @@ async def confirm_tariff_extend(
             logger.error('Ошибка очистки корзины', error=e)
 
         await state.clear()
+
+        # Авто-обновление меню подписчика (без /start) после продления. best-effort.
+        try:
+            from app.utils.funnel_notify import notify_subscriber_menu
+
+            await notify_subscriber_menu(db, db_user)
+        except Exception:
+            pass
 
         traffic = format_traffic(tariff.traffic_limit_gb)
 

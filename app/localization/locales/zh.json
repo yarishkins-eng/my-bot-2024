@@ -1981,5 +1981,6 @@
   "REFERRAL_LIST_STATS_HEADER": "💎 已赚取: <b>{total}</b> (本月 {month})",
   "REFERRAL_LIST_ITEM_JOINED_TODAY": "   📅 今天加入",
   "REFERRAL_LIST_ITEM_JOINED_YESTERDAY": "   📅 昨天加入",
-  "REFERRAL_LIST_LEGEND": "💰 — 已充值 · ⏳ — 还没有"
+  "REFERRAL_LIST_LEGEND": "💰 — 已充值 · ⏳ — 还没有",
+  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ 订阅已激活！这是你的菜单："
 }

@@ -337,11 +337,13 @@ async def send_cart_notification_after_topup(
         try_auto_extend_expired_after_topup,
         try_resume_disabled_daily_after_topup,
     )
+    from app.utils.funnel_notify import notify_subscriber_menu  # авто-обновление меню подписчика
 
     # Try to resume DISABLED daily subscription immediately (highest priority)
     try:
         daily_resumed = await try_resume_disabled_daily_after_topup(db, user, bot=bot)
         if daily_resumed:
+            await notify_subscriber_menu(db, user)  # меню подписчика без /start
             return False
     except Exception as daily_error:
         logger.error(
@@ -371,6 +373,7 @@ async def send_cart_notification_after_topup(
         # MAIN_MENU_MODE=cabinet и уводила из миниаппа в полное меню бота.
         try:
             await auto_purchase_saved_cart_after_topup(db, user, bot=bot)
+            await notify_subscriber_menu(db, user)  # меню подписчика без /start (только при успехе)
         except Exception as auto_error:
             logger.error(
                 'Ошибка автоматической покупки подписки для пользователя',
@@ -384,6 +387,7 @@ async def send_cart_notification_after_topup(
     try:
         auto_extended = await try_auto_extend_expired_after_topup(db, user, bot=bot)
         if auto_extended:
+            await notify_subscriber_menu(db, user)  # меню подписчика без /start
             return False
     except Exception as extend_error:
         logger.error(

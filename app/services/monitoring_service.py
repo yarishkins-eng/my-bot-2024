@@ -1734,6 +1734,14 @@ class MonitoringService:
                                     new_expires_at=subscription.end_date,
                                 )
 
+                            # Авто-обновление меню подписчика в Telegram (без /start) после автопродления.
+                            try:
+                                from app.utils.funnel_notify import notify_subscriber_menu
+
+                                await notify_subscriber_menu(db, user)
+                            except Exception:
+                                pass
+
                             processed_count += 1
                             self._notified_users.add(autopay_key)
                             logger.info(

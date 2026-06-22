@@ -1981,5 +1981,6 @@
   "REFERRAL_LIST_STATS_HEADER": "💎 Зароблено: <b>{total}</b> (за місяць {month})",
   "REFERRAL_LIST_ITEM_JOINED_TODAY": "   📅 Прийшов сьогодні",
   "REFERRAL_LIST_ITEM_JOINED_YESTERDAY": "   📅 Прийшов учора",
-  "REFERRAL_LIST_LEGEND": "💰 — поповнював · ⏳ — ще ні"
+  "REFERRAL_LIST_LEGEND": "💰 — поповнював · ⏳ — ще ні",
+  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ Підписка активна! Ось твоє меню:"
 }

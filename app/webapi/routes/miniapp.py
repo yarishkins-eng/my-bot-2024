@@ -5598,6 +5598,11 @@ async def subscription_purchase_endpoint(
 
     await db.refresh(user)
 
+    # Авто-обновление меню подписчика в Telegram (без /start) после активации платной. best-effort.
+    from app.utils.funnel_notify import notify_subscriber_menu
+
+    await notify_subscriber_menu(db, user)
+
     subscription = result.get('subscription')
     transaction = result.get('transaction')
     was_trial_conversion = bool(result.get('was_trial_conversion'))
@@ -6729,6 +6734,11 @@ async def purchase_tariff_endpoint(
         logger.error('Ошибка сохранения корзины тарифа (miniapp)', error=e)
 
     await db.refresh(user)
+
+    # Авто-обновление меню подписчика в Telegram (без /start) после активации платной. best-effort.
+    from app.utils.funnel_notify import notify_subscriber_menu
+
+    await notify_subscriber_menu(db, user)
 
     return MiniAppTariffPurchaseResponse(
         success=True,
