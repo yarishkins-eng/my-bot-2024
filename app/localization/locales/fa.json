@@ -1478,6 +1478,7 @@
   "SUBSCRIPTION_DEVICE_HOW_TO_STEP4": "4. به سرور متصل شوید",
   "SUBSCRIPTION_DEVICE_HOW_TO_TITLE": "💡 <b>نحوه اتصال:</b>",
   "SUBSCRIPTION_DEVICE_LINK_TITLE": "🔗 <b>لینک اشتراک:</b>",
+  "SUBSCRIPTION_MY_LINK_TITLE": "🔗 <b>لینک اتصال شما</b>",
   "SUBSCRIPTION_DEVICE_OTHER_APPS": "📦 <b>سایر اپلیکیشن‌ها:</b> {app_list}",
   "SUBSCRIPTION_DEVICE_OTHER_APPS_HINT": "دکمه «سایر اپلیکیشن‌ها» بزنید.",
   "SUBSCRIPTION_DEVICE_STEP_ADD_TITLE": "<b>مرحله ۲ - افزودن اشتراک:</b>",
@@ -1808,7 +1809,6 @@
   "WEBHOOK_CLOSE_BUTTON": "✖️ بستن",
   "TRAFFIC_WARNING_ALERT": "⚠️ <b>هشدار ترافیک</b>\n\nاستفاده شده: {used:.1f} / {limit} گیگابایت ({percent:.0f}%)\n\nحد ترافیک شما تقریباً تمام شده است.",
   "LOW_BALANCE_ALERT": "⚠️ <b>موجودی کم</b>\n\nموجودی شما: {balance} ₽\nآستانه اطلاع‌رسانی: {threshold} ₽\n\nموجودی خود را شارژ کنید تا تمدید خودکار اشتراک با موفقیت انجام شود.",
-
   "SUBSCRIPTION_REVOKE_BTN": "🔄 صدور مجدد اشتراک",
   "SUBSCRIPTION_REVOKE_TITLE": "⚠️ صدور مجدد اشتراک",
   "SUBSCRIPTION_REVOKE_WARNING": "⚠️ <b>صدور مجدد اشتراک</b>\n\nاین عمل:\n• لینک اتصال جدیدی تولید می‌کند\n• تمام دستگاه‌های متصل را قطع می‌کند\n• لینک قدیمی دیگر کار نخواهد کرد\n\nادامه می‌دهید؟",
@@ -1976,5 +1976,10 @@
   "DEVICE_RENAME_TOO_LONG": "⚠️ نام بیش از حد طولانی است، به {max_len} نویسه کوتاه شد.",
   "AUTOPAY_NOT_AVAILABLE_FOR_DAILY": "پرداخت خودکار برای طرح‌های روزانه در دسترس نیست. کسر مبلغ روزی یک‌بار به‌طور خودکار انجام می‌شود.",
   "AUTOPAY_NOT_AVAILABLE_TRIAL": "پرداخت خودکار برای اشتراک‌های آزمایشی در دسترس نیست.",
-  "AUTOPAY_NOT_AVAILABLE_CLASSIC": "پرداخت خودکار در دسترس نیست. برای تمدید باید یک طرح انتخاب کنید."
+  "AUTOPAY_NOT_AVAILABLE_CLASSIC": "پرداخت خودکار در دسترس نیست. برای تمدید باید یک طرح انتخاب کنید.",
+  "REFERRAL_SHORT_STATS": "📊 دعوت‌شده: {invited} · شارژ کرده: {paid} · درآمد: {total}",
+  "REFERRAL_LIST_STATS_HEADER": "💎 درآمد: <b>{total}</b> (این ماه {month})",
+  "REFERRAL_LIST_ITEM_JOINED_TODAY": "   📅 امروز پیوست",
+  "REFERRAL_LIST_ITEM_JOINED_YESTERDAY": "   📅 دیروز پیوست",
+  "REFERRAL_LIST_LEGEND": "💰 — شارژ کرده · ⏳ — هنوز نه"
 }

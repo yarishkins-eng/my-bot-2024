@@ -2361,18 +2361,13 @@ def get_referral_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMar
     keyboard = [
         [
             InlineKeyboardButton(
-                text=texts.t('CREATE_INVITE_BUTTON', '📝 Создать приглашение'), callback_data='referral_create_invite'
+                text=texts.t('CREATE_INVITE_BUTTON', '📤 Поделиться с другом'), callback_data='referral_create_invite'
             )
         ],
-        [InlineKeyboardButton(text=texts.t('SHOW_QR_BUTTON', '📱 Показать QR код'), callback_data='referral_show_qr')],
+        [InlineKeyboardButton(text=texts.t('SHOW_QR_BUTTON', '📱 Мой QR-код'), callback_data='referral_show_qr')],
         [
             InlineKeyboardButton(
-                text=texts.t('REFERRAL_LIST_BUTTON', '👥 Список рефералов'), callback_data='referral_list'
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=texts.t('REFERRAL_ANALYTICS_BUTTON', '📊 Аналитика'), callback_data='referral_analytics'
+                text=texts.t('REFERRAL_LIST_BUTTON', '👥 Мои приглашённые'), callback_data='referral_list'
             )
         ],
     ]

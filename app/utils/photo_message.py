@@ -163,6 +163,8 @@ async def edit_or_answer_photo(
             logger.debug('Пользователь заблокировал бота, пропускаем')
             return None
         except TelegramBadRequest as error:
+            if 'message is not modified' in str(error).lower():
+                return callback.message
             try:
                 await callback.message.delete()
             except Exception:
@@ -234,6 +236,9 @@ async def edit_or_answer_photo(
             logger.debug('Пользователь заблокировал бота, пропускаем edit_media')
             return None
         except TelegramBadRequest as error:
+            if 'message is not modified' in str(error).lower():
+                # Контент тот же — это не ошибка; не пересоздаём сообщение (иначе «прыгает» вниз чата).
+                return callback.message
             if is_privacy_restricted_error(error):
                 try:
                     await callback.message.delete()
