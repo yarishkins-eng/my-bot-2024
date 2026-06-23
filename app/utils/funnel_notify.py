@@ -112,14 +112,21 @@ async def _delete_remembered_menu(bot, telegram_id: int) -> None:
         logger.debug('_delete_remembered_menu failed', error=exc)
 
 
-async def send_funnel_trial_menu(user) -> None:
+async def send_funnel_trial_menu(user, *, source: str | None = None) -> None:
     """Шлёт пользователю меню активного триала (3 кнопки) после активации.
 
     Дополнительно удаляет предыдущее меню (новичка), если оно было запомнено, и
     запоминает новое — чтобы его, в свою очередь, убрать при следующем переходе.
     Ничего не делает, если funnel-меню выключено, бот не в cabinet-режиме или у
     пользователя нет telegram_id (email-only). Ошибки логируются, но не пробрасываются.
+
+    ``source='cabinet'`` глушит чат-пуш: React-кабинет (cabinet.lilulalu.xyz) сам
+    обновляет экран после активации триала, поэтому меню в чат было бы дублем.
+    Старый Telegram-miniapp (``app/webapi/routes/miniapp.py``) вызывает без source
+    и поведения не меняет. См. РЕВЬЮ-волна1: «триал-пуш из ДВУХ мест; гасим один».
     """
+    if source == 'cabinet':
+        return
     if not (_funnel_enabled() and getattr(user, 'telegram_id', None)):
         return
 

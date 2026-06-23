@@ -37,6 +37,39 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
+async def _resolve_disabled_reason_hint(user: User, subscription) -> str | None:
+    """Best-effort guess at WHY a subscription is disabled.
+
+    The DB doesn't store the disable reason (set in 5+ places: channel
+    unsubscribe, manual admin/broadcast block, panel sync). We only blame the
+    channel when the user actually LEFT a required channel whose settings would
+    disable a subscription of THIS type — see
+    :meth:`ChannelSubscriptionService.should_disable_subscription` (trials need
+    ``CHANNEL_DISABLE_TRIAL_ON_UNSUBSCRIBE`` + per-channel ``disable_trial_on_leave``;
+    paid subs need per-channel ``disable_paid_on_leave``). That keeps a paid sub
+    disabled by an admin block — whose owner merely isn't in a trial-only channel —
+    from being wrongly told to rejoin the channel. Returns ``'channel'`` or ``None``
+    (``None`` → the screen shows a neutral support message). Reads the cached channel
+    service (Redis/DB) — no Telegram API call — and NEVER raises.
+    """
+    try:
+        telegram_id = getattr(user, 'telegram_id', None)
+        if not telegram_id:
+            return None
+        from app.services.channel_subscription_service import ChannelSubscriptionService
+
+        unsubscribed = await ChannelSubscriptionService().get_unsubscribed_channels(telegram_id)
+        if not unsubscribed:
+            return None
+        is_trial = bool(getattr(subscription, 'is_trial', False))
+        if any(ChannelSubscriptionService.should_disable_subscription(ch, is_trial) for ch in unsubscribed):
+            return 'channel'
+        return None
+    except Exception as exc:  # best-effort hint — must never break the status response
+        logger.debug('disabled_reason_hint resolution failed (non-fatal)', error=str(exc)[:200])
+        return None
+
+
 @router.get('/info', response_model=SubscriptionStatusResponse)
 async def get_subscription(
     user: User = Depends(get_current_cabinet_user),
@@ -111,8 +144,19 @@ async def get_subscription(
             }
         )
 
+    # Best-effort "why disabled" hint, computed only when actually disabled (rare)
+    # to avoid the cached channel lookup on every healthy status fetch.
+    disabled_reason_hint = None
+    if subscription.actual_status == 'disabled':
+        disabled_reason_hint = await _resolve_disabled_reason_hint(fresh_user, subscription)
+
     subscription_data = _subscription_to_response(
-        subscription, servers, tariff_name, traffic_purchases_data, user=fresh_user
+        subscription,
+        servers,
+        tariff_name,
+        traffic_purchases_data,
+        user=fresh_user,
+        disabled_reason_hint=disabled_reason_hint,
     )
     return SubscriptionStatusResponse(has_subscription=True, subscription=subscription_data)
 

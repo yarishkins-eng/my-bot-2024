@@ -58,6 +58,19 @@ class SubscriptionData(BaseModel):
     tariff_id: int | None = None
     tariff_name: str | None = None
     traffic_reset_mode: str | None = None
+    # ---- Redesigned-cabinet fields (Чат 1). Additive: the old frontend ignores
+    # them; the new screen reads them with safe defaults so it can hide buttons
+    # up-front instead of reacting to errors. ----
+    # Device / traffic top-up gates: hide the "докупить" buttons when unavailable.
+    # `device_addon_price_kopeks` is the effective per-device price (0 = unavailable).
+    can_topup_devices: bool = False
+    device_addon_price_kopeks: int = 0
+    can_topup_traffic: bool = False
+    # Manual admin purchase block — hide purchase/renew CTAs before a 403.
+    restriction_subscription: bool = False
+    # Best-effort guess at WHY a subscription is disabled ('channel' | None). The
+    # DB doesn't store the exact reason; None → screen shows a neutral support msg.
+    disabled_reason_hint: str | None = None
 
     class Config:
         from_attributes = True
