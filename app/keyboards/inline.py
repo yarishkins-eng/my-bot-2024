@@ -769,7 +769,7 @@ def get_main_menu_keyboard(
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                     )
                 ]
             )
@@ -1263,7 +1263,7 @@ def get_subscription_keyboard(
                         [
                             InlineKeyboardButton(
                                 text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                                web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                                web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                             )
                         ]
                     )
@@ -1303,7 +1303,7 @@ def get_subscription_keyboard(
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                     )
                 ]
             )

@@ -131,7 +131,7 @@ async def handle_connect_subscription(
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                     )
                 ],
                 [InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)],
