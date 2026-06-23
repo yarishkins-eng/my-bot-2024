@@ -1344,7 +1344,7 @@
   "REFERRAL_INVITE_TITLE": "🎉 Join the VPN service!",
   "REFERRAL_LINK_CAPTION": "🔗 Your referral link:\n{link}",
   "REFERRAL_LINK_TITLE": "🔗 <b>Your referral link:</b>",
-  "REFERRAL_BOT_LINK_TITLE": "🔗 <b>Your link</b> (tap to copy):",
+  "REFERRAL_BOT_LINK_TITLE": "🔗 <b>Your invite link</b> (tap to copy):",
   "REFERRAL_CABINET_LINK_TITLE": "🌐 <b>Cabinet link:</b>",
   "REFERRAL_QR_BOT_LINK": "📱 Show your friend this QR — they point their camera and land on your link.\nHandy when you can't send the link.\n\n🔗 {link}",
   "REFERRAL_QR_CABINET_LINK": "🌐 Cabinet link:\n{link}",

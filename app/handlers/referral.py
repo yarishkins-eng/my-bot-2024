@@ -89,7 +89,7 @@ async def show_referral_info(callback: types.CallbackQuery, db_user: User, db: A
 
     # Ссылка (нажми — копируется), в <code> (не экранируем всю строку — #634720)
     referral_text += (
-        texts.t('REFERRAL_BOT_LINK_TITLE', '🔗 <b>Твоя ссылка</b> (нажми — скопируется):')
+        texts.t('REFERRAL_BOT_LINK_TITLE', '🔗 <b>Твоя ссылка для друга</b> (нажми — скопируется):')
         + f'\n<code>{html_escape(bot_referral_link)}</code>\n\n'
     )
 

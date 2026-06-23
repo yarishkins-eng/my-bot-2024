@@ -1366,7 +1366,7 @@
   "REFERRAL_INVITE_TITLE": "🎉 Присоединяйся к VPN сервису!",
   "REFERRAL_LINK_CAPTION": "🔗 Ваша реферальная ссылка:\n{link}",
   "REFERRAL_LINK_TITLE": "🔗 <b>Ваша реферальная ссылка:</b>",
-  "REFERRAL_BOT_LINK_TITLE": "🔗 <b>Твоя ссылка</b> (нажми — скопируется):",
+  "REFERRAL_BOT_LINK_TITLE": "🔗 <b>Твоя ссылка для друга</b> (нажми — скопируется):",
   "REFERRAL_CABINET_LINK_TITLE": "🌐 <b>Ссылка на кабинет:</b>",
   "REFERRAL_QR_BOT_LINK": "📱 Покажи другу этот QR — он наведёт камеру и попадёт к тебе по ссылке.\nУдобно, когда переслать ссылку не получается.\n\n🔗 {link}",
   "REFERRAL_QR_CABINET_LINK": "🌐 Ссылка на кабинет:\n{link}",
