@@ -72,6 +72,15 @@ def get_subscriber_state(user):
 
     status = (getattr(sub, 'actual_status', '') or '').lower()
 
+    # Grace «бонус 2 дня»: VPN ещё жив, хотя в БД status=EXPIRED (намеренно — чтобы
+    # автосписание после пополнения работало). Меню — как у ЗАКАНЧИВАЮЩЕЙСЯ платной
+    # (Продлить + «Моя ссылка»), а НЕ как у истёкшей (где «Моя ссылка» спрятана).
+    # Ленивый импорт: funnel_state — фундаментальный модуль, не тянем grace на загрузке.
+    from app.utils.grace import is_in_grace
+
+    if is_in_grace(sub):
+        return FunnelState.PAID_EXPIRING, sub
+
     if status == 'disabled':
         return None, sub
     if status == 'expired':

@@ -1551,6 +1551,7 @@
   "SUB_STATUS_ACTIVE_TOMORROW": "💎 Активна\n⚠️ истекает завтра!",
   "SUB_STATUS_DAILY_ACTIVE": "💎 Активна",
   "SUB_STATUS_EXPIRED": "🔴 Истекла\n📅 {end_date}",
+  "SUB_STATUS_GRACE": "🎁 Бонусные дни\n⏳ VPN активен до {date}",
   "SUB_STATUS_TRIAL_EXPIRED": "⛔ Ваш пробный период закончился\nОформите подписку, чтобы вернуть доступ.",
   "TRIAL_EXPIRED_DISCOUNT": "🎁 <b>Персональная скидка {percent}%</b>\n\nВаш пробный период закончился. Оформите первую подписку со скидкой — предложение действует до {expires_at}.",
   "SUB_STATUS_DISABLED": "⚫ Отключена",

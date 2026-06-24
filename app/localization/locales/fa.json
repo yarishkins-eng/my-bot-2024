@@ -1551,6 +1551,7 @@
   "SUB_STATUS_ACTIVE_TOMORROW": "💎 فعال\n⚠️ فردا منقضی می‌شود!",
   "SUB_STATUS_DAILY_ACTIVE": "💎 فعال",
   "SUB_STATUS_EXPIRED": "🔴 منقضی شده\n📅 {end_date}",
+  "SUB_STATUS_GRACE": "🎁 روزهای جایزه\n⏳ VPN فعال تا {date}",
   "SUB_STATUS_TRIAL_EXPIRED": "⛔ دوره آزمایشی شما به پایان رسید\nبرای بازگرداندن دسترسی اشتراک تهیه کنید.",
   "TRIAL_EXPIRED_DISCOUNT": "🎁 <b>تخفیف شخصی {percent}٪</b>\n\nدوره آزمایشی شما به پایان رسید. اولین اشتراک خود را با تخفیف تهیه کنید — این پیشنهاد تا {expires_at} معتبر است.",
   "SUB_STATUS_DISABLED": "🚫 غیرفعال",

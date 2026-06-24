@@ -36,6 +36,7 @@ from app.services.subscription_checkout_service import (
 from app.services.support_settings_service import SupportSettingsService
 from app.services.user_cart_service import user_cart_service
 from app.utils.display_mode import is_visible_in_bot
+from app.utils.grace import is_in_grace
 from app.utils.photo_message import edit_or_answer_photo
 from app.utils.pricing_utils import format_period_description
 from app.utils.promo_offer import (
@@ -1284,6 +1285,17 @@ def _get_subscription_status(user: User, texts, is_daily_tariff: bool = False) -
 
     if subscription.end_date and subscription.end_date > current_time:
         days_left = (subscription.end_date - current_time).days
+
+    # Grace «бонус 2 дня»: VPN ещё жив, в БД status=EXPIRED — показываем бонус, НЕ «Истекла».
+    # Согласовано с экраном кабинета (там жёлтый баннер «бонус 2 дня») и с клавиатурой
+    # (get_subscriber_state отдаёт grace как PAID_EXPIRING). Не зависит от FUNNEL_MENU_ENABLED:
+    # факт «VPN живёт ещё 2 дня» истинен независимо от воронки.
+    if is_in_grace(subscription):
+        grace_until_text = format_local_datetime(getattr(subscription, 'grace_until', None), '%d.%m.%Y')
+        return texts.t(
+            'SUB_STATUS_GRACE',
+            '🎁 Бонусные дни\n⏳ VPN активен до {date}',
+        ).format(date=grace_until_text or '—')
 
     # Funnel: истёкший триал (платной никогда не было) — отдельный понятный баннер
     # вместо общего «🔴 Истекла». Только под флагом и в cabinet-режиме.
