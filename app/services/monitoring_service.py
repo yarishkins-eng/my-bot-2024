@@ -629,7 +629,7 @@ class MonitoringService:
             from app.cabinet.routes.websocket import notify_user_subscription_grace_started
 
             await notify_user_subscription_grace_started(subscription.user_id)
-        except Exception as ws_error:  # noqa: BLE001
+        except Exception as ws_error:
             logger.debug('grace WS-сигнал кабинету не отправлен (не критично)', error=ws_error)
 
         if notify and user and self.bot:
