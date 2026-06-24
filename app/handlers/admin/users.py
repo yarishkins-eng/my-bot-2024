@@ -3360,6 +3360,14 @@ async def confirm_subscription_reset(callback: types.CallbackQuery, db_user: Use
 
     success = await _reset_user_subscription(db, user_id, db_user.id, subscription_id=subscription_id)
 
+    if success:
+        # Доступ снят → убираем устаревшее funnel-меню из чата пользователя (best-effort).
+        from app.utils.funnel_notify import clear_funnel_menu
+
+        _target = await get_user_by_id(db, user_id)
+        if _target is not None:
+            await clear_funnel_menu(_target)
+
     message = (
         '✅ Подписка обнулена. Пользователь и его тикеты сохранены.' if success else '❌ Ошибка обнуления подписки'
     )

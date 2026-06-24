@@ -89,3 +89,38 @@ async def test_no_send_when_no_telegram_id(monkeypatch: pytest.MonkeyPatch) -> N
     await funnel_notify.send_funnel_trial_menu(user)
 
     assert recorder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_clear_funnel_menu_deletes_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Потеря доступа (обнуление): устаревшее меню удаляется из чата."""
+    recorder = _wire(monkeypatch)
+    deleted = {}
+
+    async def _spy_delete(bot, telegram_id):
+        deleted['telegram_id'] = telegram_id
+
+    monkeypatch.setattr(funnel_notify, '_delete_remembered_menu', _spy_delete)
+    user = SimpleNamespace(telegram_id=123, language='ru')
+
+    await funnel_notify.clear_funnel_menu(user)
+
+    assert deleted.get('telegram_id') == 123
+    assert recorder.calls == 1  # бот создан, чтобы удалить сообщение
+
+
+@pytest.mark.asyncio
+async def test_clear_funnel_menu_noop_when_funnel_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorder = _wire(monkeypatch, funnel_enabled=False)
+    called = {'delete': False}
+
+    async def _spy_delete(bot, telegram_id):
+        called['delete'] = True
+
+    monkeypatch.setattr(funnel_notify, '_delete_remembered_menu', _spy_delete)
+    user = SimpleNamespace(telegram_id=123, language='ru')
+
+    await funnel_notify.clear_funnel_menu(user)
+
+    assert called['delete'] is False
+    assert recorder.calls == 0

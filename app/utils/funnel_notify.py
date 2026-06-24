@@ -112,6 +112,30 @@ async def _delete_remembered_menu(bot, telegram_id: int) -> None:
         logger.debug('_delete_remembered_menu failed', error=exc)
 
 
+async def clear_funnel_menu(user) -> None:
+    """Убирает устаревшее funnel-меню из чата при ПОТЕРЕ доступа (обнуление подписки).
+
+    Зеркало к send_funnel_*: там при ПОЛУЧЕНИИ доступа шлём новое меню и удаляем старое.
+    Здесь пользователь доступ потерял — старое меню подписчика/триала стало мусором
+    (неверные «Моя ссылка»/«Продлить»). Навязчиво слать меню новичка не нужно — корректное
+    соберётся при следующем /start; просто удаляем устаревшее сообщение. Best-effort:
+    под флагом FUNNEL_MENU_ENABLED, только telegram-юзеры, ошибки подавляются.
+    """
+    telegram_id = getattr(user, 'telegram_id', None)
+    if not (_funnel_enabled() and telegram_id):
+        return
+    try:
+        from app.bot_factory import create_bot
+
+        bot = create_bot()
+        try:
+            await _delete_remembered_menu(bot, telegram_id)
+        finally:
+            await bot.session.close()
+    except Exception as exc:  # best-effort — не мешаем сбросу подписки
+        logger.debug('clear_funnel_menu failed', error=exc)
+
+
 async def send_funnel_trial_menu(user) -> None:
     """Шлёт пользователю меню активного триала (3 кнопки) после активации.
 

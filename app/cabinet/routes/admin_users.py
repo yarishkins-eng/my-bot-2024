@@ -1510,6 +1510,11 @@ async def update_user_subscription(
             panel_disabled=result.get('panel_disabled'),
         )
 
+        # Доступ снят → убираем устаревшее funnel-меню из чата пользователя (best-effort).
+        from app.utils.funnel_notify import clear_funnel_menu
+
+        await clear_funnel_menu(user)
+
         return UpdateSubscriptionResponse(
             success=True,
             message='Subscription reset',
@@ -2632,6 +2637,12 @@ async def reset_user_trial(
     user.updated_at = datetime.now(UTC)
 
     await db.commit()
+
+    if subscription_deleted:
+        # Триал снесён → убираем устаревшее funnel-меню из чата (best-effort).
+        from app.utils.funnel_notify import clear_funnel_menu
+
+        await clear_funnel_menu(user)
 
     reason_text = f' (reason: {request.reason})' if request.reason else ''
     logger.info('Admin reset trial for user', admin_id=admin.id, user_id=user_id, reason_text=reason_text)
