@@ -85,10 +85,15 @@ class PaymentCommonMixin:
                     error=error,
                 )
 
-        # Создаем основную кнопку: если есть активная подписка - продлить, иначе купить
+        # Создаем основную кнопку: если есть активная подписка - продлить, иначе купить.
+        # cabinet_path задан явно на экран покупки/продления (`/subscription/purchase`):
+        # этот экран корректен в любом состоянии (для активной подписки покажет «Продлить»),
+        # иначе после пополнения юзер с активной подпиской и запасом дней попал бы на Главную,
+        # где продающая кнопка скрыта по состоянию (объединение «Главная + Подписка»).
         first_button = build_miniapp_or_callback_button(
             text=(texts.MENU_EXTEND_SUBSCRIPTION if has_active_subscription else texts.MENU_BUY_SUBSCRIPTION),
             callback_data=('subscription_extend' if has_active_subscription else 'menu_buy'),
+            cabinet_path='/subscription/purchase',
         )
 
         keyboard_rows: list[list[InlineKeyboardButton]] = [

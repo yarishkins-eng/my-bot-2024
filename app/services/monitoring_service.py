@@ -2322,7 +2322,7 @@ class MonitoringService:
                         build_miniapp_or_callback_button(
                             text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
                             callback_data='menu_buy',
-                            cabinet_path='/subscription',
+                            cabinet_path='/subscription/purchase',
                         )
                     ],
                 ]
