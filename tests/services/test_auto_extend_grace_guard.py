@@ -116,10 +116,12 @@ async def test_try_auto_extend_skips_during_grace_multi_tariff(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_try_auto_extend_not_blocked_when_grace_window_already_closed(monkeypatch) -> None:
-    """Control: once the bonus window has passed (grace_until in the past), the grace
-    guard must NOT trip — the sub flows on to the normal path. Here the target tariff is
-    inactive, so it stops at the *inactive-tariff* guard (also returns False) — proving the
-    grace guard let it through rather than being what stopped it."""
+    """Control: once the bonus window has passed (grace_until in the past), the grace guard
+    must NOT trip — is_in_grace() returns False, so the sub flows on down the normal path
+    (here it stops harmlessly at the inactive-tariff guard). NOTE: this control test on its
+    own cannot isolate the grace guard — it would also pass if the guard were deleted. The
+    guard itself is pinned by tests 1 and 2 (active tariff + OPEN window → a charge would
+    happen without it). This case only confirms a *past* window does not wrongly block."""
     from app.services import subscription_auto_purchase_service as svc
 
     now = datetime.now(UTC)
