@@ -76,7 +76,9 @@ def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMar
             second_row.append(InlineKeyboardButton(text=cabinet_text, web_app=types.WebAppInfo(url=cabinet_url)))
         else:
             second_row.append(InlineKeyboardButton(text=cabinet_text, callback_data='menu_subscription'))
-        second_row.append(InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs'))
+        second_row.append(
+            InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs')
+        )
         rows.append(second_row)
         # Рефералку показываем и триальщику (во всю ширину): попробовал VPN в 1-й день —
         # на 2-3-й может рекомендовать. «Моя ссылка» триалу НЕ нужна (он подключается через кабинет).

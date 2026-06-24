@@ -63,9 +63,7 @@ def test_get_subscription_status_grace_shows_bonus_not_expired():
 def test_get_subscription_status_truly_expired_still_says_expired():
     """Регресс: по-настоящему истёкшая (НЕ в grace) платная — по-прежнему «Истекла»."""
     texts = DummyTexts()
-    user = _build_user_with_subscription(
-        actual_status='expired', is_trial=False, days_left=-3, in_grace=False
-    )
+    user = _build_user_with_subscription(actual_status='expired', is_trial=False, days_left=-3, in_grace=False)
 
     status_text = _get_subscription_status(user, texts)
 

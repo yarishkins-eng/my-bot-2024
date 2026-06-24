@@ -174,7 +174,8 @@ async def show_detailed_referral_list(callback: types.CallbackQuery, db_user: Us
 
     # Устаревшая кнопка «стр.N»: если список сократился и страница пуста — вернуться на первую.
     if not referrals_data['referrals'] and page > 1:
-        return await show_detailed_referral_list(callback, db_user, db, 1)
+        await show_detailed_referral_list(callback, db_user, db, 1)
+        return
 
     if not referrals_data['referrals']:
         await edit_or_answer_photo(
@@ -395,9 +396,7 @@ async def create_invite_message(callback: types.CallbackQuery, db_user: User):
 
     invite_template = texts.t(
         'REFERRAL_INVITE_TEXT',
-        '🎉 Подключайся к ВПН Тёпло по моей ссылке!{bonus_block}\n\n'
-        '👇 Жми:\n'
-        '{link}{cabinet_block}',
+        '🎉 Подключайся к ВПН Тёпло по моей ссылке!{bonus_block}\n\n👇 Жми:\n{link}{cabinet_block}',
     )
     invite_html = html_escape(invite_template).format(
         bonus_block=html_escape(bonus_block),

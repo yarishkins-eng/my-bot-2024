@@ -111,12 +111,8 @@ async def test_grace_disabled_flag_falls_back_to_normal_expiry(monkeypatch):
     )
     paid_user = SimpleNamespace(id=11, telegram_id=111, has_had_paid_subscription=True)
 
-    monkeypatch.setattr(
-        'app.services.monitoring_service.get_expired_subscriptions', AsyncMock(return_value=[eligible])
-    )
-    monkeypatch.setattr(
-        'app.services.monitoring_service.get_user_by_id', AsyncMock(return_value=paid_user)
-    )
+    monkeypatch.setattr('app.services.monitoring_service.get_expired_subscriptions', AsyncMock(return_value=[eligible]))
+    monkeypatch.setattr('app.services.monitoring_service.get_user_by_id', AsyncMock(return_value=paid_user))
     monkeypatch.setattr('app.database.crud.subscription.is_recently_updated_by_webhook', lambda _s: False)
     expire_spy = AsyncMock(side_effect=lambda _db, s: s)
     monkeypatch.setattr('app.database.crud.subscription.expire_subscription', expire_spy)

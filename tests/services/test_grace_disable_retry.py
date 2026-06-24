@@ -36,9 +36,7 @@ def _grace_ended_sub():
 @pytest.mark.asyncio
 async def test_grace_disable_failure_enqueues_retry(monkeypatch):
     sub, user = _grace_ended_sub()
-    monkeypatch.setattr(
-        'app.services.monitoring_service.get_subscriptions_grace_ended', AsyncMock(return_value=[sub])
-    )
+    monkeypatch.setattr('app.services.monitoring_service.get_subscriptions_grace_ended', AsyncMock(return_value=[sub]))
     monkeypatch.setattr('app.services.monitoring_service.get_user_by_id', AsyncMock(return_value=user))
     # Панель НЕ приняла disable.
     monkeypatch.setattr(monitoring_service.subscription_service, 'push_panel_state', AsyncMock(return_value=False))
@@ -60,9 +58,7 @@ async def test_grace_disable_failure_enqueues_retry(monkeypatch):
 @pytest.mark.asyncio
 async def test_grace_disable_success_no_retry(monkeypatch):
     sub, user = _grace_ended_sub()
-    monkeypatch.setattr(
-        'app.services.monitoring_service.get_subscriptions_grace_ended', AsyncMock(return_value=[sub])
-    )
+    monkeypatch.setattr('app.services.monitoring_service.get_subscriptions_grace_ended', AsyncMock(return_value=[sub]))
     monkeypatch.setattr('app.services.monitoring_service.get_user_by_id', AsyncMock(return_value=user))
     # Панель приняла disable.
     monkeypatch.setattr(monitoring_service.subscription_service, 'push_panel_state', AsyncMock(return_value=True))

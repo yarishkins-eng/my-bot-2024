@@ -599,9 +599,7 @@ class MonitoringService:
             return False
 
         # Панель — источник правды по живости VPN. Двигаем expireAt ВПЕРЁД (статус ACTIVE).
-        ok = await self.subscription_service.push_panel_state(
-            db, subscription, active=True, expire_at=grace_until
-        )
+        ok = await self.subscription_service.push_panel_state(db, subscription, active=True, expire_at=grace_until)
         if not ok:
             logger.warning(
                 '🎁 Grace не включён: панель недоступна — обычное истечение',
@@ -727,10 +725,7 @@ class MonitoringService:
         cabinet_url = settings.get_cabinet_link()
         if not cabinet_url:
             return ''
-        return (
-            '\n\n🌐 Продлить можно и в браузере (работает без VPN, если домен доступен):\n'
-            f'{cabinet_url}'
-        )
+        return f'\n\n🌐 Продлить можно и в браузере (работает без VPN, если домен доступен):\n{cabinet_url}'
 
     async def update_remnawave_user(self, db: AsyncSession, subscription: Subscription) -> RemnaWaveUser | None:
         try:

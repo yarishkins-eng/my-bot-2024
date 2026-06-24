@@ -560,7 +560,9 @@ class SubscriptionService:
                 remnawave_uuid = user.remnawave_uuid
             if not remnawave_uuid:
                 logger.warning(
-                    'push_panel_state: нет remnawave_uuid', subscription_id=subscription.id, user_id=subscription.user_id
+                    'push_panel_state: нет remnawave_uuid',
+                    subscription_id=subscription.id,
+                    user_id=subscription.user_id,
                 )
                 return False
 

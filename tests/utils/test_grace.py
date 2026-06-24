@@ -114,9 +114,7 @@ def test_is_in_grace_false_without_flag():
 def test_panel_active_subscription_keeps_real_end_date():
     now = datetime.now(UTC)
     end = now + timedelta(days=5)
-    sub = SimpleNamespace(
-        status=SubscriptionStatus.ACTIVE.value, end_date=end, in_grace=False, grace_until=None
-    )
+    sub = SimpleNamespace(status=SubscriptionStatus.ACTIVE.value, end_date=end, in_grace=False, grace_until=None)
     active, expire_at = resolve_panel_active_and_expiry(sub, now)
     assert active is True
     assert expire_at == end
@@ -125,9 +123,7 @@ def test_panel_active_subscription_keeps_real_end_date():
 def test_panel_expired_non_grace_is_disabled():
     now = datetime.now(UTC)
     end = now - timedelta(days=1)
-    sub = SimpleNamespace(
-        status=SubscriptionStatus.EXPIRED.value, end_date=end, in_grace=False, grace_until=None
-    )
+    sub = SimpleNamespace(status=SubscriptionStatus.EXPIRED.value, end_date=end, in_grace=False, grace_until=None)
     active, expire_at = resolve_panel_active_and_expiry(sub, now)
     assert active is False
     # disabled users get a near-future expire (existing behaviour: max(end, now+1min))
@@ -140,9 +136,7 @@ def test_panel_grace_keeps_vpn_alive_until_grace_until():
     now = datetime.now(UTC)
     end = now - timedelta(hours=2)
     grace_until = now + timedelta(days=2)
-    sub = SimpleNamespace(
-        status=SubscriptionStatus.EXPIRED.value, end_date=end, in_grace=True, grace_until=grace_until
-    )
+    sub = SimpleNamespace(status=SubscriptionStatus.EXPIRED.value, end_date=end, in_grace=True, grace_until=grace_until)
     active, expire_at = resolve_panel_active_and_expiry(sub, now)
     assert active is True
     assert expire_at == grace_until

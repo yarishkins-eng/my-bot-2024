@@ -2429,10 +2429,14 @@ class RemnaWaveService:
                                     is_subscription_active = True
                                     expire_at = self._safe_expire_at_for_panel(sub.grace_until)
                                 else:
-                                    is_subscription_active = sub.status in (
-                                        SubscriptionStatus.ACTIVE.value,
-                                        SubscriptionStatus.TRIAL.value,
-                                    ) and sub.end_date > _now
+                                    is_subscription_active = (
+                                        sub.status
+                                        in (
+                                            SubscriptionStatus.ACTIVE.value,
+                                            SubscriptionStatus.TRIAL.value,
+                                        )
+                                        and sub.end_date > _now
+                                    )
                                     expire_at = self._safe_expire_at_for_panel(sub.end_date)
                                 status = UserStatus.ACTIVE if is_subscription_active else UserStatus.DISABLED
 
