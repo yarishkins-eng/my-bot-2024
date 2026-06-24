@@ -638,9 +638,28 @@ class MonitoringService:
                 _tariff_name = subscription.tariff.name if getattr(subscription, 'tariff', None) else None
 
                 # Гасим VPN явно (на случай если панель почему-то ещё активна).
-                await self.subscription_service.push_panel_state(
+                panel_disabled = await self.subscription_service.push_panel_state(
                     db, subscription, active=False, expire_at=datetime.now(UTC) + timedelta(minutes=1)
                 )
+                # Если панель не приняла disable — в очередь ретраев (action='update'
+                # перечитает grace-aware состояние и догасит). БД всё равно финализируем
+                # ниже: повторно в grace не войдём (in_grace=False), а панель и так истечёт
+                # по ранее выставленному expireAt=grace_until. Best-effort — не ломает цикл.
+                if not panel_disabled:
+                    try:
+                        from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+                        remnawave_retry_queue.enqueue(
+                            subscription_id=subscription.id,
+                            user_id=subscription.user_id,
+                            action='update',
+                        )
+                        logger.warning(
+                            'Grace-disable панели не прошёл — поставлен в очередь ретраев',
+                            subscription_id=subscription.id,
+                        )
+                    except Exception as enqueue_err:
+                        logger.error('Не удалось поставить grace-disable в ретрай', error=enqueue_err)
 
                 subscription.in_grace = False
                 subscription.grace_until = None
