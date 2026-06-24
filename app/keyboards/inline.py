@@ -58,9 +58,11 @@ def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMar
         # чтобы вернуть доступ. Отличается только баннер-текст над меню.
         rows = []
 
-        # CTA «Оформить подписку» — во всю ширину, открывает экран покупки в мини-аппе
+        # CTA «Оформить подписку» — во всю ширину, открывает экран ПОКУПКИ тарифов в мини-аппе.
+        # Именно /subscription/purchase (не /subscription → Главная): иначе этот CTA вёл бы в то же
+        # место, что и «Личный кабинет» ниже (оба на Главную), и противоречил бы своему описанию.
         cta_text = texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку')
-        subscribe_url = build_cabinet_url('/subscription')
+        subscribe_url = build_cabinet_url('/subscription/purchase')
         if subscribe_url:
             rows.append([InlineKeyboardButton(text=cta_text, web_app=types.WebAppInfo(url=subscribe_url))])
         else:
