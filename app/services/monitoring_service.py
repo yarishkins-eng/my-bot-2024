@@ -621,6 +621,17 @@ class MonitoringService:
             grace_until=grace_until,
         )
 
+        # Кабинет, открытый в момент истечения, должен сразу показать «бонус» вместо
+        # устаревшего состояния. Шлём тихий WS-сигнал «перечитай подписку» (НЕ
+        # subscription.expired — на него фронт рисует пугающий тост «истекла»).
+        # Best-effort: сбой WS не должен мешать grace.
+        try:
+            from app.cabinet.routes.websocket import notify_user_subscription_grace_started
+
+            await notify_user_subscription_grace_started(subscription.user_id)
+        except Exception as ws_error:  # noqa: BLE001
+            logger.debug('grace WS-сигнал кабинету не отправлен (не критично)', error=ws_error)
+
         if notify and user and self.bot:
             await self._send_grace_started_notification(user, subscription, grace_until, tariff_name=tariff_name)
         return True
