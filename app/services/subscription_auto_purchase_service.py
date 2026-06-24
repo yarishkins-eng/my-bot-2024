@@ -2178,6 +2178,7 @@ async def try_auto_extend_expired_after_topup(
     """
     from app.cabinet.routes.websocket import notify_user_subscription_renewed
     from app.database.crud.subscription import get_subscription_by_user_id
+    from app.utils.grace import is_in_grace
 
     if not user or not getattr(user, 'id', None):
         return False
@@ -2206,6 +2207,19 @@ async def try_auto_extend_expired_after_topup(
     if subscription.status != SubscriptionStatus.EXPIRED.value:
         return False
     if subscription.is_trial is not False:
+        return False
+    # Во время «бонуса 2 дня» (grace) НЕ списываем за продление. Окно бонуса — это
+    # подаренные дни, чтобы человек сам решил продлевать; модуль grace прямо декларирует
+    # «autopay simply won't charge». Регулярный автоплатёж grace и так не трогает (фильтр
+    # status=ACTIVE), но ЭТОТ путь (продление после пополнения баланса) срабатывал на
+    # status=EXPIRED+in_grace и молча списывал. Как только бонус кончится (in_grace=False) —
+    # путь снова работает штатно.
+    if is_in_grace(subscription):
+        logger.info(
+            '🎁 Автопродление expired: пропуск — идёт grace (бонус), не списываем',
+            format_user_id=_format_user_id(user),
+            subscription_id=getattr(subscription, 'id', None),
+        )
         return False
     # #629889-смежный: ПОВЕРХ is_trial-гарда требуем, что пользователь РЕАЛЬНО платил.
     # Бесплатная админ-выданная подписка (is_trial=False, autopay=True, но не плативший)
