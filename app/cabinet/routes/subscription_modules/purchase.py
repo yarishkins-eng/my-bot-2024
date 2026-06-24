@@ -1442,11 +1442,11 @@ async def activate_trial(
         )
 
     # Авто-обновление меню в Telegram: после успешной активации триала шлём
-    # пользователю новое меню (3 кнопки), чтобы оно обновилось не дожидаясь /start.
-    # source='cabinet' глушит чат-пуш — React-кабинет сам обновит экран; дубль в
-    # чат не нужен (старый miniapp шлёт без source). См. funnel_notify.
+    # пользователю меню активного триала (3 кнопки) и убираем старое меню новичка
+    # из чата (иначе там осталась бы устаревшая кнопка «Попробовать бесплатно»),
+    # не дожидаясь /start. Best-effort — ошибки не ломают активацию. См. funnel_notify.
     from app.utils.funnel_notify import send_funnel_trial_menu
 
-    await send_funnel_trial_menu(user, source='cabinet')
+    await send_funnel_trial_menu(user)
 
     return _subscription_to_response(subscription, user=user)

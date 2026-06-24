@@ -112,7 +112,7 @@ async def _delete_remembered_menu(bot, telegram_id: int) -> None:
         logger.debug('_delete_remembered_menu failed', error=exc)
 
 
-async def send_funnel_trial_menu(user, *, source: str | None = None) -> None:
+async def send_funnel_trial_menu(user) -> None:
     """Шлёт пользователю меню активного триала (3 кнопки) после активации.
 
     Дополнительно удаляет предыдущее меню (новичка), если оно было запомнено, и
@@ -120,13 +120,13 @@ async def send_funnel_trial_menu(user, *, source: str | None = None) -> None:
     Ничего не делает, если funnel-меню выключено, бот не в cabinet-режиме или у
     пользователя нет telegram_id (email-only). Ошибки логируются, но не пробрасываются.
 
-    ``source='cabinet'`` глушит чат-пуш: React-кабинет (cabinet.lilulalu.xyz) сам
-    обновляет экран после активации триала, поэтому меню в чат было бы дублем.
-    Старый Telegram-miniapp (``app/webapi/routes/miniapp.py``) вызывает без source
-    и поведения не меняет. См. РЕВЬЮ-волна1: «триал-пуш из ДВУХ мест; гасим один».
+    Вызывается из ВСЕХ мест активации триала одинаково (React-кабинет, legacy
+    Telegram mini-app, админ-выдача). Раньше тут был параметр ``source`` с ранним
+    выходом при ``source='cabinet'`` — глушил пуш «чтобы не дублировать» экран
+    кабинета. Это была ошибка: webview кабинета и сообщение-меню в чате Telegram —
+    РАЗНЫЕ поверхности, и у пользователя в чате оставалась устаревшая кнопка
+    «Попробовать бесплатно». Глушилку убрали — меню обновляется отовсюду.
     """
-    if source == 'cabinet':
-        return
     if not (_funnel_enabled() and getattr(user, 'telegram_id', None)):
         return
 
