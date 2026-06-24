@@ -400,6 +400,16 @@ class Settings(BaseSettings):
     SUBSCRIPTION_RENEWAL_BALANCE_THRESHOLD_KOPEKS: int = 20000
 
     MONITORING_INTERVAL: int = 60
+
+    # ── Grace-период «бонус 2 дня после конца» (внутри код — grace; пользователю слово
+    # «грейс» НЕ показываем). Платная подписка не отключается сразу: VPN живёт ещё
+    # GRACE_PERIOD_DAYS дней, чтобы человек успел продлить. Правила (одобрены 22.06.2026):
+    # только реально платившим (триал — нет); только период ≥ GRACE_MIN_PERIOD_DAYS дней;
+    # даём даже без карты/баланса. GRACE_ENABLED=false → мгновенный откат фичи. ──
+    GRACE_ENABLED: bool = True
+    GRACE_PERIOD_DAYS: int = 2
+    GRACE_MIN_PERIOD_DAYS: int = 30
+
     LOW_BALANCE_ALERT_EXPIRY_DAYS: int = 3  # Only alert when subscription expires within N days
     # Months of inactivity before a user row is soft-deleted (status=DELETED).
     # 12 months is conservative — VPN users are highly seasonal (vacations,
@@ -1975,6 +1985,12 @@ class Settings(BaseSettings):
         if not cabinet_url or cabinet_url == self._CABINET_URL_DEFAULT:
             return None
         return cabinet_url
+
+    def get_cabinet_link(self) -> str | None:
+        """Public browser URL of the web cabinet (e.g. https://cabinet.lilulalu.xyz),
+        or None if not configured. Used to give users a link they can open WITHOUT a
+        VPN to renew from a browser (grace / expiry messages)."""
+        return self._normalized_cabinet_url()
 
     def get_referral_link(self, referral_code: str, bot_username: str | None = None) -> str:
         """Build a referral link pointing to the web cabinet.

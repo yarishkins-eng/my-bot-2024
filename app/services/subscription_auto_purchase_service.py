@@ -2207,6 +2207,17 @@ async def try_auto_extend_expired_after_topup(
         return False
     if subscription.is_trial is not False:
         return False
+    # #629889-смежный: ПОВЕРХ is_trial-гарда требуем, что пользователь РЕАЛЬНО платил.
+    # Бесплатная админ-выданная подписка (is_trial=False, autopay=True, но не плативший)
+    # иначе была бы молча списана на полный период при первом же пополнении баланса.
+    # Это ДОПОЛНЕНИЕ к is_trial-гарду, не замена.
+    if not bool(getattr(user, 'has_had_paid_subscription', False)):
+        logger.info(
+            '🔄 Автопродление expired: пропуск — пользователь никогда не платил (#629889)',
+            format_user_id=_format_user_id(user),
+            subscription_id=getattr(subscription, 'id', None),
+        )
+        return False
 
     # Требуем явное согласие: продлеваем с баланса после пополнения ТОЛЬКО если
     # пользователь сам включил автоплатёж. Иначе пополнение, сделанное под другую

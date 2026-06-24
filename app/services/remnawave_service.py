@@ -34,6 +34,7 @@ from app.external.remnawave_api import (
     UserStatus,
 )
 from app.services.subscription_service import get_traffic_reset_strategy
+from app.utils.grace import is_in_grace
 from app.utils.subscription_utils import (
     coerce_panel_device_limit,
     device_limit_needs_heal,
@@ -2419,13 +2420,20 @@ class RemnaWaveService:
                             try:
                                 user = sub.user
                                 hwid_limit = resolve_hwid_device_limit_for_payload(sub)
-                                expire_at = self._safe_expire_at_for_panel(sub.end_date)
 
-                                # Определяем статус для панели
-                                is_subscription_active = sub.status in (
-                                    SubscriptionStatus.ACTIVE.value,
-                                    SubscriptionStatus.TRIAL.value,
-                                ) and sub.end_date > datetime.now(UTC)
+                                # Определяем статус для панели. Grace-aware: пока идёт
+                                # «бонус 2 дня» (in_grace), держим ACTIVE с expireAt=grace_until,
+                                # чтобы массовый sync не отрубил живой VPN.
+                                _now = datetime.now(UTC)
+                                if is_in_grace(sub, _now):
+                                    is_subscription_active = True
+                                    expire_at = self._safe_expire_at_for_panel(sub.grace_until)
+                                else:
+                                    is_subscription_active = sub.status in (
+                                        SubscriptionStatus.ACTIVE.value,
+                                        SubscriptionStatus.TRIAL.value,
+                                    ) and sub.end_date > _now
+                                    expire_at = self._safe_expire_at_for_panel(sub.end_date)
                                 status = UserStatus.ACTIVE if is_subscription_active else UserStatus.DISABLED
 
                                 # multi-tariff create-path в bulk-sync приклеивает

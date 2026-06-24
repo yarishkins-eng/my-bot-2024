@@ -71,6 +71,11 @@ class SubscriptionData(BaseModel):
     # Best-effort guess at WHY a subscription is disabled ('channel' | None). The
     # DB doesn't store the exact reason; None → screen shows a neutral support msg.
     disabled_reason_hint: str | None = None
+    # ---- Grace «бонус 2 дня после конца» (Чат 5). in_grace=True → подписка формально
+    # истекла, но VPN ещё жив до grace_until; экран рисует жёлтый баннер «бонус 2 дня»
+    # (а не «ИСТЕКЛА»), ссылку и устройства показывает. ----
+    in_grace: bool = False
+    grace_until: datetime | None = None
 
     class Config:
         from_attributes = True

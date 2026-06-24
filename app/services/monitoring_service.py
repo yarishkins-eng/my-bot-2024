@@ -27,6 +27,7 @@ from app.database.crud.subscription import (
     get_expired_subscriptions,
     get_expiring_subscriptions,
     get_subscriptions_for_autopay,
+    get_subscriptions_grace_ended,
     reactivate_subscription,
 )
 from app.database.crud.user import (
@@ -60,6 +61,7 @@ from app.services.notification_settings_service import NotificationSettingsServi
 from app.services.promo_offer_service import promo_offer_service
 from app.services.subscription_service import SubscriptionService, get_traffic_reset_strategy
 from app.utils.cache import cache
+from app.utils.grace import is_grace_eligible, is_in_grace
 from app.utils.message_patch import caption_exceeds_telegram_limit
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
 from app.utils.promo_offer import get_user_active_promo_discount_percent
@@ -497,6 +499,11 @@ class MonitoringService:
         try:
             from app.database.crud.subscription import is_recently_updated_by_webhook
 
+            # Сначала финализируем подписки, чей «бонус 2 дня» уже закончился: реально
+            # гасим VPN и шлём «истекла». Делаем ДО get_expired_subscriptions (та их не
+            # вернёт — они исключены фильтром in_grace).
+            await self._process_grace_ended(db)
+
             expired_subscriptions = await get_expired_subscriptions(db)
 
             for subscription in expired_subscriptions:
@@ -511,26 +518,41 @@ class MonitoringService:
                 # Capture tariff name before expire_subscription's db.refresh() expires the relationship
                 _tariff_name = subscription.tariff.name if getattr(subscription, 'tariff', None) else None
 
+                user = await get_user_by_id(db, subscription.user_id)
+
+                # Multi-tariff: гасим уведомление (и «истекла», и «бонус»), если у юзера
+                # есть ДРУГАЯ активная подписка — сервис не прервался. Считаем ОДИН раз,
+                # чтобы единым флагом покрыть и grace-ветку, и обычное истечение.
+                skip_notify = False
+                if user and settings.is_multi_tariff_enabled():
+                    other_active = await db.execute(
+                        select(Subscription.id)
+                        .where(
+                            Subscription.user_id == user.id,
+                            Subscription.id != subscription.id,
+                            Subscription.status == SubscriptionStatus.ACTIVE.value,
+                            Subscription.end_date > datetime.now(UTC),
+                        )
+                        .limit(1)
+                    )
+                    skip_notify = other_active.scalar_one_or_none() is not None
+
+                # 🎁 Grace («бонус 2 дня»): платным подписчикам от 1 месяца даём ещё 2 дня
+                # живого VPN вместо мгновенного отключения. Внутри: панельный expireAt=end+2д,
+                # статус EXPIRED + in_grace, отдельное «бонусное» уведомление (НЕ «истекла»).
+                # Если включить grace не удалось (панель недоступна) — честно идём по обычному
+                # истечению ниже.
+                if settings.GRACE_ENABLED and user and is_grace_eligible(subscription, user):
+                    entered = await self._enter_subscription_grace(
+                        db, subscription, user, tariff_name=_tariff_name, notify=not skip_notify
+                    )
+                    if entered:
+                        continue
+
                 await expire_subscription(db, subscription)
 
-                user = await get_user_by_id(db, subscription.user_id)
-                if user and self.bot:
-                    # Skip notification if user has another ACTIVE subscription (multi-tariff)
-                    skip_notify = False
-                    if settings.is_multi_tariff_enabled():
-                        other_active = await db.execute(
-                            select(Subscription.id)
-                            .where(
-                                Subscription.user_id == user.id,
-                                Subscription.id != subscription.id,
-                                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                                Subscription.end_date > datetime.now(UTC),
-                            )
-                            .limit(1)
-                        )
-                        skip_notify = other_active.scalar_one_or_none() is not None
-                    if not skip_notify:
-                        await self._send_subscription_expired_notification(user, subscription, tariff_name=_tariff_name)
+                if user and self.bot and not skip_notify:
+                    await self._send_subscription_expired_notification(user, subscription, tariff_name=_tariff_name)
 
                 logger.info(
                     "🔴 Подписка пользователя истекла и статус изменен на 'expired'", user_id=subscription.user_id
@@ -546,6 +568,150 @@ class MonitoringService:
 
         except Exception as e:
             logger.error('Ошибка проверки истёкших подписок', error=e)
+
+    async def _enter_subscription_grace(
+        self,
+        db: AsyncSession,
+        subscription: Subscription,
+        user: User,
+        *,
+        tariff_name: str | None = None,
+        notify: bool = True,
+    ) -> bool:
+        """Перевести истёкшую платную подписку в «бонус 2 дня» (grace).
+
+        Сначала ЯВНО двигаем панельный expireAt на end+GRACE_PERIOD_DAYS (VPN живёт).
+        Только если панель приняла — фиксируем в БД (status=EXPIRED + in_grace=True +
+        grace_until) и шлём «бонусное» уведомление. Если панель недоступна — возвращаем
+        False, и вызывающая сторона честно истекает подписку как обычно (не врём «VPN жив»).
+        ``notify=False`` (multi-tariff: есть другая активная подписка) — флаги ставим, но
+        «бонусное» сообщение не шлём.
+        """
+        now = datetime.now(UTC)
+        end = subscription.end_date
+        if end is None:
+            return False
+        grace_until = end + timedelta(days=settings.GRACE_PERIOD_DAYS)
+        # Окно бонуса уже прошло (подписка обработана с большим опозданием — простой
+        # мониторинга и т.п.): держать grace бессмысленно и сообщение «отключится <прошлая
+        # дата>» вводит в заблуждение. Идём по обычному истечению.
+        if grace_until <= now:
+            return False
+
+        # Панель — источник правды по живости VPN. Двигаем expireAt ВПЕРЁД (статус ACTIVE).
+        ok = await self.subscription_service.push_panel_state(
+            db, subscription, active=True, expire_at=grace_until
+        )
+        if not ok:
+            logger.warning(
+                '🎁 Grace не включён: панель недоступна — обычное истечение',
+                subscription_id=subscription.id,
+                user_id=subscription.user_id,
+            )
+            return False
+
+        subscription.status = SubscriptionStatus.EXPIRED.value
+        subscription.in_grace = True
+        subscription.grace_until = grace_until
+        subscription.updated_at = now
+        await db.commit()
+
+        logger.info(
+            '🎁 Подписка переведена в grace (бонус 2 дня), VPN продлён в панели',
+            subscription_id=subscription.id,
+            user_id=subscription.user_id,
+            grace_until=grace_until,
+        )
+
+        if notify and user and self.bot:
+            await self._send_grace_started_notification(user, subscription, grace_until, tariff_name=tariff_name)
+        return True
+
+    async def _process_grace_ended(self, db: AsyncSession) -> None:
+        """Финализировать подписки, чей «бонус 2 дня» закончился: реально гасим VPN,
+        снимаем in_grace и шлём «истекла». Панель и так авто-истечёт по grace_until, но
+        дублируем явным disable для чистого состояния; снятие in_grace — идемпотентно."""
+        try:
+            ended = await get_subscriptions_grace_ended(db)
+            for subscription in ended:
+                user = subscription.user or await get_user_by_id(db, subscription.user_id)
+                _tariff_name = subscription.tariff.name if getattr(subscription, 'tariff', None) else None
+
+                # Гасим VPN явно (на случай если панель почему-то ещё активна).
+                await self.subscription_service.push_panel_state(
+                    db, subscription, active=False, expire_at=datetime.now(UTC) + timedelta(minutes=1)
+                )
+
+                subscription.in_grace = False
+                subscription.grace_until = None
+                subscription.status = SubscriptionStatus.EXPIRED.value
+                subscription.updated_at = datetime.now(UTC)
+                # НЕ делаем db.refresh: expire_on_commit=False сохраняет загруженные
+                # user/tariff, а refresh истёк бы relationship → ленивая загрузка в async
+                # (MissingGreenlet) при сборке уведомления.
+                await db.commit()
+
+                logger.info(
+                    '🔴 Grace закончился — подписка реально истекла, VPN отключён',
+                    subscription_id=subscription.id,
+                    user_id=subscription.user_id,
+                )
+
+                if user and self.bot:
+                    await self._send_subscription_expired_notification(user, subscription, tariff_name=_tariff_name)
+        except Exception as e:
+            logger.error('Ошибка финализации grace-подписок', error=e)
+
+    async def _send_grace_started_notification(
+        self, user: User, subscription: Subscription, grace_until: datetime, *, tariff_name: str | None = None
+    ) -> bool:
+        """«Бонусное» уведомление при входе в grace: VPN ещё работает 2 дня + ссылка на
+        кабинет (продлить из браузера без VPN). Слово «грейс» пользователю НЕ показываем."""
+        try:
+            from aiogram.types import InlineKeyboardMarkup
+
+            until_str = format_local_datetime(grace_until, '%d.%m')
+            message = (
+                '🎁 <b>Подписка закончилась</b>\n\n'
+                'Но мы оставили VPN включённым ещё на 2 дня — продли спокойно, без спешки.\n\n'
+                f'⏳ Отключится {until_str}.'
+            )
+            message += self._cabinet_link_suffix()
+
+            extend_callback = f'se:{subscription.id}' if settings.is_multi_tariff_enabled() else 'subscription_extend'
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [build_miniapp_or_callback_button(text='💎 Продлить подписку', callback_data=extend_callback)],
+                    [build_miniapp_or_callback_button(text='💳 Пополнить баланс', callback_data='balance_topup')],
+                ]
+            )
+
+            await self._send_message_with_logo(
+                chat_id=user.telegram_id,
+                text=message,
+                parse_mode='HTML',
+                reply_markup=keyboard,
+            )
+            return True
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            if await self._handle_unreachable_user(user, exc, 'бонусное уведомление (grace)'):
+                return True
+            logger.error('Ошибка Telegram при отправке бонусного уведомления', telegram_id=user.telegram_id, exc=exc)
+            return False
+        except Exception as e:
+            logger.error('Ошибка отправки бонусного уведомления (grace)', telegram_id=user.telegram_id, e=e)
+            return False
+
+    def _cabinet_link_suffix(self) -> str:
+        """Строка-приписка со ссылкой на кабинет в браузере (вход без VPN), если настроена.
+        Сообщение «оседает» в чате → человек может зайти и продлить даже если VPN отключится."""
+        cabinet_url = settings.get_cabinet_link()
+        if not cabinet_url:
+            return ''
+        return (
+            '\n\n🌐 Продлить можно и в браузере (работает без VPN, если домен доступен):\n'
+            f'{cabinet_url}'
+        )
 
     async def update_remnawave_user(self, db: AsyncSession, subscription: Subscription) -> RemnaWaveUser | None:
         try:
@@ -613,15 +779,24 @@ class MonitoringService:
                 )
                 return None
 
+            # Grace-aware: пока идёт «бонус 2 дня» — держим ACTIVE с expireAt=grace_until.
+            if is_in_grace(subscription, current_time):
+                is_active = True
+                panel_expire_at = subscription.grace_until
+            else:
+                panel_expire_at = (
+                    subscription.end_date
+                    if is_active
+                    else max(subscription.end_date, current_time + timedelta(minutes=1))
+                )
+
             async with self.subscription_service.get_api_client() as api:
                 hwid_limit = resolve_hwid_device_limit_for_payload(subscription)
 
                 update_kwargs = dict(
                     uuid=remnawave_uuid,
                     status=RemnaWaveUserStatus.ACTIVE if is_active else RemnaWaveUserStatus.DISABLED,
-                    expire_at=subscription.end_date
-                    if is_active
-                    else max(subscription.end_date, current_time + timedelta(minutes=1)),
+                    expire_at=panel_expire_at,
                     traffic_limit_bytes=self._gb_to_bytes(subscription.traffic_limit_gb),
                     traffic_limit_strategy=get_traffic_reset_strategy(subscription.tariff),
                     description=settings.format_remnawave_user_description(
@@ -1153,6 +1328,9 @@ class MonitoringService:
                         Subscription.status == SubscriptionStatus.EXPIRED.value,
                         Subscription.end_date <= now,
                         Subscription.end_date >= lookback,
+                        # 🎁 Не трогаем подписки в «бонусе 2 дня»: VPN ещё жив, иначе на
+                        # day+1 ушло бы «Доступ заблокирован» при работающем VPN.
+                        Subscription.in_grace.is_(False),
                         User.status == UserStatus.ACTIVE.value,
                     )
                 )
@@ -1172,6 +1350,10 @@ class MonitoringService:
             for subscription in subscriptions:
                 user = subscription.user
                 if not user:
+                    continue
+
+                # Подстраховка к SQL-фильтру: пока идёт «бонус 2 дня» — молчим (VPN жив).
+                if getattr(subscription, 'in_grace', False):
                     continue
 
                 if subscription.end_date is None:
@@ -1816,6 +1998,7 @@ class MonitoringService:
 
 🔧 Доступ к серверам заблокирован до продления.
 """
+            message += self._cabinet_link_suffix()
 
             from aiogram.types import InlineKeyboardMarkup
 
@@ -1911,6 +2094,8 @@ class MonitoringService:
                 action_text=action_text,
                 tariff_label=tariff_label,
             )
+            # Ссылка на кабинет в браузере (вход без VPN) — даём заранее, пока VPN ещё жив.
+            message += self._cabinet_link_suffix()
 
             from aiogram.types import InlineKeyboardMarkup
 
@@ -2947,6 +3132,10 @@ class MonitoringService:
         from app.database.crud.subscription import is_recently_updated_by_webhook
 
         try:
+            # Также финализируем подписки с закончившимся «бонусом 2 дня» (их get_expired
+            # не вернёт — они исключены фильтром in_grace), иначе ручная проверка их пропустит.
+            await self._process_grace_ended(db)
+
             expired_subscriptions = await get_expired_subscriptions(db)
             expired_count = 0
 

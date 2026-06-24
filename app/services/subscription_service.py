@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy import select
@@ -12,6 +12,7 @@ from app.database.crud.server_squad import get_all_server_squads
 from app.database.crud.user import get_user_by_id
 from app.database.models import Subscription, SubscriptionStatus, User
 from app.external.remnawave_api import RemnaWaveAPI, RemnaWaveAPIError, RemnaWaveUser, TrafficLimitStrategy, UserStatus
+from app.utils.grace import is_in_grace, resolve_panel_active_and_expiry
 from app.utils.subscription_utils import (
     resolve_hwid_device_limit_for_payload,
 )
@@ -434,17 +435,19 @@ class SubscriptionService:
                 pass  # tariff может быть None или уже загружен
 
             current_time = datetime.now(UTC)
-            # Определяем актуальный статус для отправки в RemnaWave
-            # НЕ меняем статус подписки здесь - это задача scheduled job
-            is_actually_active = (
-                subscription.status in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value)
-                and subscription.end_date > current_time
-            )
+            # Определяем актуальный статус и дату для панели. Grace-aware: пока идёт
+            # «бонус 2 дня» (in_grace), держим пользователя ACTIVE с expireAt=grace_until,
+            # хотя в БД статус уже EXPIRED — иначе действие юзера в кабинете в эти 2 дня
+            # (докупка/переименование устройства и т.п.) отрубило бы живой VPN.
+            # НЕ меняем статус подписки здесь — это задача scheduled job.
+            is_actually_active, panel_expire_at = resolve_panel_active_and_expiry(subscription, current_time)
 
-            # Логируем если статус и end_date не согласованы (для отладки)
+            # Логируем если статус и end_date не согласованы (для отладки), но НЕ для grace
+            # (там рассинхрон ожидаемый и корректный).
             if (
                 subscription.status in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value)
                 and subscription.end_date <= current_time
+                and not is_in_grace(subscription, current_time)
             ):
                 logger.warning(
                     '⚠️ update_remnawave_user: подписка имеет статус ACTIVE, но end_date <= now. Отправляем в RemnaWave как DISABLED, но НЕ меняем статус в БД.',
@@ -464,9 +467,7 @@ class SubscriptionService:
                 update_kwargs = dict(
                     uuid=remnawave_uuid,
                     status=UserStatus.ACTIVE if is_actually_active else UserStatus.DISABLED,
-                    expire_at=subscription.end_date
-                    if is_actually_active
-                    else max(subscription.end_date, current_time + timedelta(minutes=1)),
+                    expire_at=panel_expire_at,
                     traffic_limit_bytes=self._gb_to_bytes(subscription.traffic_limit_gb),
                     traffic_limit_strategy=get_traffic_reset_strategy(subscription.tariff),
                     telegram_id=user.telegram_id,
@@ -539,6 +540,46 @@ class SubscriptionService:
         except Exception as e:
             logger.error('Ошибка обновления RemnaWave пользователя', error=e)
             return None
+
+    async def push_panel_state(
+        self, db: AsyncSession, subscription: Subscription, *, active: bool, expire_at: datetime
+    ) -> bool:
+        """Толкает в RemnaWave ТОЛЬКО статус и expireAt одной подписки (без записи в БД).
+
+        Используется grace-флоу: держать VPN живым (active=True, expire_at=grace_until)
+        при входе в «бонус 2 дня» и гасить (active=False) когда бонус закончился.
+        Возвращает True при успехе, False если панель не настроена / нет UUID / ошибка API.
+        """
+        try:
+            user = await get_user_by_id(db, subscription.user_id)
+            if not user:
+                return False
+            if settings.is_multi_tariff_enabled():
+                remnawave_uuid = subscription.remnawave_uuid
+            else:
+                remnawave_uuid = user.remnawave_uuid
+            if not remnawave_uuid:
+                logger.warning(
+                    'push_panel_state: нет remnawave_uuid', subscription_id=subscription.id, user_id=subscription.user_id
+                )
+                return False
+
+            async with self.get_api_client() as api:
+                await api.update_user(
+                    uuid=remnawave_uuid,
+                    status=UserStatus.ACTIVE if active else UserStatus.DISABLED,
+                    expire_at=expire_at,
+                )
+            logger.info(
+                '🎁 RemnaWave expireAt сдвинут (grace)',
+                subscription_id=subscription.id,
+                active=active,
+                expire_at=expire_at,
+            )
+            return True
+        except Exception as e:
+            logger.error('push_panel_state: ошибка обновления панели', subscription_id=subscription.id, error=e)
+            return False
 
     @staticmethod
     def _format_user_log(user) -> str:
@@ -1008,10 +1049,9 @@ class SubscriptionService:
                             return False
 
                         current_time = datetime.now(UTC)
-                        is_actually_active = (
-                            sub.status in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value)
-                            and sub.end_date > current_time
-                        )
+                        # Grace-aware (см. update_remnawave_user): в «бонусные 2 дня»
+                        # держим ACTIVE с expireAt=grace_until, чтобы squad-sync не отрубил VPN.
+                        is_actually_active, panel_expire_at = resolve_panel_active_and_expiry(sub, current_time)
 
                         user_tag = self._resolve_user_tag(sub)
                         ext_squad_uuid = sub.tariff.external_squad_uuid if sub.tariff else None
@@ -1020,9 +1060,7 @@ class SubscriptionService:
                         update_kwargs = dict(
                             uuid=remnawave_uuid,
                             status=UserStatus.ACTIVE if is_actually_active else UserStatus.DISABLED,
-                            expire_at=sub.end_date
-                            if is_actually_active
-                            else max(sub.end_date, current_time + timedelta(minutes=1)),
+                            expire_at=panel_expire_at,
                             traffic_limit_bytes=self._gb_to_bytes(sub.traffic_limit_gb),
                             traffic_limit_strategy=traffic_strategy,
                             telegram_id=user.telegram_id,

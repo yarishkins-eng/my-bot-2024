@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from app.database.models import Tariff
 
 from app.database.models import Subscription, User
+from app.utils.grace import is_in_grace
 
 from ...schemas.subscription import (
     ServerInfo,
@@ -308,4 +309,8 @@ def _subscription_to_response(
         can_topup_traffic=can_topup_traffic,
         restriction_subscription=restriction_subscription,
         disabled_reason_hint=disabled_reason_hint,
+        # Grace «бонус 2 дня»: in_grace только при ОТКРЫТОМ окне (флаг + grace_until>now),
+        # иначе экран покажет «ИСТЕКЛА». grace_until — для текста баннера «Отключится DD.MM».
+        in_grace=is_in_grace(subscription),
+        grace_until=subscription.grace_until,
     )
