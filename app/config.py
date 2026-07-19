@@ -199,9 +199,11 @@ class Settings(BaseSettings):
     RESET_DEVICES_ON_RENEWAL: bool = False
     TARIFF_SWITCH_UPGRADE_ENABLED: bool = True
     TARIFF_SWITCH_DOWNGRADE_ENABLED: bool = True
-    # При смене тарифа НЕ переносить остаток дней, наспамленных на бесплатном (0₽)
-    # тарифе, на новый платный тариф (иначе юзер бесплатно уносит, напр., 1000 дней).
-    # Платные подписки переносят дни как обычно. Выключите, чтобы вернуть перенос.
+    # Мастер-переключатель сброса бесплатного периода при переходе на платный.
+    # При True остаток НЕ переносится ни для триала («бесплатная версия» бота),
+    # ни для 0₽-тарифа — даже если TRIAL_ADD_REMAINING_DAYS_TO_PAID=true (сброс
+    # перебивает перенос). Платные подписки переносят дни как обычно. Выключите,
+    # чтобы разрешить перенос (тогда для триалов действует TRIAL_ADD_REMAINING_DAYS_TO_PAID).
     TARIFF_SWITCH_RESET_FREE_DAYS: bool = True
     MAX_DEVICES_LIMIT: int = 20
 
@@ -400,6 +402,22 @@ class Settings(BaseSettings):
     SUBSCRIPTION_RENEWAL_BALANCE_THRESHOLD_KOPEKS: int = 20000
 
     MONITORING_INTERVAL: int = 60
+    # ── Grace-период «бонус 2 дня после конца» (внутри код — grace; пользователю слово
+    # «грейс» НЕ показываем). Платная подписка не отключается сразу: VPN живёт ещё
+    # GRACE_PERIOD_DAYS дней, чтобы человек успел продлить. Правила (одобрены 22.06.2026):
+    # только реально платившим (триал — нет); только период ≥ GRACE_MIN_PERIOD_DAYS дней;
+    # даём даже без карты/баланса. GRACE_ENABLED=false → мгновенный откат фичи. ──
+    GRACE_ENABLED: bool = True
+    GRACE_PERIOD_DAYS: int = 2
+    GRACE_MIN_PERIOD_DAYS: int = 30
+
+    # Жёсткий per-send таймаут (сек) на отправку уведомлений из MonitoringService.
+    # Дефолтный session timeout aiogram = 60s; при медленном канале до Telegram
+    # или недоступном получателе один send_photo/send_message блокирует ВЕСЬ хвост
+    # цикла мониторинга на минуты (последовательно по многим получателям, без
+    # per-send логов). Этот таймаут даёт быстрый предсказуемый предел: на TimeoutError
+    # получатель пропускается, цикл продолжается.
+    MONITORING_NOTIFICATION_SEND_TIMEOUT: float = 20.0
     LOW_BALANCE_ALERT_EXPIRY_DAYS: int = 3  # Only alert when subscription expires within N days
     # Months of inactivity before a user row is soft-deleted (status=DELETED).
     # 12 months is conservative — VPN users are highly seasonal (vacations,
@@ -578,6 +596,11 @@ class Settings(BaseSettings):
     PLATEGA_SECRET: str | None = None
     PLATEGA_DISPLAY_NAME: str = 'Platega'
     PLATEGA_BASE_URL: str = 'https://app.platega.io'
+    # 'v1' — документированный POST /transaction/process с обязательным paymentMethod
+    # (ответ несёт ссылку в поле `redirect`); 'v2' — POST /v2/transaction/process
+    # (ссылка в поле `url`), нужен мерчантам, у которых карточные каскады доступны
+    # только в v2 (#2934: v1 отдаёт 400 «No available card cascades» для карт).
+    PLATEGA_API_VERSION: str = 'v1'
     PLATEGA_RETURN_URL: str | None = None
     PLATEGA_FAILED_URL: str | None = None
     PLATEGA_CURRENCY: str = 'RUB'
@@ -909,6 +932,16 @@ class Settings(BaseSettings):
     ETOPLATEZHI_CARD_DISPLAY_NAME: str = 'Карта (Etoplatezhi)'
 
     MAIN_MENU_MODE: str = 'default'  # 'default' | 'cabinet'
+    # Меню по состояниям воронки (новичок/триал) для ОБЫЧНЫХ пользователей (не админ/модератор).
+    # Работает только в cabinet-режиме. Аварийный выключатель: меняешь на false → меню возвращается к обычному.
+    FUNNEL_MENU_ENABLED: bool = False
+    # Отдельная воронка-меню для ПЛАТНОГО подписчика (3 состояния: активна/заканчивается/закончилась).
+    # Работает поверх FUNNEL_MENU_ENABLED + cabinet-режим. Свой выключатель для независимого отката:
+    # false → платный подписчик снова видит обычное кабинетное меню.
+    FUNNEL_SUBSCRIBER_MENU_ENABLED: bool = False
+    # За сколько дней до конца подписки в меню подписчика появляется кнопка «Продлить».
+    # 0 → берётся из AUTOPAY_WARNING_DAYS (синхронно с пуш-уведомлениями «скоро истекает»).
+    SUBSCRIBER_MENU_RENEW_THRESHOLD_DAYS: int = 0
     # Стиль кнопок Cabinet: primary (синий), success (зелёный), danger (красный), '' (по умолчанию для каждой секции)
     CABINET_BUTTON_STYLE: str = ''
     CONNECT_BUTTON_MODE: str = 'miniapp_subscription'
@@ -933,6 +966,14 @@ class Settings(BaseSettings):
     MINIAPP_SERVICE_DESCRIPTION_RU: str = 'Безопасное и быстрое подключение'
     CONNECT_BUTTON_HAPP_DOWNLOAD_ENABLED: bool = False
     HAPP_CRYPTOLINK_REDIRECT_TEMPLATE: str | None = None
+    # Remnawave 2.8.0 удалил /api/system/tools/happ/encrypt — недостающие crypt-ссылки
+    # генерируются локально (RSA публичным ключом Happ, как на subpage панели ->
+    # happ://crypt4/...). Выключатель на случай ротации ключа Happ: тогда до обновления
+    # бота ссылки поедут через панель/внешний API.
+    HAPP_CRYPTOLINK_LOCAL_ENCRYPTION_ENABLED: bool = True
+    # Запасной путь — официальный Happ API (crypto.happ.su -> happ://crypt5/...).
+    # Выключатель на случай проблем с внешним сервисом.
+    HAPP_CRYPTOLINK_API_FALLBACK_ENABLED: bool = True
     HAPP_DOWNLOAD_LINK_IOS: str | None = None
     HAPP_DOWNLOAD_LINK_ANDROID: str | None = None
     HAPP_DOWNLOAD_LINK_MACOS: str | None = None
@@ -1741,6 +1782,24 @@ class Settings(BaseSettings):
         except (ValueError, AttributeError):
             return [3, 1]
 
+    def is_funnel_subscriber_menu_enabled(self) -> bool:
+        return bool(getattr(self, 'FUNNEL_SUBSCRIBER_MENU_ENABLED', False))
+
+    def get_subscriber_menu_renew_threshold_days(self) -> int:
+        """Порог (в днях) появления кнопки «Продлить» в меню подписчика.
+
+        0/пусто → берём максимум из AUTOPAY_WARNING_DAYS, чтобы кнопка в меню и
+        пуш-уведомление «скоро истекает» срабатывали на одном пороге.
+        """
+        try:
+            val = int(getattr(self, 'SUBSCRIBER_MENU_RENEW_THRESHOLD_DAYS', 0) or 0)
+        except (ValueError, TypeError):
+            val = 0
+        if val > 0:
+            return val
+        days = self.get_autopay_warning_days() or [3]
+        return max(days)
+
     def is_autopay_enabled_by_default(self) -> bool:
         value = getattr(self, 'DEFAULT_AUTOPAY_ENABLED', True)
 
@@ -1947,6 +2006,12 @@ class Settings(BaseSettings):
         if not cabinet_url or cabinet_url == self._CABINET_URL_DEFAULT:
             return None
         return cabinet_url
+
+    def get_cabinet_link(self) -> str | None:
+        """Public browser URL of the web cabinet (e.g. https://cabinet.lilulalu.xyz),
+        or None if not configured. Used to give users a link they can open WITHOUT a
+        VPN to renew from a browser (grace / expiry messages)."""
+        return self._normalized_cabinet_url()
 
     def get_referral_link(self, referral_code: str, bot_username: str | None = None) -> str:
         """Build a referral link pointing to the web cabinet.

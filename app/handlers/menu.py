@@ -36,6 +36,7 @@ from app.services.subscription_checkout_service import (
 from app.services.support_settings_service import SupportSettingsService
 from app.services.user_cart_service import user_cart_service
 from app.utils.display_mode import is_visible_in_bot
+from app.utils.grace import is_in_grace
 from app.utils.photo_message import edit_or_answer_photo
 from app.utils.pricing_utils import format_period_description
 from app.utils.promo_offer import (
@@ -238,12 +239,15 @@ async def show_main_menu(
         custom_buttons=custom_buttons,
     )
 
-    await edit_or_answer_photo(
+    _menu_msg = await edit_or_answer_photo(
         callback=callback,
         caption=menu_text,
         keyboard=keyboard,
         parse_mode='HTML',
     )
+    from app.utils.funnel_notify import remember_funnel_menu_message
+
+    await remember_funnel_menu_message(db_user, _menu_msg or callback.message)
     if not skip_callback_answer:
         await callback.answer()
 
@@ -288,16 +292,58 @@ async def show_service_rules(callback: types.CallbackQuery, db_user: User, db: A
         )
         return
 
+    raw_page = 1
+    if callback.data and ':' in callback.data:
+        try:
+            raw_page = int(callback.data.split(':', 1)[1])
+        except ValueError:
+            raw_page = 1
+    raw_page = max(raw_page, 1)
+
     rules_text = await get_current_rules_content(db, db_user.language)
 
     if not rules_text:
         rules_text = await get_rules(db_user.language)
 
+    # Правила могут быть длиннее лимита Telegram (4096) — пагинация как у
+    # политики конфиденциальности и оферты
+    pages = split_telegram_text(rules_text, max_length=3500) or ['']
+    total_pages = len(pages)
+    current_page = min(raw_page, total_pages)
+
+    message_text = f'{texts.t("RULES_HEADER", "📋 <b>Правила сервиса</b>")}\n\n{pages[current_page - 1]}'
+
+    keyboard_rows: list[list[types.InlineKeyboardButton]] = []
+
+    if total_pages > 1:
+        nav_row: list[types.InlineKeyboardButton] = []
+        if current_page > 1:
+            nav_row.append(
+                types.InlineKeyboardButton(
+                    text=texts.t('PAGINATION_PREV', '⬅️'),
+                    callback_data=f'menu_rules:{current_page - 1}',
+                )
+            )
+        nav_row.append(
+            types.InlineKeyboardButton(
+                text=f'{current_page}/{total_pages}',
+                callback_data='noop',
+            )
+        )
+        if current_page < total_pages:
+            nav_row.append(
+                types.InlineKeyboardButton(
+                    text=texts.t('PAGINATION_NEXT', '➡️'),
+                    callback_data=f'menu_rules:{current_page + 1}',
+                )
+            )
+        keyboard_rows.append(nav_row)
+
+    keyboard_rows.append([types.InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')])
+
     await callback.message.edit_text(
-        f'{texts.t("RULES_HEADER", "📋 <b>Правила сервиса</b>")}\n\n{rules_text}',
-        reply_markup=types.InlineKeyboardMarkup(
-            inline_keyboard=[[types.InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')]]
-        ),
+        message_text,
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
     )
     await callback.answer()
 
@@ -1058,6 +1104,33 @@ async def show_info_page(
     await callback.answer()
 
 
+async def cmd_language(message: types.Message, db_user: User, state: FSMContext):
+    """Команда /language (из меню команд ☰) — тот же выбор языка, что и кнопка menu_language.
+
+    Переиспользует get_language_selection_keyboard (callback language_select:XX обрабатывает
+    существующий process_language_change). Команда шлёт НОВОЕ сообщение → message.answer.
+    ВАЖНО: ☰-команда доступна из любого контекста, в т.ч. посреди FSM-флоу (ввод промокода/тикета/
+    суммы). process_language_change гейтится StateFilter(None) — без сброса состояния выбор языка
+    молча не сработает. Поэтому сбрасываем FSM перед показом (как «Назад в меню»).
+    """
+    if db_user is None:
+        return
+    await state.clear()
+    texts = get_texts(db_user.language)
+    if not settings.is_language_selection_enabled():
+        await message.answer(texts.t('LANGUAGE_SELECTION_DISABLED', '⚙️ Выбор языка временно недоступен.'))
+        return
+    await message.answer(
+        texts.t('LANGUAGE_PROMPT', '🌐 Выберите язык интерфейса:'),
+        reply_markup=get_language_selection_keyboard(
+            current_language=db_user.language,
+            include_back=True,
+            language=db_user.language,
+        ),
+        parse_mode='HTML',
+    )
+
+
 async def show_language_menu(
     callback: types.CallbackQuery,
     db_user: User,
@@ -1229,12 +1302,15 @@ async def handle_back_to_menu(callback: types.CallbackQuery, state: FSMContext, 
         custom_buttons=custom_buttons,
     )
 
-    await edit_or_answer_photo(
+    _menu_msg = await edit_or_answer_photo(
         callback=callback,
         caption=menu_text,
         keyboard=keyboard,
         parse_mode='HTML',
     )
+    from app.utils.funnel_notify import remember_funnel_menu_message
+
+    await remember_funnel_menu_message(db_user, _menu_msg or callback.message)
     await callback.answer()
 
 
@@ -1249,8 +1325,30 @@ def _get_subscription_status(user: User, texts, is_daily_tariff: bool = False) -
     end_date_text = format_local_datetime(end_date, '%d.%m.%Y') if end_date else None
     days_left = 0
 
-    if subscription.end_date > current_time:
+    if subscription.end_date and subscription.end_date > current_time:
         days_left = (subscription.end_date - current_time).days
+
+    # Grace «бонус 2 дня»: VPN ещё жив, в БД status=EXPIRED — показываем бонус, НЕ «Истекла».
+    # Согласовано с экраном кабинета (там жёлтый баннер «бонус 2 дня») и с клавиатурой
+    # (get_subscriber_state отдаёт grace как PAID_EXPIRING). Не зависит от FUNNEL_MENU_ENABLED:
+    # факт «VPN живёт ещё 2 дня» истинен независимо от воронки.
+    if is_in_grace(subscription):
+        grace_until_text = format_local_datetime(getattr(subscription, 'grace_until', None), '%d.%m.%Y')
+        return texts.t(
+            'SUB_STATUS_GRACE',
+            '🎁 Бонусные дни\n⏳ VPN активен до {date}',
+        ).format(date=grace_until_text or '—')
+
+    # Funnel: истёкший триал (платной никогда не было) — отдельный понятный баннер
+    # вместо общего «🔴 Истекла». Только под флагом и в cabinet-режиме.
+    if (
+        getattr(settings, 'FUNNEL_MENU_ENABLED', False)
+        and settings.is_cabinet_mode()
+        and getattr(subscription, 'is_trial', False)
+        and actual_status == 'expired'
+        and not getattr(user, 'has_had_paid_subscription', False)
+    ):
+        return texts.t('SUB_STATUS_TRIAL_EXPIRED', '⛔ Пробный период закончился')
 
     if actual_status == 'pending':
         return texts.t('SUBSCRIPTION_NONE', '❌ Нет активной подписки')
@@ -1382,6 +1480,25 @@ async def _get_multi_tariff_status(user, texts, db: AsyncSession) -> tuple[str, 
 async def get_main_menu_text(user, texts, db: AsyncSession):
     from app.config import settings
 
+    # Funnel: новичку — короткий продающий текст вместо сухого «Подписка: ❌ Отсутствует».
+    # Срок триала {trial_days} подставляется из настройки (со склонением: 1 день / 3 дня / 7 дней).
+    if getattr(settings, 'FUNNEL_MENU_ENABLED', False) and settings.is_cabinet_mode():
+        try:
+            from app.utils.funnel_state import FunnelState, classify_funnel_state
+
+            if classify_funnel_state(user) == FunnelState.NEWBIE:
+                from app.utils.pricing_utils import format_period_description
+
+                language = getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE
+                trial_days = format_period_description(settings.TRIAL_DURATION_DAYS, language)
+                return texts.t(
+                    'FUNNEL_NEWBIE_MENU_TEXT',
+                    '🔥 Остался один шаг до свободного интернета.\n\n'
+                    'Подписки пока нет — но {trial_days} с Тепло бесплатно. Включается за 30 секунд 👇',
+                ).format(trial_days=trial_days)
+        except Exception as exc:
+            logger.debug('Funnel newbie text failed, fallback на обычный', error=exc)
+
     # Multi-tariff: show summary of all subscriptions
     if settings.is_multi_tariff_enabled():
         subscriptions_status, tariff_info_block = await _get_multi_tariff_status(user, texts, db)
@@ -1409,7 +1526,7 @@ async def get_main_menu_text(user, texts, db: AsyncSession):
                 tariff = await get_tariff_by_id(db, subscription.tariff_id)
                 if tariff:
                     is_daily_tariff = getattr(tariff, 'is_daily', False)
-                    tariff_info_block = f'\n📦 Тариф: {html.escape(tariff.name)}'
+                    tariff_info_block = f'\nТариф: {html.escape(tariff.name)}'
             except Exception as e:
                 logger.debug('Не удалось загрузить тариф для главного меню', error=e)
 
@@ -1682,6 +1799,11 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(show_service_rules, F.data == 'menu_rules')
 
     dp.callback_query.register(
+        show_service_rules,
+        F.data.startswith('menu_rules:'),
+    )
+
+    dp.callback_query.register(
         show_info_menu,
         F.data == 'menu_info',
     )
@@ -1727,6 +1849,7 @@ def register_handlers(dp: Dispatcher):
     )
 
     dp.callback_query.register(show_language_menu, F.data == 'menu_language')
+    # cmd_language (/language) регистрируется РАНЬШЕ — в app/bot.py, до FSM-обработчиков ввода.
 
     dp.callback_query.register(process_language_change, F.data.startswith('language_select:'), StateFilter(None))
 

@@ -3360,6 +3360,14 @@ async def confirm_subscription_reset(callback: types.CallbackQuery, db_user: Use
 
     success = await _reset_user_subscription(db, user_id, db_user.id, subscription_id=subscription_id)
 
+    if success:
+        # Доступ снят → убираем устаревшее funnel-меню из чата пользователя (best-effort).
+        from app.utils.funnel_notify import clear_funnel_menu
+
+        _target = await get_user_by_id(db, user_id)
+        if _target is not None:
+            await clear_funnel_menu(_target)
+
     message = (
         '✅ Подписка обнулена. Пользователь и его тикеты сохранены.' if success else '❌ Ошибка обнуления подписки'
     )
@@ -3484,6 +3492,14 @@ async def activate_user_subscription(callback: types.CallbackQuery, db_user: Use
     success = await _activate_user_subscription(db, user_id, db_user.id, subscription_id=subscription_id)
 
     if success:
+        # Авто-обновление меню подписчика у пользователя в Telegram (без /start), best-effort.
+        from app.utils.funnel_notify import notify_subscriber_menu
+
+        _target = await get_user_by_id(db, user_id)
+        if _target is not None:
+            await notify_subscriber_menu(db, _target)
+
+    if success:
         await callback.message.edit_text(
             '✅ Подписка пользователя активирована',
             reply_markup=types.InlineKeyboardMarkup(
@@ -3509,6 +3525,14 @@ async def grant_trial_subscription(callback: types.CallbackQuery, db_user: User,
     success = await _grant_trial_subscription(db, user_id, db_user.id)
 
     if success:
+        # Авто-обновление меню у пользователя в Telegram (без /start), best-effort:
+        # выдали триал → шлём меню активного триала и убираем старое меню новичка.
+        from app.utils.funnel_notify import send_funnel_trial_menu
+
+        _target = await get_user_by_id(db, user_id)
+        if _target is not None:
+            await send_funnel_trial_menu(_target)
+
         await callback.message.edit_text(
             '✅ Пользователю выдан триальный период',
             reply_markup=types.InlineKeyboardMarkup(
@@ -3580,6 +3604,14 @@ async def process_subscription_grant_days(callback: types.CallbackQuery, db_user
     success = await _grant_paid_subscription(db, user_id, days, db_user.id)
 
     if success:
+        # Авто-обновление меню подписчика у пользователя в Telegram (без /start), best-effort.
+        from app.utils.funnel_notify import notify_subscriber_menu
+
+        _target = await get_user_by_id(db, user_id)
+        if _target is not None:
+            await notify_subscriber_menu(db, _target)
+
+    if success:
         await callback.message.edit_text(
             f'✅ Пользователю выдана подписка на {days} дней',
             reply_markup=types.InlineKeyboardMarkup(
@@ -3628,6 +3660,14 @@ async def process_subscription_grant_text(message: types.Message, db_user: User,
             return
 
         success = await _grant_paid_subscription(db, user_id, days, db_user.id)
+
+        if success:
+            # Авто-обновление меню подписчика у пользователя в Telegram (без /start), best-effort.
+            from app.utils.funnel_notify import notify_subscriber_menu
+
+            _target = await get_user_by_id(db, user_id)
+            if _target is not None:
+                await notify_subscriber_menu(db, _target)
 
         if success:
             await message.answer(

@@ -359,6 +359,22 @@ async def notify_user_subscription_expired(user_id: int) -> None:
     )
 
 
+async def notify_user_subscription_grace_started(user_id: int) -> None:
+    """Сигнал кабинету: подписка вошла в «бонус 2 дня» (grace) — перечитай подписку.
+
+    Намеренно «тихий» (без своего текста): про бонус пользователю уже уходит
+    Telegram-сообщение. Задача одна — чтобы ОТКРЫТЫЙ кабинет сразу перечитал подписку
+    и показал жёлтый баннер «Бонус N дней» вместо устаревшего состояния, не дожидаясь
+    ручного обновления. Слать subscription.expired нельзя — на него фронт рисует
+    пугающий тост «Подписка истекла»."""
+    await cabinet_ws_manager.send_to_user(
+        user_id,
+        {
+            'type': 'subscription.grace_started',
+        },
+    )
+
+
 async def notify_user_subscription_renewed(
     user_id: int,
     subscription_id: int | None = None,

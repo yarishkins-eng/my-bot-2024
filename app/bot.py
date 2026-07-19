@@ -176,6 +176,14 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     dp.message.middleware(SubscriptionStatusMiddleware())
     dp.callback_query.middleware(SubscriptionStatusMiddleware())
     dp.pre_checkout_query.middleware(SubscriptionStatusMiddleware())
+    # Командные хендлеры меню ☰ (/language, /support) регистрируем ПЕРВЫМИ: иначе FSM-обработчики
+    # ввода (промокод/вывод средств/тикеты) перехватывают команду как «ввод» и она не срабатывает.
+    # /start уже идёт первым внутри start.register_handlers. Команды должны иметь приоритет.
+    from aiogram.filters import Command as _CmdFilter
+
+    dp.message.register(menu.cmd_language, _CmdFilter('language'))
+    dp.message.register(support.cmd_support, _CmdFilter('support'))
+
     start.register_handlers(dp)
     menu.register_handlers(dp)
     subscription.register_handlers(dp)
@@ -296,6 +304,37 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
         logger.info('RemnaWave retry queue запущен')
     except Exception as e:
         logger.error('Ошибка запуска RemnaWave retry queue', error=e)
+
+    # --- Меню команд Telegram (☰): Перезагрузить / Язык / Техподдержка ---
+    # В меню команд можно только команда + текст-описание с эмодзи (картинку/логотип Telegram
+    # не поддерживает). Ставим для default + ru + en (Telegram берёт язык клиента). best-effort.
+    try:
+        from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
+
+        _cmds_ru = [
+            BotCommand(command='start', description='🔄 Перезагрузить бота'),
+            BotCommand(command='language', description='🌐 Язык'),
+            BotCommand(command='support', description='🛠️ Техподдержка'),
+        ]
+        _cmds_en = [
+            BotCommand(command='start', description='🔄 Restart bot'),
+            BotCommand(command='language', description='🌐 Language'),
+            BotCommand(command='support', description='🛠️ Support'),
+        ]
+        # default scope
+        await bot.set_my_commands(_cmds_ru)
+        await bot.set_my_commands(_cmds_ru, language_code='ru')
+        await bot.set_my_commands(_cmds_en, language_code='en')
+        # ВАЖНО: в личных чатах приоритет у scope all_private_chats (он перебивает default).
+        # Старое «/start Меню Бота» из BotFather сидело именно в этом скоупе — перезаписываем,
+        # иначе пользователи в личке продолжают видеть старое одиночное меню.
+        _scope_pm = BotCommandScopeAllPrivateChats()
+        await bot.set_my_commands(_cmds_ru, scope=_scope_pm)
+        await bot.set_my_commands(_cmds_ru, scope=_scope_pm, language_code='ru')
+        await bot.set_my_commands(_cmds_en, scope=_scope_pm, language_code='en')
+        logger.info('Команды бота (меню ☰) установлены')
+    except Exception as e:
+        logger.warning('Не удалось установить команды бота', error=e)
 
     logger.info('Бот успешно настроен')
 

@@ -302,16 +302,12 @@ async def _sync_subscription_to_panel(
             logger.warning('Remnawave not configured, skipping panel sync for user', user_id=user.id)
             return {'skipped': True, 'reason': 'Remnawave not configured'}
 
-        is_active = (
-            subscription.status in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value)
-            and subscription.end_date
-            and subscription.end_date > datetime.now(UTC)
-        )
-        panel_status = PanelUserStatus.ACTIVE if is_active else PanelUserStatus.DISABLED
+        from app.utils.grace import resolve_panel_active_and_expiry
 
-        expire_at = subscription.end_date
-        if expire_at and expire_at <= datetime.now(UTC):
-            expire_at = datetime.now(UTC) + timedelta(minutes=1)
+        # Grace-aware: пока идёт «бонус 2 дня» (in_grace) — держим ACTIVE с expireAt=grace_until,
+        # чтобы админ-действие на пользователе в эти 2 дня не отрубило живой VPN раньше срока.
+        is_active, expire_at = resolve_panel_active_and_expiry(subscription, datetime.now(UTC))
+        panel_status = PanelUserStatus.ACTIVE if is_active else PanelUserStatus.DISABLED
 
         # При multi-tariff create-path ниже приклеивается `_<remnawave_short_id>`.
         # build_remnawave_subscription_username гарантирует, что итоговая строка
@@ -1244,6 +1240,11 @@ async def update_user_subscription(
 
         logger.info('Admin created subscription for user', admin_id=admin.id, user_id=user_id)
 
+        # Авто-обновление меню подписчика в Telegram (без /start), best-effort.
+        from app.utils.funnel_notify import notify_subscriber_menu
+
+        await notify_subscriber_menu(db, user)
+
         return UpdateSubscriptionResponse(
             success=True,
             message=f'Subscription created for {days} days',
@@ -1508,6 +1509,11 @@ async def update_user_subscription(
             subscription_id=subscription.id,
             panel_disabled=result.get('panel_disabled'),
         )
+
+        # Доступ снят → убираем устаревшее funnel-меню из чата пользователя (best-effort).
+        from app.utils.funnel_notify import clear_funnel_menu
+
+        await clear_funnel_menu(user)
 
         return UpdateSubscriptionResponse(
             success=True,
@@ -2632,6 +2638,12 @@ async def reset_user_trial(
 
     await db.commit()
 
+    if subscription_deleted:
+        # Триал снесён → убираем устаревшее funnel-меню из чата (best-effort).
+        from app.utils.funnel_notify import clear_funnel_menu
+
+        await clear_funnel_menu(user)
+
     reason_text = f' (reason: {request.reason})' if request.reason else ''
     logger.info('Admin reset trial for user', admin_id=admin.id, user_id=user_id, reason_text=reason_text)
 
@@ -3456,18 +3468,11 @@ async def sync_user_to_panel(
             sub.remnawave_uuid if settings.is_multi_tariff_enabled() and sub.remnawave_uuid else user.remnawave_uuid
         )
 
-        # Prepare data for panel
-        is_active = (
-            sub.status in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value)
-            and sub.end_date
-            and sub.end_date > datetime.now(UTC)
-        )
-        panel_status = PanelUserStatus.ACTIVE if is_active else PanelUserStatus.DISABLED
+        # Prepare data for panel (grace-aware: «бонус 2 дня» держит ACTIVE до grace_until)
+        from app.utils.grace import resolve_panel_active_and_expiry
 
-        # Ensure expire_at is in future for panel
-        expire_at = sub.end_date
-        if expire_at and expire_at <= datetime.now(UTC):
-            expire_at = datetime.now(UTC) + timedelta(minutes=1)
+        is_active, expire_at = resolve_panel_active_and_expiry(sub, datetime.now(UTC))
+        panel_status = PanelUserStatus.ACTIVE if is_active else PanelUserStatus.DISABLED
 
         # Same precaution as the per-user sync above: multi-tariff create-path
         # appends `_<remnawave_short_id>`. Helper resрвирует место.

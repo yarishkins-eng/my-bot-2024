@@ -2786,8 +2786,14 @@ async def _resolve_connected_servers(
     return connected_servers
 
 
-async def _load_devices_info(user: User) -> tuple[int, list[MiniAppDevice]]:
-    remnawave_uuid = getattr(user, 'remnawave_uuid', None)
+async def _load_devices_info(user: User, subscription=None) -> tuple[int, list[MiniAppDevice]]:
+    # Multi-tariff: каждая подписка — свой пользователь панели, поэтому берём
+    # UUID подписки, а не общий user.remnawave_uuid (иначе показали бы устройства
+    # другого тарифа и лимит выглядел бы общим). Single-tariff: один пользователь.
+    if subscription is not None and settings.is_multi_tariff_enabled():
+        remnawave_uuid = getattr(subscription, 'remnawave_uuid', None)
+    else:
+        remnawave_uuid = getattr(user, 'remnawave_uuid', None)
     if not remnawave_uuid:
         return 0, []
 
@@ -3381,7 +3387,7 @@ async def get_subscription_details(
         autopay_payload,
     )
 
-    devices_count, devices = await _load_devices_info(user)
+    devices_count, devices = await _load_devices_info(user, subscription)
 
     # Загружаем данные суточного тарифа
     is_daily_tariff = False
@@ -4039,6 +4045,12 @@ async def activate_subscription_trial_endpoint(
             charged_amount_kopeks=charged_amount,
         )
     )
+
+    # Авто-обновление меню в Telegram после успешной активации триала
+    # (общий хелпер; безопасен — под флагом, ошибки не ломают активацию).
+    from app.utils.funnel_notify import send_funnel_trial_menu
+
+    await send_funnel_trial_menu(user)
 
     return MiniAppSubscriptionTrialResponse(
         message=message,
@@ -5592,6 +5604,11 @@ async def subscription_purchase_endpoint(
 
     await db.refresh(user)
 
+    # Авто-обновление меню подписчика в Telegram (без /start) после активации платной. best-effort.
+    from app.utils.funnel_notify import notify_subscriber_menu
+
+    await notify_subscriber_menu(db, user)
+
     subscription = result.get('subscription')
     transaction = result.get('transaction')
     was_trial_conversion = bool(result.get('was_trial_conversion'))
@@ -6334,7 +6351,14 @@ async def _build_tariff_model(
     is_upgrade = None
     is_switch_free = None
 
-    if current_tariff and current_tariff.id != tariff.id:
+    if (
+        current_tariff
+        and current_tariff.id != tariff.id
+        # Для бесплатного (0₽) источника prorated-стоимость не показываем:
+        # переключение с него заблокировано (free_tariff_cannot_switch),
+        # пользователь идёт через обычную покупку по ценам периодов.
+        and not (settings.TARIFF_SWITCH_RESET_FREE_DAYS and current_tariff.is_free)
+    ):
         # PricingEngine обрабатывает все случаи: periodic↔periodic, daily→periodic, periodic→daily
         result = _calculate_tariff_switch(current_tariff, tariff, remaining_days, user=user)
         switch_cost_kopeks = result.upgrade_cost
@@ -6724,6 +6748,11 @@ async def purchase_tariff_endpoint(
 
     await db.refresh(user)
 
+    # Авто-обновление меню подписчика в Telegram (без /start) после активации платной. best-effort.
+    from app.utils.funnel_notify import notify_subscriber_menu
+
+    await notify_subscriber_menu(db, user)
+
     return MiniAppTariffPurchaseResponse(
         success=True,
         message=f"Тариф '{tariff.name}' успешно активирован",
@@ -6820,6 +6849,20 @@ async def preview_tariff_switch_endpoint(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={'code': 'same_tariff', 'message': 'Already on this tariff'},
+        )
+
+    if settings.TARIFF_SWITCH_RESET_FREE_DAYS and current_tariff is not None and current_tariff.is_free:
+        # A free (0₽) tariff has no paid value to prorate from — the prorated switch
+        # would quote the full new-tariff rate for the whole (often huge) free
+        # remainder AND carry those free days onto a paid tariff, violating
+        # TARIFF_SWITCH_RESET_FREE_DAYS. Route to the purchase flow instead.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                'code': 'free_tariff_cannot_switch',
+                'message': 'Free-tariff subscriptions cannot switch tariffs. Please purchase a tariff instead.',
+                'use_purchase_flow': True,
+            },
         )
 
     # Проверяем доступность тарифа для пользователя
@@ -6936,6 +6979,19 @@ async def switch_tariff_endpoint(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={'code': 'same_tariff', 'message': 'Already on this tariff'},
+        )
+
+    if settings.TARIFF_SWITCH_RESET_FREE_DAYS and current_tariff is not None and current_tariff.is_free:
+        # Same guard as in preview: free (0₽) source tariffs must go through the
+        # purchase flow — prorated switching would charge for and carry the whole
+        # free remainder (TARIFF_SWITCH_RESET_FREE_DAYS).
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                'code': 'free_tariff_cannot_switch',
+                'message': 'Free-tariff subscriptions cannot switch tariffs. Please purchase a tariff instead.',
+                'use_purchase_flow': True,
+            },
         )
 
     # Проверяем доступность тарифа

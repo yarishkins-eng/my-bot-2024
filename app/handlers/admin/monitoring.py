@@ -41,18 +41,24 @@ def _build_notification_settings_view(language: str):
     third_percent = NotificationSettingsService.get_third_wave_discount_percent()
     third_hours = NotificationSettingsService.get_third_wave_valid_hours()
     third_days = NotificationSettingsService.get_third_wave_trigger_days()
+    trial_discount_percent = NotificationSettingsService.get_trial_expired_discount_percent()
+    trial_discount_hours = NotificationSettingsService.get_trial_expired_discount_valid_hours()
+    trial_discount_days = NotificationSettingsService.get_trial_expired_discount_trigger_days()
 
     trial_channel_status = _format_toggle(config.get('trial_channel_unsubscribed', {}).get('enabled', True))
     expired_1d_status = _format_toggle(config['expired_1d'].get('enabled', True))
     second_wave_status = _format_toggle(config['expired_second_wave'].get('enabled', True))
     third_wave_status = _format_toggle(config['expired_third_wave'].get('enabled', True))
+    trial_discount_status = _format_toggle(config.get('trial_expired_discount', {}).get('enabled', False))
 
     summary_text = (
         '🔔 <b>Уведомления пользователям</b>\n\n'
         f'• Отписка от канала: {trial_channel_status}\n'
         f'• 1 день после истечения: {expired_1d_status}\n'
         f'• 2-3 дня (скидка {second_percent}% / {second_hours} ч): {second_wave_status}\n'
-        f'• {third_days} дней (скидка {third_percent}% / {third_hours} ч): {third_wave_status}'
+        f'• {third_days} дней (скидка {third_percent}% / {third_hours} ч): {third_wave_status}\n'
+        f'• Скидка после триала ({trial_discount_percent}% / {trial_discount_hours} ч, '
+        f'через {trial_discount_days} дн.): {trial_discount_status}'
     )
 
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -128,6 +134,30 @@ def _build_notification_settings_view(language: str):
             [
                 InlineKeyboardButton(
                     text=f'📆 Порог уведомления: {third_days} дн.', callback_data='admin_mon_notify_edit_nd_threshold'
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f'{trial_discount_status} • Скидка после триала',
+                    callback_data='admin_mon_notify_toggle_trial_discount',
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f'✏️ Скидка после триала: {trial_discount_percent}%',
+                    callback_data='admin_mon_notify_edit_trial_percent',
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f'⏱️ Срок скидки после триала: {trial_discount_hours} ч',
+                    callback_data='admin_mon_notify_edit_trial_hours',
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f'📆 Через сколько дней после триала: {trial_discount_days} дн.',
+                    callback_data='admin_mon_notify_edit_trial_days',
                 )
             ],
             [InlineKeyboardButton(text='🧪 Отправить все тесты', callback_data='admin_mon_notify_preview_all')],
@@ -484,6 +514,15 @@ async def toggle_second_wave_notification(callback: CallbackQuery):
     await _render_notification_settings(callback)
 
 
+@router.callback_query(F.data == 'admin_mon_notify_toggle_trial_discount')
+@admin_required
+async def toggle_trial_discount_notification(callback: CallbackQuery):
+    enabled = NotificationSettingsService.is_trial_expired_discount_enabled()
+    NotificationSettingsService.set_trial_expired_discount_enabled(not enabled)
+    await callback.answer('✅ Включено' if not enabled else '⏸️ Отключено')
+    await _render_notification_settings(callback)
+
+
 @router.callback_query(F.data == 'admin_mon_notify_preview_expired_2d')
 @admin_required
 async def preview_second_wave_notification(callback: CallbackQuery):
@@ -625,6 +664,45 @@ async def edit_third_wave_threshold(callback: CallbackQuery, state: FSMContext):
         'trigger',
         'NOTIFY_PROMPT_THIRD_DAYS',
         'Через сколько дней после истечения отправлять предложение? (минимум 2):',
+    )
+
+
+@router.callback_query(F.data == 'admin_mon_notify_edit_trial_percent')
+@admin_required
+async def edit_trial_discount_percent(callback: CallbackQuery, state: FSMContext):
+    await _start_notification_value_edit(
+        callback,
+        state,
+        'trial_expired_discount',
+        'percent',
+        'NOTIFY_PROMPT_TRIAL_PERCENT',
+        'Введите процент скидки после триала (0-100):',
+    )
+
+
+@router.callback_query(F.data == 'admin_mon_notify_edit_trial_hours')
+@admin_required
+async def edit_trial_discount_hours(callback: CallbackQuery, state: FSMContext):
+    await _start_notification_value_edit(
+        callback,
+        state,
+        'trial_expired_discount',
+        'hours',
+        'NOTIFY_PROMPT_TRIAL_HOURS',
+        'Введите количество часов действия скидки (1-168):',
+    )
+
+
+@router.callback_query(F.data == 'admin_mon_notify_edit_trial_days')
+@admin_required
+async def edit_trial_discount_days(callback: CallbackQuery, state: FSMContext):
+    await _start_notification_value_edit(
+        callback,
+        state,
+        'trial_expired_discount',
+        'trigger',
+        'NOTIFY_PROMPT_TRIAL_DAYS',
+        'Через сколько дней после окончания триала отправлять скидку? (минимум 1):',
     )
 
 
@@ -1678,6 +1756,18 @@ async def process_notification_value_input(message: Message, state: FSMContext):
         if value < 2:  # Минимум 2 дня
             await message.answer('❌ Количество дней должно быть не менее 2.')
             return
+    elif key == 'trial_expired_discount' and field == 'percent':
+        if value < 0 or value > 100:
+            await message.answer('❌ Процент скидки должен быть от 0 до 100.')
+            return
+    elif key == 'trial_expired_discount' and field == 'hours':
+        if value < 1 or value > 168:
+            await message.answer('❌ Количество часов должно быть от 1 до 168.')
+            return
+    elif key == 'trial_expired_discount' and field == 'trigger':
+        if value < 1:
+            await message.answer('❌ Количество дней должно быть не менее 1.')
+            return
 
     success = False
     if key == 'expired_second_wave' and field == 'percent':
@@ -1690,6 +1780,12 @@ async def process_notification_value_input(message: Message, state: FSMContext):
         success = NotificationSettingsService.set_third_wave_valid_hours(value)
     elif key == 'expired_third_wave' and field == 'trigger':
         success = NotificationSettingsService.set_third_wave_trigger_days(value)
+    elif key == 'trial_expired_discount' and field == 'percent':
+        success = NotificationSettingsService.set_trial_expired_discount_percent(value)
+    elif key == 'trial_expired_discount' and field == 'hours':
+        success = NotificationSettingsService.set_trial_expired_discount_valid_hours(value)
+    elif key == 'trial_expired_discount' and field == 'trigger':
+        success = NotificationSettingsService.set_trial_expired_discount_trigger_days(value)
 
     if not success:
         await message.answer(texts.get('NOTIFICATION_VALUE_INVALID', '❌ Некорректное значение, попробуйте снова.'))

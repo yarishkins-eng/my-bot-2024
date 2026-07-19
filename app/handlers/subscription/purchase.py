@@ -14,6 +14,7 @@ from app.database.crud.subscription import (
     create_paid_subscription,
     create_pending_trial_subscription,
     create_trial_subscription,
+    should_carry_trial_remaining_days,
 )
 from app.database.crud.transaction import create_transaction
 from app.database.crud.user import subtract_user_balance
@@ -198,13 +199,22 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
     await db.refresh(db_user)
 
     texts = get_texts(db_user.language)
+    # Фото-безопасный рендер: экран достижим из фото-меню (ENABLE_LOGO_MODE).
+    from app.utils.photo_message import edit_or_answer_photo
+
     # Multi-tariff: this branch is only reached in single-tariff mode (multi-tariff
     # is redirected to show_my_subscriptions above). db_user.subscription returns
     # the first active or most recent subscription, which is correct here.
     subscription = db_user.subscription
 
     if not subscription:
-        await callback.message.edit_text(texts.SUBSCRIPTION_NONE, reply_markup=get_back_keyboard(db_user.language))
+        await edit_or_answer_photo(
+            callback=callback,
+            caption=texts.SUBSCRIPTION_NONE,
+            keyboard=get_back_keyboard(db_user.language),
+            parse_mode='HTML',
+            force_text=True,
+        )
         await callback.answer()
         return
 
@@ -583,12 +593,15 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
             '📱 Скопируйте ссылку и добавьте в ваше VPN приложение',
         )
 
-    await callback.message.edit_text(
-        message,
-        reply_markup=get_subscription_keyboard(
+    # Фото-безопасно (импорт выше): «Продлить» суточного тарифа в меню подписчика → resume сюда.
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=message,
+        keyboard=get_subscription_keyboard(
             db_user.language, has_subscription=True, is_trial=subscription.is_trial, subscription=subscription
         ),
         parse_mode='HTML',
+        force_text=True,
     )
     await callback.answer()
 
@@ -1186,7 +1199,7 @@ async def activate_trial(callback: types.CallbackQuery, db_user: User, db: Async
                         [
                             InlineKeyboardButton(
                                 text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                                web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                                web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                             )
                         ],
                         [
@@ -1631,6 +1644,8 @@ async def handle_extend_subscription(
         return
 
     texts = get_texts(db_user.language)
+    # Фото-безопасно: меню в боте — фото (ENABLE_LOGO_MODE), edit_text по фото падает.
+    from app.utils.photo_message import edit_or_answer_photo
 
     if settings.is_multi_tariff_enabled():
         subscription, _sub_id = await _resolve_subscription(callback, db_user, db, state)
@@ -1640,9 +1655,10 @@ async def handle_extend_subscription(
         subscription = db_user.subscription
 
     if not subscription:
-        await callback.message.edit_text(
-            '🎯 <b>Пробный период заканчивается</b>\n\nЧтобы продолжить пользоваться VPN, выберите подходящий тариф.',
-            reply_markup=types.InlineKeyboardMarkup(
+        await edit_or_answer_photo(
+            callback=callback,
+            caption='🎯 <b>Пробный период заканчивается</b>\n\nЧтобы продолжить пользоваться VPN, выберите подходящий тариф.',
+            keyboard=types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [types.InlineKeyboardButton(text=texts.MENU_BUY_SUBSCRIPTION, callback_data='menu_buy')],
                     [
@@ -1654,6 +1670,7 @@ async def handle_extend_subscription(
                 ]
             ),
             parse_mode='HTML',
+            force_text=True,
         )
         await callback.answer()
         return
@@ -1666,9 +1683,10 @@ async def handle_extend_subscription(
             await show_tariff_extend(callback, db_user, db)
             return
         # Триал без тарифа — предлагаем выбрать
-        await callback.message.edit_text(
-            '🎯 <b>Пробный период заканчивается</b>\n\nЧтобы продолжить пользоваться VPN, выберите подходящий тариф.',
-            reply_markup=types.InlineKeyboardMarkup(
+        await edit_or_answer_photo(
+            callback=callback,
+            caption='🎯 <b>Пробный период заканчивается</b>\n\nЧтобы продолжить пользоваться VPN, выберите подходящий тариф.',
+            keyboard=types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [types.InlineKeyboardButton(text=texts.MENU_BUY_SUBSCRIPTION, callback_data='menu_buy')],
                     [
@@ -1680,6 +1698,7 @@ async def handle_extend_subscription(
                 ]
             ),
             parse_mode='HTML',
+            force_text=True,
         )
         await callback.answer()
         return
@@ -1705,18 +1724,20 @@ async def handle_extend_subscription(
 
     if settings.is_tariffs_mode():
         # У подписки нет тарифа, но режим тарифов включён - предлагаем выбрать тариф
-        await callback.message.edit_text(
-            '📦 <b>Выберите тариф для продления</b>\n\n'
+        await edit_or_answer_photo(
+            callback=callback,
+            caption='📦 <b>Выберите тариф для продления</b>\n\n'
             'Ваша текущая подписка была создана до введения тарифов.\n'
             'Для продления необходимо выбрать один из доступных тарифов.\n\n'
             '⚠️ Ваша текущая подписка продолжит действовать до окончания срока.',
-            reply_markup=types.InlineKeyboardMarkup(
+            keyboard=types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [types.InlineKeyboardButton(text='📦 Выбрать тариф', callback_data='tariff_switch')],
                     [types.InlineKeyboardButton(text=texts.BACK, callback_data='menu_subscription')],
                 ]
             ),
             parse_mode='HTML',
+            force_text=True,
         )
         await callback.answer()
         return
@@ -1836,10 +1857,12 @@ async def handle_extend_subscription(
 
     message_text += '💡 <i>Цена включает все ваши текущие серверы и настройки</i>'
 
-    await callback.message.edit_text(
-        message_text,
-        reply_markup=get_extend_subscription_keyboard_with_prices(db_user.language, renewal_prices),
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=message_text,
+        keyboard=get_extend_subscription_keyboard_with_prices(db_user.language, renewal_prices),
         parse_mode='HTML',
+        force_text=True,
     )
 
     await callback.answer()
@@ -2459,7 +2482,7 @@ async def confirm_purchase(callback: types.CallbackQuery, state: FSMContext, db_
 
                 trial_duration = (current_time - existing_subscription.start_date).days
 
-                if settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID and existing_subscription.end_date:
+                if should_carry_trial_remaining_days() and existing_subscription.end_date:
                     remaining_trial_delta = existing_subscription.end_date - current_time
                     if remaining_trial_delta.total_seconds() > 0:
                         bonus_period = remaining_trial_delta
@@ -2746,7 +2769,7 @@ async def confirm_purchase(callback: types.CallbackQuery, state: FSMContext, db_
                         [
                             InlineKeyboardButton(
                                 text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                                web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                                web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                             )
                         ],
                         [
@@ -3546,7 +3569,7 @@ def _build_trial_success_keyboard(texts, subscription_link: str, connect_mode: s
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                     )
                 ],
                 [

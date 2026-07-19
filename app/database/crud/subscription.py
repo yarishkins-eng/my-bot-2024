@@ -22,6 +22,7 @@ from app.database.models import (
     User,
     UserStatus,
 )
+from app.utils.grace import grace_period_for_term
 from app.utils.timezone import format_local_datetime
 
 
@@ -364,6 +365,13 @@ async def _revive_paid_subscription(
     subscription.end_date = base_date + timedelta(days=duration_days)
     subscription.updated_at = now
 
+    # Реанимация = подписка снова жива → снимаем grace и запоминаем оплаченный период.
+    subscription.in_grace = False
+    subscription.grace_until = None
+    _grace_period = grace_period_for_term(duration_days)
+    if _grace_period is not None:
+        subscription.grace_eligible_period_days = _grace_period
+
     if commit:
         await db.commit()
         await db.refresh(subscription)
@@ -422,13 +430,17 @@ async def create_paid_subscription(
     # Multi-tariff invariant: at most ONE subscription per (user, tariff). If a
     # subscription for this tariff has EXPIRED, revive it in place instead of
     # inserting a duplicate — the partial unique index only guards the alive
-    # statuses, so expired duplicates otherwise piled up. Scope intentionally
-    # narrow: an ACTIVE/LIMITED tariff still falls through to the insert and its
-    # existing unique-index "already active" handling; trials and classic mode
-    # (tariff_id is None) always create a fresh record.
+    # statuses, so expired duplicates otherwise piled up. This includes an EXPIRED
+    # TRIAL of the same tariff: re-purchasing converts it in place
+    # (_revive_paid_subscription sets is_trial=False and resets traffic BEFORE the
+    # trial-cleanup, so no self-deactivation) — the user keeps the SAME Remnawave
+    # user/link instead of getting a brand-new one (#3004, prod report 2026-06).
+    # This makes the bot/guest paths match the cabinet purchase flow. Scope still
+    # narrow: an ACTIVE/LIMITED tariff falls through to the insert (its unique-index
+    # "already active" handling); classic mode (tariff_id is None) creates fresh.
     if not is_trial and tariff_id is not None and settings.is_multi_tariff_enabled():
         _existing = await get_subscription_by_user_and_tariff(db, user_id, tariff_id, include_inactive=True)
-        if _existing is not None and not _existing.is_trial and _existing.status == SubscriptionStatus.EXPIRED.value:
+        if _existing is not None and _existing.status == SubscriptionStatus.EXPIRED.value:
             return await _revive_paid_subscription(
                 db,
                 _existing,
@@ -478,6 +490,13 @@ async def create_paid_subscription(
         tariff_id=tariff_id,
         remnawave_short_id=short_id,
     )
+
+    # Право на grace («бонус 2 дня») при будущем истечении: запоминаем оплаченный
+    # период (только month+; для триала — никогда).
+    if not is_trial:
+        _grace_period = grace_period_for_term(duration_days)
+        if _grace_period is not None:
+            subscription.grace_eligible_period_days = _grace_period
 
     db.add(subscription)
     if commit:
@@ -590,6 +609,14 @@ async def replace_subscription(
     subscription.end_date = current_time + timedelta(days=duration_days)
     subscription.traffic_limit_gb = traffic_limit_gb
     subscription.traffic_used_gb = 0.0
+
+    # Замена = свежая активная подписка → снимаем grace; запоминаем оплаченный период
+    # (только month+, не для триала).
+    subscription.in_grace = False
+    subscription.grace_until = None
+    _grace_period = None if is_trial else grace_period_for_term(duration_days)
+    if _grace_period is not None:
+        subscription.grace_eligible_period_days = _grace_period
 
     # Удаляем записи TrafficPurchase перед сбросом purchased_traffic_gb.
     # synchronize_session='fetch' — корректно инвалидирует ORM identity map
@@ -829,16 +856,30 @@ async def _apply_base_limit_preserving_active_purchases(
     return purchased_gb, subscription.traffic_limit_gb
 
 
+def should_carry_trial_remaining_days() -> bool:
+    """Переносить ли остаток триальных дней на платную подписку при переходе.
+
+    ``TARIFF_SWITCH_RESET_FREE_DAYS`` — мастер-переключатель сброса бесплатного
+    периода: пока он включён, остаток триала НЕ переносится ни на одном пути
+    покупки, даже если ``TRIAL_ADD_REMAINING_DAYS_TO_PAID=true`` (иначе флаг сброса
+    оставался мёртвым для триалов — «бесплатная версия» бота это именно триал, а
+    не 0₽-тариф). Перенос возможен только когда сброс ВЫКЛЮЧЕН и явно включён
+    ``TRIAL_ADD_REMAINING_DAYS_TO_PAID``.
+    """
+    return bool(settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID and not settings.TARIFF_SWITCH_RESET_FREE_DAYS)
+
+
 def _should_carry_remaining_days(*, is_trial: bool, source_is_free: bool) -> bool:
     """Переносить ли остаток дней при СМЕНЕ тарифа на новый срок.
 
-    - Триал: переносим только если включён TRIAL_ADD_REMAINING_DAYS_TO_PAID.
+    - Триал: по ``should_carry_trial_remaining_days`` (TARIFF_SWITCH_RESET_FREE_DAYS
+      перебивает TRIAL_ADD_REMAINING_DAYS_TO_PAID).
     - Бесплатный 0₽ тариф (``source_is_free`` уже учитывает TARIFF_SWITCH_RESET_FREE_DAYS):
       не переносим — наспамленные дни нельзя бесплатно унести на платный тариф.
     - Обычная платная подписка: переносим как раньше.
     """
-    if is_trial and not settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID:
-        return False
+    if is_trial:
+        return should_carry_trial_remaining_days()
     if source_is_free:
         return False
     return True
@@ -998,6 +1039,20 @@ async def extend_subscription(
         logger.info('🔄 Статус подписки изменён с trial на ACTIVE', subscription_id=subscription.id)
     elif days > 0 and subscription.status == SubscriptionStatus.PENDING.value:
         logger.warning('⚠️ Попытка продлить PENDING подписку , дни', subscription_id=subscription.id, days=days)
+
+    if days > 0:
+        # Grace («бонус 2 дня»): любое продление возвращает подписку к жизни → снимаем
+        # флаги, иначе экран продолжит рисовать «бонус 2 дня» на уже активной подписке.
+        if getattr(subscription, 'in_grace', False):
+            subscription.in_grace = False
+            subscription.grace_until = None
+            logger.info('🎁 Снят grace при продлении подписки', subscription_id=subscription.id)
+        # Запоминаем оплаченный период для права на grace при будущем истечении. Только
+        # month+: короткий бесплатный бонус (промо/кампания/админ) НЕ должен затирать
+        # уже накопленное право платящего пользователя (grace_period_for_term вернёт None).
+        _grace_period = grace_period_for_term(days)
+        if _grace_period is not None:
+            subscription.grace_eligible_period_days = _grace_period
 
     # Обновляем параметры тарифа, если переданы
     if tariff_id is not None:
@@ -1168,7 +1223,21 @@ async def extend_subscription(
     else:
         await db.flush()
 
-    await clear_notifications(db, subscription.id, commit=commit)
+    # Best-effort cleanup: the extension is already committed above. A failure here
+    # must not propagate — a caller that wraps extend_subscription in a compensating
+    # refund guard would otherwise roll back (a no-op for the committed extension) and
+    # refund a subscription that was actually delivered.
+    try:
+        await clear_notifications(db, subscription.id, commit=commit)
+    except Exception as clear_err:
+        logger.warning('Failed to clear notifications on extend', error=clear_err)
+        if commit:
+            # A failed internal commit leaves the session in an errored state; reset it
+            # so the caller can keep using it (the extension itself is already durable).
+            try:
+                await db.rollback()
+            except Exception:
+                pass
 
     # Kill other trial subscriptions if this extension converts trial to paid
     if not subscription.is_trial and days > 0:
@@ -1431,6 +1500,8 @@ async def reset_subscription(db: AsyncSession, subscription: Subscription, *, co
     subscription.connected_squads = []
     subscription.traffic_used_gb = 0.0
     subscription.autopay_enabled = False  # не списывать за обнулённую подписку
+    subscription.in_grace = False  # обнуление снимает «бонус 2 дня»
+    subscription.grace_until = None
     subscription.updated_at = now
 
     if commit:
@@ -1523,11 +1594,45 @@ async def get_expired_subscriptions(db: AsyncSession) -> list[Subscription]:
                 Subscription.status == SubscriptionStatus.ACTIVE.value,
                 User.status == UserStatus.ACTIVE.value,
                 Subscription.end_date <= datetime.now(UTC),
+                # 🔴 Защита от петли grace: подписки в «бонусных 2 днях» (in_grace=True)
+                # помечены EXPIRED, но сюда попадать НЕ должны — иначе каждый цикл (~30 мин)
+                # снова двигал бы grace_until вперёд бесконечно. Их финализирует
+                # get_subscriptions_grace_ended по наступлению grace_until.
+                Subscription.in_grace.is_(False),
                 # Не трогаем активные суточные подписки — ими управляет DailySubscriptionService
                 ~and_(
                     Tariff.is_daily.is_(True),
                     Subscription.is_daily_paused.is_(False),
                 ),
+            )
+        )
+    )
+    return result.scalars().all()
+
+
+async def get_subscriptions_grace_ended(db: AsyncSession) -> list[Subscription]:
+    """Подписки, у которых «бонус 2 дня» (grace) закончился — пора реально отключать VPN.
+
+    Возвращает те, что в grace (in_grace=True) и чей grace_until уже наступил.
+    Центральный цикл по ним: гасит панель, снимает in_grace, шлёт «истекла».
+    """
+    # Без фильтра по статусу пользователя: финализировать grace нужно ВСЕГДА (снять флаг +
+    # погасить панель), даже если юзера успели заблокировать/удалить за эти 2 дня — иначе
+    # подписка зависнет в in_grace навсегда. Отправку уведомления вызывающая сторона и так
+    # гейтит по доступности пользователя.
+    result = await db.execute(
+        select(Subscription)
+        .options(selectinload(Subscription.user), selectinload(Subscription.tariff))
+        .where(
+            and_(
+                Subscription.in_grace.is_(True),
+                # 🔴 Только реально истёкшие: если подписку успели продлить/реактивировать
+                # (status стал ACTIVE) с ещё не снятым in_grace — НЕ финализировать её как
+                # «grace закончился», иначе погасили бы живую оплаченную подписку и прислали
+                # ложное «истекла». (Защита от админских inline-путей продления.)
+                Subscription.status == SubscriptionStatus.EXPIRED.value,
+                Subscription.grace_until.isnot(None),
+                Subscription.grace_until <= datetime.now(UTC),
             )
         )
     )

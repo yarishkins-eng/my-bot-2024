@@ -39,17 +39,31 @@ def strip_leading_emoji(text: str) -> str:
 # Mapping from callback_data to cabinet frontend paths.
 # Used for automatic deep-linking when explicit ``cabinet_path`` is not provided.
 # If callback_data is NOT in this mapping, the button falls back to a regular callback.
+#
+# Two destinations on purpose (объединение «Главная + Подписка», июнь 2026):
+#  • ``/subscription`` — кабинет редиректит на объединённую Главную («/»). Главная
+#    сама показывает нужное действие ПО СОСТОЯНИЮ: «Продлить» при истечении (≤3 дн,
+#    совпадает с порогом уведомлений AUTOPAY_WARNING_DAYS='3,1'), «Докупить трафик»
+#    когда трафик кончился (вебхук SUB_LIMITED), «Подключить» и т.д. Сюда ведём
+#    обобщённые и зависящие-от-состояния намерения: «моя подписка», «подключиться»,
+#    «продлить», «докупить трафик».
+#  • ``/subscription/purchase`` — экран выбора тарифа/продления (``SubscriptionPurchase``).
+#    Он корректен в ЛЮБОМ состоянии (для активной показывает «Продлить», для истёкшей —
+#    баннер, для триала — апгрейд, без подписки — «Получить»). Сюда ведём явные
+#    ПОКУПОЧНЫЕ намерения: «купить», «оформить», «сменить тариф», «вернуться к
+#    оформлению/корзине» — чтобы покупатель не попал на Главную, где продающая кнопка
+#    может быть скрыта по состоянию.
 CALLBACK_TO_CABINET_PATH: dict[str, str] = {
     'menu_balance': '/balance',
     'balance_topup': '/balance/top-up',
     'menu_subscription': '/subscription',
     'subscription': '/subscription',
     'subscription_extend': '/subscription',
-    'subscription_upgrade': '/subscription',
+    'subscription_upgrade': '/subscription/purchase',
     'subscription_connect': '/subscription',
-    'subscription_resume_checkout': '/subscription',
-    'return_to_saved_cart': '/subscription',
-    'menu_buy': '/subscription',
+    'subscription_resume_checkout': '/subscription/purchase',
+    'return_to_saved_cart': '/subscription/purchase',
+    'menu_buy': '/subscription/purchase',
     'buy_traffic': '/subscription',
     'menu_referrals': '/referral',
     'menu_referral': '/referral',

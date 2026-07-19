@@ -39,7 +39,7 @@ from app.services.user_cart_service import user_cart_service
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from ...schemas.subscription import DevicePurchaseRequest
-from .helpers import _apply_addon_discount, resolve_subscription
+from .helpers import _apply_addon_discount, _resolve_device_addon_price, resolve_subscription
 
 
 logger = structlog.get_logger(__name__)
@@ -54,8 +54,14 @@ router = APIRouter()
 
 
 def _resolve_panel_uuid(subscription: Subscription | None, user: User) -> str | None:
-    """Resolve RemnaWave panel UUID: per-subscription in multi-tariff, user-level otherwise."""
-    if settings.is_multi_tariff_enabled() and subscription and subscription.remnawave_uuid:
+    """Resolve RemnaWave panel UUID: per-subscription in multi-tariff, user-level otherwise.
+
+    Multi-tariff: each subscription is its OWN panel user — return the sub's UUID
+    and do NOT fall back to ``user.remnawave_uuid`` when it's null. The fallback
+    would read/operate on another tariff's panel user, making HWID devices/limit
+    look shared across tariffs (баг с общим лимитом «по наименьшему тарифу»).
+    """
+    if settings.is_multi_tariff_enabled() and subscription is not None:
         return subscription.remnawave_uuid
     return user.remnawave_uuid
 
@@ -776,14 +782,9 @@ async def get_device_price(
 
         tariff = await get_tariff_by_id(db, subscription.tariff_id)
 
-    # Determine device price and max limit from tariff or settings
-    if tariff and tariff.device_price_kopeks is not None:
-        device_price = tariff.device_price_kopeks
-        max_device_limit = tariff.max_device_limit
-    else:
-        # Classic mode - use settings
-        device_price = settings.PRICE_PER_DEVICE
-        max_device_limit = settings.MAX_DEVICES_LIMIT if settings.MAX_DEVICES_LIMIT > 0 else None
+    # Determine device price and max limit from tariff or settings. Shared with
+    # the subscription-response top-up gate (helpers) so the two never drift.
+    device_price, max_device_limit = _resolve_device_addon_price(tariff)
 
     if not device_price or device_price <= 0:
         return {
@@ -903,10 +904,14 @@ async def get_devices(
 
     _puuid = _resolve_panel_uuid(subscription, user)
     if not _puuid:
+        # No panel uuid = account not provisioned yet (a brand-new user), NOT a
+        # panel failure → panel_ok stays True so the screen still lights up
+        # "Подключить". Distinct from the `except` branch below (real failure).
         return {
             'devices': [],
             'total': 0,
             'device_limit': subscription.device_limit or 0,
+            'panel_ok': True,
         }
 
     try:
@@ -951,6 +956,7 @@ async def get_devices(
                 'devices': formatted_devices,
                 'total': response.get('total', len(formatted_devices)),
                 'device_limit': subscription.device_limit or 0,
+                'panel_ok': True,
             }
 
     except Exception as e:
@@ -958,10 +964,13 @@ async def get_devices(
         # WARNING, как соседние читатели устройств (device_ownership, miniapp), чтобы
         # транзиентный таймаут панели не спамил админ-чат ошибками.
         logger.warning('Failed to load devices from RemnaWave (panel slow/unavailable)', error=str(e)[:200])
+        # Real panel failure: panel_ok=False so the screen shows a "panel error"
+        # state instead of a false "Подключить" on the degraded empty list.
         return {
             'devices': [],
             'total': 0,
             'device_limit': subscription.device_limit or 0,
+            'panel_ok': False,
         }
 
 

@@ -27,6 +27,7 @@ from app.database.crud.subscription import (
     get_expired_subscriptions,
     get_expiring_subscriptions,
     get_subscriptions_for_autopay,
+    get_subscriptions_grace_ended,
     reactivate_subscription,
 )
 from app.database.crud.user import (
@@ -60,6 +61,7 @@ from app.services.notification_settings_service import NotificationSettingsServi
 from app.services.promo_offer_service import promo_offer_service
 from app.services.subscription_service import SubscriptionService, get_traffic_reset_strategy
 from app.utils.cache import cache
+from app.utils.grace import is_grace_eligible, is_in_grace
 from app.utils.message_patch import caption_exceeds_telegram_limit
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
 from app.utils.promo_offer import get_user_active_promo_discount_percent
@@ -235,15 +237,30 @@ class MonitoringService:
             try:
                 from app.utils.message_patch import _cache_logo_file_id, get_logo_media
 
-                result = await self.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=get_logo_media(),
-                    caption=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
+                # Жёсткий per-send таймаут: без него залипший send_photo (на медленном
+                # канале это особенно вероятно на ПЕРВОЙ отправке цикла, где грузится
+                # файл логотипа ~700КБ — file_id кешируется только после успеха) держит
+                # await до session timeout (60s) на каждого получателя и блокирует хвост
+                # цикла мониторинга. На TimeoutError пропускаем получателя.
+                result = await asyncio.wait_for(
+                    self.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=get_logo_media(),
+                        caption=text,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode,
+                    ),
+                    timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
                 )
                 _cache_logo_file_id(result)
                 return result
+            except TimeoutError:
+                logger.warning(
+                    'send_photo завис дольше таймаута — пропускаем получателя, цикл продолжается',
+                    chat_id=chat_id,
+                    timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
+                )
+                return None
             except TelegramBadRequest as exc:
                 logger.warning(
                     'Не удалось отправить сообщение с логотипом, отправляем текстовое сообщение',
@@ -251,12 +268,23 @@ class MonitoringService:
                     exc=exc,
                 )
 
-        return await self.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-        )
+        try:
+            return await asyncio.wait_for(
+                self.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                ),
+                timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
+            )
+        except TimeoutError:
+            logger.warning(
+                'send_message завис дольше таймаута — пропускаем получателя, цикл продолжается',
+                chat_id=chat_id,
+                timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
+            )
+            return None
 
     @staticmethod
     def _is_unreachable_error(error: TelegramBadRequest) -> bool:
@@ -358,6 +386,7 @@ class MonitoringService:
                 await self._check_trial_expiring_soon(db)
                 await self._check_trial_channel_subscriptions(db)
                 await self._check_expired_subscription_followups(db)
+                await self._check_trial_expired_discount(db)
                 await self._check_traffic_warnings(db)
                 await self._check_low_balance_alerts(db)
                 await self._retry_stuck_guest_purchases(db)
@@ -496,6 +525,11 @@ class MonitoringService:
         try:
             from app.database.crud.subscription import is_recently_updated_by_webhook
 
+            # Сначала финализируем подписки, чей «бонус 2 дня» уже закончился: реально
+            # гасим VPN и шлём «истекла». Делаем ДО get_expired_subscriptions (та их не
+            # вернёт — они исключены фильтром in_grace).
+            await self._process_grace_ended(db)
+
             expired_subscriptions = await get_expired_subscriptions(db)
 
             for subscription in expired_subscriptions:
@@ -510,26 +544,41 @@ class MonitoringService:
                 # Capture tariff name before expire_subscription's db.refresh() expires the relationship
                 _tariff_name = subscription.tariff.name if getattr(subscription, 'tariff', None) else None
 
+                user = await get_user_by_id(db, subscription.user_id)
+
+                # Multi-tariff: гасим уведомление (и «истекла», и «бонус»), если у юзера
+                # есть ДРУГАЯ активная подписка — сервис не прервался. Считаем ОДИН раз,
+                # чтобы единым флагом покрыть и grace-ветку, и обычное истечение.
+                skip_notify = False
+                if user and settings.is_multi_tariff_enabled():
+                    other_active = await db.execute(
+                        select(Subscription.id)
+                        .where(
+                            Subscription.user_id == user.id,
+                            Subscription.id != subscription.id,
+                            Subscription.status == SubscriptionStatus.ACTIVE.value,
+                            Subscription.end_date > datetime.now(UTC),
+                        )
+                        .limit(1)
+                    )
+                    skip_notify = other_active.scalar_one_or_none() is not None
+
+                # 🎁 Grace («бонус 2 дня»): платным подписчикам от 1 месяца даём ещё 2 дня
+                # живого VPN вместо мгновенного отключения. Внутри: панельный expireAt=end+2д,
+                # статус EXPIRED + in_grace, отдельное «бонусное» уведомление (НЕ «истекла»).
+                # Если включить grace не удалось (панель недоступна) — честно идём по обычному
+                # истечению ниже.
+                if settings.GRACE_ENABLED and user and is_grace_eligible(subscription, user):
+                    entered = await self._enter_subscription_grace(
+                        db, subscription, user, tariff_name=_tariff_name, notify=not skip_notify
+                    )
+                    if entered:
+                        continue
+
                 await expire_subscription(db, subscription)
 
-                user = await get_user_by_id(db, subscription.user_id)
-                if user and self.bot:
-                    # Skip notification if user has another ACTIVE subscription (multi-tariff)
-                    skip_notify = False
-                    if settings.is_multi_tariff_enabled():
-                        other_active = await db.execute(
-                            select(Subscription.id)
-                            .where(
-                                Subscription.user_id == user.id,
-                                Subscription.id != subscription.id,
-                                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                                Subscription.end_date > datetime.now(UTC),
-                            )
-                            .limit(1)
-                        )
-                        skip_notify = other_active.scalar_one_or_none() is not None
-                    if not skip_notify:
-                        await self._send_subscription_expired_notification(user, subscription, tariff_name=_tariff_name)
+                if user and self.bot and not skip_notify:
+                    await self._send_subscription_expired_notification(user, subscription, tariff_name=_tariff_name)
 
                 logger.info(
                     "🔴 Подписка пользователя истекла и статус изменен на 'expired'", user_id=subscription.user_id
@@ -545,6 +594,175 @@ class MonitoringService:
 
         except Exception as e:
             logger.error('Ошибка проверки истёкших подписок', error=e)
+
+    async def _enter_subscription_grace(
+        self,
+        db: AsyncSession,
+        subscription: Subscription,
+        user: User,
+        *,
+        tariff_name: str | None = None,
+        notify: bool = True,
+    ) -> bool:
+        """Перевести истёкшую платную подписку в «бонус 2 дня» (grace).
+
+        Сначала ЯВНО двигаем панельный expireAt на end+GRACE_PERIOD_DAYS (VPN живёт).
+        Только если панель приняла — фиксируем в БД (status=EXPIRED + in_grace=True +
+        grace_until) и шлём «бонусное» уведомление. Если панель недоступна — возвращаем
+        False, и вызывающая сторона честно истекает подписку как обычно (не врём «VPN жив»).
+        ``notify=False`` (multi-tariff: есть другая активная подписка) — флаги ставим, но
+        «бонусное» сообщение не шлём.
+        """
+        now = datetime.now(UTC)
+        end = subscription.end_date
+        if end is None:
+            return False
+        grace_until = end + timedelta(days=settings.GRACE_PERIOD_DAYS)
+        # Окно бонуса уже прошло (подписка обработана с большим опозданием — простой
+        # мониторинга и т.п.): держать grace бессмысленно и сообщение «отключится <прошлая
+        # дата>» вводит в заблуждение. Идём по обычному истечению.
+        if grace_until <= now:
+            return False
+
+        # Панель — источник правды по живости VPN. Двигаем expireAt ВПЕРЁД (статус ACTIVE).
+        ok = await self.subscription_service.push_panel_state(db, subscription, active=True, expire_at=grace_until)
+        if not ok:
+            logger.warning(
+                '🎁 Grace не включён: панель недоступна — обычное истечение',
+                subscription_id=subscription.id,
+                user_id=subscription.user_id,
+            )
+            return False
+
+        subscription.status = SubscriptionStatus.EXPIRED.value
+        subscription.in_grace = True
+        subscription.grace_until = grace_until
+        subscription.updated_at = now
+        await db.commit()
+
+        logger.info(
+            '🎁 Подписка переведена в grace (бонус 2 дня), VPN продлён в панели',
+            subscription_id=subscription.id,
+            user_id=subscription.user_id,
+            grace_until=grace_until,
+        )
+
+        # Кабинет, открытый в момент истечения, должен сразу показать «бонус» вместо
+        # устаревшего состояния. Шлём тихий WS-сигнал «перечитай подписку» (НЕ
+        # subscription.expired — на него фронт рисует пугающий тост «истекла»).
+        # Best-effort: сбой WS не должен мешать grace.
+        try:
+            from app.cabinet.routes.websocket import notify_user_subscription_grace_started
+
+            await notify_user_subscription_grace_started(subscription.user_id)
+        except Exception as ws_error:
+            logger.debug('grace WS-сигнал кабинету не отправлен (не критично)', error=ws_error)
+
+        if notify and user and self.bot:
+            await self._send_grace_started_notification(user, subscription, grace_until, tariff_name=tariff_name)
+        return True
+
+    async def _process_grace_ended(self, db: AsyncSession) -> None:
+        """Финализировать подписки, чей «бонус 2 дня» закончился: реально гасим VPN,
+        снимаем in_grace и шлём «истекла». Панель и так авто-истечёт по grace_until, но
+        дублируем явным disable для чистого состояния; снятие in_grace — идемпотентно."""
+        try:
+            ended = await get_subscriptions_grace_ended(db)
+            for subscription in ended:
+                user = subscription.user or await get_user_by_id(db, subscription.user_id)
+                _tariff_name = subscription.tariff.name if getattr(subscription, 'tariff', None) else None
+
+                # Гасим VPN явно (на случай если панель почему-то ещё активна).
+                panel_disabled = await self.subscription_service.push_panel_state(
+                    db, subscription, active=False, expire_at=datetime.now(UTC) + timedelta(minutes=1)
+                )
+                # Если панель не приняла disable — в очередь ретраев (action='update'
+                # перечитает grace-aware состояние и догасит). БД всё равно финализируем
+                # ниже: повторно в grace не войдём (in_grace=False), а панель и так истечёт
+                # по ранее выставленному expireAt=grace_until. Best-effort — не ломает цикл.
+                if not panel_disabled:
+                    try:
+                        from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+                        remnawave_retry_queue.enqueue(
+                            subscription_id=subscription.id,
+                            user_id=subscription.user_id,
+                            action='update',
+                        )
+                        logger.warning(
+                            'Grace-disable панели не прошёл — поставлен в очередь ретраев',
+                            subscription_id=subscription.id,
+                        )
+                    except Exception as enqueue_err:
+                        logger.error('Не удалось поставить grace-disable в ретрай', error=enqueue_err)
+
+                subscription.in_grace = False
+                subscription.grace_until = None
+                subscription.status = SubscriptionStatus.EXPIRED.value
+                subscription.updated_at = datetime.now(UTC)
+                # НЕ делаем db.refresh: expire_on_commit=False сохраняет загруженные
+                # user/tariff, а refresh истёк бы relationship → ленивая загрузка в async
+                # (MissingGreenlet) при сборке уведомления.
+                await db.commit()
+
+                logger.info(
+                    '🔴 Grace закончился — подписка реально истекла, VPN отключён',
+                    subscription_id=subscription.id,
+                    user_id=subscription.user_id,
+                )
+
+                if user and self.bot:
+                    await self._send_subscription_expired_notification(user, subscription, tariff_name=_tariff_name)
+        except Exception as e:
+            logger.error('Ошибка финализации grace-подписок', error=e)
+
+    async def _send_grace_started_notification(
+        self, user: User, subscription: Subscription, grace_until: datetime, *, tariff_name: str | None = None
+    ) -> bool:
+        """«Бонусное» уведомление при входе в grace: VPN ещё работает 2 дня + ссылка на
+        кабинет (продлить из браузера без VPN). Слово «грейс» пользователю НЕ показываем."""
+        try:
+            from aiogram.types import InlineKeyboardMarkup
+
+            until_str = format_local_datetime(grace_until, '%d.%m')
+            message = (
+                '🎁 <b>Подписка закончилась</b>\n\n'
+                'Но мы оставили VPN включённым ещё на 2 дня — продли спокойно, без спешки.\n\n'
+                f'⏳ Отключится {until_str}.'
+            )
+            message += self._cabinet_link_suffix()
+
+            extend_callback = f'se:{subscription.id}' if settings.is_multi_tariff_enabled() else 'subscription_extend'
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [build_miniapp_or_callback_button(text='💎 Продлить подписку', callback_data=extend_callback)],
+                    [build_miniapp_or_callback_button(text='💳 Пополнить баланс', callback_data='balance_topup')],
+                ]
+            )
+
+            await self._send_message_with_logo(
+                chat_id=user.telegram_id,
+                text=message,
+                parse_mode='HTML',
+                reply_markup=keyboard,
+            )
+            return True
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            if await self._handle_unreachable_user(user, exc, 'бонусное уведомление (grace)'):
+                return True
+            logger.error('Ошибка Telegram при отправке бонусного уведомления', telegram_id=user.telegram_id, exc=exc)
+            return False
+        except Exception as e:
+            logger.error('Ошибка отправки бонусного уведомления (grace)', telegram_id=user.telegram_id, e=e)
+            return False
+
+    def _cabinet_link_suffix(self) -> str:
+        """Строка-приписка со ссылкой на кабинет в браузере (вход без VPN), если настроена.
+        Сообщение «оседает» в чате → человек может зайти и продлить даже если VPN отключится."""
+        cabinet_url = settings.get_cabinet_link()
+        if not cabinet_url:
+            return ''
+        return f'\n\n🌐 Продлить можно и в браузере (работает без VPN, если домен доступен):\n{cabinet_url}'
 
     async def update_remnawave_user(self, db: AsyncSession, subscription: Subscription) -> RemnaWaveUser | None:
         try:
@@ -612,15 +830,24 @@ class MonitoringService:
                 )
                 return None
 
+            # Grace-aware: пока идёт «бонус 2 дня» — держим ACTIVE с expireAt=grace_until.
+            if is_in_grace(subscription, current_time):
+                is_active = True
+                panel_expire_at = subscription.grace_until
+            else:
+                panel_expire_at = (
+                    subscription.end_date
+                    if is_active
+                    else max(subscription.end_date, current_time + timedelta(minutes=1))
+                )
+
             async with self.subscription_service.get_api_client() as api:
                 hwid_limit = resolve_hwid_device_limit_for_payload(subscription)
 
                 update_kwargs = dict(
                     uuid=remnawave_uuid,
                     status=RemnaWaveUserStatus.ACTIVE if is_active else RemnaWaveUserStatus.DISABLED,
-                    expire_at=subscription.end_date
-                    if is_active
-                    else max(subscription.end_date, current_time + timedelta(minutes=1)),
+                    expire_at=panel_expire_at,
                     traffic_limit_bytes=self._gb_to_bytes(subscription.traffic_limit_gb),
                     traffic_limit_strategy=get_traffic_reset_strategy(subscription.tariff),
                     description=settings.format_remnawave_user_description(
@@ -1152,6 +1379,9 @@ class MonitoringService:
                         Subscription.status == SubscriptionStatus.EXPIRED.value,
                         Subscription.end_date <= now,
                         Subscription.end_date >= lookback,
+                        # 🎁 Не трогаем подписки в «бонусе 2 дня»: VPN ещё жив, иначе на
+                        # day+1 ушло бы «Доступ заблокирован» при работающем VPN.
+                        Subscription.in_grace.is_(False),
                         User.status == UserStatus.ACTIVE.value,
                     )
                 )
@@ -1171,6 +1401,10 @@ class MonitoringService:
             for subscription in subscriptions:
                 user = subscription.user
                 if not user:
+                    continue
+
+                # Подстраховка к SQL-фильтру: пока идёт «бонус 2 дня» — молчим (VPN жив).
+                if getattr(subscription, 'in_grace', False):
                     continue
 
                 if subscription.end_date is None:
@@ -1276,6 +1510,94 @@ class MonitoringService:
 
         except Exception as e:
             logger.error('Ошибка проверки напоминаний об истекшей подписке', error=e)
+
+    async def _check_trial_expired_discount(self, db: AsyncSession):
+        """Скидка-крючок для пользователей, у которых закончился ТРИАЛ (платной не было).
+
+        Через trigger_days дней после окончания триала создаёт персональный промо-оффер
+        и шлёт предложение со скидкой. Под отдельным флагом (по умолчанию ВЫКЛ).
+        Платные подписки НЕ затрагивает (фильтр is_trial==True + has_had_paid==False).
+        """
+        if not NotificationSettingsService.are_notifications_globally_enabled():
+            return
+        if not NotificationSettingsService.is_trial_expired_discount_enabled():
+            return
+        if not self.bot:
+            return
+
+        try:
+            now = datetime.now(UTC)
+            lookback = now - timedelta(days=30)
+            trigger_days = NotificationSettingsService.get_trial_expired_discount_trigger_days()
+            percent = NotificationSettingsService.get_trial_expired_discount_percent()
+            if percent <= 0:
+                return
+            valid_hours = NotificationSettingsService.get_trial_expired_discount_valid_hours()
+
+            result = await db.execute(
+                select(Subscription)
+                .join(User, Subscription.user_id == User.id)
+                .options(
+                    selectinload(Subscription.user),
+                    selectinload(Subscription.tariff),
+                )
+                .where(
+                    and_(
+                        Subscription.is_trial == True,
+                        Subscription.status == SubscriptionStatus.EXPIRED.value,
+                        Subscription.end_date <= now,
+                        Subscription.end_date >= lookback,
+                        User.status == UserStatus.ACTIVE.value,
+                        User.has_had_paid_subscription == False,
+                    )
+                )
+            )
+            subscriptions = result.scalars().all()
+
+            sent = 0
+            processed_users: set[int] = set()
+            for subscription in subscriptions:
+                user = subscription.user
+                if not user or subscription.end_date is None:
+                    continue
+                if not getattr(user, 'telegram_id', None):
+                    continue
+                # Один оффер на пользователя за цикл (у юзера может быть >1 истёкшего триала)
+                if user.id in processed_users:
+                    continue
+
+                days_since = (now - subscription.end_date).total_seconds() / 86400
+                if not (trigger_days <= days_since < trigger_days + 1):
+                    continue
+
+                if await notification_sent(db, user.id, subscription.id, 'trial_expired_discount'):
+                    continue
+
+                processed_users.add(user.id)
+                offer = await upsert_discount_offer(
+                    db,
+                    user_id=user.id,
+                    subscription_id=subscription.id,
+                    notification_type='trial_expired_discount',
+                    discount_percent=percent,
+                    bonus_amount_kopeks=0,
+                    valid_hours=valid_hours,
+                    effect_type='percent_discount',
+                    # Срок скидки ПОСЛЕ нажатия «Получить скидку» = тот же valid_hours,
+                    # чтобы скидка не была бессрочной (совпадает с текстом «действует до …»).
+                    extra_data={'active_discount_hours': valid_hours},
+                )
+                success = await self._send_trial_expired_discount_notification(
+                    user, subscription, percent, offer.expires_at, offer.id
+                )
+                if success:
+                    await record_notification(db, user.id, subscription.id, 'trial_expired_discount')
+                    sent += 1
+
+            if sent:
+                logger.info('Отправлены скидочные предложения после триала', count=sent)
+        except Exception as e:
+            logger.error('Ошибка проверки скидок после триала', error=e)
 
     async def _get_expiring_paid_subscriptions(self, db: AsyncSession, days_before: int) -> list[Subscription]:
         current_time = datetime.now(UTC)
@@ -1645,6 +1967,14 @@ class MonitoringService:
                                     new_expires_at=subscription.end_date,
                                 )
 
+                            # Авто-обновление меню подписчика в Telegram (без /start) после автопродления.
+                            try:
+                                from app.utils.funnel_notify import notify_subscriber_menu
+
+                                await notify_subscriber_menu(db, user)
+                            except Exception:
+                                pass
+
                             processed_count += 1
                             self._notified_users.add(autopay_key)
                             logger.info(
@@ -1719,6 +2049,7 @@ class MonitoringService:
 
 🔧 Доступ к серверам заблокирован до продления.
 """
+            message += self._cabinet_link_suffix()
 
             from aiogram.types import InlineKeyboardMarkup
 
@@ -1814,6 +2145,8 @@ class MonitoringService:
                 action_text=action_text,
                 tariff_label=tariff_label,
             )
+            # Ссылка на кабинет в браузере (вход без VPN) — даём заранее, пока VPN ещё жив.
+            message += self._cabinet_link_suffix()
 
             from aiogram.types import InlineKeyboardMarkup
 
@@ -2186,6 +2519,73 @@ class MonitoringService:
             return False
         except Exception as e:
             logger.error('Ошибка отправки скидочного уведомления пользователю', telegram_id=user.telegram_id, e=e)
+            return False
+
+    async def _send_trial_expired_discount_notification(
+        self,
+        user: User,
+        subscription: Subscription,
+        percent: int,
+        expires_at: datetime,
+        offer_id: int,
+    ) -> bool:
+        try:
+            texts = get_texts(user.language)
+
+            template = texts.t(
+                'TRIAL_EXPIRED_DISCOUNT',
+                (
+                    '🎁 <b>Персональная скидка {percent}%</b>\n\n'
+                    'Ваш пробный период закончился. Оформите первую подписку со скидкой — '
+                    'предложение действует до {expires_at}.'
+                ),
+            )
+            message = template.format(
+                percent=percent,
+                expires_at=format_local_datetime(expires_at, '%d.%m.%Y %H:%M'),
+            )
+
+            from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup  # noqa: F401
+
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        build_miniapp_or_callback_button(
+                            text='🎁 Получить скидку', callback_data=f'claim_discount_{offer_id}'
+                        )
+                    ],
+                    [
+                        build_miniapp_or_callback_button(
+                            text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
+                            callback_data='menu_buy',
+                            cabinet_path='/subscription/purchase',
+                        )
+                    ],
+                ]
+            )
+
+            await self._send_message_with_logo(
+                chat_id=user.telegram_id,
+                text=message,
+                parse_mode='HTML',
+                reply_markup=keyboard,
+            )
+            return True
+
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            if await self._handle_unreachable_user(user, exc, 'скидку после триала'):
+                return True
+            logger.error(
+                'Ошибка Telegram API при отправке скидки после триала',
+                telegram_id=user.telegram_id,
+                exc=exc,
+            )
+            return False
+        except TelegramNetworkError as e:
+            logger.warning('Таймаут отправки скидки после триала', telegram_id=user.telegram_id, e=e)
+            return False
+        except Exception as e:
+            logger.error('Ошибка отправки скидки после триала', telegram_id=user.telegram_id, e=e)
             return False
 
     async def _send_autopay_success_notification(
@@ -2783,6 +3183,10 @@ class MonitoringService:
         from app.database.crud.subscription import is_recently_updated_by_webhook
 
         try:
+            # Также финализируем подписки с закончившимся «бонусом 2 дня» (их get_expired
+            # не вернёт — они исключены фильтром in_grace), иначе ручная проверка их пропустит.
+            await self._process_grace_ended(db)
+
             expired_subscriptions = await get_expired_subscriptions(db)
             expired_count = 0
 

@@ -25,6 +25,116 @@ from app.utils.subscription_utils import (
 logger = structlog.get_logger(__name__)
 
 
+def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMarkup | None:
+    """Строит меню воронки по состоянию пользователя.
+
+    Возвращает None, если для состояния funnel-меню не задано — тогда вызывающий
+    код использует обычное меню. Кусок A — NEWBIE; кусок B — TRIAL_ACTIVE/TRIAL_EXPIRED;
+    кусок C — платный подписчик PAID_ACTIVE/PAID_EXPIRING/PAID_EXPIRED.
+    Вызывается также из мини-аппа (авто-обновление меню после активации триала).
+    """
+    from app.utils.funnel_state import FunnelState
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    if state == FunnelState.NEWBIE:
+        rows: list[list[InlineKeyboardButton]] = []
+
+        # «Попробовать бесплатно» показываем только если триал реально доступен
+        trial_available = settings.TRIAL_DURATION_DAYS > 0 and settings.TRIAL_DISABLED_FOR != 'all'
+        if trial_available:
+            trial_text = texts.t('FUNNEL_TRY_FREE', '🎁 Попробовать бесплатно')
+            cabinet_url = build_cabinet_url('/')
+            if cabinet_url:
+                rows.append([InlineKeyboardButton(text=trial_text, web_app=types.WebAppInfo(url=cabinet_url))])
+            else:
+                # Нет URL мини-аппа — fallback на бот-флоу триала
+                rows.append([InlineKeyboardButton(text=trial_text, callback_data='menu_trial')])
+
+        rows.append([InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs')])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if state in (FunnelState.TRIAL_ACTIVE, FunnelState.TRIAL_EXPIRED):
+        # Меню одинаковое: на триале — чтобы оформить заранее; после триала —
+        # чтобы вернуть доступ. Отличается только баннер-текст над меню.
+        rows = []
+
+        # CTA «Оформить подписку» — во всю ширину, открывает экран ПОКУПКИ тарифов в мини-аппе.
+        # Именно /subscription/purchase (не /subscription → Главная): иначе этот CTA вёл бы в то же
+        # место, что и «Личный кабинет» ниже (оба на Главную), и противоречил бы своему описанию.
+        cta_text = texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку')
+        subscribe_url = build_cabinet_url('/subscription/purchase')
+        if subscribe_url:
+            rows.append([InlineKeyboardButton(text=cta_text, web_app=types.WebAppInfo(url=subscribe_url))])
+        else:
+            rows.append([InlineKeyboardButton(text=cta_text, callback_data='menu_buy')])
+
+        # Второй ряд: Личный кабинет (корень мини-аппа) + Тарифы (периоды в боте)
+        second_row: list[InlineKeyboardButton] = []
+        cabinet_text = texts.t('FUNNEL_CABINET', '👤 Личный кабинет')
+        cabinet_url = build_cabinet_url('/')
+        if cabinet_url:
+            second_row.append(InlineKeyboardButton(text=cabinet_text, web_app=types.WebAppInfo(url=cabinet_url)))
+        else:
+            second_row.append(InlineKeyboardButton(text=cabinet_text, callback_data='menu_subscription'))
+        second_row.append(
+            InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs')
+        )
+        rows.append(second_row)
+        # Рефералку показываем и триальщику (во всю ширину): попробовал VPN в 1-й день —
+        # на 2-3-й может рекомендовать. «Моя ссылка» триалу НЕ нужна (он подключается через кабинет).
+        if settings.is_referral_program_enabled():
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=texts.t('FUNNEL_INVITE_FRIEND', '🎁 Привести друга — получить бонус'),
+                        callback_data='menu_referrals',
+                    )
+                ]
+            )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if state in (FunnelState.PAID_ACTIVE, FunnelState.PAID_EXPIRING, FunnelState.PAID_EXPIRED):
+        # Меню платного подписчика. Кнопки ведут на готовые внутрибот-обработчики
+        # (open_subscription_link / menu_referrals / subscription_extend) — они сделаны
+        # фото-безопасными (edit_or_answer_photo), т.к. главное меню в боте — это фото.
+        rows = []
+        cabinet_url = build_cabinet_url('/')
+        renew_text = texts.t('FUNNEL_RENEW_CTA', '💎 Продлить подписку')
+        link_text = texts.t('FUNNEL_MY_CONNECTION_LINK', '🔗 Моя ссылка для подключения')
+        invite_text = texts.t('FUNNEL_INVITE_FRIEND', '🎁 Привести друга — получить бонус')
+        referral_on = settings.is_referral_program_enabled()
+
+        def _cabinet_button() -> InlineKeyboardButton:
+            cabinet_text = texts.t('FUNNEL_CABINET', '👤 Личный кабинет')
+            if cabinet_url:
+                return InlineKeyboardButton(text=cabinet_text, web_app=types.WebAppInfo(url=cabinet_url))
+            return InlineKeyboardButton(text=cabinet_text, callback_data='menu_subscription')
+
+        if state == FunnelState.PAID_EXPIRED:
+            # Закончилась: акцент на продление. «Моя ссылка» прячем (без активной
+            # подписки сервер не пускает по ней). Рефералку оставляем — на ней зарабатывают.
+            rows.append([InlineKeyboardButton(text=renew_text, callback_data='subscription_extend')])
+            rows.append([_cabinet_button()])
+            if referral_on:
+                rows.append([InlineKeyboardButton(text=invite_text, callback_data='menu_referrals')])
+            return InlineKeyboardMarkup(inline_keyboard=rows)
+
+        # PAID_ACTIVE / PAID_EXPIRING: «Продлить» сверху только когда заканчивается
+        if state == FunnelState.PAID_EXPIRING:
+            rows.append([InlineKeyboardButton(text=renew_text, callback_data='subscription_extend')])
+        rows.append([_cabinet_button()])
+        # Каждая кнопка — отдельным рядом (во всю ширину): длинные подписи «Моя ссылка для
+        # подключения» / «Привести друга — получить бонус» в два столбца обрезались.
+        # «Моя ссылка» уважает настройку HIDE_SUBSCRIPTION_LINK: если ссылку прячут — кнопки нет
+        if not settings.should_hide_subscription_link():
+            rows.append([InlineKeyboardButton(text=link_text, callback_data='open_subscription_link')])
+        if referral_on:
+            rows.append([InlineKeyboardButton(text=invite_text, callback_data='menu_referrals')])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    return None
+
+
 async def get_main_menu_keyboard_async(
     db: AsyncSession,
     language: str = DEFAULT_LANGUAGE,
@@ -47,6 +157,26 @@ async def get_main_menu_keyboard_async(
     Если MENU_LAYOUT_ENABLED=True, использует конфигурацию из БД.
     Иначе делегирует в синхронную версию.
     """
+    # --- Меню по состояниям воронки (только обычные пользователи, cabinet-режим, под флагом) ---
+    # Админ/модератор всегда получают обычное полное меню (не теряют вход в админку).
+    if (
+        getattr(settings, 'FUNNEL_MENU_ENABLED', False)
+        and settings.is_cabinet_mode()
+        and user is not None
+        and not is_admin
+        and not is_moderator
+    ):
+        try:
+            from app.utils.funnel_state import classify_funnel_state
+
+            funnel_keyboard = build_funnel_menu_keyboard(classify_funnel_state(user), language, get_texts(language))
+            if funnel_keyboard is not None:
+                return funnel_keyboard
+        except Exception as exc:
+            # Защита: при любой ошибке (напр. ленивая загрузка subscriptions вне greenlet)
+            # — не падаем, отдаём обычное меню.
+            logger.warning('Funnel-меню не построено, fallback на обычное меню', error=exc)
+
     if settings.MENU_LAYOUT_ENABLED:
         from app.services.menu_layout_service import MenuContext, MenuLayoutService
 
@@ -659,7 +789,7 @@ def get_main_menu_keyboard(
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                     )
                 ]
             )
@@ -1153,7 +1283,7 @@ def get_subscription_keyboard(
                         [
                             InlineKeyboardButton(
                                 text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                                web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                                web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                             )
                         ]
                     )
@@ -1193,7 +1323,7 @@ def get_subscription_keyboard(
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                     )
                 ]
             )
@@ -1270,8 +1400,14 @@ def get_subscription_keyboard(
                         )
                     )
                 else:
-                    # Для суточных тарифов переходим на список тарифов, для обычных - мгновенное переключение
-                    tariff_callback = 'tariff_switch' if is_daily_tariff else 'instant_switch'
+                    # Для суточных тарифов переходим на список тарифов, для обычных - мгновенное переключение.
+                    # Бесплатный (0₽) тариф — тоже через список с выбором периода: prorated
+                    # instant-switch посчитал бы доплату за весь остаток бесплатных дней
+                    # и перенёс бы их на платный тариф вопреки TARIFF_SWITCH_RESET_FREE_DAYS.
+                    is_free_tariff = bool(
+                        tariff and getattr(tariff, 'is_free', False) and settings.TARIFF_SWITCH_RESET_FREE_DAYS
+                    )
+                    tariff_callback = 'tariff_switch' if (is_daily_tariff or is_free_tariff) else 'instant_switch'
                     settings_row.append(
                         InlineKeyboardButton(
                             text=texts.t('CHANGE_TARIFF_BUTTON', '📦 Тариф'), callback_data=tariff_callback
@@ -2261,18 +2397,13 @@ def get_referral_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMar
     keyboard = [
         [
             InlineKeyboardButton(
-                text=texts.t('CREATE_INVITE_BUTTON', '📝 Создать приглашение'), callback_data='referral_create_invite'
+                text=texts.t('CREATE_INVITE_BUTTON', '📤 Поделиться с другом'), callback_data='referral_create_invite'
             )
         ],
-        [InlineKeyboardButton(text=texts.t('SHOW_QR_BUTTON', '📱 Показать QR код'), callback_data='referral_show_qr')],
+        [InlineKeyboardButton(text=texts.t('SHOW_QR_BUTTON', '📱 Мой QR-код'), callback_data='referral_show_qr')],
         [
             InlineKeyboardButton(
-                text=texts.t('REFERRAL_LIST_BUTTON', '👥 Список рефералов'), callback_data='referral_list'
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=texts.t('REFERRAL_ANALYTICS_BUTTON', '📊 Аналитика'), callback_data='referral_analytics'
+                text=texts.t('REFERRAL_LIST_BUTTON', '👥 Мои приглашённые'), callback_data='referral_list'
             )
         ],
     ]

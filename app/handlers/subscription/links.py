@@ -131,7 +131,7 @@ async def handle_connect_subscription(
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL),
+                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
                     )
                 ],
                 [InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)],
@@ -261,7 +261,9 @@ async def handle_open_subscription_link(
     if subscription is None:
         return
     subscription_link = get_display_subscription_link(subscription)
-    back_cb = f'sm:{sub_id}' if settings.is_multi_tariff_enabled() else 'menu_subscription'
+    # «Назад» возвращает в ГЛАВНОЕ меню (откуда зашли через меню подписчика), а не на страницу
+    # деталей «Моя подписка» (в кабинет-режиме она иначе не открывается → выглядела «чужой»).
+    back_cb = f'sm:{sub_id}' if settings.is_multi_tariff_enabled() else 'back_to_menu'
 
     if not subscription_link:
         await callback.answer(
@@ -307,6 +309,12 @@ async def handle_open_subscription_link(
             redirect_link=redirect_link,
         )
 
+        # Фото-меню (ENABLE_LOGO_MODE) удаляем, иначе под ним повиснет дубль-сообщение.
+        if getattr(callback.message, 'photo', None):
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
         await callback.message.answer(
             happ_message,
             parse_mode='HTML',
@@ -317,53 +325,74 @@ async def handle_open_subscription_link(
         return
 
     link_text = (
-        texts.t('SUBSCRIPTION_DEVICE_LINK_TITLE', '🔗 <b>Ссылка подписки:</b>')
+        texts.t('SUBSCRIPTION_MY_LINK_TITLE', '🔗 <b>Твоя ссылка для подключения</b>')
         + '\n\n'
         + f'<code>{subscription_link}</code>\n\n'
-        + texts.t('SUBSCRIPTION_LINK_USAGE_TITLE', '📱 <b>Как использовать:</b>')
+        + texts.t(
+            'SUBSCRIPTION_LINK_USAGE_TITLE',
+            'Подключайся через приложение Happ или INCY — другие могут не подойти.\n\n📱 <b>Как подключить:</b>',
+        )
         + '\n'
         + '\n'.join(
             [
                 texts.t(
                     'SUBSCRIPTION_LINK_STEP1',
-                    '1. Нажмите на ссылку выше чтобы её скопировать',
+                    '1️⃣ Нажми на ссылку выше — она скопируется',
                 ),
                 texts.t(
                     'SUBSCRIPTION_LINK_STEP2',
-                    '2. Откройте ваше VPN приложение',
+                    '2️⃣ Открой Happ или INCY (нет приложения — установи из магазина)',
                 ),
                 texts.t(
                     'SUBSCRIPTION_LINK_STEP3',
-                    '3. Найдите функцию "Добавить подписку" или "Import"',
+                    '3️⃣ Нажми «+» (в Happ) или «Добавить» (в INCY) и вставь ссылку из буфера',
                 ),
                 texts.t(
                     'SUBSCRIPTION_LINK_STEP4',
-                    '4. Вставьте скопированную ссылку',
+                    '4️⃣ Включи VPN в приложении — и всё работает 🚀',
                 ),
             ]
         )
         + '\n\n'
         + texts.t(
             'SUBSCRIPTION_LINK_HINT',
-            '💡 Если ссылка не скопировалась, выделите её вручную и скопируйте.',
+            '➕ Ещё одно устройство (телефон, планшет, ПК): вставь эту же ссылку в приложение на нём. Сколько устройств можно — зависит от твоего тарифа.',
         )
     )
 
-    await callback.message.edit_text(
-        link_text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        callback_data=f'subscription_connect:{sub_id}'
-                        if settings.is_multi_tariff_enabled()
-                        else 'subscription_connect',
-                    )
-                ],
-                [InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)],
-            ]
-        ),
+    # «Подключиться» — в ОДИН тап на экран подключения мини-аппа (Happ/INCY + QR), без
+    # промежуточного экрана бота. Telegram не открывает happ://-схемы из inline-кнопки —
+    # только через HTTPS-страницу (мини-апп). Fallback (нет URL мини-аппа) — старый callback.
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    _connect_url = build_cabinet_url('/connection')
+    if _connect_url:
+        connect_button = InlineKeyboardButton(
+            text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
+            web_app=types.WebAppInfo(url=_connect_url),
+        )
+    else:
+        connect_button = InlineKeyboardButton(
+            text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
+            callback_data=f'subscription_connect:{sub_id}'
+            if settings.is_multi_tariff_enabled()
+            else 'subscription_connect',
+        )
+    link_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [connect_button],
+            [InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)],
+        ]
+    )
+    # Фото-безопасно: главное меню в боте — это фото (ENABLE_LOGO_MODE), а edit_text по фото
+    # падает. force_text → если сообщение фото, удаляем его и шлём текст со ссылкой.
+    from app.utils.photo_message import edit_or_answer_photo
+
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=link_text,
+        keyboard=link_keyboard,
         parse_mode='HTML',
+        force_text=True,
     )
     await callback.answer()

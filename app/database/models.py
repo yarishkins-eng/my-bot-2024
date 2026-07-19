@@ -2149,6 +2149,16 @@ class Subscription(Base):
     )  # Приостановлена ли суточная подписка пользователем
     last_daily_charge_at = Column(AwareDateTime(), nullable=True)  # Время последнего суточного списания
 
+    # ── Grace-период «бонус 2 дня после конца» (Чат 5; внутри код — grace) ──
+    # in_grace=True → подписка формально EXPIRED, но VPN держим живым до grace_until
+    # (панельный expireAt сдвинут вперёд). Экран по этим полям рисует «бонус 2 дня».
+    in_grace = Column(Boolean, default=False, nullable=False, server_default=text('false'))
+    grace_until = Column(AwareDateTime(), nullable=True)  # реальный конец grace (end_date + GRACE_PERIOD_DAYS)
+    # Оплаченный период последней покупки/продления (дней). По нему проверяем право на
+    # grace (≥ GRACE_MIN_PERIOD_DAYS). Отдельная колонка нужна, т.к. start_date при
+    # продлении не двигается → достоверного «сколько оплачено» в модели иначе нет.
+    grace_eligible_period_days = Column(Integer, nullable=True)
+
     user = relationship('User', back_populates='subscriptions')
     tariff = relationship('Tariff', back_populates='subscriptions')
     discount_offers = relationship('DiscountOffer', back_populates='subscription')

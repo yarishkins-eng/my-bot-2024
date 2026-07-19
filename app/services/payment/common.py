@@ -85,10 +85,15 @@ class PaymentCommonMixin:
                     error=error,
                 )
 
-        # Создаем основную кнопку: если есть активная подписка - продлить, иначе купить
+        # Создаем основную кнопку: если есть активная подписка - продлить, иначе купить.
+        # cabinet_path задан явно на экран покупки/продления (`/subscription/purchase`):
+        # этот экран корректен в любом состоянии (для активной подписки покажет «Продлить»),
+        # иначе после пополнения юзер с активной подпиской и запасом дней попал бы на Главную,
+        # где продающая кнопка скрыта по состоянию (объединение «Главная + Подписка»).
         first_button = build_miniapp_or_callback_button(
             text=(texts.MENU_EXTEND_SUBSCRIPTION if has_active_subscription else texts.MENU_BUY_SUBSCRIPTION),
             callback_data=('subscription_extend' if has_active_subscription else 'menu_buy'),
+            cabinet_path='/subscription/purchase',
         )
 
         keyboard_rows: list[list[InlineKeyboardButton]] = [
@@ -318,6 +323,43 @@ class PaymentCommonMixin:
             return False
 
 
+async def notify_email_user_topup(user: Any, amount_kopeks: int) -> None:
+    """«Пополнение успешно» для юзеров без Telegram (#2952).
+
+    Провайдерские webhook-обработчики шлют это сообщение только в Telegram
+    (гейт ``if bot and user.telegram_id``) — email-юзеры (telegram_id IS NULL)
+    не получали ничего. Вызываем мультиканальный роутер ТОЛЬКО для юзеров без
+    telegram_id: telegram-юзерам провайдер уже отправил сообщение напрямую, а
+    роутер сам проверяет email_verified и статус аккаунта. Сбои глотаем —
+    уведомление не должно ронять webhook после зачисления денег.
+    """
+    if user is None or getattr(user, 'telegram_id', None) or not getattr(user, 'email', None):
+        return
+    try:
+        from app.services.notification_delivery_service import (
+            NotificationType,
+            notification_delivery_service,
+        )
+
+        await notification_delivery_service.send_notification(
+            user=user,
+            notification_type=NotificationType.BALANCE_TOPUP,
+            context={
+                'formatted_amount': settings.format_price(amount_kopeks),
+                'formatted_balance': settings.format_price(getattr(user, 'balance_kopeks', 0) or 0),
+                'amount_kopeks': amount_kopeks,
+                'new_balance_kopeks': getattr(user, 'balance_kopeks', 0) or 0,
+            },
+            bot=None,
+        )
+    except Exception as error:
+        logger.error(
+            'Не удалось отправить email-уведомление о пополнении',
+            user_id=getattr(user, 'id', None),
+            error=error,
+        )
+
+
 async def send_cart_notification_after_topup(
     user: Any,
     amount_kopeks: int,
@@ -330,18 +372,25 @@ async def send_cart_notification_after_topup(
     Само сообщение «Баланс пополнен…» больше не шлётся — оно дублировало
     основное «Пополнение успешно!» и ломало MAIN_MENU_MODE=cabinet.
     """
-    del amount_kopeks  # больше не используется после удаления второго сообщения
+    # Единственная общая точка после зачисления во ВСЕХ провайдерах — поэтому
+    # email/WS-канал для юзеров без Telegram подключён здесь, а не в 18+
+    # webhook-обработчиках. Уходит до автопокупки, чтобы уведомления пришли в
+    # хронологическом порядке «пополнение → подписка» (#2952). Для
+    # telegram-юзеров это no-op — им сообщение уже отправил провайдер.
+    await notify_email_user_topup(user, amount_kopeks)
 
     from app.services.subscription_auto_purchase_service import (
         auto_purchase_saved_cart_after_topup,
         try_auto_extend_expired_after_topup,
         try_resume_disabled_daily_after_topup,
     )
+    from app.utils.funnel_notify import notify_subscriber_menu  # авто-обновление меню подписчика
 
     # Try to resume DISABLED daily subscription immediately (highest priority)
     try:
         daily_resumed = await try_resume_disabled_daily_after_topup(db, user, bot=bot)
         if daily_resumed:
+            await notify_subscriber_menu(db, user)  # меню подписчика без /start
             return False
     except Exception as daily_error:
         logger.error(
@@ -371,6 +420,7 @@ async def send_cart_notification_after_topup(
         # MAIN_MENU_MODE=cabinet и уводила из миниаппа в полное меню бота.
         try:
             await auto_purchase_saved_cart_after_topup(db, user, bot=bot)
+            await notify_subscriber_menu(db, user)  # меню подписчика без /start (только при успехе)
         except Exception as auto_error:
             logger.error(
                 'Ошибка автоматической покупки подписки для пользователя',
@@ -384,6 +434,7 @@ async def send_cart_notification_after_topup(
     try:
         auto_extended = await try_auto_extend_expired_after_topup(db, user, bot=bot)
         if auto_extended:
+            await notify_subscriber_menu(db, user)  # меню подписчика без /start
             return False
     except Exception as extend_error:
         logger.error(

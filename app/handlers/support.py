@@ -1,5 +1,6 @@
 import structlog
 from aiogram import Dispatcher, F, types
+from aiogram.fsm.context import FSMContext
 
 from app.database.models import User
 from app.keyboards.inline import get_support_keyboard
@@ -23,5 +24,32 @@ async def show_support_info(callback: types.CallbackQuery, db_user: User):
     await callback.answer()
 
 
+async def cmd_support(message: types.Message, db_user: User, state: FSMContext):
+    """Команда /support (из меню команд ☰) — тот же экран поддержки, что и кнопка menu_support.
+
+    Переиспользует текст SupportSettingsService и клавиатуру get_support_keyboard (тикеты + связаться).
+    Команда присылает НОВОЕ сообщение, поэтому message.answer (downstream-обработчики фото-безопасны).
+    ☰-команда доступна из любого контекста → сбрасываем возможный FSM-флоу (как «Назад в меню»).
+    """
+    if db_user is None:
+        return
+    await state.clear()
+    texts = get_texts(db_user.language)
+    try:
+        support_enabled = SupportSettingsService.is_support_menu_enabled()
+    except Exception:
+        support_enabled = True
+    if not support_enabled:
+        await message.answer(texts.t('SUPPORT_UNAVAILABLE', '⚙️ Поддержка временно недоступна.'))
+        return
+    support_info = SupportSettingsService.get_support_info_text(db_user.language)
+    await message.answer(
+        support_info,
+        reply_markup=get_support_keyboard(db_user.language),
+        parse_mode='HTML',
+    )
+
+
 def register_handlers(dp: Dispatcher):
     dp.callback_query.register(show_support_info, F.data == 'menu_support')
+    # cmd_support (/support) регистрируется РАНЬШЕ — в app/bot.py, до FSM-обработчиков ввода.
