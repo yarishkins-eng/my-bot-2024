@@ -1,4 +1,4 @@
-name: Deploy to staging
+name: Deploy bot to staging
 
 on:
   push:
@@ -6,23 +6,164 @@ on:
       - staging
   workflow_dispatch:
 
+concurrency:
+  group: teplo-bot-staging-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
+  verify:
+    uses: ./.github/workflows/lint.yml
+
   deploy-staging:
+    needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - name: Deploy staging via SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Deploy the exact revision and wait for staging health
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 15m
           script: |
-            set -e
-            cd /opt/teplo-bot-staging
-            git fetch origin staging
-            git reset --hard origin/staging
-            # Собираем тестового бота. При ошибке сборки старый тестовый бот продолжит работать.
-            docker compose -f docker-compose.staging.yml build bot_staging
-            docker compose -f docker-compose.staging.yml up -d
-            docker image prune -f || true
-            echo "Staging deploy OK: $(git rev-parse --short HEAD) at $(date)"
+            set -Eeuo pipefail
+
+            readonly REPO_DIR='/opt/teplo-bot-staging'
+            readonly SERVICE='bot_staging'
+            readonly TARGET_SHA='${{ github.sha }}'
+            readonly MIN_FREE_KB=2097152
+            readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'
+            readonly STATE_FILE="$STATE_DIR/bot-staging.state"
+            BUILD_DIR=''
+            BUILD_OVERRIDE=''
+
+            cd "$REPO_DIR"
+
+            compose() {
+              if [ -n "$BUILD_OVERRIDE" ]; then
+                docker compose -f docker-compose.staging.yml -f "$BUILD_OVERRIDE" "$@"
+              else
+                docker compose -f docker-compose.staging.yml "$@"
+              fi
+            }
+
+            cleanup_build_context() {
+              if [ -n "$BUILD_DIR" ]; then
+                rm -rf "$BUILD_DIR"
+              fi
+            }
+
+            create_clean_build_context() {
+              BUILD_DIR="$(mktemp -d /tmp/teplo-vpn-staging-build.XXXXXX)"
+              BUILD_OVERRIDE="$BUILD_DIR/compose-build-context.yml"
+              git archive "$TARGET_SHA" | tar -x -C "$BUILD_DIR"
+              printf '%s\n' \
+                'services:' \
+                '  bot_staging:' \
+                '    build:' \
+                "      context: $BUILD_DIR" \
+                '      dockerfile: Dockerfile' > "$BUILD_OVERRIDE"
+            }
+
+            verify_deployed_state() {
+              test -r "$STATE_FILE"
+              stored_sha="$(sed -n 's/^sha=//p' "$STATE_FILE")"
+              stored_image="$(sed -n 's/^image=//p' "$STATE_FILE")"
+              current_image="$(docker inspect --format '{{.Image}}' teplo_staging_bot)"
+              test "$stored_sha" = "$TARGET_SHA"
+              test "$stored_image" = "$current_image"
+            }
+
+            write_deployed_state() {
+              install -d -m 700 "$STATE_DIR"
+              state_tmp="$(mktemp "$STATE_DIR/bot-staging.XXXXXX")"
+              printf 'sha=%s\nimage=%s\n' "$TARGET_SHA" "$(docker inspect --format '{{.Image}}' teplo_staging_bot)" > "$state_tmp"
+              chmod 600 "$state_tmp"
+              mv "$state_tmp" "$STATE_FILE"
+            }
+
+            trap cleanup_build_context EXIT
+
+            if [ -n "$(git status --porcelain)" ]; then
+              echo 'Refusing staging deploy: the server working tree is not an exact tracked source tree.' >&2
+              exit 10
+            fi
+
+            if [ "$(df -Pk . | awk 'NR == 2 { print $4 }')" -lt "$MIN_FREE_KB" ]; then
+              echo 'Refusing staging deploy: less than 2 GiB of free disk space for a safe build.' >&2
+              exit 11
+            fi
+
+            git fetch --no-tags origin '+refs/heads/staging:refs/remotes/origin/staging'
+            readonly PREVIOUS_SHA="$(git rev-parse HEAD)"
+            readonly REMOTE_STAGING_SHA="$(git rev-parse origin/staging)"
+
+            if [ "$TARGET_SHA" != "$REMOTE_STAGING_SHA" ]; then
+              echo "Skipping superseded staging deploy: workflow=$TARGET_SHA, origin/staging=$REMOTE_STAGING_SHA"
+              exit 0
+            fi
+
+            git cat-file -e "${TARGET_SHA}^{commit}"
+
+            if [ "$PREVIOUS_SHA" = "$TARGET_SHA" ]; then
+              echo "Source already at $TARGET_SHA; requiring the staging health gate again."
+              verify_deployed_state
+              compose up -d --no-build --wait --wait-timeout 240 "$SERVICE"
+              compose ps "$SERVICE"
+              exit 0
+            fi
+
+            if ! git merge-base --is-ancestor "$PREVIOUS_SHA" "$TARGET_SHA"; then
+              echo "Refusing staging deploy: server commit $PREVIOUS_SHA is not an ancestor of $TARGET_SHA." >&2
+              exit 12
+            fi
+
+            HAS_NEW_MIGRATION=0
+            if ! git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- migrations alembic.ini app/database main.py app/config.py; then
+              HAS_NEW_MIGRATION=1
+              echo 'New Alembic migration detected: staging will test it, but no automatic source rollback is safe.'
+            fi
+
+            SOURCE_SWITCHED=0
+            SERVICE_SWITCH_ATTEMPTED=0
+            readonly PREVIOUS_IMAGE_ID="$(docker inspect --format '{{.Image}}' teplo_staging_bot)"
+            readonly SERVICE_IMAGE="$(docker inspect --format '{{.Config.Image}}' teplo_staging_bot)"
+            readonly ROLLBACK_IMAGE_TAG='teplo-vpn-rollback/bot-staging:previous'
+            docker image tag "$PREVIOUS_IMAGE_ID" "$ROLLBACK_IMAGE_TAG"
+            rollback() {
+              rc=$?
+              trap - ERR
+              set +e
+              if [ "$SOURCE_SWITCHED" = '1' ] && [ "$HAS_NEW_MIGRATION" = '0' ]; then
+                echo "Staging deploy failed; restoring the previous source revision $PREVIOUS_SHA." >&2
+                git checkout --detach "$PREVIOUS_SHA"
+              fi
+              if [ "$SERVICE_SWITCH_ATTEMPTED" = '1' ] && [ "$HAS_NEW_MIGRATION" = '0' ]; then
+                echo 'The staging container may have started; restoring the preserved working image.' >&2
+                docker image tag "$ROLLBACK_IMAGE_TAG" "$SERVICE_IMAGE"
+                compose up -d --no-build --wait --wait-timeout 240 "$SERVICE"
+                compose ps "$SERVICE"
+              fi
+              exit "$rc"
+            }
+            trap rollback ERR
+
+            # For a schema-changing staging test, preserve the failure for inspection instead of
+            # pretending that the old source is automatically compatible with the new test schema.
+            git checkout --detach "$TARGET_SHA"
+            SOURCE_SWITCHED=1
+            create_clean_build_context
+            compose build "$SERVICE"
+            SERVICE_SWITCH_ATTEMPTED=1
+            compose up -d --wait --wait-timeout 240 "$SERVICE"
+            compose ps "$SERVICE"
+            write_deployed_state
+
+            SOURCE_SWITCHED=0
+            SERVICE_SWITCH_ATTEMPTED=0
+            trap - ERR
+            echo "Staging container healthy: $TARGET_SHA at $(date --iso-8601=seconds)"
