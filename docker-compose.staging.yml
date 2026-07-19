@@ -67,6 +67,13 @@ services:
       # В продакшене код не запрашивается при регистрации; реферальная программа
       # в меню при этом продолжает работать.
       SKIP_REFERRAL_CODE: 'true'
+      # Тестируем те же пользовательские меню, что и в продакшене. Администраторы
+      # и модераторы по логике бота всё равно видят своё полное служебное меню.
+      MAIN_MENU_MODE: 'cabinet'
+      MENU_LAYOUT_ENABLED: 'false'
+      FUNNEL_MENU_ENABLED: 'true'
+      FUNNEL_SUBSCRIBER_MENU_ENABLED: 'true'
+      SUBSCRIBER_MENU_RENEW_THRESHOLD_DAYS: '0'
       # В staging панель RemnaWave намеренно недоступна — не создаём ложных тревог.
       MAINTENANCE_MONITORING_ENABLED: 'false'
       LOCALES_PATH: '/app/locales'
