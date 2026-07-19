@@ -64,6 +64,11 @@ services:
       # Тестовый бот повторяет боевой UX: правила доступны только через FAQ,
       # без обязательного принятия при /start.
       SKIP_RULES_ACCEPT: 'true'
+      # В продакшене код не запрашивается при регистрации; реферальная программа
+      # в меню при этом продолжает работать.
+      SKIP_REFERRAL_CODE: 'true'
+      # В staging панель RemnaWave намеренно недоступна — не создаём ложных тревог.
+      MAINTENANCE_MONITORING_ENABLED: 'false'
       LOCALES_PATH: '/app/locales'
     volumes:
       - ./logs:/app/logs:rw
