@@ -61,6 +61,9 @@ services:
       DATABASE_URL: 'postgresql+asyncpg://staging_user:${STAGING_DB_PASSWORD:-staging_local_only}@postgres_staging:5432/teplo_staging'
       REDIS_URL: 'redis://redis_staging:6379/0'
       TZ: 'Europe/Moscow'
+      # Тестовый бот повторяет боевой UX: правила доступны только через FAQ,
+      # без обязательного принятия при /start.
+      SKIP_RULES_ACCEPT: 'true'
       LOCALES_PATH: '/app/locales'
     volumes:
       - ./logs:/app/logs:rw
