@@ -1,8 +1,8 @@
 name: Lint
 
 on:
-  push:
-    branches: ['**']
+  # release.yml calls this workflow as a reusable job for tagged releases.
+  workflow_call:
   pull_request:
     branches: ['**']
   workflow_dispatch:
@@ -11,11 +11,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.13'
 
@@ -26,3 +26,6 @@ jobs:
 
       - name: Check linting
         run: uv run ruff check .
+
+      - name: Run tests
+        run: uv run pytest -q
