@@ -88,6 +88,17 @@ services:
     networks:
       - staging_net
     # Портов нет и web-healthcheck нет: бот в режиме polling, WEB_API выключен.
+    # Проверяем живой polling-процесс и его реальные зависимости, а не HTTP :8080:
+    # веб-сервер у staging намеренно не запускается.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import os, socket; assert b'python' in open('/proc/1/cmdline', 'rb').read(); socket.create_connection(('postgres_staging', 5432), 5).close(); socket.create_connection(('redis_staging', 6379), 5).close()"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 volumes:
   staging_postgres_data:
