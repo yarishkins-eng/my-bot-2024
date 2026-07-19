@@ -483,7 +483,9 @@ async def reply_to_ticket(
 
     message = TicketMessage(
         ticket_id=ticket.id,
-        user_id=ticket.user_id,
+        # Автор сообщения — реально ответивший админ, а не владелец тикета.
+        # Сторону сообщения сериализаторы определяют по is_from_admin.
+        user_id=admin.id,
         message_text=request.message,
         is_from_admin=True,
         has_media=has_media,
