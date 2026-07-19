@@ -2299,6 +2299,7 @@ async def show_tariff_extend(
     # Фото-безопасно: меню в боте — фото (ENABLE_LOGO_MODE). force_text переводит экран
     # в текст, дальше шаги продления (edit_text) работают по текстовому сообщению.
     from app.utils.photo_message import edit_or_answer_photo
+
     get_texts(db_user.language)
 
     if settings.is_multi_tariff_enabled():
