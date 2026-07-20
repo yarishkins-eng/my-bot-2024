@@ -4048,9 +4048,9 @@ async def activate_subscription_trial_endpoint(
 
     # Авто-обновление меню в Telegram после успешной активации триала
     # (общий хелпер; безопасен — под флагом, ошибки не ломают активацию).
-    from app.utils.funnel_notify import send_funnel_trial_menu
+    from app.utils.funnel_notify import notify_trial_menu
 
-    await send_funnel_trial_menu(user)
+    await notify_trial_menu(db, user)
 
     return MiniAppSubscriptionTrialResponse(
         message=message,

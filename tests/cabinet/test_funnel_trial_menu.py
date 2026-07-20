@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -67,6 +68,42 @@ async def test_sends_trial_menu_after_activation(monkeypatch: pytest.MonkeyPatch
     await funnel_notify.send_funnel_trial_menu(user)
 
     assert recorder.calls == 1  # меню активного триала отправлено, старое заменено
+
+
+@pytest.mark.asyncio
+async def test_trial_menu_includes_ready_connection_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Новая активная тестовая подписка сразу получает кнопку без /start."""
+    _wire(monkeypatch)
+    captured = {}
+
+    def _build(*args, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr('app.keyboards.inline.build_funnel_menu_keyboard', _build)
+    monkeypatch.setattr(
+        'app.utils.subscription_link_access.get_user_subscription_with_available_link',
+        lambda user: object(),
+    )
+    user = SimpleNamespace(telegram_id=123, language='ru')
+
+    await funnel_notify.send_funnel_trial_menu(user)
+
+    assert captured['show_connection_link'] is True
+
+
+@pytest.mark.asyncio
+async def test_notify_trial_menu_refreshes_subscription_before_sending(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Гейт ссылки видит готовый URL, созданный в той же транзакции выдачи триала."""
+    send_menu = AsyncMock()
+    monkeypatch.setattr(funnel_notify, 'send_funnel_trial_menu', send_menu)
+    db = SimpleNamespace(refresh=AsyncMock())
+    user = SimpleNamespace()
+
+    await funnel_notify.notify_trial_menu(db, user)
+
+    db.refresh.assert_awaited_once_with(user, ['subscriptions'])
+    send_menu.assert_awaited_once_with(user)
 
 
 @pytest.mark.asyncio

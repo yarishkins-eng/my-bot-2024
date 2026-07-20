@@ -11,6 +11,10 @@ from app.keyboards.inline import (
     get_happ_download_button_row,
 )
 from app.localization.texts import get_texts
+from app.utils.subscription_link_access import (
+    has_active_subscription_connection,
+    has_available_subscription_link,
+)
 from app.utils.subscription_utils import (
     convert_subscription_link_to_happ_scheme,
     get_display_subscription_link,
@@ -75,6 +79,14 @@ async def handle_connect_subscription(
     subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
     if subscription is None:
         return
+    # Старый callback может пережить истечение/отключение подписки. Экран
+    # подключения не должен отдавать конфигурацию, если VPN-доступ уже снят.
+    if not has_active_subscription_connection(subscription):
+        await callback.answer(
+            texts.t('SUBSCRIPTION_NO_ACTIVE_LINK', '⚠ У вас нет активной подписки или ссылка еще генерируется'),
+            show_alert=True,
+        )
+        return
     subscription_link = get_display_subscription_link(subscription)
     hide_subscription_link = settings.should_hide_subscription_link()
     back_cb = f'sm:{sub_id}' if settings.is_multi_tariff_enabled() else 'menu_subscription'
@@ -90,6 +102,17 @@ async def handle_connect_subscription(
         return
 
     connect_mode = settings.CONNECT_BUTTON_MODE
+
+    # В этих двух режимах кнопка Telegram содержит именно исходный URL
+    # подписки. Старый callback не должен обойти включённый позднее HIDE:
+    # miniapp_custom/guide остаются доступны, потому что не отдают raw URL из
+    # этого экрана и используют свои защищённые пути подключения.
+    if hide_subscription_link and connect_mode in {'miniapp_subscription', 'link'}:
+        await callback.answer(
+            texts.t('SUBSCRIPTION_LINK_UNAVAILABLE', '❌ Ссылка подписки недоступна'),
+            show_alert=True,
+        )
+        return
 
     if connect_mode == 'miniapp_subscription':
         keyboard = InlineKeyboardMarkup(
@@ -259,6 +282,14 @@ async def handle_open_subscription_link(
     texts = get_texts(db_user.language)
     subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
     if subscription is None:
+        return
+    # Повторяем тот же access-гейт, что управляет кнопкой. Меню может быть старым:
+    # подписка успела истечь/отключиться или админ включил скрытие URL после его отправки.
+    if not has_available_subscription_link(subscription):
+        await callback.answer(
+            texts.t('SUBSCRIPTION_LINK_UNAVAILABLE', '❌ Ссылка подписки недоступна'),
+            show_alert=True,
+        )
         return
     subscription_link = get_display_subscription_link(subscription)
     # «Назад» возвращает в ГЛАВНОЕ меню (откуда зашли через меню подписчика), а не на страницу

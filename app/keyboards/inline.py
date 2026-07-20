@@ -25,13 +25,21 @@ from app.utils.subscription_utils import (
 logger = structlog.get_logger(__name__)
 
 
-def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMarkup | None:
+def build_funnel_menu_keyboard(
+    state,
+    language: str,
+    texts,
+    *,
+    show_connection_link: bool = False,
+) -> InlineKeyboardMarkup | None:
     """Строит меню воронки по состоянию пользователя.
 
     Возвращает None, если для состояния funnel-меню не задано — тогда вызывающий
     код использует обычное меню. Кусок A — NEWBIE; кусок B — TRIAL_ACTIVE/TRIAL_EXPIRED;
     кусок C — платный подписчик PAID_ACTIVE/PAID_EXPIRING/PAID_EXPIRED.
     Вызывается также из мини-аппа (авто-обновление меню после активации триала).
+    ``show_connection_link`` вычисляется единым гейтом по живой подписке и её
+    готовой ссылке; сам билдер не должен угадывать это по is_trial/тарифу.
     """
     from app.utils.funnel_state import FunnelState
     from app.utils.miniapp_buttons import build_cabinet_url
@@ -80,8 +88,21 @@ def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMar
             InlineKeyboardButton(text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'), callback_data='funnel_tariffs')
         )
         rows.append(second_row)
+        # У любого активного тарифа, включая бесплатный/триальный, ссылка нужна
+        # для настройки следующего устройства без захода в кабинет. Ряд всегда
+        # перед рефералкой, как и в меню платного подписчика.
+        if show_connection_link:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=texts.t('FUNNEL_MY_CONNECTION_LINK', '🔗 Моя ссылка для подключения'),
+                        callback_data='open_subscription_link',
+                    )
+                ]
+            )
+
         # Рефералку показываем и триальщику (во всю ширину): попробовал VPN в 1-й день —
-        # на 2-3-й может рекомендовать. «Моя ссылка» триалу НЕ нужна (он подключается через кабинет).
+        # на 2-3-й может рекомендовать.
         if settings.is_referral_program_enabled():
             rows.append(
                 [
@@ -125,8 +146,9 @@ def build_funnel_menu_keyboard(state, language: str, texts) -> InlineKeyboardMar
         rows.append([_cabinet_button()])
         # Каждая кнопка — отдельным рядом (во всю ширину): длинные подписи «Моя ссылка для
         # подключения» / «Привести друга — получить бонус» в два столбца обрезались.
-        # «Моя ссылка» уважает настройку HIDE_SUBSCRIPTION_LINK: если ссылку прячут — кнопки нет
-        if not settings.should_hide_subscription_link():
+        # Ссылка доступна только когда общий гейт подтвердил действующий доступ,
+        # уже созданный URL и выключенное HIDE_SUBSCRIPTION_LINK.
+        if show_connection_link:
             rows.append([InlineKeyboardButton(text=link_text, callback_data='open_subscription_link')])
         if referral_on:
             rows.append([InlineKeyboardButton(text=invite_text, callback_data='menu_referrals')])
@@ -168,8 +190,14 @@ async def get_main_menu_keyboard_async(
     ):
         try:
             from app.utils.funnel_state import classify_funnel_state
+            from app.utils.subscription_link_access import get_user_subscription_with_available_link
 
-            funnel_keyboard = build_funnel_menu_keyboard(classify_funnel_state(user), language, get_texts(language))
+            funnel_keyboard = build_funnel_menu_keyboard(
+                classify_funnel_state(user),
+                language,
+                get_texts(language),
+                show_connection_link=get_user_subscription_with_available_link(user) is not None,
+            )
             if funnel_keyboard is not None:
                 return funnel_keyboard
         except Exception as exc:

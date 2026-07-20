@@ -185,6 +185,17 @@ async def get_connection_link(
             detail='No subscription found',
         )
 
+    # Нельзя выдать конфигурацию истёкшей/отключённой подписке только потому,
+    # что старый URL ещё не был очищен webhook'ом. HIDE_SUBSCRIPTION_LINK сюда
+    # намеренно не входит: он скрывает raw URL, но не штатные crypt/deep-link.
+    from app.utils.subscription_link_access import has_active_subscription_connection
+
+    if not has_active_subscription_connection(subscription):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='No active subscription connection link',
+        )
+
     subscription_url = subscription.subscription_url
     if not subscription_url:
         raise HTTPException(
@@ -377,7 +388,7 @@ async def _load_app_config_async() -> dict[str, Any] | None:
 
 
 def _create_deep_link(
-    app: dict[str, Any], subscription_url: str, subscription_crypto_link: str | None = None
+    app: dict[str, Any], subscription_url: str | None, subscription_crypto_link: str | None = None
 ) -> str | None:
     """Create deep link for app with subscription URL.
 
@@ -467,6 +478,18 @@ async def get_app_config(
     """Get app configuration for connection with deep links."""
     subscription = await resolve_subscription(db, user, subscription_id)
 
+    # Этот endpoint участвует в экране /connection параллельно с
+    # /connection-link. Без такого же гейта старый URL мог бы отдать
+    # конфигурацию истёкшей/отключённой подписки через fallback фронтенда.
+    if subscription:
+        from app.utils.subscription_link_access import has_active_subscription_connection
+
+        if not has_active_subscription_connection(subscription):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail='No active subscription connection link',
+            )
+
     subscription_url = None
     subscription_crypto_link = None
     if subscription:
@@ -500,8 +523,12 @@ async def get_app_config(
             detail='App configuration not set up.',
         )
 
-    config.pop('_isRemnawave', None)
     hide_link = settings.should_hide_subscription_link()
+    # HIDE_SUBSCRIPTION_LINK скрывает именно исходный subscription URL. Даже
+    # авторизованный mini-app не получает его в JSON: для deep-link остаётся
+    # только crypto-вариант, если он создан выше.
+    connection_url = None if hide_link else subscription_url
+    config.pop('_isRemnawave', None)
 
     # Build platformNames from displayName of each platform
     platform_names: dict[str, Any] = {}
@@ -537,8 +564,8 @@ async def get_app_config(
 
             # Generate deep link
             deep_link = None
-            if subscription_url or subscription_crypto_link:
-                deep_link = _create_deep_link(app, subscription_url, subscription_crypto_link)
+            if connection_url or subscription_crypto_link:
+                deep_link = _create_deep_link(app, connection_url, subscription_crypto_link)
             app['deepLink'] = deep_link
 
             # Resolve templates only for subscriptionLink and copyButton (not external)
@@ -554,7 +581,7 @@ async def get_app_config(
                         if url and '{{' in url:
                             resolved = _resolve_button_url(
                                 url,
-                                subscription_url,
+                                connection_url,
                                 subscription_crypto_link,
                             )
                             # Only set resolvedUrl if ALL templates were resolved;
@@ -577,8 +604,8 @@ async def get_app_config(
         'baseSettings': config.get('baseSettings'),
         'uiConfig': config.get('uiConfig', {}),
         'platformNames': platform_names,
-        'hasSubscription': bool(subscription_url or subscription_crypto_link),
-        'subscriptionUrl': subscription_url,
+        'hasSubscription': bool(connection_url or subscription_crypto_link),
+        'subscriptionUrl': connection_url,
         'subscriptionCryptoLink': subscription_crypto_link,
         'hideLink': hide_link,
         'branding': config.get('brandingSettings', {}),
