@@ -3527,11 +3527,11 @@ async def grant_trial_subscription(callback: types.CallbackQuery, db_user: User,
     if success:
         # Авто-обновление меню у пользователя в Telegram (без /start), best-effort:
         # выдали триал → шлём меню активного триала и убираем старое меню новичка.
-        from app.utils.funnel_notify import send_funnel_trial_menu
+        from app.utils.funnel_notify import notify_trial_menu
 
         _target = await get_user_by_id(db, user_id)
         if _target is not None:
-            await send_funnel_trial_menu(_target)
+            await notify_trial_menu(db, _target)
 
         await callback.message.edit_text(
             '✅ Пользователю выдан триальный период',

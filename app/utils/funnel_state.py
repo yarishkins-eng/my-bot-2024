@@ -129,8 +129,15 @@ def classify_funnel_state(user) -> FunnelState:
     if paid_state is not None:
         return paid_state
 
-    # Платил когда-либо → платный путь, funnel-меню (триал) не для него
+    # У пользователя с историей оплаты может быть текущий БЕСПЛАТНЫЙ тариф,
+    # который намеренно остаётся is_trial=True после admin relabel. Он должен
+    # видеть тот же active-trial UX (включая «Моя ссылка»), а не обычное меню.
+    # Не меняем ни is_trial, ни has_had_paid_subscription: это только выбор UI.
     if has_had_paid:
+        for sub in subscriptions:
+            status = (getattr(sub, 'actual_status', '') or '').lower()
+            if bool(getattr(sub, 'is_trial', False)) and status in _ALIVE_STATUSES:
+                return FunnelState.TRIAL_ACTIVE
         return FunnelState.OTHER
 
     trial_active = False

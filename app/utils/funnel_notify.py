@@ -134,13 +134,24 @@ async def clear_funnel_menu(user) -> None:
         logger.debug('clear_funnel_menu failed', error=exc)
 
 
+async def notify_trial_menu(db, user) -> None:
+    """Обновляет свежую подписку и best-effort шлёт меню активного триала."""
+    try:
+        await db.refresh(user, ['subscriptions'])
+    except Exception as exc:
+        logger.debug('notify_trial_menu refresh failed', error=exc)
+    await send_funnel_trial_menu(user)
+
+
 async def send_funnel_trial_menu(user) -> None:
-    """Шлёт пользователю меню активного триала (3 кнопки) после активации.
+    """Шлёт пользователю меню активного триала после активации.
 
     Дополнительно удаляет предыдущее меню (новичка), если оно было запомнено, и
     запоминает новое — чтобы его, в свою очередь, убрать при следующем переходе.
     Ничего не делает, если funnel-меню выключено, бот не в cabinet-режиме или у
     пользователя нет telegram_id (email-only). Ошибки логируются, но не пробрасываются.
+    Вызывающий, которому нужен актуальный ряд ссылки сразу после выдачи, должен
+    использовать ``notify_trial_menu(db, user)``.
 
     Вызывается из ВСЕХ мест активации триала одинаково (React-кабинет, legacy
     Telegram mini-app, админ-выдача). Раньше тут был параметр ``source`` с ранним
@@ -157,10 +168,16 @@ async def send_funnel_trial_menu(user) -> None:
         from app.keyboards.inline import build_funnel_menu_keyboard
         from app.localization.texts import get_texts
         from app.utils.funnel_state import FunnelState
+        from app.utils.subscription_link_access import get_user_subscription_with_available_link
 
         language = getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE
         texts = get_texts(language)
-        keyboard = build_funnel_menu_keyboard(FunnelState.TRIAL_ACTIVE, language, texts)
+        keyboard = build_funnel_menu_keyboard(
+            FunnelState.TRIAL_ACTIVE,
+            language,
+            texts,
+            show_connection_link=get_user_subscription_with_available_link(user) is not None,
+        )
         if keyboard is None:
             return
 
@@ -217,6 +234,7 @@ async def send_funnel_subscriber_menu(user) -> None:
         from app.keyboards.inline import build_funnel_menu_keyboard
         from app.localization.texts import get_texts
         from app.utils.funnel_state import get_subscriber_state
+        from app.utils.subscription_link_access import has_available_subscription_link
 
         state, _sub = get_subscriber_state(user)
         if state is None:
@@ -224,7 +242,12 @@ async def send_funnel_subscriber_menu(user) -> None:
 
         language = getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE
         texts = get_texts(language)
-        keyboard = build_funnel_menu_keyboard(state, language, texts)
+        keyboard = build_funnel_menu_keyboard(
+            state,
+            language,
+            texts,
+            show_connection_link=has_available_subscription_link(_sub),
+        )
         if keyboard is None:
             return
 
