@@ -174,7 +174,9 @@ def _format_tariff_period_button_text(
     period_text = _format_tariff_period_label(period_days, texts.language)
     months = calculate_months_from_days(period_days)
     if price_kopeks <= 0 or months <= 1:
-        display_price_text = texts.TARIFF_PERIOD_FROM_PRICE.format(price=price_text) if is_starting_price else price_text
+        display_price_text = (
+            texts.TARIFF_PERIOD_FROM_PRICE.format(price=price_text) if is_starting_price else price_text
+        )
         return f'{period_text} — {display_price_text}'
 
     monthly_price_rubles = (price_kopeks + months * 100 - 1) // (months * 100)
@@ -188,7 +190,7 @@ def _format_tariff_period_button_text(
 def _format_tariff_period_label(period_days: int, language: str) -> str:
     """Format tariff button periods in the selected UI language."""
     if (language or '').split('-')[0].lower() == 'en':
-        return f"{period_days} {'day' if period_days == 1 else 'days'}"
+        return f'{period_days} {"day" if period_days == 1 else "days"}'
     return format_period(period_days)
 
 
@@ -1493,9 +1495,7 @@ async def select_tariff_period(
     final_price = pricing_result.final_total
     original_price = pricing_result.original_total
     discount_percent = (
-        round((1 - final_price / original_price) * 100)
-        if original_price > 0 and final_price < original_price
-        else 0
+        round((1 - final_price / original_price) * 100) if original_price > 0 and final_price < original_price else 0
     )
 
     # Проверяем баланс
