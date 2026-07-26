@@ -158,7 +158,7 @@ def _format_tariff_period_button_text(
     price_text: str,
     texts,
     *,
-    is_base_price: bool = False,
+    is_starting_price: bool = False,
 ) -> str:
     """Format a period button with an easy-to-read effective monthly price.
 
@@ -167,19 +167,79 @@ def _format_tariff_period_button_text(
     monthly price is rounded *up* to whole rubles so the compact UI never
     understates the actual cost of the selected period.
 
-    ``is_base_price`` is used for configurable-traffic tariffs. Their traffic
-    cost is selected on the next screen, therefore this button can only show a
-    starting monthly price.
+    ``is_starting_price`` is used for configurable-traffic tariffs. Their
+    traffic cost is selected on the next screen, therefore this button shows
+    the minimum allowed configuration rather than an incomplete base price.
     """
+    period_text = _format_tariff_period_label(period_days, texts.language)
     months = calculate_months_from_days(period_days)
     if price_kopeks <= 0 or months <= 1:
-        return f'{format_period(period_days)} — {price_text}'
+        display_price_text = texts.TARIFF_PERIOD_FROM_PRICE.format(price=price_text) if is_starting_price else price_text
+        return f'{period_text} — {display_price_text}'
 
     monthly_price_rubles = (price_kopeks + months * 100 - 1) // (months * 100)
     monthly_price_text = format_price_kopeks(monthly_price_rubles * 100)
-    template = texts.TARIFF_PERIOD_MONTHLY_FROM if is_base_price else texts.TARIFF_PERIOD_MONTHLY
+    template = texts.TARIFF_PERIOD_MONTHLY_FROM if is_starting_price else texts.TARIFF_PERIOD_MONTHLY
     monthly_text = template.format(price=monthly_price_text)
-    return f'{format_period(period_days)} — {price_text} {monthly_text}'
+    display_price_text = texts.TARIFF_PERIOD_FROM_PRICE.format(price=price_text) if is_starting_price else price_text
+    return f'{period_text} — {display_price_text} {monthly_text}'
+
+
+def _format_tariff_period_label(period_days: int, language: str) -> str:
+    """Format tariff button periods in the selected UI language."""
+    if (language or '').split('-')[0].lower() == 'en':
+        return f"{period_days} {'day' if period_days == 1 else 'days'}"
+    return format_period(period_days)
+
+
+async def _calculate_tariff_period_display_price(
+    tariff: Tariff,
+    period_days: int,
+    db_user: User | None,
+    *,
+    device_limit: int | None = None,
+    custom_traffic_gb: int | None = None,
+) -> tuple[int, int]:
+    """Return the same final price and discount as the confirmation screen.
+
+    The period keyboard is only an estimate UI, but it must not display a
+    number that differs from confirmation. PricingEngine owns all discounts,
+    additional-device costs and configurable-traffic costs, so it is the
+    single source of truth here as well.
+    """
+    from app.services.pricing_engine import pricing_engine
+
+    result = await pricing_engine.calculate_tariff_purchase_price(
+        tariff,
+        period_days,
+        device_limit=device_limit if device_limit is not None else tariff.device_limit,
+        custom_traffic_gb=custom_traffic_gb,
+        user=db_user,
+    )
+    discount_percent = (
+        round((1 - result.final_total / result.original_total) * 100)
+        if result.original_total > 0 and result.final_total < result.original_total
+        else 0
+    )
+    return result.final_total, discount_percent
+
+
+async def _get_matching_subscription_device_limit(
+    db: AsyncSession,
+    db_user: User,
+    tariff: Tariff,
+) -> int | None:
+    """Return the current limit only when this purchase extends the same tariff."""
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_subscription_by_user_and_tariff
+
+        existing_subscription = await get_subscription_by_user_and_tariff(db, db_user.id, tariff.id)
+    else:
+        existing_subscription = await get_subscription_by_user_id(db, db_user.id)
+
+    if existing_subscription and existing_subscription.tariff_id == tariff.id:
+        return existing_subscription.device_limit
+    return None
 
 
 def format_tariffs_list_text(
@@ -268,11 +328,12 @@ def get_tariffs_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_tariff_periods_keyboard(
+async def get_tariff_periods_keyboard(
     tariff: Tariff,
     language: str,
     db_user: User | None = None,
     back_callback: str = 'tariff_list',
+    subscription_device_limit: int | None = None,
 ) -> InlineKeyboardMarkup:
     """Создает клавиатуру выбора периода для тарифа с учетом скидок по периодам.
 
@@ -285,15 +346,13 @@ def get_tariff_periods_keyboard(
     prices = tariff.period_prices or {}
     for period_str in sorted(prices.keys(), key=int):
         period = int(period_str)
-        price = prices[period_str]
-
-        # Получаем скидку для конкретного периода
-        group_pct, offer_pct, discount_percent = 0, 0, 0
-        if db_user:
-            group_pct, offer_pct, discount_percent = _get_user_period_discount(db_user, period)
-
+        price, discount_percent = await _calculate_tariff_period_display_price(
+            tariff,
+            period,
+            db_user,
+            device_limit=subscription_device_limit,
+        )
         if discount_percent > 0:
-            price = _apply_promo_discount(price, group_pct, offer_pct)
             price_text = f'{format_price_kopeks(price)} 🔥−{discount_percent}%'
         else:
             price_text = format_price_kopeks(price)
@@ -306,7 +365,7 @@ def get_tariff_periods_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_tariff_periods_keyboard_with_traffic(
+async def get_tariff_periods_keyboard_with_traffic(
     tariff: Tariff,
     language: str,
     db_user: User | None = None,
@@ -318,15 +377,13 @@ def get_tariff_periods_keyboard_with_traffic(
     prices = tariff.period_prices or {}
     for period_str in sorted(prices.keys(), key=int):
         period = int(period_str)
-        price = prices[period_str]
-
-        # Получаем скидку для конкретного периода
-        group_pct, offer_pct, discount_percent = 0, 0, 0
-        if db_user:
-            group_pct, offer_pct, discount_percent = _get_user_period_discount(db_user, period)
-
+        price, discount_percent = await _calculate_tariff_period_display_price(
+            tariff,
+            period,
+            db_user,
+            custom_traffic_gb=tariff.min_traffic_gb,
+        )
         if discount_percent > 0:
-            price = _apply_promo_discount(price, group_pct, offer_pct)
             price_text = f'{format_price_kopeks(price)} 🔥−{discount_percent}%'
         else:
             price_text = format_price_kopeks(price)
@@ -336,7 +393,7 @@ def get_tariff_periods_keyboard_with_traffic(
             price,
             price_text,
             texts,
-            is_base_price=True,
+            is_starting_price=True,
         )
         # Используем другой callback для перехода к настройке трафика
         buttons.append(
@@ -727,7 +784,13 @@ async def show_funnel_tariffs(
     await edit_or_answer_photo(
         callback=callback,
         caption=format_tariff_info_for_user(tariff, db_user.language),
-        keyboard=get_tariff_periods_keyboard(tariff, db_user.language, db_user=db_user, back_callback='back_to_menu'),
+        keyboard=await get_tariff_periods_keyboard(
+            tariff,
+            db_user.language,
+            db_user=db_user,
+            back_callback='back_to_menu',
+            subscription_device_limit=await _get_matching_subscription_device_limit(db, db_user, tariff),
+        ),
         parse_mode='HTML',
     )
     await callback.answer()
@@ -888,14 +951,19 @@ async def select_tariff(
             await callback.message.edit_text(
                 format_tariff_info_for_user(tariff, db_user.language)
                 + '\n\n📊 <i>После выбора периода вы сможете настроить трафик</i>',
-                reply_markup=get_tariff_periods_keyboard_with_traffic(tariff, db_user.language, db_user=db_user),
+                reply_markup=await get_tariff_periods_keyboard_with_traffic(tariff, db_user.language, db_user=db_user),
                 parse_mode='HTML',
             )
         else:
             # Для обычного тарифа показываем выбор периода
             await callback.message.edit_text(
                 format_tariff_info_for_user(tariff, db_user.language),
-                reply_markup=get_tariff_periods_keyboard(tariff, db_user.language, db_user=db_user),
+                reply_markup=await get_tariff_periods_keyboard(
+                    tariff,
+                    db_user.language,
+                    db_user=db_user,
+                    subscription_device_limit=await _get_matching_subscription_device_limit(db, db_user, tariff),
+                ),
                 parse_mode='HTML',
             )
 
@@ -1396,13 +1464,39 @@ async def select_tariff_period(
         await callback.answer('Тариф недоступен', show_alert=True)
         return
 
-    # Получаем скидку для выбранного периода
-    group_pct, offer_pct, discount_percent = _get_user_period_discount(db_user, period)
+    # Resolve the same subscription/device limit that confirmation will use.
+    # Otherwise the period button could include extra devices while this
+    # intermediate confirmation showed only the tariff base price.
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_subscription_by_user_and_tariff
 
-    # Получаем цену
-    prices = tariff.period_prices or {}
-    base_price = prices.get(str(period), 0)
-    final_price = _apply_promo_discount(base_price, group_pct, offer_pct)
+        existing_subscription = await get_subscription_by_user_and_tariff(db, db_user.id, tariff_id)
+    else:
+        existing_subscription = await get_subscription_by_user_id(db, db_user.id)
+
+    effective_device_limit = (
+        existing_subscription.device_limit
+        if existing_subscription and existing_subscription.tariff_id == tariff.id
+        else tariff.device_limit
+    )
+
+    # Use the same engine as the period button and the actual charge. This is
+    # essential for separately discounted devices and promotional offers.
+    from app.services.pricing_engine import pricing_engine
+
+    pricing_result = await pricing_engine.calculate_tariff_purchase_price(
+        tariff,
+        period,
+        device_limit=effective_device_limit,
+        user=db_user,
+    )
+    final_price = pricing_result.final_total
+    original_price = pricing_result.original_total
+    discount_percent = (
+        round((1 - final_price / original_price) * 100)
+        if original_price > 0 and final_price < original_price
+        else 0
+    )
 
     # Проверяем баланс
     user_balance = db_user.balance_kopeks or 0
@@ -1413,13 +1507,13 @@ async def select_tariff_period(
         # Показываем подтверждение
         discount_text = ''
         if discount_percent > 0:
-            discount_text = f'\n🎁 Скидка: {discount_percent}% (-{format_price_kopeks(base_price - final_price)})'
+            discount_text = f'\n🎁 Скидка: {discount_percent}% (-{format_price_kopeks(original_price - final_price)})'
 
         await callback.message.edit_text(
             f'✅ <b>Подтверждение покупки</b>\n\n'
             f'📦 Тариф: <b>{html.escape(tariff.name)}</b>\n'
             f'📊 Трафик: {traffic}\n'
-            f'📱 Устройств: {tariff.device_limit}\n'
+            f'📱 Устройств: {effective_device_limit}\n'
             f'📅 Период: {format_period(period)}\n'
             f'{discount_text}\n'
             f'💰 <b>Итого: {format_price_kopeks(final_price)}</b>\n\n'
@@ -1431,14 +1525,6 @@ async def select_tariff_period(
     else:
         # Недостаточно средств - сохраняем корзину для автопокупки
         missing = final_price - user_balance
-
-        # Ищем существующую подписку для передачи subscription_id в корзину
-        if settings.is_multi_tariff_enabled():
-            from app.database.crud.subscription import get_subscription_by_user_and_tariff
-
-            _existing_sub = await get_subscription_by_user_and_tariff(db, db_user.id, tariff_id)
-        else:
-            _existing_sub = await get_subscription_by_user_id(db, db_user.id)
 
         # Сохраняем данные корзины для автопокупки после пополнения
         cart_data = {
@@ -1452,10 +1538,10 @@ async def select_tariff_period(
             'return_to_cart': True,
             'description': f'Покупка тарифа {tariff.name} на {period} дней',
             'traffic_limit_gb': tariff.traffic_limit_gb,
-            'device_limit': tariff.device_limit,
+            'device_limit': effective_device_limit,
             'allowed_squads': tariff.allowed_squads or [],
             'discount_percent': discount_percent,
-            'subscription_id': _existing_sub.id if _existing_sub else None,
+            'subscription_id': existing_subscription.id if existing_subscription else None,
         }
         await user_cart_service.save_user_cart(db_user.id, cart_data)
 
@@ -1480,10 +1566,7 @@ async def select_tariff_period(
     # активен", refunds, leaves user confused).
     target_subscription_id: int | None = None
     if settings.is_multi_tariff_enabled():
-        from app.database.crud.subscription import get_subscription_by_user_and_tariff
-
-        _existing_sub = await get_subscription_by_user_and_tariff(db, db_user.id, tariff_id)
-        target_subscription_id = _existing_sub.id if _existing_sub else None
+        target_subscription_id = existing_subscription.id if existing_subscription else None
 
     await state.update_data(
         selected_tariff_id=tariff_id,
