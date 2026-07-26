@@ -1493,8 +1493,9 @@ async def get_main_menu_text(user, texts, db: AsyncSession):
                 trial_days = format_period_description(settings.TRIAL_DURATION_DAYS, language)
                 return texts.t(
                     'FUNNEL_NEWBIE_MENU_TEXT',
-                    '🔥 Остался один шаг до свободного интернета.\n\n'
-                    'Подписки пока нет — но {trial_days} с Тепло бесплатно. Включается за 30 секунд 👇',
+                    '🔥Осталось включить VPN и интернет свободен\n\n'
+                    'Первые {trial_days} бесплатно.\n'
+                    'Подключение занимает ~30 секунд👇',
                 ).format(trial_days=trial_days)
         except Exception as exc:
             logger.debug('Funnel newbie text failed, fallback на обычный', error=exc)
