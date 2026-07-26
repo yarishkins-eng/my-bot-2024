@@ -1092,6 +1092,7 @@
   "INSUFFICIENT_BALANCE": "❌ Insufficient balance.\n\nTop up {amount} and try again.",
   "INVALID_AMOUNT": "❌ Invalid amount",
   "LANGUAGE_PROMPT": "🌐 Choose the interface language:",
+  "CABINET_COMMAND_PROMPT": "👤 Open your personal account using the button below.",
   "LANGUAGE_SELECTED": "🌐 Interface language set: <b>English</b>",
   "LANGUAGE_SELECTION_DISABLED": "⚙️ Language selection is temporarily unavailable. Using the default language.",
   "LOADING": "⏳ Loading...",

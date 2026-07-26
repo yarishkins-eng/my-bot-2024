@@ -1131,6 +1131,54 @@ async def cmd_language(message: types.Message, db_user: User, state: FSMContext)
     )
 
 
+async def cmd_cabinet(message: types.Message, db_user: User, state: FSMContext):
+    """Команда /cabinet из меню ☰: открыть корень личного кабинета.
+
+    Telegram-команда не умеет открывать Mini App сама по себе, поэтому команда
+    присылает одну нативную WebApp-кнопку. Это намеренно не заменяет кнопку ☰:
+    в ней остаются /start, /language и /support.
+
+    Как и остальные навигационные команды из ☰, команда прекращает незавершённый
+    ввод в FSM: после перехода в кабинет старый ввод не должен обработаться при
+    следующем сообщении пользователя.
+    """
+    if db_user is None:
+        return
+
+    await state.clear()
+    texts = get_texts(db_user.language)
+
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    cabinet_url = build_cabinet_url('/') if settings.is_cabinet_mode() else ''
+    if not cabinet_url:
+        await message.answer(
+            texts.t(
+                'MENU_PROFILE_UNAVAILABLE',
+                '❗️ Личный кабинет пока недоступен. Попробуйте позже.',
+            )
+        )
+        return
+
+    cabinet_text = texts.t('MENU_PROFILE', '👤 Личный кабинет')
+    await message.answer(
+        texts.t(
+            'CABINET_COMMAND_PROMPT',
+            '👤 Откройте личный кабинет кнопкой ниже.',
+        ),
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text=cabinet_text,
+                        web_app=types.WebAppInfo(url=cabinet_url),
+                    )
+                ]
+            ]
+        ),
+    )
+
+
 async def show_language_menu(
     callback: types.CallbackQuery,
     db_user: User,
