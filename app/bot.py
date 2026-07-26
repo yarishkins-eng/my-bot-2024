@@ -76,6 +76,7 @@ from app.middlewares.maintenance import MaintenanceMiddleware
 from app.middlewares.subscription_checker import SubscriptionStatusMiddleware
 from app.middlewares.throttling import ThrottlingMiddleware
 from app.services.maintenance_service import maintenance_service
+from app.utils.bot_commands import get_command_menus
 from app.utils.cache import cache
 from app.utils.message_patch import patch_message_methods
 
@@ -176,11 +177,12 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     dp.message.middleware(SubscriptionStatusMiddleware())
     dp.callback_query.middleware(SubscriptionStatusMiddleware())
     dp.pre_checkout_query.middleware(SubscriptionStatusMiddleware())
-    # Командные хендлеры меню ☰ (/language, /support) регистрируем ПЕРВЫМИ: иначе FSM-обработчики
+    # Командные хендлеры меню ☰ (/cabinet, /language, /support) регистрируем ПЕРВЫМИ: иначе FSM-обработчики
     # ввода (промокод/вывод средств/тикеты) перехватывают команду как «ввод» и она не срабатывает.
     # /start уже идёт первым внутри start.register_handlers. Команды должны иметь приоритет.
     from aiogram.filters import Command as _CmdFilter
 
+    dp.message.register(menu.cmd_cabinet, _CmdFilter('cabinet'))
     dp.message.register(menu.cmd_language, _CmdFilter('language'))
     dp.message.register(support.cmd_support, _CmdFilter('support'))
 
@@ -305,22 +307,13 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     except Exception as e:
         logger.error('Ошибка запуска RemnaWave retry queue', error=e)
 
-    # --- Меню команд Telegram (☰): Перезагрузить / Язык / Техподдержка ---
+    # --- Меню команд Telegram (☰): Перезагрузить / Личный кабинет / Язык / Техподдержка ---
     # В меню команд можно только команда + текст-описание с эмодзи (картинку/логотип Telegram
     # не поддерживает). Ставим для default + ru + en (Telegram берёт язык клиента). best-effort.
     try:
-        from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
+        from aiogram.types import BotCommandScopeAllPrivateChats
 
-        _cmds_ru = [
-            BotCommand(command='start', description='🔄 Перезагрузить бота'),
-            BotCommand(command='language', description='🌐 Язык'),
-            BotCommand(command='support', description='🛠️ Техподдержка'),
-        ]
-        _cmds_en = [
-            BotCommand(command='start', description='🔄 Restart bot'),
-            BotCommand(command='language', description='🌐 Language'),
-            BotCommand(command='support', description='🛠️ Support'),
-        ]
+        _cmds_ru, _cmds_en = get_command_menus()
         # default scope
         await bot.set_my_commands(_cmds_ru)
         await bot.set_my_commands(_cmds_ru, language_code='ru')
