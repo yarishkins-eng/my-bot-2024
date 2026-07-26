@@ -2309,59 +2309,29 @@ async def confirm_daily_tariff_purchase(
 # ==================== Продление по тарифу ====================
 
 
-def _calc_extra_devices_cost(tariff: Tariff, subscription_device_limit: int, period_days: int) -> int:
-    """Рассчитывает стоимость дополнительных устройств сверх тарифа для периода."""
-    additional = max(0, subscription_device_limit - (tariff.device_limit or 1))
-    if additional <= 0:
-        return 0
-    device_price = getattr(tariff, 'device_price_kopeks', None) or 0
-    if device_price <= 0:
-        return 0
-    months = max(1, round(period_days / 30))
-    return additional * device_price * months
-
-
-def get_tariff_extend_keyboard(
+async def get_tariff_extend_keyboard(
     tariff: Tariff,
     language: str,
     db_user: User | None = None,
     subscription_device_limit: int | None = None,
     subscription_id: int | None = None,
 ) -> InlineKeyboardMarkup:
-    """Создает клавиатуру выбора периода для продления по тарифу с учетом скидок по периодам."""
-    from app.services.pricing_engine import PricingEngine
-
+    """Create renewal periods using the same pricing engine as the charge."""
     texts = get_texts(language)
     buttons = []
-
-    promo_group = PricingEngine.resolve_promo_group(db_user) if db_user else None
 
     prices = tariff.period_prices or {}
     for period_str in sorted(prices.keys(), key=int):
         period = int(period_str)
-        base_price = prices[period_str]
+        price, discount_percent = await _calculate_tariff_period_display_price(
+            tariff,
+            period,
+            db_user,
+            device_limit=subscription_device_limit,
+        )
 
-        # Стоимость дополнительных устройств
-        devices_cost = 0
-        if subscription_device_limit is not None:
-            devices_cost = _calc_extra_devices_cost(tariff, subscription_device_limit, period)
-
-        # Per-category group discounts (period + devices separately, like PricingEngine)
-        period_pct = promo_group.get_discount_percent('period', period) if promo_group else 0
-        devices_pct = promo_group.get_discount_percent('devices', period) if promo_group else 0
-        offer_pct = get_user_active_promo_discount_percent(db_user) if db_user else 0
-
-        discounted_base = PricingEngine.apply_discount(base_price, period_pct)
-        discounted_devices = PricingEngine.apply_discount(devices_cost, devices_pct)
-        subtotal = discounted_base + discounted_devices
-        price = PricingEngine.apply_discount(subtotal, offer_pct)
-
-        # Combined display discount
-        total_original = base_price + devices_cost
-        has_discount = price < total_original and total_original > 0
-        if has_discount:
-            combined_pct = round((1 - price / total_original) * 100)
-            price_text = f'{format_price_kopeks(price)} 🔥−{combined_pct}%'
+        if discount_percent > 0:
+            price_text = f'{format_price_kopeks(price)} 🔥−{discount_percent}%'
         else:
             price_text = format_price_kopeks(price)
 
@@ -2567,7 +2537,7 @@ async def show_tariff_extend(
             f'📱 Устройств: {actual_device_limit}\n\n'
             'Выберите период продления:'
         ),
-        keyboard=get_tariff_extend_keyboard(
+        keyboard=await get_tariff_extend_keyboard(
             tariff,
             db_user.language,
             db_user=db_user,
@@ -3011,27 +2981,21 @@ def get_tariff_switch_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_tariff_switch_periods_keyboard(
+async def get_tariff_switch_periods_keyboard(
     tariff: Tariff,
     language: str,
     db_user: User | None = None,
 ) -> InlineKeyboardMarkup:
-    """Создает клавиатуру выбора периода для переключения тарифа с учетом скидок по периодам."""
+    """Create switch periods using the same pricing engine as the charge."""
     texts = get_texts(language)
     buttons = []
 
     prices = tariff.period_prices or {}
     for period_str in sorted(prices.keys(), key=int):
         period = int(period_str)
-        price = prices[period_str]
-
-        # Получаем скидку для конкретного периода
-        group_pct, offer_pct, discount_percent = 0, 0, 0
-        if db_user:
-            group_pct, offer_pct, discount_percent = _get_user_period_discount(db_user, period)
+        price, discount_percent = await _calculate_tariff_period_display_price(tariff, period, db_user)
 
         if discount_percent > 0:
-            price = _apply_promo_discount(price, group_pct, offer_pct)
             price_text = f'{format_price_kopeks(price)} 🔥−{discount_percent}%'
         else:
             price_text = format_price_kopeks(price)
@@ -3313,7 +3277,7 @@ async def select_tariff_switch(
 
         await callback.message.edit_text(
             info_text,
-            reply_markup=get_tariff_switch_periods_keyboard(tariff, db_user.language, db_user=db_user),
+            reply_markup=await get_tariff_switch_periods_keyboard(tariff, db_user.language, db_user=db_user),
             parse_mode='HTML',
         )
 

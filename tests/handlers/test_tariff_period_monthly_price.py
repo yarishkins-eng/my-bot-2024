@@ -132,8 +132,14 @@ async def test_purchase_confirmation_uses_same_existing_device_limit_as_period_b
     assert '💰 <b>Итого: 1720 ₽</b>' in confirmation_text
 
 
-def test_renewal_monthly_price_includes_extra_devices_and_rounds_up():
-    keyboard = tariff_purchase.get_tariff_extend_keyboard(
+@pytest.mark.asyncio
+async def test_renewal_monthly_price_includes_extra_devices_and_rounds_up(monkeypatch):
+    async def price_with_extra_device(_tariff, _period, _user, **kwargs):
+        assert kwargs['device_limit'] == 3
+        return 172000, 0
+
+    monkeypatch.setattr(tariff_purchase, '_calculate_tariff_period_display_price', price_with_extra_device)
+    keyboard = await tariff_purchase.get_tariff_extend_keyboard(
         _tariff(prices={'180': 124000}),
         'ru',
         subscription_device_limit=3,
@@ -146,8 +152,14 @@ def test_renewal_monthly_price_includes_extra_devices_and_rounds_up():
     assert keyboard.inline_keyboard[0][0].callback_data == 'tariff_extend:22:7:180'
 
 
-def test_tariff_switch_uses_same_monthly_price_and_keeps_callback_format():
-    keyboard = tariff_purchase.get_tariff_switch_periods_keyboard(
+@pytest.mark.asyncio
+async def test_tariff_switch_uses_same_monthly_price_and_keeps_callback_format(monkeypatch):
+    async def full_new_tariff_price(_tariff, _period, _user, **kwargs):
+        assert kwargs == {}
+        return 199000, 0
+
+    monkeypatch.setattr(tariff_purchase, '_calculate_tariff_period_display_price', full_new_tariff_price)
+    keyboard = await tariff_purchase.get_tariff_switch_periods_keyboard(
         _tariff(prices={'365': 199000}),
         'ru',
     )
