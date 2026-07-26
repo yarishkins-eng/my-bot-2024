@@ -12,6 +12,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+from app.handlers.subscription import tariff_purchase
 from app.handlers.subscription.tariff_purchase import (
     get_tariff_extend_confirm_keyboard,
     get_tariff_extend_keyboard,
@@ -36,12 +39,17 @@ def test_confirm_keyboard_puts_subscription_id_first_period_last():
     assert parts[3] == '30'  # period (last — no longer mistaken for a sub_id)
 
 
-def test_extend_keyboard_embeds_subscription_id_before_tariff_and_period():
+@pytest.mark.asyncio
+async def test_extend_keyboard_embeds_subscription_id_before_tariff_and_period(monkeypatch):
     tariff = MagicMock()
     tariff.id = 2
     tariff.period_prices = {'30': 10000, '90': 27000}
 
-    kb = get_tariff_extend_keyboard(
+    async def price_from_tariff(tariff, period_days, _user, **_kwargs):
+        return tariff.period_prices[str(period_days)], 0
+
+    monkeypatch.setattr(tariff_purchase, '_calculate_tariff_period_display_price', price_from_tariff)
+    kb = await get_tariff_extend_keyboard(
         tariff,
         'ru',
         db_user=None,
