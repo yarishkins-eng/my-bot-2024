@@ -29,6 +29,7 @@ from app.services.subscription_service import SubscriptionService
 from app.services.user_cart_service import user_cart_service
 from app.utils.decorators import error_handler
 from app.utils.formatting import format_period, format_price_kopeks, format_traffic
+from app.utils.pricing_utils import calculate_months_from_days
 from app.utils.promo_offer import get_user_active_promo_discount_percent
 
 
@@ -151,6 +152,36 @@ def _get_user_period_discount(db_user: User, period_days: int) -> tuple[int, int
     return group_discount, personal_discount, display_combined
 
 
+def _format_tariff_period_button_text(
+    period_days: int,
+    price_kopeks: int,
+    price_text: str,
+    texts,
+    *,
+    is_base_price: bool = False,
+) -> str:
+    """Format a period button with an easy-to-read effective monthly price.
+
+    The total price remains the source of truth: it has already included every
+    applicable discount and, for renewals, additional devices.  The effective
+    monthly price is rounded *up* to whole rubles so the compact UI never
+    understates the actual cost of the selected period.
+
+    ``is_base_price`` is used for configurable-traffic tariffs. Their traffic
+    cost is selected on the next screen, therefore this button can only show a
+    starting monthly price.
+    """
+    months = calculate_months_from_days(period_days)
+    if price_kopeks <= 0 or months <= 1:
+        return f'{format_period(period_days)} — {price_text}'
+
+    monthly_price_rubles = (price_kopeks + months * 100 - 1) // (months * 100)
+    monthly_price_text = format_price_kopeks(monthly_price_rubles * 100)
+    template = texts.TARIFF_PERIOD_MONTHLY_FROM if is_base_price else texts.TARIFF_PERIOD_MONTHLY
+    monthly_text = template.format(price=monthly_price_text)
+    return f'{format_period(period_days)} — {price_text} {monthly_text}'
+
+
 def format_tariffs_list_text(
     tariffs: list[Tariff],
     db_user: User | None = None,
@@ -267,7 +298,7 @@ def get_tariff_periods_keyboard(
         else:
             price_text = format_price_kopeks(price)
 
-        button_text = f'{format_period(period)} — {price_text}'
+        button_text = _format_tariff_period_button_text(period, price, price_text, texts)
         buttons.append([InlineKeyboardButton(text=button_text, callback_data=f'tariff_period:{tariff.id}:{period}')])
 
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=back_callback)])
@@ -300,7 +331,13 @@ def get_tariff_periods_keyboard_with_traffic(
         else:
             price_text = format_price_kopeks(price)
 
-        button_text = f'{format_period(period)} — {price_text}'
+        button_text = _format_tariff_period_button_text(
+            period,
+            price,
+            price_text,
+            texts,
+            is_base_price=True,
+        )
         # Используем другой callback для перехода к настройке трафика
         buttons.append(
             [InlineKeyboardButton(text=button_text, callback_data=f'tariff_period_traffic:{tariff.id}:{period}')]
@@ -2245,7 +2282,7 @@ def get_tariff_extend_keyboard(
         else:
             price_text = format_price_kopeks(price)
 
-        button_text = f'{format_period(period)} — {price_text}'
+        button_text = _format_tariff_period_button_text(period, price, price_text, texts)
         # subscription_id ОБЯЗАН быть первым сегментом: иначе резолвер по callback
         # принял бы хвостовой {period} за subscription_id (см. issue #3012 —
         # период совпадал с id чужой подписки и продлевалась не та подписка).
@@ -2916,7 +2953,7 @@ def get_tariff_switch_periods_keyboard(
         else:
             price_text = format_price_kopeks(price)
 
-        button_text = f'{format_period(period)} — {price_text}'
+        button_text = _format_tariff_period_button_text(period, price, price_text, texts)
         buttons.append([InlineKeyboardButton(text=button_text, callback_data=f'tariff_sw_period:{tariff.id}:{period}')])
 
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data='tariff_switch')])

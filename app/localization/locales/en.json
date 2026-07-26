@@ -927,6 +927,8 @@
   "PAYMENT_METHOD_SBP": "🏦 SBP",
   "PAYMENT_METHOD_MIR_PAY": "🟦 Mir Pay",
   "BACK": "⬅️ Back",
+  "TARIFF_PERIOD_MONTHLY": "({price}/mo.)",
+  "TARIFF_PERIOD_MONTHLY_FROM": "(from {price}/mo.)",
   "BACK_BUTTON": "◀️ Back",
   "BACK_TO_MAIN_MENU_BUTTON": "⬅️ Back to main menu",
   "BACK_TO_MENU": "🏠 Back to menu",
