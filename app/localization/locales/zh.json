@@ -1029,6 +1029,7 @@
   "INSUFFICIENT_BALANCE": "❌余额不足。 \n  \n  <b>请充值{amount}后重试。</b>\n  ",
   "INVALID_AMOUNT": "❌金额无效",
   "LANGUAGE_PROMPT": "🌐请选择界面语言：",
+  "CABINET_COMMAND_PROMPT": "👤 请点击下方按钮打开个人中心。",
   "LANGUAGE_SELECTED": "🌐界面语言已设置为：<b>中文（简体）</b>",
   "LANGUAGE_SELECTION_DISABLED": "⚙️语言选择暂时不可用。将使用默认语言。",
   "LOADING": "⏳加载中...",
