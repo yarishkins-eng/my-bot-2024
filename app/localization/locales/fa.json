@@ -1114,6 +1114,7 @@
   "INSUFFICIENT_BALANCE": "❌ موجودی ناکافی.\n    \n    <b>موجودی را {amount} شارژ و دوباره تلاش کنید.</b>\n    ",
   "INVALID_AMOUNT": "❌ مبلغ نامعتبر",
   "LANGUAGE_PROMPT": "🌐 زبان رابط را انتخاب کنید:",
+  "CABINET_COMMAND_PROMPT": "👤 حساب کاربری خود را با دکمه زیر باز کنید.",
   "LANGUAGE_SELECTED": "🌐 زبان رابط انتخاب شد: <b>فارسی</b>",
   "LANGUAGE_SELECTION_DISABLED": "⚙️ انتخاب زبان موقتاً در دسترس نیست. زبان پیش‌فرض استفاده می‌شود.",
   "LOADING": "⏳ بارگذاری...",
