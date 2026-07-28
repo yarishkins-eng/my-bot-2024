@@ -56,6 +56,23 @@ async def test_spin_rechecks_daily_limit_under_lock() -> None:
 
 
 @pytest.mark.asyncio
+async def test_spin_rejects_stars_when_globally_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A direct wheel API call cannot bypass the global Stars switch."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, 'TELEGRAM_STARS_ENABLED', False, raising=False)
+    service = FortuneWheelService()
+    availability = AsyncMock()
+    service.check_availability = availability
+
+    result = await service.spin(AsyncMock(), SimpleNamespace(id=1), 'telegram_stars')
+
+    assert result.success is False
+    assert result.error == 'stars_disabled'
+    availability.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_spin_under_limit_proceeds_to_payment() -> None:
     """Sanity: when the re-check is below the limit, spin() proceeds to payment."""
     svc = FortuneWheelService()
