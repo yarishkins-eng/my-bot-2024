@@ -4,12 +4,12 @@ The bug from 2026-05-16: with default rate=1.3 ₽/⭐, asking the bot to
 top up 150 ₽ produced a quote of 115 ⭐ (round(150/1.3)=115), and the
 return-conversion credited 115 × 1.3 = 149.50 ₽. The user paid for
 150 ₽ worth of stars and got 149.50 ₽ credited — a built-in rounding
-loss on every transaction, plus the rate itself was ~30% below
-Telegram's actual cash-out rate (~0.95–1.0 ₽/⭐).
+loss on every transaction. The quote is a Teplo product setting, not
+Telegram's user purchase price or reward rate.
 
 These tests pin:
-  1. The default rate stays 1.0 (matches market, eliminates the loss
-     for integer-ruble round-trips).
+  1. The default quote stays 1.0 (eliminates the loss for integer-ruble
+     round-trips).
   2. Common integer ruble amounts round-trip losslessly at the default
      rate. If someone changes the default to >1 again, these tests
      fail with the exact ruble loss highlighted.
@@ -25,14 +25,12 @@ from app.config import settings
 def test_default_stars_rate_is_one_ruble_per_star() -> None:
     """REGRESSION: default rate must stay at 1.0 ₽/⭐.
 
-    Lower → users get over-credited (bot loses money — but Telegram
-    actually pays bot owners ~0.95 ₽/⭐ on withdrawal, so the floor is
-    around there).
+    Lower → users get over-credited (bot loses money).
     Higher → users get under-credited (the original 1.3-default bug:
     150 ₽ top-up credited as 149.50 ₽).
     """
     assert settings.TELEGRAM_STARS_RATE_RUB == 1.0, (
-        f'Default TELEGRAM_STARS_RATE_RUB must be 1.0 to match Telegram cash-out and '
+        f'Default TELEGRAM_STARS_RATE_RUB must be 1.0 to quote and credit '
         f'round-trip losslessly. Got {settings.TELEGRAM_STARS_RATE_RUB!r}.'
     )
 

@@ -40,6 +40,13 @@ class PlategaPaymentMixin:
             logger.error('Platega сервис не инициализирован')
             return None
 
+        if payment_method_code not in settings.get_platega_active_methods():
+            logger.warning(
+                'Запрошен выключенный метод Platega',
+                payment_method_code=payment_method_code,
+            )
+            return None
+
         if amount_kopeks < settings.PLATEGA_MIN_AMOUNT_KOPEKS:
             logger.warning(
                 'Сумма Platega меньше минимальной: <',

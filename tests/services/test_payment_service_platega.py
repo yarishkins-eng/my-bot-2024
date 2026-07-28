@@ -83,7 +83,8 @@ def _make_service(stub: StubPlategaService | None) -> PaymentService:
 
 
 @pytest.mark.anyio('asyncio')
-async def test_create_platega_payment_success(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize('payment_method_code', [2, 11, 13])
+async def test_create_platega_payment_success(monkeypatch: pytest.MonkeyPatch, payment_method_code: int) -> None:
     stub = StubPlategaService()
     service = _make_service(stub)
     db = DummySession()
@@ -114,7 +115,7 @@ async def test_create_platega_payment_success(monkeypatch: pytest.MonkeyPatch) -
         amount_kopeks=50_000,
         description='Пополнение счёта',
         language='ru',
-        payment_method_code=11,
+        payment_method_code=payment_method_code,
     )
 
     assert result is not None
@@ -125,9 +126,9 @@ async def test_create_platega_payment_success(monkeypatch: pytest.MonkeyPatch) -
     assert 'correlation_id' in result and len(result['correlation_id']) == 32
     assert captured_args['user_id'] == 42
     assert captured_args['amount_kopeks'] == 50_000
-    assert captured_args['payment_method_code'] == 11
-    assert captured_args['metadata']['selected_method'] == 11
-    assert stub.calls and stub.calls[0]['payment_method'] == 11
+    assert captured_args['payment_method_code'] == payment_method_code
+    assert captured_args['metadata']['selected_method'] == payment_method_code
+    assert stub.calls and stub.calls[0]['payment_method'] == payment_method_code
     assert stub.calls[0]['amount'] == pytest.approx(500.0)
     assert stub.calls[0]['currency'] == 'RUB'
     assert captured_args['metadata']['language'] == 'ru'
@@ -172,6 +173,27 @@ async def test_create_platega_payment_respects_limits_and_configuration(monkeypa
         payment_method_code=2,
     )
     assert result is None
+
+
+@pytest.mark.anyio('asyncio')
+async def test_create_platega_payment_rejects_inactive_method(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = StubPlategaService()
+    service = _make_service(stub)
+    db = DummySession()
+
+    monkeypatch.setattr(settings, 'PLATEGA_ACTIVE_METHODS', '2,11,13', raising=False)
+
+    result = await service.create_platega_payment(
+        db=db,
+        user_id=None,
+        amount_kopeks=50_000,
+        description='Подарок',
+        language='ru',
+        payment_method_code=12,
+    )
+
+    assert result is None
+    assert stub.calls == []
 
 
 @pytest.mark.anyio('asyncio')
