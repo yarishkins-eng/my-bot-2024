@@ -1,6 +1,11 @@
 name: Inspect staging cabinet prerequisites
 
 on:
+  push:
+    branches:
+      - staging
+    paths:
+      - '.github/workflows/staging-cabinet-preflight.yml'
   workflow_dispatch:
 
 permissions:
