@@ -99,9 +99,9 @@ services:
       - ./vpn_logo.png:/app/vpn_logo.png:ro
     networks:
       - staging_net
-    # Портов нет и web-healthcheck нет: бот в режиме polling, WEB_API выключен.
-    # Проверяем живой polling-процесс и его реальные зависимости, а не HTTP :8080:
-    # веб-сервер у staging намеренно не запускается.
+    # Docker healthcheck проверяет polling-процесс и его реальные зависимости.
+    # Готовность HTTP API дополнительно проверяется в deploy-staging.yml: веб-сервер
+    # запускается внутри общей последовательности старта бота немного позднее.
     healthcheck:
       test:
         - CMD-SHELL
