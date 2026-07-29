@@ -77,6 +77,8 @@ services:
       # Отдельный тестовый кабинет на том же TLS-домене, но другом origin/порту.
       # Это не production URL и не разделяет браузерное хранилище с боевым кабинетом.
       WEB_API_ENABLED: 'true'
+      WEB_API_HOST: '0.0.0.0'
+      WEB_API_PORT: '8080'
       CABINET_ENABLED: 'true'
       CABINET_URL: 'https://cabinet.lilulalu.xyz:8443'
       MINIAPP_CUSTOM_URL: 'https://cabinet.lilulalu.xyz:8443'
