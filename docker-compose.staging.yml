@@ -74,9 +74,19 @@ services:
       FUNNEL_MENU_ENABLED: 'true'
       FUNNEL_SUBSCRIBER_MENU_ENABLED: 'true'
       SUBSCRIBER_MENU_RENEW_THRESHOLD_DAYS: '0'
+      # Отдельный тестовый кабинет на том же TLS-домене, но другом origin/порту.
+      # Это не production URL и не разделяет браузерное хранилище с боевым кабинетом.
+      WEB_API_ENABLED: 'true'
+      CABINET_ENABLED: 'true'
+      CABINET_URL: 'https://cabinet.lilulalu.xyz:8443'
+      MINIAPP_CUSTOM_URL: 'https://cabinet.lilulalu.xyz:8443'
+      CABINET_ALLOWED_ORIGINS: 'https://cabinet.lilulalu.xyz:8443'
       # В staging панель RemnaWave намеренно недоступна — не создаём ложных тревог.
       MAINTENANCE_MONITORING_ENABLED: 'false'
       LOCALES_PATH: '/app/locales'
+    ports:
+      # Только loopback: наружу staging API доступен исключительно через отдельный nginx route.
+      - '127.0.0.1:18080:8080'
     volumes:
       - ./logs:/app/logs:rw
       - ./data:/app/data:rw

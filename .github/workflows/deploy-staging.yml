@@ -161,6 +161,9 @@ jobs:
             SERVICE_SWITCH_ATTEMPTED=1
             compose up -d --wait --wait-timeout 240 "$SERVICE"
             compose ps "$SERVICE"
+            # The staging cabinet reaches the API only through this loopback listener.
+            # Do not treat the process-only Docker health check as evidence that FastAPI is serving.
+            curl --fail --silent --show-error --max-time 15 http://127.0.0.1:18080/health/unified >/dev/null
             write_deployed_state
 
             SOURCE_SWITCHED=0
