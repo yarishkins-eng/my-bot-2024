@@ -115,7 +115,7 @@ class FortuneWheelService:
         required_balance_kopeks = 0
 
         # Проверяем оплату Stars (конвертируется в рубли из баланса)
-        if config.spin_cost_stars_enabled and config.spin_cost_stars > 0:
+        if settings.TELEGRAM_STARS_ENABLED and config.spin_cost_stars_enabled and config.spin_cost_stars > 0:
             stars_rate = Decimal(str(settings.get_stars_rate()))
             rubles = Decimal(config.spin_cost_stars) * stars_rate
             required_balance_kopeks = int(rubles * 100)
@@ -155,7 +155,11 @@ class FortuneWheelService:
         if not can_pay_stars and not can_pay_days:
             # Определяем причину
             reason = 'no_payment_method_available'
-            if config.spin_cost_stars_enabled and user.balance_kopeks < required_balance_kopeks:
+            if (
+                settings.TELEGRAM_STARS_ENABLED
+                and config.spin_cost_stars_enabled
+                and user.balance_kopeks < required_balance_kopeks
+            ):
                 reason = 'insufficient_balance'
 
             return SpinAvailability(
@@ -587,6 +591,13 @@ class FortuneWheelService:
         6. Вернуть результат
         """
         try:
+            if payment_type == WheelSpinPaymentType.TELEGRAM_STARS.value and not settings.TELEGRAM_STARS_ENABLED:
+                return SpinResult(
+                    success=False,
+                    error='stars_disabled',
+                    message='Оплата Stars отключена',
+                )
+
             # 1. Проверяем доступность
             availability = await self.check_availability(db, user)
             if not availability.can_spin:

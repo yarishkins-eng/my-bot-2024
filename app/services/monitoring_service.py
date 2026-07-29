@@ -393,6 +393,28 @@ class MonitoringService:
                 await self._cleanup_expired_refresh_tokens(db)
                 await self._cleanup_inactive_users(db)
                 await self._sync_with_remnawave(db)
+                # Device-first remains drainable even when creation flag is OFF.
+                # The outbox commits its claim before any RemnaWave HTTP call.
+                try:
+                    from app.services.device_first_checkout_service import (
+                        process_provisioning_outbox,
+                        reconcile_armed_checkouts,
+                    )
+                    from app.services.device_first_deposit_outbox_service import (
+                        process_device_first_deposit_outbox,
+                    )
+                    from app.services.device_first_payment_service import reconcile_device_first_payments
+
+                    await reconcile_device_first_payments(db)
+                    await process_device_first_deposit_outbox(db)
+                    await reconcile_armed_checkouts(db)
+                    await process_provisioning_outbox(db, bot=self.bot)
+                except Exception as device_first_error:
+                    logger.error(
+                        'Ошибка device-first provisioning outbox',
+                        error=device_first_error,
+                        exc_info=True,
+                    )
 
                 await self._log_monitoring_event(
                     db,

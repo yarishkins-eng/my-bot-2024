@@ -468,6 +468,17 @@ async def handle_pre_checkout_query(query: types.PreCheckoutQuery):
             )
             return
 
+        if not settings.TELEGRAM_STARS_ENABLED:
+            logger.info(
+                'Stars checkout rejected because the payment method is disabled',
+                from_user_id=query.from_user.id,
+            )
+            await query.answer(
+                ok=False,
+                error_message='Оплата через Telegram Stars отключена.',
+            )
+            return
+
         try:
             from app.database.database import AsyncSessionLocal
 

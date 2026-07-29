@@ -1,6 +1,7 @@
 name: Lint
 
 on:
+  # Reused by release and staging deploys as their single CI gate.
   workflow_call:
   pull_request:
     branches: ['**']

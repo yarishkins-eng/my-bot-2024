@@ -40,6 +40,13 @@ class PlategaPaymentMixin:
             logger.error('Platega сервис не инициализирован')
             return None
 
+        if payment_method_code not in settings.get_platega_active_methods():
+            logger.warning(
+                'Запрошен выключенный метод Platega',
+                payment_method_code=payment_method_code,
+            )
+            return None
+
         if amount_kopeks < settings.PLATEGA_MIN_AMOUNT_KOPEKS:
             logger.warning(
                 'Сумма Platega меньше минимальной: <',
@@ -309,6 +316,18 @@ class PlategaPaymentMixin:
 
         # Read fresh metadata AFTER lock to avoid stale data
         metadata = dict(getattr(payment, 'metadata_json', {}) or {})
+
+        # Device-first owns its exact provider amount, ledger idempotency and
+        # explicit-arm fulfillment. It must not fall through to the generic
+        # top-up/cart/autopay hooks.
+        if metadata.get('device_first_attempt_id') is not None:
+            from app.services.device_first_payment_service import settle_device_first_platega_payment
+
+            return await settle_device_first_platega_payment(
+                db,
+                payment=payment,
+                payload=payload,
+            )
 
         # --- Guest purchase flow (landing page) ---
         from app.services.payment.common import try_fulfill_guest_purchase

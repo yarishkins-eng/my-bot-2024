@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
@@ -134,7 +134,7 @@ jobs:
           } >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: ${{ github.ref_name }}
           body: |
@@ -154,15 +154,11 @@ jobs:
             docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ```
 
-            ### Update
+            ### Update note
 
-            ```bash
-            # Docker Compose
-            docker compose pull && docker compose up -d
-
-            # Or with Make
-            make reload
-            ```
+            For a standard standalone installation, follow the release documentation for the
+            chosen image. Do not run broad `docker compose pull` / `up` commands on a custom or
+            integrated deployment without its own reviewed release procedure.
           draft: false
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'dev') }}
           generate_release_notes: false

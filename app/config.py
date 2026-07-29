@@ -270,6 +270,9 @@ class Settings(BaseSettings):
     # Only works when SALES_MODE='tariffs'
     MULTI_TARIFF_ENABLED: bool = False
     MAX_ACTIVE_SUBSCRIPTIONS: int = 10
+    # Master switch for creating NEW device-first checkouts. Existing status,
+    # payment webhooks and workers deliberately continue while this is false.
+    DEVICE_FIRST_NEW_CHECKOUTS_ENABLED: bool = False
 
     # ID тарифа для триала в режиме тарифов (0 = использовать стандартные настройки триала)
     # Если указан ID тарифа, параметры триала берутся из тарифа (traffic_limit_gb, device_limit, allowed_squads)

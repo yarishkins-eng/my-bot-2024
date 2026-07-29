@@ -3665,6 +3665,10 @@ async def handle_trial_payment_method(callback: types.CallbackQuery, db_user: Us
     # Определяем метод оплаты
     payment_method = callback.data.replace('trial_payment_', '')
 
+    if payment_method == 'stars' and not settings.TELEGRAM_STARS_ENABLED:
+        await callback.answer('❌ Оплата через Telegram Stars отключена', show_alert=True)
+        return
+
     try:
         payment_service = PaymentService(callback.bot)
 

@@ -848,6 +848,10 @@ async def handle_simple_subscription_payment_method(
 
     payment_method = callback.data.replace('simple_subscription_', '')
 
+    if payment_method == 'stars' and not settings.TELEGRAM_STARS_ENABLED:
+        await callback.answer('❌ Оплата через Telegram Stars отключена', show_alert=True)
+        return
+
     try:
         payment_service = PaymentService(callback.bot)
         purchase_service = SubscriptionPurchaseService()

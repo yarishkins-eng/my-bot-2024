@@ -394,6 +394,10 @@ async def get_purchase_options(
                     tariff_data['is_purchased'] = False
                 tariff_responses.append(tariff_data)
 
+            from app.services.device_first_checkout_service import build_purchase_options
+
+            device_first_options = await build_purchase_options(db, user)
+
             return {
                 'sales_mode': 'tariffs',
                 'tariffs': tariff_responses,
@@ -412,12 +416,16 @@ async def get_purchase_options(
                 # Направления смены тарифа
                 'tariff_switch_upgrade_enabled': settings.TARIFF_SWITCH_UPGRADE_ENABLED,
                 'tariff_switch_downgrade_enabled': settings.TARIFF_SWITCH_DOWNGRADE_ENABLED,
+                # Additive versioned block; all legacy keys and semantics above
+                # remain unchanged while the feature is OFF/ineligible.
+                'device_first': {'version': 1, **device_first_options},
             }
 
         # Classic mode - return periods
         context = await purchase_service.build_options(db, user, subscription_id=subscription_id)
         payload = context.payload
         payload['sales_mode'] = 'classic'
+        payload['device_first'] = {'version': 1, 'eligible': False, 'reason': 'legacy_sales_mode'}
         return payload
 
     except PurchaseValidationError as e:

@@ -89,9 +89,11 @@ async def get_wheel_config(
     return WheelConfigResponse(
         is_enabled=config.is_enabled,
         name=config.name,
-        spin_cost_stars=config.spin_cost_stars if config.spin_cost_stars_enabled else None,
+        spin_cost_stars=(
+            config.spin_cost_stars if settings.TELEGRAM_STARS_ENABLED and config.spin_cost_stars_enabled else None
+        ),
         spin_cost_days=config.spin_cost_days if config.spin_cost_days_enabled else None,
-        spin_cost_stars_enabled=config.spin_cost_stars_enabled,
+        spin_cost_stars_enabled=settings.TELEGRAM_STARS_ENABLED and config.spin_cost_stars_enabled,
         spin_cost_days_enabled=config.spin_cost_days_enabled,
         prizes=prizes_display,
         daily_limit=config.daily_spin_limit,
@@ -227,6 +229,12 @@ async def create_stars_invoice(
     Создать Telegram Stars invoice для оплаты спина колеса.
     Используется в Telegram Mini App для прямой оплаты Stars.
     """
+    if not settings.TELEGRAM_STARS_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Оплата Stars отключена',
+        )
+
     config = await get_or_create_wheel_config(db)
 
     if not config.is_enabled:
