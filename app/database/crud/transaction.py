@@ -186,11 +186,13 @@ async def emit_transaction_side_effects(
     external_id: str | None = None,
     is_completed: bool = True,
     description: str = '',
+    raise_on_error: bool = False,
 ) -> None:
     """Fire side-effects that were deferred when create_transaction(commit=False) was used.
 
     Call this AFTER db.commit() to emit events and run promo checks.
     """
+    errors: list[Exception] = []
     try:
         from app.services.event_emitter import event_emitter
 
@@ -211,6 +213,7 @@ async def emit_transaction_side_effects(
         )
     except Exception as error:
         logger.warning('Failed to emit deferred transaction event', error=error)
+        errors.append(error)
 
     try:
         from app.services.promo_group_assignment import (
@@ -220,6 +223,7 @@ async def emit_transaction_side_effects(
         await maybe_assign_promo_group_by_total_spent(db, user_id)
     except Exception as exc:
         logger.warning('Не удалось проверить автовыдачу промогруппы для пользователя', user_id=user_id, exc=exc)
+        errors.append(exc)
 
     if type == TransactionType.SUBSCRIPTION_PAYMENT and is_completed:
         try:
@@ -232,6 +236,7 @@ async def emit_transaction_side_effects(
             )
         except Exception as exc:
             logger.debug('Не удалось записать событие конкурса для пользователя', user_id=user_id, exc=exc)
+            errors.append(exc)
 
         # Yandex.Metrika offline conversion — central chokepoint (deferred path
         # for create_transaction(commit=False) callers). Fires the purchase event
@@ -243,6 +248,10 @@ async def emit_transaction_side_effects(
             yandex_conv.spawn_bg(yandex_conv.fire_purchase_bg(user_id, abs(amount_kopeks)))
         except Exception as exc:
             logger.debug('Не удалось отправить Yandex purchase для пользователя', user_id=user_id, exc=exc)
+            errors.append(exc)
+
+    if raise_on_error and errors:
+        raise RuntimeError(f'{len(errors)} deferred transaction side effect(s) failed') from errors[0]
 
 
 async def get_transaction_by_id(db: AsyncSession, transaction_id: int) -> Transaction | None:

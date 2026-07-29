@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database.models import PromoGroup, Subscription, SubscriptionStatus, Tariff
+from app.services.device_first_eligibility import normalize_device_purchase_options
 
 
 logger = structlog.get_logger(__name__)
@@ -172,6 +173,7 @@ async def create_tariff(
     device_limit: int = 1,
     device_price_kopeks: int | None = None,
     max_device_limit: int | None = None,
+    device_purchase_options: list[int] | None = None,
     allowed_squads: list[str] | None = None,
     server_traffic_limits: dict[str, dict] | None = None,
     period_prices: dict[int, int] | None = None,
@@ -203,6 +205,12 @@ async def create_tariff(
 ) -> Tariff:
     """Создает новый тариф."""
     normalized_prices = _normalize_period_prices(period_prices)
+    normalized_device_options = normalize_device_purchase_options(
+        device_purchase_options,
+        base_device_limit=max(1, device_limit),
+        max_device_limit=max_device_limit,
+        device_price_kopeks=device_price_kopeks,
+    )
 
     tariff = Tariff(
         name=name.strip(),
@@ -213,6 +221,7 @@ async def create_tariff(
         device_limit=max(1, device_limit),
         device_price_kopeks=device_price_kopeks,
         max_device_limit=max_device_limit,
+        device_purchase_options=normalized_device_options,
         allowed_squads=allowed_squads or [],
         server_traffic_limits=server_traffic_limits or {},
         period_prices=normalized_prices,
@@ -281,6 +290,7 @@ async def update_tariff(
     device_limit: int | None = None,
     device_price_kopeks: int | None = ...,  # ... = не передан, None = сбросить
     max_device_limit: int | None = ...,  # ... = не передан, None = сбросить (без лимита)
+    device_purchase_options: list[int] | None = ...,  # ... = не передан, None = legacy
     allowed_squads: list[str] | None = None,
     server_traffic_limits: dict[str, dict] | None = None,
     period_prices: dict[int, int] | None = None,
@@ -312,6 +322,19 @@ async def update_tariff(
     external_squad_uuid: str | None = ...,  # ... = не передан, None = убрать внешний сквад
 ) -> Tariff:
     """Обновляет существующий тариф."""
+    revision_before = (
+        tariff.is_active,
+        tariff.traffic_limit_gb,
+        tariff.device_limit,
+        tariff.device_price_kopeks,
+        tariff.max_device_limit,
+        tuple(tariff.device_purchase_options or ()),
+        tuple(sorted((tariff.period_prices or {}).items())),
+        tuple(tariff.allowed_squads or ()),
+        tariff.is_daily,
+        tariff.custom_days_enabled,
+        tariff.custom_traffic_enabled,
+    )
     if name is not None:
         tariff.name = name.strip()
     if description is not None:
@@ -330,6 +353,13 @@ async def update_tariff(
     if max_device_limit is not ...:
         # Если передан max_device_limit (включая None) - обновляем
         tariff.max_device_limit = max_device_limit
+    if device_purchase_options is not ...:
+        tariff.device_purchase_options = normalize_device_purchase_options(
+            device_purchase_options,
+            base_device_limit=int(tariff.device_limit or 1),
+            max_device_limit=tariff.max_device_limit,
+            device_price_kopeks=tariff.device_price_kopeks,
+        )
     if allowed_squads is not None:
         tariff.allowed_squads = allowed_squads
     if server_traffic_limits is not None:
@@ -382,6 +412,22 @@ async def update_tariff(
     # Внешний сквад
     if external_squad_uuid is not ...:
         tariff.external_squad_uuid = external_squad_uuid
+
+    revision_after = (
+        tariff.is_active,
+        tariff.traffic_limit_gb,
+        tariff.device_limit,
+        tariff.device_price_kopeks,
+        tariff.max_device_limit,
+        tuple(tariff.device_purchase_options or ()),
+        tuple(sorted((tariff.period_prices or {}).items())),
+        tuple(tariff.allowed_squads or ()),
+        tariff.is_daily,
+        tariff.custom_days_enabled,
+        tariff.custom_traffic_enabled,
+    )
+    if revision_after != revision_before:
+        tariff.pricing_revision = int(tariff.pricing_revision or 1) + 1
 
     # Обновляем промогруппы если указаны
     if promo_group_ids is not None:
