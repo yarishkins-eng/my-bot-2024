@@ -70,6 +70,23 @@ def test_default_period_prefers_30_and_exactly_one_tariff_is_required(monkeypatc
 
 
 @pytest.mark.parametrize(
+    'parallel_legacy_flow',
+    [
+        {'is_trial_available': True},
+        {'show_in_gift': True},
+        {'is_trial_available': True, 'show_in_gift': True},
+    ],
+)
+def test_parallel_trial_and_gift_flows_do_not_change_ordinary_purchase_eligibility(
+    monkeypatch, parallel_legacy_flow
+):
+    """Trial/gift flags enable separate legacy routes, not a tariff type."""
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.SALES_MODE', 'tariffs')
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.MULTI_TARIFF_ENABLED', False)
+    assert tariff_eligibility(tariff(**parallel_legacy_flow)).eligible
+
+
+@pytest.mark.parametrize(
     'override',
     [
         {'is_daily': True},
