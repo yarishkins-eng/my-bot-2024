@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from app.cabinet.routes.device_first import _checkout_command, _mutation, checkout_get
+from app.cabinet.routes.device_first import _checkout_command, _mutation, checkout_get, checkout_open
 from app.services.device_first_checkout_service import DeviceFirstError, checkout_ui_state
 
 
@@ -19,6 +19,27 @@ async def test_foreign_checkout_get_preserves_safe_404() -> None:
             await checkout_get('foreign-id', user=user, db=AsyncMock())
     assert raised.value.status_code == 404
     assert raised.value.detail['code'] == 'not_found'
+
+
+@pytest.mark.asyncio
+async def test_open_checkout_endpoint_returns_only_the_authenticated_users_checkout() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=1250)
+    checkout = SimpleNamespace(public_id='owned-checkout')
+    db = AsyncMock()
+    with (
+        patch(
+            'app.cabinet.routes.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=checkout),
+        ) as get_open,
+        patch(
+            'app.cabinet.routes.device_first.serialize_checkout',
+            return_value={'id': 'owned-checkout'},
+        ),
+    ):
+        response = await checkout_open(user=user, db=db)
+
+    assert response == {'id': 'owned-checkout'}
+    get_open.assert_awaited_once_with(db, user_id=17)
 
 
 @pytest.mark.asyncio

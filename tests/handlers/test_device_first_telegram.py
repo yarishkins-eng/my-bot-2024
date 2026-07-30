@@ -9,6 +9,7 @@ from app.handlers.subscription.device_first import (
     _period_page,
     _render_checkout,
     _render_confirmation,
+    _render_error,
     arm,
     cancel,
     choose_devices,
@@ -55,6 +56,50 @@ async def test_period_page_is_first_and_keeps_origin_callback() -> None:
         df_view_id='view1234',
         df_origin_callback='funnel_tariffs',
     )
+
+
+@pytest.mark.asyncio
+async def test_period_prices_are_clearly_marked_as_starting_prices_for_the_base_device() -> None:
+    state = AsyncMock()
+    callback = SimpleNamespace()
+    options = {
+        'tariff': {'name': 'Premium'},
+        'period_options': [30, 365],
+        'device_options': [1, 3],
+        'price_matrix': [
+            {
+                'period_days': 30,
+                'prices': [
+                    {'device_limit': 1, 'price_kopeks': 89_000},
+                    {'device_limit': 3, 'price_kopeks': 109_000},
+                ],
+            },
+            {
+                'period_days': 365,
+                'prices': [
+                    {'device_limit': 1, 'price_kopeks': 849_000},
+                    {'device_limit': 3, 'price_kopeks': 1_089_000},
+                ],
+            },
+        ],
+    }
+
+    with patch(
+        'app.handlers.subscription.device_first.edit_or_answer_photo',
+        AsyncMock(),
+    ) as render:
+        await _period_page(
+            callback,
+            _user(),
+            state,
+            options,
+            view_id='view1234',
+            origin_callback='funnel_tariffs',
+        )
+
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert keyboard[0][0].text == '30 дней · от 890.00 ₽'
+    assert keyboard[0][1].text == '1 год · от 8 490.00 ₽'
 
 
 @pytest.mark.asyncio
@@ -168,6 +213,37 @@ async def test_confirmation_contains_server_snapshot_contract() -> None:
     assert '29.08.2026' in caption
     assert '1 500.00 ₽' in caption
     assert '1 090.00 ₽' in caption
+
+
+@pytest.mark.asyncio
+async def test_annual_confirmation_keeps_the_exact_365_day_term() -> None:
+    callback = SimpleNamespace()
+    user = SimpleNamespace(language='ru', balance_kopeks=150_000)
+    checkout = SimpleNamespace(
+        public_id='checkout-id',
+        selected_device_limit=3,
+        period_days=365,
+        quoted_price_kopeks=109_000,
+    )
+    snapshot = {
+        'current_device_limit': 1,
+        'estimated_end_at': '2027-07-30T12:00:00+00:00',
+        'shortage_kopeks': 0,
+    }
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value=snapshot,
+        ),
+        patch(
+            'app.handlers.subscription.device_first.edit_or_answer_photo',
+            AsyncMock(),
+        ) as render,
+    ):
+        await _render_confirmation(callback, user, checkout, tariff_name='Premium')
+
+    assert '1 год (365 дней)' in render.await_args.kwargs['caption']
 
 
 @pytest.mark.asyncio
@@ -423,3 +499,20 @@ async def test_pay_binds_method_checkout_and_owner_then_renders_provider_url() -
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert keyboard[0][0].url == 'https://pay.example/invoice'
     assert keyboard[1][0].callback_data == 'df:s:owned-checkout'
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_error_tells_telegram_user_not_to_pay_again_and_offers_safe_recovery() -> None:
+    callback = SimpleNamespace(data='df:y:sbp:owned-checkout')
+    error = DeviceFirstError('reconciliation_required', 'Payment requires reconciliation')
+
+    with patch(
+        'app.handlers.subscription.device_first.edit_or_answer_photo',
+        AsyncMock(),
+    ) as render:
+        await _render_error(callback, _user(), error)
+
+    assert 'Не оплачивайте повторно' in render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert keyboard[0][0].callback_data == 'df:s:owned-checkout'
+    assert keyboard[1][0].callback_data == 'menu_support'

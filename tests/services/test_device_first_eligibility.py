@@ -109,3 +109,8 @@ def test_paid_subscription_is_grandfathered_and_cannot_decrease():
 def test_current_limit_plus_configured_higher_options_are_offered():
     current = SimpleNamespace(tariff_id=7, is_trial=False, device_limit=3)
     assert device_options_for_subscription(tariff(), current) == (3, 5)
+
+
+def test_paid_subscription_on_another_tariff_cannot_decrease_devices_during_extension():
+    current = SimpleNamespace(tariff_id=99, is_trial=False, device_limit=4)
+    assert device_options_for_subscription(tariff(), current) == (4, 5)

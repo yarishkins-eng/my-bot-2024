@@ -26,6 +26,7 @@ from app.services.device_first_checkout_service import (
     confirm_checkout,
     create_checkout,
     fulfill_checkout,
+    get_open_checkout_for_user,
     get_owned_checkout,
     request_hash,
     serialize_checkout,
@@ -46,7 +47,6 @@ router = APIRouter(prefix='/device-first', tags=['Cabinet Device First'])
 class CheckoutCreateRequest(BaseModel):
     period_days: int = Field(..., gt=0)
     selected_device_limit: int = Field(..., gt=0)
-    source: str = Field('cabinet', pattern=r'^(cabinet|telegram)$')
 
 
 class PaymentAttemptRequest(BaseModel):
@@ -162,7 +162,7 @@ async def checkout_create(
             user=user,
             period_days=request.period_days,
             selected_device_limit=request.selected_device_limit,
-            source=request.source,
+            source='cabinet',
             mutation=mutation,
         )
     except DeviceFirstError as error:
@@ -177,6 +177,17 @@ async def checkout_create(
     mutation.checkout_id = checkout.id
     await store_mutation_result(db, mutation, response=response, status_code=201)
     return response
+
+
+@router.get('/checkout/open')
+async def checkout_open(
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    checkout = await get_open_checkout_for_user(db, user_id=user.id)
+    if checkout is None:
+        raise HTTPException(status_code=404, detail={'code': 'no_open_checkout'})
+    return serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)
 
 
 @router.get('/checkout/{checkout_id}')

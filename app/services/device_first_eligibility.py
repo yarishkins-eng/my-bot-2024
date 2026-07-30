@@ -72,12 +72,17 @@ def device_options_for_subscription(tariff: Tariff, subscription: Subscription |
     )
     if configured is None:
         return ()
-    if subscription is None or subscription.tariff_id != tariff.id or subscription.is_trial:
+    if subscription is None or subscription.is_trial:
         return tuple(configured)
 
     current = int(subscription.device_limit or tariff.device_limit or 0)
-    # Paid users are grandfathered: current limit remains selectable even if an
-    # admin later removes it or lowers max_device_limit. No decrease is exposed.
+    # A paid subscription can be extended onto a different tariff. Its current
+    # device limit is still the floor: device-first must never quietly turn an
+    # extension into a device-limit downgrade just because the previous tariff
+    # differs from the one currently offered.
+    #
+    # Paid users are grandfathered: the current limit remains selectable even
+    # if an admin later removes it or lowers max_device_limit.
     allowed = {current}
     effective_max = tariff.max_device_limit
     allowed.update(

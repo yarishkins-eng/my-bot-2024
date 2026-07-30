@@ -157,6 +157,35 @@ async def get_owned_checkout(
     return checkout
 
 
+async def get_open_checkout_for_user(
+    db: AsyncSession,
+    *,
+    user_id: int,
+) -> SubscriptionCheckout | None:
+    """Return the owner's resumable checkout, never another user's checkout."""
+    checkout = (
+        await db.execute(
+            select(SubscriptionCheckout)
+            .where(
+                SubscriptionCheckout.user_id == user_id,
+                SubscriptionCheckout.lifecycle_state.in_(OPEN_STATES),
+                SubscriptionCheckout.fulfillment_state != 'fulfilled',
+            )
+            .order_by(SubscriptionCheckout.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if checkout is None:
+        return None
+    if checkout.expires_at <= datetime.now(UTC):
+        checkout.lifecycle_state = 'expired'
+        checkout.terminal_reason = 'checkout_expired'
+        checkout.quote_state = 'expired'
+        await db.commit()
+        return None
+    return checkout
+
+
 async def _current_subscription(db: AsyncSession, user_id: int) -> Subscription | None:
     return await get_subscription_by_user_id(db, user_id)
 
@@ -263,6 +292,15 @@ async def create_checkout(
     options = await build_purchase_options(db, user)
     if not options.get('eligible'):
         raise DeviceFirstError('legacy_only', 'Device-first checkout is unavailable', status_code=404)
+    current_subscription = options.get('current_subscription') or {}
+    if not current_subscription.get('is_trial', False) and selected_device_limit < int(
+        current_subscription.get('device_limit') or 0
+    ):
+        raise DeviceFirstError(
+            'device_limit_decrease_not_allowed',
+            'A paid subscription cannot be extended with fewer devices',
+            status_code=422,
+        )
     if period_days not in options['period_options'] or selected_device_limit not in options['device_options']:
         raise DeviceFirstError('invalid_selection', 'Unsupported period or device limit', status_code=422)
 
@@ -418,6 +456,13 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         _event('conflict', checkout, reason=checkout.terminal_reason)
         return checkout
 
+    if target is not None and not target.is_trial and checkout.selected_device_limit < int(target.device_limit or 0):
+        checkout.lifecycle_state = 'conflict'
+        checkout.terminal_reason = 'device_limit_decrease_not_allowed'
+        await db.commit()
+        _event('conflict', checkout, reason=checkout.terminal_reason)
+        return checkout
+
     current_price = await pricing_engine.calculate_tariff_purchase_price(
         tariff,
         checkout.period_days,
@@ -425,12 +470,12 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         user=user,
     )
     charge = current_price.final_total
-    if charge > checkout.max_price_kopeks:
+    if int(tariff.pricing_revision or 1) != checkout.pricing_revision or charge != checkout.quoted_price_kopeks:
         checkout.lifecycle_state = 'reprice_required'
-        checkout.quote_state = 'price_increased'
-        checkout.terminal_reason = 'price_increased'
+        checkout.quote_state = 'price_changed'
+        checkout.terminal_reason = 'price_changed'
         await db.commit()
-        _event('reprice_required', checkout, reason='price_increased')
+        _event('reprice_required', checkout, reason='price_changed')
         return checkout
     if user.balance_kopeks < charge:
         checkout.lifecycle_state = 'awaiting_funds'

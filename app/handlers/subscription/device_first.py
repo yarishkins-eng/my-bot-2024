@@ -19,6 +19,7 @@ from app.services.device_first_checkout_service import (
     cancel_checkout,
     confirm_checkout,
     create_checkout,
+    get_open_checkout_for_user,
     get_owned_checkout,
     serialize_checkout,
 )
@@ -39,6 +40,28 @@ def _text(user: User, ru: str, en: str) -> str:
 
 def _money(kopeks: int) -> str:
     return f'{kopeks // 100:,}.{kopeks % 100:02d}'.replace(',', ' ')
+
+
+def _period_short_label(user: User, days: int) -> str:
+    if days == 365:
+        return _text(user, '1 год', '1 year')
+    return _text(user, f'{days} дней', f'{days} days')
+
+
+def _period_summary_label(user: User, days: int) -> str:
+    if days == 365:
+        return _text(user, '1 год (365 дней)', '1 year (365 days)')
+    return _period_short_label(user, days)
+
+
+def _price_for(options: dict, *, days: int, devices: int) -> int | None:
+    for row in options.get('price_matrix', []):
+        if row.get('period_days') != days:
+            continue
+        for item in row.get('prices', []):
+            if item.get('device_limit') == devices:
+                return item.get('price_kopeks')
+    return None
 
 
 def _chunks(values: list[int], size: int):
@@ -77,15 +100,13 @@ async def _device_page(
     page_count = max(1, (len(values) + 5) // 6)
     page = max(0, min(page, page_count - 1))
     visible = values[page * 6 : page * 6 + 6]
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=_text(user, f'{limit} устройств', f'{limit} devices'),
-                callback_data=f'df:d:{view_id}:{limit}',
-            )
-        ]
-        for limit in visible
-    ]
+    rows = []
+    for limit in visible:
+        price = _price_for(options, days=days, devices=limit)
+        label = _text(user, f'{limit} устройств', f'{limit} devices')
+        if price is not None:
+            label = f'{label} · {_money(price)} ₽'
+        rows.append([InlineKeyboardButton(text=label, callback_data=f'df:d:{view_id}:{limit}')])
     if page_count > 1:
         nav = []
         if page:
@@ -113,8 +134,8 @@ async def _device_page(
             f'📱 <b>{options["tariff"]["name"]}</b>\n\n'
             + _text(
                 user,
-                f'Срок: <b>{days} дней</b>\n\nСколько устройств будут пользоваться VPN?',
-                f'Period: <b>{days} days</b>\n\nHow many devices will use the VPN?',
+                f'Срок: <b>{_period_summary_label(user, days)}</b>\n\nСколько устройств будут пользоваться VPN?',
+                f'Period: <b>{_period_summary_label(user, days)}</b>\n\nHow many devices will use the VPN?',
             )
         ),
         keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -131,16 +152,21 @@ async def _period_page(
     view_id: str,
     origin_callback: str,
 ) -> None:
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=_text(user, f'{days} дней', f'{days} days'),
-                callback_data=f'df:t:{view_id}:{days}',
-            )
-            for days in chunk
-        ]
-        for chunk in _chunks(list(options['period_options']), 2)
-    ]
+    default_devices = int(options['device_options'][0])
+    rows = []
+    for chunk in _chunks(list(options['period_options']), 2):
+        row = []
+        for days in chunk:
+            price = _price_for(options, days=days, devices=default_devices)
+            label = _period_short_label(user, days)
+            if price is not None:
+                label = _text(
+                    user,
+                    f'{label} · от {_money(price)} ₽',
+                    f'{label} · from ₽{_money(price)}',
+                )
+            row.append(InlineKeyboardButton(text=label, callback_data=f'df:t:{view_id}:{days}'))
+        rows.append(row)
     rows.append([_back(user, origin_callback)])
     await state.update_data(
         df_options=options,
@@ -274,7 +300,21 @@ async def choose_devices(
             source='telegram',
         )
     except DeviceFirstError as error:
-        await _render_error(callback, db_user, str(error))
+        if error.code == 'open_checkout_exists':
+            existing = await get_open_checkout_for_user(db, user_id=db_user.id)
+            if existing is not None:
+                await state.update_data(df_checkout_id=existing.public_id)
+                if existing.lifecycle_state == 'draft':
+                    await _render_confirmation(
+                        callback,
+                        db_user,
+                        existing,
+                        tariff_name=options['tariff']['name'],
+                    )
+                else:
+                    await _render_checkout(callback, db_user, db, existing)
+                return
+        await _render_error(callback, db_user, error)
         return
     await state.update_data(df_checkout_id=checkout.public_id)
     await _render_confirmation(
@@ -374,7 +414,7 @@ async def _render_confirmation(
                 '✅ <b>Проверьте заказ</b>\n\n'
                 f'💎 Тариф: <b>{tariff_name}</b>\n'
                 f'📱 Устройства: <b>{device_change}</b>\n'
-                f'📅 Срок: {checkout.period_days} дней\n'
+                f'📅 Срок: {_period_summary_label(user, checkout.period_days)}\n'
                 f'🏁 До: {end_date}\n'
                 f'💳 Баланс: {_money(user.balance_kopeks)} ₽\n'
                 f'💰 Итого: <b>{_money(checkout.quoted_price_kopeks)} ₽</b>\n'
@@ -385,7 +425,7 @@ async def _render_confirmation(
                 '✅ <b>Review your order</b>\n\n'
                 f'💎 Tariff: <b>{tariff_name}</b>\n'
                 f'📱 Devices: <b>{device_change}</b>\n'
-                f'📅 Period: {checkout.period_days} days\n'
+                f'📅 Period: {_period_summary_label(user, checkout.period_days)}\n'
                 f'🏁 Ends: {end_date}\n'
                 f'💳 Balance: ₽{_money(user.balance_kopeks)}\n'
                 f'💰 Total: <b>₽{_money(checkout.quoted_price_kopeks)}</b>\n'
@@ -399,7 +439,13 @@ async def _render_confirmation(
 
 
 def _checkout_id(callback: types.CallbackQuery) -> str | None:
-    parts = (callback.data or '').split(':', 2)
+    parts = (callback.data or '').split(':', 3)
+    # Payment callbacks carry both the method and the checkout id
+    # (``df:y:<method>:<checkout>``). All checkout-state callbacks carry
+    # only the id (``df:s:<checkout>`` etc.). Never turn the former into a
+    # malformed status callback such as ``df:s:sbp:<checkout>``.
+    if len(parts) == 4 and parts[:2] == ['df', 'y']:
+        return parts[3]
     return parts[2] if len(parts) == 3 else None
 
 
@@ -416,7 +462,7 @@ async def confirm(
         checkout = await get_owned_checkout(db, public_id=public_id or '', user_id=db_user.id, for_update=True)
         checkout = await confirm_checkout(db, checkout)
     except DeviceFirstError as error:
-        await _render_error(callback, db_user, str(error))
+        await _render_error(callback, db_user, error)
         return
     shortage = max(0, checkout.max_price_kopeks - db_user.balance_kopeks)
     await edit_or_answer_photo(
@@ -504,14 +550,14 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                 user,
                 (
                     '💳 <b>Недостаточно средств</b>\n\n'
-                    f'📱 {checkout.selected_device_limit} устройств · 📅 {checkout.period_days} дней\n'
+                    f'📱 {checkout.selected_device_limit} устройств · 📅 {_period_summary_label(user, checkout.period_days)}\n'
                     f'💰 Итого: {_money(checkout.quoted_price_kopeks)} ₽\n'
                     f'⚠️ Нужно доплатить: <b>{_money(shortage)} ₽</b>\n\n'
                     'Заказ сохранён. Выберите способ доплаты.'
                 ),
                 (
                     '💳 <b>Insufficient balance</b>\n\n'
-                    f'📱 {checkout.selected_device_limit} devices · 📅 {checkout.period_days} days\n'
+                    f'📱 {checkout.selected_device_limit} devices · 📅 {_period_summary_label(user, checkout.period_days)}\n'
                     f'💰 Total: ₽{_money(checkout.quoted_price_kopeks)}\n'
                     f'⚠️ Top up: <b>₽{_money(shortage)}</b>\n\n'
                     'Your order is saved. Choose a top-up method.'
@@ -522,13 +568,13 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                 user,
                 (
                     '✅ <b>Баланс пополнен</b>\n\n'
-                    f'📱 {checkout.selected_device_limit} устройств · 📅 {checkout.period_days} дней\n'
+                    f'📱 {checkout.selected_device_limit} устройств · 📅 {_period_summary_label(user, checkout.period_days)}\n'
                     f'💰 К списанию: {_money(checkout.quoted_price_kopeks)} ₽\n\n'
                     'Нажмите «Продолжить и оформить».'
                 ),
                 (
                     '✅ <b>Balance topped up</b>\n\n'
-                    f'📱 {checkout.selected_device_limit} devices · 📅 {checkout.period_days} days\n'
+                    f'📱 {checkout.selected_device_limit} devices · 📅 {_period_summary_label(user, checkout.period_days)}\n'
                     f'💰 To charge: ₽{_money(checkout.quoted_price_kopeks)}\n\n'
                     'Tap “Continue and subscribe”.'
                 ),
@@ -626,7 +672,7 @@ async def arm(
         )
         checkout = await arm_checkout(db, checkout)
     except DeviceFirstError as error:
-        await _render_error(callback, db_user, str(error))
+        await _render_error(callback, db_user, error)
         return
     await _render_checkout(callback, db_user, db, checkout)
 
@@ -646,7 +692,7 @@ async def refresh_status(
             user_id=db_user.id,
         )
     except DeviceFirstError as error:
-        await _render_error(callback, db_user, str(error))
+        await _render_error(callback, db_user, error)
         return
     await _render_checkout(callback, db_user, db, checkout)
 
@@ -670,7 +716,7 @@ async def pay(
             method_key=parts[2],
         )
     except DeviceFirstError as error:
-        await _render_error(callback, db_user, str(error))
+        await _render_error(callback, db_user, error)
         return
     if not attempt.redirect_url:
         await _render_error(
@@ -729,7 +775,7 @@ async def cancel(
         if error.code == 'invalid_state' and 'checkout' in locals():
             await _render_checkout(callback, db_user, db, checkout)
         else:
-            await _render_error(callback, db_user, str(error))
+            await _render_error(callback, db_user, error)
         return
     await state.clear()
     await edit_or_answer_photo(
@@ -744,11 +790,75 @@ async def cancel(
     )
 
 
-async def _render_error(callback: types.CallbackQuery, user: User, detail: str) -> None:
+def _safe_error_detail(user: User, error: DeviceFirstError | str) -> str:
+    if not isinstance(error, DeviceFirstError):
+        return str(error)
+    messages = {
+        'device_limit_decrease_not_allowed': _text(
+            user,
+            'Нельзя уменьшить количество устройств при продлении. Выберите текущее число или больше.',
+            'A renewal cannot reduce the device limit. Choose the current number or more.',
+        ),
+        'open_checkout_exists': _text(
+            user,
+            'У вас уже есть незавершённый заказ. Откройте его и продолжите.',
+            'You already have an unfinished order. Open it and continue.',
+        ),
+        'subscription_restricted': _text(
+            user,
+            'Покупка подписки сейчас недоступна для этого аккаунта. Обратитесь в поддержку.',
+            'Subscription purchases are unavailable for this account. Contact support.',
+        ),
+        'invalid_selection': _text(
+            user,
+            'Этот вариант больше недоступен. Я обновил список — выберите ещё раз.',
+            'That option is no longer available. I refreshed the list; choose again.',
+        ),
+        'rate_limited': _text(
+            user,
+            'Слишком много попыток подряд. Подождите минуту и повторите.',
+            'Too many attempts. Wait a minute and try again.',
+        ),
+        'reconciliation_required': _text(
+            user,
+            'Мы проверяем созданный счёт. Не оплачивайте повторно: откройте проверку статуса или обратитесь в поддержку.',
+            'We are checking the created invoice. Do not pay again: check its status or contact support.',
+        ),
+    }
+    return messages.get(
+        error.code,
+        _text(
+            user,
+            'Не удалось продолжить заказ. Попробуйте ещё раз или начните новый расчёт.',
+            'Could not continue the order. Try again or start a new quote.',
+        ),
+    )
+
+
+async def _render_error(callback: types.CallbackQuery, user: User, error: DeviceFirstError | str) -> None:
+    rows = [[_back(user, 'df:start')]]
+    if isinstance(error, DeviceFirstError) and error.code == 'reconciliation_required':
+        public_id = _checkout_id(callback)
+        if public_id:
+            rows = [
+                [
+                    InlineKeyboardButton(
+                        text=_text(user, 'Проверить статус', 'Check status'),
+                        callback_data=f'df:s:{public_id}',
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=_text(user, 'Связаться с поддержкой', 'Contact support'),
+                        callback_data='menu_support',
+                    )
+                ],
+                [_back(user, 'df:start')],
+            ]
     await edit_or_answer_photo(
         callback=callback,
-        caption=_text(user, f'⚠️ Не удалось продолжить: {detail}', f'⚠️ Could not continue: {detail}'),
-        keyboard=InlineKeyboardMarkup(inline_keyboard=[[_back(user, 'df:start')]]),
+        caption=f'⚠️ {_safe_error_detail(user, error)}',
+        keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
         parse_mode='HTML',
     )
 
