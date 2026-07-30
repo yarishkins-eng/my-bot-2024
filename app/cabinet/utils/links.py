@@ -19,6 +19,7 @@ def get_campaign_web_link(start_parameter: str) -> str | None:
     Prefers CABINET_URL (where the auth flow captures ?campaign= param),
     falls back to MINIAPP_CUSTOM_URL for backwards compatibility.
     """
+
     def _with_campaign(url: str) -> str:
         parsed = urlsplit(url)
         query = parse_qsl(parsed.query, keep_blank_values=True)

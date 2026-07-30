@@ -187,7 +187,7 @@ def build_cabinet_url(path: str = '') -> str:
     if path == '/':
         target_path = base_path
     else:
-        target_path = f"{base_path}/{path.lstrip('/')}"
+        target_path = f'{base_path}/{path.lstrip("/")}'
 
     return urlunsplit((parsed.scheme, parsed.netloc, target_path, parsed.query, parsed.fragment))
 
