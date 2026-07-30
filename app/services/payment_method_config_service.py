@@ -362,6 +362,27 @@ def get_effective_quick_amounts(
     return [amount for amount in source if min_amount_kopeks <= amount <= max_amount_kopeks]
 
 
+def get_effective_amount_limits(
+    configured_min_amount_kopeks: int | None,
+    configured_max_amount_kopeks: int | None,
+    provider_min_amount_kopeks: int,
+    provider_max_amount_kopeks: int,
+) -> tuple[int, int]:
+    """Return the user-visible limits that the payment provider will accept.
+
+    Admin overrides may make a range stricter, but must never expand it beyond
+    the provider's configured hard bounds.  The returned values feed both the
+    cabinet's ``GET /payment-methods`` response and the route-level validation
+    performed before an invoice is created.
+    """
+    configured_min = configured_min_amount_kopeks or provider_min_amount_kopeks
+    configured_max = configured_max_amount_kopeks or provider_max_amount_kopeks
+    return (
+        max(configured_min, provider_min_amount_kopeks),
+        min(configured_max, provider_max_amount_kopeks),
+    )
+
+
 # ============ Initialization ============
 
 
@@ -608,15 +629,25 @@ async def get_enabled_methods_for_user(
         # Build display name
         display_name = config.display_name or method_def.get('default_display_name', method_id)
 
-        # Build min/max amounts (DB overrides env defaults)
-        min_amount = (
-            config.min_amount_kopeks if config.min_amount_kopeks is not None else method_def.get('default_min', 1000)
+        # DB values can narrow a range for a campaign, but cannot advertise an
+        # amount that the configured provider later rejects.  This used to let
+        # a Platega override of 1 ₽ leak into the cabinet despite the provider
+        # enforcing its own (higher) env minimum at invoice creation.
+        min_amount, max_amount = get_effective_amount_limits(
+            config.min_amount_kopeks,
+            config.max_amount_kopeks,
+            method_def.get('default_min', 1000),
+            method_def.get('default_max', 10000000),
         )
-        max_amount = (
-            config.max_amount_kopeks
-            if config.max_amount_kopeks is not None
-            else method_def.get('default_max', 10000000)
-        )
+
+        if min_amount > max_amount:
+            logger.warning(
+                'Платёжный метод скрыт: итоговый минимум больше максимума',
+                method_id=method_id,
+                min_amount_kopeks=min_amount,
+                max_amount_kopeks=max_amount,
+            )
+            continue
 
         # Build options (filter by sub_options config)
         options = None

@@ -67,7 +67,11 @@ class PaymentMethodResponse(BaseModel):
 class TopUpRequest(BaseModel):
     """Request to create payment for balance top-up."""
 
-    amount_kopeks: int = Field(..., ge=1000, le=2_000_000_000, description='Amount in kopeks (min 10 rubles)')
+    # The minimum and maximum are method- and user-specific.  ``create_topup``
+    # resolves the selected method and applies the exact range returned by
+    # ``GET /payment-methods``; this generic schema only rejects non-positive
+    # amounts before that lookup.
+    amount_kopeks: int = Field(..., ge=1, le=2_000_000_000, description='Amount in kopeks')
     payment_method: str = Field(..., description='Payment method ID')
     payment_option: str | None = Field(None, description='Payment option (e.g. Platega method code)')
 

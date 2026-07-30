@@ -496,7 +496,10 @@ async def create_topup(
 
             if result and result.get('redirect_url'):
                 payment_url = result.get('redirect_url')
-                payment_id = result.get('transaction_id') or str(result.get('local_payment_id', 'pending'))
+                # The pending-payment status endpoint accepts the local DB id.
+                # Platega's external transaction id is useful for provider API
+                # calls, but cannot address that endpoint reliably.
+                payment_id = str(result.get('local_payment_id') or result.get('transaction_id') or 'pending')
             else:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

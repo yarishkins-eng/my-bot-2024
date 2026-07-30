@@ -12,6 +12,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from app.services.payment_method_config_service import (
     DEFAULT_QUICK_AMOUNTS,
+    get_effective_amount_limits,
     get_effective_quick_amounts,
     normalize_quick_amounts,
 )
@@ -68,3 +69,16 @@ def test_effective_filters_by_min_max():
 
 def test_effective_returns_empty_when_all_filtered_out():
     assert get_effective_quick_amounts([5000], 10000, 100000) == []
+
+
+def test_effective_limits_cannot_expand_the_provider_range():
+    # A stale admin override must not promise 1 ₽ when Platega accepts from
+    # 100 ₽, nor promise a ceiling higher than the provider will accept.
+    assert get_effective_amount_limits(100, 200_000_000, 10_000, 100_000_000) == (
+        10_000,
+        100_000_000,
+    )
+
+
+def test_effective_limits_allow_admin_to_narrow_the_provider_range():
+    assert get_effective_amount_limits(25_000, 75_000, 10_000, 100_000_000) == (25_000, 75_000)
