@@ -16,7 +16,10 @@ from app.keyboards.inline import build_funnel_menu_keyboard
 from app.localization.texts import get_texts
 from app.utils.funnel_state import FunnelState, classify_funnel_state
 from app.utils.subscription_link_access import (
+    STAGING_FAKE_SUBSCRIPTION_URL,
+    get_staging_fake_subscription_url,
     get_user_subscription_with_available_link,
+    has_active_subscription_access,
     has_active_subscription_connection,
     has_available_subscription_link,
 )
@@ -32,6 +35,7 @@ def _configure_link_access(
     monkeypatch.setattr(settings_cls, 'should_hide_subscription_link', lambda self: hidden, raising=False)
     monkeypatch.setattr(settings_cls, 'is_multi_tariff_enabled', lambda self: multi_tariff, raising=False)
     monkeypatch.setattr(settings_cls, 'is_happ_cryptolink_mode', lambda self: False, raising=False)
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', False, raising=False)
 
 
 def _subscription(
@@ -43,6 +47,7 @@ def _subscription(
     end_date: datetime | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        id=17,
         actual_status=status,
         subscription_url=url,
         subscription_crypto_link=None,
@@ -107,6 +112,67 @@ def test_link_is_not_available_before_panel_generates_it(monkeypatch: pytest.Mon
     _configure_link_access(monkeypatch)
 
     assert not has_available_subscription_link(_subscription(url=None))
+
+
+@pytest.mark.parametrize(
+    ('status', 'is_trial', 'in_grace', 'end_date'),
+    [
+        ('active', False, False, None),
+        ('trial', True, False, None),
+        ('limited', False, False, datetime.now(UTC) + timedelta(days=1)),
+        ('expired', False, True, None),
+    ],
+)
+def test_staging_fake_url_is_available_only_for_live_subscription_without_real_url(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    is_trial: bool,
+    in_grace: bool,
+    end_date: datetime | None,
+) -> None:
+    _configure_link_access(monkeypatch)
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', True, raising=False)
+    subscription = _subscription(status, url=None, is_trial=is_trial, in_grace=in_grace, end_date=end_date)
+
+    assert has_active_subscription_access(subscription)
+    assert get_staging_fake_subscription_url(subscription) == STAGING_FAKE_SUBSCRIPTION_URL
+    # The Telegram menu remains tied to a real panel URL; this fixture is only
+    # for the staging cabinet's display/copy smoke.
+    assert not has_available_subscription_link(subscription)
+    assert subscription.subscription_url is None
+
+
+@pytest.mark.parametrize('status', ['expired', 'disabled', 'pending'])
+def test_staging_fake_url_never_bypasses_access_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    _configure_link_access(monkeypatch)
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', True, raising=False)
+
+    assert get_staging_fake_subscription_url(_subscription(status, url=None)) is None
+
+
+def test_staging_fake_url_never_bypasses_limited_subscription_past_end_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_link_access(monkeypatch)
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', True, raising=False)
+    subscription = _subscription('limited', url=None, end_date=datetime.now(UTC) - timedelta(seconds=1))
+
+    assert get_staging_fake_subscription_url(subscription) is None
+
+
+def test_staging_fake_url_respects_hidden_link_and_real_url_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_link_access(monkeypatch, hidden=True)
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', True, raising=False)
+    assert get_staging_fake_subscription_url(_subscription(url=None)) is None
+
+    _configure_link_access(monkeypatch)
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', True, raising=False)
+    assert get_staging_fake_subscription_url(_subscription()) is None
 
 
 def test_hidden_link_setting_hides_button_and_blocks_old_callback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -226,6 +292,49 @@ async def test_connection_link_endpoint_rejects_expired_subscription(
         subscription_status,
         'resolve_subscription',
         AsyncMock(return_value=_subscription('expired')),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await subscription_status.get_connection_link(user=SimpleNamespace(), db=SimpleNamespace())
+
+    assert error.value.status_code == 404
+
+
+@pytest.mark.anyio('asyncio')
+async def test_connection_link_endpoint_returns_nonpersistent_staging_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_link_access(monkeypatch)
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', True, raising=False)
+    subscription = _subscription(url=None)
+    monkeypatch.setattr(subscription_status, 'resolve_subscription', AsyncMock(return_value=subscription))
+    no_write_db = SimpleNamespace(commit=AsyncMock())
+    monkeypatch.setattr(
+        subscription_status,
+        'RemnaWaveService',
+        lambda: pytest.fail('staging fixture must not construct RemnaWaveService'),
+    )
+
+    payload = await subscription_status.get_connection_link(user=SimpleNamespace(), db=no_write_db)
+
+    assert payload['subscription_url'] == STAGING_FAKE_SUBSCRIPTION_URL
+    assert payload['display_link'] == STAGING_FAKE_SUBSCRIPTION_URL
+    assert payload['connect_mode'] == 'miniapp_custom'
+    assert payload['happ_crypto_link'] is None
+    assert subscription.subscription_url is None
+    no_write_db.commit.assert_not_awaited()
+
+
+@pytest.mark.anyio('asyncio')
+async def test_connection_link_endpoint_does_not_expose_staging_fixture_when_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_link_access(monkeypatch, hidden=True)
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', True, raising=False)
+    monkeypatch.setattr(
+        subscription_status,
+        'resolve_subscription',
+        AsyncMock(return_value=_subscription(url=None)),
     )
 
     with pytest.raises(HTTPException) as error:

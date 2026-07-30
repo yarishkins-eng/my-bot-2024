@@ -188,20 +188,43 @@ async def get_connection_link(
     # Нельзя выдать конфигурацию истёкшей/отключённой подписке только потому,
     # что старый URL ещё не был очищен webhook'ом. HIDE_SUBSCRIPTION_LINK сюда
     # намеренно не входит: он скрывает raw URL, но не штатные crypt/deep-link.
-    from app.utils.subscription_link_access import has_active_subscription_connection
+    from app.utils.subscription_link_access import (
+        get_staging_fake_subscription_url,
+        has_active_subscription_connection,
+    )
 
-    if not has_active_subscription_connection(subscription):
+    staging_fake_url = get_staging_fake_subscription_url(subscription)
+    if not has_active_subscription_connection(subscription) and not staging_fake_url:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='No active subscription connection link',
         )
 
-    subscription_url = subscription.subscription_url
+    subscription_url = subscription.subscription_url or staging_fake_url
     if not subscription_url:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Subscription link not yet generated',
         )
+
+    # This fixture proves display/copy behaviour in the isolated test cabinet;
+    # it is non-routable and must not trigger Happ or RemnaWave enrichment.
+    if staging_fake_url:
+        return {
+            'subscription_url': staging_fake_url,
+            'display_link': staging_fake_url,
+            'happ_redirect_link': None,
+            'happ_scheme_link': None,
+            'happ_crypto_link': None,
+            'connect_mode': 'miniapp_custom',
+            'hide_link': False,
+            'instructions': {
+                'steps': [
+                    'Copy the staging test link',
+                    'This link is deliberately non-working and does not configure VPN',
+                ]
+            },
+        }
 
     display_link = get_display_subscription_link(subscription)
     happ_redirect = get_happ_cryptolink_redirect_link(subscription_url) if settings.is_happ_cryptolink_mode() else None

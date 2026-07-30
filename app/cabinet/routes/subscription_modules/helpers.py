@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 from app.database.models import Subscription, User
 from app.utils.grace import is_in_grace
+from app.utils.subscription_link_access import get_staging_fake_subscription_url
 
 from ...schemas.subscription import (
     ServerInfo,
@@ -291,7 +292,9 @@ def _subscription_to_response(
         servers=servers or [],
         autopay_enabled=subscription.autopay_enabled or False,
         autopay_days_before=subscription.autopay_days_before or 3,
-        subscription_url=subscription.subscription_url,
+        # Staging may provide a safe in-memory fixture when RemnaWave is
+        # intentionally disconnected. It is never assigned to the ORM model.
+        subscription_url=subscription.subscription_url or get_staging_fake_subscription_url(subscription),
         hide_subscription_link=hide_link,
         is_active=is_active,
         is_expired=is_expired,

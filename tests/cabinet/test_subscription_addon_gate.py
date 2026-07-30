@@ -239,3 +239,23 @@ def test_response_passes_disabled_reason_hint_through() -> None:
     resp = _subscription_to_response(sub, user=None, disabled_reason_hint='channel')
     assert resp.status == 'disabled'
     assert resp.disabled_reason_hint == 'channel'
+
+
+def test_response_exposes_staging_fixture_without_mutating_subscription(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', True, raising=False)
+    sub = _make_subscription(subscription_url=None)
+
+    resp = _subscription_to_response(sub, user=None)
+
+    assert resp.subscription_url == 'https://teplo-staging.invalid/subscription-preview'
+    assert sub.subscription_url is None
+
+
+def test_response_hides_staging_fixture_when_direct_links_are_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, 'STAGING_FAKE_SUBSCRIPTION_URL_ENABLED', True, raising=False)
+    monkeypatch.setattr(type(settings), 'should_hide_subscription_link', lambda self: True)
+    sub = _make_subscription(subscription_url=None)
+
+    resp = _subscription_to_response(sub, user=None)
+
+    assert resp.subscription_url is None

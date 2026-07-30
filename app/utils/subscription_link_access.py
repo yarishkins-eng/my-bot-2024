@@ -13,6 +13,45 @@ from app.utils.grace import is_in_grace
 from app.utils.subscription_utils import get_display_subscription_link
 
 
+STAGING_FAKE_SUBSCRIPTION_URL = 'https://teplo-staging.invalid/subscription-preview'
+
+
+def has_active_subscription_access(subscription) -> bool:
+    """True when the subscription still has VPN access, independent of any URL.
+
+    The distinction matters only for staging's UI-only test URL: a test
+    subscription has no RemnaWave-generated URL by design, but must never make
+    an expired, disabled or pending subscription look connectable.
+    """
+    if subscription is None:
+        return False
+
+    actual_status = str(getattr(subscription, 'actual_status', '') or '').lower()
+    if actual_status in {'active', 'trial'}:
+        return True
+    if actual_status == 'limited':
+        end_date = _aware(getattr(subscription, 'end_date', None))
+        return end_date is not None and end_date > datetime.now(UTC)
+    return actual_status == 'expired' and getattr(subscription, 'is_trial', True) is False and is_in_grace(subscription)
+
+
+def get_staging_fake_subscription_url(subscription) -> str | None:
+    """Return a non-routable UI fixture without mutating the subscription.
+
+    This code is deployed only on the staging branch. The explicit flag still
+    defaults to ``False`` so production and local environments fail closed.
+    ``.invalid`` is RFC-reserved and can never be a working VPN configuration.
+    """
+    if not settings.STAGING_FAKE_SUBSCRIPTION_URL_ENABLED:
+        return None
+    if settings.should_hide_subscription_link() or not has_active_subscription_access(subscription):
+        return None
+    # A real URL or an existing Happ crypto link always wins over the fixture.
+    if get_display_subscription_link(subscription):
+        return None
+    return STAGING_FAKE_SUBSCRIPTION_URL
+
+
 def has_active_subscription_connection(subscription) -> bool:
     """Возвращает True, когда подписка ещё вправе получить конфигурацию.
 
@@ -25,25 +64,7 @@ def has_active_subscription_connection(subscription) -> bool:
     истёкшей НЕ-триальной подписки; отключенная подписка, даже с устаревшим
     флагом ``in_grace``, доступа не получает.
     """
-    if subscription is None:
-        return False
-
-    actual_status = str(getattr(subscription, 'actual_status', '') or '').lower()
-    if actual_status in {'active', 'trial'}:
-        has_vpn_access = True
-    elif actual_status == 'limited':
-        end_date = _aware(getattr(subscription, 'end_date', None))
-        has_vpn_access = end_date is not None and end_date > datetime.now(UTC)
-    else:
-        has_vpn_access = (
-            actual_status == 'expired'
-            and getattr(subscription, 'is_trial', True) is False
-            and is_in_grace(subscription)
-        )
-    if not has_vpn_access:
-        return False
-
-    return bool(get_display_subscription_link(subscription))
+    return has_active_subscription_access(subscription) and bool(get_display_subscription_link(subscription))
 
 
 def has_available_subscription_link(subscription) -> bool:

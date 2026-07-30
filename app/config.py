@@ -983,6 +983,10 @@ class Settings(BaseSettings):
     HAPP_DOWNLOAD_LINK_WINDOWS: str | None = None
     HAPP_DOWNLOAD_LINK_PC: str | None = None
     HIDE_SUBSCRIPTION_LINK: bool = False
+    # Только для изолированного staging: позволяет проверить UI ссылки, когда
+    # RemnaWave намеренно не создаёт реальный subscription_url. В production
+    # остаётся fail-closed; сам безопасный .invalid URL жёстко задан в коде.
+    STAGING_FAKE_SUBSCRIPTION_URL_ENABLED: bool = False
     ENABLE_LOGO_MODE: bool = True
     LOGO_FILE: str = 'vpn_logo.png'
     SKIP_RULES_ACCEPT: bool = False

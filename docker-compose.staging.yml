@@ -83,6 +83,9 @@ services:
       CABINET_URL: 'https://cabinet.lilulalu.xyz:8443'
       MINIAPP_CUSTOM_URL: 'https://cabinet.lilulalu.xyz:8443'
       CABINET_ALLOWED_ORIGINS: 'https://cabinet.lilulalu.xyz:8443'
+      # Не пишет в БД и не создаёт VPN-конфигурацию: только позволяет будущим
+      # staging-сценариям увидеть и скопировать заведомо нерабочий .invalid URL.
+      STAGING_FAKE_SUBSCRIPTION_URL_ENABLED: 'true'
       # В staging панель RemnaWave намеренно недоступна — не создаём ложных тревог.
       MAINTENANCE_MONITORING_ENABLED: 'false'
       LOCALES_PATH: '/app/locales'
