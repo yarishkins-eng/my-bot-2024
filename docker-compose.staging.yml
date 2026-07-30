@@ -80,8 +80,12 @@ services:
       WEB_API_HOST: '0.0.0.0'
       WEB_API_PORT: '8080'
       CABINET_ENABLED: 'true'
+      # A distinct WebApp URL makes Telegram create a new staging document after
+      # the theme-state release; build_cabinet_url keeps this query after routes.
+      # CABINET_URL feeds backend callback/return URLs, so it must stay a clean
+      # origin. Only the Telegram WebApp launcher below is versioned.
       CABINET_URL: 'https://cabinet.lilulalu.xyz:8443'
-      MINIAPP_CUSTOM_URL: 'https://cabinet.lilulalu.xyz:8443'
+      MINIAPP_CUSTOM_URL: 'https://cabinet.lilulalu.xyz:8443?release=cabinet-6020269'
       CABINET_ALLOWED_ORIGINS: 'https://cabinet.lilulalu.xyz:8443'
       # Не пишет в БД и не создаёт VPN-конфигурацию: только позволяет будущим
       # staging-сценариям увидеть и скопировать заведомо нерабочий .invalid URL.

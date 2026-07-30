@@ -1,4 +1,5 @@
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 from aiogram import types
 from aiogram.types import InlineKeyboardButton
@@ -166,23 +167,29 @@ def _resolve_style(style: str | None) -> str | None:
 def build_cabinet_url(path: str = '') -> str:
     """Join ``MINIAPP_CUSTOM_URL`` with an optional *path* segment.
 
-    Handles trailing-slash normalization so that both
-    ``https://example.com`` and ``https://example.com/`` produce
-    correct URLs like ``https://example.com/balance``.
+    Handles trailing-slash normalization and preserves query/fragment data, so
+    that both ``https://example.com`` and ``https://example.com/`` produce
+    correct URLs like ``https://example.com/balance``.  This also lets an
+    isolated staging Mini App use a versioned query parameter without turning
+    a deep link into the invalid ``?version=/balance`` form.
 
     Returns an empty string when the base URL is not configured
     or when *path* is empty (no known section).
     """
-    base = (settings.MINIAPP_CUSTOM_URL or '').strip().rstrip('/')
+    base = (settings.MINIAPP_CUSTOM_URL or '').strip()
     if not base:
         return ''
     if not path:
         return ''
+
+    parsed = urlsplit(base)
+    base_path = parsed.path.rstrip('/')
     if path == '/':
-        return base
-    if not path.startswith('/'):
-        path = f'/{path}'
-    return f'{base}{path}'
+        target_path = base_path
+    else:
+        target_path = f"{base_path}/{path.lstrip('/')}"
+
+    return urlunsplit((parsed.scheme, parsed.netloc, target_path, parsed.query, parsed.fragment))
 
 
 def build_miniapp_or_callback_button(

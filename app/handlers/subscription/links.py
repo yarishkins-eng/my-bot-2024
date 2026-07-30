@@ -11,6 +11,7 @@ from app.keyboards.inline import (
     get_happ_download_button_row,
 )
 from app.localization.texts import get_texts
+from app.utils.miniapp_buttons import build_cabinet_url
 from app.utils.subscription_link_access import (
     has_active_subscription_connection,
     has_available_subscription_link,
@@ -154,7 +155,7 @@ async def handle_connect_subscription(
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
+                        web_app=types.WebAppInfo(url=build_cabinet_url('/connection')),
                     )
                 ],
                 [InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)],
@@ -394,8 +395,6 @@ async def handle_open_subscription_link(
     # «Подключиться» — в ОДИН тап на экран подключения мини-аппа (Happ/INCY + QR), без
     # промежуточного экрана бота. Telegram не открывает happ://-схемы из inline-кнопки —
     # только через HTTPS-страницу (мини-апп). Fallback (нет URL мини-аппа) — старый callback.
-    from app.utils.miniapp_buttons import build_cabinet_url
-
     _connect_url = build_cabinet_url('/connection')
     if _connect_url:
         connect_button = InlineKeyboardButton(

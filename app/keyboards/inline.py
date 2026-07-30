@@ -10,7 +10,7 @@ from app.config import PERIOD_PRICES, settings
 from app.database.models import User
 from app.localization.loader import DEFAULT_LANGUAGE
 from app.localization.texts import get_texts
-from app.utils.miniapp_buttons import build_miniapp_or_callback_button
+from app.utils.miniapp_buttons import build_cabinet_url, build_miniapp_or_callback_button
 from app.utils.price_display import PriceInfo, format_price_button
 from app.utils.pricing_utils import (
     apply_percentage_discount,
@@ -42,7 +42,6 @@ def build_funnel_menu_keyboard(
     готовой ссылке; сам билдер не должен угадывать это по is_trial/тарифу.
     """
     from app.utils.funnel_state import FunnelState
-    from app.utils.miniapp_buttons import build_cabinet_url
 
     if state == FunnelState.NEWBIE:
         rows: list[list[InlineKeyboardButton]] = []
@@ -550,7 +549,6 @@ def _build_cabinet_main_menu_keyboard(
     from app.utils.miniapp_buttons import (
         CALLBACK_TO_CABINET_STYLE,
         _resolve_style,
-        build_cabinet_url,
     )
 
     global_style = _resolve_style((settings.CABINET_BUTTON_STYLE or '').strip())
@@ -815,7 +813,7 @@ def get_main_menu_keyboard(
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
+                        web_app=types.WebAppInfo(url=build_cabinet_url('/connection')),
                     )
                 ]
             )
@@ -1309,7 +1307,7 @@ def get_subscription_keyboard(
                         [
                             InlineKeyboardButton(
                                 text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                                web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
+                                web_app=types.WebAppInfo(url=build_cabinet_url('/connection')),
                             )
                         ]
                     )
@@ -1349,7 +1347,7 @@ def get_subscription_keyboard(
                 [
                     InlineKeyboardButton(
                         text=texts.t('CONNECT_BUTTON', '🔗 Подключиться'),
-                        web_app=types.WebAppInfo(url=settings.MINIAPP_CUSTOM_URL.rstrip('/') + '/connection'),
+                        web_app=types.WebAppInfo(url=build_cabinet_url('/connection')),
                     )
                 ]
             )
