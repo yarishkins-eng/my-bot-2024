@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -68,6 +69,49 @@ async def test_sends_trial_menu_after_activation(monkeypatch: pytest.MonkeyPatch
     await funnel_notify.send_funnel_trial_menu(user)
 
     assert recorder.calls == 1  # меню активного триала отправлено, старое заменено
+
+
+@pytest.mark.asyncio
+async def test_slow_trial_menu_delivery_does_not_block_activation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Служебное Telegram-сообщение не должно держать HTTP-ответ триала бесконечно."""
+    recorder = _wire(monkeypatch)
+    started = asyncio.Event()
+
+    async def _never_returns(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    recorder._bot.send_message = _never_returns
+    monkeypatch.setattr(funnel_notify, '_FUNNEL_MENU_SEND_TIMEOUT_SECONDS', 0.01)
+    user = SimpleNamespace(telegram_id=123, language='ru')
+
+    await asyncio.wait_for(funnel_notify.send_funnel_trial_menu(user), timeout=0.2)
+
+    assert started.is_set()
+
+
+@pytest.mark.asyncio
+async def test_slow_old_menu_cleanup_still_remembers_new_menu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """После успешной отправки ID нового меню не теряется из-за медленного cleanup."""
+    _wire(monkeypatch)
+    remembered: dict[str, int] = {}
+
+    async def _slow_delete(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    async def _remember(telegram_id: int, message_id: int):
+        remembered['telegram_id'] = telegram_id
+        remembered['message_id'] = message_id
+
+    monkeypatch.setattr(funnel_notify, '_delete_remembered_menu', _slow_delete)
+    monkeypatch.setattr(funnel_notify, '_remember_menu_message_id', _remember)
+    monkeypatch.setattr(funnel_notify, '_FUNNEL_MENU_SEND_TIMEOUT_SECONDS', 0.01)
+    monkeypatch.setattr(funnel_notify, '_FUNNEL_MENU_CLEANUP_TIMEOUT_SECONDS', 0.01)
+    user = SimpleNamespace(telegram_id=123, language='ru')
+
+    await asyncio.wait_for(funnel_notify.send_funnel_trial_menu(user), timeout=0.2)
+
+    assert remembered == {'telegram_id': 123, 'message_id': 7}
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,8 @@
 иначе get_subscriber_state прочитает старую/пустую подписку и пришлёт неверное меню.
 """
 
+import asyncio
+
 import redis.asyncio as aioredis
 import structlog
 
@@ -27,6 +29,11 @@ logger = structlog.get_logger(__name__)
 # меню при ЛЮБОМ переходе (новичок→триал, триал→платный, истёк→активен и т.д.).
 _MENU_MSG_KEY = 'funnel:menu_msg:{}'
 _MENU_MSG_TTL = 7200  # 2 часа — окно, в которое разумно ждать перехода состояния
+# Автообновление меню — только удобство после уже сохранённой подписки. Оно не должно
+# держать HTTP-ответ кабинету дольше клиентского API-таймаута (30 секунд).
+_FUNNEL_MENU_SEND_TIMEOUT_SECONDS = 5.0
+_FUNNEL_MENU_CLEANUP_TIMEOUT_SECONDS = 2.0
+_FUNNEL_MENU_CLOSE_TIMEOUT_SECONDS = 2.0
 
 _redis_client: aioredis.Redis | None = None
 _redis_initialized: bool = False
@@ -110,6 +117,67 @@ async def _delete_remembered_menu(bot, telegram_id: int) -> None:
         logger.debug('_delete_remembered_menu failed', error=exc)
 
 
+async def _send_and_remember_funnel_menu(bot, telegram_id: int, text: str, keyboard) -> None:
+    """Отправляет best-effort меню в ограниченное время.
+
+    Подписка к этому моменту уже сохранена. Медленный Telegram или Redis не должны
+    превращать успешную активацию/покупку в ошибку HTTP-ответа кабинета.
+    """
+    try:
+        async with asyncio.timeout(_FUNNEL_MENU_SEND_TIMEOUT_SECONDS):
+            sent = await bot.send_message(
+                chat_id=telegram_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode='HTML',
+            )
+    except TimeoutError:
+        logger.warning(
+            'Отправка funnel-меню превысила допустимое время; основной поток продолжается',
+            telegram_id=telegram_id,
+            timeout_seconds=_FUNNEL_MENU_SEND_TIMEOUT_SECONDS,
+        )
+        return
+
+    if sent is None:
+        return
+
+    # Сначала пробуем убрать старое сообщение. Даже если этот cleanup завис,
+    # обязательно продолжаем к сохранению ID уже доставленного нового меню.
+    try:
+        async with asyncio.timeout(_FUNNEL_MENU_CLEANUP_TIMEOUT_SECONDS):
+            await _delete_remembered_menu(bot, telegram_id)
+    except TimeoutError:
+        logger.warning(
+            'Удаление старого funnel-меню превысило допустимое время; основной поток продолжается',
+            telegram_id=telegram_id,
+            timeout_seconds=_FUNNEL_MENU_CLEANUP_TIMEOUT_SECONDS,
+        )
+
+    try:
+        async with asyncio.timeout(_FUNNEL_MENU_CLEANUP_TIMEOUT_SECONDS):
+            await _remember_menu_message_id(telegram_id, sent.message_id)
+    except TimeoutError:
+        logger.warning(
+            'Сохранение нового funnel-меню превысило допустимое время; основной поток продолжается',
+            telegram_id=telegram_id,
+            timeout_seconds=_FUNNEL_MENU_CLEANUP_TIMEOUT_SECONDS,
+        )
+
+
+async def _close_funnel_bot_session(bot, telegram_id: int) -> None:
+    """Закрывает клиент Telegram, не задерживая уже завершённый основной поток."""
+    try:
+        async with asyncio.timeout(_FUNNEL_MENU_CLOSE_TIMEOUT_SECONDS):
+            await bot.session.close()
+    except TimeoutError:
+        logger.warning(
+            'Закрытие Telegram-сессии для funnel-меню превысило допустимое время',
+            telegram_id=telegram_id,
+            timeout_seconds=_FUNNEL_MENU_CLOSE_TIMEOUT_SECONDS,
+        )
+
+
 async def clear_funnel_menu(user) -> None:
     """Убирает устаревшее funnel-меню из чата при ПОТЕРЕ доступа (обнуление подписки).
 
@@ -184,18 +252,9 @@ async def send_funnel_trial_menu(user) -> None:
         text = texts.t('FUNNEL_TRIAL_ACTIVATED', '🎉 Готово! Пробный период активирован.')
         bot = create_bot()
         try:
-            sent = await bot.send_message(
-                chat_id=user.telegram_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode='HTML',
-            )
-            # Старое меню новичка теперь мусор — удаляем; новое запоминаем.
-            await _delete_remembered_menu(bot, user.telegram_id)
-            if sent is not None:
-                await _remember_menu_message_id(user.telegram_id, sent.message_id)
+            await _send_and_remember_funnel_menu(bot, user.telegram_id, text, keyboard)
         finally:
-            await bot.session.close()
+            await _close_funnel_bot_session(bot, user.telegram_id)
     except Exception as exc:  # авто-обновление не критично — логируем и идём дальше
         logger.warning('Не удалось отправить funnel-меню после активации триала', error=exc)
 
@@ -254,16 +313,8 @@ async def send_funnel_subscriber_menu(user) -> None:
         text = texts.t('FUNNEL_SUBSCRIPTION_ACTIVE', '✅ Подписка активна! Вот твоё меню:')
         bot = create_bot()
         try:
-            sent = await bot.send_message(
-                chat_id=user.telegram_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode='HTML',
-            )
-            await _delete_remembered_menu(bot, user.telegram_id)
-            if sent is not None:
-                await _remember_menu_message_id(user.telegram_id, sent.message_id)
+            await _send_and_remember_funnel_menu(bot, user.telegram_id, text, keyboard)
         finally:
-            await bot.session.close()
+            await _close_funnel_bot_session(bot, user.telegram_id)
     except Exception as exc:  # авто-обновление не критично — логируем и идём дальше
         logger.warning('Не удалось отправить меню подписчика после активации', error=exc)
