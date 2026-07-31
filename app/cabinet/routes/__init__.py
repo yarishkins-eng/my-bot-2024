@@ -48,6 +48,7 @@ from .auth import router as auth_router
 from .balance import router as balance_router
 from .branding import router as branding_router
 from .contests import router as contests_router
+from .device_first import router as device_first_router
 from .gift import router as gift_router
 from .info import router as info_router
 from .info_pages import router as info_pages_router
@@ -88,6 +89,7 @@ router.include_router(oauth_router)
 router.include_router(account_linking_router)
 router.include_router(merge_router)
 router.include_router(subscription_router)
+router.include_router(device_first_router)
 router.include_router(multi_tariff_subscription_router)
 router.include_router(balance_router)
 router.include_router(referral_router)

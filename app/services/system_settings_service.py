@@ -311,6 +311,7 @@ class BotConfigurationService:
         'TRAFFIC_PACKAGES_CONFIG': 'TRAFFIC_PACKAGES',
         'MULTI_TARIFF_ENABLED': 'SUBSCRIPTIONS_CORE',
         'MAX_ACTIVE_SUBSCRIPTIONS': 'SUBSCRIPTIONS_CORE',
+        'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED': 'SUBSCRIPTIONS_CORE',
         'BASE_PROMO_GROUP_PERIOD_DISCOUNTS_ENABLED': 'SUBSCRIPTIONS_CORE',
         'BASE_PROMO_GROUP_PERIOD_DISCOUNTS': 'SUBSCRIPTIONS_CORE',
         'DEFAULT_AUTOPAY_ENABLED': 'AUTOPAY',
@@ -687,6 +688,16 @@ class BotConfigurationService:
             'example': '10',
             'warning': 'Большое значение может усложнить управление подписками для пользователя.',
             'dependencies': 'MULTI_TARIFF_ENABLED',
+        },
+        'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED': {
+            'description': (
+                'Разрешает создавать новые checkout выбора устройств и срока. '
+                'Выключение не останавливает уже созданные платежи, статусы и фоновые повторы.'
+            ),
+            'format': 'Булево значение.',
+            'example': 'false',
+            'warning': 'Включайте только после настройки ровно одного совместимого тарифа.',
+            'dependencies': 'SALES_MODE=tariffs, MULTI_TARIFF_ENABLED=false',
         },
         'DEVICES_SELECTION_ENABLED': {
             'description': 'Разрешает пользователям выбирать количество устройств при покупке и продлении подписки.',

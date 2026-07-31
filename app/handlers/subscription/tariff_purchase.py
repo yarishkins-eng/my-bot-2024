@@ -760,6 +760,22 @@ async def show_funnel_tariffs(
     promo_group_id = getattr(db_user, 'promo_group_id', None)
     tariffs = await get_tariffs_for_user(db, promo_group_id)
 
+    if settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED:
+        from app.handlers.subscription.device_first import show_device_first_entry
+        from app.services.device_first_checkout_service import build_purchase_options
+
+        device_first_options = await build_purchase_options(db, db_user)
+        if device_first_options.get('eligible'):
+            await show_device_first_entry(
+                callback,
+                db_user,
+                db,
+                state,
+                options=device_first_options,
+                origin_callback='funnel_tariffs',
+            )
+            return
+
     if not tariffs:
         await edit_or_answer_photo(
             callback=callback,
@@ -4901,6 +4917,10 @@ def register_tariff_purchase_handlers(dp: Dispatcher):
     dp.callback_query.register(show_tariffs_list, F.data == 'buy_subscription_tariffs')
     # Кнопка «Тарифы» из меню воронки (новичок/триал)
     dp.callback_query.register(show_funnel_tariffs, F.data == 'funnel_tariffs')
+
+    from app.handlers.subscription.device_first import register_device_first_handlers
+
+    register_device_first_handlers(dp)
 
     # Выбор тарифа
     dp.callback_query.register(select_tariff, F.data.startswith('tariff_select:'))

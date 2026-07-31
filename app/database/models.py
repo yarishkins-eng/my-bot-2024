@@ -1680,6 +1680,11 @@ class Tariff(Base):
         Integer, nullable=True, default=None
     )  # Цена за доп. устройство (None = нельзя докупить)
     max_device_limit = Column(Integer, nullable=True, default=None)  # Макс. устройств (None = без ограничений)
+    # Явный набор устройств для нового device-first checkout. NULL означает,
+    # что тариф остаётся на legacy-покупке; пустой/некорректный набор запрещён
+    # на границе admin API.
+    device_purchase_options = Column(JSON, nullable=True)
+    pricing_revision = Column(Integer, nullable=False, default=1, server_default='1')
 
     # Сквады (серверы) доступные в тарифе
     allowed_squads = Column(JSON, default=list)  # список UUID сквадов
@@ -2377,6 +2382,13 @@ class Transaction(Base):
 
     payment_method = Column(String(50), nullable=True)
     external_id = Column(String(255), nullable=True)
+    device_first_checkout_id = Column(
+        Integer,
+        ForeignKey('subscription_checkouts.id', ondelete='SET NULL'),
+        nullable=True,
+        index=True,
+    )
+    device_first_ledger_key = Column(String(255), nullable=True, unique=True)
 
     is_completed = Column(Boolean, default=True)
 
@@ -2392,6 +2404,176 @@ class Transaction(Base):
     @property
     def amount_rubles(self) -> float:
         return self.amount_kopeks / 100
+
+
+class SubscriptionCheckout(Base):
+    """Durable state machine for device-first purchase/renewal."""
+
+    __tablename__ = 'subscription_checkouts'
+    __table_args__ = (
+        CheckConstraint('period_days > 0', name='ck_subscription_checkout_period_positive'),
+        CheckConstraint('selected_device_limit > 0', name='ck_subscription_checkout_devices_positive'),
+        CheckConstraint('quoted_price_kopeks >= 0', name='ck_subscription_checkout_quote_nonnegative'),
+        CheckConstraint('max_price_kopeks >= quoted_price_kopeks', name='ck_subscription_checkout_max_quote'),
+        Index('ix_subscription_checkouts_user_created', 'user_id', 'created_at'),
+        Index('ix_subscription_checkouts_lifecycle', 'lifecycle_state', 'expires_at'),
+        Index(
+            'uq_subscription_checkouts_one_open_per_user',
+            'user_id',
+            unique=True,
+            postgresql_where=text("lifecycle_state IN ('draft','confirmed','awaiting_funds','armed','fulfilling')"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    public_id = Column(String(36), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    source = Column(String(32), nullable=False, default='cabinet')
+    tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='RESTRICT'), nullable=False)
+    target_subscription_id = Column(Integer, nullable=True)
+    expect_no_subscription = Column(Boolean, nullable=False, default=True)
+    target_snapshot = Column(JSON, nullable=False, default=dict)
+    period_days = Column(Integer, nullable=False)
+    selected_device_limit = Column(Integer, nullable=False)
+    price_breakdown = Column(JSON, nullable=False, default=dict)
+    quoted_price_kopeks = Column(Integer, nullable=False)
+    max_price_kopeks = Column(Integer, nullable=False)
+    pricing_revision = Column(Integer, nullable=False)
+    quote_expires_at = Column(AwareDateTime(), nullable=False)
+    expires_at = Column(AwareDateTime(), nullable=False)
+    lifecycle_state = Column(String(32), nullable=False, default='draft')
+    quote_state = Column(String(32), nullable=False, default='valid')
+    funding_state = Column(String(32), nullable=False, default='unfunded')
+    fulfillment_state = Column(String(32), nullable=False, default='not_started')
+    provisioning_state = Column(String(32), nullable=False, default='not_started')
+    terminal_reason = Column(String(255), nullable=True)
+    confirmed_at = Column(AwareDateTime(), nullable=True)
+    armed_at = Column(AwareDateTime(), nullable=True)
+    fulfilled_at = Column(AwareDateTime(), nullable=True)
+    fulfilled_end_at = Column(AwareDateTime(), nullable=True)
+    created_subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='SET NULL'), nullable=True)
+    debit_transaction_id = Column(Integer, ForeignKey('transactions.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
+
+    user = relationship('User', foreign_keys=[user_id])
+    tariff = relationship('Tariff')
+    created_subscription = relationship('Subscription', foreign_keys=[created_subscription_id])
+    debit_transaction = relationship('Transaction', foreign_keys=[debit_transaction_id])
+
+
+class CheckoutPaymentAttempt(Base):
+    """One provider invoice/settlement attempt bound to a checkout."""
+
+    __tablename__ = 'checkout_payment_attempts'
+    __table_args__ = (
+        CheckConstraint('requested_amount_kopeks > 0', name='ck_checkout_attempt_requested_positive'),
+        CheckConstraint('credited_amount_kopeks >= 0', name='ck_checkout_attempt_credited_nonnegative'),
+        Index('ix_checkout_attempt_checkout_created', 'checkout_id', 'created_at'),
+        Index(
+            'uq_checkout_attempt_one_active',
+            'checkout_id',
+            unique=True,
+            postgresql_where=text("status IN ('creating','pending','paid_processing')"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    checkout_id = Column(Integer, ForeignKey('subscription_checkouts.id', ondelete='CASCADE'), nullable=False)
+    merchant_order_key = Column(String(96), nullable=False, unique=True)
+    provider = Column(String(32), nullable=False, default='platega')
+    method_key = Column(String(32), nullable=False)
+    provider_method_code = Column(Integer, nullable=False)
+    currency = Column(String(3), nullable=False, default='RUB')
+    requested_amount_kopeks = Column(Integer, nullable=False)
+    credited_amount_kopeks = Column(Integer, nullable=False, default=0)
+    status = Column(String(32), nullable=False, default='creating')
+    provider_payment_id = Column(String(255), nullable=True, unique=True)
+    platega_payment_id = Column(
+        Integer, ForeignKey('platega_payments.id', ondelete='SET NULL'), nullable=True, unique=True
+    )
+    redirect_url = Column(Text, nullable=True)
+    reconciliation_reason = Column(Text, nullable=True)
+    reconcile_attempts = Column(Integer, nullable=False, default=0)
+    next_reconcile_at = Column(AwareDateTime(), nullable=False, default=func.now(), index=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
+
+    checkout = relationship('SubscriptionCheckout')
+    platega_payment = relationship('PlategaPayment')
+
+
+class DeviceFirstMutation(Base):
+    """PostgreSQL-backed idempotency record for every state-changing command."""
+
+    __tablename__ = 'device_first_mutations'
+    __table_args__ = (
+        UniqueConstraint('owner_user_id', 'action', 'idempotency_key', name='uq_device_first_mutation_key'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    owner_user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    checkout_id = Column(Integer, ForeignKey('subscription_checkouts.id', ondelete='CASCADE'), nullable=True)
+    action = Column(String(48), nullable=False)
+    idempotency_key = Column(String(128), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    response_json = Column(JSON, nullable=True)
+    status_code = Column(Integer, nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+
+
+class DeviceFirstOutbox(Base):
+    """Retryable post-commit provisioning work; no RemnaWave HTTP in DB tx."""
+
+    __tablename__ = 'device_first_outbox'
+    __table_args__ = (
+        UniqueConstraint('checkout_id', 'event_type', name='uq_device_first_outbox_event'),
+        Index('ix_device_first_outbox_pending', 'status', 'available_at'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    checkout_id = Column(Integer, ForeignKey('subscription_checkouts.id', ondelete='CASCADE'), nullable=False)
+    event_type = Column(String(48), nullable=False, default='sync_subscription')
+    payload_json = Column(JSON, nullable=False, default=dict)
+    status = Column(String(24), nullable=False, default='pending')
+    attempts = Column(Integer, nullable=False, default=0)
+    available_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    last_error = Column(Text, nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
+
+
+class DeviceFirstDepositOutbox(Base):
+    """Retryable, step-aware side effects for one credited provider deposit."""
+
+    __tablename__ = 'device_first_deposit_outbox'
+    __table_args__ = (Index('ix_device_first_deposit_outbox_pending', 'status', 'available_at'),)
+
+    id = Column(Integer, primary_key=True)
+    transaction_id = Column(
+        Integer,
+        ForeignKey('transactions.id', ondelete='CASCADE'),
+        nullable=False,
+        unique=True,
+    )
+    checkout_id = Column(
+        Integer,
+        ForeignKey('subscription_checkouts.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    status = Column(String(24), nullable=False, default='pending')
+    event_status = Column(String(24), nullable=False, default='pending')
+    referral_status = Column(String(24), nullable=False, default='pending')
+    fulfillment_status = Column(String(24), nullable=False, default='not_required')
+    attempts = Column(Integer, nullable=False, default=0)
+    available_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    last_error = Column(Text, nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
+
+    transaction = relationship('Transaction')
+    checkout = relationship('SubscriptionCheckout')
 
 
 class SubscriptionConversion(Base):

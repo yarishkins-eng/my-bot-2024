@@ -32,6 +32,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    'greenlet>=3.3.1',
     'ruff',
     'pytest',
     'pytest-asyncio',

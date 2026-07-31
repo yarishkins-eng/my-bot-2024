@@ -246,6 +246,8 @@ async def get_tariff(
         device_limit=tariff.device_limit,
         device_price_kopeks=tariff.device_price_kopeks,
         max_device_limit=tariff.max_device_limit,
+        device_purchase_options=tariff.device_purchase_options,
+        pricing_revision=tariff.pricing_revision,
         tier_level=tariff.tier_level,
         display_order=tariff.display_order,
         period_prices=_period_prices_to_list(tariff.period_prices),
@@ -294,44 +296,48 @@ async def create_new_tariff(
         else {}
     )
 
-    tariff = await create_tariff(
-        db=db,
-        name=request.name,
-        description=request.description,
-        is_active=request.is_active,
-        allow_traffic_topup=request.allow_traffic_topup,
-        traffic_topup_enabled=request.traffic_topup_enabled,
-        traffic_topup_packages=request.traffic_topup_packages,
-        max_topup_traffic_gb=request.max_topup_traffic_gb,
-        traffic_limit_gb=request.traffic_limit_gb,
-        device_limit=request.device_limit,
-        device_price_kopeks=request.device_price_kopeks,
-        max_device_limit=request.max_device_limit,
-        tier_level=request.tier_level,
-        period_prices=period_prices_dict,
-        allowed_squads=request.allowed_squads,
-        server_traffic_limits=server_limits_dict,
-        promo_group_ids=request.promo_group_ids or None,
-        # Произвольное количество дней
-        custom_days_enabled=request.custom_days_enabled,
-        price_per_day_kopeks=request.price_per_day_kopeks,
-        min_days=request.min_days,
-        max_days=request.max_days,
-        # Произвольный трафик при покупке
-        custom_traffic_enabled=request.custom_traffic_enabled,
-        traffic_price_per_gb_kopeks=request.traffic_price_per_gb_kopeks,
-        min_traffic_gb=request.min_traffic_gb,
-        max_traffic_gb=request.max_traffic_gb,
-        # Дневной тариф
-        is_daily=request.is_daily,
-        daily_price_kopeks=request.daily_price_kopeks,
-        # Режим сброса трафика
-        traffic_reset_mode=request.traffic_reset_mode,
-        # Внешний сквад
-        external_squad_uuid=request.external_squad_uuid,
-        # Показывать в подарках
-        show_in_gift=request.show_in_gift,
-    )
+    try:
+        tariff = await create_tariff(
+            db=db,
+            name=request.name,
+            description=request.description,
+            is_active=request.is_active,
+            allow_traffic_topup=request.allow_traffic_topup,
+            traffic_topup_enabled=request.traffic_topup_enabled,
+            traffic_topup_packages=request.traffic_topup_packages,
+            max_topup_traffic_gb=request.max_topup_traffic_gb,
+            traffic_limit_gb=request.traffic_limit_gb,
+            device_limit=request.device_limit,
+            device_price_kopeks=request.device_price_kopeks,
+            max_device_limit=request.max_device_limit,
+            device_purchase_options=request.device_purchase_options,
+            tier_level=request.tier_level,
+            period_prices=period_prices_dict,
+            allowed_squads=request.allowed_squads,
+            server_traffic_limits=server_limits_dict,
+            promo_group_ids=request.promo_group_ids or None,
+            # Произвольное количество дней
+            custom_days_enabled=request.custom_days_enabled,
+            price_per_day_kopeks=request.price_per_day_kopeks,
+            min_days=request.min_days,
+            max_days=request.max_days,
+            # Произвольный трафик при покупке
+            custom_traffic_enabled=request.custom_traffic_enabled,
+            traffic_price_per_gb_kopeks=request.traffic_price_per_gb_kopeks,
+            min_traffic_gb=request.min_traffic_gb,
+            max_traffic_gb=request.max_traffic_gb,
+            # Дневной тариф
+            is_daily=request.is_daily,
+            daily_price_kopeks=request.daily_price_kopeks,
+            # Режим сброса трафика
+            traffic_reset_mode=request.traffic_reset_mode,
+            # Внешний сквад
+            external_squad_uuid=request.external_squad_uuid,
+            # Показывать в подарках
+            show_in_gift=request.show_in_gift,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
 
     logger.info('Admin created tariff', admin_id=admin.id, tariff_id=tariff.id, tariff_name=tariff.name)
 
@@ -385,6 +391,8 @@ async def update_existing_tariff(
         updates['device_price_kopeks'] = request.device_price_kopeks
     if request.max_device_limit is not None:
         updates['max_device_limit'] = request.max_device_limit
+    if 'device_purchase_options' in request.model_fields_set:
+        updates['device_purchase_options'] = request.device_purchase_options
     if request.tier_level is not None:
         updates['tier_level'] = request.tier_level
     if request.display_order is not None:
@@ -432,7 +440,10 @@ async def update_existing_tariff(
         updates['show_in_gift'] = request.show_in_gift
 
     if updates:
-        await update_tariff(db, tariff, **updates)
+        try:
+            await update_tariff(db, tariff, **updates)
+        except ValueError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
 
     # Update promo groups separately
     if request.promo_group_ids is not None:

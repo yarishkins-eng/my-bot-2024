@@ -301,6 +301,10 @@ def format_tariff_info(tariff: Tariff, language: str, subs_count: int = 0) -> st
         max_devices_display = str(max_devices)
     else:
         max_devices_display = '∞ (без лимита)'
+    device_purchase_options = getattr(tariff, 'device_purchase_options', None)
+    device_purchase_options_display = (
+        ', '.join(map(str, device_purchase_options)) if device_purchase_options else 'выключено (legacy)'
+    )
 
     # Форматируем докупку трафика
     traffic_topup_display = _format_traffic_topup_packages(tariff)
@@ -332,6 +336,8 @@ def format_tariff_info(tariff: Tariff, language: str, subs_count: int = 0) -> st
 • Устройств: {tariff.device_limit}
 • Макс. устройств: {max_devices_display}
 • Цена за доп. устройство: {device_price_display}
+• Варианты device-first: {device_purchase_options_display}
+• Ревизия цены: {getattr(tariff, 'pricing_revision', 1)}
 • Триал: {trial_status}
 • Дней триала: {trial_days_display}
 
