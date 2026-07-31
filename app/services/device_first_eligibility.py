@@ -8,6 +8,9 @@ from app.config import settings
 from app.database.models import Subscription, Tariff
 
 
+MAX_DEVICE_FIRST_DEVICE_LIMIT = 10
+
+
 class DeviceFirstConfigurationError(ValueError):
     pass
 
@@ -38,10 +41,20 @@ def normalize_device_purchase_options(
         raise DeviceFirstConfigurationError('device_purchase_options must contain integers only')
     if any(value <= 0 for value in raw):
         raise DeviceFirstConfigurationError('device_purchase_options must contain positive limits')
+    if base_device_limit > MAX_DEVICE_FIRST_DEVICE_LIMIT or any(
+        value > MAX_DEVICE_FIRST_DEVICE_LIMIT for value in raw
+    ):
+        raise DeviceFirstConfigurationError(
+            f'device-first supports no more than {MAX_DEVICE_FIRST_DEVICE_LIMIT} devices'
+        )
     if raw != sorted(raw) or len(raw) != len(set(raw)):
         raise DeviceFirstConfigurationError('device_purchase_options must be unique and strictly increasing')
     if base_device_limit not in raw:
         raise DeviceFirstConfigurationError('device_purchase_options must include the tariff base device limit')
+    if any(value < base_device_limit for value in raw):
+        raise DeviceFirstConfigurationError(
+            'device_purchase_options cannot be below the tariff base device limit'
+        )
     if max_device_limit is not None and any(value > max_device_limit for value in raw):
         raise DeviceFirstConfigurationError('device_purchase_options cannot exceed max_device_limit')
     if any(value > base_device_limit for value in raw) and (device_price_kopeks is None or device_price_kopeks <= 0):
@@ -76,6 +89,10 @@ def device_options_for_subscription(tariff: Tariff, subscription: Subscription |
         return tuple(configured)
 
     current = int(subscription.device_limit or tariff.device_limit or 0)
+    if current > MAX_DEVICE_FIRST_DEVICE_LIMIT:
+        raise DeviceFirstConfigurationError(
+            f'device-first supports no more than {MAX_DEVICE_FIRST_DEVICE_LIMIT} devices'
+        )
     # A paid subscription can be extended onto a different tariff. Its current
     # device limit is still the floor: device-first must never quietly turn an
     # extension into a device-limit downgrade just because the previous tariff

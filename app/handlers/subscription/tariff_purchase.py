@@ -772,7 +772,7 @@ async def show_funnel_tariffs(
                 db,
                 state,
                 options=device_first_options,
-                origin_callback='funnel_tariffs',
+                origin_callback='back_to_menu',
             )
             return
 
