@@ -41,9 +41,7 @@ def normalize_device_purchase_options(
         raise DeviceFirstConfigurationError('device_purchase_options must contain integers only')
     if any(value <= 0 for value in raw):
         raise DeviceFirstConfigurationError('device_purchase_options must contain positive limits')
-    if base_device_limit > MAX_DEVICE_FIRST_DEVICE_LIMIT or any(
-        value > MAX_DEVICE_FIRST_DEVICE_LIMIT for value in raw
-    ):
+    if base_device_limit > MAX_DEVICE_FIRST_DEVICE_LIMIT or any(value > MAX_DEVICE_FIRST_DEVICE_LIMIT for value in raw):
         raise DeviceFirstConfigurationError(
             f'device-first supports no more than {MAX_DEVICE_FIRST_DEVICE_LIMIT} devices'
         )
@@ -52,9 +50,7 @@ def normalize_device_purchase_options(
     if base_device_limit not in raw:
         raise DeviceFirstConfigurationError('device_purchase_options must include the tariff base device limit')
     if any(value < base_device_limit for value in raw):
-        raise DeviceFirstConfigurationError(
-            'device_purchase_options cannot be below the tariff base device limit'
-        )
+        raise DeviceFirstConfigurationError('device_purchase_options cannot be below the tariff base device limit')
     if max_device_limit is not None and any(value > max_device_limit for value in raw):
         raise DeviceFirstConfigurationError('device_purchase_options cannot exceed max_device_limit')
     if any(value > base_device_limit for value in raw) and (device_price_kopeks is None or device_price_kopeks <= 0):
