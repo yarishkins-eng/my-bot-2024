@@ -455,7 +455,13 @@ async def _render_confirmation(
     checkout_id = checkout.public_id
     snapshot = serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)
     current_devices = snapshot['current_device_limit']
-    if current_devices is not None and current_devices != checkout.selected_device_limit:
+    # A trial is only the user's temporary access, not a paid plan they are
+    # extending.  While comparing offers, showing “was → will become” makes a
+    # draft quote look like an already committed subscription change.  Show the
+    # selected limit alone until the user actually chooses to buy.
+    target_snapshot = getattr(checkout, 'target_snapshot', None) or {}
+    is_trial_target = bool(target_snapshot.get('is_trial'))
+    if not is_trial_target and current_devices is not None and current_devices != checkout.selected_device_limit:
         device_change = _text(
             user,
             f'было {_device_label(user, current_devices)} → станет {_device_label(user, checkout.selected_device_limit)}',

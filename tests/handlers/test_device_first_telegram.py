@@ -269,6 +269,41 @@ async def test_confirmation_contains_server_snapshot_contract() -> None:
 
 
 @pytest.mark.asyncio
+async def test_trial_quote_shows_only_the_selected_device_limit() -> None:
+    callback = SimpleNamespace()
+    user = SimpleNamespace(language='ru', balance_kopeks=0)
+    checkout = SimpleNamespace(
+        public_id='checkout-id',
+        selected_device_limit=6,
+        period_days=30,
+        quoted_price_kopeks=44_900,
+        target_snapshot={'is_trial': True, 'device_limit': 3},
+    )
+    snapshot = {
+        'current_device_limit': 3,
+        'estimated_end_at': '2026-08-29T12:00:00+00:00',
+        'shortage_kopeks': 44_900,
+    }
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value=snapshot,
+        ),
+        patch(
+            'app.handlers.subscription.device_first.edit_or_answer_photo',
+            AsyncMock(),
+        ) as render,
+    ):
+        await _render_confirmation(callback, user, checkout, tariff_name='Premium')
+
+    caption = render.await_args.kwargs['caption']
+    assert 'Устройства: <b>6 устройств</b>' in caption
+    assert 'было' not in caption
+    assert 'станет' not in caption
+
+
+@pytest.mark.asyncio
 async def test_annual_confirmation_keeps_the_exact_365_day_term() -> None:
     callback = SimpleNamespace()
     user = SimpleNamespace(language='ru', balance_kopeks=150_000)
