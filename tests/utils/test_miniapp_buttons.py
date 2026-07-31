@@ -9,17 +9,15 @@ def test_build_cabinet_url_keeps_a_version_query_after_deep_link(monkeypatch) ->
     monkeypatch.setattr(
         settings,
         'MINIAPP_CUSTOM_URL',
-        'https://cabinet.example.com:8443?release=cabinet-theme-bg-remount-1',
+        'https://cabinet.example.com:8443?release=cabinet-copy-success-ui-1',
         raising=False,
     )
 
-    assert build_cabinet_url('/') == 'https://cabinet.example.com:8443?release=cabinet-theme-bg-remount-1'
-    assert (
-        build_cabinet_url('/balance') == 'https://cabinet.example.com:8443/balance?release=cabinet-theme-bg-remount-1'
-    )
+    assert build_cabinet_url('/') == 'https://cabinet.example.com:8443?release=cabinet-copy-success-ui-1'
+    assert build_cabinet_url('/balance') == 'https://cabinet.example.com:8443/balance?release=cabinet-copy-success-ui-1'
     assert (
         build_cabinet_url('connection')
-        == 'https://cabinet.example.com:8443/connection?release=cabinet-theme-bg-remount-1'
+        == 'https://cabinet.example.com:8443/connection?release=cabinet-copy-success-ui-1'
     )
 
 
@@ -34,14 +32,14 @@ def test_build_cabinet_url_keeps_a_base_path_and_fragment(monkeypatch) -> None:
     monkeypatch.setattr(
         settings,
         'MINIAPP_CUSTOM_URL',
-        'https://cabinet.example.com/app/?release=cabinet-theme-bg-remount-1#telegram',
+        'https://cabinet.example.com/app/?release=cabinet-copy-success-ui-1#telegram',
         raising=False,
     )
 
-    assert build_cabinet_url('/') == 'https://cabinet.example.com/app?release=cabinet-theme-bg-remount-1#telegram'
+    assert build_cabinet_url('/') == 'https://cabinet.example.com/app?release=cabinet-copy-success-ui-1#telegram'
     assert (
         build_cabinet_url('/connection')
-        == 'https://cabinet.example.com/app/connection?release=cabinet-theme-bg-remount-1#telegram'
+        == 'https://cabinet.example.com/app/connection?release=cabinet-copy-success-ui-1#telegram'
     )
 
 
@@ -49,13 +47,13 @@ def test_campaign_link_keeps_the_version_query(monkeypatch) -> None:
     monkeypatch.setattr(
         settings,
         'CABINET_URL',
-        'https://cabinet.example.com:8443?release=cabinet-theme-bg-remount-1',
+        'https://cabinet.example.com:8443?release=cabinet-copy-success-ui-1',
         raising=False,
     )
 
     assert (
         get_campaign_web_link('summer sale')
-        == 'https://cabinet.example.com:8443?release=cabinet-theme-bg-remount-1&campaign=summer+sale'
+        == 'https://cabinet.example.com:8443?release=cabinet-copy-success-ui-1&campaign=summer+sale'
     )
 
 
