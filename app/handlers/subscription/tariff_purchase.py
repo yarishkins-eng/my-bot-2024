@@ -776,6 +776,15 @@ async def show_funnel_tariffs(
             )
             return
 
+    # The current tariff may have been changed after a user started a native
+    # checkout.  Let the dedicated handler find and render that user's open
+    # order before falling back to the legacy picker, including when new
+    # device-first orders have just been turned off.
+    from app.handlers.subscription.device_first import show_device_first_entry
+
+    if await show_device_first_entry(callback, db_user, db, state, origin_callback='back_to_menu'):
+        return
+
     if not tariffs:
         await edit_or_answer_photo(
             callback=callback,

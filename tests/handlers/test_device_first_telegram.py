@@ -3,6 +3,7 @@ from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
+from app.database.models import Tariff
 from app.handlers.subscription.device_first import (
     _answer_stale,
     _days_label,
@@ -20,6 +21,7 @@ from app.handlers.subscription.device_first import (
     choose_period,
     confirm,
     pay,
+    restart_device_first_or_show_legacy_tariffs,
     show_device_first_entry,
 )
 from app.services.device_first_checkout_service import DeviceFirstError
@@ -476,6 +478,61 @@ async def test_device_back_after_a_predeploy_state_returns_period_screen_to_the_
         assert await show_device_first_entry(callback, user, AsyncMock(), state) is True
 
     assert period_page.await_args.kwargs['origin_callback'] == 'back_to_menu'
+
+
+@pytest.mark.asyncio
+async def test_open_draft_remains_reviewable_when_new_device_first_orders_are_disabled() -> None:
+    callback = SimpleNamespace(data='df:start', answer=AsyncMock())
+    state = AsyncMock()
+    user = SimpleNamespace(id=17, language='ru')
+    checkout = SimpleNamespace(public_id='draft-17', lifecycle_state='draft', tariff_id=9)
+    tariff = SimpleNamespace(name='Premium')
+    db = SimpleNamespace(get=AsyncMock(return_value=tariff))
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=checkout),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.build_purchase_options',
+            AsyncMock(return_value={'eligible': False, 'reason': 'feature_disabled'}),
+        ) as build_options,
+        patch(
+            'app.handlers.subscription.device_first._render_confirmation',
+            AsyncMock(),
+        ) as render,
+    ):
+        assert await show_device_first_entry(callback, user, db, state) is True
+
+    build_options.assert_not_awaited()
+    callback.answer.assert_awaited_once()
+    state.update_data.assert_awaited_once_with(df_checkout_id='draft-17')
+    db.get.assert_awaited_once_with(Tariff, 9)
+    render.assert_awaited_once_with(callback, user, checkout, tariff_name='Premium')
+
+
+@pytest.mark.asyncio
+async def test_old_start_button_falls_back_to_the_legacy_tariff_picker() -> None:
+    callback = SimpleNamespace(data='df:start')
+    user = SimpleNamespace(id=17, language='ru')
+    db = AsyncMock()
+    state = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.show_device_first_entry',
+            AsyncMock(return_value=False),
+        ) as show_entry,
+        patch(
+            'app.handlers.subscription.tariff_purchase.show_funnel_tariffs',
+            AsyncMock(),
+        ) as show_legacy,
+    ):
+        await restart_device_first_or_show_legacy_tariffs(callback, user, db, state)
+
+    show_entry.assert_awaited_once_with(callback, user, db, state)
+    show_legacy.assert_awaited_once_with(callback, user, db, state)
 
 
 @pytest.mark.asyncio

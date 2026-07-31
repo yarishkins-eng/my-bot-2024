@@ -243,9 +243,18 @@ async def get_owned_checkout(
     if checkout is None:
         # Deliberately hide whether a foreign checkout exists.
         raise DeviceFirstError('not_found', 'Checkout not found', status_code=404)
+    # An exact provider payment is already credited to the internal balance
+    # before its fulfilment worker runs.  Its checkout must remain resumable
+    # beyond the general 24-hour UI timeout: expiring it would strand the
+    # customer's payment with no way for the outbox to finish the order.
+    fulfillment_committed = (
+        getattr(checkout, 'fulfillment_state', 'not_started') == 'in_progress'
+        and getattr(checkout, 'quote_state', None) == 'committed'
+    )
     if (
         checkout.lifecycle_state in OPEN_STATES
         and checkout.fulfillment_state != 'fulfilled'
+        and not fulfillment_committed
         and checkout.expires_at <= datetime.now(UTC)
     ):
         checkout.lifecycle_state = 'expired'
@@ -276,7 +285,11 @@ async def get_open_checkout_for_user(
     ).scalar_one_or_none()
     if checkout is None:
         return None
-    if checkout.expires_at <= datetime.now(UTC):
+    fulfillment_committed = (
+        getattr(checkout, 'fulfillment_state', 'not_started') == 'in_progress'
+        and getattr(checkout, 'quote_state', None) == 'committed'
+    )
+    if checkout.expires_at <= datetime.now(UTC) and not fulfillment_committed:
         checkout.lifecycle_state = 'expired'
         checkout.terminal_reason = 'checkout_expired'
         checkout.quote_state = 'expired'
@@ -387,6 +400,10 @@ async def create_checkout(
             SubscriptionCheckout.lifecycle_state.in_(OPEN_STATES),
             SubscriptionCheckout.fulfillment_state != 'fulfilled',
             SubscriptionCheckout.expires_at <= now,
+            ~and_(
+                SubscriptionCheckout.fulfillment_state == 'in_progress',
+                SubscriptionCheckout.quote_state == 'committed',
+            ),
         )
         .values(
             lifecycle_state='expired',
@@ -511,6 +528,12 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         return checkout
     if checkout.lifecycle_state not in {'armed', 'fulfilling'}:
         return checkout
+
+    # One authoritative completion time is persisted both on the balance debit
+    # and on the checkout.  It must be defined before any successful-payment
+    # mutation, otherwise an exact provider payment would fail with NameError
+    # after the order has been armed but before the debit/fulfilment commit.
+    now = datetime.now(UTC)
 
     user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one()
     target = None
