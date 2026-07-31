@@ -233,6 +233,45 @@ def test_credited_armed_checkout_is_serialized_as_processing():
     assert service.checkout_ui_state(checkout) == 'processing'
 
 
+@pytest.mark.parametrize(
+    ('target_snapshot', 'expected_trial_state'),
+    [
+        ({'is_trial': True, 'device_limit': 1}, True),
+        ({'is_trial': False, 'device_limit': 1}, False),
+        ({'device_limit': 1}, None),
+        ({}, None),
+    ],
+)
+def test_checkout_serialization_preserves_trial_state_without_guessing(target_snapshot, expected_trial_state):
+    now = datetime.now(UTC)
+    checkout = SimpleNamespace(
+        public_id='checkout-1',
+        tariff_id=7,
+        target_subscription_id=12,
+        period_days=30,
+        selected_device_limit=3,
+        price_breakdown={},
+        quoted_price_kopeks=10_000,
+        max_price_kopeks=10_000,
+        quote_expires_at=now + timedelta(minutes=30),
+        expires_at=now + timedelta(hours=24),
+        lifecycle_state='confirmed',
+        quote_state='valid',
+        funding_state='funded',
+        fulfillment_state='not_started',
+        provisioning_state='not_started',
+        terminal_reason=None,
+        created_subscription_id=None,
+        target_snapshot=target_snapshot,
+        created_at=now,
+        fulfilled_end_at=None,
+    )
+
+    snapshot = service.serialize_checkout(checkout)
+
+    assert snapshot['current_subscription_is_trial'] is expected_trial_state
+
+
 @pytest.mark.asyncio
 async def test_kill_switch_blocks_new_arm(monkeypatch):
     checkout = SimpleNamespace(

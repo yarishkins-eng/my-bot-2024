@@ -240,6 +240,7 @@ async def test_confirmation_contains_server_snapshot_contract() -> None:
     )
     snapshot = {
         'current_device_limit': 1,
+        'current_subscription_is_trial': False,
         'estimated_end_at': '2026-08-29T12:00:00+00:00',
         'shortage_kopeks': 0,
     }
@@ -270,6 +271,40 @@ async def test_confirmation_contains_server_snapshot_contract() -> None:
 
 
 @pytest.mark.asyncio
+async def test_trial_confirmation_does_not_present_a_temporary_limit_as_a_paid_change() -> None:
+    callback = SimpleNamespace()
+    user = SimpleNamespace(language='ru', balance_kopeks=150_000)
+    checkout = SimpleNamespace(
+        public_id='checkout-id',
+        selected_device_limit=3,
+        period_days=30,
+        quoted_price_kopeks=109_000,
+    )
+    snapshot = {
+        'current_device_limit': 1,
+        'current_subscription_is_trial': True,
+        'estimated_end_at': '2026-08-29T12:00:00+00:00',
+        'shortage_kopeks': 0,
+    }
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value=snapshot,
+        ),
+        patch(
+            'app.handlers.subscription.device_first.edit_or_answer_photo',
+            AsyncMock(),
+        ) as render,
+    ):
+        await _render_confirmation(callback, user, checkout, tariff_name='Premium')
+
+    caption = render.await_args.kwargs['caption']
+    assert '📱 Устройства: <b>3 устройства</b>' in caption
+    assert 'было 1 устройство → станет' not in caption
+
+
+@pytest.mark.asyncio
 async def test_annual_confirmation_keeps_the_exact_365_day_term() -> None:
     callback = SimpleNamespace()
     user = SimpleNamespace(language='ru', balance_kopeks=150_000)
@@ -281,6 +316,7 @@ async def test_annual_confirmation_keeps_the_exact_365_day_term() -> None:
     )
     snapshot = {
         'current_device_limit': 1,
+        'current_subscription_is_trial': False,
         'estimated_end_at': '2027-07-30T12:00:00+00:00',
         'shortage_kopeks': 0,
     }

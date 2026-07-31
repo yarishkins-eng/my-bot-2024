@@ -135,7 +135,8 @@ def serialize_checkout(
     *,
     balance_kopeks: int | None = None,
 ) -> dict[str, Any]:
-    snapshot_end = (checkout.target_snapshot or {}).get('end_date')
+    target_snapshot = checkout.target_snapshot or {}
+    snapshot_end = target_snapshot.get('end_date')
     try:
         parsed_end = datetime.fromisoformat(snapshot_end) if snapshot_end else None
     except (TypeError, ValueError):
@@ -160,7 +161,13 @@ def serialize_checkout(
         'terminal_reason': checkout.terminal_reason,
         'ui_state': checkout_ui_state(checkout),
         'created_subscription_id': checkout.created_subscription_id,
-        'current_device_limit': (checkout.target_snapshot or {}).get('device_limit'),
+        'current_device_limit': target_snapshot.get('device_limit'),
+        # The client must not infer that a trial's temporary device count is a
+        # paid subscription being changed.  A missing key is intentionally
+        # unknown (rather than False) for old checkout snapshots.
+        'current_subscription_is_trial': (
+            target_snapshot.get('is_trial') if isinstance(target_snapshot.get('is_trial'), bool) else None
+        ),
         'estimated_end_at': (
             checkout.fulfilled_end_at or (base_end + timedelta(days=checkout.period_days))
         ).isoformat(),
