@@ -128,6 +128,28 @@ def test_current_limit_plus_configured_higher_options_are_offered():
     assert device_options_for_subscription(tariff(), current) == (3, 5)
 
 
+def test_paid_subscription_on_another_tariff_stays_on_legacy_picker(monkeypatch):
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.SALES_MODE', 'tariffs')
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.MULTI_TARIFF_ENABLED', False)
+
+    current = SimpleNamespace(tariff_id=99, is_trial=False, device_limit=4)
+    result = tariff_eligibility(tariff(), subscription=current)
+
+    assert not result.eligible
+    assert result.reason == 'subscription_tariff_mismatch'
+
+
+def test_trial_can_convert_to_the_single_displayed_paid_tariff(monkeypatch):
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.SALES_MODE', 'tariffs')
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.MULTI_TARIFF_ENABLED', False)
+
+    trial = SimpleNamespace(tariff_id=99, is_trial=True, device_limit=1)
+    result = tariff_eligibility(tariff(), subscription=trial)
+
+    assert result.eligible
+    assert result.device_options == (2, 3, 5)
+
+
 def test_paid_subscription_on_another_tariff_cannot_decrease_devices_during_extension():
     current = SimpleNamespace(tariff_id=99, is_trial=False, device_limit=4)
     assert device_options_for_subscription(tariff(), current) == (4, 5)
