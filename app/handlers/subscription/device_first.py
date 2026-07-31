@@ -11,7 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import User
+from app.database.models import Tariff, User
 from app.services.device_first_checkout_service import (
     DeviceFirstError,
     arm_checkout,
@@ -246,28 +246,35 @@ async def show_device_first_entry(
     options: dict | None = None,
     origin_callback: str | None = None,
 ) -> bool:
-    await callback.answer()
+    # An order already created by this user remains theirs to review or cancel,
+    # even if an administrator later disables new device-first orders or edits
+    # the tariff so that it is no longer eligible.  Otherwise an old draft
+    # would become an unreachable row with no honest recovery path.
+    existing = await get_open_checkout_for_user(db, user_id=db_user.id)
+    if existing is not None:
+        await callback.answer()
+        await state.update_data(df_checkout_id=existing.public_id)
+        if existing.lifecycle_state == 'draft':
+            tariff = await db.get(Tariff, existing.tariff_id)
+            await _render_confirmation(
+                callback,
+                db_user,
+                existing,
+                tariff_name=getattr(tariff, 'name', None) or _text(db_user, 'Тариф', 'Tariff'),
+            )
+        else:
+            await _render_checkout(callback, db_user, db, existing)
+        return True
+
     options = options or await build_purchase_options(db, db_user)
     if not options.get('eligible'):
         return False
+    await callback.answer()
     view_id = uuid.uuid4().hex[:8]
     # ``df:start`` can arrive from a keyboard rendered before this deployment.
     # Do not preserve its stale funnel callback: both a fresh entry and device
     # Back must ultimately return to the main menu, never re-open this funnel.
     origin = origin_callback or 'back_to_menu'
-    existing = await get_open_checkout_for_user(db, user_id=db_user.id)
-    if existing is not None:
-        await state.update_data(df_checkout_id=existing.public_id)
-        if existing.lifecycle_state == 'draft':
-            await _render_confirmation(
-                callback,
-                db_user,
-                existing,
-                tariff_name=options['tariff']['name'],
-            )
-        else:
-            await _render_checkout(callback, db_user, db, existing)
-        return True
     await _period_page(
         callback,
         db_user,
@@ -277,6 +284,24 @@ async def show_device_first_entry(
         origin_callback=origin,
     )
     return True
+
+
+async def restart_device_first_or_show_legacy_tariffs(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+) -> None:
+    """Keep historical ``df:start`` buttons useful after the feature changes."""
+    if await show_device_first_entry(callback, db_user, db, state):
+        return
+
+    # A terminal screen can outlive an administrator disabling new native
+    # checkouts.  Its “New quote” button should lead to the normal tariff
+    # picker instead of silently doing nothing.
+    from app.handlers.subscription.tariff_purchase import show_funnel_tariffs
+
+    await show_funnel_tariffs(callback, db_user, db, state)
 
 
 async def legacy_device_page(
@@ -1235,7 +1260,7 @@ async def _render_error(callback: types.CallbackQuery, user: User, error: Device
 
 
 def register_device_first_handlers(dp) -> None:
-    dp.callback_query.register(show_device_first_entry, F.data == 'df:start')
+    dp.callback_query.register(restart_device_first_or_show_legacy_tariffs, F.data == 'df:start')
     # Keep old pagination callbacks replay-safe after deploy; new keyboards do
     # not emit `df:p:` at all.
     dp.callback_query.register(legacy_device_page, F.data.startswith('df:p:'))

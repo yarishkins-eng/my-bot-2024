@@ -223,6 +223,76 @@ async def test_locked_checkout_query_forces_fresh_orm_state():
     assert query.get_execution_options()['populate_existing'] is True
 
 
+@pytest.mark.asyncio
+async def test_exact_paid_checkout_does_not_expire_before_delayed_fulfillment():
+    checkout = SimpleNamespace(
+        lifecycle_state='armed',
+        fulfillment_state='in_progress',
+        quote_state='committed',
+        expires_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    result = SimpleNamespace(scalar_one_or_none=lambda: checkout)
+    db = SimpleNamespace(execute=AsyncMock(return_value=result), commit=AsyncMock(), refresh=AsyncMock())
+
+    returned = await service.get_owned_checkout(
+        db,
+        public_id='public-id',
+        user_id=7,
+        for_update=True,
+    )
+
+    assert returned is checkout
+    assert checkout.lifecycle_state == 'armed'
+    db.commit.assert_not_awaited()
+    db.refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exact_paid_checkout_remains_resumable_after_the_general_timeout():
+    checkout = SimpleNamespace(
+        lifecycle_state='fulfilling',
+        fulfillment_state='in_progress',
+        quote_state='committed',
+        expires_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    result = SimpleNamespace(scalar_one_or_none=lambda: checkout)
+    db = SimpleNamespace(execute=AsyncMock(return_value=result), commit=AsyncMock())
+
+    returned = await service.get_open_checkout_for_user(db, user_id=7)
+
+    assert returned is checkout
+    assert checkout.lifecycle_state == 'fulfilling'
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_quote_does_not_bulk_expire_an_exact_paid_checkout_waiting_for_fulfillment(monkeypatch):
+    user = SimpleNamespace(id=7, restriction_subscription=False)
+    db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock())
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+    monkeypatch.setattr(
+        service,
+        'build_purchase_options',
+        AsyncMock(return_value={'eligible': False, 'reason': 'feature_disabled'}),
+    )
+
+    with pytest.raises(service.DeviceFirstError) as raised:
+        await service.create_checkout(
+            db,
+            user=user,
+            period_days=30,
+            selected_device_limit=2,
+            source='cabinet',
+        )
+
+    assert raised.value.code == 'legacy_only'
+    statement = str(db.execute.await_args.args[0].compile(compile_kwargs={'literal_binds': True}))
+    assert (
+        "NOT (subscription_checkouts.fulfillment_state = 'in_progress' "
+        "AND subscription_checkouts.quote_state = 'committed')"
+    ) in statement
+
+
 def test_credited_armed_checkout_is_serialized_as_processing():
     checkout = SimpleNamespace(
         lifecycle_state='armed',
@@ -464,6 +534,58 @@ async def test_fulfillment_reprices_before_debit_when_the_current_price_changes(
     assert result.quote_state == 'price_changed'
     assert user.balance_kopeks == 50_000
     db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fulfillment_records_one_completion_time_and_finishes_the_debit(monkeypatch):
+    target = paid_target(device_limit=4)
+    checkout = armed_checkout(target, devices=4, quoted_price=10_000)
+    user = SimpleNamespace(id=7, balance_kopeks=50_000, has_had_paid_subscription=False)
+    tariff = SimpleNamespace(id=7, pricing_revision=1, traffic_limit_gb=100, allowed_squads=[])
+    extended = SimpleNamespace(id=target.id, end_date=datetime.now(UTC) + timedelta(days=50))
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                ScalarResult(user),
+                ScalarResult(target),
+                ScalarResult(tariff),
+            ]
+        ),
+        commit=AsyncMock(),
+        add=added.append,
+        flush=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+    monkeypatch.setattr(service, 'get_owned_checkout', AsyncMock(return_value=checkout))
+    monkeypatch.setattr(
+        service,
+        'tariff_eligibility',
+        lambda tariff, subscription: SimpleNamespace(
+            eligible=True,
+            period_options=(30,),
+            device_options=(4, 5),
+        ),
+    )
+    monkeypatch.setattr(
+        service.pricing_engine,
+        'calculate_tariff_purchase_price',
+        AsyncMock(return_value=SimpleNamespace(final_total=10_000)),
+    )
+    monkeypatch.setattr(service, 'extend_subscription', AsyncMock(return_value=extended))
+
+    result = await service.fulfill_checkout(db, checkout.public_id, user.id)
+
+    assert result is checkout
+    assert checkout.fulfillment_state == 'fulfilled'
+    assert checkout.fulfilled_at is not None
+    assert checkout.fulfilled_end_at == extended.end_date
+    assert user.balance_kopeks == 40_000
+    assert user.has_had_paid_subscription is True
+    debit = added[0]
+    assert debit.completed_at == checkout.fulfilled_at
+    assert debit.amount_kopeks == -10_000
+    assert db.commit.await_count == 1
 
 
 @pytest.mark.asyncio
