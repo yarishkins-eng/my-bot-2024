@@ -80,12 +80,9 @@ def device_first_top_up_kopeks(*, price_kopeks: int, balance_kopeks: int) -> int
     shortage = max(0, int(price_kopeks) - int(balance_kopeks))
     if shortage == 0:
         return 0
-    whole_ruble_shortage = (
-        (shortage + KOPEKS_PER_RUBLE - 1) // KOPEKS_PER_RUBLE
-    ) * KOPEKS_PER_RUBLE
+    whole_ruble_shortage = ((shortage + KOPEKS_PER_RUBLE - 1) // KOPEKS_PER_RUBLE) * KOPEKS_PER_RUBLE
     minimum_top_up = (
-        (max(0, int(settings.PLATEGA_MIN_AMOUNT_KOPEKS)) + KOPEKS_PER_RUBLE - 1)
-        // KOPEKS_PER_RUBLE
+        (max(0, int(settings.PLATEGA_MIN_AMOUNT_KOPEKS)) + KOPEKS_PER_RUBLE - 1) // KOPEKS_PER_RUBLE
     ) * KOPEKS_PER_RUBLE
     return max(whole_ruble_shortage, minimum_top_up)
 
@@ -95,10 +92,13 @@ def device_first_top_up_surplus_kopeks(*, price_kopeks: int, balance_kopeks: int
     raw_shortage = max(0, int(price_kopeks) - int(balance_kopeks))
     if raw_shortage == 0:
         return 0
-    return device_first_top_up_kopeks(
-        price_kopeks=price_kopeks,
-        balance_kopeks=balance_kopeks,
-    ) - raw_shortage
+    return (
+        device_first_top_up_kopeks(
+            price_kopeks=price_kopeks,
+            balance_kopeks=balance_kopeks,
+        )
+        - raw_shortage
+    )
 
 
 def request_hash(payload: Any) -> str:
@@ -579,9 +579,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         _event('reprice_required', checkout, reason='price_changed')
         return checkout
     if user.balance_kopeks < charge:
-        had_committed_payment = (
-            checkout.fulfillment_state == 'in_progress' and checkout.quote_state == 'committed'
-        )
+        had_committed_payment = checkout.fulfillment_state == 'in_progress' and checkout.quote_state == 'committed'
         if had_committed_payment:
             # A concurrent balance action consumed funds after an exact
             # provider payment. The deposit remains in the ledger, but the old
