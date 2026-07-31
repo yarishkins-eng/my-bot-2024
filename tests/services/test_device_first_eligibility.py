@@ -71,6 +71,24 @@ def test_default_period_prefers_30_and_exactly_one_tariff_is_required(monkeypatc
 
 
 @pytest.mark.parametrize(
+    'parallel_legacy_flow',
+    [
+        {'is_trial_available': True},
+        {'show_in_gift': True},
+        {'is_trial_available': True, 'show_in_gift': True},
+    ],
+)
+def test_trial_and_gift_flags_do_not_disable_an_ordinary_paid_device_first_purchase(
+    monkeypatch,
+    parallel_legacy_flow,
+):
+    """Those flags expose separate legacy routes; they do not make a paid tariff free."""
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.SALES_MODE', 'tariffs')
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.MULTI_TARIFF_ENABLED', False)
+    assert tariff_eligibility(tariff(**parallel_legacy_flow)).eligible
+
+
+@pytest.mark.parametrize(
     'override',
     [
         {'is_daily': True},
@@ -84,6 +102,19 @@ def test_legacy_modes_are_not_eligible(monkeypatch, override):
     monkeypatch.setattr('app.services.device_first_eligibility.settings.SALES_MODE', 'tariffs')
     monkeypatch.setattr('app.services.device_first_eligibility.settings.MULTI_TARIFF_ENABLED', False)
     assert not tariff_eligibility(tariff(**override)).eligible
+
+
+def test_free_and_zero_price_periods_stay_on_the_legacy_flow(monkeypatch):
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.SALES_MODE', 'tariffs')
+    monkeypatch.setattr('app.services.device_first_eligibility.settings.MULTI_TARIFF_ENABLED', False)
+
+    fully_free = tariff(period_prices={'30': 0}, is_free=True, device_price_kopeks=5_000)
+    mixed = tariff(period_prices={'30': 0, '90': 249000})
+
+    assert tariff_eligibility(fully_free).reason == 'free_tariff'
+    eligible = tariff_eligibility(mixed)
+    assert eligible.eligible
+    assert eligible.period_options == (90,)
 
 
 def test_paid_subscription_is_grandfathered_and_cannot_decrease():

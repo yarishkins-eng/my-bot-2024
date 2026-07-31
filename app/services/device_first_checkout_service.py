@@ -90,6 +90,17 @@ def device_first_top_up_kopeks(*, price_kopeks: int, balance_kopeks: int) -> int
     return max(whole_ruble_shortage, minimum_top_up)
 
 
+def device_first_top_up_surplus_kopeks(*, price_kopeks: int, balance_kopeks: int) -> int:
+    """Return the part of a provider-valid top-up that remains on balance."""
+    raw_shortage = max(0, int(price_kopeks) - int(balance_kopeks))
+    if raw_shortage == 0:
+        return 0
+    return device_first_top_up_kopeks(
+        price_kopeks=price_kopeks,
+        balance_kopeks=balance_kopeks,
+    ) - raw_shortage
+
+
 def request_hash(payload: Any) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -162,7 +173,47 @@ def serialize_checkout(
             if balance_kopeks is not None
             else None
         ),
+        'top_up_surplus_kopeks': (
+            device_first_top_up_surplus_kopeks(
+                price_kopeks=checkout.max_price_kopeks,
+                balance_kopeks=balance_kopeks,
+            )
+            if balance_kopeks is not None
+            else None
+        ),
     }
+
+
+async def expire_checkout_quote_if_needed(
+    db: AsyncSession,
+    checkout: SubscriptionCheckout,
+) -> bool:
+    """Expire an open quote before any money-moving transition.
+
+    A device-first quote is deliberately short-lived: its price is a snapshot
+    of tariff, promo and device rules.  The same transition is used by the
+    browser, native Telegram flow and payment adapter so an expired quote can
+    never create a fresh provider invoice or debit a balance.
+    """
+    # Once an exact provider payment or balance debit has been atomically
+    # committed, the user already approved this snapshot. Do not turn a slow
+    # outbox worker into a surprise repricing; only pre-payment quotes expire.
+    if (
+        checkout.lifecycle_state not in OPEN_STATES
+        or (
+            getattr(checkout, 'fulfillment_state', 'not_started') == 'in_progress'
+            and getattr(checkout, 'quote_state', None) == 'committed'
+        )
+        or datetime.now(UTC) < checkout.quote_expires_at
+    ):
+        return False
+
+    checkout.lifecycle_state = 'reprice_required'
+    checkout.quote_state = 'expired'
+    checkout.terminal_reason = 'quote_expired'
+    await db.commit()
+    _event('reprice_required', checkout, reason='quote_expired')
+    return True
 
 
 async def get_owned_checkout(
@@ -268,6 +319,10 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
                 user=user,
             )
             quoted_price = round_device_first_quote_kopeks(price.final_total)
+            if quoted_price <= 0:
+                # A full promo/free period must retain the established trial or
+                # gift semantics, never be mistaken for a paid checkout.
+                return {'eligible': False, 'reason': 'non_positive_quote'}
             prices.append(
                 {
                     'device_limit': devices,
@@ -359,6 +414,8 @@ async def create_checkout(
         for price in row['prices']
         if price['device_limit'] == selected_device_limit
     )
+    if int(selected['price_kopeks']) <= 0:
+        raise DeviceFirstError('non_positive_quote', 'Free quotes use the legacy flow', status_code=422)
     checkout = SubscriptionCheckout(
         public_id=str(uuid.uuid4()),
         user_id=user.id,
@@ -402,17 +459,13 @@ async def create_checkout(
 
 async def confirm_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> SubscriptionCheckout:
     if checkout.lifecycle_state == 'draft':
-        now = datetime.now(UTC)
-        if now >= checkout.quote_expires_at:
-            checkout.lifecycle_state = 'reprice_required'
-            checkout.quote_state = 'expired'
-            checkout.terminal_reason = 'quote_expired'
-        else:
-            checkout.lifecycle_state = 'confirmed'
-            checkout.confirmed_at = now
+        if await expire_checkout_quote_if_needed(db, checkout):
+            return checkout
+        checkout.lifecycle_state = 'confirmed'
+        checkout.confirmed_at = datetime.now(UTC)
         await db.commit()
         await db.refresh(checkout)
-        _event('confirmed' if checkout.lifecycle_state == 'confirmed' else 'reprice_required', checkout)
+        _event('confirmed', checkout)
     return checkout
 
 
@@ -433,6 +486,8 @@ async def arm_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> Subs
         raise DeviceFirstError('invalid_state', 'Checkout cannot be armed in its current state')
     if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED and checkout.armed_at is None:
         raise DeviceFirstError('feature_disabled', 'New checkouts are temporarily disabled')
+    if await expire_checkout_quote_if_needed(db, checkout):
+        return checkout
     checkout.lifecycle_state = 'armed'
     checkout.armed_at = checkout.armed_at or datetime.now(UTC)
     await db.commit()
@@ -467,13 +522,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         await db.execute(select(Tariff).where(Tariff.id == checkout.tariff_id).with_for_update())
     ).scalar_one_or_none()
 
-    now = datetime.now(UTC)
-    if now >= checkout.quote_expires_at:
-        checkout.lifecycle_state = 'reprice_required'
-        checkout.quote_state = 'expired'
-        checkout.terminal_reason = 'quote_expired'
-        await db.commit()
-        _event('reprice_required', checkout, reason='quote_expired')
+    if await expire_checkout_quote_if_needed(db, checkout):
         return checkout
     current_eligibility = tariff_eligibility(tariff, subscription=target) if tariff is not None else None
     if (
@@ -516,6 +565,12 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         user=user,
     )
     charge = round_device_first_quote_kopeks(current_price.final_total)
+    if charge <= 0:
+        checkout.lifecycle_state = 'conflict'
+        checkout.terminal_reason = 'non_positive_quote'
+        await db.commit()
+        _event('conflict', checkout, reason=checkout.terminal_reason)
+        return checkout
     if int(tariff.pricing_revision or 1) != checkout.pricing_revision or charge != checkout.quoted_price_kopeks:
         checkout.lifecycle_state = 'reprice_required'
         checkout.quote_state = 'price_changed'
@@ -524,6 +579,22 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         _event('reprice_required', checkout, reason='price_changed')
         return checkout
     if user.balance_kopeks < charge:
+        had_committed_payment = (
+            checkout.fulfillment_state == 'in_progress' and checkout.quote_state == 'committed'
+        )
+        if had_committed_payment:
+            # A concurrent balance action consumed funds after an exact
+            # provider payment. The deposit remains in the ledger, but the old
+            # quote must not retain its post-payment expiry exemption forever.
+            checkout.fulfillment_state = 'not_started'
+            checkout.quote_state = 'valid'
+            if datetime.now(UTC) >= checkout.quote_expires_at:
+                checkout.lifecycle_state = 'reprice_required'
+                checkout.quote_state = 'expired'
+                checkout.terminal_reason = 'quote_expired'
+                await db.commit()
+                _event('reprice_required', checkout, reason='funds_spent_after_payment')
+                return checkout
         checkout.lifecycle_state = 'awaiting_funds'
         checkout.funding_state = 'partial' if user.balance_kopeks > 0 else 'unfunded'
         await db.commit()
@@ -532,6 +603,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
 
     checkout.lifecycle_state = 'fulfilling'
     checkout.fulfillment_state = 'in_progress'
+    checkout.quote_state = 'committed'
     user.balance_kopeks -= charge
     user.has_had_paid_subscription = True
     ledger = Transaction(

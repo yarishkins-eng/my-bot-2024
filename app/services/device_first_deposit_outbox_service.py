@@ -258,7 +258,7 @@ async def _apply_referral_step(
 
 
 async def _apply_fulfillment_step(db: AsyncSession, *, job_id: int) -> None:
-    """Resume exact/overpayment fulfillment after any post-credit crash."""
+    """Resume exact-payment fulfillment after any post-credit crash."""
     job = (
         await db.execute(
             select(DeviceFirstDepositOutbox).where(DeviceFirstDepositOutbox.id == job_id).with_for_update()

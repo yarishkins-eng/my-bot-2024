@@ -91,6 +91,16 @@ def test_device_first_top_up_is_rounded_up_to_a_whole_ruble(
     )
 
 
+def test_device_first_top_up_surplus_is_explicit_and_never_lost():
+    assert (
+        service.device_first_top_up_surplus_kopeks(
+            price_kopeks=30_100,
+            balance_kopeks=30_050,
+        )
+        == 9_950
+    )
+
+
 @pytest.mark.asyncio
 async def test_purchase_options_quote_the_same_whole_ruble_total_that_will_be_charged(monkeypatch):
     tariff = SimpleNamespace(id=7, name='Premium', traffic_limit_gb=100, device_limit=2, pricing_revision=1)
@@ -127,6 +137,42 @@ async def test_purchase_options_quote_the_same_whole_ruble_total_that_will_be_ch
     assert price['price_kopeks'] == 30_100
     assert price['breakdown']['raw_total_kopeks'] == 30_050
     assert price['breakdown']['rounding_adjustment_kopeks'] == 50
+
+
+@pytest.mark.asyncio
+async def test_full_promo_that_rounds_to_zero_stays_on_the_legacy_flow(monkeypatch):
+    tariff = SimpleNamespace(id=7, name='Premium', traffic_limit_gb=100, device_limit=2, pricing_revision=1)
+    user = SimpleNamespace(id=9, balance_kopeks=0)
+    eligibility = SimpleNamespace(
+        eligible=True,
+        tariff=tariff,
+        device_options=(2,),
+        period_options=(30,),
+        default_period_days=30,
+    )
+    db = SimpleNamespace()
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+    monkeypatch.setattr(service, 'get_tariffs_for_user', AsyncMock(return_value=[tariff]))
+    monkeypatch.setattr(service, '_current_subscription', AsyncMock(return_value=None))
+    monkeypatch.setattr(service, 'resolve_single_eligible_tariff', lambda *_args, **_kwargs: eligibility)
+    monkeypatch.setattr(
+        service.pricing_engine,
+        'calculate_tariff_purchase_price',
+        AsyncMock(
+            return_value=SimpleNamespace(
+                final_total=49,
+                base_price=49,
+                devices_price=0,
+                promo_group_discount=0,
+                promo_offer_discount=0,
+            )
+        ),
+    )
+
+    assert await service.build_purchase_options(db, user) == {
+        'eligible': False,
+        'reason': 'non_positive_quote',
+    }
 
 
 @pytest.mark.asyncio
@@ -212,6 +258,7 @@ async def test_kill_switch_still_drains_already_armed_checkout(monkeypatch):
         lifecycle_state='armed',
         fulfillment_state='not_started',
         armed_at=object(),
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
     db = SimpleNamespace(commit=AsyncMock())
     result = SimpleNamespace(lifecycle_state='ready')
@@ -223,6 +270,50 @@ async def test_kill_switch_still_drains_already_armed_checkout(monkeypatch):
 
     assert returned is result
     fulfill.assert_awaited_once_with(db, 'checkout-1', 7)
+
+
+@pytest.mark.asyncio
+async def test_expired_quote_cannot_be_armed_or_debited(monkeypatch):
+    checkout = SimpleNamespace(
+        public_id='checkout-1',
+        user_id=7,
+        lifecycle_state='confirmed',
+        fulfillment_state='not_started',
+        armed_at=None,
+        quote_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        quote_state='valid',
+        terminal_reason=None,
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+    fulfill = AsyncMock()
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+    monkeypatch.setattr(service, 'fulfill_checkout', fulfill)
+
+    returned = await service.arm_checkout(db, checkout)
+
+    assert returned is checkout
+    assert checkout.lifecycle_state == 'reprice_required'
+    assert checkout.quote_state == 'expired'
+    assert checkout.terminal_reason == 'quote_expired'
+    fulfill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_verified_exact_payment_keeps_its_quote_while_the_outbox_finishes(monkeypatch):
+    checkout = SimpleNamespace(
+        public_id='checkout-1',
+        user_id=7,
+        lifecycle_state='armed',
+        fulfillment_state='in_progress',
+        quote_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        quote_state='committed',
+        terminal_reason=None,
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+
+    assert not await service.expire_checkout_quote_if_needed(db, checkout)
+    assert checkout.lifecycle_state == 'armed'
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -334,3 +425,90 @@ async def test_fulfillment_reprices_before_debit_when_the_current_price_changes(
     assert result.quote_state == 'price_changed'
     assert user.balance_kopeks == 50_000
     db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handcrafted_zero_price_checkout_never_debits_or_converts_a_trial(monkeypatch):
+    target = paid_target(device_limit=4)
+    checkout = armed_checkout(target, devices=4, quoted_price=0)
+    user = SimpleNamespace(id=7, balance_kopeks=50_000, has_had_paid_subscription=False)
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                ScalarResult(user),
+                ScalarResult(target),
+                ScalarResult(SimpleNamespace(id=7, pricing_revision=1)),
+            ]
+        ),
+        commit=AsyncMock(),
+        add=AsyncMock(),
+        flush=AsyncMock(),
+    )
+    monkeypatch.setattr(service, 'get_owned_checkout', AsyncMock(return_value=checkout))
+    monkeypatch.setattr(
+        service,
+        'tariff_eligibility',
+        lambda tariff, subscription: SimpleNamespace(
+            eligible=True,
+            period_options=(30,),
+            device_options=(4, 5),
+        ),
+    )
+    monkeypatch.setattr(
+        service.pricing_engine,
+        'calculate_tariff_purchase_price',
+        AsyncMock(return_value=SimpleNamespace(final_total=0)),
+    )
+
+    result = await service.fulfill_checkout(db, checkout.public_id, user.id)
+
+    assert result.lifecycle_state == 'conflict'
+    assert result.terminal_reason == 'non_positive_quote'
+    assert user.balance_kopeks == 50_000
+    assert user.has_had_paid_subscription is False
+    db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_spent_exact_payment_loses_its_expiry_exemption_and_requires_a_new_quote(monkeypatch):
+    target = paid_target(device_limit=4)
+    checkout = armed_checkout(target, devices=4, quoted_price=10_000)
+    checkout.fulfillment_state = 'in_progress'
+    checkout.quote_state = 'committed'
+    checkout.quote_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    user = SimpleNamespace(id=7, balance_kopeks=0, has_had_paid_subscription=False)
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                ScalarResult(user),
+                ScalarResult(target),
+                ScalarResult(SimpleNamespace(id=7, pricing_revision=1)),
+            ]
+        ),
+        commit=AsyncMock(),
+        add=AsyncMock(),
+        flush=AsyncMock(),
+    )
+    monkeypatch.setattr(service, 'get_owned_checkout', AsyncMock(return_value=checkout))
+    monkeypatch.setattr(
+        service,
+        'tariff_eligibility',
+        lambda tariff, subscription: SimpleNamespace(
+            eligible=True,
+            period_options=(30,),
+            device_options=(4, 5),
+        ),
+    )
+    monkeypatch.setattr(
+        service.pricing_engine,
+        'calculate_tariff_purchase_price',
+        AsyncMock(return_value=SimpleNamespace(final_total=10_000)),
+    )
+
+    result = await service.fulfill_checkout(db, checkout.public_id, user.id)
+
+    assert result.lifecycle_state == 'reprice_required'
+    assert result.fulfillment_state == 'not_started'
+    assert result.quote_state == 'expired'
+    assert result.terminal_reason == 'quote_expired'
+    assert user.has_had_paid_subscription is False

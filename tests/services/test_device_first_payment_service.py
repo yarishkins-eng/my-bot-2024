@@ -1,8 +1,10 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.services.device_first_checkout_service import DeviceFirstError, expire_checkout_quote_if_needed
 from app.services.device_first_payment_service import (
     _checkout_return_url,
     _verified_amount,
@@ -19,6 +21,7 @@ def test_verified_amount_uses_actual_rub_provider_value():
 def test_verified_amount_rejects_untrusted_currency_or_missing_amount():
     assert _verified_amount({'paymentDetails': {'amount': '10', 'currency': 'USD'}}) is None
     assert _verified_amount({'paymentDetails': {'currency': 'RUB'}}) is None
+    assert _verified_amount({'paymentDetails': {'amount': '349.995', 'currency': 'RUB'}}) is None
 
 
 def test_semantic_method_mapping_excludes_unapproved_numeric_12(monkeypatch):
@@ -65,13 +68,47 @@ async def test_payment_attempt_requires_explicitly_armed_checkout(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_payment_attempt_rejects_replay_after_exact_payment_started_fulfillment(monkeypatch):
+    """A settled invoice cannot be replaced with a second invoice while its outbox runs."""
+    user = SimpleNamespace(id=7)
+    checkout = SimpleNamespace(
+        lifecycle_state='armed',
+        armed_at=object(),
+        fulfillment_state='in_progress',
+        quote_state='committed',
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=user))
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.available_platega_methods_for_db',
+        AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.get_owned_checkout',
+        AsyncMock(return_value=checkout),
+    )
+
+    with pytest.raises(DeviceFirstError) as raised:
+        await create_platega_attempt(
+            db,
+            checkout_public_id='checkout-1',
+            user_id=7,
+            method_key='sbp',
+        )
+
+    assert raised.value.code == 'invalid_state'
+
+
+@pytest.mark.asyncio
 async def test_payment_attempt_requests_the_whole_ruble_top_up_shown_to_the_customer(monkeypatch):
     checkout = SimpleNamespace(
         id=91,
         public_id='checkout-91',
+        user_id=7,
         lifecycle_state='awaiting_funds',
         armed_at=object(),
+        fulfillment_state='not_started',
         max_price_kopeks=40_100,
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
     user = SimpleNamespace(id=7, balance_kopeks=30_050)
     db = SimpleNamespace(
@@ -108,6 +145,46 @@ async def test_payment_attempt_requests_the_whole_ruble_top_up_shown_to_the_cust
 
     assert attempt.requested_amount_kopeks == 10_100
     assert provider.create_payment.await_args.kwargs['amount'] == 101.0
+
+
+@pytest.mark.asyncio
+async def test_expired_quote_never_returns_or_creates_a_provider_invoice(monkeypatch):
+    checkout = SimpleNamespace(
+        id=91,
+        public_id='checkout-91',
+        user_id=7,
+        lifecycle_state='awaiting_funds',
+        armed_at=object(),
+        fulfillment_state='not_started',
+        max_price_kopeks=40_100,
+        quote_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        quote_state='valid',
+        terminal_reason=None,
+    )
+    user = SimpleNamespace(id=7, balance_kopeks=0)
+    db = SimpleNamespace(get=AsyncMock(return_value=user), commit=AsyncMock())
+    provider_class = MagicMock()
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.available_platega_methods_for_db',
+        AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.get_owned_checkout',
+        AsyncMock(return_value=checkout),
+    )
+    monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', provider_class)
+
+    with pytest.raises(DeviceFirstError, match='expired') as raised:
+        await create_platega_attempt(
+            db,
+            checkout_public_id=checkout.public_id,
+            user_id=user.id,
+            method_key='sbp',
+        )
+
+    assert raised.value.code == 'quote_expired'
+    assert checkout.lifecycle_state == 'reprice_required'
+    provider_class.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -190,6 +267,9 @@ def _checkout(state='armed'):
         user_id=7,
         lifecycle_state=state,
         armed_at=object(),
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        quote_state='valid',
+        terminal_reason=None,
     )
 
 
@@ -324,15 +404,15 @@ async def test_partial_provider_amount_records_reconciliation_and_uses_actual_cr
     assert user.balance_kopeks == 10000
     assert attempt.credited_amount_kopeks == 10000
     assert attempt.reconciliation_reason == 'amount_mismatch:requested=35000:actual=10000'
-    assert checkout.lifecycle_state == 'awaiting_funds'
-    assert ensure.return_value.fulfillment_status == 'action_required'
+    assert checkout.lifecycle_state == 'conflict'
+    assert checkout.terminal_reason == 'payment_amount_mismatch'
+    assert ensure.return_value.fulfillment_status == 'not_required'
     created = db.add.call_args.args[0]
     assert created.amount_kopeks == 10000
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('provider_amount', ['350.00', '400.00'])
-async def test_exact_or_overpayment_queues_durable_fulfillment(provider_amount):
+async def test_exact_provider_amount_queues_durable_fulfillment():
     attempt = _attempt()
     checkout = _checkout()
     user = SimpleNamespace(id=7, balance_kopeks=0)
@@ -355,7 +435,7 @@ async def test_exact_or_overpayment_queues_durable_fulfillment(provider_amount):
     payload = {
         'id': 'provider-1',
         'paymentMethod': 2,
-        'paymentDetails': {'amount': provider_amount, 'currency': 'RUB'},
+        'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
     }
 
     with (
@@ -372,5 +452,110 @@ async def test_exact_or_overpayment_queues_durable_fulfillment(provider_amount):
 
     assert checkout.lifecycle_state == 'armed'
     assert checkout.fulfillment_state == 'in_progress'
+    assert checkout.funding_state == 'funded'
+    assert checkout.quote_state == 'committed'
     assert job.fulfillment_status == 'pending'
+    process.assert_awaited_once()
+
+    # A payment accepted before expiry keeps this exact approved quote while a
+    # later outbox worker resumes after the 30-minute display window.
+    checkout.quote_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    follow_up_db = SimpleNamespace(commit=AsyncMock())
+    assert not await expire_checkout_quote_if_needed(follow_up_db, checkout)
+    follow_up_db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_overpayment_is_credited_to_balance_but_never_auto_fulfills():
+    attempt = _attempt()
+    checkout = _checkout()
+    user = SimpleNamespace(id=7, balance_kopeks=0)
+    payment = _payment()
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Result(payment),
+                Result(attempt),
+                Result(checkout),
+                Result(user),
+                Result(None),
+            ]
+        ),
+        add=MagicMock(),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+    )
+    job = SimpleNamespace(fulfillment_status='pending')
+    payload = {
+        'id': 'provider-1',
+        'paymentMethod': 2,
+        'paymentDetails': {'amount': '400.00', 'currency': 'RUB'},
+    }
+
+    with (
+        patch(
+            'app.services.device_first_payment_service.ensure_deposit_outbox',
+            AsyncMock(return_value=job),
+        ),
+        patch(
+            'app.services.device_first_payment_service.process_device_first_deposit_outbox',
+            AsyncMock(),
+        ) as process,
+    ):
+        await settle_device_first_platega_payment(db, payment=payment, payload=payload)
+
+    assert user.balance_kopeks == 40_000
+    assert checkout.lifecycle_state == 'conflict'
+    assert checkout.terminal_reason == 'payment_amount_mismatch'
+    assert attempt.reconciliation_reason == 'amount_mismatch:requested=35000:actual=40000'
+    assert job.fulfillment_status == 'not_required'
+    process.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_late_quote_payment_is_credited_to_balance_but_never_auto_fulfills():
+    attempt = _attempt()
+    checkout = _checkout()
+    checkout.quote_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    user = SimpleNamespace(id=7, balance_kopeks=0)
+    payment = _payment()
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Result(payment),
+                Result(attempt),
+                Result(checkout),
+                Result(user),
+                Result(None),
+            ]
+        ),
+        add=MagicMock(),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+    )
+    job = SimpleNamespace(fulfillment_status='pending')
+    payload = {
+        'id': 'provider-1',
+        'paymentMethod': 2,
+        'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+    }
+
+    with (
+        patch(
+            'app.services.device_first_payment_service.ensure_deposit_outbox',
+            AsyncMock(return_value=job),
+        ),
+        patch(
+            'app.services.device_first_payment_service.process_device_first_deposit_outbox',
+            AsyncMock(),
+        ) as process,
+    ):
+        await settle_device_first_platega_payment(db, payment=payment, payload=payload)
+
+    assert user.balance_kopeks == 35_000
+    assert checkout.lifecycle_state == 'reprice_required'
+    assert checkout.quote_state == 'expired'
+    assert checkout.terminal_reason == 'quote_expired'
+    assert attempt.reconciliation_reason == 'quote_expired_paid_credited_to_balance_only'
+    assert job.fulfillment_status == 'not_required'
     process.assert_awaited_once()

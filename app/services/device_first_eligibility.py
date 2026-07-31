@@ -65,13 +65,19 @@ def normalize_device_purchase_options(
 
 
 def period_options(tariff: Tariff) -> tuple[int, ...]:
+    """Return only paid fixed periods for the paid device-first flow.
+
+    Free tariffs and 0 ₽ periods have separate trial/gift semantics. Routing
+    them through a paid checkout would wrongly mark a user as a paid customer
+    and can convert a trial, so they stay on the established legacy flow.
+    """
     values: list[int] = []
     for raw_days, raw_price in (tariff.period_prices or {}).items():
         try:
             days, price = int(raw_days), int(raw_price)
         except (TypeError, ValueError):
             continue
-        if days > 0 and price >= 0:
+        if days > 0 and price > 0:
             values.append(days)
     return tuple(sorted(set(values)))
 
@@ -126,6 +132,8 @@ def tariff_eligibility(
         return DeviceFirstEligibility(False, 'custom_days_tariff')
     if tariff.custom_traffic_enabled:
         return DeviceFirstEligibility(False, 'custom_traffic_tariff')
+    if bool(getattr(tariff, 'is_free', False)):
+        return DeviceFirstEligibility(False, 'free_tariff')
     periods = period_options(tariff)
     if not periods:
         return DeviceFirstEligibility(False, 'no_fixed_periods')

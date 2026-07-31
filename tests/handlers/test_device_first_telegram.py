@@ -9,6 +9,7 @@ from app.handlers.subscription.device_first import (
     _device_label,
     _device_page,
     _period_page,
+    _render_arm_confirmation,
     _render_checkout,
     _render_confirmation,
     _render_error,
@@ -497,6 +498,24 @@ async def test_arm_renders_exact_server_shortage_and_configuration() -> None:
 
 
 @pytest.mark.asyncio
+async def test_arm_confirmation_shows_the_same_provider_valid_minimum_top_up_as_the_invoice() -> None:
+    callback = SimpleNamespace()
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=30_050)
+    checkout = SimpleNamespace(
+        public_id='owned-checkout',
+        quoted_price_kopeks=30_100,
+        max_price_kopeks=30_100,
+    )
+
+    with patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output:
+        await _render_arm_confirmation(callback, user, checkout)
+
+    button = output.await_args.kwargs['keyboard'].inline_keyboard[0][0]
+    assert button.text == 'Пополнить 100 ₽ и оформить'
+    assert 'останется на балансе' in output.await_args.kwargs['caption']
+
+
+@pytest.mark.asyncio
 async def test_awaiting_checkout_with_funded_balance_requires_explicit_continue() -> None:
     callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
     user = SimpleNamespace(id=17, language='ru', balance_kopeks=45000)
@@ -689,6 +708,26 @@ async def test_terminal_checkout_states_have_honest_recovery_messages(
     assert caption_fragment in caption
     assert expected_callback in callbacks
     assert 'Расчёт изменился' not in caption
+
+
+@pytest.mark.asyncio
+async def test_payment_amount_mismatch_tells_the_user_that_money_is_on_balance() -> None:
+    callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=40_000)
+    checkout = SimpleNamespace(public_id='owned-checkout')
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value={'ui_state': 'conflict', 'terminal_reason': 'payment_amount_mismatch'},
+        ),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output,
+    ):
+        await _render_checkout(callback, user, AsyncMock(), checkout)
+
+    caption = output.await_args.kwargs['caption']
+    assert 'Деньги зачислены на баланс' in caption
+    assert 'Новый расчёт' in str(output.await_args.kwargs['keyboard'])
 
 
 @pytest.mark.asyncio

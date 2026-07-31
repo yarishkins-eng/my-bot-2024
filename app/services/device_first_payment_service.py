@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import structlog
@@ -29,6 +29,7 @@ from app.database.models import (
 from app.services.device_first_checkout_service import (
     DeviceFirstError,
     device_first_top_up_kopeks,
+    expire_checkout_quote_if_needed,
     get_owned_checkout,
 )
 from app.services.device_first_deposit_outbox_service import (
@@ -157,6 +158,14 @@ async def create_platega_attempt(
     )
     if checkout.lifecycle_state not in {'awaiting_funds', 'armed'} or checkout.armed_at is None:
         raise DeviceFirstError('invalid_state', 'Checkout is not ready for a payment attempt')
+    # An exact provider payment moves the checkout into fulfillment before the
+    # outbox finishes.  It may still look ``armed`` while the worker runs, but
+    # it is no longer an order that can accept an invoice.  This closes the
+    # short replay window between provider settlement and fulfillment.
+    if checkout.fulfillment_state != 'not_started':
+        raise DeviceFirstError('invalid_state', 'Checkout is already being fulfilled')
+    if await expire_checkout_quote_if_needed(db, checkout):
+        raise DeviceFirstError('quote_expired', 'Checkout quote has expired')
     existing = await get_pending_platega_attempt(db, checkout_id=checkout.id)
     if existing:
         if existing.status in {'creating', 'reconciliation'}:
@@ -287,7 +296,12 @@ def _verified_amount(payload: dict | None) -> tuple[int, str] | None:
         return None
     if not amount.is_finite() or amount <= 0:
         return None
-    kopeks = int((amount * Decimal(100)).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    kopeks_decimal = amount * Decimal(100)
+    # The provider is the financial source of truth.  Do not make a fractional
+    # kopek look like an exact invoice by rounding it in either direction.
+    if kopeks_decimal != kopeks_decimal.to_integral_value():
+        return None
+    kopeks = int(kopeks_decimal)
     return kopeks, currency
 
 
@@ -395,29 +409,49 @@ async def settle_device_first_platega_payment(
     payment.metadata_json = {**metadata, 'webhook': payload, 'balance_credited': True}
     attempt.credited_amount_kopeks = amount_kopeks
     attempt.status = 'credited'
-    is_underpayment = amount_kopeks < attempt.requested_amount_kopeks
-    if amount_kopeks != attempt.requested_amount_kopeks:
-        attempt.reconciliation_reason = (
-            f'amount_mismatch:requested={attempt.requested_amount_kopeks}:actual={amount_kopeks}'
+    amount_matches_invoice = amount_kopeks == attempt.requested_amount_kopeks
+    quote_expired_after_invoice = (
+        checkout.lifecycle_state in {'draft', 'confirmed', 'awaiting_funds', 'armed', 'fulfilling'}
+        and not (
+            getattr(checkout, 'fulfillment_state', 'not_started') == 'in_progress'
+            and getattr(checkout, 'quote_state', None) == 'committed'
         )
+        and datetime.now(UTC) >= checkout.quote_expires_at
+    )
     if checkout.lifecycle_state in {'cancelled', 'expired', 'failed', 'reprice_required', 'conflict'}:
         attempt.reconciliation_reason = 'late_paid_credited_to_balance_only'
+        deposit_job.fulfillment_status = 'not_required'
+    elif quote_expired_after_invoice:
+        # Platega may settle an already opened invoice after its local quote
+        # expired. Keep the money, but never apply an old quote automatically.
+        checkout.lifecycle_state = 'reprice_required'
+        checkout.quote_state = 'expired'
+        checkout.terminal_reason = 'quote_expired'
+        attempt.reconciliation_reason = 'quote_expired_paid_credited_to_balance_only'
         deposit_job.fulfillment_status = 'not_required'
     elif checkout.armed_at is None:
         attempt.reconciliation_reason = 'paid_checkout_was_not_armed'
         deposit_job.fulfillment_status = 'not_required'
         checkout.lifecycle_state = 'awaiting_funds'
-    elif is_underpayment:
-        checkout.lifecycle_state = 'awaiting_funds'
-        checkout.funding_state = 'partial'
-        deposit_job.fulfillment_status = 'action_required'
+    elif not amount_matches_invoice:
+        # Never infer customer consent from an invoice whose provider-reported
+        # amount differs from the amount displayed in the checkout. The actual
+        # funds remain available on balance for a fresh, explicit quote.
+        checkout.lifecycle_state = 'conflict'
+        checkout.terminal_reason = 'payment_amount_mismatch'
+        attempt.reconciliation_reason = (
+            f'amount_mismatch:requested={attempt.requested_amount_kopeks}:actual={amount_kopeks}'
+        )
+        deposit_job.fulfillment_status = 'not_required'
     elif checkout.armed_at is not None:
         checkout.lifecycle_state = 'armed'
-        # Crediting the exact/greater provider amount is the financial commit
+        # Crediting the exact provider amount is the financial commit
         # point. Mark fulfillment as started in the same DB transaction so a
         # concurrent user cancellation cannot strand credited money without
         # completing the explicitly approved purchase.
         checkout.fulfillment_state = 'in_progress'
+        checkout.funding_state = 'funded'
+        checkout.quote_state = 'committed'
         deposit_job.fulfillment_status = 'pending'
     await db.commit()
     await process_device_first_deposit_outbox(

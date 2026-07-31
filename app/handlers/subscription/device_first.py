@@ -19,6 +19,8 @@ from app.services.device_first_checkout_service import (
     cancel_checkout,
     confirm_checkout,
     create_checkout,
+    device_first_top_up_kopeks,
+    device_first_top_up_surplus_kopeks,
     get_open_checkout_for_user,
     get_owned_checkout,
     serialize_checkout,
@@ -550,7 +552,16 @@ async def _render_arm_confirmation(
     checkout,
 ) -> None:
     """Render the deliberate second confirmation for a confirmed checkout."""
-    shortage = max(0, checkout.max_price_kopeks - user.balance_kopeks)
+    # This is the exact whole-ruble, provider-valid invoice amount shown by
+    # both the API and Platega. A small minimum top-up surplus stays on balance.
+    shortage = device_first_top_up_kopeks(
+        price_kopeks=checkout.max_price_kopeks,
+        balance_kopeks=user.balance_kopeks,
+    )
+    top_up_surplus = device_first_top_up_surplus_kopeks(
+        price_kopeks=checkout.max_price_kopeks,
+        balance_kopeks=user.balance_kopeks,
+    )
     await edit_or_answer_photo(
         callback=callback,
         caption=_text(
@@ -559,11 +570,21 @@ async def _render_arm_confirmation(
                 '🔐 <b>Заказ подтверждён</b>\n\n'
                 f'К списанию: {_money(user, checkout.quoted_price_kopeks)} ₽.\n'
                 'Списание произойдёт только после следующего нажатия.'
+                + (
+                    f' После оформления {_money(user, top_up_surplus)} ₽ останется на балансе.'
+                    if top_up_surplus
+                    else ''
+                )
             ),
             (
                 '🔐 <b>Order confirmed</b>\n\n'
                 f'To charge: ₽{_money(user, checkout.quoted_price_kopeks)}.\n'
                 'The charge happens only after the next tap.'
+                + (
+                    f' ₽{_money(user, top_up_surplus)} will remain on your balance after the order.'
+                    if top_up_surplus
+                    else ''
+                )
             ),
         ),
         keyboard=InlineKeyboardMarkup(
@@ -603,6 +624,7 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
         return
     if result['ui_state'] == 'awaiting_payment':
         shortage = result['shortage_kopeks'] or 0
+        top_up_surplus = result.get('top_up_surplus_kopeks') or 0
         pending_attempt = None
         if getattr(checkout, 'id', None) is not None:
             pending_attempt = await get_pending_platega_attempt(db, checkout_id=checkout.id)
@@ -713,6 +735,11 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                         f'💰 Итого: {_money(user, checkout.quoted_price_kopeks)} ₽\n'
                         f'⚠️ Нужно доплатить: <b>{_money(user, shortage)} ₽</b>\n\n'
                         'Заказ сохранён. Выберите способ доплаты.'
+                        + (
+                            f' После оформления {_money(user, top_up_surplus)} ₽ останется на балансе.'
+                            if top_up_surplus
+                            else ''
+                        )
                     ),
                     (
                         '💳 <b>Insufficient balance</b>\n\n'
@@ -721,6 +748,11 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                         f'💰 Total: ₽{_money(user, checkout.quoted_price_kopeks)}\n'
                         f'⚠️ Top up: <b>₽{_money(user, shortage)}</b>\n\n'
                         'Your order is saved. Choose a top-up method.'
+                        + (
+                            f' ₽{_money(user, top_up_surplus)} will remain on your balance after the order.'
+                            if top_up_surplus
+                            else ''
+                        )
                     ),
                 )
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -732,12 +764,22 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                         f'Нужно доплатить: <b>{_money(user, shortage)} ₽</b>.\n\n'
                         'Пополнение сейчас недоступно. Обновите баланс, если его пополнили другим способом, '
                         'или обратитесь в поддержку.'
+                        + (
+                            f' После оформления {_money(user, top_up_surplus)} ₽ останется на балансе.'
+                            if top_up_surplus
+                            else ''
+                        )
                     ),
                     (
                         '💳 <b>Insufficient balance</b>\n\n'
                         f'Top up needed: <b>₽{_money(user, shortage)}</b>.\n\n'
                         'Top-up is currently unavailable. Refresh your balance if you used another method, '
                         'or contact support.'
+                        + (
+                            f' ₽{_money(user, top_up_surplus)} will remain on your balance after the order.'
+                            if top_up_surplus
+                            else ''
+                        )
                     ),
                 )
                 keyboard = InlineKeyboardMarkup(
@@ -862,10 +904,23 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
             ]
         )
     elif result['ui_state'] == 'conflict':
+        is_payment_amount_mismatch = result.get('terminal_reason') == 'payment_amount_mismatch'
         caption = _text(
             user,
-            '⚠️ <b>Заказ нельзя продолжить</b>\n\nДанные подписки изменились. Создайте новый расчёт.',
-            '⚠️ <b>This order cannot continue</b>\n\nSubscription data changed. Create a new quote.',
+            (
+                '⚠️ <b>Оплату нужно проверить</b>\n\n'
+                'Платёжная система вернула сумму, отличающуюся от счёта. Деньги зачислены на баланс. '
+                'Создайте новый расчёт и подтвердите его отдельно.'
+                if is_payment_amount_mismatch
+                else '⚠️ <b>Заказ нельзя продолжить</b>\n\nДанные подписки изменились. Создайте новый расчёт.'
+            ),
+            (
+                '⚠️ <b>Payment needs a check</b>\n\n'
+                'The payment provider reported an amount different from the invoice. The funds are on your balance. '
+                'Create and confirm a new quote separately.'
+                if is_payment_amount_mismatch
+                else '⚠️ <b>This order cannot continue</b>\n\nSubscription data changed. Create a new quote.'
+            ),
         )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
