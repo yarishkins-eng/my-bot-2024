@@ -61,8 +61,13 @@ jobs:
             readonly MIN_FREE_KB=2097152
             readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'
             readonly STATE_FILE="$STATE_DIR/bot-production.state"
+            readonly RECOVERY_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
+            readonly RECOVERY_IMAGE_TAG="teplo-vpn-rollback/bot:pre-migration-${TARGET_SHA}"
             BUILD_DIR=''
             BUILD_OVERRIDE=''
+            TARGET_SCHEMA_REVISIONS=''
+            PREPARE_IN_PROGRESS=0
+            RECOVERY_JOURNAL_PREPARED=0
 
             cd "$REPO_DIR"
 
@@ -92,13 +97,27 @@ jobs:
                 '      dockerfile: Dockerfile' > "$BUILD_OVERRIDE"
             }
 
+            state_value() {
+              key="$1"
+              file="$2"
+              test "$(grep -Ec "^${key}=[^[:space:]]+$" "$file")" = '1'
+              sed -n "s/^${key}=//p" "$file"
+            }
+
+            read_schema_revisions() {
+              docker compose -f docker-compose.yml exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT version_num FROM alembic_version ORDER BY version_num"' | sort | paste -sd, -
+            }
+
             verify_deployed_state() {
+              expected_sha="$1"
               test -r "$STATE_FILE"
-              stored_sha="$(sed -n 's/^sha=//p' "$STATE_FILE")"
-              stored_image="$(sed -n 's/^image=//p' "$STATE_FILE")"
+              stored_sha="$(state_value sha "$STATE_FILE")"
+              stored_image="$(state_value image "$STATE_FILE")"
               current_image="$(docker inspect --format '{{.Image}}' remnawave_bot)"
-              test "$stored_sha" = "$TARGET_SHA"
+              test "$stored_sha" = "$expected_sha"
+              [[ "$stored_image" =~ ^sha256:[0-9a-f]{64}$ ]]
               test "$stored_image" = "$current_image"
+              test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" = 'healthy'
             }
 
             write_deployed_state() {
@@ -107,6 +126,43 @@ jobs:
               printf 'sha=%s\nimage=%s\n' "$TARGET_SHA" "$(docker inspect --format '{{.Image}}' remnawave_bot)" > "$state_tmp"
               chmod 600 "$state_tmp"
               mv "$state_tmp" "$STATE_FILE"
+            }
+
+            # Write the journal before the service switch.  The recovery workflow
+            # accepts only its captured SHA and image identity, so it remains
+            # usable if Alembic commits but candidate startup fails.
+            write_migration_recovery_state() {
+              phase="$1"
+              install -d -m 700 "$STATE_DIR"
+              state_tmp="$(mktemp "$STATE_DIR/bot-production.migration-recovery.XXXXXX")"
+              printf 'format_version=1\nphase=%s\ndeployed_sha=%s\nrollback_source_sha=%s\nrollback_image_tag=%s\nrollback_image_id=%s\nmigration_image_id=%s\nprevious_schema_revisions=%s\ntarget_schema_revisions=%s\n' \
+                "$phase" "$TARGET_SHA" "$PREVIOUS_SHA" "$RECOVERY_IMAGE_TAG" "$PREVIOUS_IMAGE_ID" \
+                "$TARGET_IMAGE_ID" "$PREVIOUS_SCHEMA_REVISIONS" "$TARGET_SCHEMA_REVISIONS" > "$state_tmp"
+              chmod 600 "$state_tmp"
+              mv "$state_tmp" "$RECOVERY_STATE_FILE"
+            }
+
+            # Until the recovery journal is durably written, no database or
+            # service switch has happened.  A failed build/preparation must
+            # leave the server at the exact prior source and deploy state so a
+            # corrected retry is possible.  After `prepared`, recovery is
+            # deliberately manual because Alembic may have committed.
+            restore_after_preparation_failure() {
+              original_rc=$?
+              trap - ERR
+              set +e
+              restored=1
+              if [ "$PREPARE_IN_PROGRESS" = '1' ] && [ "$RECOVERY_JOURNAL_PREPARED" = '0' ]; then
+                echo 'Candidate preparation failed; restoring the prior source before any migration switch.' >&2
+                git checkout --detach "$PREVIOUS_SHA" || restored=0
+                docker image rm "$RECOVERY_IMAGE_TAG" >/dev/null 2>&1 || restored=0
+                verify_deployed_state "$PREVIOUS_SHA" || restored=0
+              fi
+              if [ "$restored" != '1' ]; then
+                echo 'CRITICAL: candidate preparation failed and the prior source/state could not be proven restored.' >&2
+                exit 91
+              fi
+              exit "$original_rc"
             }
 
             verify_migration_flags() {
@@ -118,10 +174,9 @@ jobs:
             }
 
             verify_migration_revision() {
-              expected_revisions="$(compose exec -T "$SERVICE" /app/.venv/bin/alembic heads 2>/dev/null | awk '{ print $1 }' | sort | paste -sd, -)"
-              actual_revisions="$(compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT version_num FROM alembic_version ORDER BY version_num"' | sort | paste -sd, -)"
-              test -n "$expected_revisions"
-              test "$expected_revisions" = "$actual_revisions"
+              actual_revisions="$(read_schema_revisions)"
+              test -n "$TARGET_SCHEMA_REVISIONS"
+              test "$TARGET_SCHEMA_REVISIONS" = "$actual_revisions"
             }
 
             trap cleanup_build_context EXIT
@@ -151,11 +206,20 @@ jobs:
             fi
 
             git cat-file -e "${TARGET_SHA}^{commit}"
+            readonly SERVICE_IMAGE="$(docker inspect --format '{{.Config.Image}}' remnawave_bot)"
+            readonly RUNNING_IMAGE_ID="$(docker inspect --format '{{.Image}}' remnawave_bot)"
 
             if [ "$PREVIOUS_SHA" = "$TARGET_SHA" ]; then
               echo "Source already at $TARGET_SHA; requiring the container health gate again."
-              verify_deployed_state
+              verify_deployed_state "$TARGET_SHA"
+              # Compose names images by a mutable tag.  On a retry, that tag
+              # must still resolve to the image already proved by deploy state;
+              # otherwise `up --no-build` could replace a healthy bot with an
+              # unrelated local image.
+              test "$(docker image inspect --format '{{.Id}}' "$SERVICE_IMAGE")" = "$RUNNING_IMAGE_ID"
               verify_migration_flags
+              TARGET_SCHEMA_REVISIONS="$(docker run --rm --entrypoint /app/.venv/bin/alembic "$SERVICE_IMAGE" heads 2>/dev/null | awk '{ print $1 }' | sort | paste -sd, -)"
+              test -n "$TARGET_SCHEMA_REVISIONS"
               compose up -d --no-build --wait --wait-timeout 240 "$SERVICE"
               compose ps "$SERVICE"
               verify_migration_revision
@@ -177,19 +241,33 @@ jobs:
               exit 26
             fi
 
-            git checkout --detach "$TARGET_SHA"
-            if ! verify_migration_flags; then
-              git checkout --detach "$PREVIOUS_SHA"
-              exit 27
-            fi
+            # Refuse to relabel an unknown running image as the prior source.
+            # The ordinary deploy state is part of the migration pre-flight.
+            verify_deployed_state "$PREVIOUS_SHA"
+            readonly PREVIOUS_SCHEMA_REVISIONS="$(read_schema_revisions)"
+            test -n "$PREVIOUS_SCHEMA_REVISIONS"
+            readonly PREVIOUS_IMAGE_ID="$RUNNING_IMAGE_ID"
+            docker image tag "$PREVIOUS_IMAGE_ID" "$RECOVERY_IMAGE_TAG"
 
+            PREPARE_IN_PROGRESS=1
+            trap restore_after_preparation_failure ERR
+            git checkout --detach "$TARGET_SHA"
+            verify_migration_flags
             create_clean_build_context
             compose build "$SERVICE"
+            readonly TARGET_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$SERVICE_IMAGE")"
+            TARGET_SCHEMA_REVISIONS="$(docker run --rm --entrypoint /app/.venv/bin/alembic "$SERVICE_IMAGE" heads 2>/dev/null | awk '{ print $1 }' | sort | paste -sd, -)"
+            test -n "$TARGET_SCHEMA_REVISIONS"
+            write_migration_recovery_state prepared
+            RECOVERY_JOURNAL_PREPARED=1
+            PREPARE_IN_PROGRESS=0
+            trap - ERR
 
-            # No automatic rollback here: the migration may have changed the schema in a way
-            # that makes the previous code unsafe. Recovery follows the approved release card.
+            # No automatic image rollback: after a committed forward migration the
+            # protected recovery workflow is the explicit, rehearsed path.
             compose up -d --wait --wait-timeout 240 "$SERVICE"
             compose ps "$SERVICE"
             verify_migration_revision
             write_deployed_state
+            write_migration_recovery_state completed
             echo "Container healthy and database revision verified for $TARGET_SHA at $(date --iso-8601=seconds)"

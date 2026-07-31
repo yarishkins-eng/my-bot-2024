@@ -1,0 +1,267 @@
+name: Recover bot code after forward-only migration
+
+# This is an immediate-only, protected recovery path.  It is intentionally
+# unavailable after another main/source deployment: returning to the image that
+# preceded 0095 could otherwise erase a later code release.
+on:
+  workflow_dispatch:
+    inputs:
+      rollback_source_sha:
+        description: 'Exact previous source SHA recorded by the migration release'
+        required: true
+        type: string
+      recovery_rehearsal_evidence:
+        description: 'Exact phrase: RECOVERY_PATH_REHEARSED'
+        required: true
+        type: string
+      owner_go_no_go:
+        description: 'Exact phrase: OWNER_APPROVED'
+        required: true
+        type: string
+      release_card_reference:
+        description: 'Private release-card / incident record reference (no secrets)'
+        required: true
+        type: string
+
+concurrency:
+  group: teplo-bot-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/lint.yml
+
+  recover:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: teplo-vpn-production-migration
+    timeout-minutes: 20
+    steps:
+      - name: Validate recovery gates
+        env:
+          ROLLBACK_SOURCE_SHA: ${{ inputs.rollback_source_sha }}
+          RECOVERY_REHEARSAL_EVIDENCE: ${{ inputs.recovery_rehearsal_evidence }}
+          OWNER_GO_NO_GO: ${{ inputs.owner_go_no_go }}
+          RELEASE_CARD_REFERENCE: ${{ inputs.release_card_reference }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$ROLLBACK_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$RECOVERY_REHEARSAL_EVIDENCE" = 'RECOVERY_PATH_REHEARSED'
+          test "$OWNER_GO_NO_GO" = 'OWNER_APPROVED'
+          test -n "$RELEASE_CARD_REFERENCE"
+
+      - name: Recover only the captured pre-migration bot image
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        env:
+          TARGET_SHA: ${{ github.sha }}
+          REQUESTED_ROLLBACK_SHA: ${{ inputs.rollback_source_sha }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 15m
+          envs: TARGET_SHA,REQUESTED_ROLLBACK_SHA
+          script: |
+            set -Eeuo pipefail
+
+            readonly REPO_DIR='/opt/remnawave-bedolaga-telegram-bot'
+            readonly SERVICE='bot'
+            readonly TARGET_SHA="${TARGET_SHA:?missing workflow target SHA}"
+            readonly REQUESTED_ROLLBACK_SHA="${REQUESTED_ROLLBACK_SHA:?missing rollback SHA}"
+            readonly MIN_FREE_KB=2097152
+            readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'
+            readonly STATE_FILE="$STATE_DIR/bot-production.state"
+            readonly RECOVERY_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
+            readonly RECOVERY_AUDIT_FILE="$STATE_DIR/bot-production.migration-recovery.audit"
+            RECOVERY_DIR=''
+            RECOVERY_OVERRIDE=''
+            CURRENT_SOURCE_SHA=''
+            CURRENT_IMAGE_ID=''
+            CURRENT_SERVICE_IMAGE=''
+            CURRENT_SCHEMA_REVISIONS=''
+            RECOVERY_SWITCH_ATTEMPTED=0
+
+            cd "$REPO_DIR"
+
+            compose() {
+              if [ -n "$RECOVERY_OVERRIDE" ]; then
+                docker compose -f docker-compose.yml -f "$RECOVERY_OVERRIDE" "$@"
+              else
+                docker compose -f docker-compose.yml "$@"
+              fi
+            }
+
+            state_value() {
+              key="$1"
+              file="$2"
+              test "$(grep -Ec "^${key}=[^[:space:]]+$" "$file")" = '1'
+              sed -n "s/^${key}=//p" "$file"
+            }
+
+            validate_recovery_state() {
+              file="$1"
+              test -r "$file"
+              if grep -Ev '^(format_version|phase|deployed_sha|rollback_source_sha|rollback_image_tag|rollback_image_id|migration_image_id|previous_schema_revisions|target_schema_revisions)=[^[:space:]]+$' "$file" >/dev/null; then
+                echo 'Refusing recovery: malformed or unknown recovery-state key.' >&2
+                return 1
+              fi
+              for key in format_version phase deployed_sha rollback_source_sha rollback_image_tag rollback_image_id migration_image_id previous_schema_revisions target_schema_revisions; do
+                state_value "$key" "$file" >/dev/null
+              done
+              test "$(state_value format_version "$file")" = '1'
+              phase="$(state_value phase "$file")"
+              test "$phase" = 'prepared' -o "$phase" = 'completed'
+              [[ "$(state_value deployed_sha "$file")" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$(state_value rollback_source_sha "$file")" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$(state_value rollback_image_tag "$file")" =~ ^teplo-vpn-rollback/bot:pre-migration-[0-9a-f]{40}$ ]]
+              [[ "$(state_value rollback_image_id "$file")" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ "$(state_value migration_image_id "$file")" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ "$(state_value previous_schema_revisions "$file")" =~ ^[0-9a-z]+(,[0-9a-z]+)*$ ]]
+              [[ "$(state_value target_schema_revisions "$file")" =~ ^[0-9a-z]+(,[0-9a-z]+)*$ ]]
+            }
+
+            read_schema_revisions() {
+              docker compose -f docker-compose.yml exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT version_num FROM alembic_version ORDER BY version_num"' | sort | paste -sd, -
+            }
+
+            cleanup_recovery_context() {
+              if [ -n "$RECOVERY_DIR" ]; then
+                rm -rf "$RECOVERY_DIR"
+              fi
+            }
+
+            restore_current_service() {
+              original_rc=$?
+              trap - ERR
+              set +e
+              restored=1
+              if [ "$RECOVERY_SWITCH_ATTEMPTED" = '1' ] && [ -n "$CURRENT_IMAGE_ID" ]; then
+                echo 'Recovery switch failed; restoring the captured current bot image.' >&2
+                docker image tag "$CURRENT_IMAGE_ID" "$CURRENT_SERVICE_IMAGE" || restored=0
+                RECOVERY_OVERRIDE=''
+                compose up -d --no-build --wait --wait-timeout 240 "$SERVICE" || restored=0
+                test "$(docker inspect --format '{{.Image}}' remnawave_bot 2>/dev/null)" = "$CURRENT_IMAGE_ID" || restored=0
+                test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot 2>/dev/null)" = 'healthy' || restored=0
+                restored_started_at="$(docker inspect --format '{{.State.StartedAt}}' remnawave_bot 2>/dev/null)" || restored=0
+                docker logs --since "$restored_started_at" remnawave_bot 2>&1 | grep -F 'Aiogram polling запущен' >/dev/null || restored=0
+                test "$(read_schema_revisions)" = "$CURRENT_SCHEMA_REVISIONS" || restored=0
+              fi
+              git checkout --detach "$CURRENT_SOURCE_SHA" || restored=0
+              test "$(git rev-parse HEAD 2>/dev/null)" = "$CURRENT_SOURCE_SHA" || restored=0
+              cleanup_recovery_context
+              if [ "$restored" != '1' ]; then
+                echo 'CRITICAL: recovery failed and the previous service could not be proven restored.' >&2
+                exit 91
+              fi
+              echo 'Recovery failed before completion; the previous service image was restored and verified.' >&2
+              exit "$original_rc"
+            }
+
+            trap 'cleanup_recovery_context' EXIT
+
+            if [ -n "$(git status --porcelain)" ]; then
+              echo 'Refusing recovery: the server working tree is not exact.' >&2
+              exit 10
+            fi
+            if find . -maxdepth 1 -type f \( -name '*override*.yml' -o -name '*override*.yaml' \) -print -quit | grep -q .; then
+              echo 'Refusing recovery: a Compose override file is present on the server.' >&2
+              exit 11
+            fi
+            if [ "$(df -Pk . | awk 'NR == 2 { print $4 }')" -lt "$MIN_FREE_KB" ]; then
+              echo 'Refusing recovery: less than 2 GiB of free disk space.' >&2
+              exit 12
+            fi
+            [[ "$REQUESTED_ROLLBACK_SHA" =~ ^[0-9a-f]{40}$ ]]
+            validate_recovery_state "$RECOVERY_STATE_FILE"
+
+            git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+            CURRENT_SOURCE_SHA="$(git rev-parse HEAD)"
+            REMOTE_MAIN_SHA="$(git rev-parse origin/main)"
+            RECOVERY_PHASE="$(state_value phase "$RECOVERY_STATE_FILE")"
+            RECOVERY_DEPLOYED_SHA="$(state_value deployed_sha "$RECOVERY_STATE_FILE")"
+            RECOVERY_SOURCE_SHA="$(state_value rollback_source_sha "$RECOVERY_STATE_FILE")"
+            RECOVERY_IMAGE_TAG="$(state_value rollback_image_tag "$RECOVERY_STATE_FILE")"
+            RECOVERY_IMAGE_ID="$(state_value rollback_image_id "$RECOVERY_STATE_FILE")"
+            MIGRATION_IMAGE_ID="$(state_value migration_image_id "$RECOVERY_STATE_FILE")"
+            PREVIOUS_REVISIONS="$(state_value previous_schema_revisions "$RECOVERY_STATE_FILE")"
+            TARGET_REVISIONS="$(state_value target_schema_revisions "$RECOVERY_STATE_FILE")"
+
+            # Immediate-only: source, current main and the journal must all still
+            # point to this migration target.  Any later deploy fails closed.
+            test "$TARGET_SHA" = "$REMOTE_MAIN_SHA"
+            test "$TARGET_SHA" = "$CURRENT_SOURCE_SHA"
+            test "$TARGET_SHA" = "$RECOVERY_DEPLOYED_SHA"
+            test "$RECOVERY_SOURCE_SHA" = "$REQUESTED_ROLLBACK_SHA"
+            git cat-file -e "${REQUESTED_ROLLBACK_SHA}^{commit}"
+            git merge-base --is-ancestor "$REQUESTED_ROLLBACK_SHA" "$TARGET_SHA"
+            if ! git diff --quiet "$REQUESTED_ROLLBACK_SHA" "$TARGET_SHA" -- Dockerfile .dockerignore docker-compose.yml; then
+              echo 'Refusing recovery: Docker or Compose changed between the captured source and migration target.' >&2
+              exit 13
+            fi
+            test "$(docker image inspect --format '{{.Id}}' "$RECOVERY_IMAGE_TAG")" = "$RECOVERY_IMAGE_ID"
+            docker image inspect "$MIGRATION_IMAGE_ID" >/dev/null
+
+            CURRENT_IMAGE_ID="$(docker inspect --format '{{.Image}}' remnawave_bot)"
+            CURRENT_SERVICE_IMAGE="$(docker inspect --format '{{.Config.Image}}' remnawave_bot)"
+            CURRENT_SCHEMA_REVISIONS="$(read_schema_revisions)"
+            if [ "$RECOVERY_PHASE" = 'completed' ]; then
+              test -r "$STATE_FILE"
+              test "$(state_value sha "$STATE_FILE")" = "$TARGET_SHA"
+              test "$(state_value image "$STATE_FILE")" = "$MIGRATION_IMAGE_ID"
+              test "$CURRENT_IMAGE_ID" = "$MIGRATION_IMAGE_ID"
+              test "$(read_schema_revisions)" = "$TARGET_REVISIONS"
+            else
+              actual_revisions="$(read_schema_revisions)"
+              # Before `compose up` the old container may still be running only
+              # against the old schema.  Once 0095 commits, the candidate image
+              # owns the interrupted switch.  Reject the impossible old-image /
+              # target-schema cross-pair instead of claiming it can be restored.
+              if [ "$CURRENT_IMAGE_ID" = "$RECOVERY_IMAGE_ID" ]; then
+                test "$actual_revisions" = "$PREVIOUS_REVISIONS"
+              elif [ "$CURRENT_IMAGE_ID" = "$MIGRATION_IMAGE_ID" ]; then
+                test "$actual_revisions" = "$PREVIOUS_REVISIONS" -o "$actual_revisions" = "$TARGET_REVISIONS"
+              else
+                echo 'Refusing recovery: prepared state has an unknown running image.' >&2
+                exit 14
+              fi
+            fi
+
+            RECOVERY_DIR="$(mktemp -d /tmp/teplo-vpn-bot-recovery.XXXXXX)"
+            RECOVERY_OVERRIDE="$RECOVERY_DIR/compose-recovery.yml"
+            printf '%s\n' \
+              'services:' \
+              '  bot:' \
+              '    environment:' \
+              "      SKIP_MIGRATION: 'true'" > "$RECOVERY_OVERRIDE"
+
+            trap restore_current_service ERR
+            docker image tag "$RECOVERY_IMAGE_TAG" "$CURRENT_SERVICE_IMAGE"
+            RECOVERY_SWITCH_ATTEMPTED=1
+            compose up -d --no-build --wait --wait-timeout 240 "$SERVICE"
+            compose ps "$SERVICE"
+            running_image="$(docker inspect --format '{{.Image}}' remnawave_bot)"
+            test "$running_image" = "$RECOVERY_IMAGE_ID"
+            test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" = 'healthy'
+            started_at="$(docker inspect --format '{{.State.StartedAt}}' remnawave_bot)"
+            docker logs --since "$started_at" remnawave_bot 2>&1 | grep -F 'SKIP_MIGRATION=true' >/dev/null
+            docker logs --since "$started_at" remnawave_bot 2>&1 | grep -F 'Aiogram polling запущен' >/dev/null
+            actual_revisions="$(read_schema_revisions)"
+            test "$actual_revisions" = "$PREVIOUS_REVISIONS" -o "$actual_revisions" = "$TARGET_REVISIONS"
+
+            git checkout --detach "$REQUESTED_ROLLBACK_SHA"
+            state_tmp="$(mktemp "$STATE_DIR/bot-production.XXXXXX")"
+            printf 'sha=%s\nimage=%s\nmode=recovery\nschema_revisions=%s\nrecovery_from_sha=%s\n' \
+              "$REQUESTED_ROLLBACK_SHA" "$running_image" "$actual_revisions" "$TARGET_SHA" > "$state_tmp"
+            chmod 600 "$state_tmp"
+            mv "$state_tmp" "$STATE_FILE"
+            audit_tmp="$(mktemp "$STATE_DIR/bot-production.migration-recovery.audit.XXXXXX")"
+            printf 'recovered_at=%s\nsource_sha=%s\nimage=%s\nschema_revisions=%s\nfrom_migration_sha=%s\n' \
+              "$(date --iso-8601=seconds)" "$REQUESTED_ROLLBACK_SHA" "$running_image" "$actual_revisions" "$TARGET_SHA" > "$audit_tmp"
+            chmod 600 "$audit_tmp"
+            mv "$audit_tmp" "$RECOVERY_AUDIT_FILE"
+            RECOVERY_SWITCH_ATTEMPTED=0
+            trap - ERR
+            echo "Recovered source=$REQUESTED_ROLLBACK_SHA against schema=$actual_revisions at $(date --iso-8601=seconds)"
