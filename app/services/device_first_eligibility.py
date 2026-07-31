@@ -95,11 +95,9 @@ def device_options_for_subscription(tariff: Tariff, subscription: Subscription |
         raise DeviceFirstConfigurationError(
             f'device-first supports no more than {MAX_DEVICE_FIRST_DEVICE_LIMIT} devices'
         )
-    # A paid subscription can be extended onto a different tariff. Its current
-    # device limit is still the floor: device-first must never quietly turn an
-    # extension into a device-limit downgrade just because the previous tariff
-    # differs from the one currently offered.
-    #
+    # This helper keeps the current limit as a floor for same-tariff paid
+    # renewals.  Cross-tariff paid renewals are rejected earlier by
+    # ``tariff_eligibility`` and stay on the legacy tariff picker.
     # Paid users are grandfathered: the current limit remains selectable even
     # if an admin later removes it or lowers max_device_limit.
     allowed = {current}
@@ -130,6 +128,14 @@ def tariff_eligibility(
         return DeviceFirstEligibility(False, 'custom_traffic_tariff')
     if bool(getattr(tariff, 'is_free', False)):
         return DeviceFirstEligibility(False, 'free_tariff')
+    # Device-first v1 deliberately presents exactly one tariff.  A paid user
+    # who currently owns another tariff must therefore stay on the legacy
+    # picker: silently extending them onto the single displayed tariff would
+    # overwrite the subscription's tariff, traffic and squads after payment.
+    # A trial is different — paid purchase already converts it to the tariff
+    # chosen on the screen and the tariff name is shown before confirmation.
+    if subscription is not None and not subscription.is_trial and subscription.tariff_id != tariff.id:
+        return DeviceFirstEligibility(False, 'subscription_tariff_mismatch')
     periods = period_options(tariff)
     if not periods:
         return DeviceFirstEligibility(False, 'no_fixed_periods')
