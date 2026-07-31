@@ -1,10 +1,12 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
 from app.handlers.subscription.device_first import (
     _answer_stale,
+    _days_label,
+    _device_label,
     _device_page,
     _period_page,
     _render_checkout,
@@ -12,10 +14,12 @@ from app.handlers.subscription.device_first import (
     _render_error,
     arm,
     cancel,
+    change_selection,
     choose_devices,
     choose_period,
     confirm,
     pay,
+    show_device_first_entry,
 )
 from app.services.device_first_checkout_service import DeviceFirstError
 
@@ -59,7 +63,7 @@ async def test_period_page_is_first_and_keeps_origin_callback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_period_prices_are_clearly_marked_as_starting_prices_for_the_base_device() -> None:
+async def test_period_labels_are_compact_and_do_not_promise_a_price_before_device_selection() -> None:
     state = AsyncMock()
     callback = SimpleNamespace()
     options = {
@@ -98,18 +102,18 @@ async def test_period_prices_are_clearly_marked_as_starting_prices_for_the_base_
         )
 
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    assert keyboard[0][0].text == '30 дней · от 890.00 ₽'
-    assert keyboard[0][1].text == '1 год · от 8 490.00 ₽'
+    assert keyboard[0][0].text == '1 месяц'
+    assert keyboard[0][1].text == '1 год'
 
 
 @pytest.mark.asyncio
-async def test_device_page_uses_one_wide_choice_per_row_and_paginates() -> None:
+async def test_device_page_shows_all_ten_choices_on_one_screen_without_pagination() -> None:
     state = AsyncMock()
     callback = SimpleNamespace()
     options = {
         'tariff': {'name': 'Premium'},
         'period_options': [30],
-        'device_options': list(range(1, 9)),
+        'device_options': list(range(1, 11)),
     }
 
     with patch(
@@ -122,17 +126,66 @@ async def test_device_page_uses_one_wide_choice_per_row_and_paginates() -> None:
             state,
             options,
             view_id='view1234',
-            page=0,
             days=30,
             origin_callback='funnel_tariffs',
         )
 
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    assert all(len(row) == 1 for row in keyboard[:6])
+    assert [len(row) for row in keyboard] == [2, 2, 2, 2, 2, 1]
     assert keyboard[0][0].callback_data == 'df:d:view1234:1'
-    assert len(keyboard[6]) == 2
-    assert keyboard[6][-1].callback_data == 'df:p:view1234:1'
+    assert keyboard[4][1].callback_data == 'df:d:view1234:10'
+    assert keyboard[0][0].text == '1 device'
+    assert keyboard[0][1].text == '2 devices'
+    assert all(not button.callback_data.startswith('df:p:') for row in keyboard for button in row)
     assert keyboard[-1][0].callback_data == 'df:start'
+
+
+@pytest.mark.asyncio
+async def test_device_page_places_english_ruble_amount_before_the_number() -> None:
+    state = AsyncMock()
+    callback = SimpleNamespace()
+    options = {
+        'tariff': {'name': 'Premium'},
+        'period_options': [30],
+        'device_options': [1],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 1, 'price_kopeks': 30_000}]}],
+    }
+
+    with patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render:
+        await _device_page(
+            callback,
+            _user('en'),
+            state,
+            options,
+            view_id='view1234',
+            days=30,
+            origin_callback='back_to_menu',
+        )
+
+    assert render.await_args.kwargs['keyboard'].inline_keyboard[0][0].text == '1 device · ₽300'
+
+
+@pytest.mark.parametrize(
+    ('limit', 'label'),
+    [(1, '1 устройство'), (2, '2 устройства'), (5, '5 устройств'), (11, '11 устройств')],
+)
+def test_device_labels_use_correct_russian_plural_forms(limit: int, label: str) -> None:
+    assert _device_label(_user(), limit) == label
+
+
+@pytest.mark.parametrize(
+    ('language', 'days', 'label'),
+    [
+        ('ru', 1, '1 день'),
+        ('ru', 2, '2 дня'),
+        ('ru', 5, '5 дней'),
+        ('ru', 21, '21 день'),
+        ('en', 1, '1 day'),
+        ('en', 2, '2 days'),
+    ],
+)
+def test_day_labels_use_correct_russian_and_english_plural_forms(language: str, days: int, label: str) -> None:
+    assert _days_label(_user(language), days) == label
 
 
 @pytest.mark.asyncio
@@ -209,10 +262,10 @@ async def test_confirmation_contains_server_snapshot_contract() -> None:
 
     caption = render.await_args.kwargs['caption']
     assert 'Premium' in caption
-    assert '1 → 3' in caption
+    assert 'было 1 устройство → станет 3 устройства' in caption
     assert '29.08.2026' in caption
-    assert '1 500.00 ₽' in caption
-    assert '1 090.00 ₽' in caption
+    assert '1 500 ₽' in caption
+    assert '1 090 ₽' in caption
 
 
 @pytest.mark.asyncio
@@ -289,9 +342,10 @@ async def test_choose_devices_creates_owned_telegram_checkout_and_renders_confir
 async def test_confirm_reloads_owned_checkout_before_state_transition() -> None:
     callback = SimpleNamespace(data='df:c:owned-checkout', answer=AsyncMock())
     user = SimpleNamespace(id=17, language='ru', balance_kopeks=10000)
-    draft = SimpleNamespace(public_id='owned-checkout')
+    draft = SimpleNamespace(public_id='owned-checkout', lifecycle_state='draft')
     confirmed = SimpleNamespace(
         public_id='owned-checkout',
+        lifecycle_state='confirmed',
         quoted_price_kopeks=45000,
         max_price_kopeks=45000,
     )
@@ -321,6 +375,70 @@ async def test_confirm_reloads_owned_checkout_before_state_transition() -> None:
     transition.assert_awaited_once()
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert keyboard[0][0].callback_data == 'df:a:owned-checkout'
+
+
+@pytest.mark.asyncio
+async def test_confirm_stale_callback_renders_the_canonical_cancelled_state() -> None:
+    callback = SimpleNamespace(data='df:c:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=10_000)
+    cancelled = SimpleNamespace(public_id='owned-checkout', lifecycle_state='cancelled')
+
+    with (
+        patch('app.handlers.subscription.device_first.get_owned_checkout', AsyncMock(return_value=cancelled)),
+        patch('app.handlers.subscription.device_first.confirm_checkout', AsyncMock()) as transition,
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render_checkout,
+        patch('app.handlers.subscription.device_first._render_arm_confirmation', AsyncMock()) as render_arm,
+    ):
+        await confirm(callback, user, AsyncMock(), AsyncMock())
+
+    transition.assert_not_awaited()
+    render_checkout.assert_awaited_once()
+    render_arm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resuming_confirmed_checkout_renders_second_confirmation_actions() -> None:
+    callback = SimpleNamespace()
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=10_000)
+    checkout = SimpleNamespace(
+        public_id='owned-checkout',
+        quoted_price_kopeks=45_000,
+        max_price_kopeks=45_000,
+    )
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value={'ui_state': 'confirmation'},
+        ),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_checkout(callback, user, AsyncMock(), checkout)
+
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert 'Заказ подтверждён' in caption
+    assert keyboard[0][0].callback_data == 'df:a:owned-checkout'
+    assert keyboard[1][0].callback_data == 'df:e:owned-checkout'
+    assert keyboard[1][1].callback_data == 'df:x:owned-checkout'
+
+
+@pytest.mark.asyncio
+async def test_device_back_after_a_predeploy_state_returns_period_screen_to_the_main_menu() -> None:
+    callback = SimpleNamespace(data='df:start', answer=AsyncMock())
+    state = AsyncMock()
+    state.get_data.return_value = {'df_origin_callback': 'funnel_tariffs'}
+    user = SimpleNamespace(id=17, language='ru')
+    options = {'eligible': True, 'tariff': {'name': 'Premium'}, 'period_options': [30], 'device_options': [1]}
+
+    with (
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
+        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock(return_value=None)),
+        patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
+    ):
+        assert await show_device_first_entry(callback, user, AsyncMock(), state) is True
+
+    assert period_page.await_args.kwargs['origin_callback'] == 'back_to_menu'
 
 
 @pytest.mark.asyncio
@@ -373,8 +491,8 @@ async def test_arm_renders_exact_server_shortage_and_configuration() -> None:
     keyboard = output.await_args.kwargs['keyboard'].inline_keyboard
     assert '5 устройств' in caption
     assert '90 дней' in caption
-    assert '450.00 ₽' in caption
-    assert '350.00 ₽' in caption
+    assert '450 ₽' in caption
+    assert '350 ₽' in caption
     assert keyboard[-2][0].callback_data == 'df:s:owned-checkout'
 
 
@@ -412,10 +530,202 @@ async def test_awaiting_checkout_with_funded_balance_requires_explicit_continue(
 
 
 @pytest.mark.asyncio
-async def test_processing_checkout_shows_paid_message_without_cancel_button() -> None:
+async def test_awaiting_checkout_without_payment_methods_explains_the_safe_recovery_actions() -> None:
+    callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=10_000)
+    checkout = SimpleNamespace(
+        public_id='owned-checkout',
+        selected_device_limit=5,
+        period_days=90,
+        quoted_price_kopeks=45_000,
+    )
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value={'ui_state': 'awaiting_payment', 'shortage_kopeks': 35_000},
+        ),
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[]),
+        ),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output,
+    ):
+        await _render_checkout(callback, user, AsyncMock(), checkout)
+
+    caption = output.await_args.kwargs['caption']
+    keyboard = output.await_args.kwargs['keyboard'].inline_keyboard
+    callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
+    assert 'Пополнение сейчас недоступно' in caption
+    assert 'Выберите способ доплаты' not in caption
+    assert 'df:s:owned-checkout' in callbacks
+    assert 'menu_support' in callbacks
+    assert 'df:e:owned-checkout' in callbacks
+    assert 'df:x:owned-checkout' in callbacks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('language', 'expected_method'),
+    [('ru', 'Карта российского банка'), ('en', 'Russian bank card')],
+)
+async def test_pending_invoice_uses_a_localized_method_name_and_blocks_second_method(
+    language: str, expected_method: str
+) -> None:
+    callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language=language, balance_kopeks=0)
+    checkout = SimpleNamespace(
+        id=101,
+        public_id='owned-checkout',
+        selected_device_limit=5,
+        period_days=90,
+        quoted_price_kopeks=45000,
+    )
+    attempt = SimpleNamespace(
+        status='pending',
+        method_key='cards_ru',
+        requested_amount_kopeks=35000,
+        redirect_url='https://pay.example/invoice',
+    )
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value={'ui_state': 'awaiting_payment', 'shortage_kopeks': 35000},
+        ),
+        patch(
+            'app.handlers.subscription.device_first.get_pending_platega_attempt',
+            AsyncMock(return_value=attempt),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(),
+        ) as methods,
+        patch(
+            'app.handlers.subscription.device_first.edit_or_answer_photo',
+            AsyncMock(),
+        ) as output,
+    ):
+        await _render_checkout(callback, user, AsyncMock(), checkout)
+
+    caption = output.await_args.kwargs['caption']
+    keyboard = output.await_args.kwargs['keyboard'].inline_keyboard
+    assert expected_method in caption
+    assert 'cards_ru' not in caption
+    assert keyboard[0][0].url == 'https://pay.example/invoice'
+    assert keyboard[1][0].callback_data == 'df:s:owned-checkout'
+    assert keyboard[2][0].callback_data == 'df:x:owned-checkout'
+    methods.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_invoice_without_a_payment_url_offers_status_support_and_cancel() -> None:
+    callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='en', balance_kopeks=0)
+    checkout = SimpleNamespace(
+        id=101,
+        public_id='owned-checkout',
+        selected_device_limit=5,
+        period_days=90,
+        quoted_price_kopeks=45_000,
+    )
+    attempt = SimpleNamespace(
+        status='pending',
+        method_key='sbp',
+        requested_amount_kopeks=35_000,
+        redirect_url=None,
+    )
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value={'ui_state': 'awaiting_payment', 'shortage_kopeks': 35_000},
+        ),
+        patch('app.handlers.subscription.device_first.get_pending_platega_attempt', AsyncMock(return_value=attempt)),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output,
+    ):
+        await _render_checkout(callback, user, AsyncMock(), checkout)
+
+    caption = output.await_args.kwargs['caption']
+    keyboard = output.await_args.kwargs['keyboard'].inline_keyboard
+    callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
+    assert 'Checking the invoice' in caption
+    assert 'df:s:owned-checkout' in callbacks
+    assert 'menu_support' in callbacks
+    assert 'df:x:owned-checkout' in callbacks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('ui_state', 'caption_fragment', 'expected_callback'),
+    [
+        ('cancelled', 'Заказ отменён', 'df:start'),
+        ('expired', 'Нужен новый расчёт', 'df:start'),
+        ('reprice_required', 'Нужен новый расчёт', 'df:start'),
+        ('conflict', 'Заказ нельзя продолжить', 'df:start'),
+        ('failed', 'Не удалось завершить заказ', 'menu_support'),
+    ],
+)
+async def test_terminal_checkout_states_have_honest_recovery_messages(
+    ui_state: str, caption_fragment: str, expected_callback: str
+) -> None:
     callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
     user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
     checkout = SimpleNamespace(public_id='owned-checkout')
+
+    with (
+        patch('app.handlers.subscription.device_first.serialize_checkout', return_value={'ui_state': ui_state}),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output,
+    ):
+        await _render_checkout(callback, user, AsyncMock(), checkout)
+
+    caption = output.await_args.kwargs['caption']
+    callbacks = [
+        button.callback_data
+        for row in output.await_args.kwargs['keyboard'].inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    assert caption_fragment in caption
+    assert expected_callback in callbacks
+    assert 'Расчёт изменился' not in caption
+
+
+@pytest.mark.asyncio
+async def test_change_selection_does_not_cancel_an_order_with_a_pending_invoice() -> None:
+    callback = SimpleNamespace(data='df:e:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    checkout = SimpleNamespace(id=101, public_id='owned-checkout')
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.get_owned_checkout',
+            AsyncMock(return_value=checkout),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.get_pending_platega_attempt',
+            AsyncMock(return_value=SimpleNamespace(status='pending')),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.cancel_checkout',
+            AsyncMock(),
+        ) as cancel_checkout,
+        patch(
+            'app.handlers.subscription.device_first._render_checkout',
+            AsyncMock(),
+        ) as render_checkout,
+    ):
+        await change_selection(callback, user, AsyncMock(), AsyncMock())
+
+    cancel_checkout.assert_not_awaited()
+    render_checkout.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_processing_checkout_shows_paid_message_without_cancel_button() -> None:
+    callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    checkout = SimpleNamespace(public_id='owned-checkout', id=101)
 
     with (
         patch(
@@ -457,6 +767,10 @@ async def test_cancel_after_credit_rerenders_processing_instead_of_claiming_canc
             AsyncMock(side_effect=invalid_state),
         ),
         patch(
+            'app.handlers.subscription.device_first.get_pending_platega_attempt',
+            AsyncMock(return_value=None),
+        ),
+        patch(
             'app.handlers.subscription.device_first._render_checkout',
             AsyncMock(),
         ) as render_checkout,
@@ -473,10 +787,11 @@ async def test_cancel_after_credit_rerenders_processing_instead_of_claiming_canc
 
 
 @pytest.mark.asyncio
-async def test_pay_binds_method_checkout_and_owner_then_renders_provider_url() -> None:
+async def test_pay_binds_method_checkout_and_owner_then_renders_the_canonical_invoice_state() -> None:
     callback = SimpleNamespace(data='df:y:sbp:owned-checkout', answer=AsyncMock())
     user = SimpleNamespace(id=17, language='ru')
     attempt = SimpleNamespace(redirect_url='https://pay.example/invoice')
+    checkout = SimpleNamespace(public_id='owned-checkout')
 
     with (
         patch(
@@ -484,10 +799,15 @@ async def test_pay_binds_method_checkout_and_owner_then_renders_provider_url() -
             AsyncMock(return_value=attempt),
         ) as create,
         patch(
-            'app.handlers.subscription.device_first.edit_or_answer_photo',
+            'app.handlers.subscription.device_first.get_owned_checkout',
+            AsyncMock(),
+        ) as get_owned,
+        patch(
+            'app.handlers.subscription.device_first._render_checkout',
             AsyncMock(),
         ) as render,
     ):
+        get_owned.return_value = checkout
         await pay(callback, user, AsyncMock(), AsyncMock())
 
     create.assert_awaited_once()
@@ -496,9 +816,8 @@ async def test_pay_binds_method_checkout_and_owner_then_renders_provider_url() -
         'user_id': 17,
         'method_key': 'sbp',
     }
-    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    assert keyboard[0][0].url == 'https://pay.example/invoice'
-    assert keyboard[1][0].callback_data == 'df:s:owned-checkout'
+    get_owned.assert_awaited_once_with(ANY, public_id='owned-checkout', user_id=17)
+    render.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -44,6 +44,37 @@ PLATEGA_METHODS = {
     'crypto': 13,
 }
 logger = structlog.get_logger(__name__)
+PENDING_ATTEMPT_STATUSES = frozenset({'creating', 'pending', 'paid_processing', 'reconciliation'})
+
+
+def platega_method_label(method_key: str, *, language: str) -> str:
+    """Return a person-facing label; provider keys are never Telegram UI text."""
+    labels = {
+        'sbp': ('СБП', 'SBP'),
+        'cards_ru': ('Карта российского банка', 'Russian bank card'),
+        'crypto': ('Криптовалюта', 'Cryptocurrency'),
+    }
+    russian, english = labels.get(method_key, ('Способ оплаты', 'Payment method'))
+    return english if language == 'en' else russian
+
+
+async def get_pending_platega_attempt(
+    db: AsyncSession,
+    *,
+    checkout_id: int,
+) -> CheckoutPaymentAttempt | None:
+    """Return the newest unresolved invoice, if it blocks creating another one."""
+    return (
+        await db.execute(
+            select(CheckoutPaymentAttempt)
+            .where(
+                CheckoutPaymentAttempt.checkout_id == checkout_id,
+                CheckoutPaymentAttempt.status.in_(PENDING_ATTEMPT_STATUSES),
+            )
+            .order_by(CheckoutPaymentAttempt.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
 
 
 def _checkout_return_url(checkout_public_id: str, *, failed: bool = False) -> str | None:
@@ -126,14 +157,7 @@ async def create_platega_attempt(
     )
     if checkout.lifecycle_state not in {'awaiting_funds', 'armed'} or checkout.armed_at is None:
         raise DeviceFirstError('invalid_state', 'Checkout is not ready for a payment attempt')
-    existing = (
-        await db.execute(
-            select(CheckoutPaymentAttempt).where(
-                CheckoutPaymentAttempt.checkout_id == checkout.id,
-                CheckoutPaymentAttempt.status.in_(['creating', 'pending', 'paid_processing', 'reconciliation']),
-            )
-        )
-    ).scalar_one_or_none()
+    existing = await get_pending_platega_attempt(db, checkout_id=checkout.id)
     if existing:
         if existing.status in {'creating', 'reconciliation'}:
             raise DeviceFirstError(

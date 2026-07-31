@@ -34,8 +34,9 @@ def tariff(**overrides):
         ([], 'non-empty'),
         ([2, 2], 'unique'),
         ([3, 2], 'strictly increasing'),
-        ([1, 3], 'include'),
+        ([1, 2], 'below'),
         ([2, 6], 'max_device_limit'),
+        ([2, 11], 'no more than 10'),
     ],
 )
 def test_device_option_contract_rejects_invalid_admin_values(raw, message):
@@ -99,3 +100,11 @@ def test_current_limit_plus_configured_higher_options_are_offered():
 def test_paid_subscription_on_another_tariff_cannot_decrease_devices_during_extension():
     current = SimpleNamespace(tariff_id=99, is_trial=False, device_limit=4)
     assert device_options_for_subscription(tariff(), current) == (4, 5)
+
+
+def test_paid_subscription_above_the_telegram_contract_uses_the_legacy_flow():
+    current = SimpleNamespace(tariff_id=7, is_trial=False, device_limit=11)
+    with pytest.raises(DeviceFirstConfigurationError, match='no more than 10'):
+        device_options_for_subscription(
+            tariff(device_limit=1, max_device_limit=10, device_purchase_options=list(range(1, 11))), current
+        )
