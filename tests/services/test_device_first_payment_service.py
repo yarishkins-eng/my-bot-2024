@@ -355,8 +355,10 @@ async def test_normal_direct_commit_does_not_recreate_a_missing_pre_attempt_invo
 
 @pytest.mark.asyncio
 async def test_direct_post_paid_provider_reversal_stays_in_operator_review():
+    user = SimpleNamespace(id=7)
     payment = SimpleNamespace(
         id=51,
+        user_id=7,
         is_paid=True,
         status='CONFIRMED',
         metadata_json={'device_first_attempt_id': 41, 'settlement_mode': 'direct_purchase_v2'},
@@ -370,7 +372,7 @@ async def test_direct_post_paid_provider_reversal_stays_in_operator_review():
             return iter([outbox])
 
     db = SimpleNamespace(
-        execute=AsyncMock(side_effect=[Result(attempt), Result(checkout), OutboxResult()]),
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), OutboxResult()]),
         commit=AsyncMock(),
     )
 

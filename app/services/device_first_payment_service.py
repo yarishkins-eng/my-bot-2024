@@ -174,7 +174,10 @@ async def create_platega_attempt(
         db,
         public_id=checkout_public_id,
         user_id=user_id,
-        for_update=True,
+        # Direct v2 takes its canonical user → checkout lock inside
+        # ``prepare_direct_external_checkout``.  Do not pre-lock the checkout
+        # here or a concurrent provider reversal could invert that order.
+        for_update=False,
     )
     if settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE:
         return await _create_direct_platega_attempt(
@@ -186,6 +189,12 @@ async def create_platega_attempt(
             was_financially_committed=checkout.financial_committed_at is not None,
             allow_pre_attempt_recovery=allow_direct_pre_attempt_recovery,
         )
+    checkout = await get_owned_checkout(
+        db,
+        public_id=checkout_public_id,
+        user_id=user_id,
+        for_update=True,
+    )
     if checkout.lifecycle_state not in {'awaiting_funds', 'armed'} or checkout.armed_at is None:
         raise DeviceFirstError('invalid_state', 'Checkout is not ready for a payment attempt')
     # An exact provider payment moves the checkout into fulfillment before the
@@ -445,6 +454,7 @@ async def _create_direct_platega_attempt(
     # The URL is stored only in the existing protected provider-payment record;
     # response metadata and the direct attempt deliberately never retain it.
     payment.redirect_url = redirect_url
+    payment.expires_at = PlategaService.parse_expires_at(response.get('expiresIn'))
     if returned_amount != payable or returned_currency != 'RUB':
         attempt.status = 'provider_invoice_mismatch'
         attempt.reconciliation_reason = 'provider_invoice_mismatch'
@@ -749,6 +759,11 @@ async def _settle_direct_platega_payment_locked(
         method_ok = method_raw is not None and int(method_raw) == attempt.provider_method_code
     except (TypeError, ValueError):
         method_ok = False
+    # Use the same per-user lock as direct checkout creation/final commit
+    # before this callback can write an operator hold.  This prevents an old
+    # provider contradiction from racing a newer direct draft into payment.
+    if payment.user_id is not None:
+        await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
     checkout = (
         await db.execute(
             select(SubscriptionCheckout).where(SubscriptionCheckout.id == attempt.checkout_id).with_for_update()
@@ -953,6 +968,11 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                         .with_for_update()
                     )
                 ).scalar_one_or_none()
+                checkout_owner_id = await db.scalar(
+                    select(SubscriptionCheckout.user_id).where(SubscriptionCheckout.id == owned_attempt.checkout_id)
+                )
+                if checkout_owner_id is not None:
+                    await db.execute(select(User).where(User.id == checkout_owner_id).with_for_update())
                 checkout = (
                     await db.execute(
                         select(SubscriptionCheckout)

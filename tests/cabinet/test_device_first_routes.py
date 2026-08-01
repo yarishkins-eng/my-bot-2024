@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -210,9 +211,21 @@ async def test_pending_payment_never_offers_resume_for_direct_operator_review() 
 @pytest.mark.asyncio
 async def test_direct_redirect_replay_is_rehydrated_from_owned_provider_payment_not_mutation_json() -> None:
     user = SimpleNamespace(id=17)
-    checkout = SimpleNamespace(id=91, settlement_mode='direct_purchase_v2')
-    attempt = SimpleNamespace(platega_payment_id=51)
-    payment = SimpleNamespace(redirect_url='https://pay.example/live')
+    checkout = SimpleNamespace(
+        id=91,
+        settlement_mode='direct_purchase_v2',
+        lifecycle_state='awaiting_funds',
+        funding_state='invoice_pending',
+        fulfillment_state='not_started',
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    attempt = SimpleNamespace(platega_payment_id=51, status='pending')
+    payment = SimpleNamespace(
+        redirect_url='https://pay.example/live',
+        status='PENDING',
+        is_paid=False,
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
     result = SimpleNamespace(scalar_one_or_none=lambda: attempt)
     db = SimpleNamespace(execute=AsyncMock(return_value=result), get=AsyncMock(return_value=payment))
     stored_response = {'checkout': {'id': 'owned-checkout'}, 'redirect_url': 'https://pay.example/stale'}
@@ -222,6 +235,38 @@ async def test_direct_redirect_replay_is_rehydrated_from_owned_provider_payment_
 
     assert response == {'checkout': {'id': 'owned-checkout'}, 'redirect_url': 'https://pay.example/live'}
     assert stored_response['redirect_url'] == 'https://pay.example/stale'
+
+
+@pytest.mark.asyncio
+async def test_failed_direct_invoice_never_rehydrates_or_reappears_in_pending_payment() -> None:
+    user = SimpleNamespace(id=17)
+    checkout = SimpleNamespace(
+        id=91,
+        settlement_mode='direct_purchase_v2',
+        lifecycle_state='awaiting_funds',
+        funding_state='invoice_pending',
+        fulfillment_state='not_started',
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    attempt = SimpleNamespace(platega_payment_id=51, status='pending')
+    # A failed webhook can arrive before the attempt reconciler writes its
+    # terminal state. The protected provider state wins over that stale row.
+    payment = SimpleNamespace(
+        redirect_url='https://pay.example/failed',
+        status='FAILED',
+        is_paid=False,
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    result = SimpleNamespace(scalar_one_or_none=lambda: attempt)
+    db = SimpleNamespace(execute=AsyncMock(return_value=result), get=AsyncMock(return_value=payment))
+    stored_response = {'checkout': {'id': 'owned-checkout'}, 'redirect_url': 'https://pay.example/stale'}
+
+    with patch('app.cabinet.routes.device_first.get_owned_checkout', AsyncMock(return_value=checkout)):
+        replay = await _rehydrate_owned_direct_redirect(db, user=user, stored_response=stored_response)
+        pending = await checkout_pending_payment('owned-checkout', user=user, db=db)
+
+    assert replay == {'checkout': {'id': 'owned-checkout'}}
+    assert pending == {'redirect_url': None, 'status': 'pending', 'resume_allowed': False}
 
 
 @pytest.mark.asyncio

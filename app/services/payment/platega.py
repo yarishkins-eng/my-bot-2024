@@ -17,6 +17,7 @@ from app.database.models import (
     PaymentMethod,
     SubscriptionCheckout,
     TransactionType,
+    User,
 )
 from app.services.platega_service import PlategaService
 from app.utils.payment_logger import payment_logger as logger
@@ -53,6 +54,13 @@ class PlategaPaymentMixin:
         metadata = getattr(payment, 'metadata_json', None) or {}
         attempt_id = metadata.get('device_first_attempt_id')
         reason = f'post_paid_provider_terminal:{provider_status.lower()}'
+        # Direct sale creation/final commit lock this row first.  Taking the
+        # same per-user lock before the old checkout becomes operator_review
+        # makes the fence serializable: a later draft cannot race through to a
+        # provider POST or a wallet debit behind a contradictory callback.
+        payment_user_id = getattr(payment, 'user_id', None)
+        if payment_user_id is not None:
+            await db.execute(select(User).where(User.id == payment_user_id).with_for_update())
         attempt = None
         if isinstance(attempt_id, int):
             attempt = (
