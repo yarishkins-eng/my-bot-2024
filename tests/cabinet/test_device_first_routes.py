@@ -5,9 +5,12 @@ import pytest
 from fastapi import HTTPException
 
 from app.cabinet.routes.device_first import (
+    CheckoutCommitRequest,
     PaymentAttemptRequest,
     _checkout_command,
     _mutation,
+    _rehydrate_owned_direct_redirect,
+    checkout_commit,
     checkout_get,
     checkout_open,
     checkout_pending_payment,
@@ -202,3 +205,52 @@ async def test_pending_payment_never_offers_resume_for_direct_operator_review() 
         response = await checkout_pending_payment('checkout-91', user=user, db=db)
 
     assert response == {'redirect_url': None, 'status': 'missing', 'resume_allowed': False}
+
+
+@pytest.mark.asyncio
+async def test_direct_redirect_replay_is_rehydrated_from_owned_provider_payment_not_mutation_json() -> None:
+    user = SimpleNamespace(id=17)
+    checkout = SimpleNamespace(id=91, settlement_mode='direct_purchase_v2')
+    attempt = SimpleNamespace(platega_payment_id=51)
+    payment = SimpleNamespace(redirect_url='https://pay.example/live')
+    result = SimpleNamespace(scalar_one_or_none=lambda: attempt)
+    db = SimpleNamespace(execute=AsyncMock(return_value=result), get=AsyncMock(return_value=payment))
+    stored_response = {'checkout': {'id': 'owned-checkout'}, 'redirect_url': 'https://pay.example/stale'}
+
+    with patch('app.cabinet.routes.device_first.get_owned_checkout', AsyncMock(return_value=checkout)):
+        response = await _rehydrate_owned_direct_redirect(db, user=user, stored_response=stored_response)
+
+    assert response == {'checkout': {'id': 'owned-checkout'}, 'redirect_url': 'https://pay.example/live'}
+    assert stored_response['redirect_url'] == 'https://pay.example/stale'
+
+
+@pytest.mark.asyncio
+async def test_direct_commit_stores_a_redacted_idempotency_response() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    checkout = SimpleNamespace(id=91, settlement_mode='direct_purchase_v2')
+    attempt = SimpleNamespace(platega_payment_id=51)
+    payment = SimpleNamespace(redirect_url='https://pay.example/live')
+    db = SimpleNamespace(get=AsyncMock(return_value=payment))
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch(
+            'app.cabinet.routes.device_first.get_owned_checkout',
+            AsyncMock(side_effect=[checkout, checkout]),
+        ),
+        patch('app.cabinet.routes.device_first.create_platega_attempt', AsyncMock(return_value=attempt)),
+        patch('app.cabinet.routes.device_first.serialize_checkout', return_value={'id': 'owned-checkout'}),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
+    ):
+        response = await checkout_commit(
+            'owned-checkout',
+            CheckoutCommitRequest(funding_mode='platega', method_key='sbp'),
+            idempotency_key='commit-redacted',
+            user=user,
+            db=db,
+        )
+
+    assert response == {'checkout': {'id': 'owned-checkout'}, 'redirect_url': 'https://pay.example/live'}
+    assert store.await_args.kwargs['response'] == {'checkout': {'id': 'owned-checkout'}}

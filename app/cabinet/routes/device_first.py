@@ -135,6 +135,51 @@ async def _rate_limit(user_id: int, action: str, *, limit: int = 10) -> None:
         raise HTTPException(status_code=429, detail={'code': 'rate_limited', 'message': 'Too many requests'})
 
 
+def _redact_mutation_response(response: dict[str, Any]) -> dict[str, Any]:
+    """Keep redirect URLs out of generic idempotency JSON storage."""
+    return {key: value for key, value in response.items() if key != 'redirect_url'}
+
+
+async def _rehydrate_owned_direct_redirect(
+    db: AsyncSession,
+    *,
+    user: User,
+    stored_response: dict[str, Any],
+) -> dict[str, Any]:
+    """Read a current provider URL only for the same owned direct checkout.
+
+    Mutation storage contains a redacted checkout snapshot.  A replay may
+    obtain a redirect only from the protected ``PlategaPayment`` record, never
+    from generic JSON that could be retained in logs, backups or admin views.
+    """
+    response = _redact_mutation_response(stored_response)
+    checkout_payload = response.get('checkout')
+    checkout_id = checkout_payload.get('id') if isinstance(checkout_payload, dict) else None
+    if not isinstance(checkout_id, str):
+        return response
+    checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
+    if checkout.settlement_mode != DIRECT_SETTLEMENT_MODE:
+        return response
+    attempt = (
+        await db.execute(
+            select(CheckoutPaymentAttempt)
+            .where(
+                CheckoutPaymentAttempt.checkout_id == checkout.id,
+                CheckoutPaymentAttempt.status.in_(['pending', 'reconciliation']),
+                CheckoutPaymentAttempt.platega_payment_id.is_not(None),
+            )
+            .order_by(CheckoutPaymentAttempt.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if attempt is None:
+        return response
+    payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+    if payment is None or not payment.redirect_url:
+        return response
+    return {**response, 'redirect_url': payment.redirect_url}
+
+
 @router.get('/purchase-options')
 async def purchase_options(
     user: User = Depends(get_current_cabinet_user),
@@ -333,7 +378,7 @@ async def checkout_commit(
         payload={'checkout_id': checkout_id, **request.model_dump()},
     )
     if replay is not None:
-        return replay
+        return await _rehydrate_owned_direct_redirect(db, user=user, stored_response=replay)
     try:
         checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
         if checkout.settlement_mode != DIRECT_SETTLEMENT_MODE:
@@ -372,7 +417,7 @@ async def checkout_commit(
             status_code=error.status_code,
         )
         _raise(error)
-    await store_mutation_result(db, mutation, response=response)
+    await store_mutation_result(db, mutation, response=_redact_mutation_response(response))
     return response
 
 
@@ -393,7 +438,7 @@ async def checkout_resume_invoice(
         payload={'checkout_id': checkout_id, **request.model_dump()},
     )
     if replay is not None:
-        return replay
+        return await _rehydrate_owned_direct_redirect(db, user=user, stored_response=replay)
     try:
         checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
         if (
@@ -438,7 +483,7 @@ async def checkout_resume_invoice(
             status_code=error.status_code,
         )
         _raise(error)
-    await store_mutation_result(db, mutation, response=response)
+    await store_mutation_result(db, mutation, response=_redact_mutation_response(response))
     return response
 
 

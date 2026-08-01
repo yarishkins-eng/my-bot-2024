@@ -274,7 +274,10 @@ async def test_exact_paid_checkout_remains_resumable_after_the_general_timeout()
 @pytest.mark.asyncio
 async def test_new_quote_does_not_bulk_expire_an_exact_paid_checkout_waiting_for_fulfillment(monkeypatch):
     user = SimpleNamespace(id=7, restriction_subscription=False)
-    db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock())
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[SimpleNamespace(), SimpleNamespace(scalar_one_or_none=lambda: None)]),
+        commit=AsyncMock(),
+    )
     monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
     monkeypatch.setattr(
         service,
@@ -292,11 +295,36 @@ async def test_new_quote_does_not_bulk_expire_an_exact_paid_checkout_waiting_for
         )
 
     assert raised.value.code == 'legacy_only'
-    statement = str(db.execute.await_args.args[0].compile(compile_kwargs={'literal_binds': True}))
+    statement = str(db.execute.await_args_list[0].args[0].compile(compile_kwargs={'literal_binds': True}))
     assert (
         "NOT (subscription_checkouts.fulfillment_state = 'in_progress' "
         "AND subscription_checkouts.quote_state = 'committed')"
     ) in statement
+
+
+@pytest.mark.asyncio
+async def test_new_direct_quote_is_blocked_while_a_paid_order_needs_operator_review(monkeypatch):
+    user = SimpleNamespace(id=7, restriction_subscription=False)
+    operator_hold = SimpleNamespace(id=91)
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[SimpleNamespace(), SimpleNamespace(scalar_one_or_none=lambda: operator_hold)]),
+        commit=AsyncMock(),
+    )
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+    build_options = AsyncMock()
+    monkeypatch.setattr(service, 'build_purchase_options', build_options)
+
+    with pytest.raises(service.DeviceFirstError) as raised:
+        await service.create_checkout(
+            db,
+            user=user,
+            period_days=30,
+            selected_device_limit=2,
+            source='cabinet',
+        )
+
+    assert raised.value.code == 'operator_review_required'
+    build_options.assert_not_awaited()
 
 
 def test_credited_armed_checkout_is_serialized_as_processing():
@@ -449,7 +477,11 @@ async def test_verified_exact_payment_keeps_its_quote_while_the_outbox_finishes(
 @pytest.mark.asyncio
 async def test_create_rejects_a_direct_cross_tariff_device_downgrade_before_creating_a_checkout(monkeypatch):
     user = SimpleNamespace(id=7, restriction_subscription=False)
-    db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock(), get=AsyncMock())
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[SimpleNamespace(), SimpleNamespace(scalar_one_or_none=lambda: None)]),
+        commit=AsyncMock(),
+        get=AsyncMock(),
+    )
     monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
     monkeypatch.setattr(
         service,

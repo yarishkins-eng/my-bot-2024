@@ -16,6 +16,7 @@ from app.services.device_first_payment_service import (
     _verified_amount,
     available_platega_methods,
     create_platega_attempt,
+    reconcile_device_first_payments,
     settle_device_first_platega_payment,
 )
 from app.services.payment.platega import PlategaPaymentMixin
@@ -385,6 +386,48 @@ async def test_direct_post_paid_provider_reversal_stays_in_operator_review():
     assert checkout.lifecycle_state == 'operator_review'
     assert outbox.status == 'operator_review'
     db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_direct_reconciler_fences_a_post_paid_provider_terminal_for_operator_review(monkeypatch):
+    attempt = SimpleNamespace(
+        id=41,
+        checkout_id=9,
+        settlement_mode='direct_purchase_v2',
+        status='pending',
+        lease_epoch=3,
+        provider_payment_id='provider-1',
+        platega_payment_id=51,
+        reconcile_attempts=0,
+    )
+    payment = SimpleNamespace(id=51, is_paid=True)
+
+    class AttemptsResult:
+        def scalars(self):
+            return SimpleNamespace(all=lambda: [attempt])
+
+    provider = SimpleNamespace(get_transaction=AsyncMock(return_value={'status': 'CANCELED'}))
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[AttemptsResult(), SimpleNamespace(rowcount=1), Result(payment)]),
+        get=AsyncMock(side_effect=[attempt, payment]),
+        commit=AsyncMock(),
+    )
+    fence = AsyncMock()
+    monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', lambda: provider)
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._lock_owned_direct_attempt_lease',
+        AsyncMock(side_effect=[attempt, attempt]),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._release_direct_attempt_lease',
+        AsyncMock(),
+    )
+    monkeypatch.setattr('app.services.payment.platega.PlategaPaymentMixin._mark_direct_post_paid_reversal', fence)
+
+    processed = await reconcile_device_first_payments(db)
+
+    assert processed == 0
+    fence.assert_awaited_once_with(db, payment=payment, provider_status='CANCELED')
 
 
 class Result:

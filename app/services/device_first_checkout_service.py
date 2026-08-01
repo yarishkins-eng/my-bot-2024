@@ -357,11 +357,18 @@ async def get_open_checkout_for_user(
     ).scalar_one_or_none()
     if checkout is None:
         return None
-    if not (
+    direct_paid_recovery = (
         settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE
         and checkout.lifecycle_state == 'fulfilling'
         and checkout.fulfillment_state == 'fulfilled'
-    ) and checkout.expires_at <= datetime.now(UTC):
+    )
+    # An operator hold after direct payment is a durable owner-facing recovery
+    # record, not an expirable quote.  Hiding it would let a restarted client
+    # start another order while the original money still needs reconciliation.
+    direct_operator_hold = (
+        settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE and checkout.lifecycle_state == 'operator_review'
+    )
+    if not (direct_paid_recovery or direct_operator_hold) and checkout.expires_at <= datetime.now(UTC):
         checkout.lifecycle_state = 'expired'
         checkout.terminal_reason = 'checkout_expired'
         checkout.quote_state = 'expired'
@@ -483,6 +490,23 @@ async def create_checkout(
         )
     )
     await db.commit()
+
+    operator_hold = (
+        await db.execute(
+            select(SubscriptionCheckout.id)
+            .where(
+                SubscriptionCheckout.user_id == user.id,
+                SubscriptionCheckout.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                SubscriptionCheckout.lifecycle_state == 'operator_review',
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if operator_hold is not None:
+        raise DeviceFirstError(
+            'operator_review_required',
+            'An earlier direct payment requires operator review before a new checkout',
+        )
 
     options = await build_purchase_options(db, user)
     if not options.get('eligible'):
