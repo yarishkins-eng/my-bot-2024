@@ -22,6 +22,7 @@ from app.services.ban_notification_service import ban_notification_service
 from app.services.broadcast_service import broadcast_service
 from app.services.contest_rotation_service import contest_rotation_service
 from app.services.daily_subscription_service import daily_subscription_service
+from app.services.device_first_recovery_service import device_first_recovery_service
 from app.services.log_rotation_service import log_rotation_service
 from app.services.maintenance_service import maintenance_service
 from app.services.monitoring_service import monitoring_service
@@ -170,6 +171,7 @@ async def main():
 
     web_app = None
     monitoring_task = None
+    device_first_recovery_task = None
     maintenance_task = None
     version_check_task = None
     traffic_monitoring_task = None
@@ -625,6 +627,14 @@ async def main():
             stage.log(f'Интервал опроса: {settings.MONITORING_INTERVAL}с')
 
         async with timeline.stage(
+            'Device-First recovery',
+            '💳',
+            success_message='Device-First recovery запущен',
+        ) as stage:
+            device_first_recovery_task = asyncio.create_task(device_first_recovery_service.start(bot=bot))
+            stage.log(f'Интервал direct-sale recovery: {settings.get_device_first_recovery_worker_interval_seconds()}с')
+
+        async with timeline.stage(
             'Служба техработ',
             '🛡️',
             success_message='Служба техработ запущена',
@@ -776,6 +786,12 @@ async def main():
                         logger.error('Служба мониторинга завершилась с ошибкой', error=exception)
                         monitoring_task = asyncio.create_task(monitoring_service.start_monitoring())
 
+                if device_first_recovery_task and device_first_recovery_task.done():
+                    exception = device_first_recovery_task.exception()
+                    if exception:
+                        logger.error('Device-First recovery завершился с ошибкой', error=exception)
+                        device_first_recovery_task = asyncio.create_task(device_first_recovery_service.start(bot=bot))
+
                 if maintenance_task and maintenance_task.done():
                     exception = maintenance_task.exception()
                     if exception:
@@ -851,6 +867,15 @@ async def main():
             monitoring_task.cancel()
             try:
                 await monitoring_task
+            except asyncio.CancelledError:
+                pass
+
+        if device_first_recovery_task and not device_first_recovery_task.done():
+            logger.info('ℹ️ Остановка Device-First recovery...')
+            device_first_recovery_service.stop()
+            device_first_recovery_task.cancel()
+            try:
+                await device_first_recovery_task
             except asyncio.CancelledError:
                 pass
 
