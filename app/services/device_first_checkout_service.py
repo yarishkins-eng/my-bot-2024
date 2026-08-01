@@ -191,9 +191,17 @@ async def get_owned_checkout(
     if checkout is None:
         # Deliberately hide whether a foreign checkout exists.
         raise DeviceFirstError('not_found', 'Checkout not found', status_code=404)
+    # An exact provider payment is already committed before its fulfilment
+    # worker runs.  Its checkout must outlive the general UI timeout so a
+    # delayed worker cannot strand accepted money behind an expired quote.
+    fulfillment_committed = (
+        getattr(checkout, 'fulfillment_state', 'not_started') == 'in_progress'
+        and getattr(checkout, 'quote_state', None) == 'committed'
+    )
     if (
         checkout.lifecycle_state in OPEN_STATES
         and checkout.fulfillment_state != 'fulfilled'
+        and not fulfillment_committed
         and checkout.expires_at <= datetime.now(UTC)
     ):
         checkout.lifecycle_state = 'expired'
@@ -367,6 +375,10 @@ async def create_checkout(
             SubscriptionCheckout.lifecycle_state.in_(OPEN_STATES),
             SubscriptionCheckout.fulfillment_state != 'fulfilled',
             SubscriptionCheckout.expires_at <= now,
+            ~and_(
+                SubscriptionCheckout.fulfillment_state == 'in_progress',
+                SubscriptionCheckout.quote_state == 'committed',
+            ),
         )
         .values(
             lifecycle_state='expired',
