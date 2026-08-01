@@ -10,19 +10,24 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.crud.rbac import AuditLogCRUD
 from app.database.models import (
     CheckoutPaymentAttempt,
     DeviceFirstMutation,
     DeviceFirstOutbox,
+    DeviceFirstReconciliationCredit,
+    PlategaPayment,
     SubscriptionCheckout,
     Transaction,
     User,
 )
 from app.services.device_first_checkout_service import (
+    DIRECT_SETTLEMENT_MODE,
     DeviceFirstError,
     arm_checkout,
     build_purchase_options,
     cancel_checkout,
+    commit_direct_wallet_checkout,
     confirm_checkout,
     create_checkout,
     fulfill_checkout,
@@ -51,6 +56,19 @@ class CheckoutCreateRequest(BaseModel):
 
 class PaymentAttemptRequest(BaseModel):
     method_key: str = Field(..., min_length=1, max_length=32)
+
+
+class CheckoutCommitRequest(BaseModel):
+    """One explicit v2 funding choice; mixed funding is intentionally absent."""
+
+    funding_mode: str = Field(..., pattern='^(wallet|platega)$')
+    method_key: str | None = Field(None, min_length=1, max_length=32)
+
+
+class ReconciliationResolutionRequest(BaseModel):
+    """An audited operator decision, never an implicit wallet credit."""
+
+    resolution: str = Field(..., pattern='^(refund_requested|transfer_to_wallet|hold)$')
 
 
 def _raise(error: DeviceFirstError) -> None:
@@ -293,6 +311,98 @@ async def checkout_arm(
     )
 
 
+@router.post('/checkout/{checkout_id}/commit')
+async def checkout_commit(
+    checkout_id: str,
+    request: CheckoutCommitRequest,
+    idempotency_key: str | None = Header(None, alias='Idempotency-Key'),
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Commit one v2 sale or create its exact full-price provider invoice.
+
+    The redirect is deliberately returned only by this authenticated, owned
+    mutation response.  Status reads and public values never expose it.
+    """
+    await _rate_limit(user.id, 'commit', limit=5)
+    mutation, replay = await _mutation(
+        db,
+        user_id=user.id,
+        action='commit',
+        key=idempotency_key,
+        payload={'checkout_id': checkout_id, **request.model_dump()},
+    )
+    if replay is not None:
+        return replay
+    try:
+        checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
+        if checkout.settlement_mode != DIRECT_SETTLEMENT_MODE:
+            raise DeviceFirstError('legacy_checkout', 'This checkout must use the legacy payment path')
+        mutation.checkout_id = checkout.id
+        if request.funding_mode == 'wallet':
+            if request.method_key is not None:
+                raise DeviceFirstError('invalid_funding_request', 'Wallet checkout has no provider method', status_code=422)
+            checkout = await commit_direct_wallet_checkout(db, public_id=checkout_id, user_id=user.id)
+            await db.refresh(user)
+            response = {'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)}
+        else:
+            if not request.method_key:
+                raise DeviceFirstError('payment_method_required', 'Select an available payment method', status_code=422)
+            attempt = await create_platega_attempt(
+                db,
+                checkout_public_id=checkout_id,
+                user_id=user.id,
+                method_key=request.method_key,
+            )
+            payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+            if payment is None or not payment.redirect_url:
+                raise DeviceFirstError('reconciliation_required', 'Provider invoice requires reconciliation')
+            checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
+            response = {
+                'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks),
+                'redirect_url': payment.redirect_url,
+            }
+    except DeviceFirstError as error:
+        await store_mutation_result(
+            db,
+            mutation,
+            response={'code': error.code, 'message': str(error)},
+            status_code=error.status_code,
+        )
+        _raise(error)
+    await store_mutation_result(db, mutation, response=response)
+    return response
+
+
+@router.get('/checkout/{checkout_id}/pending-payment')
+async def checkout_pending_payment(
+    checkout_id: str,
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Owned recovery read for the still-open direct invoice only."""
+    checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
+    if checkout.settlement_mode != DIRECT_SETTLEMENT_MODE:
+        raise HTTPException(status_code=404, detail={'code': 'pending_payment_not_found'})
+    attempt = (
+        await db.execute(
+            select(CheckoutPaymentAttempt)
+            .where(
+                CheckoutPaymentAttempt.checkout_id == checkout.id,
+                CheckoutPaymentAttempt.status.in_(['creating', 'pending', 'reconciliation']),
+            )
+            .order_by(CheckoutPaymentAttempt.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if attempt is None or attempt.platega_payment_id is None:
+        raise HTTPException(status_code=404, detail={'code': 'pending_payment_not_found'})
+    payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+    if payment is None or not payment.redirect_url:
+        raise HTTPException(status_code=404, detail={'code': 'pending_payment_not_found'})
+    return {'redirect_url': payment.redirect_url, 'status': attempt.status}
+
+
 @router.post('/checkout/{checkout_id}/cancel')
 async def checkout_cancel(
     checkout_id: str,
@@ -349,6 +459,18 @@ async def checkout_payment_attempt(
             return response
     owned_checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
     mutation.checkout_id = owned_checkout.id
+    if owned_checkout.settlement_mode == DIRECT_SETTLEMENT_MODE:
+        error = DeviceFirstError(
+            'direct_commit_required',
+            'Direct checkout payment can only be created by the final commit command',
+        )
+        await store_mutation_result(
+            db,
+            mutation,
+            response={'code': error.code, 'message': str(error)},
+            status_code=error.status_code,
+        )
+        _raise(error)
     await db.commit()
     try:
         attempt = await create_platega_attempt(
@@ -407,6 +529,17 @@ async def admin_checkout_read_only(
     outbox = (
         await db.execute(select(DeviceFirstOutbox).where(DeviceFirstOutbox.checkout_id == checkout.id))
     ).scalar_one_or_none()
+    reconciliation_credits = list(
+        (
+            await db.execute(
+                select(DeviceFirstReconciliationCredit)
+                .where(DeviceFirstReconciliationCredit.checkout_id == checkout.id)
+                .order_by(DeviceFirstReconciliationCredit.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     return {
         'checkout': serialize_checkout(checkout),
         'user_id': checkout.user_id,
@@ -443,4 +576,63 @@ async def admin_checkout_read_only(
             if outbox
             else None
         ),
+        'reconciliation_credits': [
+            {
+                'id': item.id,
+                'attempt_id': item.attempt_id,
+                'provider_payment_id': item.provider_payment_id,
+                'amount_kopeks': item.amount_kopeks,
+                'currency': item.currency,
+                'status': item.status,
+                'resolution': item.resolution,
+                'resolved_by_user_id': item.resolved_by_user_id,
+                'resolved_at': item.resolved_at,
+            }
+            for item in reconciliation_credits
+        ],
     }
+
+
+@router.post('/admin/reconciliation-credits/{credit_id}/resolve')
+async def admin_resolve_reconciliation_credit(
+    credit_id: int,
+    request: ReconciliationResolutionRequest,
+    admin: User = Depends(require_permission('payments:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Record an accountable resolution; never mutate wallet automatically."""
+    credit = (
+        await db.execute(
+            select(DeviceFirstReconciliationCredit)
+            .where(DeviceFirstReconciliationCredit.id == credit_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if credit is None:
+        raise HTTPException(status_code=404, detail='Reconciliation credit not found')
+    if credit.status != 'operator_review':
+        raise HTTPException(status_code=409, detail={'code': 'already_resolved'})
+    # ``transfer_to_wallet`` is a request for the separately authorised support
+    # process; this endpoint stores no balance mutation and no provider action.
+    from datetime import UTC, datetime
+
+    credit.status = 'resolved'
+    credit.resolution = request.resolution
+    credit.resolved_by_user_id = admin.id
+    credit.resolved_at = datetime.now(UTC)
+    await AuditLogCRUD.create(
+        db,
+        user_id=admin.id,
+        action='device_first_reconciliation_resolution',
+        resource_type='device_first_reconciliation_credit',
+        resource_id=str(credit.id),
+        details={
+            'checkout_id': credit.checkout_id,
+            'attempt_id': credit.attempt_id,
+            'resolution': request.resolution,
+            'amount_kopeks': credit.amount_kopeks,
+        },
+        status='success',
+    )
+    await db.commit()
+    return {'id': credit.id, 'status': credit.status, 'resolution': credit.resolution}

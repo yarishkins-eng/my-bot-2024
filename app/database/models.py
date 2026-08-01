@@ -137,6 +137,9 @@ class TransactionType(Enum):
     REFERRAL_REWARD = 'referral_reward'
     POLL_REWARD = 'poll_reward'
     GIFT_PAYMENT = 'gift_payment'
+    # A provider-confirmed receipt for a direct device-first sale.  It is an
+    # audit record, not a wallet deposit: the ordinary balance is untouched.
+    PROVIDER_RECEIPT = 'provider_receipt'
 
 
 class PromoCodeType(Enum):
@@ -2443,6 +2446,16 @@ class SubscriptionCheckout(Base):
     expires_at = Column(AwareDateTime(), nullable=False)
     lifecycle_state = Column(String(32), nullable=False, default='draft')
     quote_state = Column(String(32), nullable=False, default='valid')
+    # Legacy is the conservative ORM default. A v2 writer must deliberately
+    # opt into direct_purchase_v2, so a draining old flow cannot change its
+    # financial semantics merely by omitting this field.
+    settlement_mode = Column(String(32), nullable=False, default='legacy_deposit')
+    tariff_total_kopeks = Column(Integer, nullable=False, default=0)
+    wallet_applied_kopeks = Column(Integer, nullable=False, default=0)
+    external_payable_kopeks = Column(Integer, nullable=False, default=0)
+    funding_mode = Column(String(32), nullable=True)
+    sale_snapshot = Column(JSON, nullable=False, default=dict)
+    financial_committed_at = Column(AwareDateTime(), nullable=True)
     funding_state = Column(String(32), nullable=False, default='unfunded')
     fulfillment_state = Column(String(32), nullable=False, default='not_started')
     provisioning_state = Column(String(32), nullable=False, default='not_started')
@@ -2487,6 +2500,9 @@ class CheckoutPaymentAttempt(Base):
     currency = Column(String(3), nullable=False, default='RUB')
     requested_amount_kopeks = Column(Integer, nullable=False)
     credited_amount_kopeks = Column(Integer, nullable=False, default=0)
+    settlement_mode = Column(String(32), nullable=False, default='legacy_deposit')
+    provider_returned_amount_kopeks = Column(Integer, nullable=True)
+    provider_returned_currency = Column(String(3), nullable=True)
     status = Column(String(32), nullable=False, default='creating')
     provider_payment_id = Column(String(255), nullable=True, unique=True)
     platega_payment_id = Column(
@@ -2494,6 +2510,9 @@ class CheckoutPaymentAttempt(Base):
     )
     redirect_url = Column(Text, nullable=True)
     reconciliation_reason = Column(Text, nullable=True)
+    lease_token = Column(String(64), nullable=True, index=True)
+    lease_expires_at = Column(AwareDateTime(), nullable=True, index=True)
+    lease_epoch = Column(Integer, nullable=False, default=0)
     reconcile_attempts = Column(Integer, nullable=False, default=0)
     next_reconcile_at = Column(AwareDateTime(), nullable=False, default=func.now(), index=True)
     created_at = Column(AwareDateTime(), nullable=False, default=func.now())
@@ -2534,11 +2553,15 @@ class DeviceFirstOutbox(Base):
     id = Column(Integer, primary_key=True)
     checkout_id = Column(Integer, ForeignKey('subscription_checkouts.id', ondelete='CASCADE'), nullable=False)
     event_type = Column(String(48), nullable=False, default='sync_subscription')
+    settlement_mode = Column(String(32), nullable=False, default='legacy_deposit')
     payload_json = Column(JSON, nullable=False, default=dict)
     status = Column(String(24), nullable=False, default='pending')
     attempts = Column(Integer, nullable=False, default=0)
     available_at = Column(AwareDateTime(), nullable=False, default=func.now())
     last_error = Column(Text, nullable=True)
+    lease_token = Column(String(64), nullable=True, index=True)
+    lease_expires_at = Column(AwareDateTime(), nullable=True, index=True)
+    lease_epoch = Column(Integer, nullable=False, default=0)
     created_at = Column(AwareDateTime(), nullable=False, default=func.now())
     updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
 
@@ -2562,6 +2585,7 @@ class DeviceFirstDepositOutbox(Base):
         nullable=False,
         index=True,
     )
+    settlement_mode = Column(String(32), nullable=False, default='legacy_deposit')
     status = Column(String(24), nullable=False, default='pending')
     event_status = Column(String(24), nullable=False, default='pending')
     referral_status = Column(String(24), nullable=False, default='pending')
@@ -2573,6 +2597,60 @@ class DeviceFirstDepositOutbox(Base):
     updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
 
     transaction = relationship('Transaction')
+    checkout = relationship('SubscriptionCheckout')
+
+
+class DeviceFirstReconciliationCredit(Base):
+    """Provider money that must never become spendable without an audit decision."""
+
+    __tablename__ = 'device_first_reconciliation_credits'
+    __table_args__ = (
+        UniqueConstraint('attempt_id', name='uq_df_reconciliation_credit_attempt'),
+        CheckConstraint('amount_kopeks > 0', name='ck_df_reconciliation_credit_positive'),
+        Index('ix_df_reconciliation_credit_status', 'status', 'created_at'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    checkout_id = Column(Integer, ForeignKey('subscription_checkouts.id', ondelete='CASCADE'), nullable=False)
+    attempt_id = Column(Integer, ForeignKey('checkout_payment_attempts.id', ondelete='RESTRICT'), nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    provider_payment_id = Column(String(255), nullable=False)
+    amount_kopeks = Column(Integer, nullable=False)
+    currency = Column(String(3), nullable=False)
+    status = Column(String(32), nullable=False, default='operator_review')
+    resolution = Column(String(32), nullable=True)
+    resolved_by_user_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    resolved_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
+
+    checkout = relationship('SubscriptionCheckout', foreign_keys=[checkout_id])
+    attempt = relationship('CheckoutPaymentAttempt', foreign_keys=[attempt_id])
+    user = relationship('User', foreign_keys=[user_id])
+    resolver = relationship('User', foreign_keys=[resolved_by_user_id])
+
+
+class DeviceFirstNotificationOutbox(Base):
+    """At-most-once Telegram notification after a committed READY checkout."""
+
+    __tablename__ = 'device_first_notification_outbox'
+    __table_args__ = (
+        UniqueConstraint('checkout_id', 'notification_type', name='uq_df_notification_checkout_type'),
+        Index('ix_df_notification_status', 'status', 'created_at'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    checkout_id = Column(Integer, ForeignKey('subscription_checkouts.id', ondelete='CASCADE'), nullable=False)
+    notification_type = Column(String(48), nullable=False, default='ready')
+    status = Column(String(32), nullable=False, default='pending')
+    lease_token = Column(String(64), nullable=True, unique=True)
+    lease_expires_at = Column(AwareDateTime(), nullable=True)
+    sending_at = Column(AwareDateTime(), nullable=True)
+    sent_at = Column(AwareDateTime(), nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
+
     checkout = relationship('SubscriptionCheckout')
 
 
