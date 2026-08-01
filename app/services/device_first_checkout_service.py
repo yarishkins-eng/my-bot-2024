@@ -21,6 +21,7 @@ from app.database.crud.subscription import (
 )
 from app.database.crud.tariff import get_tariffs_for_user
 from app.database.models import (
+    CheckoutPaymentAttempt,
     DeviceFirstMutation,
     DeviceFirstNotificationOutbox,
     DeviceFirstOutbox,
@@ -82,13 +83,11 @@ def is_device_first_canary_user(user: User) -> bool:
 
 def settlement_mode(row: Any) -> str:
     mode = getattr(row, 'settlement_mode', None)
-    # Rows from before revision 0096 are backfilled in the migration.  Treat a
-    # missing value conservatively as that legacy path as well: it can never
-    # accidentally acquire direct-sale semantics or debit a v2 checkout.
-    if mode is None:
-        return LEGACY_SETTLEMENT_MODE
+    # Revision 0096 backfills every historical row before enforcing its CHECK
+    # constraint.  A missing or corrupted discriminator must therefore never
+    # be guessed as legacy money flow: stop it for operator review instead.
     if mode not in {LEGACY_SETTLEMENT_MODE, DIRECT_SETTLEMENT_MODE}:
-        raise DeviceFirstError('invalid_settlement_mode', 'Checkout settlement mode requires operator review')
+        raise DeviceFirstError('operator_review_required', 'Checkout settlement mode requires operator review')
     return mode
 
 
@@ -204,13 +203,27 @@ async def get_open_checkout_for_user(
     user_id: int,
 ) -> SubscriptionCheckout | None:
     """Return the owner's resumable checkout, never another user's checkout."""
+    # Direct checkout money is committed before provisioning.  Keep that
+    # owner-visible recovery record resumable until fenced provisioning reports
+    # ready, even though its fulfilment step is already complete.
+    direct_provisioning_recovery = and_(
+        SubscriptionCheckout.settlement_mode == DIRECT_SETTLEMENT_MODE,
+        SubscriptionCheckout.lifecycle_state == 'fulfilling',
+        SubscriptionCheckout.fulfillment_state == 'fulfilled',
+        SubscriptionCheckout.provisioning_state.in_(['pending', 'retry']),
+    )
     checkout = (
         await db.execute(
             select(SubscriptionCheckout)
             .where(
                 SubscriptionCheckout.user_id == user_id,
-                SubscriptionCheckout.lifecycle_state.in_(OPEN_STATES),
-                SubscriptionCheckout.fulfillment_state != 'fulfilled',
+                or_(
+                    and_(
+                        SubscriptionCheckout.lifecycle_state.in_(OPEN_STATES),
+                        SubscriptionCheckout.fulfillment_state != 'fulfilled',
+                    ),
+                    direct_provisioning_recovery,
+                ),
             )
             .order_by(SubscriptionCheckout.created_at.desc())
             .limit(1)
@@ -218,7 +231,11 @@ async def get_open_checkout_for_user(
     ).scalar_one_or_none()
     if checkout is None:
         return None
-    if checkout.expires_at <= datetime.now(UTC):
+    if not (
+        settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE
+        and checkout.lifecycle_state == 'fulfilling'
+        and checkout.fulfillment_state == 'fulfilled'
+    ) and checkout.expires_at <= datetime.now(UTC):
         checkout.lifecycle_state = 'expired'
         checkout.terminal_reason = 'checkout_expired'
         checkout.quote_state = 'expired'
@@ -916,8 +933,32 @@ async def fulfill_direct_external_checkout(
     *,
     checkout_id: int,
     provider_payment_id: str,
+    payment_attempt_id: int | None = None,
+    lease_token: str | None = None,
+    lease_epoch: int | None = None,
 ) -> SubscriptionCheckout:
     """Recovery-safe completion after an authenticated exact provider payment."""
+    if (lease_token is None) != (lease_epoch is None):
+        raise ValueError('direct fulfilment lease requires both token and epoch')
+    if lease_token is not None:
+        if payment_attempt_id is None:
+            raise ValueError('direct fulfilment lease requires an attempt id')
+        owned_attempt = (
+            await db.execute(
+                select(CheckoutPaymentAttempt)
+                .where(
+                    CheckoutPaymentAttempt.id == payment_attempt_id,
+                    CheckoutPaymentAttempt.checkout_id == checkout_id,
+                    CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                    CheckoutPaymentAttempt.lease_token == lease_token,
+                    CheckoutPaymentAttempt.lease_epoch == lease_epoch,
+                    CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if owned_attempt is None:
+            raise DeviceFirstError('lease_lost', 'Direct payment lease was superseded')
     checkout = (
         await db.execute(select(SubscriptionCheckout).where(SubscriptionCheckout.id == checkout_id).with_for_update())
     ).scalar_one()

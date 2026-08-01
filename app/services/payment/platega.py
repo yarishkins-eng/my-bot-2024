@@ -238,6 +238,17 @@ class PlategaPaymentMixin:
         if not payment:
             return None
 
+        # Device-first v2 is settled only by its verified callback or its
+        # lease-fenced worker. Generic user-initiated checks are local reads:
+        # they may observe state but cannot contact the provider or settle it.
+        if self._is_direct_device_first_payment(payment):
+            return {
+                'payment': payment,
+                'status': payment.status,
+                'is_paid': payment.is_paid,
+                'remote': None,
+            }
+
         service: PlategaService | None = getattr(self, 'platega_service', None)
         remote_status: str | None = None
         remote_payload: dict[str, Any] | None = None

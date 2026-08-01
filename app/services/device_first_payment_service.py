@@ -465,23 +465,53 @@ async def settle_device_first_platega_payment(
     *,
     payment: PlategaPayment,
     payload: dict | None,
-) -> PlategaPayment:
+    lease_token: str | None = None,
+    lease_epoch: int | None = None,
+) -> PlategaPayment | None:
+    if (lease_token is None) != (lease_epoch is None):
+        raise ValueError('direct payment lease requires both token and epoch')
     payment = (
         await db.execute(select(PlategaPayment).where(PlategaPayment.id == payment.id).with_for_update())
     ).scalar_one()
     metadata = dict(payment.metadata_json or {})
     attempt_id = metadata.get('device_first_attempt_id')
-    attempt = (
-        await db.execute(
-            select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id).with_for_update()
+    attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
+    if lease_token is not None:
+        attempt_query = attempt_query.where(
+            CheckoutPaymentAttempt.lease_token == lease_token,
+            CheckoutPaymentAttempt.lease_epoch == lease_epoch,
+            CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
         )
+    attempt = (
+        await db.execute(attempt_query.with_for_update())
     ).scalar_one_or_none()
+    if attempt is None and lease_token is not None:
+        logger.warning('device_first_direct_payment_lease_lost', payment_id=payment.id)
+        return None
+    direct_payment = metadata.get('settlement_mode') == DIRECT_SETTLEMENT_MODE
+    if direct_payment and attempt is None:
+        # A protected direct provider row without its matching attempt cannot
+        # be classified as a legacy deposit. Preserve the evidence and require
+        # an operator; do not credit balance or synthesize a sale.
+        payment.status = 'OPERATOR_REVIEW'
+        await db.commit()
+        logger.error('device_first_direct_payment_attempt_missing', payment_id=payment.id)
+        return payment
+    if direct_payment and settlement_mode(attempt) != DIRECT_SETTLEMENT_MODE:
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'direct_payment_attempt_mode_mismatch'
+        await db.commit()
+        logger.error('device_first_direct_payment_mode_mismatch', payment_id=payment.id, attempt_id=attempt.id)
+        return payment
     if attempt is not None and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
         return await _settle_direct_platega_payment_locked(
             db,
             payment=payment,
             attempt=attempt,
             payload=payload,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
         )
     transaction_id = str((payload or {}).get('id') or (payload or {}).get('transactionId') or '').strip()
     method_raw = (payload or {}).get('paymentMethod')
@@ -651,6 +681,8 @@ async def _settle_direct_platega_payment_locked(
     payment: PlategaPayment,
     attempt: CheckoutPaymentAttempt,
     payload: dict | None,
+    lease_token: str | None = None,
+    lease_epoch: int | None = None,
 ) -> PlategaPayment:
     """Settle only an authenticated exact direct-sale provider payment.
 
@@ -729,6 +761,9 @@ async def _settle_direct_platega_payment_locked(
             db,
             checkout_id=checkout.id,
             provider_payment_id=provider_payment_id,
+            payment_attempt_id=attempt.id,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
         )
     except DeviceFirstError:
         # The durable paid_processing status lets the scoped worker continue or
@@ -742,15 +777,43 @@ async def _release_direct_attempt_lease(
     *,
     attempt_id: int,
     lease_token: str | None,
+    lease_epoch: int | None,
 ) -> None:
-    if lease_token is None:
+    if lease_token is None or lease_epoch is None:
         return
     await db.execute(
         update(CheckoutPaymentAttempt)
-        .where(CheckoutPaymentAttempt.id == attempt_id, CheckoutPaymentAttempt.lease_token == lease_token)
+        .where(
+            CheckoutPaymentAttempt.id == attempt_id,
+            CheckoutPaymentAttempt.lease_token == lease_token,
+            CheckoutPaymentAttempt.lease_epoch == lease_epoch,
+        )
         .values(lease_token=None, lease_expires_at=None)
     )
     await db.commit()
+
+
+async def _lock_owned_direct_attempt_lease(
+    db: AsyncSession,
+    *,
+    attempt_id: int,
+    lease_token: str,
+    lease_epoch: int,
+) -> CheckoutPaymentAttempt | None:
+    """Lock the attempt only if this worker still owns its unexpired lease."""
+    return (
+        await db.execute(
+            select(CheckoutPaymentAttempt)
+            .where(
+                CheckoutPaymentAttempt.id == attempt_id,
+                CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                CheckoutPaymentAttempt.lease_token == lease_token,
+                CheckoutPaymentAttempt.lease_epoch == lease_epoch,
+                CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
 
 
 async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) -> int:
@@ -780,6 +843,7 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
     reconciled = 0
     for attempt in attempts:
         lease_token: str | None = None
+        lease_epoch: int | None = None
         if settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
             lease_token = uuid.uuid4().hex
             claimed = await db.execute(
@@ -803,20 +867,39 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
             attempt = await db.get(CheckoutPaymentAttempt, attempt.id)
             if attempt is None:
                 continue
+            lease_epoch = attempt.lease_epoch
         if attempt.status == 'paid_processing' and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
             try:
                 await fulfill_direct_external_checkout(
                     db,
                     checkout_id=attempt.checkout_id,
                     provider_payment_id=attempt.provider_payment_id or '',
+                    payment_attempt_id=attempt.id,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
                 )
                 reconciled += 1
             except DeviceFirstError as error:
                 logger.warning('device_first_direct_paid_recovery_failed', attempt_id=attempt.id, code=error.code)
             finally:
-                await _release_direct_attempt_lease(db, attempt_id=attempt.id, lease_token=lease_token)
+                await _release_direct_attempt_lease(
+                    db,
+                    attempt_id=attempt.id,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                )
             continue
         try:
+            if lease_token is not None and lease_epoch is not None:
+                owned_attempt = await _lock_owned_direct_attempt_lease(
+                    db,
+                    attempt_id=attempt.id,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                )
+                if owned_attempt is None:
+                    continue
+                attempt = owned_attempt
             attempt.reconcile_attempts += 1
             attempt.next_reconcile_at = datetime.now(UTC) + timedelta(
                 minutes=min(60, 2 ** min(attempt.reconcile_attempts, 6))
@@ -825,10 +908,28 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
             try:
                 payload = await service.get_transaction(attempt.provider_payment_id)
             except Exception as error:
+                if lease_token is not None and lease_epoch is not None:
+                    attempt = await _lock_owned_direct_attempt_lease(
+                        db,
+                        attempt_id=attempt.id,
+                        lease_token=lease_token,
+                        lease_epoch=lease_epoch,
+                    )
+                    if attempt is None:
+                        continue
                 attempt.reconciliation_reason = f'status_lookup:{type(error).__name__}'
                 await db.commit()
                 continue
             if not payload:
+                if lease_token is not None and lease_epoch is not None:
+                    attempt = await _lock_owned_direct_attempt_lease(
+                        db,
+                        attempt_id=attempt.id,
+                        lease_token=lease_token,
+                        lease_epoch=lease_epoch,
+                    )
+                    if attempt is None:
+                        continue
                 attempt.reconciliation_reason = 'status_lookup:empty'
                 await db.commit()
                 continue
@@ -837,17 +938,33 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
             if payment is None:
                 continue
             if status == 'CONFIRMED':
-                await settle_device_first_platega_payment(db, payment=payment, payload=payload)
-                reconciled += 1
+                settled = await settle_device_first_platega_payment(
+                    db,
+                    payment=payment,
+                    payload=payload,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                )
+                reconciled += int(settled is not None)
             else:
                 payment = (
                     await db.execute(select(PlategaPayment).where(PlategaPayment.id == payment.id).with_for_update())
                 ).scalar_one()
-                attempt = (
-                    await db.execute(
-                        select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt.id).with_for_update()
+                if lease_token is not None and lease_epoch is not None:
+                    attempt = await _lock_owned_direct_attempt_lease(
+                        db,
+                        attempt_id=attempt.id,
+                        lease_token=lease_token,
+                        lease_epoch=lease_epoch,
                     )
-                ).scalar_one()
+                    if attempt is None:
+                        continue
+                else:
+                    attempt = (
+                        await db.execute(
+                            select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt.id).with_for_update()
+                        )
+                    ).scalar_one()
                 if status in {'FAILED', 'CANCELED', 'EXPIRED'}:
                     attempt.status = 'failed'
                     attempt.reconciliation_reason = f'provider_terminal:{status.lower()}'
@@ -856,5 +973,10 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                     attempt.reconciliation_reason = f'provider_pending:{status or "unknown"}'
                 await db.commit()
         finally:
-            await _release_direct_attempt_lease(db, attempt_id=attempt.id, lease_token=lease_token)
+            await _release_direct_attempt_lease(
+                db,
+                attempt_id=attempt.id,
+                lease_token=lease_token,
+                lease_epoch=lease_epoch,
+            )
     return reconciled

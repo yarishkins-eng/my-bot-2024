@@ -116,6 +116,7 @@ async def test_kill_switch_blocks_new_arm(monkeypatch):
         lifecycle_state='confirmed',
         fulfillment_state='not_started',
         armed_at=None,
+        settlement_mode='legacy_deposit',
     )
     db = SimpleNamespace(commit=AsyncMock())
     monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', False)
@@ -135,6 +136,7 @@ async def test_kill_switch_still_drains_already_armed_checkout(monkeypatch):
         lifecycle_state='armed',
         fulfillment_state='not_started',
         armed_at=object(),
+        settlement_mode='legacy_deposit',
     )
     db = SimpleNamespace(commit=AsyncMock())
     result = SimpleNamespace(lifecycle_state='ready')

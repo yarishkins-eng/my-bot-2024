@@ -68,7 +68,7 @@ def test_provider_create_response_requires_exact_integer_kopeks(response, expect
 @pytest.mark.asyncio
 async def test_payment_attempt_requires_explicitly_armed_checkout(monkeypatch):
     user = SimpleNamespace(id=7)
-    checkout = SimpleNamespace(lifecycle_state='confirmed', armed_at=None)
+    checkout = SimpleNamespace(lifecycle_state='confirmed', armed_at=None, settlement_mode='legacy_deposit')
     db = SimpleNamespace(get=AsyncMock(return_value=user))
     monkeypatch.setattr(
         'app.services.device_first_payment_service.available_platega_methods_for_db',
@@ -95,6 +95,7 @@ async def test_settlement_rejects_provider_identity_mismatch_before_credit():
     attempt = SimpleNamespace(
         provider_payment_id='expected-provider-id',
         provider_method_code=2,
+        settlement_mode='legacy_deposit',
         status='pending',
         reconciliation_reason=None,
     )
@@ -123,6 +124,32 @@ async def test_settlement_rejects_provider_identity_mismatch_before_credit():
     assert attempt.reconciliation_reason == 'provider_identity_mismatch'
     assert payment.callback_payload['id'] == 'different-provider-id'
     db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_direct_reconciliation_lease_cannot_settle_payment():
+    payment = SimpleNamespace(
+        id=51,
+        metadata_json={'device_first_attempt_id': 41},
+        status='PENDING',
+        is_paid=False,
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(None)]),
+        commit=AsyncMock(),
+    )
+
+    settled = await settle_device_first_platega_payment(
+        db,
+        payment=payment,
+        payload={'id': 'provider-1'},
+        lease_token='superseded-token',
+        lease_epoch=3,
+    )
+
+    assert settled is None
+    assert payment.status == 'PENDING'
+    db.commit.assert_not_awaited()
 
 
 class Result:
@@ -156,6 +183,7 @@ def _attempt():
         checkout_id=9,
         provider_payment_id='provider-1',
         provider_method_code=2,
+        settlement_mode='legacy_deposit',
         requested_amount_kopeks=35000,
         credited_amount_kopeks=0,
         status='pending',

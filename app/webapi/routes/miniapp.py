@@ -1719,6 +1719,31 @@ async def _resolve_platega_payment_status(
             },
         )
 
+    # Direct-sale provider facts and identifiers stay inside the verified
+    # callback/worker boundary. Browser polling only observes local state.
+    metadata = getattr(payment, 'metadata_json', None) or {}
+    if metadata.get('settlement_mode') == 'direct_purchase_v2':
+        status_raw = getattr(payment, 'status', None)
+        is_paid_flag = bool(getattr(payment, 'is_paid', False))
+        status_value = _classify_status(status_raw, is_paid_flag)
+        completed_at = (
+            getattr(payment, 'paid_at', None)
+            or getattr(payment, 'updated_at', None)
+            or getattr(payment, 'created_at', None)
+        )
+        return MiniAppPaymentStatusResult(
+            method='platega',
+            status=status_value,
+            is_paid=status_value == 'paid',
+            amount_kopeks=payment.amount_kopeks,
+            currency=payment.currency,
+            completed_at=completed_at,
+            transaction_id=None,
+            external_id=None,
+            message=None,
+            extra={'status': status_raw, 'is_paid': is_paid_flag},
+        )
+
     status_info = await payment_service.get_platega_payment_status(db, payment.id)
     refreshed_payment = (status_info or {}).get('payment') or payment
 
