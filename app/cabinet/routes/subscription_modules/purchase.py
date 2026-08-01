@@ -656,6 +656,19 @@ async def purchase_tariff(
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> dict[str, Any]:
     """Purchase a tariff (for tariffs mode)."""
+    # A stale cabinet bundle or a hand-crafted authenticated request must not
+    # bypass the public Device-First checkout and recreate the retired legacy
+    # price/device flow. Existing v2 checkout status/payment/recovery routes
+    # remain separate and available after this gate.
+    if settings.DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                'code': 'device_first_required',
+                'message': 'Use the Device-First checkout endpoint for new tariff purchases',
+            },
+        )
+
     if getattr(user, 'restriction_subscription', False):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
