@@ -6,7 +6,9 @@ from app.database.models import (
     CheckoutPaymentAttempt,
     DeviceFirstDepositOutbox,
     DeviceFirstMutation,
+    DeviceFirstNotificationOutbox,
     DeviceFirstOutbox,
+    DeviceFirstReconciliationCredit,
     SubscriptionCheckout,
     Tariff,
     Transaction,
@@ -32,6 +34,12 @@ def test_model_contains_durable_checkout_and_ledger_constraints():
     assert not DeviceFirstDepositOutbox.__table__.c.event_status.nullable
     assert not DeviceFirstDepositOutbox.__table__.c.referral_status.nullable
     assert not DeviceFirstDepositOutbox.__table__.c.fulfillment_status.nullable
+    assert SubscriptionCheckout.__table__.c.settlement_mode.default.arg == 'legacy_deposit'
+    assert CheckoutPaymentAttempt.__table__.c.settlement_mode.default.arg == 'legacy_deposit'
+    assert DeviceFirstOutbox.__table__.c.settlement_mode.default.arg == 'legacy_deposit'
+    assert DeviceFirstDepositOutbox.__table__.c.settlement_mode.default.arg == 'legacy_deposit'
+    assert inspect(DeviceFirstReconciliationCredit).local_table.name == 'device_first_reconciliation_credits'
+    assert inspect(DeviceFirstNotificationOutbox).local_table.name == 'device_first_notification_outbox'
 
 
 def test_migration_is_additive_and_financial_downgrade_is_noop():
@@ -43,12 +51,28 @@ def test_migration_is_additive_and_financial_downgrade_is_noop():
     assert 'op.drop_' not in downgrade
 
 
+def test_v2_migration_backfills_legacy_rows_before_enforcing_mode() -> None:
+    path = Path(__file__).parents[2] / 'migrations/alembic/versions/0096_device_first_direct_purchase_v2.py'
+    source = path.read_text()
+    assert "revision: str = '0096'" in source
+    assert "down_revision: Union[str, None] = '0095'" in source
+    assert "SET settlement_mode = 'legacy_deposit' WHERE settlement_mode IS NULL" in source
+    assert "settlement_mode IN ('legacy_deposit', 'direct_purchase_v2')" in source
+    assert 'device_first_reconciliation_credits' in source
+    assert 'device_first_notification_outbox' in source
+    assert 'op.drop_' not in source.split('def downgrade() -> None:', 1)[1]
+
+
 def test_outbox_worker_reclaims_stale_processing_rows():
     path = Path(__file__).parents[2] / 'app/services/device_first_checkout_service.py'
     source = path.read_text()
     worker = source.split('async def process_provisioning_outbox', 1)[1]
     assert "DeviceFirstOutbox.status == 'processing'" in worker
     assert 'DeviceFirstOutbox.updated_at <= stale_before' in worker
+
+    direct_worker = source.split('async def _process_direct_provisioning_outbox', 1)[1]
+    assert "DeviceFirstOutbox.status == 'processing'" in direct_worker
+    assert 'DeviceFirstOutbox.lease_expires_at < now' in direct_worker
 
     deposit_path = Path(__file__).parents[2] / 'app/services/device_first_deposit_outbox_service.py'
     deposit_worker = deposit_path.read_text().split('async def process_device_first_deposit_outbox', 1)[1]

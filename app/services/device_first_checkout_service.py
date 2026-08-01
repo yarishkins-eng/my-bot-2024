@@ -22,6 +22,7 @@ from app.database.crud.subscription import (
 from app.database.crud.tariff import get_tariffs_for_user
 from app.database.models import (
     DeviceFirstMutation,
+    DeviceFirstNotificationOutbox,
     DeviceFirstOutbox,
     Subscription,
     SubscriptionCheckout,
@@ -35,7 +36,9 @@ from app.services.pricing_engine import pricing_engine
 
 
 OPEN_STATES = {'draft', 'confirmed', 'awaiting_funds', 'armed', 'fulfilling'}
-TERMINAL_STATES = {'ready', 'cancelled', 'expired', 'failed', 'reprice_required', 'conflict'}
+TERMINAL_STATES = {'ready', 'cancelled', 'expired', 'failed', 'reprice_required', 'conflict', 'operator_review'}
+LEGACY_SETTLEMENT_MODE = 'legacy_deposit'
+DIRECT_SETTLEMENT_MODE = 'direct_purchase_v2'
 KOPEKS_PER_RUBLE = 100
 logger = structlog.get_logger(__name__)
 
@@ -101,6 +104,39 @@ def device_first_top_up_surplus_kopeks(*, price_kopeks: int, balance_kopeks: int
     )
 
 
+def device_first_canary_user_ids() -> frozenset[int]:
+    """Parse the deliberately empty-by-default controlled-payment allowlist."""
+    result: set[int] = set()
+    for raw in (settings.DEVICE_FIRST_CANARY_USER_IDS or '').split(','):
+        value = raw.strip()
+        if not value:
+            continue
+        try:
+            user_id = int(value)
+        except ValueError:
+            logger.warning('device_first_invalid_canary_configuration')
+            continue
+        if user_id > 0:
+            result.add(user_id)
+    return frozenset(result)
+
+
+def is_device_first_canary_user(user: User) -> bool:
+    return user.id in device_first_canary_user_ids()
+
+
+def settlement_mode(row: Any) -> str:
+    mode = getattr(row, 'settlement_mode', None)
+    # Rows from before revision 0096 are backfilled in the migration.  Treat a
+    # missing value conservatively as that legacy path as well: it can never
+    # accidentally acquire direct-sale semantics or debit a v2 checkout.
+    if mode is None:
+        return LEGACY_SETTLEMENT_MODE
+    if mode not in {LEGACY_SETTLEMENT_MODE, DIRECT_SETTLEMENT_MODE}:
+        raise DeviceFirstError('invalid_settlement_mode', 'Checkout settlement mode requires operator review')
+    return mode
+
+
 def request_hash(payload: Any) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -117,7 +153,7 @@ def checkout_ui_state(checkout: SubscriptionCheckout) -> str:
         return 'provisioning'
     if checkout.lifecycle_state in {'armed', 'fulfilling'} and checkout.fulfillment_state == 'in_progress':
         return 'processing'
-    if checkout.lifecycle_state in {'reprice_required', 'conflict', 'cancelled', 'expired', 'failed'}:
+    if checkout.lifecycle_state in {'reprice_required', 'conflict', 'cancelled', 'expired', 'failed', 'operator_review'}:
         return checkout.lifecycle_state
     if checkout.lifecycle_state == 'draft':
         return 'configuration'
@@ -151,10 +187,13 @@ def serialize_checkout(
         'price_breakdown': checkout.price_breakdown,
         'quoted_price_kopeks': checkout.quoted_price_kopeks,
         'max_price_kopeks': checkout.max_price_kopeks,
+        'settlement_mode': settlement_mode(checkout),
+        'tariff_total_kopeks': checkout.tariff_total_kopeks,
+        'wallet_applied_kopeks': checkout.wallet_applied_kopeks,
+        'external_payable_kopeks': checkout.external_payable_kopeks,
+        'funding_mode': checkout.funding_mode,
         # The same payload is returned to the client and persisted in the
-        # idempotency record.  Keep timestamps JSON-native for both paths;
-        # otherwise PostgreSQL's JSON encoder raises after the checkout was
-        # committed and the client sees a false generic error.
+        # idempotency record. Keep timestamps JSON-native for both paths.
         'quote_expires_at': checkout.quote_expires_at.isoformat(),
         'expires_at': checkout.expires_at.isoformat(),
         'lifecycle_state': checkout.lifecycle_state,
@@ -323,6 +362,8 @@ def _subscription_snapshot(subscription: Subscription | None) -> dict[str, Any]:
 async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]:
     if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED:
         return {'eligible': False, 'reason': 'feature_disabled'}
+    if not is_device_first_canary_user(user):
+        return {'eligible': False, 'reason': 'canary_not_allowed'}
     promo_group = user.get_primary_promo_group() if hasattr(user, 'get_primary_promo_group') else None
     if promo_group is None:
         promo_group = getattr(user, 'promo_group', None)
@@ -366,6 +407,7 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
         matrix.append({'period_days': days, 'prices': prices})
     return {
         'eligible': True,
+        'version': 2,
         'tariff': {
             'id': tariff.id,
             'name': tariff.name,
@@ -457,6 +499,10 @@ async def create_checkout(
         price_breakdown=selected['breakdown'],
         quoted_price_kopeks=selected['price_kopeks'],
         max_price_kopeks=selected['price_kopeks'],
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        tariff_total_kopeks=selected['price_kopeks'],
+        wallet_applied_kopeks=0,
+        external_payable_kopeks=0,
         pricing_revision=int(tariff.pricing_revision or 1),
         quote_expires_at=now + timedelta(minutes=30),
         expires_at=now + timedelta(hours=24),
@@ -510,6 +556,8 @@ async def cancel_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> S
 
 
 async def arm_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> SubscriptionCheckout:
+    if settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE:
+        raise DeviceFirstError('direct_commit_required', 'Choose a funding method before the final purchase')
     if checkout.lifecycle_state not in {'confirmed', 'awaiting_funds', 'armed'}:
         raise DeviceFirstError('invalid_state', 'Checkout cannot be armed in its current state')
     if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED and checkout.armed_at is None:
@@ -691,6 +739,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
     db.add(
         DeviceFirstOutbox(
             checkout_id=checkout.id,
+            settlement_mode=LEGACY_SETTLEMENT_MODE,
             payload_json={'subscription_id': target.id},
         )
     )
@@ -704,6 +753,348 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         charged_kopeks=charge,
     )
     return checkout
+
+
+async def _lock_direct_context(
+    db: AsyncSession,
+    *,
+    public_id: str,
+    user_id: int,
+) -> tuple[SubscriptionCheckout, User, Subscription | None, Tariff]:
+    """Lock in the same order as legacy fulfilment: checkout → user → sub → tariff."""
+    checkout = await get_owned_checkout(db, public_id=public_id, user_id=user_id, for_update=True)
+    if settlement_mode(checkout) != DIRECT_SETTLEMENT_MODE:
+        raise DeviceFirstError('legacy_checkout', 'This older checkout uses its original settlement path')
+    user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one()
+    target = None
+    if checkout.target_subscription_id is not None:
+        target = (
+            await db.execute(
+                select(Subscription)
+                .where(Subscription.id == checkout.target_subscription_id, Subscription.user_id == user_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+    tariff = (await db.execute(select(Tariff).where(Tariff.id == checkout.tariff_id).with_for_update())).scalar_one_or_none()
+    if tariff is None:
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'tariff_missing_after_quote'
+        await db.commit()
+        raise DeviceFirstError('operator_review_required', 'The order requires operator review')
+    return checkout, user, target, tariff
+
+
+async def _validate_direct_pre_commit(
+    db: AsyncSession,
+    *,
+    checkout: SubscriptionCheckout,
+    user: User,
+    target: Subscription | None,
+    tariff: Tariff,
+) -> bool:
+    """Fail before money if the quoted target is no longer safe to sell."""
+    now = datetime.now(UTC)
+    if checkout.lifecycle_state != 'confirmed':
+        raise DeviceFirstError('invalid_state', 'Checkout is not ready for final confirmation')
+    if now >= checkout.quote_expires_at:
+        checkout.lifecycle_state = 'reprice_required'
+        checkout.quote_state = 'expired'
+        checkout.terminal_reason = 'quote_expired'
+        await db.commit()
+        return False
+    if checkout.expect_no_subscription:
+        if await _current_subscription(db, user.id) is not None:
+            checkout.lifecycle_state = 'conflict'
+            checkout.terminal_reason = 'subscription_appeared'
+            await db.commit()
+            return False
+    elif target is None or _subscription_snapshot(target) != checkout.target_snapshot:
+        checkout.lifecycle_state = 'conflict'
+        checkout.terminal_reason = 'target_subscription_changed'
+        await db.commit()
+        return False
+    if target is not None and not target.is_trial and checkout.selected_device_limit < int(target.device_limit or 0):
+        checkout.lifecycle_state = 'conflict'
+        checkout.terminal_reason = 'device_limit_decrease_not_allowed'
+        await db.commit()
+        return False
+    eligibility = tariff_eligibility(tariff, subscription=target)
+    if (
+        not eligibility.eligible
+        or checkout.period_days not in eligibility.period_options
+        or checkout.selected_device_limit not in eligibility.device_options
+    ):
+        checkout.lifecycle_state = 'reprice_required'
+        checkout.quote_state = 'price_changed'
+        checkout.terminal_reason = 'tariff_no_longer_eligible'
+        await db.commit()
+        return False
+    current_price = await pricing_engine.calculate_tariff_purchase_price(
+        tariff,
+        checkout.period_days,
+        device_limit=checkout.selected_device_limit,
+        user=user,
+    )
+    if int(tariff.pricing_revision or 1) != checkout.pricing_revision or current_price.final_total != checkout.tariff_total_kopeks:
+        checkout.lifecycle_state = 'reprice_required'
+        checkout.quote_state = 'price_changed'
+        checkout.terminal_reason = 'price_changed'
+        await db.commit()
+        return False
+    return True
+
+
+def _direct_sale_snapshot(checkout: SubscriptionCheckout, tariff: Tariff, *, funding_mode: str) -> dict[str, Any]:
+    """The post-confirmation source of truth; no later tariff repricing is allowed."""
+    return {
+        'tariff_id': checkout.tariff_id,
+        'tariff_name': tariff.name,
+        'period_days': checkout.period_days,
+        'device_limit': checkout.selected_device_limit,
+        'traffic_limit_gb': tariff.traffic_limit_gb,
+        # Required to fulfil an immutable entitlement without consulting a
+        # mutable tariff after an exact external payment.
+        'allowed_squads': list(tariff.allowed_squads or []),
+        'currency': 'RUB',
+        'tariff_total_kopeks': checkout.tariff_total_kopeks,
+        'price_breakdown': checkout.price_breakdown,
+        'pricing_revision': checkout.pricing_revision,
+        'funding_mode': funding_mode,
+        'target_snapshot': checkout.target_snapshot,
+        'expires_at': checkout.quote_expires_at.isoformat(),
+    }
+
+
+async def prepare_direct_external_checkout(
+    db: AsyncSession,
+    *,
+    public_id: str,
+    user_id: int,
+) -> SubscriptionCheckout:
+    """Atomically freeze a full-price external sale before the provider POST."""
+    checkout, user, target, tariff = await _lock_direct_context(db, public_id=public_id, user_id=user_id)
+    if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED or not is_device_first_canary_user(user):
+        raise DeviceFirstError('feature_disabled', 'New checkouts are temporarily disabled')
+    if checkout.financial_committed_at is not None:
+        if checkout.funding_mode != 'platega':
+            raise DeviceFirstError('funding_mode_locked', 'Funding method is already fixed')
+        return checkout
+    if not await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff):
+        raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')
+    total = checkout.tariff_total_kopeks
+    checkout.wallet_applied_kopeks = 0
+    checkout.external_payable_kopeks = total
+    checkout.funding_mode = 'platega'
+    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='platega')
+    checkout.financial_committed_at = datetime.now(UTC)
+    checkout.lifecycle_state = 'awaiting_funds'
+    checkout.funding_state = 'invoice_pending'
+    await db.commit()
+    await db.refresh(checkout)
+    return checkout
+
+
+async def _complete_direct_sale_locked(
+    db: AsyncSession,
+    *,
+    checkout: SubscriptionCheckout,
+    user: User,
+    target: Subscription | None,
+    provider_payment_id: str | None = None,
+) -> SubscriptionCheckout:
+    """Create exactly one direct-sale ledger and local subscription in this transaction."""
+    snapshot = dict(checkout.sale_snapshot or {})
+    total = int(snapshot.get('tariff_total_kopeks') or 0)
+    if (
+        not snapshot
+        or snapshot.get('currency') != 'RUB'
+        or total <= 0
+        or total != checkout.tariff_total_kopeks
+        or snapshot.get('funding_mode') != checkout.funding_mode
+    ):
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'invalid_sale_snapshot'
+        raise DeviceFirstError('operator_review_required', 'The immutable sale snapshot is invalid')
+    if checkout.expect_no_subscription:
+        if await _current_subscription(db, user.id) is not None:
+            checkout.lifecycle_state = 'operator_review'
+            checkout.terminal_reason = 'subscription_appeared_after_payment'
+            raise DeviceFirstError('operator_review_required', 'Subscription changed after payment')
+    elif target is None or _subscription_snapshot(target) != snapshot.get('target_snapshot'):
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'target_subscription_changed_after_payment'
+        raise DeviceFirstError('operator_review_required', 'Subscription changed after payment')
+
+    if checkout.fulfillment_state == 'fulfilled':
+        return checkout
+    now = datetime.now(UTC)
+    if checkout.funding_mode == 'wallet':
+        if checkout.wallet_applied_kopeks != total or checkout.external_payable_kopeks != 0:
+            raise DeviceFirstError('operator_review_required', 'Invalid wallet settlement values')
+        if user.balance_kopeks < total:
+            raise DeviceFirstError('wallet_insufficient', 'The balance no longer covers the checkout', status_code=422)
+        user.balance_kopeks -= total
+    elif checkout.funding_mode == 'platega':
+        if checkout.wallet_applied_kopeks != 0 or checkout.external_payable_kopeks != total or not provider_payment_id:
+            raise DeviceFirstError('operator_review_required', 'Invalid provider settlement values')
+        receipt_key = f'provider-receipt:{checkout.id}'
+        receipt = (
+            await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == receipt_key))
+        ).scalar_one_or_none()
+        if receipt is None:
+            db.add(
+                Transaction(
+                    user_id=user.id,
+                    type=TransactionType.PROVIDER_RECEIPT.value,
+                    amount_kopeks=total,
+                    description=f'Device-first provider receipt for checkout {checkout.public_id}',
+                    payment_method='platega',
+                    external_id=provider_payment_id,
+                    device_first_checkout_id=checkout.id,
+                    device_first_ledger_key=receipt_key,
+                    is_completed=True,
+                    completed_at=now,
+                )
+            )
+    else:
+        raise DeviceFirstError('operator_review_required', 'Unknown funding method')
+
+    sale_key = f'direct-sale:{checkout.id}'
+    sale = (await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == sale_key))).scalar_one_or_none()
+    if sale is None:
+        sale = Transaction(
+            user_id=user.id,
+            type=TransactionType.SUBSCRIPTION_PAYMENT.value,
+            amount_kopeks=-total,
+            description=(f'Device-first direct sale: {snapshot["period_days"]} days, '
+                         f'{snapshot["device_limit"]} devices, checkout {checkout.public_id}'),
+            payment_method='balance' if checkout.funding_mode == 'wallet' else 'platega',
+            external_id=f'device-first-sale:{checkout.public_id}',
+            device_first_checkout_id=checkout.id,
+            device_first_ledger_key=sale_key,
+            is_completed=True,
+            completed_at=now,
+        )
+        db.add(sale)
+        await db.flush()
+
+    if target is None:
+        target = await create_paid_subscription(
+            db,
+            user_id=user.id,
+            duration_days=int(snapshot['period_days']),
+            traffic_limit_gb=int(snapshot['traffic_limit_gb']),
+            device_limit=int(snapshot['device_limit']),
+            connected_squads=list(snapshot['allowed_squads']),
+            tariff_id=int(snapshot['tariff_id']),
+            commit=False,
+        )
+    else:
+        target = await extend_subscription(
+            db,
+            target,
+            int(snapshot['period_days']),
+            tariff_id=int(snapshot['tariff_id']),
+            traffic_limit_gb=int(snapshot['traffic_limit_gb']),
+            device_limit=int(snapshot['device_limit']),
+            connected_squads=list(snapshot['allowed_squads']),
+            convert_trial=True,
+            commit=False,
+        )
+    user.has_had_paid_subscription = True
+    checkout.created_subscription_id = target.id
+    checkout.debit_transaction_id = sale.id
+    checkout.lifecycle_state = 'fulfilling'
+    checkout.funding_state = 'funded'
+    checkout.fulfillment_state = 'fulfilled'
+    checkout.provisioning_state = 'pending'
+    checkout.fulfilled_at = now
+    checkout.fulfilled_end_at = target.end_date
+    existing_outbox = (
+        await db.execute(
+            select(DeviceFirstOutbox).where(
+                DeviceFirstOutbox.checkout_id == checkout.id,
+                DeviceFirstOutbox.event_type == 'sync_subscription',
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_outbox is None:
+        db.add(
+            DeviceFirstOutbox(
+                checkout_id=checkout.id,
+                settlement_mode=DIRECT_SETTLEMENT_MODE,
+                payload_json={'subscription_id': target.id, 'checkout_id': checkout.public_id},
+            )
+        )
+    return checkout
+
+
+async def commit_direct_wallet_checkout(
+    db: AsyncSession,
+    *,
+    public_id: str,
+    user_id: int,
+) -> SubscriptionCheckout:
+    """The explicit full-wallet path; partial balance is never combined with Platega."""
+    checkout, user, target, tariff = await _lock_direct_context(db, public_id=public_id, user_id=user_id)
+    if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED or not is_device_first_canary_user(user):
+        raise DeviceFirstError('feature_disabled', 'New checkouts are temporarily disabled')
+    if checkout.financial_committed_at is not None:
+        if checkout.funding_mode != 'wallet':
+            raise DeviceFirstError('funding_mode_locked', 'Funding method is already fixed')
+        return checkout
+    if not await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff):
+        raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')
+    total = checkout.tariff_total_kopeks
+    if user.balance_kopeks < total:
+        raise DeviceFirstError('wallet_insufficient', 'The balance does not cover this checkout', status_code=422)
+    checkout.wallet_applied_kopeks = total
+    checkout.external_payable_kopeks = 0
+    checkout.funding_mode = 'wallet'
+    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='wallet')
+    checkout.financial_committed_at = datetime.now(UTC)
+    await _complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
+    await db.commit()
+    await db.refresh(checkout)
+    return checkout
+
+
+async def fulfill_direct_external_checkout(
+    db: AsyncSession,
+    *,
+    checkout_id: int,
+    provider_payment_id: str,
+) -> SubscriptionCheckout:
+    """Recovery-safe completion after an authenticated exact provider payment."""
+    checkout = (
+        await db.execute(select(SubscriptionCheckout).where(SubscriptionCheckout.id == checkout_id).with_for_update())
+    ).scalar_one()
+    if settlement_mode(checkout) != DIRECT_SETTLEMENT_MODE:
+        raise DeviceFirstError('legacy_checkout', 'This checkout is not a direct sale')
+    user = (await db.execute(select(User).where(User.id == checkout.user_id).with_for_update())).scalar_one()
+    target = None
+    if checkout.target_subscription_id is not None:
+        target = (
+            await db.execute(
+                select(Subscription)
+                .where(Subscription.id == checkout.target_subscription_id, Subscription.user_id == checkout.user_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+    try:
+        result = await _complete_direct_sale_locked(
+            db,
+            checkout=checkout,
+            user=user,
+            target=target,
+            provider_payment_id=provider_payment_id,
+        )
+    except DeviceFirstError:
+        await db.commit()
+        raise
+    await db.commit()
+    await db.refresh(result)
+    return result
 
 
 async def reconcile_armed_checkouts(db: AsyncSession, *, limit: int = 20) -> int:
@@ -741,7 +1132,10 @@ async def reconcile_armed_checkouts(db: AsyncSession, *, limit: int = 20) -> int
 
 
 async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=None) -> int:
-    """Claim one batch, then call RemnaWave only after the claim transaction."""
+    """Drain legacy work and fence v2 provisioning before any RemnaWave call."""
+    processed = await _process_direct_provisioning_outbox(db, limit=limit)
+    # Historical deposits remain drainable with their established worker.  v2
+    # rows never enter this unfenced legacy branch.
     now = datetime.now(UTC)
     stale_before = now - timedelta(minutes=5)
     rows = list(
@@ -749,6 +1143,7 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
             await db.execute(
                 select(DeviceFirstOutbox)
                 .where(
+                    DeviceFirstOutbox.settlement_mode == LEGACY_SETTLEMENT_MODE,
                     or_(
                         and_(
                             DeviceFirstOutbox.status.in_(['pending', 'retry']),
@@ -776,7 +1171,7 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
 
     from app.services.subscription_service import SubscriptionService
 
-    processed = 0
+    legacy_processed = 0
     for row in rows:
         checkout = await db.get(SubscriptionCheckout, row.checkout_id)
         subscription = await db.get(Subscription, row.payload_json['subscription_id'])
@@ -804,14 +1199,185 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
                             checkout_id=checkout.public_id,
                             error=str(delivery_error),
                         )
-            processed += int(ok)
+            legacy_processed += int(ok)
         except Exception as error:  # worker must preserve retry evidence
             row.status = 'retry'
             row.last_error = str(error)
             row.available_at = datetime.now(UTC) + timedelta(minutes=min(60, 2**row.attempts))
             checkout.provisioning_state = 'retry'
         await db.commit()
+    return processed + legacy_processed
+
+
+async def _process_direct_provisioning_outbox(db: AsyncSession, *, limit: int) -> int:
+    """Lease-fenced v2 delivery; a stale worker can never mark a newer lease done."""
+    now = datetime.now(UTC)
+    rows = list(
+        (
+            await db.execute(
+                select(DeviceFirstOutbox)
+                .where(
+                    DeviceFirstOutbox.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                    or_(
+                        and_(
+                            DeviceFirstOutbox.status.in_(['pending', 'retry']),
+                            DeviceFirstOutbox.available_at <= now,
+                            or_(
+                                DeviceFirstOutbox.lease_token.is_(None),
+                                DeviceFirstOutbox.lease_expires_at < now,
+                            ),
+                        ),
+                        # A worker may die after committing its claim and before
+                        # the RemnaWave call. Reclaim only its expired fenced
+                        # lease; an old token still cannot complete afterward.
+                        and_(
+                            DeviceFirstOutbox.status == 'processing',
+                            DeviceFirstOutbox.lease_expires_at < now,
+                        ),
+                    ),
+                )
+                .order_by(DeviceFirstOutbox.id)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    claims: list[tuple[int, str]] = []
+    for row in rows:
+        token = uuid.uuid4().hex
+        row.status = 'processing'
+        row.attempts += 1
+        row.lease_token = token
+        row.lease_expires_at = now + timedelta(minutes=5)
+        row.lease_epoch += 1
+        claims.append((row.id, token))
+    if claims:
+        await db.commit()
+
+    from app.services.subscription_service import SubscriptionService
+
+    processed = 0
+    for row_id, token in claims:
+        row = await db.get(DeviceFirstOutbox, row_id)
+        if row is None:
+            continue
+        subscription = await db.get(Subscription, row.payload_json['subscription_id'])
+        try:
+            ok, error = await SubscriptionService().ensure_subscription_synced(db, subscription)
+        except Exception as error:  # no stale write; preserve concise retry evidence
+            ok = False
+            error = type(error).__name__
+        current = (
+            await db.execute(
+                select(DeviceFirstOutbox)
+                .where(DeviceFirstOutbox.id == row_id, DeviceFirstOutbox.lease_token == token)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            continue
+        checkout = (
+            await db.execute(
+                select(SubscriptionCheckout)
+                .where(SubscriptionCheckout.id == current.checkout_id)
+                .with_for_update()
+            )
+        ).scalar_one()
+        current.lease_token = None
+        current.lease_expires_at = None
+        current.last_error = error
+        if ok:
+            current.status = 'done'
+            checkout.provisioning_state = 'ready'
+            checkout.lifecycle_state = 'ready'
+            notification = (
+                await db.execute(
+                    select(DeviceFirstNotificationOutbox).where(
+                        DeviceFirstNotificationOutbox.checkout_id == checkout.id,
+                        DeviceFirstNotificationOutbox.notification_type == 'ready',
+                    )
+                )
+            ).scalar_one_or_none()
+            if notification is None:
+                db.add(DeviceFirstNotificationOutbox(checkout_id=checkout.id, notification_type='ready'))
+            processed += 1
+        else:
+            current.status = 'retry'
+            current.available_at = datetime.now(UTC) + timedelta(minutes=min(60, 2 ** current.attempts))
+            checkout.provisioning_state = 'retry'
+        await db.commit()
     return processed
+
+
+async def process_device_first_notification_outbox(db: AsyncSession, *, bot, limit: int = 20) -> int:
+    """Send at most once: a crash after handing off to Telegram stays ``sending``."""
+    if bot is None:
+        return 0
+    rows = list(
+        (
+            await db.execute(
+                select(DeviceFirstNotificationOutbox)
+                .where(DeviceFirstNotificationOutbox.status == 'pending')
+                .order_by(DeviceFirstNotificationOutbox.id)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    claims: list[tuple[int, str]] = []
+    for row in rows:
+        token = uuid.uuid4().hex
+        row.status = 'sending'
+        row.lease_token = token
+        row.lease_expires_at = datetime.now(UTC) + timedelta(minutes=10)
+        row.sending_at = datetime.now(UTC)
+        claims.append((row.id, token))
+    if claims:
+        await db.commit()
+
+    sent = 0
+    for row_id, token in claims:
+        row = await db.get(DeviceFirstNotificationOutbox, row_id)
+        if row is None:
+            continue
+        checkout = await db.get(SubscriptionCheckout, row.checkout_id)
+        user = await db.get(User, checkout.user_id) if checkout else None
+        error: str | None = None
+        try:
+            if user is None or not user.telegram_id:
+                raise RuntimeError('telegram_recipient_unavailable')
+            text = (
+                '✅ Your VPN subscription is ready. Open the cabinet to connect.'
+                if user.language == 'en'
+                else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
+            )
+            await bot.send_message(user.telegram_id, text)
+        except Exception as exc:  # do not retry an uncertain external send
+            error = type(exc).__name__
+        current = (
+            await db.execute(
+                select(DeviceFirstNotificationOutbox)
+                .where(DeviceFirstNotificationOutbox.id == row_id, DeviceFirstNotificationOutbox.lease_token == token)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            continue
+        current.lease_token = None
+        current.lease_expires_at = None
+        if error is None:
+            current.status = 'sent'
+            current.sent_at = datetime.now(UTC)
+            sent += 1
+        else:
+            current.status = 'failed'
+            current.last_error = error
+        await db.commit()
+    return sent
 
 
 async def store_mutation_result(

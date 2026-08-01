@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import aiohttp
@@ -244,6 +245,39 @@ class PlategaService:
             return None
         redirect_url = response.get('redirect') or response.get('url')
         return str(redirect_url) if redirect_url else None
+
+    @staticmethod
+    def parse_amount_currency(response: dict[str, Any] | None) -> tuple[int, str] | None:
+        """Parse the documented provider amount without rounding it into agreement."""
+        if not isinstance(response, dict):
+            return None
+        details = response.get('paymentDetails')
+        details = details if isinstance(details, dict) else response
+        currency = str(details.get('currency') or '').upper()
+        raw_amount = details.get('amount')
+        if currency != 'RUB' or raw_amount is None:
+            return None
+        try:
+            amount = Decimal(str(raw_amount))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        if not amount.is_finite() or amount <= 0:
+            return None
+        kopeks = amount * Decimal(100)
+        if kopeks != kopeks.to_integral_value():
+            return None
+        return int(kopeks), currency
+
+    async def cancel_payment(self, transaction_id: str) -> bool:
+        """Documented Platega API currently exposes no cancellation endpoint.
+
+        Keep this explicit best-effort hook instead of inventing an unsafe URL.
+        A future documented provider cancellation can replace this method without
+        weakening the fail-closed mismatch path.
+        """
+        del transaction_id
+        logger.warning('platega_cancellation_not_supported_by_configured_api')
+        return False
 
     @staticmethod
     def parse_expires_at(expires_in: str | None) -> datetime | None:

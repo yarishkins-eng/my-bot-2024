@@ -397,6 +397,7 @@ class MonitoringService:
                 # The outbox commits its claim before any RemnaWave HTTP call.
                 try:
                     from app.services.device_first_checkout_service import (
+                        process_device_first_notification_outbox,
                         process_provisioning_outbox,
                         reconcile_armed_checkouts,
                     )
@@ -409,6 +410,7 @@ class MonitoringService:
                     await process_device_first_deposit_outbox(db)
                     await reconcile_armed_checkouts(db)
                     await process_provisioning_outbox(db, bot=self.bot)
+                    await process_device_first_notification_outbox(db, bot=self.bot)
                 except Exception as device_first_error:
                     logger.error(
                         'Ошибка device-first provisioning outbox',

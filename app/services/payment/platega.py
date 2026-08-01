@@ -23,6 +23,12 @@ class PlategaPaymentMixin:
     _FAILED_STATUSES = {'FAILED', 'CANCELED', 'EXPIRED'}
     _PENDING_STATUSES = {'PENDING', 'INPROGRESS'}
 
+    @staticmethod
+    def _is_direct_device_first_payment(payment: Any) -> bool:
+        """Direct-sale callbacks must not retain raw webhook payloads/signatures."""
+        metadata = getattr(payment, 'metadata_json', None) or {}
+        return metadata.get('settlement_mode') == 'direct_purchase_v2'
+
     async def create_platega_payment(
         self,
         db: AsyncSession,
@@ -167,6 +173,7 @@ class PlategaPaymentMixin:
             logger.error('Platega: не удалось заблокировать платёж', payment_id=payment.id)
             return False
         payment = locked
+        direct_device_first = self._is_direct_device_first_payment(payment)
 
         status_raw = str(payload.get('status') or '').upper()
         if not status_raw:
@@ -177,7 +184,8 @@ class PlategaPaymentMixin:
             if payment.is_paid:
                 logger.info('Platega платеж уже помечен как оплачен', correlation_id=payment.correlation_id)
                 # Update callback payload without releasing the lock prematurely
-                payment.callback_payload = payload
+                if not direct_device_first:
+                    payment.callback_payload = payload
                 if transaction_id and not payment.platega_transaction_id:
                     payment.platega_transaction_id = transaction_id
                 payment.updated_at = datetime.now(UTC)
@@ -186,7 +194,8 @@ class PlategaPaymentMixin:
 
             # Inline field updates — NO intermediate commit that would release FOR UPDATE lock
             payment.status = status_raw
-            payment.callback_payload = payload
+            if not direct_device_first:
+                payment.callback_payload = payload
             if transaction_id and not payment.platega_transaction_id:
                 payment.platega_transaction_id = transaction_id
             payment.updated_at = datetime.now(UTC)
@@ -203,7 +212,7 @@ class PlategaPaymentMixin:
                 db,
                 payment=payment,
                 status=status_raw,
-                callback_payload=payload,
+                callback_payload=None if direct_device_first else payload,
                 platega_transaction_id=transaction_id or None,
                 is_paid=False,
             )
@@ -214,7 +223,7 @@ class PlategaPaymentMixin:
             db,
             payment=payment,
             status=status_raw,
-            callback_payload=payload,
+            callback_payload=None if direct_device_first else payload,
             platega_transaction_id=transaction_id or None,
         )
         return True
@@ -260,11 +269,12 @@ class PlategaPaymentMixin:
                 else:
                     payment = locked
                     payment.status = remote_status
-                    payment.callback_payload = remote_payload
-                    payment.metadata_json = {
-                        **(getattr(payment, 'metadata_json', {}) or {}),
-                        'remote_status': remote_payload,
-                    }
+                    if not self._is_direct_device_first_payment(payment):
+                        payment.callback_payload = remote_payload
+                        payment.metadata_json = {
+                            **(getattr(payment, 'metadata_json', {}) or {}),
+                            'remote_status': remote_payload,
+                        }
                     payment.updated_at = datetime.now(UTC)
                     await db.flush()
                     result = await self._finalize_platega_payment(db, payment, remote_payload)
@@ -273,10 +283,11 @@ class PlategaPaymentMixin:
             elif status_changed:
                 # Non-success status change — safe to persist without lock
                 payment.status = remote_status
-                payment.metadata_json = {
-                    **(getattr(payment, 'metadata_json', {}) or {}),
-                    'remote_status': remote_payload,
-                }
+                if not self._is_direct_device_first_payment(payment):
+                    payment.metadata_json = {
+                        **(getattr(payment, 'metadata_json', {}) or {}),
+                        'remote_status': remote_payload,
+                    }
                 payment.updated_at = datetime.now(UTC)
                 await db.commit()
 

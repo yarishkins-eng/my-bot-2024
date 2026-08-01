@@ -7,11 +7,13 @@ import pytest
 from app.services.device_first_checkout_service import DeviceFirstError, expire_checkout_quote_if_needed
 from app.services.device_first_payment_service import (
     _checkout_return_url,
+    _direct_checkout_return_url,
     _verified_amount,
     available_platega_methods,
     create_platega_attempt,
     settle_device_first_platega_payment,
 )
+from app.services.platega_service import PlategaService
 
 
 def test_verified_amount_uses_actual_rub_provider_value():
@@ -22,6 +24,11 @@ def test_verified_amount_rejects_untrusted_currency_or_missing_amount():
     assert _verified_amount({'paymentDetails': {'amount': '10', 'currency': 'USD'}}) is None
     assert _verified_amount({'paymentDetails': {'currency': 'RUB'}}) is None
     assert _verified_amount({'paymentDetails': {'amount': '349.995', 'currency': 'RUB'}}) is None
+
+
+@pytest.mark.parametrize('amount', ['249.001', '248.995'])
+def test_verified_callback_amount_rejects_fractional_kopeks(amount):
+    assert _verified_amount({'paymentDetails': {'amount': amount, 'currency': 'RUB'}}) is None
 
 
 def test_semantic_method_mapping_excludes_unapproved_numeric_12(monkeypatch):
@@ -40,6 +47,25 @@ def test_checkout_return_url_keeps_only_configured_origin(monkeypatch):
         'https://cabinet.example/balance/top-up/result?old=1',
     )
     assert _checkout_return_url('checkout-1') == ('https://cabinet.example/subscription/purchase?checkout=checkout-1')
+
+
+def test_direct_return_url_never_uses_telegram_or_generic_topup_return(monkeypatch):
+    monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example/anything')
+    assert _direct_checkout_return_url('checkout-1') == 'https://cabinet.example/subscription/purchase?checkout=checkout-1'
+    monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://t.me/teplo_bot')
+    assert _direct_checkout_return_url('checkout-1') is None
+
+
+@pytest.mark.parametrize(
+    ('response', 'expected'),
+    [
+        ({'paymentDetails': {'amount': '249.00', 'currency': 'RUB'}}, (24900, 'RUB')),
+        ({'paymentDetails': {'amount': '249.001', 'currency': 'RUB'}}, None),
+        ({'paymentDetails': {'amount': '249.00', 'currency': 'USD'}}, None),
+    ],
+)
+def test_provider_create_response_requires_exact_integer_kopeks(response, expected):
+    assert PlategaService.parse_amount_currency(response) == expected
 
 
 @pytest.mark.asyncio

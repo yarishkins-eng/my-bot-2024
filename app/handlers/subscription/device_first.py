@@ -11,12 +11,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Tariff, User
+from app.database.models import PlategaPayment, Tariff, User
 from app.services.device_first_checkout_service import (
+    DIRECT_SETTLEMENT_MODE,
     DeviceFirstError,
     arm_checkout,
     build_purchase_options,
     cancel_checkout,
+    commit_direct_wallet_checkout,
     confirm_checkout,
     create_checkout,
     device_first_top_up_kopeks,
@@ -581,15 +583,23 @@ async def _render_arm_confirmation(
     checkout,
 ) -> None:
     """Render the deliberate second confirmation for a confirmed checkout."""
-    # This is the exact whole-ruble, provider-valid invoice amount shown by
-    # both the API and Platega. A small minimum top-up surplus stays on balance.
-    shortage = device_first_top_up_kopeks(
-        price_kopeks=checkout.max_price_kopeks,
-        balance_kopeks=user.balance_kopeks,
+    direct = getattr(checkout, 'settlement_mode', None) == DIRECT_SETTLEMENT_MODE
+    total = checkout.tariff_total_kopeks if direct else checkout.quoted_price_kopeks
+    shortage = (
+        max(0, total - user.balance_kopeks)
+        if direct
+        else device_first_top_up_kopeks(
+            price_kopeks=checkout.max_price_kopeks,
+            balance_kopeks=user.balance_kopeks,
+        )
     )
-    top_up_surplus = device_first_top_up_surplus_kopeks(
-        price_kopeks=checkout.max_price_kopeks,
-        balance_kopeks=user.balance_kopeks,
+    top_up_surplus = (
+        0
+        if direct
+        else device_first_top_up_surplus_kopeks(
+            price_kopeks=checkout.max_price_kopeks,
+            balance_kopeks=user.balance_kopeks,
+        )
     )
     await edit_or_answer_photo(
         callback=callback,
@@ -597,7 +607,7 @@ async def _render_arm_confirmation(
             user,
             (
                 '🔐 <b>Заказ подтверждён</b>\n\n'
-                f'К списанию: {_money(user, checkout.quoted_price_kopeks)} ₽.\n'
+                f'К оплате: {_money(user, total)} ₽.\n'
                 'Списание произойдёт только после следующего нажатия.'
                 + (
                     f' После оформления {_money(user, top_up_surplus)} ₽ останется на балансе.'
@@ -607,7 +617,7 @@ async def _render_arm_confirmation(
             ),
             (
                 '🔐 <b>Order confirmed</b>\n\n'
-                f'To charge: ₽{_money(user, checkout.quoted_price_kopeks)}.\n'
+                f'To pay: ₽{_money(user, total)}.\n'
                 'The charge happens only after the next tap.'
                 + (
                     f' ₽{_money(user, top_up_surplus)} will remain on your balance after the order.'
@@ -623,14 +633,14 @@ async def _render_arm_confirmation(
                         text=(
                             _text(
                                 user,
-                                f'Пополнить {_money(user, shortage)} ₽ и оформить',
-                                f'Top up ₽{_money(user, shortage)} and subscribe',
+                                f'Выбрать оплату {_money(user, total)} ₽',
+                                f'Choose payment ₽{_money(user, total)}',
                             )
                             if shortage
                             else _text(
                                 user,
-                                f'Списать {_money(user, checkout.quoted_price_kopeks)} ₽ и оформить',
-                                f'Charge ₽{_money(user, checkout.quoted_price_kopeks)} and subscribe',
+                                f'Списать {_money(user, total)} ₽ и оформить',
+                                f'Charge ₽{_money(user, total)} and subscribe',
                             )
                         ),
                         callback_data=f'df:a:{checkout.public_id}',
@@ -646,6 +656,45 @@ async def _render_arm_confirmation(
     )
 
 
+async def _render_direct_payment_methods(
+    callback: types.CallbackQuery,
+    user: User,
+    db: AsyncSession,
+    checkout,
+) -> None:
+    """v2 external funding is one full-price invoice, never a top-up shortfall."""
+    methods = await available_platega_methods_for_db(db, user)
+    total = _money(user, checkout.tariff_total_kopeks)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_text(
+                    user,
+                    f'Оплатить {total} ₽ через {platega_method_label(item["key"], language=user.language)}',
+                    f'Pay ₽{total} with {platega_method_label(item["key"], language=user.language)}',
+                ),
+                callback_data=f'df:y:{item["key"]}:{checkout.public_id}',
+            )
+        ]
+        for item in methods
+    ]
+    rows.append([_cancel_order(user, checkout.public_id)])
+    caption = _text(
+        user,
+        f'💳 <b>Оплата заказа</b>\n\nК оплате одним счётом: <b>{total} ₽</b>. Баланс не используется частично.',
+        f'💳 <b>Pay for your order</b>\n\nOne full invoice: <b>₽{total}</b>. Balance is not partially used.',
+    )
+    if not methods:
+        caption += _text(user, '\n\nСпособ оплаты сейчас недоступен. Обратитесь в поддержку.', '\n\nPayment is unavailable. Contact support.')
+        rows = [[InlineKeyboardButton(text=_text(user, 'Связаться с поддержкой', 'Contact support'), callback_data='menu_support')], [_cancel_order(user, checkout.public_id)]]
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=caption,
+        keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode='HTML',
+    )
+
+
 async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncSession, checkout) -> None:
     result = serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)
     if result['ui_state'] == 'confirmation':
@@ -653,7 +702,8 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
         return
     if result['ui_state'] == 'awaiting_payment':
         shortage = result['shortage_kopeks'] or 0
-        top_up_surplus = result.get('top_up_surplus_kopeks') or 0
+        direct = getattr(checkout, 'settlement_mode', None) == DIRECT_SETTLEMENT_MODE
+        top_up_surplus = 0 if direct else result.get('top_up_surplus_kopeks') or 0
         pending_attempt = None
         if getattr(checkout, 'id', None) is not None:
             pending_attempt = await get_pending_platega_attempt(db, checkout_id=checkout.id)
@@ -664,7 +714,11 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                 text=_text(user, 'Проверить статус', 'Check status'),
                 callback_data=f'df:s:{checkout.public_id}',
             )
-            if pending_attempt.status == 'pending' and pending_attempt.redirect_url:
+            redirect_url = pending_attempt.redirect_url
+            if direct and pending_attempt.platega_payment_id:
+                payment = await db.get(PlategaPayment, pending_attempt.platega_payment_id)
+                redirect_url = payment.redirect_url if payment else None
+            if pending_attempt.status == 'pending' and redirect_url:
                 caption = _text(
                     user,
                     (
@@ -686,7 +740,7 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                         [
                             InlineKeyboardButton(
                                 text=_text(user, 'Перейти к оплате', 'Open payment'),
-                                url=pending_attempt.redirect_url,
+                                url=redirect_url,
                             )
                         ],
                         [status_button],
@@ -728,6 +782,9 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                     '⏳ <b>Payment is being processed</b>\n\nDo not create another invoice. Refresh the status in a few seconds.',
                 )
                 keyboard = InlineKeyboardMarkup(inline_keyboard=[[status_button], [_main_menu(user)]])
+        elif direct:
+            await _render_direct_payment_methods(callback, user, db, checkout)
+            return
         elif shortage:
             methods = await available_platega_methods_for_db(db, user)
             if methods:
@@ -1013,7 +1070,14 @@ async def arm(
             user_id=db_user.id,
             for_update=True,
         )
-        checkout = await arm_checkout(db, checkout)
+        if getattr(checkout, 'settlement_mode', None) == DIRECT_SETTLEMENT_MODE:
+            if db_user.balance_kopeks >= checkout.tariff_total_kopeks:
+                checkout = await commit_direct_wallet_checkout(db, public_id=checkout.public_id, user_id=db_user.id)
+            else:
+                await _render_direct_payment_methods(callback, db_user, db, checkout)
+                return
+        else:
+            checkout = await arm_checkout(db, checkout)
     except DeviceFirstError as error:
         await _render_error(callback, db_user, error)
         return

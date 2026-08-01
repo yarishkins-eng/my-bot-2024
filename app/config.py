@@ -273,6 +273,10 @@ class Settings(BaseSettings):
     # Master switch for creating NEW device-first checkouts. Existing status,
     # payment webhooks and workers deliberately continue while this is false.
     DEVICE_FIRST_NEW_CHECKOUTS_ENABLED: bool = False
+    # Empty by default: a production direct-sale checkout is unavailable until
+    # one owner account is explicitly allowlisted for the controlled canary.
+    # This deliberately uses internal user ids and is never returned by an API.
+    DEVICE_FIRST_CANARY_USER_IDS: str = ''
 
     # ID тарифа для триала в режиме тарифов (0 = использовать стандартные настройки триала)
     # Если указан ID тарифа, параметры триала берутся из тарифа (traffic_limit_gb, device_limit, allowed_squads)
