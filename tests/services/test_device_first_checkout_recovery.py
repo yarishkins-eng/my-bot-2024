@@ -1,9 +1,16 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.services.device_first_checkout_service import reconcile_armed_checkouts
+from app.services.device_first_checkout_service import (
+    DIRECT_SETTLEMENT_MODE,
+    DeviceFirstError,
+    get_open_checkout_for_user,
+    reconcile_armed_checkouts,
+    settlement_mode,
+)
 
 
 class Result:
@@ -11,6 +18,9 @@ class Result:
         self.rows = rows
 
     def all(self):
+        return self.rows
+
+    def scalar_one_or_none(self):
         return self.rows
 
 
@@ -49,3 +59,29 @@ async def test_reconciler_isolates_one_failed_checkout_and_continues():
     assert processed == 1
     assert fulfill.await_count == 2
     db.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_paid_direct_provisioning_checkout_remains_resumable_after_quote_expiry():
+    checkout = SimpleNamespace(
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='fulfilling',
+        fulfillment_state='fulfilled',
+        provisioning_state='pending',
+        expires_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=Result(checkout)),
+        commit=AsyncMock(),
+    )
+
+    result = await get_open_checkout_for_user(db, user_id=7)
+
+    assert result is checkout
+    db.commit.assert_not_awaited()
+
+
+def test_missing_settlement_mode_requires_operator_review():
+    with pytest.raises(DeviceFirstError) as raised:
+        settlement_mode(SimpleNamespace(settlement_mode=None))
+    assert raised.value.code == 'operator_review_required'

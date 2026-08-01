@@ -4,6 +4,7 @@ import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -70,6 +71,45 @@ def test_compute_cryptobot_limits_scale_with_rate():
     assert high_rate_max == 12000000
     assert high_rate_min > low_rate_min
     assert high_rate_max > low_rate_max
+
+
+@pytest.mark.anyio('asyncio')
+async def test_direct_platega_browser_status_is_local_and_hides_provider_identifiers(monkeypatch):
+    payment = types.SimpleNamespace(
+        id=51,
+        user_id=7,
+        metadata_json={'settlement_mode': 'direct_purchase_v2'},
+        status='PENDING',
+        is_paid=False,
+        amount_kopeks=35000,
+        currency='RUB',
+        paid_at=None,
+        updated_at=None,
+        created_at=datetime.now(UTC),
+        transaction_id=81,
+        platega_transaction_id='provider-private-id',
+        correlation_id='provider-private-correlation',
+    )
+
+    async def get_by_id(db, payment_id):
+        assert payment_id == 51
+        return payment
+
+    monkeypatch.setattr('app.database.crud.platega.get_platega_payment_by_id', get_by_id)
+    payment_service = types.SimpleNamespace(get_platega_payment_status=AsyncMock())
+    query = MiniAppPaymentStatusQuery(method='platega', localPaymentId=51, amountKopeks=35000)
+
+    result = await miniapp._resolve_platega_payment_status(
+        payment_service=payment_service,
+        db=types.SimpleNamespace(),
+        user=types.SimpleNamespace(id=7),
+        query=query,
+    )
+
+    payment_service.get_platega_payment_status.assert_not_awaited()
+    assert result.external_id is None
+    assert result.transaction_id is None
+    assert result.extra == {'status': 'PENDING', 'is_paid': False}
 
 
 def test_encode_decode_renewal_payload_preserves_snapshot():
