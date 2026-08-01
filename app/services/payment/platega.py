@@ -43,6 +43,8 @@ class PlategaPaymentMixin:
         *,
         payment: Any,
         provider_status: str,
+        lease_token: str | None = None,
+        lease_epoch: int | None = None,
     ) -> None:
         """Fence a contradictory post-paid provider terminal status for review.
 
@@ -63,21 +65,32 @@ class PlategaPaymentMixin:
             await db.execute(select(User).where(User.id == payment_user_id).with_for_update())
         attempt = None
         if isinstance(attempt_id, int):
-            attempt = (
-                await db.execute(
-                    select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id).with_for_update()
+            attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
+            if lease_token is not None and lease_epoch is not None:
+                attempt_query = attempt_query.where(
+                    CheckoutPaymentAttempt.lease_token == lease_token,
+                    CheckoutPaymentAttempt.lease_epoch == lease_epoch,
+                    CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
                 )
-            ).scalar_one_or_none()
+            attempt = (await db.execute(attempt_query.with_for_update())).scalar_one_or_none()
+
+        if attempt is None or attempt.settlement_mode != 'direct_purchase_v2':
+            # A polling worker that lost its lease must not overwrite a newer
+            # callback's decision. A webhook path has no lease and therefore
+            # still preserves an unclassifiable paid record for an operator.
+            if lease_token is not None or lease_epoch is not None:
+                logger.warning('direct_device_first_reversal_lease_lost', payment_id=payment.id)
+                return
+            payment.status = 'OPERATOR_REVIEW'
+            payment.updated_at = datetime.now(UTC)
+            await db.commit()
+            logger.error('direct_device_first_reversal_missing_attempt', payment_id=payment.id)
+            return
 
         payment.status = 'OPERATOR_REVIEW'
         # Preserve the fact that a receipt was accepted. Setting this false
         # would let generic legacy code reinterpret an already settled sale.
         payment.updated_at = datetime.now(UTC)
-        if attempt is None or attempt.settlement_mode != 'direct_purchase_v2':
-            await db.commit()
-            logger.error('direct_device_first_reversal_missing_attempt', payment_id=payment.id)
-            return
-
         checkout = (
             await db.execute(
                 select(SubscriptionCheckout).where(SubscriptionCheckout.id == attempt.checkout_id).with_for_update()

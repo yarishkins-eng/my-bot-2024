@@ -1046,6 +1046,16 @@ async def fulfill_direct_external_checkout(
         raise ValueError('direct fulfilment lease requires both token and epoch')
     if payment_attempt_id is None:
         raise DeviceFirstError('invalid_state', 'Direct fulfilment requires its paid payment attempt')
+    # Locking contract for direct paid paths is user → attempt → checkout.
+    # Read the immutable owner key without a row lock first; taking Attempt
+    # before User would deadlock a concurrent post-paid reversal, which fences
+    # the same three rows in this canonical order.
+    checkout_owner_id = await db.scalar(
+        select(SubscriptionCheckout.user_id).where(SubscriptionCheckout.id == checkout_id)
+    )
+    if checkout_owner_id is None:
+        raise DeviceFirstError('invalid_state', 'Direct checkout is no longer eligible for fulfilment')
+    user = (await db.execute(select(User).where(User.id == checkout_owner_id).with_for_update())).scalar_one()
     attempt_predicates = [
         CheckoutPaymentAttempt.id == payment_attempt_id,
         CheckoutPaymentAttempt.checkout_id == checkout_id,
@@ -1068,7 +1078,11 @@ async def fulfill_direct_external_checkout(
     if owned_attempt is None:
         raise DeviceFirstError('invalid_state', 'Direct payment attempt is no longer eligible for fulfilment')
     checkout = (
-        await db.execute(select(SubscriptionCheckout).where(SubscriptionCheckout.id == checkout_id).with_for_update())
+        await db.execute(
+            select(SubscriptionCheckout)
+            .where(SubscriptionCheckout.id == checkout_id, SubscriptionCheckout.user_id == user.id)
+            .with_for_update()
+        )
     ).scalar_one()
     if settlement_mode(checkout) != DIRECT_SETTLEMENT_MODE:
         raise DeviceFirstError('legacy_checkout', 'This checkout is not a direct sale')
@@ -1084,7 +1098,6 @@ async def fulfill_direct_external_checkout(
         or checkout.fulfillment_state != 'not_started'
     ):
         raise DeviceFirstError('invalid_state', 'Direct checkout is no longer eligible for fulfilment')
-    user = (await db.execute(select(User).where(User.id == checkout.user_id).with_for_update())).scalar_one()
     target = None
     if checkout.target_subscription_id is not None:
         target = (

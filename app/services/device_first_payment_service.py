@@ -917,6 +917,11 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
             lease_epoch = attempt.lease_epoch
         if attempt.status == 'creating' and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
             try:
+                checkout_owner_id = await db.scalar(
+                    select(SubscriptionCheckout.user_id).where(SubscriptionCheckout.id == attempt.checkout_id)
+                )
+                if checkout_owner_id is not None:
+                    await db.execute(select(User).where(User.id == checkout_owner_id).with_for_update())
                 owned_attempt = await _lock_owned_direct_attempt_lease(
                     db,
                     attempt_id=attempt_id,
@@ -932,11 +937,6 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                         .with_for_update()
                     )
                 ).scalar_one_or_none()
-                checkout_owner_id = await db.scalar(
-                    select(SubscriptionCheckout.user_id).where(SubscriptionCheckout.id == owned_attempt.checkout_id)
-                )
-                if checkout_owner_id is not None:
-                    await db.execute(select(User).where(User.id == checkout_owner_id).with_for_update())
                 checkout = (
                     await db.execute(
                         select(SubscriptionCheckout)
@@ -1029,6 +1029,24 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
             payment = await db.get(PlategaPayment, attempt.platega_payment_id)
             if payment is None:
                 continue
+            if status in {'FAILED', 'CANCELED', 'EXPIRED'} and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
+                # The fence takes User → Attempt → Checkout.  Do not acquire
+                # Attempt here first: a paid fulfilment takes that same order
+                # and an inverted worker path would deadlock the reversal.
+                from app.services.payment.platega import PlategaPaymentMixin
+
+                payment = (
+                    await db.execute(select(PlategaPayment).where(PlategaPayment.id == payment.id).with_for_update())
+                ).scalar_one()
+                if payment.is_paid:
+                    await PlategaPaymentMixin()._mark_direct_post_paid_reversal(
+                        db,
+                        payment=payment,
+                        provider_status=status,
+                        lease_token=lease_token,
+                        lease_epoch=lease_epoch,
+                    )
+                    continue
             if status == 'CONFIRMED':
                 settled = await settle_device_first_platega_payment(
                     db,
@@ -1060,18 +1078,6 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                         )
                     ).scalar_one()
                 if status in {'FAILED', 'CANCELED', 'EXPIRED'}:
-                    if settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE and payment.is_paid:
-                        # A contradictory provider terminal after an accepted
-                        # direct payment must take exactly the same fenced
-                        # operator-review path as an authenticated webhook.
-                        from app.services.payment.platega import PlategaPaymentMixin
-
-                        await PlategaPaymentMixin()._mark_direct_post_paid_reversal(
-                            db,
-                            payment=payment,
-                            provider_status=status,
-                        )
-                        continue
                     attempt.status = 'failed'
                     attempt.reconciliation_reason = f'provider_terminal:{status.lower()}'
                     payment.status = status
