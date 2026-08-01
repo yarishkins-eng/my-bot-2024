@@ -4,7 +4,15 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from app.cabinet.routes.device_first import _checkout_command, _mutation, checkout_get, checkout_open
+from app.cabinet.routes.device_first import (
+    PaymentAttemptRequest,
+    _checkout_command,
+    _mutation,
+    checkout_get,
+    checkout_open,
+    checkout_pending_payment,
+    checkout_resume_invoice,
+)
 from app.services.device_first_checkout_service import DeviceFirstError, checkout_ui_state
 
 
@@ -129,3 +137,68 @@ def test_fulfilled_checkout_is_not_ready_before_provisioning() -> None:
     checkout.lifecycle_state = 'ready'
     checkout.provisioning_state = 'ready'
     assert checkout_ui_state(checkout) == 'ready'
+
+
+@pytest.mark.asyncio
+async def test_resume_invoice_rejects_paid_or_operator_review_direct_checkout() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    checkout = SimpleNamespace(
+        id=91,
+        settlement_mode='direct_purchase_v2',
+        funding_mode='platega',
+        financial_committed_at=object(),
+        lifecycle_state='operator_review',
+        funding_state='funded',
+        fulfillment_state='fulfilled',
+        created_subscription_id=42,
+        debit_transaction_id=77,
+    )
+    db = AsyncMock()
+    with (
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch('app.cabinet.routes.device_first.get_owned_checkout', AsyncMock(return_value=checkout)),
+        patch('app.cabinet.routes.device_first.create_platega_attempt', AsyncMock()) as create_attempt,
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()),
+    ):
+        with pytest.raises(HTTPException) as raised:
+            await checkout_resume_invoice(
+                'checkout-91',
+                PaymentAttemptRequest(method_key='sbp'),
+                idempotency_key='resume-operator-review',
+                user=user,
+                db=db,
+            )
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail['code'] == 'invoice_resume_unavailable'
+    create_attempt.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_payment_never_offers_resume_for_direct_operator_review() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    checkout = SimpleNamespace(
+        id=91,
+        settlement_mode='direct_purchase_v2',
+        funding_mode='platega',
+        financial_committed_at=object(),
+        lifecycle_state='operator_review',
+        funding_state='funded',
+        fulfillment_state='fulfilled',
+        created_subscription_id=42,
+        debit_transaction_id=77,
+    )
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[Result(None), Result(41)]))
+    with patch('app.cabinet.routes.device_first.get_owned_checkout', AsyncMock(return_value=checkout)):
+        response = await checkout_pending_payment('checkout-91', user=user, db=db)
+
+    assert response == {'redirect_url': None, 'status': 'missing', 'resume_allowed': False}

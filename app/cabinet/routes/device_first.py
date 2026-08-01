@@ -376,6 +376,72 @@ async def checkout_commit(
     return response
 
 
+@router.post('/checkout/{checkout_id}/resume-invoice')
+async def checkout_resume_invoice(
+    checkout_id: str,
+    request: PaymentAttemptRequest,
+    idempotency_key: str | None = Header(None, alias='Idempotency-Key'),
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Owner-only recovery for a pre-attempt crash; never retries a known POST."""
+    mutation, replay = await _mutation(
+        db,
+        user_id=user.id,
+        action='resume_invoice',
+        key=idempotency_key,
+        payload={'checkout_id': checkout_id, **request.model_dump()},
+    )
+    if replay is not None:
+        return replay
+    try:
+        checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
+        if (
+            checkout.settlement_mode != DIRECT_SETTLEMENT_MODE
+            or checkout.funding_mode != 'platega'
+            or checkout.financial_committed_at is None
+            or checkout.lifecycle_state != 'awaiting_funds'
+            or checkout.funding_state != 'invoice_pending'
+            or checkout.fulfillment_state != 'not_started'
+            or checkout.created_subscription_id is not None
+            or checkout.debit_transaction_id is not None
+        ):
+            raise DeviceFirstError('invoice_resume_unavailable', 'This checkout has no resumable direct invoice')
+        known_attempt = (
+            await db.execute(
+                select(CheckoutPaymentAttempt.id).where(CheckoutPaymentAttempt.checkout_id == checkout.id).limit(1)
+            )
+        ).scalar_one_or_none()
+        if known_attempt is not None:
+            raise DeviceFirstError('invoice_resume_unavailable', 'This checkout already has a payment attempt')
+        mutation.checkout_id = checkout.id
+        attempt = await create_platega_attempt(
+            db,
+            checkout_public_id=checkout_id,
+            user_id=user.id,
+            method_key=request.method_key,
+            allow_direct_pre_attempt_recovery=True,
+        )
+        payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+        checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
+        response = {
+            'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks),
+            # A missing redirect means the existing durable attempt is
+            # ambiguous/reconciling. Do not make a second provider POST.
+            **({'redirect_url': payment.redirect_url} if payment and payment.redirect_url else {}),
+        }
+    except DeviceFirstError as error:
+        await store_mutation_result(
+            db,
+            mutation,
+            response={'code': error.code, 'message': str(error)},
+            status_code=error.status_code,
+        )
+        _raise(error)
+    await store_mutation_result(db, mutation, response=response)
+    return response
+
+
 @router.get('/checkout/{checkout_id}/pending-payment')
 async def checkout_pending_payment(
     checkout_id: str,
@@ -397,12 +463,32 @@ async def checkout_pending_payment(
             .limit(1)
         )
     ).scalar_one_or_none()
-    if attempt is None or attempt.platega_payment_id is None:
-        raise HTTPException(status_code=404, detail={'code': 'pending_payment_not_found'})
-    payment = await db.get(PlategaPayment, attempt.platega_payment_id)
-    if payment is None or not payment.redirect_url:
-        raise HTTPException(status_code=404, detail={'code': 'pending_payment_not_found'})
-    return {'redirect_url': payment.redirect_url, 'status': attempt.status}
+    if attempt is None:
+        # This can only represent a crash from a version predating the atomic
+        # intent commit. The owner may choose a method once to resume; unknown
+        # provider POSTs are never retried.
+        known_attempt = (
+            await db.execute(
+                select(CheckoutPaymentAttempt.id).where(CheckoutPaymentAttempt.checkout_id == checkout.id).limit(1)
+            )
+        ).scalar_one_or_none()
+        resume_allowed = (
+            known_attempt is None
+            and checkout.funding_mode == 'platega'
+            and checkout.financial_committed_at is not None
+            and checkout.lifecycle_state == 'awaiting_funds'
+            and checkout.funding_state == 'invoice_pending'
+            and checkout.fulfillment_state == 'not_started'
+            and checkout.created_subscription_id is None
+            and checkout.debit_transaction_id is None
+        )
+        return {'redirect_url': None, 'status': 'missing', 'resume_allowed': resume_allowed}
+    payment = await db.get(PlategaPayment, attempt.platega_payment_id) if attempt.platega_payment_id else None
+    return {
+        'redirect_url': payment.redirect_url if payment and payment.redirect_url else None,
+        'status': attempt.status,
+        'resume_allowed': False,
+    }
 
 
 @router.post('/checkout/{checkout_id}/cancel')
