@@ -277,6 +277,10 @@ class Settings(BaseSettings):
     # one owner account is explicitly allowlisted for the controlled canary.
     # This deliberately uses internal user ids and is never returned by an API.
     DEVICE_FIRST_CANARY_USER_IDS: str = ''
+    # Direct-sale reconciliation must not wait for the coarse, general
+    # subscription monitoring loop. Keep this short but bounded: the worker
+    # handles only v2 rows, each protected by its own database lease.
+    DEVICE_FIRST_RECOVERY_WORKER_INTERVAL_SECONDS: int = 10
 
     # ID тарифа для триала в режиме тарифов (0 = использовать стандартные настройки триала)
     # Если указан ID тарифа, параметры триала берутся из тарифа (traffic_limit_gb, device_limit, allowed_squads)
@@ -2802,6 +2806,13 @@ class Settings(BaseSettings):
 
     def is_payment_verification_auto_check_enabled(self) -> bool:
         return self.PAYMENT_VERIFICATION_AUTO_CHECK_ENABLED
+
+    def get_device_first_recovery_worker_interval_seconds(self) -> int:
+        try:
+            interval = int(self.DEVICE_FIRST_RECOVERY_WORKER_INTERVAL_SECONDS)
+        except (TypeError, ValueError):
+            interval = 10
+        return max(5, min(60, interval))
 
     def get_payment_verification_auto_check_interval(self) -> int:
         try:

@@ -902,32 +902,40 @@ async def _lock_owned_direct_attempt_lease(
     ).scalar_one_or_none()
 
 
-async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) -> int:
+async def reconcile_device_first_payments(
+    db: AsyncSession,
+    *,
+    limit: int = 20,
+    direct_only: bool = False,
+) -> int:
     """Poll known identities with v2 lease fencing; browser state never settles money."""
     now = datetime.now(UTC)
+    predicates = [
+        CheckoutPaymentAttempt.next_reconcile_at <= now,
+        or_(
+            and_(
+                CheckoutPaymentAttempt.status.in_(['pending', 'reconciliation', 'paid_processing']),
+                CheckoutPaymentAttempt.provider_payment_id.is_not(None),
+                CheckoutPaymentAttempt.platega_payment_id.is_not(None),
+            ),
+            # A crash after the atomic intent commit but before a
+            # provider identity is known is never retried: Platega
+            # has no idempotency key. Escalate it after a grace
+            # period instead of risking a second invoice.
+            and_(
+                CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                CheckoutPaymentAttempt.status == 'creating',
+                CheckoutPaymentAttempt.provider_payment_id.is_(None),
+            ),
+        ),
+    ]
+    if direct_only:
+        predicates.append(CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE)
     attempts = list(
         (
             await db.execute(
                 select(CheckoutPaymentAttempt)
-                .where(
-                    CheckoutPaymentAttempt.next_reconcile_at <= now,
-                    or_(
-                        and_(
-                            CheckoutPaymentAttempt.status.in_(['pending', 'reconciliation', 'paid_processing']),
-                            CheckoutPaymentAttempt.provider_payment_id.is_not(None),
-                            CheckoutPaymentAttempt.platega_payment_id.is_not(None),
-                        ),
-                        # A crash after the atomic intent commit but before a
-                        # provider identity is known is never retried: Platega
-                        # has no idempotency key. Escalate it after a grace
-                        # period instead of risking a second invoice.
-                        and_(
-                            CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
-                            CheckoutPaymentAttempt.status == 'creating',
-                            CheckoutPaymentAttempt.provider_payment_id.is_(None),
-                        ),
-                    ),
-                )
+                .where(*predicates)
                 .order_by(
                     CheckoutPaymentAttempt.next_reconcile_at,
                     CheckoutPaymentAttempt.id,

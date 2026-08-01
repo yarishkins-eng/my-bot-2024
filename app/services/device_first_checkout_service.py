@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -1155,6 +1156,7 @@ async def commit_direct_wallet_checkout(
     checkout.financial_committed_at = datetime.now(UTC)
     await _complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
     await db.commit()
+    await _kick_direct_provisioning_post_commit(db, checkout_id=checkout.id)
     await db.refresh(checkout)
     return checkout
 
@@ -1246,8 +1248,35 @@ async def fulfill_direct_external_checkout(
         await db.commit()
         raise
     await db.commit()
+    await _kick_direct_provisioning_post_commit(db, checkout_id=result.id)
     await db.refresh(result)
     return result
+
+
+async def _kick_direct_provisioning_post_commit(db: AsyncSession, *, checkout_id: int) -> None:
+    """Best-effort immediate v2 delivery after its sale is durable.
+
+    This is deliberately post-commit: a failed RemnaWave request can never
+    undo a confirmed receipt or subscription sale.  The narrow worker only
+    claims this checkout's direct outbox row; its durable lease/backoff and the
+    dedicated recovery loop take over if this first attempt cannot finish.
+    """
+    try:
+        await process_direct_provisioning_outbox(db, checkout_id=checkout_id, limit=1)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        # The financial commit above is already durable. Reset this session for
+        # the webhook caller and leave the outbox pending/retry for recovery.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            'device_first_direct_provisioning_kick_failed',
+            checkout_id=checkout_id,
+            error=type(error).__name__,
+        )
 
 
 async def reconcile_armed_checkouts(db: AsyncSession, *, limit: int = 20) -> int:
@@ -1286,7 +1315,7 @@ async def reconcile_armed_checkouts(db: AsyncSession, *, limit: int = 20) -> int
 
 async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=None) -> int:
     """Drain legacy work and fence v2 provisioning before any RemnaWave call."""
-    processed = await _process_direct_provisioning_outbox(db, limit=limit)
+    processed = await process_direct_provisioning_outbox(db, limit=limit)
     # Historical deposits remain drainable with their established worker.  v2
     # rows never enter this unfenced legacy branch.
     now = datetime.now(UTC)
@@ -1362,33 +1391,51 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
     return processed + legacy_processed
 
 
-async def _process_direct_provisioning_outbox(db: AsyncSession, *, limit: int) -> int:
+async def process_direct_provisioning_outbox(
+    db: AsyncSession,
+    *,
+    limit: int = 20,
+    checkout_id: int | None = None,
+) -> int:
+    """Drain only fenced v2 provisioning; an optional id scopes an inline kick."""
+    return await _process_direct_provisioning_outbox(db, limit=limit, checkout_id=checkout_id)
+
+
+async def _process_direct_provisioning_outbox(
+    db: AsyncSession,
+    *,
+    limit: int,
+    checkout_id: int | None = None,
+) -> int:
     """Lease-fenced v2 delivery; a stale worker can never mark a newer lease done."""
     now = datetime.now(UTC)
+    predicates = [DeviceFirstOutbox.settlement_mode == DIRECT_SETTLEMENT_MODE]
+    if checkout_id is not None:
+        predicates.append(DeviceFirstOutbox.checkout_id == checkout_id)
+    predicates.append(
+        or_(
+            and_(
+                DeviceFirstOutbox.status.in_(['pending', 'retry']),
+                DeviceFirstOutbox.available_at <= now,
+                or_(
+                    DeviceFirstOutbox.lease_token.is_(None),
+                    DeviceFirstOutbox.lease_expires_at < now,
+                ),
+            ),
+            # A worker may die after committing its claim and before
+            # the RemnaWave call. Reclaim only its expired fenced
+            # lease; an old token still cannot complete afterward.
+            and_(
+                DeviceFirstOutbox.status == 'processing',
+                DeviceFirstOutbox.lease_expires_at < now,
+            ),
+        )
+    )
     rows = list(
         (
             await db.execute(
                 select(DeviceFirstOutbox)
-                .where(
-                    DeviceFirstOutbox.settlement_mode == DIRECT_SETTLEMENT_MODE,
-                    or_(
-                        and_(
-                            DeviceFirstOutbox.status.in_(['pending', 'retry']),
-                            DeviceFirstOutbox.available_at <= now,
-                            or_(
-                                DeviceFirstOutbox.lease_token.is_(None),
-                                DeviceFirstOutbox.lease_expires_at < now,
-                            ),
-                        ),
-                        # A worker may die after committing its claim and before
-                        # the RemnaWave call. Reclaim only its expired fenced
-                        # lease; an old token still cannot complete afterward.
-                        and_(
-                            DeviceFirstOutbox.status == 'processing',
-                            DeviceFirstOutbox.lease_expires_at < now,
-                        ),
-                    ),
-                )
+                .where(*predicates)
                 .order_by(DeviceFirstOutbox.id)
                 .limit(limit)
                 .with_for_update(skip_locked=True)

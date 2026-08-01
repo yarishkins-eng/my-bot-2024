@@ -1,17 +1,20 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import app.services.device_first_recovery_service as recovery_module
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
     DeviceFirstError,
     fulfill_direct_external_checkout,
     get_open_checkout_for_user,
+    process_direct_provisioning_outbox,
     reconcile_armed_checkouts,
     settlement_mode,
 )
+from app.services.device_first_recovery_service import DeviceFirstRecoveryService
 
 
 class Result:
@@ -26,6 +29,25 @@ class Result:
 
     def scalar_one(self):
         return self.rows
+
+
+class EmptyScalarResult:
+    def scalars(self):
+        return self
+
+    def all(self):
+        return []
+
+
+class SessionContext:
+    def __init__(self, db):
+        self.db = db
+
+    async def __aenter__(self):
+        return self.db
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 @pytest.mark.asyncio
@@ -183,3 +205,122 @@ async def test_direct_fulfilment_uses_the_same_user_attempt_checkout_lock_order_
     assert 'users' in str(statements[0])
     assert 'checkout_payment_attempts' in str(statements[1])
     assert 'subscription_checkouts' in str(statements[2])
+
+
+@pytest.mark.asyncio
+async def test_direct_fulfilment_kicks_only_its_own_post_commit_outbox_when_generic_auto_check_is_off(monkeypatch):
+    """A verified direct callback never waits for the generic top-up checker."""
+    user = SimpleNamespace(id=7)
+    attempt = SimpleNamespace(id=41, status='paid_processing')
+    checkout = SimpleNamespace(
+        id=9,
+        user_id=7,
+        target_subscription_id=None,
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='fulfilling',
+        funding_state='paid',
+        fulfillment_state='not_started',
+    )
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=7),
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+    completed = AsyncMock(return_value=checkout)
+    kick = AsyncMock(return_value=1)
+    monkeypatch.setattr(
+        'app.services.device_first_checkout_service.settings.PAYMENT_VERIFICATION_AUTO_CHECK_ENABLED', False
+    )
+
+    with (
+        patch('app.services.device_first_checkout_service._complete_direct_sale_locked', completed),
+        patch('app.services.device_first_checkout_service.process_direct_provisioning_outbox', kick),
+    ):
+        result = await fulfill_direct_external_checkout(
+            db,
+            checkout_id=checkout.id,
+            provider_payment_id='provider-1',
+            payment_attempt_id=attempt.id,
+        )
+
+    assert result is checkout
+    kick.assert_awaited_once_with(db, checkout_id=checkout.id, limit=1)
+    db.commit.assert_awaited_once()
+    db.rollback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_fulfilment_keeps_durable_sale_when_immediate_outbox_kick_fails():
+    user = SimpleNamespace(id=7)
+    attempt = SimpleNamespace(id=41, status='paid_processing')
+    checkout = SimpleNamespace(
+        id=9,
+        user_id=7,
+        target_subscription_id=None,
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='fulfilling',
+        funding_state='paid',
+        fulfillment_state='not_started',
+    )
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=7),
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    with (
+        patch(
+            'app.services.device_first_checkout_service._complete_direct_sale_locked',
+            AsyncMock(return_value=checkout),
+        ),
+        patch(
+            'app.services.device_first_checkout_service.process_direct_provisioning_outbox',
+            AsyncMock(side_effect=RuntimeError('temporary-remnawave-error')),
+        ),
+    ):
+        result = await fulfill_direct_external_checkout(
+            db,
+            checkout_id=checkout.id,
+            provider_payment_id='provider-1',
+            payment_attempt_id=attempt.id,
+        )
+
+    assert result is checkout
+    db.commit.assert_awaited_once()
+    db.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scoped_direct_provisioning_query_never_selects_another_checkout_or_legacy_row():
+    db = SimpleNamespace(execute=AsyncMock(return_value=EmptyScalarResult()))
+
+    await process_direct_provisioning_outbox(db, checkout_id=9, limit=1)
+
+    statement = str(db.execute.await_args.args[0])
+    assert 'device_first_outbox.checkout_id = :checkout_id_1' in statement
+    assert 'device_first_outbox.settlement_mode = :settlement_mode_1' in statement
+    assert 'direct_purchase_v2' not in statement  # bound value is never interpolated into SQL text
+
+
+@pytest.mark.asyncio
+async def test_dedicated_recovery_worker_is_direct_only_and_independent_from_generic_auto_check(monkeypatch):
+    db = MagicMock()
+    reconciler = AsyncMock(return_value=2)
+    provisioner = AsyncMock(return_value=3)
+    notifier = AsyncMock(return_value=1)
+    monkeypatch.setattr(recovery_module, 'AsyncSessionLocal', lambda: SessionContext(db))
+    monkeypatch.setattr(recovery_module, 'reconcile_device_first_payments', reconciler)
+    monkeypatch.setattr(recovery_module, 'process_direct_provisioning_outbox', provisioner)
+    monkeypatch.setattr(recovery_module, 'process_device_first_notification_outbox', notifier)
+    monkeypatch.setattr(recovery_module.settings, 'PAYMENT_VERIFICATION_AUTO_CHECK_ENABLED', False)
+
+    result = await DeviceFirstRecoveryService().run_once(bot='bot')
+
+    assert result == (2, 3, 1)
+    reconciler.assert_awaited_once_with(db, limit=20, direct_only=True)
+    provisioner.assert_awaited_once_with(db, limit=20)
+    notifier.assert_awaited_once_with(db, bot='bot', limit=20)
