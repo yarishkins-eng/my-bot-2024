@@ -1005,9 +1005,7 @@ async def fulfill_direct_external_checkout(
             ]
         )
     owned_attempt = (
-        await db.execute(
-            select(CheckoutPaymentAttempt).where(*attempt_predicates).with_for_update()
-        )
+        await db.execute(select(CheckoutPaymentAttempt).where(*attempt_predicates).with_for_update())
     ).scalar_one_or_none()
     if owned_attempt is None:
         raise DeviceFirstError('invalid_state', 'Direct payment attempt is no longer eligible for fulfilment')
@@ -1016,6 +1014,12 @@ async def fulfill_direct_external_checkout(
     ).scalar_one()
     if settlement_mode(checkout) != DIRECT_SETTLEMENT_MODE:
         raise DeviceFirstError('legacy_checkout', 'This checkout is not a direct sale')
+    # Fulfilment is deliberately idempotent: the direct attempt remains
+    # ``paid_processing`` while the provisioning outbox runs, so a later
+    # reconciler pass must observe the durable sale rather than turn it into a
+    # noisy retry. Operator-review/terminal states do not take this path.
+    if checkout.fulfillment_state == 'fulfilled' and checkout.lifecycle_state in {'fulfilling', 'ready'}:
+        return checkout
     if (
         checkout.lifecycle_state != 'fulfilling'
         or checkout.funding_state != 'paid'
