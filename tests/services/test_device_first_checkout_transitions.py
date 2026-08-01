@@ -103,6 +103,25 @@ def test_device_first_top_up_surplus_is_explicit_and_never_lost():
     )
 
 
+def test_public_rollout_allows_any_user_without_a_canary_allowlist(monkeypatch):
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', False)
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED', True)
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_CANARY_USER_IDS', '')
+
+    assert service.device_first_new_checkouts_enabled() is True
+    assert service.is_device_first_canary_user(SimpleNamespace(id=1)) is True
+    assert service.is_device_first_canary_user(SimpleNamespace(id=999_999)) is True
+
+
+def test_closed_public_rollout_keeps_the_existing_canary_fence(monkeypatch):
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED', False)
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_CANARY_USER_IDS', '17')
+
+    assert service.is_device_first_canary_user(SimpleNamespace(id=17)) is True
+    assert service.is_device_first_canary_user(SimpleNamespace(id=18)) is False
+
+
 @pytest.mark.asyncio
 async def test_purchase_options_quote_the_exact_kopeks_total_that_will_be_charged(monkeypatch):
     tariff = SimpleNamespace(id=7, name='Premium', traffic_limit_gb=100, device_limit=2, pricing_revision=1)

@@ -696,6 +696,15 @@ async def show_tariffs_list(
     texts = get_texts(db_user.language)
     await state.clear()
 
+    # ``tariff_list``, ``buy_subscription_tariffs`` and ``menu_buy`` all pass
+    # through here.  Keep them on Device-First in public mode instead of
+    # letting an old inline keyboard reopen the legacy device surcharge flow.
+    # Existing v2 orders remain reachable even after new orders are disabled.
+    from app.handlers.subscription.device_first import show_device_first_entry
+
+    if await show_device_first_entry(callback, db_user, db, state, origin_callback='back_to_menu'):
+        return
+
     # Получаем доступные тарифы
     promo_group_id = getattr(db_user, 'promo_group_id', None)
     tariffs = await get_tariffs_for_user(db, promo_group_id)
@@ -759,22 +768,6 @@ async def show_funnel_tariffs(
 
     promo_group_id = getattr(db_user, 'promo_group_id', None)
     tariffs = await get_tariffs_for_user(db, promo_group_id)
-
-    if settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED:
-        from app.handlers.subscription.device_first import show_device_first_entry
-        from app.services.device_first_checkout_service import build_purchase_options
-
-        device_first_options = await build_purchase_options(db, db_user)
-        if device_first_options.get('eligible'):
-            await show_device_first_entry(
-                callback,
-                db_user,
-                db,
-                state,
-                options=device_first_options,
-                origin_callback='back_to_menu',
-            )
-            return
 
     # The current tariff may have been changed after a user started a native
     # checkout.  Let the dedicated handler find and render that user's open

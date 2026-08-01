@@ -312,6 +312,7 @@ class BotConfigurationService:
         'MULTI_TARIFF_ENABLED': 'SUBSCRIPTIONS_CORE',
         'MAX_ACTIVE_SUBSCRIPTIONS': 'SUBSCRIPTIONS_CORE',
         'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED': 'SUBSCRIPTIONS_CORE',
+        'DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED': 'SUBSCRIPTIONS_CORE',
         'BASE_PROMO_GROUP_PERIOD_DISCOUNTS_ENABLED': 'SUBSCRIPTIONS_CORE',
         'BASE_PROMO_GROUP_PERIOD_DISCOUNTS': 'SUBSCRIPTIONS_CORE',
         'DEFAULT_AUTOPAY_ENABLED': 'AUTOPAY',
@@ -697,6 +698,20 @@ class BotConfigurationService:
             'format': 'Булево значение.',
             'example': 'false',
             'warning': 'Включайте только после настройки ровно одного совместимого тарифа.',
+            'dependencies': 'SALES_MODE=tariffs, MULTI_TARIFF_ENABLED=false',
+        },
+        'DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED': {
+            'description': (
+                'Открывает Device-First v2 для всех подходящих пользователей. '
+                'Отключение сразу блокирует только новые checkout; уже созданные платежи, '
+                'статусы и фоновые повторы продолжаются до завершения.'
+            ),
+            'format': 'Булево значение.',
+            'example': 'false',
+            'warning': (
+                'Боевой переключатель для всех пользователей. Включайте только после полной '
+                'проверки единственного совместимого тарифа и платёжного пути.'
+            ),
             'dependencies': 'SALES_MODE=tariffs, MULTI_TARIFF_ENABLED=false',
         },
         'DEVICES_SELECTION_ENABLED': {
