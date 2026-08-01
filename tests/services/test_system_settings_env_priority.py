@@ -156,3 +156,30 @@ async def test_set_value_applies_without_env_override(monkeypatch):
 
     assert settings.SUPPORT_MENU_ENABLED is target_value
     assert bot_configuration_service.has_override('SUPPORT_MENU_ENABLED')
+
+
+async def test_public_device_first_rollout_applies_live_when_not_env_pinned(monkeypatch):
+    bot_configuration_service.initialize_definitions()
+
+    env_keys = set(bot_configuration_service._env_override_keys)
+    env_keys.discard('DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED')
+    monkeypatch.setattr(bot_configuration_service, '_env_override_keys', env_keys)
+    monkeypatch.setattr(bot_configuration_service, '_overrides_raw', {})
+    monkeypatch.setattr(settings, 'DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED', False)
+
+    async def fake_upsert(db, key, value, description=None):
+        return None
+
+    monkeypatch.setattr(
+        'app.services.system_settings_service.upsert_system_setting',
+        fake_upsert,
+    )
+
+    await bot_configuration_service.set_value(
+        object(),
+        'DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED',
+        True,
+    )
+
+    assert settings.DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED is True
+    assert bot_configuration_service.has_override('DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED')
