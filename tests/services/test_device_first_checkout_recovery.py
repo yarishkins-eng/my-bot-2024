@@ -24,6 +24,9 @@ class Result:
     def scalar_one_or_none(self):
         return self.rows
 
+    def scalar_one(self):
+        return self.rows
+
 
 @pytest.mark.asyncio
 async def test_reconciler_resumes_every_armed_checkout_after_process_crash():
@@ -102,3 +105,26 @@ async def test_reversed_direct_attempt_cannot_fulfil_after_operator_review_wins_
         )
 
     assert raised.value.code == 'invalid_state'
+
+
+@pytest.mark.asyncio
+async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliation():
+    attempt = SimpleNamespace(id=41, status='paid_processing')
+    checkout = SimpleNamespace(
+        id=9,
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='fulfilling',
+        funding_state='paid',
+        fulfillment_state='fulfilled',
+    )
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[Result(attempt), Result(checkout)]))
+
+    result = await fulfill_direct_external_checkout(
+        db,
+        checkout_id=9,
+        provider_payment_id='provider-1',
+        payment_attempt_id=41,
+    )
+
+    assert result is checkout
+    assert db.execute.await_count == 2
