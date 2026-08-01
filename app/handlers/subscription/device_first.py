@@ -635,8 +635,19 @@ async def _render_direct_payment_methods(
         f'💳 <b>Pay for your order</b>\n\nOne full invoice: <b>₽{total}</b>. Balance is not partially used.',
     )
     if not methods:
-        caption += _text(user, '\n\nСпособ оплаты сейчас недоступен. Обратитесь в поддержку.', '\n\nPayment is unavailable. Contact support.')
-        rows = [[InlineKeyboardButton(text=_text(user, 'Связаться с поддержкой', 'Contact support'), callback_data='menu_support')], [_cancel_order(user, checkout.public_id)]]
+        caption += _text(
+            user,
+            '\n\nСпособ оплаты сейчас недоступен. Обратитесь в поддержку.',
+            '\n\nPayment is unavailable. Contact support.',
+        )
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=_text(user, 'Связаться с поддержкой', 'Contact support'), callback_data='menu_support'
+                )
+            ],
+            [_cancel_order(user, checkout.public_id)],
+        ]
     await edit_or_answer_photo(
         callback=callback,
         caption=caption,

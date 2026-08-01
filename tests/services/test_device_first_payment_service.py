@@ -47,8 +47,12 @@ def test_checkout_return_url_keeps_only_configured_origin(monkeypatch):
 
 
 def test_direct_return_url_never_uses_telegram_or_generic_topup_return(monkeypatch):
-    monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example/anything')
-    assert _direct_checkout_return_url('checkout-1') == 'https://cabinet.example/subscription/purchase?checkout=checkout-1'
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example/anything'
+    )
+    assert (
+        _direct_checkout_return_url('checkout-1') == 'https://cabinet.example/subscription/purchase?checkout=checkout-1'
+    )
     monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://t.me/teplo_bot')
     assert _direct_checkout_return_url('checkout-1') is None
 
