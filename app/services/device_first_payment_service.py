@@ -513,8 +513,17 @@ async def settle_device_first_platega_payment(
 ) -> PlategaPayment | None:
     if (lease_token is None) != (lease_epoch is None):
         raise ValueError('direct payment lease requires both token and epoch')
+    # The reconciler may have read this row before an authenticated webhook
+    # committed. ``expire_on_commit=False`` is deliberate in this project, so
+    # the provider lock must also refresh the identity-map instance before a
+    # terminal provider result is allowed to mutate a direct checkout.
     payment = (
-        await db.execute(select(PlategaPayment).where(PlategaPayment.id == payment.id).with_for_update())
+        await db.execute(
+            select(PlategaPayment)
+            .where(PlategaPayment.id == payment.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
     ).scalar_one()
     metadata = dict(payment.metadata_json or {})
     attempt_id = metadata.get('device_first_attempt_id')
@@ -525,7 +534,9 @@ async def settle_device_first_platega_payment(
             CheckoutPaymentAttempt.lease_epoch == lease_epoch,
             CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
         )
-    attempt = (await db.execute(attempt_query.with_for_update())).scalar_one_or_none()
+    attempt = (
+        await db.execute(attempt_query.with_for_update().execution_options(populate_existing=True))
+    ).scalar_one_or_none()
     if attempt is None and lease_token is not None:
         logger.warning('device_first_direct_payment_lease_lost', payment_id=payment.id)
         return None
@@ -759,17 +770,6 @@ async def _settle_direct_platega_payment_locked(
         method_ok = method_raw is not None and int(method_raw) == attempt.provider_method_code
     except (TypeError, ValueError):
         method_ok = False
-    # Use the same per-user lock as direct checkout creation/final commit
-    # before this callback can write an operator hold.  This prevents an old
-    # provider contradiction from racing a newer direct draft into payment.
-    if payment.user_id is not None:
-        await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
-    checkout = (
-        await db.execute(
-            select(SubscriptionCheckout).where(SubscriptionCheckout.id == attempt.checkout_id).with_for_update()
-        )
-    ).scalar_one()
-
     mismatch_reason: str | None = None
     if not identity_ok:
         mismatch_reason = 'provider_identity_mismatch'
@@ -781,8 +781,29 @@ async def _settle_direct_platega_payment_locked(
         amount_kopeks, currency = verified
         if amount_kopeks != attempt.requested_amount_kopeks or currency != 'RUB':
             mismatch_reason = 'provider_callback_amount_mismatch'
-        elif checkout.lifecycle_state not in {'awaiting_funds', 'fulfilling'}:
-            mismatch_reason = 'late_paid_direct_checkout'
+
+    # The webhook can already have committed the exact payment and fulfilled
+    # the checkout while a worker was waiting for this lock.  A refreshed
+    # paid-processing attempt is a completed idempotent transition: do not
+    # inspect the now-``ready`` checkout or downgrade it to operator review.
+    if mismatch_reason is None and attempt.status == 'paid_processing':
+        return payment
+
+    # Use the same per-user lock as direct checkout creation/final commit
+    # before this callback can write an operator hold.  This prevents an old
+    # provider contradiction from racing a newer direct draft into payment.
+    if payment.user_id is not None:
+        await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
+    checkout = (
+        await db.execute(
+            select(SubscriptionCheckout)
+            .where(SubscriptionCheckout.id == attempt.checkout_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    if mismatch_reason is None and checkout.lifecycle_state not in {'awaiting_funds', 'fulfilling'}:
+        mismatch_reason = 'late_paid_direct_checkout'
 
     if mismatch_reason is not None:
         attempt.status = 'operator_review'
@@ -807,8 +828,6 @@ async def _settle_direct_platega_payment_locked(
         return payment
 
     amount_kopeks, _currency = verified
-    if attempt.status == 'paid_processing':
-        return payment
     payment.status = 'CONFIRMED'
     payment.is_paid = True
     attempt.credited_amount_kopeks = amount_kopeks
@@ -878,6 +897,7 @@ async def _lock_owned_direct_attempt_lease(
                 CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
 
@@ -971,6 +991,7 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                         select(PlategaPayment)
                         .where(PlategaPayment.id == owned_attempt.platega_payment_id)
                         .with_for_update()
+                        .execution_options(populate_existing=True)
                     )
                 ).scalar_one_or_none()
                 checkout = (
@@ -978,6 +999,7 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                         select(SubscriptionCheckout)
                         .where(SubscriptionCheckout.id == owned_attempt.checkout_id)
                         .with_for_update()
+                        .execution_options(populate_existing=True)
                     )
                 ).scalar_one_or_none()
                 owned_attempt.status = 'operator_review'
@@ -1072,7 +1094,12 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                 from app.services.payment.platega import PlategaPaymentMixin
 
                 payment = (
-                    await db.execute(select(PlategaPayment).where(PlategaPayment.id == payment.id).with_for_update())
+                    await db.execute(
+                        select(PlategaPayment)
+                        .where(PlategaPayment.id == payment.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
                 ).scalar_one()
                 if payment.is_paid:
                     await PlategaPaymentMixin()._mark_direct_post_paid_reversal(
@@ -1094,7 +1121,12 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                 reconciled += int(settled is not None)
             else:
                 payment = (
-                    await db.execute(select(PlategaPayment).where(PlategaPayment.id == payment.id).with_for_update())
+                    await db.execute(
+                        select(PlategaPayment)
+                        .where(PlategaPayment.id == payment.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
                 ).scalar_one()
                 if lease_token is not None and lease_epoch is not None:
                     attempt = await _lock_owned_direct_attempt_lease(
@@ -1111,6 +1143,7 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                             select(CheckoutPaymentAttempt)
                             .where(CheckoutPaymentAttempt.id == attempt_id)
                             .with_for_update()
+                            .execution_options(populate_existing=True)
                         )
                     ).scalar_one()
                 if status in {'FAILED', 'CANCELED', 'EXPIRED'}:
