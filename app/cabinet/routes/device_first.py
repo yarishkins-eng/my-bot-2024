@@ -426,13 +426,19 @@ async def checkout_commit(
                 method_key=request.method_key,
             )
             payment = await db.get(PlategaPayment, attempt.platega_payment_id)
-            if payment is None or not payment.redirect_url:
-                raise DeviceFirstError('reconciliation_required', 'Provider invoice requires reconciliation')
             checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
-            response = {
-                'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks),
-                'redirect_url': payment.redirect_url,
-            }
+            if _is_live_direct_provider_invoice(checkout, attempt, payment):
+                response = {
+                    'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks),
+                    'redirect_url': payment.redirect_url,
+                }
+            elif checkout.lifecycle_state in {'fulfilling', 'ready'}:
+                # The canonical create-follow-up may have found an already
+                # paid invoice and completed the same strict settlement path.
+                # Return its owned checkout state, never a stale provider URL.
+                response = {'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)}
+            else:
+                raise DeviceFirstError('reconciliation_required', 'Provider invoice requires reconciliation')
     except DeviceFirstError as error:
         await store_mutation_result(
             db,
@@ -497,7 +503,11 @@ async def checkout_resume_invoice(
             'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks),
             # A missing redirect means the existing durable attempt is
             # ambiguous/reconciling. Do not make a second provider POST.
-            **({'redirect_url': payment.redirect_url} if payment and payment.redirect_url else {}),
+            **(
+                {'redirect_url': payment.redirect_url}
+                if _is_live_direct_provider_invoice(checkout, attempt, payment)
+                else {}
+            ),
         }
     except DeviceFirstError as error:
         await store_mutation_result(

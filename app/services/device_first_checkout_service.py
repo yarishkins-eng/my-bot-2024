@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -342,9 +342,20 @@ async def get_open_checkout_for_user(
     # mismatch, post-paid reversal, or operator hold must not disappear after
     # a WebView restart and silently allow a second order to start. Historical
     # legacy terminals stay out of this projection to preserve their old UI.
+    # A user-cancelled quote with no provider attempt is safe to leave behind
+    # as audit history and must not reopen after a WebView restart. A cancelled
+    # checkout that *does* have an external attempt stays visible: historical
+    # versions allowed that unsafe transition and a late provider payment must
+    # still be fenced from a new sale.
     terminal_recovery = and_(
         SubscriptionCheckout.settlement_mode == DIRECT_SETTLEMENT_MODE,
-        SubscriptionCheckout.lifecycle_state.in_(TERMINAL_STATES),
+        or_(
+            SubscriptionCheckout.lifecycle_state.in_(TERMINAL_STATES - {'cancelled'}),
+            and_(
+                SubscriptionCheckout.lifecycle_state == 'cancelled',
+                exists().where(CheckoutPaymentAttempt.checkout_id == SubscriptionCheckout.id),
+            ),
+        ),
     )
     checkout = (
         await db.execute(
@@ -605,14 +616,32 @@ async def confirm_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> 
 
 
 async def cancel_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> SubscriptionCheckout:
-    if checkout.lifecycle_state in OPEN_STATES and checkout.fulfillment_state == 'not_started':
-        checkout.lifecycle_state = 'cancelled'
-        checkout.terminal_reason = 'cancelled_by_user'
-        await db.commit()
-        await db.refresh(checkout)
-        _event('cancelled', checkout)
-    elif checkout.fulfillment_state != 'not_started':
+    # A direct checkout becomes financially irreversible for the UI as soon
+    # as a provider attempt exists.  Platega does not expose a reliable
+    # cancellation API, so an old invoice could still be paid after a local
+    # cancellation.  Never let that produce a second quote/order.
+    # A checkout that has already entered fulfilment is never cancellable.
+    # Check it before any provider lookup: it preserves the contract for
+    # already-paid/processing orders and avoids treating them as an invoice
+    # recovery case merely because they use the direct settlement mode.
+    if checkout.fulfillment_state != 'not_started':
         raise DeviceFirstError('invalid_state', 'A fulfilled checkout cannot be cancelled')
+    if checkout.lifecycle_state not in OPEN_STATES:
+        return checkout
+    if settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE:
+        external_attempt_exists = await db.scalar(
+            select(CheckoutPaymentAttempt.id).where(CheckoutPaymentAttempt.checkout_id == checkout.id).limit(1)
+        )
+        if external_attempt_exists is not None:
+            raise DeviceFirstError(
+                'external_invoice_active',
+                'An external payment invoice is already active and cannot be cancelled',
+            )
+    checkout.lifecycle_state = 'cancelled'
+    checkout.terminal_reason = 'cancelled_by_user'
+    await db.commit()
+    await db.refresh(checkout)
+    _event('cancelled', checkout)
     return checkout
 
 
