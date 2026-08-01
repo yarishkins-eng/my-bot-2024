@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -429,7 +429,13 @@ async def test_direct_reconciler_fences_a_post_paid_provider_terminal_for_operat
     processed = await reconcile_device_first_payments(db)
 
     assert processed == 0
-    fence.assert_awaited_once_with(db, payment=payment, provider_status='CANCELED')
+    fence.assert_awaited_once_with(
+        db,
+        payment=payment,
+        provider_status='CANCELED',
+        lease_token=ANY,
+        lease_epoch=3,
+    )
 
 
 class Result:

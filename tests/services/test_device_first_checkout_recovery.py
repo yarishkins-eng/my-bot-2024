@@ -115,7 +115,7 @@ def test_missing_settlement_mode_requires_operator_review():
 @pytest.mark.asyncio
 async def test_reversed_direct_attempt_cannot_fulfil_after_operator_review_wins_race():
     """A late success handler must not issue a subscription over an operator hold."""
-    db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)))
+    db = SimpleNamespace(scalar=AsyncMock(return_value=7), execute=AsyncMock(return_value=Result(None)))
 
     with pytest.raises(DeviceFirstError) as raised:
         await fulfill_direct_external_checkout(
@@ -131,6 +131,7 @@ async def test_reversed_direct_attempt_cannot_fulfil_after_operator_review_wins_
 @pytest.mark.asyncio
 async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliation():
     attempt = SimpleNamespace(id=41, status='paid_processing')
+    user = SimpleNamespace(id=7)
     checkout = SimpleNamespace(
         id=9,
         settlement_mode=DIRECT_SETTLEMENT_MODE,
@@ -138,7 +139,10 @@ async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliat
         funding_state='paid',
         fulfillment_state='fulfilled',
     )
-    db = SimpleNamespace(execute=AsyncMock(side_effect=[Result(attempt), Result(checkout)]))
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=7),
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+    )
 
     result = await fulfill_direct_external_checkout(
         db,
@@ -148,4 +152,34 @@ async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliat
     )
 
     assert result is checkout
-    assert db.execute.await_count == 2
+    assert db.execute.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_direct_fulfilment_uses_the_same_user_attempt_checkout_lock_order_as_reversal():
+    """A post-paid reversal and its fulfilment cannot circularly wait on their fence rows."""
+    user = SimpleNamespace(id=7)
+    attempt = SimpleNamespace(id=41, status='paid_processing')
+    checkout = SimpleNamespace(
+        id=9,
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='fulfilling',
+        funding_state='paid',
+        fulfillment_state='fulfilled',
+    )
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=7),
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+    )
+
+    await fulfill_direct_external_checkout(
+        db,
+        checkout_id=9,
+        provider_payment_id='provider-1',
+        payment_attempt_id=41,
+    )
+
+    statements = [call.args[0] for call in db.execute.await_args_list]
+    assert 'users' in str(statements[0])
+    assert 'checkout_payment_attempts' in str(statements[1])
+    assert 'subscription_checkouts' in str(statements[2])
