@@ -24,6 +24,9 @@ class Result:
     def all(self):
         return self.rows
 
+    def scalars(self):
+        return self
+
     def scalar_one_or_none(self):
         return self.rows
 
@@ -304,6 +307,92 @@ async def test_scoped_direct_provisioning_query_never_selects_another_checkout_o
     assert 'device_first_outbox.checkout_id = :checkout_id_1' in statement
     assert 'device_first_outbox.settlement_mode = :settlement_mode_1' in statement
     assert 'direct_purchase_v2' not in statement  # bound value is never interpolated into SQL text
+
+
+@pytest.mark.asyncio
+async def test_direct_provisioning_finalization_uses_checkout_then_outbox_lock_order_against_reversal():
+    """Regression: a post-paid reversal takes Checkout -> Outbox too, so no circular wait is possible."""
+    claimed = SimpleNamespace(
+        id=71,
+        checkout_id=9,
+        payload_json={'subscription_id': 13},
+        status='pending',
+        attempts=0,
+        lease_token=None,
+        lease_expires_at=None,
+        lease_epoch=0,
+    )
+    checkout = SimpleNamespace(id=9, provisioning_state='pending', lifecycle_state='fulfilling')
+    subscription = SimpleNamespace(id=13)
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Result([claimed]),  # claim without holding the lock during the remote call
+                Result(checkout),  # final critical section begins: Checkout first
+                Result(claimed),  # then fenced Outbox, matching reversal's order
+                Result(None),
+            ]
+        ),
+        get=AsyncMock(side_effect=[claimed, subscription]),
+        commit=AsyncMock(),
+        add=MagicMock(),
+    )
+
+    with patch(
+        'app.services.subscription_service.SubscriptionService.ensure_subscription_synced',
+        AsyncMock(return_value=(True, None)),
+    ):
+        processed = await process_direct_provisioning_outbox(db, checkout_id=checkout.id, limit=1)
+
+    assert processed == 1
+    statements = [str(call.args[0]) for call in db.execute.await_args_list]
+    checkout_lock_index = next(
+        index for index, statement in enumerate(statements) if 'subscription_checkouts' in statement
+    )
+    outbox_lock_index = next(
+        index
+        for index, statement in enumerate(statements[checkout_lock_index + 1 :], start=checkout_lock_index + 1)
+        if 'device_first_outbox' in statement and 'lease_token' in statement
+    )
+    assert checkout_lock_index < outbox_lock_index
+
+
+@pytest.mark.asyncio
+async def test_direct_provisioning_stale_lease_releases_checkout_lock_before_returning_to_worker():
+    """A reversal can win after RemnaWave I/O; its stale worker must not retain Checkout's lock."""
+    claimed = SimpleNamespace(
+        id=71,
+        checkout_id=9,
+        payload_json={'subscription_id': 13},
+        status='pending',
+        attempts=0,
+        lease_token=None,
+        lease_expires_at=None,
+        lease_epoch=0,
+    )
+    checkout = SimpleNamespace(id=9)
+    subscription = SimpleNamespace(id=13)
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Result([claimed]),
+                Result(checkout),
+                Result(None),  # reversal changed this row to operator_review
+            ]
+        ),
+        get=AsyncMock(side_effect=[claimed, subscription]),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    with patch(
+        'app.services.subscription_service.SubscriptionService.ensure_subscription_synced',
+        AsyncMock(return_value=(True, None)),
+    ):
+        processed = await process_direct_provisioning_outbox(db, checkout_id=checkout.id, limit=1)
+
+    assert processed == 0
+    db.rollback.assert_awaited_once()
 
 
 @pytest.mark.asyncio

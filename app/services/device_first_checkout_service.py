@@ -1344,6 +1344,15 @@ async def _process_direct_provisioning_outbox(
         except Exception as error:  # no stale write; preserve concise retry evidence
             ok = False
             error = type(error).__name__
+        # Keep the final critical section in the same lock order as the
+        # post-paid reversal: Checkout -> Outbox.  The remote sync above is
+        # deliberately outside a DB transaction; taking Outbox first here
+        # would otherwise deadlock with reversal's Checkout -> Outbox fence.
+        checkout = (
+            await db.execute(
+                select(SubscriptionCheckout).where(SubscriptionCheckout.id == row.checkout_id).with_for_update()
+            )
+        ).scalar_one()
         current = (
             await db.execute(
                 select(DeviceFirstOutbox)
@@ -1356,12 +1365,13 @@ async def _process_direct_provisioning_outbox(
             )
         ).scalar_one_or_none()
         if current is None:
+            # A post-paid reversal may have won after the external sync.  It
+            # holds Checkout then Outbox as well and moves the row to review;
+            # never resurrect delivery from this stale lease.
+            # Release the Checkout lock before the dedicated worker can move
+            # on to its notification pass (which may perform Telegram I/O).
+            await db.rollback()
             continue
-        checkout = (
-            await db.execute(
-                select(SubscriptionCheckout).where(SubscriptionCheckout.id == current.checkout_id).with_for_update()
-            )
-        ).scalar_one()
         current.lease_token = None
         current.lease_expires_at = None
         current.last_error = error
