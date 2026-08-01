@@ -7,6 +7,7 @@ import pytest
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
     DeviceFirstError,
+    fulfill_direct_external_checkout,
     get_open_checkout_for_user,
     reconcile_armed_checkouts,
     settlement_mode,
@@ -85,3 +86,19 @@ def test_missing_settlement_mode_requires_operator_review():
     with pytest.raises(DeviceFirstError) as raised:
         settlement_mode(SimpleNamespace(settlement_mode=None))
     assert raised.value.code == 'operator_review_required'
+
+
+@pytest.mark.asyncio
+async def test_reversed_direct_attempt_cannot_fulfil_after_operator_review_wins_race():
+    """A late success handler must not issue a subscription over an operator hold."""
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)))
+
+    with pytest.raises(DeviceFirstError) as raised:
+        await fulfill_direct_external_checkout(
+            db,
+            checkout_id=9,
+            provider_payment_id='provider-1',
+            payment_attempt_id=41,
+        )
+
+    assert raised.value.code == 'invalid_state'
