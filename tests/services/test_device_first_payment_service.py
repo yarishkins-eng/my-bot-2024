@@ -6,7 +6,6 @@ import pytest
 
 from app.services.device_first_checkout_service import (
     DeviceFirstError,
-    expire_checkout_quote_if_needed,
     prepare_direct_external_checkout,
 )
 from app.services.device_first_payment_service import (
