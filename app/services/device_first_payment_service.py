@@ -13,7 +13,7 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import structlog
-from sqlalchemy import exists, or_, select, update
+from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1040,6 +1040,18 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                         )
                     ).scalar_one()
                 if status in {'FAILED', 'CANCELED', 'EXPIRED'}:
+                    if settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE and payment.is_paid:
+                        # A contradictory provider terminal after an accepted
+                        # direct payment must take exactly the same fenced
+                        # operator-review path as an authenticated webhook.
+                        from app.services.payment.platega import PlategaPaymentMixin
+
+                        await PlategaPaymentMixin()._mark_direct_post_paid_reversal(
+                            db,
+                            payment=payment,
+                            provider_status=status,
+                        )
+                        continue
                     attempt.status = 'failed'
                     attempt.reconciliation_reason = f'provider_terminal:{status.lower()}'
                     payment.status = status

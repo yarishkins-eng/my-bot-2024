@@ -85,6 +85,27 @@ async def test_paid_direct_provisioning_checkout_remains_resumable_after_quote_e
     db.commit.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_direct_operator_hold_remains_visible_after_quote_expiry():
+    checkout = SimpleNamespace(
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='operator_review',
+        fulfillment_state='fulfilled',
+        provisioning_state='operator_review',
+        expires_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=Result(checkout)),
+        commit=AsyncMock(),
+    )
+
+    result = await get_open_checkout_for_user(db, user_id=7)
+
+    assert result is checkout
+    assert checkout.lifecycle_state == 'operator_review'
+    db.commit.assert_not_awaited()
+
+
 def test_missing_settlement_mode_requires_operator_review():
     with pytest.raises(DeviceFirstError) as raised:
         settlement_mode(SimpleNamespace(settlement_mode=None))
