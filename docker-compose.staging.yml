@@ -85,7 +85,7 @@ services:
       # CABINET_URL feeds backend callback/return URLs, so it must stay a clean
       # origin. Only the Telegram WebApp launcher below is versioned.
       CABINET_URL: 'https://cabinet.lilulalu.xyz:8443'
-      MINIAPP_CUSTOM_URL: 'https://cabinet.lilulalu.xyz:8443?release=cabinet-copy-success-ui-1'
+      MINIAPP_CUSTOM_URL: 'https://cabinet.lilulalu.xyz:8443?release=device-first-v2-20260801-r1'
       CABINET_ALLOWED_ORIGINS: 'https://cabinet.lilulalu.xyz:8443'
       # Не пишет в БД и не создаёт VPN-конфигурацию: только позволяет будущим
       # staging-сценариям увидеть и скопировать заведомо нерабочий .invalid URL.
