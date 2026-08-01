@@ -403,24 +403,19 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
                 device_limit=devices,
                 user=user,
             )
-            quoted_price = round_device_first_quote_kopeks(price.final_total)
-            if quoted_price <= 0:
+            if price.final_total <= 0:
                 # A full promo/free period must retain the established trial or
                 # gift semantics, never be mistaken for a paid checkout.
                 return {'eligible': False, 'reason': 'non_positive_quote'}
             prices.append(
                 {
                     'device_limit': devices,
-                    'price_kopeks': quoted_price,
+                    'price_kopeks': price.final_total,
                     'breakdown': {
                         'base_price_kopeks': price.base_price,
                         'devices_price_kopeks': price.devices_price,
                         'promo_group_discount_kopeks': price.promo_group_discount,
                         'promo_offer_discount_kopeks': price.promo_offer_discount,
-                        # Keep the pre-rounding calculation for support/audit.
-                        # The quoted total above is the only customer charge.
-                        'raw_total_kopeks': price.final_total,
-                        'rounding_adjustment_kopeks': quoted_price - price.final_total,
                     },
                 }
             )

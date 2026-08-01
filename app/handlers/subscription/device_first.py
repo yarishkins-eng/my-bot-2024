@@ -636,6 +636,12 @@ async def _render_arm_confirmation(
                                 f'Выбрать оплату {_money(user, total)} ₽',
                                 f'Choose payment ₽{_money(user, total)}',
                             )
+                            if direct and shortage
+                            else _text(
+                                user,
+                                f'Пополнить {_money(user, shortage)} ₽ и оформить',
+                                f'Top up ₽{_money(user, shortage)} and subscribe',
+                            )
                             if shortage
                             else _text(
                                 user,

@@ -48,6 +48,7 @@ def armed_checkout(target, *, devices: int, quoted_price: int = 10_000):
         quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
         pricing_revision=1,
         quoted_price_kopeks=quoted_price,
+        settlement_mode='legacy_deposit',
         quote_state='valid',
         terminal_reason=None,
     )
@@ -103,7 +104,7 @@ def test_device_first_top_up_surplus_is_explicit_and_never_lost():
 
 
 @pytest.mark.asyncio
-async def test_purchase_options_quote_the_same_whole_ruble_total_that_will_be_charged(monkeypatch):
+async def test_purchase_options_quote_the_exact_kopeks_total_that_will_be_charged(monkeypatch):
     tariff = SimpleNamespace(id=7, name='Premium', traffic_limit_gb=100, device_limit=2, pricing_revision=1)
     user = SimpleNamespace(id=9, balance_kopeks=0)
     eligibility = SimpleNamespace(
@@ -115,6 +116,7 @@ async def test_purchase_options_quote_the_same_whole_ruble_total_that_will_be_ch
     )
     db = SimpleNamespace()
     monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+    monkeypatch.setattr(service, 'is_device_first_canary_user', lambda _user: True)
     monkeypatch.setattr(service, 'get_tariffs_for_user', AsyncMock(return_value=[tariff]))
     monkeypatch.setattr(service, '_current_subscription', AsyncMock(return_value=None))
     monkeypatch.setattr(service, 'resolve_single_eligible_tariff', lambda *_args, **_kwargs: eligibility)
@@ -135,13 +137,13 @@ async def test_purchase_options_quote_the_same_whole_ruble_total_that_will_be_ch
     options = await service.build_purchase_options(db, user)
     price = options['price_matrix'][0]['prices'][0]
 
-    assert price['price_kopeks'] == 30_100
-    assert price['breakdown']['raw_total_kopeks'] == 30_050
-    assert price['breakdown']['rounding_adjustment_kopeks'] == 50
+    assert price['price_kopeks'] == 30_050
+    assert 'raw_total_kopeks' not in price['breakdown']
+    assert 'rounding_adjustment_kopeks' not in price['breakdown']
 
 
 @pytest.mark.asyncio
-async def test_full_promo_that_rounds_to_zero_stays_on_the_legacy_flow(monkeypatch):
+async def test_non_positive_direct_quote_stays_on_the_legacy_flow(monkeypatch):
     tariff = SimpleNamespace(id=7, name='Premium', traffic_limit_gb=100, device_limit=2, pricing_revision=1)
     user = SimpleNamespace(id=9, balance_kopeks=0)
     eligibility = SimpleNamespace(
@@ -153,6 +155,7 @@ async def test_full_promo_that_rounds_to_zero_stays_on_the_legacy_flow(monkeypat
     )
     db = SimpleNamespace()
     monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+    monkeypatch.setattr(service, 'is_device_first_canary_user', lambda _user: True)
     monkeypatch.setattr(service, 'get_tariffs_for_user', AsyncMock(return_value=[tariff]))
     monkeypatch.setattr(service, '_current_subscription', AsyncMock(return_value=None))
     monkeypatch.setattr(service, 'resolve_single_eligible_tariff', lambda *_args, **_kwargs: eligibility)
@@ -161,8 +164,8 @@ async def test_full_promo_that_rounds_to_zero_stays_on_the_legacy_flow(monkeypat
         'calculate_tariff_purchase_price',
         AsyncMock(
             return_value=SimpleNamespace(
-                final_total=49,
-                base_price=49,
+                final_total=0,
+                base_price=0,
                 devices_price=0,
                 promo_group_discount=0,
                 promo_offer_discount=0,
@@ -252,8 +255,10 @@ async def test_exact_paid_checkout_does_not_expire_before_delayed_fulfillment():
 async def test_exact_paid_checkout_remains_resumable_after_the_general_timeout():
     checkout = SimpleNamespace(
         lifecycle_state='fulfilling',
-        fulfillment_state='in_progress',
+        fulfillment_state='fulfilled',
+        provisioning_state='pending',
         quote_state='committed',
+        settlement_mode='direct_purchase_v2',
         expires_at=datetime.now(UTC) - timedelta(days=1),
     )
     result = SimpleNamespace(scalar_one_or_none=lambda: checkout)
@@ -326,6 +331,11 @@ def test_checkout_serialization_preserves_trial_state_without_guessing(target_sn
         price_breakdown={},
         quoted_price_kopeks=10_000,
         max_price_kopeks=10_000,
+        settlement_mode='legacy_deposit',
+        tariff_total_kopeks=10_000,
+        wallet_applied_kopeks=0,
+        external_payable_kopeks=0,
+        funding_mode=None,
         quote_expires_at=quote_expires_at,
         expires_at=expires_at,
         lifecycle_state='confirmed',
@@ -402,6 +412,7 @@ async def test_expired_quote_cannot_be_armed_or_debited(monkeypatch):
         quote_expires_at=datetime.now(UTC) - timedelta(seconds=1),
         quote_state='valid',
         terminal_reason=None,
+        settlement_mode='legacy_deposit',
     )
     db = SimpleNamespace(commit=AsyncMock())
     fulfill = AsyncMock()

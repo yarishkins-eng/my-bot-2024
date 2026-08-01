@@ -106,6 +106,7 @@ async def test_payment_attempt_rejects_replay_after_exact_payment_started_fulfil
         armed_at=object(),
         fulfillment_state='in_progress',
         quote_state='committed',
+        settlement_mode='legacy_deposit',
     )
     db = SimpleNamespace(get=AsyncMock(return_value=user))
     monkeypatch.setattr(
@@ -139,6 +140,7 @@ async def test_payment_attempt_requests_the_whole_ruble_top_up_shown_to_the_cust
         fulfillment_state='not_started',
         max_price_kopeks=40_100,
         quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        settlement_mode='legacy_deposit',
     )
     user = SimpleNamespace(id=7, balance_kopeks=30_050)
     db = SimpleNamespace(
@@ -190,6 +192,7 @@ async def test_expired_quote_never_returns_or_creates_a_provider_invoice(monkeyp
         quote_expires_at=datetime.now(UTC) - timedelta(seconds=1),
         quote_state='valid',
         terminal_reason=None,
+        settlement_mode='legacy_deposit',
     )
     user = SimpleNamespace(id=7, balance_kopeks=0)
     db = SimpleNamespace(get=AsyncMock(return_value=user), commit=AsyncMock())
