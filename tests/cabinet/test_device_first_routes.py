@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -17,7 +18,7 @@ from app.cabinet.routes.device_first import (
     checkout_pending_payment,
     checkout_resume_invoice,
 )
-from app.services.device_first_checkout_service import DeviceFirstError, checkout_ui_state
+from app.services.device_first_checkout_service import DeviceFirstError, checkout_ui_state, serialize_checkout
 
 
 @pytest.mark.asyncio
@@ -141,6 +142,43 @@ def test_fulfilled_checkout_is_not_ready_before_provisioning() -> None:
     checkout.lifecycle_state = 'ready'
     checkout.provisioning_state = 'ready'
     assert checkout_ui_state(checkout) == 'ready'
+
+
+def test_checkout_serialization_is_json_safe_for_idempotency_replay() -> None:
+    now = datetime.now(UTC)
+    checkout = SimpleNamespace(
+        public_id='checkout-id',
+        tariff_id=1,
+        target_subscription_id=2,
+        period_days=30,
+        selected_device_limit=2,
+        price_breakdown={'base_price_kopeks': 24900},
+        quoted_price_kopeks=24900,
+        max_price_kopeks=24900,
+        settlement_mode='direct_purchase_v2',
+        tariff_total_kopeks=24900,
+        wallet_applied_kopeks=0,
+        external_payable_kopeks=0,
+        funding_mode=None,
+        quote_expires_at=now + timedelta(minutes=30),
+        expires_at=now + timedelta(hours=24),
+        lifecycle_state='draft',
+        quote_state='valid',
+        funding_state='not_requested',
+        fulfillment_state='not_started',
+        provisioning_state='not_required',
+        terminal_reason=None,
+        created_subscription_id=None,
+        target_snapshot=None,
+        fulfilled_end_at=None,
+        created_at=now,
+    )
+
+    payload = serialize_checkout(checkout, balance_kopeks=0)
+
+    assert payload['quote_expires_at'] == checkout.quote_expires_at.isoformat()
+    assert payload['expires_at'] == checkout.expires_at.isoformat()
+    json.dumps(payload)
 
 
 @pytest.mark.asyncio

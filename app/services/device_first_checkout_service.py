@@ -152,8 +152,10 @@ def serialize_checkout(
         'wallet_applied_kopeks': checkout.wallet_applied_kopeks,
         'external_payable_kopeks': checkout.external_payable_kopeks,
         'funding_mode': checkout.funding_mode,
-        'quote_expires_at': checkout.quote_expires_at,
-        'expires_at': checkout.expires_at,
+        # This payload is also persisted verbatim for idempotency replays.
+        # Keep it JSON-native, not merely FastAPI-serializable at the HTTP edge.
+        'quote_expires_at': checkout.quote_expires_at.isoformat() if checkout.quote_expires_at else None,
+        'expires_at': checkout.expires_at.isoformat() if checkout.expires_at else None,
         'lifecycle_state': checkout.lifecycle_state,
         'quote_state': checkout.quote_state,
         'funding_state': checkout.funding_state,
