@@ -7,10 +7,17 @@ from datetime import UTC, datetime
 from importlib import import_module
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database.models import PaymentMethod, TransactionType
+from app.database.models import (
+    CheckoutPaymentAttempt,
+    DeviceFirstOutbox,
+    PaymentMethod,
+    SubscriptionCheckout,
+    TransactionType,
+)
 from app.services.platega_service import PlategaService
 from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
@@ -28,6 +35,69 @@ class PlategaPaymentMixin:
         """Direct-sale callbacks must not retain raw webhook payloads/signatures."""
         metadata = getattr(payment, 'metadata_json', None) or {}
         return metadata.get('settlement_mode') == 'direct_purchase_v2'
+
+    async def _mark_direct_post_paid_reversal(
+        self,
+        db: AsyncSession,
+        *,
+        payment: Any,
+        provider_status: str,
+    ) -> None:
+        """Fence a contradictory post-paid provider terminal status for review.
+
+        A direct sale never turns into a negative generic payment or a balance
+        operation after it was paid. The subscription/outbox may already have
+        progressed, so an operator must reconcile rather than an automatic
+        deprovision, re-provision, refund, or second charge taking place.
+        """
+        metadata = getattr(payment, 'metadata_json', None) or {}
+        attempt_id = metadata.get('device_first_attempt_id')
+        reason = f'post_paid_provider_terminal:{provider_status.lower()}'
+        attempt = None
+        if isinstance(attempt_id, int):
+            attempt = (
+                await db.execute(
+                    select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+
+        payment.status = 'OPERATOR_REVIEW'
+        # Preserve the fact that a receipt was accepted. Setting this false
+        # would let generic legacy code reinterpret an already settled sale.
+        payment.updated_at = datetime.now(UTC)
+        if attempt is None or attempt.settlement_mode != 'direct_purchase_v2':
+            await db.commit()
+            logger.error('direct_device_first_reversal_missing_attempt', payment_id=payment.id)
+            return
+
+        checkout = (
+            await db.execute(
+                select(SubscriptionCheckout).where(SubscriptionCheckout.id == attempt.checkout_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = reason
+        if checkout is not None:
+            checkout.lifecycle_state = 'operator_review'
+            checkout.terminal_reason = reason
+            outboxes = list(
+                (
+                    await db.execute(
+                        select(DeviceFirstOutbox)
+                        .where(
+                            DeviceFirstOutbox.checkout_id == checkout.id,
+                            DeviceFirstOutbox.settlement_mode == 'direct_purchase_v2',
+                            DeviceFirstOutbox.status.in_(['pending', 'retry', 'processing']),
+                        )
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            for outbox in outboxes:
+                outbox.status = 'operator_review'
+                outbox.last_error = reason
+        await db.commit()
+        logger.warning('direct_device_first_post_paid_reversal', payment_id=payment.id, status=provider_status)
 
     async def create_platega_payment(
         self,
@@ -208,6 +278,13 @@ class PlategaPaymentMixin:
             return True
 
         if status_raw in self._FAILED_STATUSES:
+            if direct_device_first and payment.is_paid:
+                await self._mark_direct_post_paid_reversal(
+                    db,
+                    payment=payment,
+                    provider_status=status_raw,
+                )
+                return True
             await payment_module.update_platega_payment(
                 db,
                 payment=payment,

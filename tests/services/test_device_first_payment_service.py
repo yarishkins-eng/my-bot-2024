@@ -4,15 +4,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.services.device_first_checkout_service import DeviceFirstError, expire_checkout_quote_if_needed
+from app.services.device_first_checkout_service import (
+    DeviceFirstError,
+    expire_checkout_quote_if_needed,
+    prepare_direct_external_checkout,
+)
 from app.services.device_first_payment_service import (
     _checkout_return_url,
+    _create_direct_platega_attempt,
     _direct_checkout_return_url,
     _verified_amount,
     available_platega_methods,
     create_platega_attempt,
     settle_device_first_platega_payment,
 )
+from app.services.payment.platega import PlategaPaymentMixin
 from app.services.platega_service import PlategaService
 
 
@@ -280,6 +286,105 @@ async def test_stale_direct_reconciliation_lease_cannot_settle_payment():
     assert settled is None
     assert payment.status == 'PENDING'
     db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_terminal_checkout_cannot_open_another_provider_invoice(monkeypatch):
+    checkout = SimpleNamespace(
+        financial_committed_at=datetime.now(UTC),
+        funding_mode='platega',
+        lifecycle_state='operator_review',
+        funding_state='invoice_pending',
+        fulfillment_state='not_started',
+        created_subscription_id=None,
+        debit_transaction_id=None,
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_checkout_service._lock_direct_context',
+        AsyncMock(return_value=(checkout, SimpleNamespace(id=7), None, SimpleNamespace())),
+    )
+    monkeypatch.setattr('app.services.device_first_checkout_service.settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+    monkeypatch.setattr('app.services.device_first_checkout_service.is_device_first_canary_user', lambda _user: True)
+
+    with pytest.raises(DeviceFirstError) as raised:
+        await prepare_direct_external_checkout(db=SimpleNamespace(), public_id='checkout-1', user_id=7)
+
+    assert raised.value.code == 'invalid_state'
+
+
+@pytest.mark.asyncio
+async def test_normal_direct_commit_does_not_recreate_a_missing_pre_attempt_invoice(monkeypatch):
+    checkout = SimpleNamespace(
+        id=91,
+        public_id='checkout-91',
+        financial_committed_at=datetime.now(UTC),
+        funding_mode='platega',
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(id=7)))
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.available_platega_methods_for_db',
+        AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.get_owned_checkout',
+        AsyncMock(return_value=checkout),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.prepare_direct_external_checkout',
+        AsyncMock(return_value=checkout),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.get_pending_platega_attempt',
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example')
+
+    with pytest.raises(DeviceFirstError) as raised:
+        await _create_direct_platega_attempt(
+            db,
+            checkout_public_id=checkout.public_id,
+            user_id=7,
+            method_key='sbp',
+            method_code=2,
+            was_financially_committed=True,
+        )
+
+    assert raised.value.code == 'invalid_state'
+
+
+@pytest.mark.asyncio
+async def test_direct_post_paid_provider_reversal_stays_in_operator_review():
+    payment = SimpleNamespace(
+        id=51,
+        is_paid=True,
+        status='CONFIRMED',
+        metadata_json={'device_first_attempt_id': 41, 'settlement_mode': 'direct_purchase_v2'},
+    )
+    attempt = SimpleNamespace(id=41, checkout_id=9, settlement_mode='direct_purchase_v2', status='paid_processing')
+    checkout = SimpleNamespace(id=9, lifecycle_state='fulfilling', terminal_reason=None)
+    outbox = SimpleNamespace(status='processing', last_error=None)
+
+    class OutboxResult:
+        def scalars(self):
+            return iter([outbox])
+
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(attempt), Result(checkout), OutboxResult()]),
+        commit=AsyncMock(),
+    )
+
+    await PlategaPaymentMixin()._mark_direct_post_paid_reversal(
+        db,
+        payment=payment,
+        provider_status='CANCELED',
+    )
+
+    assert payment.is_paid is True
+    assert payment.status == 'OPERATOR_REVIEW'
+    assert attempt.status == 'operator_review'
+    assert checkout.lifecycle_state == 'operator_review'
+    assert outbox.status == 'operator_review'
+    db.commit.assert_awaited_once()
 
 
 class Result:

@@ -329,6 +329,14 @@ async def get_open_checkout_for_user(
         SubscriptionCheckout.fulfillment_state == 'fulfilled',
         SubscriptionCheckout.provisioning_state.in_(['pending', 'retry']),
     )
+    # A terminal *direct-sale* record is still a recovery record: an amount
+    # mismatch, post-paid reversal, or operator hold must not disappear after
+    # a WebView restart and silently allow a second order to start. Historical
+    # legacy terminals stay out of this projection to preserve their old UI.
+    terminal_recovery = and_(
+        SubscriptionCheckout.settlement_mode == DIRECT_SETTLEMENT_MODE,
+        SubscriptionCheckout.lifecycle_state.in_(TERMINAL_STATES),
+    )
     checkout = (
         await db.execute(
             select(SubscriptionCheckout)
@@ -340,6 +348,7 @@ async def get_open_checkout_for_user(
                         SubscriptionCheckout.fulfillment_state != 'fulfilled',
                     ),
                     direct_provisioning_recovery,
+                    terminal_recovery,
                 ),
             )
             .order_by(SubscriptionCheckout.created_at.desc())
@@ -890,14 +899,32 @@ async def prepare_direct_external_checkout(
     *,
     public_id: str,
     user_id: int,
+    commit: bool = True,
 ) -> SubscriptionCheckout:
-    """Atomically freeze a full-price external sale before the provider POST."""
+    """Freeze a full-price external sale before the provider POST.
+
+    ``commit=False`` lets the invoice intent and protected payment row commit
+    in the same transaction as the funding choice. No v2 checkout can then be
+    durable in ``invoice_pending`` without a durable attempt to recover.
+    """
     checkout, user, target, tariff = await _lock_direct_context(db, public_id=public_id, user_id=user_id)
     if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED or not is_device_first_canary_user(user):
         raise DeviceFirstError('feature_disabled', 'New checkouts are temporarily disabled')
     if checkout.financial_committed_at is not None:
         if checkout.funding_mode != 'platega':
             raise DeviceFirstError('funding_mode_locked', 'Funding method is already fixed')
+        # A committed v2 checkout is never generically re-opened.  The only
+        # non-terminal state that can be inspected by payment recovery is the
+        # exact pre-fulfilment invoice state; terminal/paid/order-review
+        # checkouts must stay fenced from any further provider POST.
+        if (
+            checkout.lifecycle_state != 'awaiting_funds'
+            or checkout.funding_state != 'invoice_pending'
+            or checkout.fulfillment_state != 'not_started'
+            or checkout.created_subscription_id is not None
+            or checkout.debit_transaction_id is not None
+        ):
+            raise DeviceFirstError('invalid_state', 'Checkout cannot accept another payment invoice')
         return checkout
     if not await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff):
         raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')
@@ -909,8 +936,11 @@ async def prepare_direct_external_checkout(
     checkout.financial_committed_at = datetime.now(UTC)
     checkout.lifecycle_state = 'awaiting_funds'
     checkout.funding_state = 'invoice_pending'
-    await db.commit()
-    await db.refresh(checkout)
+    if commit:
+        await db.commit()
+        await db.refresh(checkout)
+    else:
+        await db.flush()
     return checkout
 
 
@@ -1320,7 +1350,11 @@ async def _process_direct_provisioning_outbox(db: AsyncSession, *, limit: int) -
         current = (
             await db.execute(
                 select(DeviceFirstOutbox)
-                .where(DeviceFirstOutbox.id == row_id, DeviceFirstOutbox.lease_token == token)
+                .where(
+                    DeviceFirstOutbox.id == row_id,
+                    DeviceFirstOutbox.lease_token == token,
+                    DeviceFirstOutbox.status == 'processing',
+                )
                 .with_for_update()
             )
         ).scalar_one_or_none()
