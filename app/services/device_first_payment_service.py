@@ -32,6 +32,7 @@ from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
     LEGACY_SETTLEMENT_MODE,
     DeviceFirstError,
+    device_first_new_checkouts_enabled,
     device_first_top_up_kopeks,
     expire_checkout_quote_if_needed,
     fulfill_direct_external_checkout,
@@ -213,7 +214,7 @@ async def create_platega_attempt(
                 'Invoice creation outcome is ambiguous; automatic duplicate creation is blocked',
             )
         return existing
-    if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED:
+    if not device_first_new_checkouts_enabled():
         raise DeviceFirstError('feature_disabled', 'New payment attempts are temporarily disabled')
 
     user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one()

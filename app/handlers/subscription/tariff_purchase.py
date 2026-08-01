@@ -760,7 +760,9 @@ async def show_funnel_tariffs(
     promo_group_id = getattr(db_user, 'promo_group_id', None)
     tariffs = await get_tariffs_for_user(db, promo_group_id)
 
-    if settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED:
+    from app.services.device_first_checkout_service import device_first_new_checkouts_enabled
+
+    if device_first_new_checkouts_enabled():
         from app.handlers.subscription.device_first import show_device_first_entry
         from app.services.device_first_checkout_service import build_purchase_options
 

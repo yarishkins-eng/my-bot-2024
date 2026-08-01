@@ -273,6 +273,11 @@ class Settings(BaseSettings):
     # Master switch for creating NEW device-first checkouts. Existing status,
     # payment webhooks and workers deliberately continue while this is false.
     DEVICE_FIRST_NEW_CHECKOUTS_ENABLED: bool = False
+    # Public v2 rollout. When enabled through system settings, every eligible
+    # customer can create a new device-first checkout; no user-id allowlist is
+    # consulted. It is deliberately separate from the controlled-canary flag
+    # so production can be enabled and rolled back without editing .env.
+    DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED: bool = False
     # Empty by default: a production direct-sale checkout is unavailable until
     # one owner account is explicitly allowlisted for the controlled canary.
     # This deliberately uses internal user ids and is never returned by an API.

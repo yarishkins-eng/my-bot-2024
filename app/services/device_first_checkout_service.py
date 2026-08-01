@@ -123,7 +123,15 @@ def device_first_canary_user_ids() -> frozenset[int]:
     return frozenset(result)
 
 
+def device_first_new_checkouts_enabled() -> bool:
+    """Return whether new v2 checkouts are open in either approved rollout mode."""
+    return bool(settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED or settings.DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED)
+
+
 def is_device_first_canary_user(user: User) -> bool:
+    """Allow every eligible user in public mode, otherwise retain the canary fence."""
+    if settings.DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED:
+        return True
     return user.id in device_first_canary_user_ids()
 
 
@@ -397,7 +405,7 @@ def _subscription_snapshot(subscription: Subscription | None) -> dict[str, Any]:
 
 
 async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]:
-    if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED:
+    if not device_first_new_checkouts_enabled():
         return {'eligible': False, 'reason': 'feature_disabled'}
     if not is_device_first_canary_user(user):
         return {'eligible': False, 'reason': 'canary_not_allowed'}
@@ -465,7 +473,7 @@ async def create_checkout(
     source: str,
     mutation: DeviceFirstMutation | None = None,
 ) -> SubscriptionCheckout:
-    if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED:
+    if not device_first_new_checkouts_enabled():
         raise DeviceFirstError('feature_disabled', 'New device-first checkouts are disabled', status_code=404)
     # The per-user direct-sale fence serializes a late provider reversal with a
     # new quote.  Every direct financial commit takes this same lock before it
@@ -613,7 +621,7 @@ async def arm_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> Subs
         raise DeviceFirstError('direct_commit_required', 'Choose a funding method before the final purchase')
     if checkout.lifecycle_state not in {'confirmed', 'awaiting_funds', 'armed'}:
         raise DeviceFirstError('invalid_state', 'Checkout cannot be armed in its current state')
-    if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED and checkout.armed_at is None:
+    if not device_first_new_checkouts_enabled() and checkout.armed_at is None:
         raise DeviceFirstError('feature_disabled', 'New checkouts are temporarily disabled')
     if await expire_checkout_quote_if_needed(db, checkout):
         return checkout
@@ -955,7 +963,7 @@ async def prepare_direct_external_checkout(
     durable in ``invoice_pending`` without a durable attempt to recover.
     """
     checkout, user, target, tariff = await _lock_direct_context(db, public_id=public_id, user_id=user_id)
-    if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED or not is_device_first_canary_user(user):
+    if not device_first_new_checkouts_enabled() or not is_device_first_canary_user(user):
         raise DeviceFirstError('feature_disabled', 'New checkouts are temporarily disabled')
     if checkout.financial_committed_at is not None:
         if checkout.funding_mode != 'platega':
@@ -1138,7 +1146,7 @@ async def commit_direct_wallet_checkout(
 ) -> SubscriptionCheckout:
     """The explicit full-wallet path; partial balance is never combined with Platega."""
     checkout, user, target, tariff = await _lock_direct_context(db, public_id=public_id, user_id=user_id)
-    if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED or not is_device_first_canary_user(user):
+    if not device_first_new_checkouts_enabled() or not is_device_first_canary_user(user):
         raise DeviceFirstError('feature_disabled', 'New checkouts are temporarily disabled')
     if checkout.financial_committed_at is not None:
         if checkout.funding_mode != 'wallet':
