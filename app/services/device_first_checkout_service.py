@@ -1125,30 +1125,42 @@ async def fulfill_direct_external_checkout(
     """Recovery-safe completion after an authenticated exact provider payment."""
     if (lease_token is None) != (lease_epoch is None):
         raise ValueError('direct fulfilment lease requires both token and epoch')
-    if lease_token is not None:
-        if payment_attempt_id is None:
-            raise ValueError('direct fulfilment lease requires an attempt id')
-        owned_attempt = (
-            await db.execute(
-                select(CheckoutPaymentAttempt)
-                .where(
-                    CheckoutPaymentAttempt.id == payment_attempt_id,
-                    CheckoutPaymentAttempt.checkout_id == checkout_id,
-                    CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
-                    CheckoutPaymentAttempt.lease_token == lease_token,
-                    CheckoutPaymentAttempt.lease_epoch == lease_epoch,
-                    CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if owned_attempt is None:
-            raise DeviceFirstError('lease_lost', 'Direct payment lease was superseded')
+    if payment_attempt_id is None:
+        raise DeviceFirstError('invalid_state', 'Direct fulfilment requires its paid payment attempt')
+    attempt_predicates = [
+        CheckoutPaymentAttempt.id == payment_attempt_id,
+        CheckoutPaymentAttempt.checkout_id == checkout_id,
+        CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
+        # A provider reversal/operator hold wins before sale issuance.  The
+        # previous callback can no longer fulfil an already fenced checkout.
+        CheckoutPaymentAttempt.status == 'paid_processing',
+    ]
+    if lease_token is not None and lease_epoch is not None:
+        attempt_predicates.extend(
+            [
+                CheckoutPaymentAttempt.lease_token == lease_token,
+                CheckoutPaymentAttempt.lease_epoch == lease_epoch,
+                CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
+            ]
+        )
+    owned_attempt = (
+        await db.execute(
+            select(CheckoutPaymentAttempt).where(*attempt_predicates).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if owned_attempt is None:
+        raise DeviceFirstError('invalid_state', 'Direct payment attempt is no longer eligible for fulfilment')
     checkout = (
         await db.execute(select(SubscriptionCheckout).where(SubscriptionCheckout.id == checkout_id).with_for_update())
     ).scalar_one()
     if settlement_mode(checkout) != DIRECT_SETTLEMENT_MODE:
         raise DeviceFirstError('legacy_checkout', 'This checkout is not a direct sale')
+    if (
+        checkout.lifecycle_state != 'fulfilling'
+        or checkout.funding_state != 'paid'
+        or checkout.fulfillment_state != 'not_started'
+    ):
+        raise DeviceFirstError('invalid_state', 'Direct checkout is no longer eligible for fulfilment')
     user = (await db.execute(select(User).where(User.id == checkout.user_id).with_for_update())).scalar_one()
     target = None
     if checkout.target_subscription_id is not None:
