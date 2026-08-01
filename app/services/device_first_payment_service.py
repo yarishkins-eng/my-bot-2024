@@ -345,7 +345,9 @@ async def _create_direct_platega_attempt(
     if payable <= 0 or payable != checkout.tariff_total_kopeks or checkout.wallet_applied_kopeks != 0:
         raise DeviceFirstError('operator_review_required', 'Invalid direct-sale funding totals')
     if payable < settings.PLATEGA_MIN_AMOUNT_KOPEKS or payable > settings.PLATEGA_MAX_AMOUNT_KOPEKS:
-        raise DeviceFirstError('provider_amount_out_of_range', 'Required amount is outside Platega limits', status_code=422)
+        raise DeviceFirstError(
+            'provider_amount_out_of_range', 'Required amount is outside Platega limits', status_code=422
+        )
 
     correlation_id = uuid.uuid4().hex
     attempt = CheckoutPaymentAttempt(
@@ -498,9 +500,7 @@ async def settle_device_first_platega_payment(
             CheckoutPaymentAttempt.lease_epoch == lease_epoch,
             CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
         )
-    attempt = (
-        await db.execute(attempt_query.with_for_update())
-    ).scalar_one_or_none()
+    attempt = (await db.execute(attempt_query.with_for_update())).scalar_one_or_none()
     if attempt is None and lease_token is not None:
         logger.warning('device_first_direct_payment_lease_lost', payment_id=payment.id)
         return None
@@ -998,7 +998,9 @@ async def reconcile_device_first_payments(db: AsyncSession, *, limit: int = 20) 
                 else:
                     attempt = (
                         await db.execute(
-                            select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt.id).with_for_update()
+                            select(CheckoutPaymentAttempt)
+                            .where(CheckoutPaymentAttempt.id == attempt.id)
+                            .with_for_update()
                         )
                     ).scalar_one()
                 if status in {'FAILED', 'CANCELED', 'EXPIRED'}:

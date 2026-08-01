@@ -341,7 +341,9 @@ async def checkout_commit(
         mutation.checkout_id = checkout.id
         if request.funding_mode == 'wallet':
             if request.method_key is not None:
-                raise DeviceFirstError('invalid_funding_request', 'Wallet checkout has no provider method', status_code=422)
+                raise DeviceFirstError(
+                    'invalid_funding_request', 'Wallet checkout has no provider method', status_code=422
+                )
             checkout = await commit_direct_wallet_checkout(db, public_id=checkout_id, user_id=user.id)
             await db.refresh(user)
             response = {'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)}

@@ -152,7 +152,14 @@ def checkout_ui_state(checkout: SubscriptionCheckout) -> str:
         return 'provisioning'
     if checkout.lifecycle_state in {'armed', 'fulfilling'} and checkout.fulfillment_state == 'in_progress':
         return 'processing'
-    if checkout.lifecycle_state in {'reprice_required', 'conflict', 'cancelled', 'expired', 'failed', 'operator_review'}:
+    if checkout.lifecycle_state in {
+        'reprice_required',
+        'conflict',
+        'cancelled',
+        'expired',
+        'failed',
+        'operator_review',
+    }:
         return checkout.lifecycle_state
     if checkout.lifecycle_state == 'draft':
         return 'configuration'
@@ -788,7 +795,9 @@ async def _lock_direct_context(
                 .with_for_update()
             )
         ).scalar_one_or_none()
-    tariff = (await db.execute(select(Tariff).where(Tariff.id == checkout.tariff_id).with_for_update())).scalar_one_or_none()
+    tariff = (
+        await db.execute(select(Tariff).where(Tariff.id == checkout.tariff_id).with_for_update())
+    ).scalar_one_or_none()
     if tariff is None:
         checkout.lifecycle_state = 'operator_review'
         checkout.terminal_reason = 'tariff_missing_after_quote'
@@ -848,7 +857,10 @@ async def _validate_direct_pre_commit(
         device_limit=checkout.selected_device_limit,
         user=user,
     )
-    if int(tariff.pricing_revision or 1) != checkout.pricing_revision or current_price.final_total != checkout.tariff_total_kopeks:
+    if (
+        int(tariff.pricing_revision or 1) != checkout.pricing_revision
+        or current_price.final_total != checkout.tariff_total_kopeks
+    ):
         checkout.lifecycle_state = 'reprice_required'
         checkout.quote_state = 'price_changed'
         checkout.terminal_reason = 'price_changed'
@@ -973,14 +985,18 @@ async def _complete_direct_sale_locked(
         raise DeviceFirstError('operator_review_required', 'Unknown funding method')
 
     sale_key = f'direct-sale:{checkout.id}'
-    sale = (await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == sale_key))).scalar_one_or_none()
+    sale = (
+        await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == sale_key))
+    ).scalar_one_or_none()
     if sale is None:
         sale = Transaction(
             user_id=user.id,
             type=TransactionType.SUBSCRIPTION_PAYMENT.value,
             amount_kopeks=-total,
-            description=(f'Device-first direct sale: {snapshot["period_days"]} days, '
-                         f'{snapshot["device_limit"]} devices, checkout {checkout.public_id}'),
+            description=(
+                f'Device-first direct sale: {snapshot["period_days"]} days, '
+                f'{snapshot["device_limit"]} devices, checkout {checkout.public_id}'
+            ),
             payment_method='balance' if checkout.funding_mode == 'wallet' else 'platega',
             external_id=f'device-first-sale:{checkout.public_id}',
             device_first_checkout_id=checkout.id,
@@ -1190,7 +1206,7 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
                             DeviceFirstOutbox.status == 'processing',
                             DeviceFirstOutbox.updated_at <= stale_before,
                         ),
-                    )
+                    ),
                 )
                 .order_by(DeviceFirstOutbox.id)
                 .limit(limit)
@@ -1317,9 +1333,7 @@ async def _process_direct_provisioning_outbox(db: AsyncSession, *, limit: int) -
             continue
         checkout = (
             await db.execute(
-                select(SubscriptionCheckout)
-                .where(SubscriptionCheckout.id == current.checkout_id)
-                .with_for_update()
+                select(SubscriptionCheckout).where(SubscriptionCheckout.id == current.checkout_id).with_for_update()
             )
         ).scalar_one()
         current.lease_token = None
@@ -1342,7 +1356,7 @@ async def _process_direct_provisioning_outbox(db: AsyncSession, *, limit: int) -
             processed += 1
         else:
             current.status = 'retry'
-            current.available_at = datetime.now(UTC) + timedelta(minutes=min(60, 2 ** current.attempts))
+            current.available_at = datetime.now(UTC) + timedelta(minutes=min(60, 2**current.attempts))
             checkout.provisioning_state = 'retry'
         await db.commit()
     return processed
