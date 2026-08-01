@@ -352,6 +352,10 @@ async def create_checkout(
 ) -> SubscriptionCheckout:
     if not settings.DEVICE_FIRST_NEW_CHECKOUTS_ENABLED:
         raise DeviceFirstError('feature_disabled', 'New device-first checkouts are disabled', status_code=404)
+    # The per-user direct-sale fence serializes a late provider reversal with a
+    # new quote.  Every direct financial commit takes this same lock before it
+    # can create an invoice or debit the wallet.
+    user = (await db.execute(select(User).where(User.id == user.id).with_for_update())).scalar_one()
     if user.restriction_subscription:
         raise DeviceFirstError('subscription_restricted', 'Subscription purchase is restricted', status_code=403)
 
@@ -371,7 +375,6 @@ async def create_checkout(
             updated_at=now,
         )
     )
-    await db.commit()
 
     operator_hold = (
         await db.execute(
@@ -381,6 +384,7 @@ async def create_checkout(
                 SubscriptionCheckout.settlement_mode == DIRECT_SETTLEMENT_MODE,
                 SubscriptionCheckout.lifecycle_state == 'operator_review',
             )
+            .with_for_update()
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -670,11 +674,29 @@ async def _lock_direct_context(
     public_id: str,
     user_id: int,
 ) -> tuple[SubscriptionCheckout, User, Subscription | None, Tariff]:
-    """Lock in the same order as legacy fulfilment: checkout → user → sub → tariff."""
+    """Lock direct commits in the canonical order: user → checkout → sub → tariff."""
+    user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one()
     checkout = await get_owned_checkout(db, public_id=public_id, user_id=user_id, for_update=True)
     if settlement_mode(checkout) != DIRECT_SETTLEMENT_MODE:
         raise DeviceFirstError('legacy_checkout', 'This older checkout uses its original settlement path')
-    user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one()
+    operator_hold = (
+        await db.execute(
+            select(SubscriptionCheckout.id)
+            .where(
+                SubscriptionCheckout.user_id == user.id,
+                SubscriptionCheckout.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                SubscriptionCheckout.lifecycle_state == 'operator_review',
+                SubscriptionCheckout.id != checkout.id,
+            )
+            .with_for_update()
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if operator_hold is not None:
+        raise DeviceFirstError(
+            'operator_review_required',
+            'An earlier direct payment requires operator review before another purchase can continue',
+        )
     target = None
     if checkout.target_subscription_id is not None:
         target = (

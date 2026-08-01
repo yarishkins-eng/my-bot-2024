@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -140,6 +141,29 @@ def _redact_mutation_response(response: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in response.items() if key != 'redirect_url'}
 
 
+def _is_live_direct_provider_invoice(
+    checkout: SubscriptionCheckout,
+    attempt: CheckoutPaymentAttempt,
+    payment: PlategaPayment | None,
+) -> bool:
+    """Expose a direct redirect only while the exact invoice is still usable."""
+    if (
+        payment is None
+        or not payment.redirect_url
+        or payment.is_paid
+        or attempt.status != 'pending'
+        or str(payment.status).upper() not in {'PENDING', 'INPROGRESS'}
+        or checkout.lifecycle_state != 'awaiting_funds'
+        or checkout.funding_state != 'invoice_pending'
+        or checkout.fulfillment_state != 'not_started'
+    ):
+        return False
+    # A provider expiry is authoritative when available.  Some methods do not
+    # return one; their redirect is still bounded by the immutable local quote.
+    expires_at = payment.expires_at or checkout.quote_expires_at
+    return expires_at is not None and expires_at > datetime.now(UTC)
+
+
 async def _rehydrate_owned_direct_redirect(
     db: AsyncSession,
     *,
@@ -165,7 +189,7 @@ async def _rehydrate_owned_direct_redirect(
             select(CheckoutPaymentAttempt)
             .where(
                 CheckoutPaymentAttempt.checkout_id == checkout.id,
-                CheckoutPaymentAttempt.status.in_(['pending', 'reconciliation']),
+                CheckoutPaymentAttempt.status == 'pending',
                 CheckoutPaymentAttempt.platega_payment_id.is_not(None),
             )
             .order_by(CheckoutPaymentAttempt.id.desc())
@@ -175,7 +199,7 @@ async def _rehydrate_owned_direct_redirect(
     if attempt is None:
         return response
     payment = await db.get(PlategaPayment, attempt.platega_payment_id)
-    if payment is None or not payment.redirect_url:
+    if not _is_live_direct_provider_invoice(checkout, attempt, payment):
         return response
     return {**response, 'redirect_url': payment.redirect_url}
 
@@ -530,7 +554,7 @@ async def checkout_pending_payment(
         return {'redirect_url': None, 'status': 'missing', 'resume_allowed': resume_allowed}
     payment = await db.get(PlategaPayment, attempt.platega_payment_id) if attempt.platega_payment_id else None
     return {
-        'redirect_url': payment.redirect_url if payment and payment.redirect_url else None,
+        'redirect_url': payment.redirect_url if _is_live_direct_provider_invoice(checkout, attempt, payment) else None,
         'status': attempt.status,
         'resume_allowed': False,
     }
