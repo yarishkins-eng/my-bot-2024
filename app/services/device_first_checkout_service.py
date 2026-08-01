@@ -151,8 +151,12 @@ def serialize_checkout(
         'price_breakdown': checkout.price_breakdown,
         'quoted_price_kopeks': checkout.quoted_price_kopeks,
         'max_price_kopeks': checkout.max_price_kopeks,
-        'quote_expires_at': checkout.quote_expires_at,
-        'expires_at': checkout.expires_at,
+        # The same payload is returned to the client and persisted in the
+        # idempotency record.  Keep timestamps JSON-native for both paths;
+        # otherwise PostgreSQL's JSON encoder raises after the checkout was
+        # committed and the client sees a false generic error.
+        'quote_expires_at': checkout.quote_expires_at.isoformat(),
+        'expires_at': checkout.expires_at.isoformat(),
         'lifecycle_state': checkout.lifecycle_state,
         'quote_state': checkout.quote_state,
         'funding_state': checkout.funding_state,

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -314,6 +315,8 @@ def test_credited_armed_checkout_is_serialized_as_processing():
 )
 def test_checkout_serialization_preserves_trial_state_without_guessing(target_snapshot, expected_trial_state):
     now = datetime.now(UTC)
+    quote_expires_at = now + timedelta(minutes=30)
+    expires_at = now + timedelta(hours=24)
     checkout = SimpleNamespace(
         public_id='checkout-1',
         tariff_id=7,
@@ -323,8 +326,8 @@ def test_checkout_serialization_preserves_trial_state_without_guessing(target_sn
         price_breakdown={},
         quoted_price_kopeks=10_000,
         max_price_kopeks=10_000,
-        quote_expires_at=now + timedelta(minutes=30),
-        expires_at=now + timedelta(hours=24),
+        quote_expires_at=quote_expires_at,
+        expires_at=expires_at,
         lifecycle_state='confirmed',
         quote_state='valid',
         funding_state='funded',
@@ -340,6 +343,11 @@ def test_checkout_serialization_preserves_trial_state_without_guessing(target_sn
     snapshot = service.serialize_checkout(checkout)
 
     assert snapshot['current_subscription_is_trial'] is expected_trial_state
+    assert snapshot['quote_expires_at'] == quote_expires_at.isoformat()
+    assert snapshot['expires_at'] == expires_at.isoformat()
+    # This is also the payload persisted to device_first_mutations.  A raw
+    # datetime here would create the checkout but fail the HTTP response.
+    assert json.loads(json.dumps(snapshot)) == snapshot
 
 
 @pytest.mark.asyncio
