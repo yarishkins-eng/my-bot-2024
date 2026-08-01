@@ -94,6 +94,14 @@ def test_financial_workers_preserve_lock_order_and_refresh_locked_users():
     payment_path = Path(__file__).parents[2] / 'app/services/device_first_payment_service.py'
     settlement = payment_path.read_text().split('async def settle_device_first_platega_payment', 1)[1]
     assert settlement.index('select(PlategaPayment)') < settlement.index('select(CheckoutPaymentAttempt)')
+    assert settlement.index('select(PlategaPayment)') < settlement.index('.execution_options(populate_existing=True)')
+
+    reconciler = payment_path.read_text().split('async def reconcile_device_first_payments', 1)[1]
+    assert reconciler.count('.execution_options(populate_existing=True)') >= 3
+    assert "if mismatch_reason is None and attempt.status == 'paid_processing':" in settlement
+    assert settlement.index("if mismatch_reason is None and attempt.status == 'paid_processing':") < settlement.index(
+        "checkout.lifecycle_state not in {'awaiting_funds', 'fulfilling'}"
+    )
 
     deposit_path = Path(__file__).parents[2] / 'app/services/device_first_deposit_outbox_service.py'
     referral_step = deposit_path.read_text().split('async def _apply_referral_step', 1)[1]

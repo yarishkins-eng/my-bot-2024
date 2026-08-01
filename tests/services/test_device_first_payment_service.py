@@ -313,6 +313,86 @@ async def test_direct_reconciler_fences_a_post_paid_provider_terminal_for_operat
     )
 
 
+@pytest.mark.asyncio
+async def test_direct_reconciler_refreshes_webhook_first_payment_before_confirmed_recovery(monkeypatch):
+    """A worker's stale pre-webhook objects must not turn a ready sale into review."""
+    stale_attempt = SimpleNamespace(
+        id=41,
+        checkout_id=9,
+        settlement_mode='direct_purchase_v2',
+        status='pending',
+        lease_epoch=3,
+        provider_payment_id='provider-1',
+        platega_payment_id=51,
+        reconcile_attempts=0,
+        reconciliation_reason=None,
+    )
+    stale_payment = SimpleNamespace(id=51, is_paid=False, status='PENDING')
+    webhook_payment = SimpleNamespace(
+        id=51,
+        user_id=7,
+        is_paid=True,
+        status='CONFIRMED',
+        metadata_json={'device_first_attempt_id': 41, 'settlement_mode': 'direct_purchase_v2'},
+    )
+    webhook_attempt = SimpleNamespace(
+        id=41,
+        checkout_id=9,
+        settlement_mode='direct_purchase_v2',
+        status='paid_processing',
+        provider_payment_id='provider-1',
+        provider_method_code=2,
+        requested_amount_kopeks=10_000,
+        reconciliation_reason=None,
+    )
+
+    class AttemptsResult:
+        def scalars(self):
+            return SimpleNamespace(all=lambda: [stale_attempt])
+
+    provider = SimpleNamespace(
+        get_transaction=AsyncMock(
+            return_value={
+                'id': 'provider-1',
+                'status': 'CONFIRMED',
+                'paymentMethod': 2,
+                'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+            }
+        )
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                AttemptsResult(),
+                SimpleNamespace(rowcount=1),
+                Result(webhook_payment),
+                Result(webhook_attempt),
+            ]
+        ),
+        get=AsyncMock(side_effect=[stale_attempt, stale_payment]),
+        commit=AsyncMock(),
+    )
+    fulfillment = AsyncMock()
+    monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', lambda: provider)
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._lock_owned_direct_attempt_lease',
+        AsyncMock(return_value=stale_attempt),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._release_direct_attempt_lease',
+        AsyncMock(),
+    )
+    monkeypatch.setattr('app.services.device_first_payment_service.fulfill_direct_external_checkout', fulfillment)
+
+    processed = await reconcile_device_first_payments(db)
+
+    assert processed == 1
+    assert webhook_payment.status == 'CONFIRMED'
+    assert webhook_attempt.status == 'paid_processing'
+    assert webhook_attempt.reconciliation_reason is None
+    fulfillment.assert_not_awaited()
+
+
 class Result:
     def __init__(self, value):
         self.value = value
