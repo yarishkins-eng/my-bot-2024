@@ -645,6 +645,45 @@ async def cancel_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> S
     return checkout
 
 
+async def cancel_checkout_for_new_calculation(
+    db: AsyncSession,
+    checkout: SubscriptionCheckout,
+) -> SubscriptionCheckout:
+    """Close only a checkout that cannot still collect money.
+
+    ``Тарифы`` is an explicit request to start over.  A v2 quote with no
+    provider attempt is safe to cancel in every pre-fulfilment open state,
+    including the historical ``awaiting_funds`` pre-attempt crash state.  A
+    provider attempt always remains a recovery record: provider terminal
+    statuses can still be followed by a late paid callback, so no historic
+    external attempt is ever released automatically.
+
+    The caller must own a freshly ``FOR UPDATE``-locked checkout.  This is a
+    narrow entry-point policy; generic cancellation after an invoice remains
+    deliberately blocked by :func:`cancel_checkout`.
+    """
+    if (
+        settlement_mode(checkout) != DIRECT_SETTLEMENT_MODE
+        or checkout.lifecycle_state not in {'draft', 'confirmed', 'awaiting_funds'}
+        or checkout.fulfillment_state != 'not_started'
+    ):
+        return checkout
+
+    attempts = list(
+        (
+            await db.execute(
+                select(CheckoutPaymentAttempt)
+                .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
+                .order_by(CheckoutPaymentAttempt.id.desc())
+            )
+        ).scalars()
+    )
+    if not attempts:
+        return await cancel_checkout(db, checkout)
+
+    return checkout
+
+
 async def arm_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> SubscriptionCheckout:
     if settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE:
         raise DeviceFirstError('direct_commit_required', 'Choose a funding method before the final purchase')

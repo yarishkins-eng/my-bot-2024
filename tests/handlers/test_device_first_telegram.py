@@ -3,7 +3,6 @@ from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
-from app.database.models import Tariff
 from app.handlers.subscription.device_first import (
     _answer_stale,
     _days_label,
@@ -530,13 +529,13 @@ async def test_device_back_after_a_predeploy_state_returns_period_screen_to_the_
 
 
 @pytest.mark.asyncio
-async def test_open_draft_remains_reviewable_when_new_device_first_orders_are_disabled() -> None:
+async def test_safe_open_quote_is_discarded_before_falling_back_when_new_device_first_orders_are_disabled() -> None:
     callback = SimpleNamespace(data='df:start', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
-    checkout = SimpleNamespace(public_id='draft-17', lifecycle_state='draft', tariff_id=9)
-    tariff = SimpleNamespace(name='Premium')
-    db = SimpleNamespace(get=AsyncMock(return_value=tariff))
+    checkout = SimpleNamespace(public_id='draft-17', lifecycle_state='draft')
+    cancelled_checkout = SimpleNamespace(public_id='draft-17', lifecycle_state='cancelled')
+    db = AsyncMock()
 
     with (
         patch(
@@ -547,19 +546,25 @@ async def test_open_draft_remains_reviewable_when_new_device_first_orders_are_di
             'app.handlers.subscription.device_first.build_purchase_options',
             AsyncMock(return_value={'eligible': False, 'reason': 'feature_disabled'}),
         ) as build_options,
-        patch('app.handlers.subscription.device_first._render_new_checkout', AsyncMock()) as render,
+        patch(
+            'app.handlers.subscription.device_first.get_owned_checkout',
+            AsyncMock(return_value=checkout),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.cancel_checkout_for_new_calculation',
+            AsyncMock(return_value=cancelled_checkout),
+        ) as cancel_for_restart,
     ):
-        assert await show_device_first_entry(callback, user, db, state) is True
+        assert await show_device_first_entry(callback, user, db, state) is False
 
     build_options.assert_awaited_once_with(db, user)
-    callback.answer.assert_awaited_once()
-    state.update_data.assert_awaited_once_with(df_checkout_id='draft-17')
-    db.get.assert_awaited_once_with(Tariff, 9)
-    render.assert_awaited_once_with(callback, user, db, checkout, tariff_name='Premium')
+    cancel_for_restart.assert_awaited_once_with(db, checkout)
+    state.clear.assert_awaited_once()
+    callback.answer.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('lifecycle_state', ['draft', 'confirmed'])
+@pytest.mark.parametrize('lifecycle_state', ['draft', 'confirmed', 'awaiting_funds'])
 async def test_tariffs_starts_a_new_calculation_after_discarding_a_safe_quote(lifecycle_state: str) -> None:
     callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
     state = AsyncMock()
@@ -580,15 +585,15 @@ async def test_tariffs_starts_a_new_calculation_after_discarding_a_safe_quote(li
             AsyncMock(return_value=checkout),
         ) as get_owned,
         patch(
-            'app.handlers.subscription.device_first.cancel_checkout',
+            'app.handlers.subscription.device_first.cancel_checkout_for_new_calculation',
             AsyncMock(return_value=cancelled_checkout),
-        ) as cancel_checkout,
+        ) as cancel_for_restart,
         patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
     ):
         assert await show_device_first_entry(callback, user, db, state) is True
 
     get_owned.assert_awaited_once_with(db, public_id='quote-17', user_id=17, for_update=True)
-    cancel_checkout.assert_awaited_once_with(db, checkout)
+    cancel_for_restart.assert_awaited_once_with(db, checkout)
     state.clear.assert_awaited_once()
     period_page.assert_awaited_once()
     assert period_page.await_args.args[3] == options
@@ -615,7 +620,7 @@ async def test_tariffs_keeps_recovery_when_cancellation_did_not_take_effect() ->
             AsyncMock(return_value=checkout),
         ),
         patch(
-            'app.handlers.subscription.device_first.cancel_checkout',
+            'app.handlers.subscription.device_first.cancel_checkout_for_new_calculation',
             AsyncMock(return_value=settled_checkout),
         ),
         patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
@@ -647,7 +652,10 @@ async def test_tariffs_keeps_recovery_when_a_quote_becomes_an_external_invoice()
             'app.handlers.subscription.device_first.get_owned_checkout',
             AsyncMock(side_effect=[checkout, checkout]),
         ),
-        patch('app.handlers.subscription.device_first.cancel_checkout', AsyncMock(side_effect=invoice_exists)),
+        patch(
+            'app.handlers.subscription.device_first.cancel_checkout_for_new_calculation',
+            AsyncMock(side_effect=invoice_exists),
+        ),
         patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
         patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
     ):
@@ -911,6 +919,41 @@ async def test_pending_invoice_without_a_payment_url_offers_only_safe_recovery_a
     assert 'menu_support' in callbacks
     assert 'back_to_menu' in callbacks
     assert all(not callback.startswith('df:x:') for callback in callbacks)
+
+
+@pytest.mark.asyncio
+async def test_non_live_known_direct_attempt_never_renders_payment_methods_again() -> None:
+    callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    checkout = SimpleNamespace(
+        id=101,
+        public_id='owned-checkout',
+        settlement_mode='direct_purchase_v2',
+    )
+    db = SimpleNamespace(scalar=AsyncMock(return_value=201))
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value={'ui_state': 'awaiting_payment', 'shortage_kopeks': 35_000},
+        ),
+        patch('app.handlers.subscription.device_first.get_pending_platega_attempt', AsyncMock(return_value=None)),
+        patch('app.handlers.subscription.device_first._render_direct_payment_methods', AsyncMock()) as methods,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output,
+    ):
+        await _render_checkout(callback, user, db, checkout)
+
+    caption = output.await_args.kwargs['caption']
+    callbacks = [
+        button.callback_data
+        for row in output.await_args.kwargs['keyboard'].inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    assert 'Проверяем предыдущий счёт' in caption
+    assert 'menu_support' in callbacks
+    assert 'back_to_menu' in callbacks
+    methods.assert_not_awaited()
 
 
 @pytest.mark.asyncio

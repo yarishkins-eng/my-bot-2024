@@ -246,6 +246,69 @@ async def test_direct_cancel_is_rejected_after_an_external_invoice_is_created():
 
 
 @pytest.mark.asyncio
+async def test_tariffs_restart_cancels_a_direct_awaiting_funds_checkout_without_an_attempt(monkeypatch):
+    checkout = SimpleNamespace(
+        id=51,
+        lifecycle_state='awaiting_funds',
+        fulfillment_state='not_started',
+        settlement_mode='direct_purchase_v2',
+    )
+    result = SimpleNamespace(scalars=list)
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+    cancelled = SimpleNamespace(lifecycle_state='cancelled')
+    cancel_checkout = AsyncMock(return_value=cancelled)
+    monkeypatch.setattr(service, 'cancel_checkout', cancel_checkout)
+
+    returned = await service.cancel_checkout_for_new_calculation(db, checkout)
+
+    assert returned is cancelled
+    cancel_checkout.assert_awaited_once_with(db, checkout)
+
+
+@pytest.mark.asyncio
+async def test_tariffs_restart_never_releases_a_failed_or_terminal_provider_attempt():
+    checkout = SimpleNamespace(
+        id=51,
+        lifecycle_state='awaiting_funds',
+        fulfillment_state='not_started',
+        settlement_mode='direct_purchase_v2',
+    )
+    attempt = SimpleNamespace(id=61, status='failed', platega_payment_id=71)
+    result = SimpleNamespace(scalars=lambda: [attempt])
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=result),
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+
+    returned = await service.cancel_checkout_for_new_calculation(db, checkout)
+
+    assert returned is checkout
+    assert checkout.lifecycle_state == 'awaiting_funds'
+    db.commit.assert_not_awaited()
+    db.refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tariffs_restart_never_releases_a_live_or_ambiguous_provider_attempt():
+    checkout = SimpleNamespace(
+        id=51,
+        lifecycle_state='awaiting_funds',
+        fulfillment_state='not_started',
+        settlement_mode='direct_purchase_v2',
+    )
+    attempt = SimpleNamespace(id=61, status='pending', platega_payment_id=71)
+    result = SimpleNamespace(scalars=lambda: [attempt])
+    db = SimpleNamespace(execute=AsyncMock(return_value=result), commit=AsyncMock(), refresh=AsyncMock())
+
+    returned = await service.cancel_checkout_for_new_calculation(db, checkout)
+
+    assert returned is checkout
+    db.commit.assert_not_awaited()
+    db.refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_locked_checkout_query_forces_fresh_orm_state():
     checkout = SimpleNamespace(lifecycle_state='ready')
     result = SimpleNamespace(scalar_one_or_none=lambda: checkout)

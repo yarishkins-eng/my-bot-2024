@@ -10,15 +10,17 @@ from urllib.parse import urlencode
 from aiogram import F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import PlategaPayment, Tariff, User
+from app.database.models import CheckoutPaymentAttempt, PlategaPayment, Tariff, User
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
     DeviceFirstError,
     arm_checkout,
     build_purchase_options,
     cancel_checkout,
+    cancel_checkout_for_new_calculation,
     commit_direct_wallet_checkout,
     confirm_checkout,
     create_checkout,
@@ -293,33 +295,32 @@ async def show_device_first_entry(
     origin_callback: str | None = None,
 ) -> bool:
     # “Tariffs” is an explicit intent to configure a new purchase.  A stale
-    # draft/confirmed quote has no payment attempt and can be discarded before
-    # showing periods again.  An invoice or any post-payment state must remain
-    # recoverable instead: silently replacing it could hide money in flight.
+    # quote with no external payment, including the historical pre-attempt
+    # ``awaiting_funds`` state, can be discarded before showing periods again.
+    # A live or ambiguous invoice must remain recoverable instead: silently
+    # replacing it could hide money in flight.
     existing = await get_open_checkout_for_user(db, user_id=db_user.id)
-    if existing is not None and existing.lifecycle_state in {'draft', 'confirmed'}:
-        options = options or await build_purchase_options(db, db_user)
-        if options.get('eligible'):
-            try:
-                locked_checkout = await get_owned_checkout(
-                    db,
-                    public_id=existing.public_id,
-                    user_id=db_user.id,
-                    for_update=True,
-                )
-                cancelled_checkout = await cancel_checkout(db, locked_checkout)
-            except DeviceFirstError:
-                # The row can turn into an external-invoice recovery record
-                # between the read and the lock.  Do not start another order.
-                existing = await get_owned_checkout(db, public_id=existing.public_id, user_id=db_user.id)
+    if existing is not None:
+        try:
+            locked_checkout = await get_owned_checkout(
+                db,
+                public_id=existing.public_id,
+                user_id=db_user.id,
+                for_update=True,
+            )
+            cancelled_checkout = await cancel_checkout_for_new_calculation(db, locked_checkout)
+        except DeviceFirstError:
+            # The row can turn into an external-invoice recovery record
+            # between the read and the lock.  Do not start another order.
+            existing = await get_owned_checkout(db, public_id=existing.public_id, user_id=db_user.id)
+        else:
+            if cancelled_checkout.lifecycle_state == 'cancelled':
+                await state.clear()
+                existing = None
             else:
-                if cancelled_checkout.lifecycle_state == 'cancelled':
-                    await state.clear()
-                    existing = None
-                else:
-                    # A concurrent settlement can move the row to a terminal
-                    # state before cancellation.  Keep that order visible.
-                    existing = cancelled_checkout
+                # A concurrent settlement can move the row to a terminal
+                # state before cancellation.  Keep that order visible.
+                existing = cancelled_checkout
 
     if existing is not None:
         await callback.answer()
@@ -924,6 +925,42 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                 )
                 keyboard = InlineKeyboardMarkup(inline_keyboard=[[status_button], [_main_menu(user)]])
         elif direct:
+            known_attempt_id = await db.scalar(
+                select(CheckoutPaymentAttempt.id)
+                .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
+                .order_by(CheckoutPaymentAttempt.id.desc())
+                .limit(1)
+            )
+            if known_attempt_id is not None:
+                await edit_or_answer_photo(
+                    callback=callback,
+                    caption=_text(
+                        user,
+                        (
+                            '⚠️ <b>Проверяем предыдущий счёт</b>\n\n'
+                            'Новый способ оплаты сейчас не показываем, чтобы не создать повторный счёт. '
+                            'Обратитесь в поддержку: она проверит счёт и поможет продолжить безопасно.'
+                        ),
+                        (
+                            '⚠️ <b>Checking the previous invoice</b>\n\n'
+                            'We are not showing a new payment method to avoid creating a duplicate invoice. '
+                            'Contact support so it can check the invoice and help you continue safely.'
+                        ),
+                    ),
+                    keyboard=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text=_text(user, 'Связаться с поддержкой', 'Contact support'),
+                                    callback_data='menu_support',
+                                )
+                            ],
+                            [_main_menu(user)],
+                        ]
+                    ),
+                    parse_mode='HTML',
+                )
+                return
             await _render_direct_payment_methods(callback, user, db, checkout)
             return
         elif shortage:
