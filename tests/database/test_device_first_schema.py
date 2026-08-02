@@ -123,12 +123,16 @@ def test_financial_workers_preserve_lock_order_and_refresh_locked_users():
     )[0]
     assert direct_settlement.index('select(User)') < direct_settlement.index('select(CheckoutPaymentAttempt)')
 
-    terminal_release = payment_path.read_text().split('async def _release_direct_terminal_invoice', 1)[1].split(
-        'async def _hold_direct_invoice_for_review', 1
-    )[0]
+    terminal_release = (
+        payment_path.read_text()
+        .split('async def _release_direct_terminal_invoice', 1)[1]
+        .split('async def _hold_direct_invoice_for_review', 1)[0]
+    )
     assert terminal_release.index('select(PlategaPayment)') < terminal_release.index('select(User)')
     assert terminal_release.index('select(User)') < terminal_release.index('select(CheckoutPaymentAttempt)')
-    assert terminal_release.index('select(CheckoutPaymentAttempt)') < terminal_release.index('select(SubscriptionCheckout)')
+    assert terminal_release.index('select(CheckoutPaymentAttempt)') < terminal_release.index(
+        'select(SubscriptionCheckout)'
+    )
 
     deposit_path = Path(__file__).parents[2] / 'app/services/device_first_deposit_outbox_service.py'
     referral_step = deposit_path.read_text().split('async def _apply_referral_step', 1)[1]

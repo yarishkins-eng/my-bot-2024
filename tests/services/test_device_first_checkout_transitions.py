@@ -363,7 +363,9 @@ async def test_exact_paid_checkout_remains_resumable_after_the_general_timeout()
         expires_at=datetime.now(UTC) - timedelta(days=1),
     )
     result = SimpleNamespace(scalar_one_or_none=lambda: checkout)
-    db = SimpleNamespace(execute=AsyncMock(return_value=result), scalar=AsyncMock(return_value=None), commit=AsyncMock())
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=result), scalar=AsyncMock(return_value=None), commit=AsyncMock()
+    )
 
     returned = await service.get_open_checkout_for_user(db, user_id=7)
 

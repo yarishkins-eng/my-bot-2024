@@ -150,7 +150,8 @@ def _has_exact_direct_invoice_details(attempt: CheckoutPaymentAttempt, payload: 
     return (
         _provider_transaction_id(payload) == str(attempt.provider_payment_id or '')
         and method_code == int(attempt.provider_method_code)
-        and verified == (
+        and verified
+        == (
             int(attempt.requested_amount_kopeks),
             'RUB',
         )
@@ -531,10 +532,14 @@ async def _apply_direct_pending_provider_observation(
         ),
         default=None,
     )
-    if last_local_change is not None and last_local_change > observed_after and (
-        payment.is_paid
-        or attempt.status in {'failed', 'paid_processing', 'credited', 'operator_review'}
-        or checkout.lifecycle_state in {'cancelled', 'fulfilling', 'ready', 'operator_review'}
+    if (
+        last_local_change is not None
+        and last_local_change > observed_after
+        and (
+            payment.is_paid
+            or attempt.status in {'failed', 'paid_processing', 'credited', 'operator_review'}
+            or checkout.lifecycle_state in {'cancelled', 'fulfilling', 'ready', 'operator_review'}
+        )
     ):
         return False
 
@@ -787,15 +792,15 @@ async def abandon_direct_checkout_for_new_calculation(
     # the contractual Payment -> User -> Attempt -> Checkout.
     payment_id = await db.scalar(
         select(PlategaPayment.id)
-            .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
-            .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-            .where(
-                SubscriptionCheckout.public_id == checkout_public_id,
-                SubscriptionCheckout.user_id == user_id,
-                CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
-            )
-            .order_by(CheckoutPaymentAttempt.id.desc())
-            .limit(1)
+        .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
+        .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+        .where(
+            SubscriptionCheckout.public_id == checkout_public_id,
+            SubscriptionCheckout.user_id == user_id,
+            CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
+        )
+        .order_by(CheckoutPaymentAttempt.id.desc())
+        .limit(1)
     )
     if payment_id is None:
         return None
@@ -842,7 +847,11 @@ async def abandon_direct_checkout_for_new_calculation(
         attempt.reconciliation_reason = 'direct_checkout_abandon_binding_mismatch'
         await db.commit()
         return checkout
-    if payment.is_paid or attempt.status in {'paid_processing', 'credited'} or checkout.fulfillment_state != 'not_started':
+    if (
+        payment.is_paid
+        or attempt.status in {'paid_processing', 'credited'}
+        or checkout.fulfillment_state != 'not_started'
+    ):
         # A paid/fulfilling purchase must remain visible; only a live external
         # invoice can be superseded by a fresh user configuration.
         return checkout
@@ -1381,9 +1390,7 @@ async def settle_device_first_platega_payment(
             await db.commit()
             logger.error('device_first_direct_payment_attempt_missing', payment_id=payment.id)
             return payment
-        user = (
-            await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
-        ).scalar_one()
+        user = (await db.execute(select(User).where(User.id == payment.user_id).with_for_update())).scalar_one()
         attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
         if lease_token is not None:
             attempt_query = attempt_query.where(
@@ -1402,10 +1409,7 @@ async def settle_device_first_platega_payment(
             await db.commit()
             logger.error('device_first_direct_payment_attempt_missing', payment_id=payment.id)
             return payment
-        if (
-            settlement_mode(attempt) != DIRECT_SETTLEMENT_MODE
-            or attempt.platega_payment_id != payment.id
-        ):
+        if settlement_mode(attempt) != DIRECT_SETTLEMENT_MODE or attempt.platega_payment_id != payment.id:
             payment.status = 'OPERATOR_REVIEW'
             attempt.status = 'operator_review'
             attempt.reconciliation_reason = 'direct_payment_attempt_mode_or_binding_mismatch'

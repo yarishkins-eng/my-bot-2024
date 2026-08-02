@@ -358,7 +358,9 @@ async def test_direct_invoice_persists_create_identity_then_verifies_canonical_a
         checkout.expires_at = payment.expires_at
         return True
 
-    monkeypatch.setattr('app.services.device_first_payment_service._apply_direct_pending_provider_observation', apply_pending)
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._apply_direct_pending_provider_observation', apply_pending
+    )
 
     attempt = await _create_direct_platega_attempt(
         db,

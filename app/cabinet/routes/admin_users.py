@@ -133,6 +133,7 @@ async def _has_retained_device_first_financial_history(db: AsyncSession, user_id
         )
     )
 
+
 router = APIRouter(prefix='/admin/users', tags=['Cabinet Admin Users'])
 
 

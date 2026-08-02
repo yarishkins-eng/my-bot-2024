@@ -271,9 +271,7 @@ async def expire_checkout_quote_if_needed(
     has_direct_provider_attempt = (
         settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE
         and await db.scalar(
-            select(CheckoutPaymentAttempt.id)
-            .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
-            .limit(1)
+            select(CheckoutPaymentAttempt.id).where(CheckoutPaymentAttempt.checkout_id == checkout.id).limit(1)
         )
         is not None
     )
@@ -327,9 +325,7 @@ async def get_owned_checkout(
     has_direct_provider_attempt = (
         settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE
         and await db.scalar(
-            select(CheckoutPaymentAttempt.id)
-            .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
-            .limit(1)
+            select(CheckoutPaymentAttempt.id).where(CheckoutPaymentAttempt.checkout_id == checkout.id).limit(1)
         )
         is not None
     )
@@ -407,16 +403,13 @@ async def get_open_checkout_for_user(
     has_direct_provider_attempt = (
         settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE
         and await db.scalar(
-            select(CheckoutPaymentAttempt.id)
-            .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
-            .limit(1)
+            select(CheckoutPaymentAttempt.id).where(CheckoutPaymentAttempt.checkout_id == checkout.id).limit(1)
         )
         is not None
     )
-    if (
-        not (direct_paid_recovery or direct_operator_hold or has_direct_provider_attempt)
-        and checkout.expires_at <= datetime.now(UTC)
-    ):
+    if not (
+        direct_paid_recovery or direct_operator_hold or has_direct_provider_attempt
+    ) and checkout.expires_at <= datetime.now(UTC):
         checkout.lifecycle_state = 'expired'
         checkout.terminal_reason = 'checkout_expired'
         checkout.quote_state = 'expired'

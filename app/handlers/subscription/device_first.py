@@ -293,8 +293,7 @@ async def _period_page(
     await edit_or_answer_photo(
         callback=callback,
         caption=(
-            f'📱 <b>{options["tariff"]["name"]}</b>\n\n'
-            + _text(user, '📅 Выберите срок.', '📅 Choose a period.')
+            f'📱 <b>{options["tariff"]["name"]}</b>\n\n' + _text(user, '📅 Выберите срок.', '📅 Choose a period.')
         ),
         keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
         parse_mode='HTML',
@@ -894,8 +893,7 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                         f'Способ: <b>{method}</b>\n'
                         f'К оплате: <b>{amount} ₽</b>\n\n'
                         'Оплатите этот счёт или проверьте его статус. Новый счёт не создаётся, '
-                        'чтобы не было двойной оплаты.'
-                        + _invoice_expiry_label(user, provider_expires_at)
+                        'чтобы не было двойной оплаты.' + _invoice_expiry_label(user, provider_expires_at)
                     ),
                     (
                         '💳 <b>Invoice awaiting payment</b>\n\n'

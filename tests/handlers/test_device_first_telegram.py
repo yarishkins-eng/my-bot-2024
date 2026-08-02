@@ -533,9 +533,7 @@ async def test_safe_open_quote_is_discarded_before_falling_back_when_new_device_
     callback = SimpleNamespace(data='df:start', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
-    checkout = SimpleNamespace(
-        public_id='draft-17', lifecycle_state='draft', settlement_mode='legacy_deposit'
-    )
+    checkout = SimpleNamespace(public_id='draft-17', lifecycle_state='draft', settlement_mode='legacy_deposit')
     cancelled_checkout = SimpleNamespace(public_id='draft-17', lifecycle_state='cancelled')
     db = AsyncMock()
 
@@ -571,9 +569,7 @@ async def test_tariffs_starts_a_new_calculation_after_discarding_a_safe_quote(li
     callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
-    checkout = SimpleNamespace(
-        public_id='quote-17', lifecycle_state=lifecycle_state, settlement_mode='legacy_deposit'
-    )
+    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state=lifecycle_state, settlement_mode='legacy_deposit')
     cancelled_checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='cancelled')
     options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
     db = AsyncMock()
@@ -643,9 +639,7 @@ async def test_tariffs_keeps_recovery_when_cancellation_did_not_take_effect() ->
     callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
-    checkout = SimpleNamespace(
-        public_id='quote-17', lifecycle_state='confirmed', settlement_mode='legacy_deposit'
-    )
+    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='confirmed', settlement_mode='legacy_deposit')
     settled_checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='ready')
     options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
     db = AsyncMock()
@@ -678,9 +672,7 @@ async def test_tariffs_keeps_recovery_when_a_quote_becomes_an_external_invoice()
     callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
-    checkout = SimpleNamespace(
-        public_id='quote-17', lifecycle_state='confirmed', settlement_mode='legacy_deposit'
-    )
+    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='confirmed', settlement_mode='legacy_deposit')
     options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
     invoice_exists = DeviceFirstError('external_invoice_active', 'External invoice exists')
     db = AsyncMock()
