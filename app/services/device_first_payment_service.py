@@ -554,10 +554,22 @@ async def _apply_direct_pending_provider_observation(
         await db.commit()
         return False
 
+    # Before this correction, a verified live invoice without Platega's
+    # optional ``expiresIn`` field was put into operator review.  That is not
+    # a financial mismatch: exact provider identity/method/amount/RUB was
+    # already established and the one-invoice fence remains intact. Allow only
+    # this precise historical state to be rechecked by canonical GET; every
+    # other operator review remains fail-closed.
+    recovering_missing_deadline = (
+        attempt.status == 'operator_review'
+        and attempt.reconciliation_reason == 'provider_invoice_missing_or_elapsed_expiry'
+        and checkout.lifecycle_state == 'operator_review'
+        and checkout.terminal_reason == 'provider_invoice_missing_or_elapsed_expiry'
+    )
     if (
         payment.is_paid
-        or attempt.status not in {'creating', 'pending', 'reconciliation'}
-        or checkout.lifecycle_state != 'awaiting_funds'
+        or (attempt.status not in {'creating', 'pending', 'reconciliation'} and not recovering_missing_deadline)
+        or (checkout.lifecycle_state != 'awaiting_funds' and not recovering_missing_deadline)
         or checkout.funding_state != 'invoice_pending'
         or checkout.fulfillment_state != 'not_started'
     ):
@@ -585,7 +597,12 @@ async def _apply_direct_pending_provider_observation(
         if existing_expiry is not None and observed_expiry is not None
         else existing_expiry or observed_expiry
     )
-    if provider_expires_at is None or provider_expires_at <= datetime.now(UTC):
+    # A known elapsed provider deadline is contradictory with a fresh live
+    # status and remains fail-closed. A missing deadline is different: Platega
+    # has confirmed the exact invoice is PENDING/INPROGRESS, but does not
+    # expose its TTL. Keep one durable invoice and poll its canonical status;
+    # do not convert a usable payment into an operator-only screen.
+    if provider_expires_at is not None and provider_expires_at <= datetime.now(UTC):
         payment.status = 'OPERATOR_REVIEW'
         attempt.status = 'operator_review'
         attempt.reconciliation_reason = 'provider_invoice_missing_or_elapsed_expiry'
@@ -599,10 +616,19 @@ async def _apply_direct_pending_provider_observation(
     attempt.provider_returned_currency = currency
     attempt.status = 'pending'
     attempt.reconciliation_reason = None
-    attempt.next_reconcile_at = min(datetime.now(UTC) + timedelta(minutes=2), provider_expires_at)
+    now = datetime.now(UTC)
+    attempt.next_reconcile_at = (
+        min(now + timedelta(minutes=2), provider_expires_at)
+        if provider_expires_at is not None
+        else now + timedelta(minutes=2)
+    )
     payment.status = 'PENDING'
-    payment.expires_at = provider_expires_at
-    checkout.expires_at = provider_expires_at
+    if provider_expires_at is not None:
+        payment.expires_at = provider_expires_at
+        checkout.expires_at = provider_expires_at
+    if recovering_missing_deadline:
+        checkout.lifecycle_state = 'awaiting_funds'
+        checkout.terminal_reason = None
     await db.commit()
     return True
 
@@ -1889,6 +1915,16 @@ async def reconcile_device_first_payments(
                 CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
                 CheckoutPaymentAttempt.status == 'failed',
                 CheckoutPaymentAttempt.reconciliation_reason.like('provider_terminal:%'),
+                CheckoutPaymentAttempt.provider_payment_id.is_not(None),
+                CheckoutPaymentAttempt.platega_payment_id.is_not(None),
+            ),
+            # A prior build incorrectly treated an omitted provider TTL as a
+            # financial hold. Re-open only this named, exact-proof state via
+            # canonical GET; all other operator holds stay excluded.
+            and_(
+                CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                CheckoutPaymentAttempt.status == 'operator_review',
+                CheckoutPaymentAttempt.reconciliation_reason == 'provider_invoice_missing_or_elapsed_expiry',
                 CheckoutPaymentAttempt.provider_payment_id.is_not(None),
                 CheckoutPaymentAttempt.platega_payment_id.is_not(None),
             ),

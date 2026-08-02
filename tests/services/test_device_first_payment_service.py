@@ -118,6 +118,8 @@ def _terminal_direct_rows(*, lifecycle_state: str = 'awaiting_funds'):
         user_id=7,
         is_paid=False,
         status='PENDING',
+        expires_at=None,
+        updated_at=None,
         metadata_json={'device_first_attempt_id': 41, 'settlement_mode': 'direct_purchase_v2'},
     )
     user = SimpleNamespace(id=7)
@@ -140,7 +142,9 @@ def _terminal_direct_rows(*, lifecycle_state: str = 'awaiting_funds'):
         lifecycle_state=lifecycle_state,
         quote_state='valid',
         funding_state='invoice_pending',
+        fulfillment_state='not_started',
         terminal_reason=None,
+        updated_at=None,
     )
     return payment, user, attempt, checkout
 
@@ -247,6 +251,68 @@ async def test_stale_canonical_pending_cannot_demote_a_newer_paid_transition():
     assert attempt.status == 'paid_processing'
     assert checkout.lifecycle_state == 'ready'
     db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exact_pending_invoice_without_provider_deadline_stays_payable():
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+    )
+
+    applied = await _apply_direct_pending_provider_observation(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload={
+            'id': 'provider-1',
+            'status': 'PENDING',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+        },
+        observed_after=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    assert applied is True
+    assert payment.status == 'PENDING'
+    assert payment.expires_at is None
+    assert attempt.status == 'pending'
+    assert attempt.reconciliation_reason is None
+    assert attempt.next_reconcile_at > datetime.now(UTC)
+    assert checkout.lifecycle_state == 'awaiting_funds'
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_exact_pending_invoice_reopens_only_the_prior_missing_deadline_hold():
+    payment, user, attempt, checkout = _terminal_direct_rows(lifecycle_state='operator_review')
+    payment.status = 'OPERATOR_REVIEW'
+    attempt.status = 'operator_review'
+    attempt.reconciliation_reason = 'provider_invoice_missing_or_elapsed_expiry'
+    checkout.terminal_reason = 'provider_invoice_missing_or_elapsed_expiry'
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+    )
+
+    applied = await _apply_direct_pending_provider_observation(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload={
+            'id': 'provider-1',
+            'status': 'PENDING',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+        },
+        observed_after=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    assert applied is True
+    assert attempt.status == 'pending'
+    assert checkout.lifecycle_state == 'awaiting_funds'
+    assert checkout.terminal_reason is None
 
 
 def _stub_direct_create_identity_binding(monkeypatch, added):
@@ -382,7 +448,7 @@ async def test_direct_invoice_persists_create_identity_then_verifies_canonical_a
 
 
 @pytest.mark.asyncio
-async def test_direct_invoice_without_a_provider_deadline_is_held_for_reconciliation(monkeypatch):
+async def test_direct_invoice_without_a_provider_deadline_opens_the_verified_single_invoice(monkeypatch):
     checkout = SimpleNamespace(
         id=91,
         public_id='checkout-91',
@@ -425,7 +491,6 @@ async def test_direct_invoice_without_a_provider_deadline_is_held_for_reconcilia
         commit=AsyncMock(),
         refresh=AsyncMock(),
     )
-    hold = AsyncMock(return_value=True)
     monkeypatch.setattr(
         'app.services.device_first_payment_service.prepare_direct_external_checkout',
         AsyncMock(return_value=checkout),
@@ -435,26 +500,24 @@ async def test_direct_invoice_without_a_provider_deadline_is_held_for_reconcilia
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', FakePlategaService)
-    monkeypatch.setattr('app.services.device_first_payment_service._hold_direct_invoice_for_review', hold)
     monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example')
     _stub_direct_create_identity_binding(monkeypatch, added)
     monkeypatch.setattr(
         'app.services.device_first_payment_service._apply_direct_pending_provider_observation',
-        AsyncMock(return_value=False),
+        AsyncMock(return_value=True),
     )
 
-    with pytest.raises(DeviceFirstError) as raised:
-        await _create_direct_platega_attempt(
-            db,
-            checkout_public_id=checkout.public_id,
-            user_id=7,
-            method_key='sbp',
-            method_code=2,
-            was_financially_committed=False,
-        )
+    attempt = await _create_direct_platega_attempt(
+        db,
+        checkout_public_id=checkout.public_id,
+        user_id=7,
+        method_key='sbp',
+        method_code=2,
+        was_financially_committed=False,
+    )
 
-    assert raised.value.code == 'reconciliation_required'
-    hold.assert_not_awaited()
+    assert attempt.provider_payment_id == 'no-deadline'
+    assert attempt.redirect_url == 'https://pay.example/no-deadline'
 
 
 @pytest.mark.asyncio
