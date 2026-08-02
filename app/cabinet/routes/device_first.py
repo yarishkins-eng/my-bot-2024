@@ -172,11 +172,47 @@ def _is_live_direct_provider_invoice(
         or checkout.fulfillment_state != 'not_started'
     ):
         return False
-    # A provider-owned deadline is required for every direct redirect.  A
-    # local quote TTL cannot prove that Platega has stopped accepting money;
-    # invoices without a canonical ``expiresIn`` are held for reconciliation.
-    expires_at = payment.expires_at
-    return expires_at is not None and expires_at > datetime.now(UTC)
+    # The provider's canonical PENDING/INPROGRESS status is authoritative.
+    # Some valid Platega responses omit ``expiresIn`` entirely; withholding a
+    # verified one-invoice redirect in that case traps an ordinary customer in
+    # support despite an exact ID/method/amount/currency match.  Absence of a
+    # deadline never permits another provider POST: the durable attempt above
+    # remains the unique payment path and the reconciliation worker continues
+    # to verify it.
+    return payment.expires_at is None or payment.expires_at > datetime.now(UTC)
+
+
+async def _serialize_cabinet_checkout(
+    db: AsyncSession,
+    checkout: SubscriptionCheckout,
+    *,
+    balance_kopeks: int | None = None,
+) -> dict[str, Any]:
+    """Add the optional provider deadline without exposing payment internals.
+
+    ``checkout.expires_at`` is the quote TTL until Platega supplies a canonical
+    invoice deadline. Keeping the two concepts separate prevents the Mini App
+    from falsely telling a customer that an invoice with an omitted provider
+    TTL expires at the old quote deadline.
+    """
+    payload = serialize_checkout(checkout, balance_kopeks=balance_kopeks)
+    if (
+        getattr(checkout, 'settlement_mode', None) == DIRECT_SETTLEMENT_MODE
+        and getattr(checkout, 'funding_state', None) == 'invoice_pending'
+        and callable(getattr(db, 'scalar', None))
+    ):
+        invoice_expires_at = await db.scalar(
+            select(PlategaPayment.expires_at)
+            .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
+            .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
+            .order_by(CheckoutPaymentAttempt.id.desc())
+            .limit(1)
+        )
+        if invoice_expires_at is None or isinstance(invoice_expires_at, datetime):
+            payload['provider_invoice_expires_at'] = (
+                invoice_expires_at.isoformat() if invoice_expires_at is not None else None
+            )
+    return payload
 
 
 async def _rehydrate_owned_direct_redirect(
@@ -255,7 +291,7 @@ async def checkout_create(
     if mutation.checkout_id is not None:
         existing_checkout = await db.get(SubscriptionCheckout, mutation.checkout_id)
         if existing_checkout is not None:
-            response = serialize_checkout(existing_checkout, balance_kopeks=user.balance_kopeks)
+            response = await _serialize_cabinet_checkout(db, existing_checkout, balance_kopeks=user.balance_kopeks)
             await store_mutation_result(db, mutation, response=response, status_code=201)
             return response
     try:
@@ -305,7 +341,7 @@ async def checkout_create(
             status_code=error.status_code,
         )
         _raise(error)
-    response = serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)
+    response = await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)
     mutation.checkout_id = checkout.id
     await store_mutation_result(db, mutation, response=response, status_code=201)
     return response
@@ -319,7 +355,7 @@ async def checkout_open(
     checkout = await get_open_checkout_for_user(db, user_id=user.id)
     if checkout is None:
         raise HTTPException(status_code=404, detail={'code': 'no_open_checkout'})
-    return serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)
+    return await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)
 
 
 @router.get('/checkout/{checkout_id}')
@@ -329,7 +365,8 @@ async def checkout_get(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     try:
-        return serialize_checkout(
+        return await _serialize_cabinet_checkout(
+            db,
             await get_owned_checkout(db, public_id=checkout_id, user_id=user.id),
             balance_kopeks=user.balance_kopeks,
         )
@@ -360,7 +397,7 @@ async def _checkout_command(
         if recovered is not None:
             if action == 'arm' and recovered.lifecycle_state in {'armed', 'fulfilling'}:
                 recovered = await fulfill_checkout(db, recovered.public_id, user.id)
-            response = serialize_checkout(recovered, balance_kopeks=user.balance_kopeks)
+            response = await _serialize_cabinet_checkout(db, recovered, balance_kopeks=user.balance_kopeks)
             await store_mutation_result(db, mutation, response=response)
             return response
     try:
@@ -388,7 +425,7 @@ async def _checkout_command(
         )
         _raise(error)
     await db.refresh(user)
-    response = serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)
+    response = await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)
     await store_mutation_result(db, mutation, response=response)
     return response
 
@@ -461,7 +498,7 @@ async def _commit_checkout(
                 )
             checkout = await commit_direct_wallet_checkout(db, public_id=checkout_id, user_id=user.id)
             await db.refresh(user)
-            response = {'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)}
+            response = {'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)}
         else:
             if not request.method_key:
                 raise DeviceFirstError('payment_method_required', 'Select an available payment method', status_code=422)
@@ -475,14 +512,16 @@ async def _commit_checkout(
             checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
             if _is_live_direct_provider_invoice(checkout, attempt, payment):
                 response = {
-                    'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks),
+                    'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks),
                     'redirect_url': payment.redirect_url,
                 }
             elif checkout.lifecycle_state in {'fulfilling', 'ready'}:
                 # The canonical create-follow-up may have found an already
                 # paid invoice and completed the same strict settlement path.
                 # Return its owned checkout state, never a stale provider URL.
-                response = {'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)}
+                response = {
+                    'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)
+                }
             else:
                 raise DeviceFirstError('reconciliation_required', 'Provider invoice requires reconciliation')
     except DeviceFirstError as error:
@@ -590,7 +629,7 @@ async def checkout_resume_invoice(
         payment = await db.get(PlategaPayment, attempt.platega_payment_id)
         checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
         response = {
-            'checkout': serialize_checkout(checkout, balance_kopeks=user.balance_kopeks),
+            'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks),
             # A missing redirect means the existing durable attempt is
             # ambiguous/reconciling. Do not make a second provider POST.
             **(
