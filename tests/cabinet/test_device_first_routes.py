@@ -273,9 +273,21 @@ async def test_failed_direct_invoice_never_rehydrates_or_reappears_in_pending_pa
 async def test_direct_commit_stores_a_redacted_idempotency_response() -> None:
     user = SimpleNamespace(id=17, balance_kopeks=0)
     mutation = SimpleNamespace(checkout_id=None)
-    checkout = SimpleNamespace(id=91, settlement_mode='direct_purchase_v2')
-    attempt = SimpleNamespace(platega_payment_id=51)
-    payment = SimpleNamespace(redirect_url='https://pay.example/live')
+    checkout = SimpleNamespace(
+        id=91,
+        settlement_mode='direct_purchase_v2',
+        lifecycle_state='awaiting_funds',
+        funding_state='invoice_pending',
+        fulfillment_state='not_started',
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    attempt = SimpleNamespace(platega_payment_id=51, status='pending')
+    payment = SimpleNamespace(
+        redirect_url='https://pay.example/live',
+        is_paid=False,
+        status='PENDING',
+        expires_at=None,
+    )
     db = SimpleNamespace(get=AsyncMock(return_value=payment))
 
     with (
@@ -299,3 +311,93 @@ async def test_direct_commit_stores_a_redacted_idempotency_response() -> None:
 
     assert response == {'checkout': {'id': 'owned-checkout'}, 'redirect_url': 'https://pay.example/live'}
     assert store.await_args.kwargs['response'] == {'checkout': {'id': 'owned-checkout'}}
+
+
+@pytest.mark.asyncio
+async def test_direct_commit_returns_settled_owned_checkout_without_a_provider_redirect() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    initial_checkout = SimpleNamespace(id=91, settlement_mode='direct_purchase_v2')
+    settled_checkout = SimpleNamespace(
+        id=91,
+        settlement_mode='direct_purchase_v2',
+        lifecycle_state='fulfilling',
+        funding_state='paid',
+        fulfillment_state='fulfilled',
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    attempt = SimpleNamespace(platega_payment_id=51, status='paid_processing')
+    payment = SimpleNamespace(
+        redirect_url='https://pay.example/confirmed',
+        is_paid=True,
+        status='CONFIRMED',
+        expires_at=None,
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=payment))
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch(
+            'app.cabinet.routes.device_first.get_owned_checkout',
+            AsyncMock(side_effect=[initial_checkout, settled_checkout]),
+        ),
+        patch('app.cabinet.routes.device_first.create_platega_attempt', AsyncMock(return_value=attempt)),
+        patch('app.cabinet.routes.device_first.serialize_checkout', return_value={'id': 'owned-checkout'}),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
+    ):
+        response = await checkout_commit(
+            'owned-checkout',
+            CheckoutCommitRequest(funding_mode='platega', method_key='sbp'),
+            idempotency_key='commit-confirmed',
+            user=user,
+            db=db,
+        )
+
+    assert response == {'checkout': {'id': 'owned-checkout'}}
+    assert store.await_args.kwargs['response'] == {'checkout': {'id': 'owned-checkout'}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payment_status', ['VERIFYING', 'CONFIRMED', 'FAILED', 'CANCELED', 'EXPIRED'])
+async def test_direct_commit_never_exposes_a_non_live_provider_redirect(payment_status: str) -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    checkout = SimpleNamespace(
+        id=91,
+        settlement_mode='direct_purchase_v2',
+        lifecycle_state='awaiting_funds',
+        funding_state='invoice_pending',
+        fulfillment_state='not_started',
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    attempt = SimpleNamespace(platega_payment_id=51, status='pending')
+    payment = SimpleNamespace(
+        redirect_url='https://pay.example/unverified',
+        is_paid=False,
+        status=payment_status,
+        expires_at=None,
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=payment))
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch(
+            'app.cabinet.routes.device_first.get_owned_checkout',
+            AsyncMock(side_effect=[checkout, checkout]),
+        ),
+        patch('app.cabinet.routes.device_first.create_platega_attempt', AsyncMock(return_value=attempt)),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
+    ):
+        with pytest.raises(HTTPException) as raised:
+            await checkout_commit(
+                'owned-checkout',
+                CheckoutCommitRequest(funding_mode='platega', method_key='sbp'),
+                idempotency_key='commit-unverified',
+                user=user,
+                db=db,
+            )
+
+    assert raised.value.detail['code'] == 'reconciliation_required'
+    assert store.await_args.kwargs['response']['code'] == 'reconciliation_required'

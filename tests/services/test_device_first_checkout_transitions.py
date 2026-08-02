@@ -229,6 +229,23 @@ async def test_cancel_is_rejected_after_provider_credit_commit():
 
 
 @pytest.mark.asyncio
+async def test_direct_cancel_is_rejected_after_an_external_invoice_is_created():
+    checkout = SimpleNamespace(
+        id=51,
+        lifecycle_state='awaiting_funds',
+        fulfillment_state='not_started',
+        settlement_mode='direct_purchase_v2',
+    )
+    db = SimpleNamespace(scalar=AsyncMock(return_value=41), commit=AsyncMock(), refresh=AsyncMock())
+
+    with pytest.raises(service.DeviceFirstError) as error:
+        await service.cancel_checkout(db, checkout)
+
+    assert error.value.code == 'external_invoice_active'
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_locked_checkout_query_forces_fresh_orm_state():
     checkout = SimpleNamespace(lifecycle_state='ready')
     result = SimpleNamespace(scalar_one_or_none=lambda: checkout)
