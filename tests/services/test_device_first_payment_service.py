@@ -10,10 +10,13 @@ from app.services.device_first_checkout_service import (
     prepare_direct_external_checkout,
 )
 from app.services.device_first_payment_service import (
+    _apply_direct_pending_provider_observation,
     _checkout_return_url,
     _create_direct_platega_attempt,
     _direct_checkout_return_url,
+    _provider_method_code,
     _provider_transaction_id,
+    _release_direct_terminal_invoice,
     _safe_provider_redirect_url,
     _verified_amount,
     available_platega_methods,
@@ -27,6 +30,11 @@ from app.services.platega_service import PlategaService
 
 def test_verified_amount_uses_actual_rub_provider_value():
     assert _verified_amount({'paymentDetails': {'amount': '123.45', 'currency': 'RUB'}}) == (12345, 'RUB')
+
+
+def test_documented_canonical_sbpqr_method_is_an_exact_allowlisted_match():
+    assert _provider_method_code({'paymentMethod': 'SBPQR'}) == 2
+    assert _provider_method_code({'paymentMethod': 'definitely-not-a-provider-method'}) is None
 
 
 def test_verified_amount_rejects_untrusted_currency_or_missing_amount():
@@ -104,6 +112,160 @@ def test_direct_create_shapes_keep_identity_and_redirect_but_require_canonical_g
     assert PlategaService.parse_amount_currency(response) is None
 
 
+def _terminal_direct_rows(*, lifecycle_state: str = 'awaiting_funds'):
+    payment = SimpleNamespace(
+        id=51,
+        user_id=7,
+        is_paid=False,
+        status='PENDING',
+        metadata_json={'device_first_attempt_id': 41, 'settlement_mode': 'direct_purchase_v2'},
+    )
+    user = SimpleNamespace(id=7)
+    attempt = SimpleNamespace(
+        id=41,
+        checkout_id=9,
+        platega_payment_id=51,
+        provider_payment_id='provider-1',
+        provider_method_code=2,
+        requested_amount_kopeks=35_000,
+        method_key='sbp',
+        status='pending',
+        reconciliation_reason=None,
+        terminal_observations=0,
+    )
+    checkout = SimpleNamespace(
+        id=9,
+        public_id='checkout-1',
+        user_id=7,
+        lifecycle_state=lifecycle_state,
+        quote_state='valid',
+        funding_state='invoice_pending',
+        terminal_reason=None,
+    )
+    return payment, user, attempt, checkout
+
+
+@pytest.mark.asyncio
+async def test_exact_terminal_provider_result_archives_only_that_invoice_and_releases_next_quote():
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        scalar=AsyncMock(return_value=None),
+        add=MagicMock(),
+        commit=AsyncMock(),
+    )
+
+    released = await _release_direct_terminal_invoice(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload={
+            'id': 'provider-1',
+            'status': 'CANCELED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+        },
+        provider_status='CANCELED',
+        source='canonical_get',
+    )
+
+    assert released is True
+    assert payment.status == 'CANCELED'
+    assert attempt.status == 'failed'
+    assert attempt.reconciliation_reason == 'provider_terminal:canceled'
+    assert checkout.lifecycle_state == 'cancelled'
+    assert checkout.quote_state == 'expired'
+    assert checkout.terminal_reason == 'provider_terminal:canceled'
+    event = db.add.call_args.args[0]
+    assert event.provider_payment_id == 'provider-1'
+    assert event.amount_kopeks == 35_000
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sparse_signed_terminal_callback_is_journaled_then_requires_canonical_get():
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        scalar=AsyncMock(return_value=None),
+        add=MagicMock(),
+        commit=AsyncMock(),
+    )
+
+    released = await _release_direct_terminal_invoice(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload={'id': 'provider-1', 'status': 'EXPIRED'},
+        provider_status='EXPIRED',
+        source='callback',
+    )
+
+    assert released is False
+    assert payment.status == 'VERIFYING'
+    assert attempt.status == 'reconciliation'
+    assert attempt.reconciliation_reason == 'provider_terminal_callback_awaiting_canonical'
+    assert checkout.lifecycle_state == 'awaiting_funds'
+    event = db.add.call_args.args[0]
+    assert event.amount_kopeks is None
+    assert event.currency is None
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_canonical_pending_cannot_demote_a_newer_paid_transition():
+    payment, user, attempt, checkout = _terminal_direct_rows(lifecycle_state='ready')
+    now = datetime.now(UTC)
+    payment.is_paid = True
+    payment.status = 'CONFIRMED'
+    payment.updated_at = now
+    payment.expires_at = now + timedelta(minutes=10)
+    attempt.status = 'paid_processing'
+    checkout.fulfillment_state = 'fulfilled'
+    checkout.updated_at = now
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+    )
+
+    applied = await _apply_direct_pending_provider_observation(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload={
+            'id': 'provider-1',
+            'status': 'PENDING',
+            'expiresIn': '00:15:00',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+        },
+        observed_after=now - timedelta(seconds=1),
+    )
+
+    assert applied is False
+    assert payment.status == 'CONFIRMED'
+    assert attempt.status == 'paid_processing'
+    assert checkout.lifecycle_state == 'ready'
+    db.commit.assert_not_awaited()
+
+
+def _stub_direct_create_identity_binding(monkeypatch, added):
+    """Keep POST orchestration tests focused; lock fencing is tested below."""
+
+    async def bind(_db, *, attempt_id, payment_id, provider_payment_id, redirect_url):
+        attempt, payment = added
+        assert (attempt.id, payment.id) == (attempt_id, payment_id)
+        attempt.provider_payment_id = provider_payment_id
+        attempt.redirect_url = redirect_url
+        attempt.status = 'reconciliation'
+        payment.platega_transaction_id = provider_payment_id
+        payment.redirect_url = redirect_url
+        payment.status = 'VERIFYING'
+        return attempt
+
+    monkeypatch.setattr('app.services.device_first_payment_service._bind_direct_provider_identity', bind)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     'create_response',
@@ -162,11 +324,13 @@ async def test_direct_invoice_persists_create_identity_then_verifies_canonical_a
             assert transaction_id == attempt.provider_payment_id
             assert payment.platega_transaction_id == transaction_id
             assert payment.redirect_url == _safe_provider_redirect_url(create_response)
-            assert attempt.status == 'pending'
+            assert attempt.status == 'reconciliation'
             assert payment.status == 'VERIFYING'
             return {
                 'id': transaction_id,
                 'status': 'PENDING',
+                'expiresIn': '00:15:00',
+                'paymentMethod': 2,
                 'paymentDetails': {'amount': '450.00', 'currency': 'RUB'},
             }
 
@@ -180,6 +344,23 @@ async def test_direct_invoice_persists_create_identity_then_verifies_canonical_a
     )
     monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', FakePlategaService)
     monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example')
+    _stub_direct_create_identity_binding(monkeypatch, added)
+
+    async def apply_pending(_db, *, attempt_id, payment_id, payload, observed_after):
+        attempt, payment = added
+        assert (attempt.id, payment.id) == (attempt_id, payment_id)
+        assert payload['paymentMethod'] == 2
+        attempt.provider_returned_amount_kopeks = 45_000
+        attempt.provider_returned_currency = 'RUB'
+        attempt.status = 'pending'
+        payment.status = 'PENDING'
+        payment.expires_at = datetime.now(UTC) + timedelta(minutes=15)
+        checkout.expires_at = payment.expires_at
+        return True
+
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._apply_direct_pending_provider_observation', apply_pending
+    )
 
     attempt = await _create_direct_platega_attempt(
         db,
@@ -196,6 +377,84 @@ async def test_direct_invoice_persists_create_identity_then_verifies_canonical_a
     assert attempt.provider_returned_currency == 'RUB'
     assert attempt.status == 'pending'
     assert added[1].status == 'PENDING'
+    assert added[1].expires_at > datetime.now(UTC)
+    assert checkout.expires_at == added[1].expires_at
+
+
+@pytest.mark.asyncio
+async def test_direct_invoice_without_a_provider_deadline_is_held_for_reconciliation(monkeypatch):
+    checkout = SimpleNamespace(
+        id=91,
+        public_id='checkout-91',
+        external_payable_kopeks=45_000,
+        tariff_total_kopeks=45_000,
+        wallet_applied_kopeks=0,
+    )
+    added = []
+
+    def add(model):
+        added.append(model)
+
+    async def flush():
+        for model in added:
+            if getattr(model, 'id', None) is None:
+                model.id = 41 if hasattr(model, 'merchant_order_key') else 51
+
+    class FakePlategaService:
+        parse_redirect_url = staticmethod(PlategaService.parse_redirect_url)
+        parse_expires_at = staticmethod(PlategaService.parse_expires_at)
+        parse_amount_currency = staticmethod(PlategaService.parse_amount_currency)
+
+        def __init__(self):
+            self._max_retries = 0
+
+        async def create_payment(self, **_kwargs):
+            return {'id': 'no-deadline', 'url': 'https://pay.example/no-deadline'}
+
+        async def get_transaction(self, _transaction_id):
+            return {
+                'id': 'no-deadline',
+                'status': 'PENDING',
+                'paymentMethod': 2,
+                'paymentDetails': {'amount': '450.00', 'currency': 'RUB'},
+            }
+
+    db = SimpleNamespace(
+        add=MagicMock(side_effect=add),
+        flush=AsyncMock(side_effect=flush),
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+    hold = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.prepare_direct_external_checkout',
+        AsyncMock(return_value=checkout),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.get_pending_platega_attempt',
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', FakePlategaService)
+    monkeypatch.setattr('app.services.device_first_payment_service._hold_direct_invoice_for_review', hold)
+    monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example')
+    _stub_direct_create_identity_binding(monkeypatch, added)
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._apply_direct_pending_provider_observation',
+        AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(DeviceFirstError) as raised:
+        await _create_direct_platega_attempt(
+            db,
+            checkout_public_id=checkout.public_id,
+            user_id=7,
+            method_key='sbp',
+            method_code=2,
+            was_financially_committed=False,
+        )
+
+    assert raised.value.code == 'reconciliation_required'
+    hold.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -246,6 +505,7 @@ async def test_direct_invoice_never_exposes_a_canonically_terminal_provider_stat
             return {
                 'id': _provider_transaction_id(create_response),
                 'status': provider_status,
+                'paymentMethod': 'SBPQR',
                 'paymentDetails': {'amount': '450.00', 'currency': 'RUB'},
             }
 
@@ -263,8 +523,14 @@ async def test_direct_invoice_never_exposes_a_canonically_terminal_provider_stat
         'app.services.device_first_payment_service.get_pending_platega_attempt',
         AsyncMock(return_value=None),
     )
+    release_terminal = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._release_direct_terminal_invoice',
+        release_terminal,
+    )
     monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', FakePlategaService)
     monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example')
+    _stub_direct_create_identity_binding(monkeypatch, added)
 
     with pytest.raises(DeviceFirstError) as raised:
         await _create_direct_platega_attempt(
@@ -276,9 +542,20 @@ async def test_direct_invoice_never_exposes_a_canonically_terminal_provider_stat
             was_financially_committed=False,
         )
 
-    assert raised.value.code == 'reconciliation_required'
-    assert added[0].status == 'failed'
-    assert added[1].status == provider_status
+    assert raised.value.code == 'invoice_terminal'
+    release_terminal.assert_awaited_once_with(
+        db,
+        attempt_id=41,
+        payment_id=51,
+        payload={
+            'id': _provider_transaction_id(create_response),
+            'status': provider_status,
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '450.00', 'currency': 'RUB'},
+        },
+        provider_status=provider_status,
+        source='canonical_get',
+    )
 
 
 @pytest.mark.asyncio
@@ -337,6 +614,7 @@ async def test_direct_invoice_with_confirmed_canonical_status_uses_strict_settle
     monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', FakePlategaService)
     monkeypatch.setattr('app.services.device_first_payment_service.settle_device_first_platega_payment', settle)
     monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example')
+    _stub_direct_create_identity_binding(monkeypatch, added)
 
     await _create_direct_platega_attempt(
         db,
@@ -614,6 +892,50 @@ async def test_stale_direct_reconciliation_lease_cannot_settle_payment():
 
 
 @pytest.mark.asyncio
+async def test_duplicate_late_exact_confirmation_keeps_wallet_credit_idempotent():
+    payment = SimpleNamespace(
+        id=51,
+        user_id=7,
+        platega_transaction_id='provider-1',
+        metadata_json={'device_first_attempt_id': 41, 'settlement_mode': 'direct_purchase_v2'},
+        status='CONFIRMED',
+        is_paid=True,
+    )
+    user = SimpleNamespace(id=7, balance_kopeks=35_000)
+    attempt = SimpleNamespace(
+        id=41,
+        checkout_id=9,
+        platega_payment_id=51,
+        provider_payment_id='provider-1',
+        provider_method_code=2,
+        requested_amount_kopeks=35_000,
+        settlement_mode='direct_purchase_v2',
+        status='credited',
+        reconciliation_reason='late_paid_wallet_credit',
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt)]),
+        commit=AsyncMock(),
+    )
+
+    settled = await settle_device_first_platega_payment(
+        db,
+        payment=payment,
+        payload={
+            'id': 'provider-1',
+            'paymentMethod': 2,
+            'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+        },
+    )
+
+    assert settled is payment
+    assert user.balance_kopeks == 35_000
+    assert attempt.status == 'credited'
+    assert attempt.reconciliation_reason == 'late_paid_wallet_credit'
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_direct_terminal_checkout_cannot_open_another_provider_invoice(monkeypatch):
     checkout = SimpleNamespace(
         financial_committed_at=datetime.now(UTC),
@@ -792,6 +1114,7 @@ async def test_direct_reconciler_refreshes_webhook_first_payment_before_confirme
         provider_payment_id='provider-1',
         provider_method_code=2,
         requested_amount_kopeks=10_000,
+        platega_payment_id=51,
         reconciliation_reason=None,
     )
 
@@ -815,6 +1138,7 @@ async def test_direct_reconciler_refreshes_webhook_first_payment_before_confirme
                 AttemptsResult(),
                 SimpleNamespace(rowcount=1),
                 Result(webhook_payment),
+                Result(SimpleNamespace(id=7)),
                 Result(webhook_attempt),
             ]
         ),
@@ -891,6 +1215,7 @@ def _checkout(state='armed'):
         quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
         quote_state='valid',
         terminal_reason=None,
+        settlement_mode='legacy_deposit',
     )
 
 

@@ -310,7 +310,7 @@ async def test_tariffs_restart_never_releases_a_live_or_ambiguous_provider_attem
 
 @pytest.mark.asyncio
 async def test_locked_checkout_query_forces_fresh_orm_state():
-    checkout = SimpleNamespace(lifecycle_state='ready')
+    checkout = SimpleNamespace(lifecycle_state='ready', settlement_mode='legacy_deposit')
     result = SimpleNamespace(scalar_one_or_none=lambda: checkout)
     db = SimpleNamespace(execute=AsyncMock(return_value=result))
 
@@ -332,6 +332,7 @@ async def test_exact_paid_checkout_does_not_expire_before_delayed_fulfillment():
         lifecycle_state='armed',
         fulfillment_state='in_progress',
         quote_state='committed',
+        settlement_mode='legacy_deposit',
         expires_at=datetime.now(UTC) - timedelta(days=1),
     )
     result = SimpleNamespace(scalar_one_or_none=lambda: checkout)
@@ -353,6 +354,7 @@ async def test_exact_paid_checkout_does_not_expire_before_delayed_fulfillment():
 @pytest.mark.asyncio
 async def test_exact_paid_checkout_remains_resumable_after_the_general_timeout():
     checkout = SimpleNamespace(
+        id=91,
         lifecycle_state='fulfilling',
         fulfillment_state='fulfilled',
         provisioning_state='pending',
@@ -361,7 +363,9 @@ async def test_exact_paid_checkout_remains_resumable_after_the_general_timeout()
         expires_at=datetime.now(UTC) - timedelta(days=1),
     )
     result = SimpleNamespace(scalar_one_or_none=lambda: checkout)
-    db = SimpleNamespace(execute=AsyncMock(return_value=result), commit=AsyncMock())
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=result), scalar=AsyncMock(return_value=None), commit=AsyncMock()
+    )
 
     returned = await service.get_open_checkout_for_user(db, user_id=7)
 
@@ -379,6 +383,7 @@ async def test_new_quote_does_not_bulk_expire_an_exact_paid_checkout_waiting_for
                 ScalarResult(user),
                 SimpleNamespace(),
                 SimpleNamespace(scalar_one_or_none=lambda: None),
+                SimpleNamespace(scalars=list),
             ]
         ),
         commit=AsyncMock(),
@@ -603,6 +608,7 @@ async def test_verified_exact_payment_keeps_its_quote_while_the_outbox_finishes(
         quote_expires_at=datetime.now(UTC) - timedelta(seconds=1),
         quote_state='committed',
         terminal_reason=None,
+        settlement_mode='legacy_deposit',
     )
     db = SimpleNamespace(commit=AsyncMock())
 
@@ -620,6 +626,7 @@ async def test_create_rejects_a_direct_cross_tariff_device_downgrade_before_crea
                 ScalarResult(user),
                 SimpleNamespace(),
                 SimpleNamespace(scalar_one_or_none=lambda: None),
+                SimpleNamespace(scalars=list),
             ]
         ),
         commit=AsyncMock(),

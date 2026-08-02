@@ -16,6 +16,7 @@ from app.database.models import (
     CheckoutPaymentAttempt,
     DeviceFirstMutation,
     DeviceFirstOutbox,
+    DeviceFirstProviderEvent,
     DeviceFirstReconciliationCredit,
     PlategaPayment,
     SubscriptionCheckout,
@@ -28,6 +29,7 @@ from app.services.device_first_checkout_service import (
     arm_checkout,
     build_purchase_options,
     cancel_checkout,
+    cancel_checkout_for_new_calculation,
     commit_direct_wallet_checkout,
     confirm_checkout,
     create_checkout,
@@ -39,6 +41,7 @@ from app.services.device_first_checkout_service import (
     store_mutation_result,
 )
 from app.services.device_first_payment_service import (
+    abandon_direct_checkout_for_new_calculation,
     available_platega_methods_for_db,
     create_platega_attempt,
 )
@@ -169,9 +172,10 @@ def _is_live_direct_provider_invoice(
         or checkout.fulfillment_state != 'not_started'
     ):
         return False
-    # A provider expiry is authoritative when available.  Some methods do not
-    # return one; their redirect is still bounded by the immutable local quote.
-    expires_at = payment.expires_at or checkout.quote_expires_at
+    # A provider-owned deadline is required for every direct redirect.  A
+    # local quote TTL cannot prove that Platega has stopped accepting money;
+    # invoices without a canonical ``expiresIn`` are held for reconciliation.
+    expires_at = payment.expires_at
     return expires_at is not None and expires_at > datetime.now(UTC)
 
 
@@ -255,6 +259,36 @@ async def checkout_create(
             await store_mutation_result(db, mutation, response=response, status_code=201)
             return response
     try:
+        # A new *different* selection is an explicit customer decision to
+        # replace an old direct invoice. Keep the provider evidence, but
+        # locally archive the old configuration under P->U->A->C so an exact
+        # late payment becomes wallet credit rather than stale fulfilment.
+        # Repeating the same selection resumes its existing invoice instead.
+        existing = await get_open_checkout_for_user(db, user_id=user.id)
+        if (
+            existing is not None
+            and existing.settlement_mode == DIRECT_SETTLEMENT_MODE
+            and (
+                existing.period_days != request.period_days
+                or existing.selected_device_limit != request.selected_device_limit
+            )
+        ):
+            abandoned = await abandon_direct_checkout_for_new_calculation(
+                db,
+                checkout_public_id=existing.public_id,
+                user_id=user.id,
+            )
+            if abandoned is None:
+                # Before a provider method is chosen there is no immutable
+                # financial attempt.  This is a disposable quote, so replace
+                # it atomically instead of resuming the old configuration.
+                locked_quote = await get_owned_checkout(
+                    db,
+                    public_id=existing.public_id,
+                    user_id=user.id,
+                    for_update=True,
+                )
+                await cancel_checkout_for_new_calculation(db, locked_quote)
         checkout = await create_checkout(
             db,
             user=user,
@@ -763,6 +797,17 @@ async def admin_checkout_read_only(
         .scalars()
         .all()
     )
+    provider_events = list(
+        (
+            await db.execute(
+                select(DeviceFirstProviderEvent)
+                .where(DeviceFirstProviderEvent.checkout_id == checkout.id)
+                .order_by(DeviceFirstProviderEvent.observed_at, DeviceFirstProviderEvent.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     return {
         'checkout': serialize_checkout(checkout),
         'user_id': checkout.user_id,
@@ -812,6 +857,24 @@ async def admin_checkout_read_only(
                 'resolved_at': item.resolved_at,
             }
             for item in reconciliation_credits
+        ],
+        # Evidence is deliberately normalized/redacted: no payment URL,
+        # callback signature or raw provider payload is exposed here.
+        'provider_events': [
+            {
+                'id': event.id,
+                'attempt_id': event.attempt_id,
+                'provider_payment_id': event.provider_payment_id,
+                'provider_status': event.provider_status,
+                'source': event.source,
+                'amount_kopeks': event.amount_kopeks,
+                'currency': event.currency,
+                'method_key': event.method_key,
+                'payload_hash': event.payload_hash,
+                'authenticated': event.authenticated,
+                'observed_at': event.observed_at,
+            }
+            for event in provider_events
         ],
     }
 

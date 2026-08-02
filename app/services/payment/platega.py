@@ -29,6 +29,7 @@ class PlategaPaymentMixin:
 
     _SUCCESS_STATUSES = {'CONFIRMED'}
     _FAILED_STATUSES = {'FAILED', 'CANCELED', 'EXPIRED'}
+    _POST_PAID_REVERSAL_STATUSES = {'CHARGEBACKED'}
     _PENDING_STATUSES = {'PENDING', 'INPROGRESS'}
 
     @staticmethod
@@ -271,6 +272,83 @@ class PlategaPaymentMixin:
             logger.warning('Platega webhook без статуса для платежа', payment_id=payment.id)
             return False
 
+        if direct_device_first:
+            # Direct checkout is deliberately not handled by the generic
+            # Platega state machine below.  Its callback may arrive before
+            # POST has returned the transaction id; its terminal/PENDING
+            # view may also be older than canonical GET.  First determine
+            # whether the immutable provider identity has been bound while
+            # holding the payment lock.
+            from app.services.device_first_payment_service import (
+                _queue_direct_callback_for_canonical_reconciliation,
+                settle_device_first_platega_payment,
+            )
+
+            attempt_id = (payment.metadata_json or {}).get('device_first_attempt_id')
+            attempt = None
+            if isinstance(attempt_id, int):
+                attempt = (
+                    await db.execute(
+                        select(CheckoutPaymentAttempt)
+                        .where(CheckoutPaymentAttempt.id == attempt_id)
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+            if attempt is None or not attempt.provider_payment_id:
+                await _queue_direct_callback_for_canonical_reconciliation(
+                    db,
+                    payment_id=payment.id,
+                    payload=payload,
+                    reason='provider_callback_before_identity_binding',
+                )
+                return True
+
+            if status_raw in self._SUCCESS_STATUSES:
+                result = await settle_device_first_platega_payment(
+                    db,
+                    payment=payment,
+                    payload=payload,
+                )
+                return result is not None
+
+            if status_raw in self._POST_PAID_REVERSAL_STATUSES:
+                await self._mark_direct_post_paid_reversal(
+                    db,
+                    payment=payment,
+                    provider_status=status_raw,
+                )
+                return True
+
+            if status_raw in self._FAILED_STATUSES and payment.is_paid:
+                # A paid sale receiving a later cancellation is a financial
+                # contradiction, not an abandoned invoice. Freeze fulfilment
+                # for accountable review before any generic callback path.
+                await self._mark_direct_post_paid_reversal(
+                    db,
+                    payment=payment,
+                    provider_status=status_raw,
+                )
+                return True
+
+            # Signed terminal/PENDING/unknown callbacks are receipt evidence
+            # only.  Canonical GET decides live, terminal or conflicting
+            # state; a stale callback can therefore never reopen, cancel or
+            # downgrade a direct payment.
+            callback_reason = (
+                'provider_terminal_callback_awaiting_canonical'
+                if status_raw in self._FAILED_STATUSES
+                else 'provider_pending_callback_awaiting_canonical'
+                if status_raw in self._PENDING_STATUSES
+                else 'provider_callback_unknown_status'
+            )
+            await _queue_direct_callback_for_canonical_reconciliation(
+                db,
+                payment_id=payment.id,
+                payload=payload,
+                reason=callback_reason,
+            )
+            return True
+
         if status_raw in self._SUCCESS_STATUSES:
             if payment.is_paid:
                 logger.info('Platega платеж уже помечен как оплачен', correlation_id=payment.correlation_id)
@@ -298,14 +376,17 @@ class PlategaPaymentMixin:
                 return False
             return True
 
+        if status_raw in self._POST_PAID_REVERSAL_STATUSES:
+            await payment_module.update_platega_payment(
+                db,
+                payment=payment,
+                status=status_raw,
+                callback_payload=payload,
+                platega_transaction_id=transaction_id or None,
+            )
+            return True
+
         if status_raw in self._FAILED_STATUSES:
-            if direct_device_first and payment.is_paid:
-                await self._mark_direct_post_paid_reversal(
-                    db,
-                    payment=payment,
-                    provider_status=status_raw,
-                )
-                return True
             await payment_module.update_platega_payment(
                 db,
                 payment=payment,

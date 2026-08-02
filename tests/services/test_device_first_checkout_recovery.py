@@ -93,6 +93,7 @@ async def test_reconciler_isolates_one_failed_checkout_and_continues():
 @pytest.mark.asyncio
 async def test_paid_direct_provisioning_checkout_remains_resumable_after_quote_expiry():
     checkout = SimpleNamespace(
+        id=91,
         settlement_mode=DIRECT_SETTLEMENT_MODE,
         lifecycle_state='fulfilling',
         fulfillment_state='fulfilled',
@@ -101,6 +102,7 @@ async def test_paid_direct_provisioning_checkout_remains_resumable_after_quote_e
     )
     db = SimpleNamespace(
         execute=AsyncMock(return_value=Result(checkout)),
+        scalar=AsyncMock(return_value=None),
         commit=AsyncMock(),
     )
 
@@ -113,6 +115,7 @@ async def test_paid_direct_provisioning_checkout_remains_resumable_after_quote_e
 @pytest.mark.asyncio
 async def test_direct_operator_hold_remains_visible_after_quote_expiry():
     checkout = SimpleNamespace(
+        id=92,
         settlement_mode=DIRECT_SETTLEMENT_MODE,
         lifecycle_state='operator_review',
         fulfillment_state='fulfilled',
@@ -121,6 +124,7 @@ async def test_direct_operator_hold_remains_visible_after_quote_expiry():
     )
     db = SimpleNamespace(
         execute=AsyncMock(return_value=Result(checkout)),
+        scalar=AsyncMock(return_value=None),
         commit=AsyncMock(),
     )
 

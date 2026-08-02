@@ -2492,7 +2492,7 @@ class CheckoutPaymentAttempt(Base):
     )
 
     id = Column(Integer, primary_key=True)
-    checkout_id = Column(Integer, ForeignKey('subscription_checkouts.id', ondelete='CASCADE'), nullable=False)
+    checkout_id = Column(Integer, ForeignKey('subscription_checkouts.id', ondelete='RESTRICT'), nullable=False)
     merchant_order_key = Column(String(96), nullable=False, unique=True)
     provider = Column(String(32), nullable=False, default='platega')
     method_key = Column(String(32), nullable=False)
@@ -2514,12 +2514,60 @@ class CheckoutPaymentAttempt(Base):
     lease_expires_at = Column(AwareDateTime(), nullable=True, index=True)
     lease_epoch = Column(Integer, nullable=False, default=0)
     reconcile_attempts = Column(Integer, nullable=False, default=0)
+    # Counts only canonical observations after this exact provider invoice was
+    # archived as terminal. It is deliberately independent from the general
+    # retry counter, which may already be high before a provider expiry.
+    terminal_observations = Column(Integer, nullable=False, default=0)
     next_reconcile_at = Column(AwareDateTime(), nullable=False, default=func.now(), index=True)
     created_at = Column(AwareDateTime(), nullable=False, default=func.now())
     updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
 
     checkout = relationship('SubscriptionCheckout')
     platega_payment = relationship('PlategaPayment')
+
+
+class DeviceFirstProviderEvent(Base):
+    """Immutable, redacted evidence received from the direct-sale provider.
+
+    The checkout and payment rows contain the current projection.  This table
+    keeps the compact, auditable history needed to explain a terminal release
+    or a later contradictory callback without retaining a provider URL or
+    callback secret.
+    """
+
+    __tablename__ = 'device_first_provider_events'
+    __table_args__ = (
+        UniqueConstraint(
+            'attempt_id',
+            'source',
+            'provider_status',
+            'payload_hash',
+            name='uq_df_provider_event_evidence',
+        ),
+        CheckConstraint('amount_kopeks IS NULL OR amount_kopeks > 0', name='ck_df_provider_event_amount_positive'),
+        Index('ix_df_provider_event_attempt_observed', 'attempt_id', 'observed_at'),
+        Index('ix_df_provider_event_provider_status', 'provider_payment_id', 'provider_status'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    checkout_id = Column(Integer, ForeignKey('subscription_checkouts.id', ondelete='RESTRICT'), nullable=False)
+    attempt_id = Column(Integer, ForeignKey('checkout_payment_attempts.id', ondelete='RESTRICT'), nullable=False)
+    provider_payment_id = Column(String(255), nullable=False)
+    provider_status = Column(String(32), nullable=False)
+    source = Column(String(16), nullable=False)
+    amount_kopeks = Column(Integer, nullable=True)
+    # A signed provider callback can be intentionally sparse. Retain its
+    # redacted receipt even when financial fields have not yet been confirmed
+    # by the canonical GET; such evidence must never be used to settle money.
+    currency = Column(String(3), nullable=True)
+    method_key = Column(String(32), nullable=True)
+    payload_hash = Column(String(64), nullable=False)
+    authenticated = Column(Boolean, nullable=False, default=True)
+    observed_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+
+    checkout = relationship('SubscriptionCheckout')
+    attempt = relationship('CheckoutPaymentAttempt')
 
 
 class DeviceFirstMutation(Base):

@@ -269,11 +269,15 @@ class PlategaService:
         return int(kopeks), currency
 
     async def cancel_payment(self, transaction_id: str) -> bool:
-        """Documented Platega API currently exposes no cancellation endpoint.
+        """Do not auto-cancel an abandoned Device-First invoice.
 
-        Keep this explicit best-effort hook instead of inventing an unsafe URL.
-        A future documented provider cancellation can replace this method without
-        weakening the fail-closed mismatch path.
+        Platega documents a cancellation endpoint, but it is a merchant-funded
+        refund flow (with a separate ``cancel-supported`` balance check), not a
+        safe ``void pending invoice`` primitive.  Calling it when a customer
+        merely leaves checkout could refund real money or create an accounting
+        side effect.  Device-First therefore waits for canonical terminal
+        provider status and only exposes refunds through an explicit operator
+        workflow.
         """
         del transaction_id
         logger.warning('platega_cancellation_not_supported_by_configured_api')

@@ -533,7 +533,7 @@ async def test_safe_open_quote_is_discarded_before_falling_back_when_new_device_
     callback = SimpleNamespace(data='df:start', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
-    checkout = SimpleNamespace(public_id='draft-17', lifecycle_state='draft')
+    checkout = SimpleNamespace(public_id='draft-17', lifecycle_state='draft', settlement_mode='legacy_deposit')
     cancelled_checkout = SimpleNamespace(public_id='draft-17', lifecycle_state='cancelled')
     db = AsyncMock()
 
@@ -569,7 +569,7 @@ async def test_tariffs_starts_a_new_calculation_after_discarding_a_safe_quote(li
     callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
-    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state=lifecycle_state)
+    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state=lifecycle_state, settlement_mode='legacy_deposit')
     cancelled_checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='cancelled')
     options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
     db = AsyncMock()
@@ -600,11 +600,46 @@ async def test_tariffs_starts_a_new_calculation_after_discarding_a_safe_quote(li
 
 
 @pytest.mark.asyncio
+async def test_tariffs_discards_a_direct_quote_before_payment_method_selection() -> None:
+    """A direct C1 quote has no financial attempt and is safe to replace."""
+    callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
+    state = AsyncMock()
+    user = SimpleNamespace(id=17, language='ru')
+    quote = SimpleNamespace(
+        public_id='direct-quote-17', lifecycle_state='confirmed', settlement_mode='direct_purchase_v2'
+    )
+    cancelled_quote = SimpleNamespace(public_id='direct-quote-17', lifecycle_state='cancelled')
+    options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
+    db = AsyncMock()
+
+    with (
+        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock(return_value=quote)),
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
+        patch(
+            'app.handlers.subscription.device_first.abandon_direct_checkout_for_new_calculation',
+            AsyncMock(return_value=None),
+        ) as abandon,
+        patch('app.handlers.subscription.device_first.get_owned_checkout', AsyncMock(return_value=quote)) as locked,
+        patch(
+            'app.handlers.subscription.device_first.cancel_checkout_for_new_calculation',
+            AsyncMock(return_value=cancelled_quote),
+        ) as cancel_quote,
+        patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
+    ):
+        assert await show_device_first_entry(callback, user, db, state) is True
+
+    abandon.assert_awaited_once_with(db, checkout_public_id='direct-quote-17', user_id=17)
+    locked.assert_awaited_once_with(db, public_id='direct-quote-17', user_id=17, for_update=True)
+    cancel_quote.assert_awaited_once_with(db, quote)
+    period_page.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_tariffs_keeps_recovery_when_cancellation_did_not_take_effect() -> None:
     callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
-    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='confirmed')
+    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='confirmed', settlement_mode='legacy_deposit')
     settled_checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='ready')
     options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
     db = AsyncMock()
@@ -637,7 +672,7 @@ async def test_tariffs_keeps_recovery_when_a_quote_becomes_an_external_invoice()
     callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
-    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='confirmed')
+    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='confirmed', settlement_mode='legacy_deposit')
     options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
     invoice_exists = DeviceFirstError('external_invoice_active', 'External invoice exists')
     db = AsyncMock()
@@ -950,7 +985,7 @@ async def test_non_live_known_direct_attempt_never_renders_payment_methods_again
         for button in row
         if button.callback_data
     ]
-    assert 'Проверяем предыдущий счёт' in caption
+    assert 'Проверяем счёт' in caption
     assert 'menu_support' in callbacks
     assert 'back_to_menu' in callbacks
     methods.assert_not_awaited()

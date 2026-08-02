@@ -22,6 +22,7 @@ from app.database.models import (
     AdvertisingCampaignRegistration,
     ButtonClickLog,
     CabinetRefreshToken,
+    CheckoutPaymentAttempt,
     CloudPaymentsPayment,
     ContestAttempt,
     CryptoBotPayment,
@@ -38,6 +39,7 @@ from app.database.models import (
     ReferralEarning,
     SentNotification,
     Subscription,
+    SubscriptionCheckout,
     SubscriptionConversion,
     SubscriptionEvent,
     SubscriptionServer,
@@ -309,6 +311,26 @@ class BlockedUsersService:
                 return False
 
             user_display = user.telegram_id or user.email or f'#{user.id}'
+
+            # Provider attempts are immutable financial evidence.  Refuse the
+            # legacy cleanup path *before* deleting any dependent row: a
+            # database FK is a last line of defence, not an operator-facing
+            # workflow.
+            has_financial_history = bool(
+                await db.scalar(
+                    select(CheckoutPaymentAttempt.id)
+                    .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+                    .where(SubscriptionCheckout.user_id == user.id)
+                    .limit(1)
+                )
+            )
+            if has_financial_history:
+                logger.warning(
+                    'Удаление пользователя заблокировано: сохранена финансовая история',
+                    user_id=user.id,
+                    user_display=user_display,
+                )
+                return False
 
             # Удаляем связанные записи (порядок важен из-за foreign keys)
 
