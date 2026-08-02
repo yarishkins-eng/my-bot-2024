@@ -636,9 +636,18 @@ async def auth_telegram(
         # at the end of the function persists this together with
         # cabinet_last_login in one round-trip.
         if user.status == UserStatus.DELETED.value:
-            from app.services.user_revival_service import revive_deleted_user
+            from app.services.user_revival_service import AccountErasurePendingError, revive_deleted_user
 
-            await revive_deleted_user(db, user, source='cabinet_telegram_login')
+            try:
+                await revive_deleted_user(db, user, source='cabinet_telegram_login')
+            except AccountErasurePendingError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        'code': 'account_erasure_pending',
+                        'message': 'Account closure is being reconciled. Do not create a new payment; contact support if it does not finish.',
+                    },
+                ) from error
         else:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

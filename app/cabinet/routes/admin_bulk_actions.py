@@ -371,7 +371,7 @@ async def _do_add_traffic(
             from app.services.subscription_service import SubscriptionService
 
             subscription_service = SubscriptionService()
-            await subscription_service.enable_remnawave_user(_enable_uuid)
+            await subscription_service.enable_remnawave_user(_enable_uuid, db=db)
         except Exception:
             pass  # "User already enabled" is expected for active subscriptions
 
@@ -579,14 +579,14 @@ async def _do_delete_user(
             force_panel_delete=params.delete_from_panel,
         )
 
-        if result.bot_deleted:
+        if result.bot_deleted or result.account_closed:
             panel_note = ''
             if params.delete_from_panel:
                 panel_note = ' + panel' if result.panel_deleted else ' (panel failed)'
             return BulkUserResult(
                 user_id=user_id,
                 success=True,
-                message=f'User deleted{panel_note}',
+                message=result.message or f'User deleted{panel_note}',
                 username=username,
                 subscriptions=[],
             )
@@ -807,6 +807,16 @@ async def _execute_for_user(
         if not user:
             return BulkUserResult(user_id=uid, success=False, message='User not found')
 
+        # A financial account closure is a one-way payment-safety state. A
+        # bulk action must not quietly restore money, access or a panel user;
+        # DELETE_USER remains allowed so an operator can retry its lifecycle.
+        if getattr(user, 'account_erasure_requested_at', None) is not None and action != BulkActionType.DELETE_USER:
+            return BulkUserResult(
+                user_id=uid,
+                success=False,
+                message='Account closure is in progress; this user cannot be changed.',
+            )
+
         if action == BulkActionType.CHANGE_TARIFF:
             result = await _do_change_tariff(db, user, params, tariff, dry_run)
         elif action == BulkActionType.GRANT_SUBSCRIPTION:
@@ -862,6 +872,13 @@ async def _execute_for_subscription(
         if not user:
             return BulkUserResult(
                 user_id=0, subscription_id=sub_id, success=False, message='User not found for subscription'
+            )
+        if getattr(user, 'account_erasure_requested_at', None) is not None:
+            return BulkUserResult(
+                user_id=user.id,
+                subscription_id=sub_id,
+                success=False,
+                message='Account closure is in progress; this user cannot be changed.',
             )
 
         if action == BulkActionType.CHANGE_TARIFF:

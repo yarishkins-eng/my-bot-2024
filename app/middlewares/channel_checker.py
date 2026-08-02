@@ -584,7 +584,7 @@ class ChannelCheckerMiddleware(BaseMiddleware):
                     )
                     if panel_uuid:
                         try:
-                            await service.enable_remnawave_user(panel_uuid)
+                            await service.enable_remnawave_user(panel_uuid, db=db)
                         except Exception as api_error:
                             logger.error(
                                 'Failed to enable RemnaWave user',

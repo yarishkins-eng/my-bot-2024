@@ -179,6 +179,7 @@ async def _reload_subscription_with_user(db: AsyncSession, subscription_id: int)
     """
     result = await db.execute(
         select(Subscription)
+        .join(User, Subscription.user_id == User.id)
         .options(
             selectinload(Subscription.user).options(
                 selectinload(User.promo_group),
@@ -186,7 +187,10 @@ async def _reload_subscription_with_user(db: AsyncSession, subscription_id: int)
             ),
             selectinload(Subscription.tariff),
         )
-        .where(Subscription.id == subscription_id)
+        .where(
+            Subscription.id == subscription_id,
+            User.account_erasure_requested_at.is_(None),
+        )
     )
     return result.scalar_one_or_none()
 
@@ -203,6 +207,7 @@ async def _find_subscriptions_needing_topup(db: AsyncSession) -> list:
 
     result = await db.execute(
         select(Subscription)
+        .join(User, Subscription.user_id == User.id)
         .options(
             selectinload(Subscription.user).options(
                 selectinload(User.promo_group),
@@ -224,6 +229,7 @@ async def _find_subscriptions_needing_topup(db: AsyncSession) -> list:
                 ),
                 Subscription.autopay_enabled == True,
                 Subscription.is_trial == False,
+                User.account_erasure_requested_at.is_(None),
             )
         )
     )

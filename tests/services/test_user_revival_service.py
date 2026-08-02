@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.database.models import UserStatus
-from app.services.user_revival_service import NotDeletedError, revive_deleted_user
+from app.services.user_revival_service import AccountErasurePendingError, NotDeletedError, revive_deleted_user
 
 
 class _FakeUser:
@@ -110,4 +110,16 @@ async def test_revive_raises_on_blocked_user(db: AsyncMock) -> None:
     user = _FakeUser(status=UserStatus.BLOCKED.value)
     with pytest.raises(NotDeletedError):
         await revive_deleted_user(db, user, source='unit_test')
+    db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_financial_account_erasure_can_never_be_auto_revived(db: AsyncMock) -> None:
+    user = _FakeUser()
+    user.account_erasure_requested_at = datetime.now(UTC)
+
+    with pytest.raises(AccountErasurePendingError):
+        await revive_deleted_user(db, user, source='unit_test')
+
+    assert user.status == UserStatus.DELETED.value
     db.commit.assert_not_called()

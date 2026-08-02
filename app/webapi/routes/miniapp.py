@@ -7391,7 +7391,7 @@ async def purchase_traffic_topup_endpoint(
             else getattr(user, 'remnawave_uuid', None)
         )
         if _en_uuid and subscription.status == 'active':
-            await service.enable_remnawave_user(_en_uuid)
+            await service.enable_remnawave_user(_en_uuid, db=db)
     except Exception as e:
         logger.error('Ошибка синхронизации с RemnaWave при докупке трафика', error=e)
         from app.services.remnawave_retry_queue import remnawave_retry_queue

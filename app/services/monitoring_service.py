@@ -32,7 +32,6 @@ from app.database.crud.subscription import (
 )
 from app.database.crud.user import (
     cleanup_expired_promo_offer_discounts,
-    delete_user,
     get_inactive_users,
     get_user_by_id,
     subtract_user_balance,
@@ -396,6 +395,7 @@ class MonitoringService:
                 # Device-first remains drainable even when creation flag is OFF.
                 # The outbox commits its claim before any RemnaWave HTTP call.
                 try:
+                    from app.services.account_erasure_service import process_pending_financial_account_erasures
                     from app.services.device_first_checkout_service import (
                         process_device_first_notification_outbox,
                         process_provisioning_outbox,
@@ -407,6 +407,10 @@ class MonitoringService:
                     from app.services.device_first_payment_service import reconcile_device_first_payments
 
                     await reconcile_device_first_payments(db)
+                    # Account erasure advances only after canonical payment
+                    # reconciliation; it never guesses provider finality from
+                    # a browser return or elapsed time.
+                    await process_pending_financial_account_erasures(db)
                     await process_device_first_deposit_outbox(db)
                     await reconcile_armed_checkouts(db)
                     await process_provisioning_outbox(db, bot=self.bot)
@@ -1340,7 +1344,7 @@ class MonitoringService:
                                         else user.remnawave_uuid
                                     )
                                     if _enable_uuid:
-                                        await self.subscription_service.enable_remnawave_user(_enable_uuid)
+                                        await self.subscription_service.enable_remnawave_user(_enable_uuid, db=batch_db)
                             except Exception as api_error:
                                 logger.error(
                                     'Failed to update RemnaWave user',
@@ -1673,6 +1677,7 @@ class MonitoringService:
             recently_expired_threshold = current_time - timedelta(hours=2)
             result = await db.execute(
                 select(Subscription)
+                .join(User, Subscription.user_id == User.id)
                 .options(
                     selectinload(Subscription.user).options(
                         selectinload(User.promo_group),
@@ -1693,6 +1698,7 @@ class MonitoringService:
                         ),
                         Subscription.autopay_enabled == True,
                         Subscription.is_trial == False,
+                        User.account_erasure_requested_at.is_(None),
                     )
                 )
             )
@@ -2986,8 +2992,20 @@ class MonitoringService:
                 # Check if user has ANY active subscription (multi-tariff aware)
                 has_active = any(sub.is_active for sub in (getattr(user, 'subscriptions', None) or []))
                 if not has_active:
-                    success = await delete_user(db, user)
-                    if success:
+                    # Never use the old reversible soft-delete helper here:
+                    # a dormant user may still have checkout evidence and a
+                    # late provider callback. The service preserves legacy
+                    # soft deletion only when there is no such history.
+                    from app.services.user_service import UserService
+
+                    result = await UserService().delete_user_account(
+                        db,
+                        user.id,
+                        admin_id=0,
+                        force_panel_delete=False,
+                        soft_delete_if_no_financial_history=True,
+                    )
+                    if result.bot_deleted or result.account_closed:
                         deleted_count += 1
 
             if deleted_count > 0:

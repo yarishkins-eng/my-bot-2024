@@ -328,7 +328,7 @@ async def add_subscription_traffic_endpoint(
         else (user.remnawave_uuid if user else None)
     )
     if user and _enable_uuid and subscription.status == 'active':
-        await service.enable_remnawave_user(_enable_uuid)
+        await service.enable_remnawave_user(_enable_uuid, db=db)
 
     subscription = await _get_subscription(db, subscription.id)
     return _serialize_subscription(subscription)
@@ -358,7 +358,7 @@ async def add_subscription_devices_endpoint(
         else (user.remnawave_uuid if user else None)
     )
     if user and _enable_uuid and subscription.status == 'active':
-        await service.enable_remnawave_user(_enable_uuid)
+        await service.enable_remnawave_user(_enable_uuid, db=db)
 
     subscription = await _get_subscription(db, subscription.id)
     return _serialize_subscription(subscription)

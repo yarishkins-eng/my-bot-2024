@@ -28,6 +28,21 @@ from app.utils.timezone import format_local_datetime
 
 logger = structlog.get_logger(__name__)
 
+
+class AccountErasureClosureError(RuntimeError):
+    """Raised before a payment flow can create/revive access for a closing account."""
+
+
+async def _assert_user_not_in_financial_closure(db: AsyncSession, user_id: int) -> None:
+    user = await db.scalar(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if user is not None and getattr(user, 'account_erasure_requested_at', None) is not None:
+        raise AccountErasureClosureError('Account closure is in progress; paid access cannot be created or revived.')
+
 # Статусы, при которых подписка считается «живой» (индекс uq_subscriptions_user_tariff_active
 # защищает именно эти статусы). Используется в нескольких местах модуля.
 ALIVE_SUBSCRIPTION_STATUSES: frozenset[str] = frozenset(
@@ -175,6 +190,7 @@ async def create_trial_subscription(
         connected_squads: Список UUID сквадов (если указан, squad_uuid игнорируется)
         tariff_id: ID тарифа (для режима тарифов)
     """
+    await _assert_user_not_in_financial_closure(db, user_id)
     duration_days = duration_days or settings.TRIAL_DURATION_DAYS
     # 0 ГБ — это осознанный БЕЗЛИМИТ (валидное значение), поэтому отличаем
     # «не передано» (None → берём конфиг) от «0» (оставляем безлимит). `or` тут
@@ -347,6 +363,7 @@ async def _revive_paid_subscription(
     Mirrors the classic extend branch — extend from the current end_date if still
     alive, otherwise start a fresh period from now and reset used traffic.
     """
+    await _assert_user_not_in_financial_closure(db, subscription.user_id)
     now = datetime.now(UTC)
     was_alive = subscription.end_date is not None and subscription.end_date > now
 
@@ -427,6 +444,9 @@ async def create_paid_subscription(
     tariff_id: int | None = None,
     commit: bool = True,
 ) -> Subscription:
+    # This central gate runs before any subscription row or later panel sync
+    # can be created. The DB trigger is retained as a final independent rail.
+    await _assert_user_not_in_financial_closure(db, user_id)
     # Multi-tariff invariant: at most ONE subscription per (user, tariff). If a
     # subscription for this tariff has EXPIRED, revive it in place instead of
     # inserting a duplicate — the partial unique index only guards the alive
@@ -929,6 +949,7 @@ async def extend_subscription(
             превратится в фантомную платную подписку и попадёт в авто-продление
             (баг #629889).
     """
+    await _assert_user_not_in_financial_closure(db, subscription.user_id)
     current_time = datetime.now(UTC)
 
     # Lock + refresh traffic-полей ДО любых чтений и расчёта base_limit для веток.
@@ -1522,6 +1543,7 @@ async def reactivate_subscription(db: AsyncSession, subscription: Subscription, 
     Активирует если подписка была DISABLED или EXPIRED и ещё не истекла по времени.
     Не логирует если реактивация не требуется.
     """
+    await _assert_user_not_in_financial_closure(db, subscription.user_id)
     now = datetime.now(UTC)
 
     # Тихо выходим если реактивация не нужна (уже активна или другой статус)
@@ -1653,6 +1675,7 @@ async def get_subscriptions_for_autopay(db: AsyncSession) -> list[Subscription]:
             and_(
                 Subscription.status == SubscriptionStatus.ACTIVE.value,
                 User.status == UserStatus.ACTIVE.value,
+                User.account_erasure_requested_at.is_(None),
                 Subscription.autopay_enabled == True,
                 Subscription.is_trial == False,
             )
@@ -1976,7 +1999,9 @@ async def get_subscriptions_batch(
     """Получает подписки пачками для синхронизации. Загружает связанных пользователей и тарифы."""
     result = await db.execute(
         select(Subscription)
+        .join(User, Subscription.user_id == User.id)
         .options(selectinload(Subscription.user), selectinload(Subscription.tariff))
+        .where(User.account_erasure_requested_at.is_(None))
         .order_by(Subscription.id)
         .offset(offset)
         .limit(limit)

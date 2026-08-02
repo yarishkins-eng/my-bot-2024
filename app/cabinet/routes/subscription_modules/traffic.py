@@ -367,7 +367,7 @@ async def purchase_traffic(
                         else getattr(user, 'remnawave_uuid', None)
                     )
                     if _enable_uuid:
-                        await subscription_service.enable_remnawave_user(_enable_uuid)
+                        await subscription_service.enable_remnawave_user(_enable_uuid, db=db)
     except Exception as e:
         logger.error('Failed to sync traffic with RemnaWave', error=e)
         from app.services.remnawave_retry_queue import remnawave_retry_queue

@@ -2402,10 +2402,16 @@ class RemnaWaveService:
 
             batch_size = 500
             offset = 0
-            concurrent_limit = 5
 
             async with self.get_api_client() as api:
-                semaphore = asyncio.Semaphore(concurrent_limit)
+                # Raw bulk payloads need the same durable before/after fence
+                # as normal subscription writes. The shared session is not
+                # safe for concurrent fresh reads, so this worker processes a
+                # batch serially; it is a reconciliation job, not a request
+                # path, and correctness wins over bulk throughput here.
+                from app.services.subscription_service import SubscriptionService
+
+                closure_guard = SubscriptionService()
 
                 while True:
                     # Получаем подписки напрямую (не через users)
@@ -2415,7 +2421,11 @@ class RemnaWaveService:
                         break
 
                     # Фильтруем подписки у которых есть пользователь
-                    valid_subscriptions = [s for s in subscriptions if s.user]
+                    valid_subscriptions = [
+                        s
+                        for s in subscriptions
+                        if s.user and getattr(s.user, 'account_erasure_requested_at', None) is None
+                    ]
 
                     if not valid_subscriptions:
                         if len(subscriptions) < batch_size:
@@ -2425,9 +2435,12 @@ class RemnaWaveService:
 
                     # Подготавливаем задачи для параллельного выполнения
                     async def process_subscription(sub):
-                        async with semaphore:
-                            try:
+                        try:
                                 user = sub.user
+                                if await closure_guard._account_erasure_started(db, user.id):
+                                    return ('skipped', sub, None)
+                                original_sub_uuid = sub.remnawave_uuid
+                                original_user_uuid = user.remnawave_uuid
                                 hwid_limit = resolve_hwid_device_limit_for_payload(sub)
 
                                 # Определяем статус для панели. Grace-aware: пока идёт
@@ -2573,7 +2586,17 @@ class RemnaWaveService:
                                         update_kwargs['external_squad_uuid'] = sub.tariff.external_squad_uuid
 
                                     try:
-                                        await api.update_user(**update_kwargs)
+                                        updated_user = await closure_guard.run_guarded_panel_write(
+                                            db,
+                                            user_id=user.id,
+                                            api=api,
+                                            panel_uuid=panel_uuid,
+                                            operation=lambda: api.update_user(**update_kwargs),
+                                        )
+                                        if updated_user is None:
+                                            sub.remnawave_uuid = original_sub_uuid
+                                            user.remnawave_uuid = original_user_uuid
+                                            return ('skipped', sub, None)
                                         # Сохраняем UUID если его не было
                                         if settings.is_multi_tariff_enabled():
                                             if not sub.remnawave_uuid:
@@ -2588,51 +2611,73 @@ class RemnaWaveService:
                                         # синхронизация в панель чинила рассинхрон, а не падала в ошибку.
                                         error_code = (api_error.response_data or {}).get('errorCode', '')
                                         if api_error.status_code == 404 or error_code in ('A018', 'A063'):
-                                            new_user = await api.create_user(**create_kwargs)
+                                            new_user = await closure_guard.run_guarded_panel_write(
+                                                db,
+                                                user_id=user.id,
+                                                api=api,
+                                                operation=lambda: api.create_user(**create_kwargs),
+                                            )
+                                            if new_user is None:
+                                                sub.remnawave_uuid = original_sub_uuid
+                                                user.remnawave_uuid = original_user_uuid
+                                                return ('skipped', sub, None)
                                             return ('created', sub, new_user)
                                         raise
                                 else:
-                                    new_user = await api.create_user(**create_kwargs)
+                                    new_user = await closure_guard.run_guarded_panel_write(
+                                        db,
+                                        user_id=user.id,
+                                        api=api,
+                                        operation=lambda: api.create_user(**create_kwargs),
+                                    )
+                                    if new_user is None:
+                                        sub.remnawave_uuid = original_sub_uuid
+                                        user.remnawave_uuid = original_user_uuid
+                                        return ('skipped', sub, None)
                                     return ('created', sub, new_user)
 
-                            except Exception as e:
-                                logger.error(
-                                    'Ошибка синхронизации пользователя в панель',
-                                    telegram_id=sub.user.telegram_id if sub.user else 'N/A',
-                                    error=e,
+                        except Exception as e:
+                            logger.error(
+                                'Ошибка синхронизации пользователя в панель',
+                                telegram_id=sub.user.telegram_id if sub.user else 'N/A',
+                                error=e,
+                            )
+                            return ('error', sub, None)
+
+                    # Persist one subscription before starting the next. The
+                    # panel-write fence holds that user's ``FOR UPDATE`` lock
+                    # through the provider request, and delaying commit to the
+                    # end of a 500-user batch would stall unrelated checkout
+                    # and callback work for minutes.
+                    for subscription in valid_subscriptions:
+                        try:
+                            action, sub, new_user = await process_subscription(subscription)
+                            if action == 'created':
+                                if new_user and sub.user:
+                                    if settings.is_multi_tariff_enabled():
+                                        sub.remnawave_uuid = new_user.uuid
+                                    else:
+                                        sub.user.remnawave_uuid = new_user.uuid
+                                    sub.remnawave_short_uuid = new_user.short_uuid
+                                stats['created'] += 1
+                            elif action == 'updated':
+                                stats['updated'] += 1
+                            elif action == 'skipped':
+                                logger.info(
+                                    'Пропущена синхронизация закрывающегося финансового аккаунта',
+                                    subscription_id=sub.id,
                                 )
-                                return ('error', sub, None)
-
-                    # Выполняем параллельно
-                    tasks = [process_subscription(s) for s in valid_subscriptions]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                    # Обрабатываем результаты
-                    for result in results:
-                        if isinstance(result, Exception):
+                            else:
+                                stats['errors'] += 1
+                            await db.commit()
+                        except Exception as commit_error:
+                            logger.error(
+                                'Ошибка фиксации подписки при синхронизации в панель',
+                                subscription_id=subscription.id,
+                                commit_error=commit_error,
+                            )
+                            await db.rollback()
                             stats['errors'] += 1
-                            continue
-
-                        action, sub, new_user = result
-                        if action == 'created':
-                            if new_user and sub.user:
-                                if settings.is_multi_tariff_enabled():
-                                    sub.remnawave_uuid = new_user.uuid
-                                else:
-                                    sub.user.remnawave_uuid = new_user.uuid
-                                sub.remnawave_short_uuid = new_user.short_uuid
-                            stats['created'] += 1
-                        elif action == 'updated':
-                            stats['updated'] += 1
-                        else:
-                            stats['errors'] += 1
-
-                    try:
-                        await db.commit()
-                    except Exception as commit_error:
-                        logger.error('Ошибка фиксации транзакции при синхронизации в панель', commit_error=commit_error)
-                        await db.rollback()
-                        stats['errors'] += len(valid_subscriptions)
 
                     logger.info(
                         '📦 Обработана партия подписок',

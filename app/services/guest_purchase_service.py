@@ -50,6 +50,33 @@ logger = structlog.get_logger(__name__)
 GIFT_TOKEN_MIN_PREFIX_LENGTH = 48
 
 _TELEGRAM_USERNAME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]{4,31}$')
+_ACCOUNT_ERASURE_FINANCIAL_HOLD = 'account_erasure_financial_review'
+
+
+async def _purchase_touches_financially_closing_account(db: AsyncSession, purchase: GuestPurchase) -> bool:
+    """Keep paid landing orders from delivering into a closing account.
+
+    A guest order can name both a buyer and an eventual recipient.  Either
+    user is a financial anchor; a late provider event must be retained for
+    manual reconciliation instead of creating/reviving VPN access.
+    """
+    user_ids = {user_id for user_id in (purchase.buyer_user_id, purchase.user_id) if user_id is not None}
+    if not user_ids:
+        return False
+    return bool(
+        await db.scalar(
+            select(User.id)
+            .where(User.id.in_(user_ids), User.account_erasure_requested_at.is_not(None))
+            .limit(1)
+        )
+    )
+
+
+async def _hold_purchase_for_account_erasure(db: AsyncSession, purchase: GuestPurchase) -> GuestPurchase:
+    purchase.recipient_warning = _ACCOUNT_ERASURE_FINANCIAL_HOLD
+    await db.commit()
+    logger.warning('guest_purchase_held_for_financial_account_erasure', purchase_id=purchase.id)
+    return purchase
 
 
 async def _send_admin_notification(
@@ -318,6 +345,13 @@ async def fulfill_purchase(
         )
         return purchase
 
+    if purchase.recipient_warning == _ACCOUNT_ERASURE_FINANCIAL_HOLD:
+        logger.warning('guest_purchase_already_held_for_account_erasure', purchase_id=purchase.id)
+        return purchase
+
+    if await _purchase_touches_financially_closing_account(db, purchase):
+        return await _hold_purchase_for_account_erasure(db, purchase)
+
     try:
         # Determine recipient contact info
         recipient_type, recipient_value = _get_recipient_contact(purchase)
@@ -331,6 +365,9 @@ async def fulfill_purchase(
             pre_resolved_telegram_id=pre_resolved_telegram_id,
             tariff_id=purchase.tariff_id,
         )
+        if getattr(user, 'account_erasure_requested_at', None) is not None:
+            purchase.user_id = user.id
+            return await _hold_purchase_for_account_erasure(db, purchase)
 
         # Load tariff early — needed for both PENDING_ACTIVATION and DELIVERED paths
         tariff = await get_tariff_by_id(db, purchase.tariff_id)
@@ -1183,6 +1220,9 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     if purchase.status == GuestPurchaseStatus.DELIVERED.value:
         return purchase
 
+    if purchase.recipient_warning == _ACCOUNT_ERASURE_FINANCIAL_HOLD:
+        raise GuestPurchaseError('Account is under financial closure review', status_code=409)
+
     if purchase.status != GuestPurchaseStatus.PENDING_ACTIVATION.value:
         raise GuestPurchaseError('Purchase is not pending activation', status_code=400)
 
@@ -1197,6 +1237,9 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     user = user_result.scalars().first()
     if user is None:
         raise GuestPurchaseError('User not found', status_code=500)
+    if getattr(user, 'account_erasure_requested_at', None) is not None or await _purchase_touches_financially_closing_account(db, purchase):
+        await _hold_purchase_for_account_erasure(db, purchase)
+        raise GuestPurchaseError('Account is under financial closure review', status_code=409)
 
     # Ensure email users have cabinet access
     is_new_account = False
@@ -1434,6 +1477,10 @@ async def retry_stuck_paid_purchases(
             # whoever activates). Retrying would eagerly fulfill a directed gift
             # to a phantom recipient and re-introduce the wrong-recipient binding.
             ~GuestPurchase.is_gift.is_(True),
+            or_(
+                GuestPurchase.recipient_warning.is_(None),
+                GuestPurchase.recipient_warning != _ACCOUNT_ERASURE_FINANCIAL_HOLD,
+            ),
         )
         .order_by(GuestPurchase.paid_at.asc().nulls_first())
         .limit(limit)
@@ -1488,6 +1535,10 @@ async def retry_stuck_pending_activation(
             or_(GuestPurchase.paid_at < cutoff, GuestPurchase.paid_at.is_(None)),
             or_(GuestPurchase.paid_at > max_age, GuestPurchase.paid_at.is_(None)),
             GuestPurchase.user_id.isnot(None),
+            or_(
+                GuestPurchase.recipient_warning.is_(None),
+                GuestPurchase.recipient_warning != _ACCOUNT_ERASURE_FINANCIAL_HOLD,
+            ),
         )
         .order_by(GuestPurchase.paid_at.asc().nulls_first())
         .limit(limit)

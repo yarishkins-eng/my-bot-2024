@@ -102,7 +102,7 @@ async def on_user_joined_channel(event: ChatMemberUpdated, bot: Bot) -> None:
                     )
                 if _uuid:
                     try:
-                        await service.enable_remnawave_user(_uuid)
+                        await service.enable_remnawave_user(_uuid, db=db)
                     except Exception as api_error:
                         logger.error('Failed to enable RemnaWave user', error=api_error)
 

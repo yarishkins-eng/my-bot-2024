@@ -1,10 +1,11 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -154,6 +155,141 @@ class SubscriptionService:
         async with self.api as api:
             yield api
 
+    @staticmethod
+    async def _load_user_for_panel_write(db: AsyncSession, user_id: int) -> User | None:
+        """Load current account state immediately before an external VPN write.
+
+        A subscription can be held by a background worker for minutes.  Its
+        already-loaded ``User`` object is therefore not a safe authorization
+        source for enabling VPN access: a financial account closure may have
+        committed after the worker fetched it.  ``populate_existing`` makes
+        this an explicit database re-read rather than an identity-map hit.
+        """
+        user = await db.scalar(
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if user is None:
+            return None
+        if getattr(user, 'account_erasure_requested_at', None) is not None:
+            logger.warning(
+                'panel_write_blocked_for_financial_account_closure',
+                user_id=user_id,
+            )
+            return None
+        return user
+
+    @staticmethod
+    async def _account_erasure_started(db: AsyncSession, user_id: int) -> bool:
+        """Return the durable close marker using a fresh read."""
+        return (
+            await db.scalar(
+                select(User.account_erasure_requested_at)
+                .where(User.id == user_id)
+                .execution_options(populate_existing=True)
+            )
+        ) is not None
+
+    async def _delete_panel_identity_if_closed_after_write(
+        self,
+        api: RemnaWaveAPI,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        panel_uuid: str,
+    ) -> bool:
+        """Compensate the only unavoidable external race during panel create.
+
+        If an account closure committed after the preflight read but before a
+        provider request, the closing worker may have deleted the old panel
+        identity first.  Delete the identity we just observed before returning
+        control; a closing account must never retain a newly-created VPN user.
+        """
+        if not await self._account_erasure_started(db, user_id):
+            return False
+        try:
+            await api.delete_user(panel_uuid)
+        except Exception as error:
+            # Account-erasure service has an independent retry state for this
+            # exact panel cleanup.  Do not write credentials locally.
+            logger.exception(
+                'panel_write_compensation_failed_after_financial_closure',
+                user_id=user_id,
+                panel_uuid=panel_uuid,
+                error=error,
+            )
+            from app.services.account_erasure_service import record_panel_cleanup_retry_for_financial_closure
+
+            await record_panel_cleanup_retry_for_financial_closure(user_id=user_id, panel_uuid=panel_uuid)
+        logger.warning(
+            'panel_write_compensated_after_financial_closure',
+            user_id=user_id,
+            panel_uuid=panel_uuid,
+        )
+        return True
+
+    async def run_guarded_panel_write(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        api: RemnaWaveAPI,
+        operation: Callable[[], Awaitable[RemnaWaveUser]],
+        panel_uuid: str | None = None,
+    ) -> RemnaWaveUser | None:
+        """Run a raw panel write behind the financial-erasure fence.
+
+        Some administrative flows need a narrower RemnaWave payload than the
+        normal subscription synchroniser.  They must still use the same
+        before/after database check as the canonical create flow: a close that
+        lands during the HTTP call deletes the just-written identity and the
+        caller must not persist new URLs or UUIDs.
+        """
+        # Take the same row lock used by account closure *before* issuing the
+        # remote write.  The caller persists its UUID and commits before a
+        # closer can set the marker; if the provider accepted a request but
+        # its response was lost, closure then performs a stable-ID panel sweep
+        # while the pre-erasure Telegram/email identifiers still exist.
+        if await self._load_user_for_panel_write(db, user_id) is None:
+            logger.warning('raw_panel_write_blocked_for_financial_account_closure', user_id=user_id)
+            return None
+
+        result = await operation()
+        if await self._account_erasure_started(db, user_id):
+            cleanup_uuid = getattr(result, 'uuid', None) or panel_uuid
+            if cleanup_uuid:
+                try:
+                    await api.delete_user(cleanup_uuid)
+                except Exception as error:
+                    logger.exception(
+                        'raw_panel_write_compensation_failed_after_financial_closure',
+                        user_id=user_id,
+                        panel_uuid=cleanup_uuid,
+                        error=error,
+                    )
+                    from app.services.account_erasure_service import record_panel_cleanup_retry_for_financial_closure
+
+                    await record_panel_cleanup_retry_for_financial_closure(user_id=user_id, panel_uuid=cleanup_uuid)
+            logger.warning(
+                'raw_panel_write_compensated_after_financial_closure',
+                user_id=user_id,
+                panel_uuid=cleanup_uuid,
+            )
+            return None
+        return result
+
+    async def _panel_uuid_is_financially_closing(self, db: AsyncSession, user_uuid: str) -> bool:
+        """Resolve a panel UUID to its user and refuse a stale enable call."""
+        user = await db.scalar(
+            select(User)
+            .outerjoin(Subscription, Subscription.user_id == User.id)
+            .where(or_(User.remnawave_uuid == user_uuid, Subscription.remnawave_uuid == user_uuid))
+            .execution_options(populate_existing=True)
+        )
+        return bool(user is not None and getattr(user, 'account_erasure_requested_at', None) is not None)
+
     async def create_remnawave_user(
         self,
         db: AsyncSession,
@@ -163,9 +299,9 @@ class SubscriptionService:
         reset_reason: str | None = None,
     ) -> RemnaWaveUser | None:
         try:
-            user = await get_user_by_id(db, subscription.user_id)
+            user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
-                logger.error('Пользователь не найден', user_id=subscription.user_id)
+                logger.warning('Создание VPN-профиля отклонено: пользователь не найден или закрывается', user_id=subscription.user_id)
                 return None
 
             validation_success = await self.validate_and_clean_subscription(db, subscription, user)
@@ -189,27 +325,40 @@ class SubscriptionService:
 
                 # Multi-tariff mode: each subscription has its own Remnawave user
                 if settings.is_multi_tariff_enabled():
-                    updated_user = await self._create_or_update_remnawave_user_multi(
-                        api,
-                        user,
-                        subscription,
-                        user_tag=user_tag,
-                        hwid_limit=hwid_limit,
-                        ext_squad_uuid=ext_squad_uuid,
-                        reset_traffic=reset_traffic,
-                        reset_reason=reset_reason,
-                    )
+                    async def operation() -> RemnaWaveUser:
+                        return await self._create_or_update_remnawave_user_multi(
+                            api,
+                            user,
+                            subscription,
+                            user_tag=user_tag,
+                            hwid_limit=hwid_limit,
+                            ext_squad_uuid=ext_squad_uuid,
+                            reset_traffic=reset_traffic,
+                            reset_reason=reset_reason,
+                        )
                 else:
-                    updated_user = await self._create_or_update_remnawave_user_single(
-                        api,
-                        user,
-                        subscription,
-                        user_tag=user_tag,
-                        hwid_limit=hwid_limit,
-                        ext_squad_uuid=ext_squad_uuid,
-                        reset_traffic=reset_traffic,
-                        reset_reason=reset_reason,
-                    )
+                    async def operation() -> RemnaWaveUser:
+                        return await self._create_or_update_remnawave_user_single(
+                            api,
+                            user,
+                            subscription,
+                            user_tag=user_tag,
+                            hwid_limit=hwid_limit,
+                            ext_squad_uuid=ext_squad_uuid,
+                            reset_traffic=reset_traffic,
+                            reset_reason=reset_reason,
+                        )
+                # Re-acquire the closure fence immediately before the actual
+                # provider mutation. Validation above may have committed a
+                # stale-UUID repair and therefore released an earlier lock.
+                updated_user = await self.run_guarded_panel_write(
+                    db,
+                    user_id=subscription.user_id,
+                    api=api,
+                    operation=operation,
+                )
+                if updated_user is None:
+                    return None
 
                 subscription.remnawave_short_uuid = updated_user.short_uuid
                 subscription.subscription_url = updated_user.subscription_url
@@ -416,9 +565,9 @@ class SubscriptionService:
         sync_squads: bool = True,
     ) -> RemnaWaveUser | None:
         try:
-            user = await get_user_by_id(db, subscription.user_id)
+            user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
-                logger.error('Пользователь не найден', user_id=subscription.user_id)
+                logger.warning('Обновление VPN-профиля отклонено: пользователь не найден или закрывается', user_id=subscription.user_id)
                 return None
 
             # Resolve the Remnawave UUID: prefer subscription-level in multi-tariff mode
@@ -560,7 +709,7 @@ class SubscriptionService:
         Возвращает True при успехе, False если панель не настроена / нет UUID / ошибка API.
         """
         try:
-            user = await get_user_by_id(db, subscription.user_id)
+            user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
                 return False
             if settings.is_multi_tariff_enabled():
@@ -654,8 +803,17 @@ class SubscriptionService:
             logger.error('Ошибка удаления RemnaWave пользователя', error=e, user_uuid=user_uuid)
             return False
 
-    async def enable_remnawave_user(self, user_uuid: str) -> bool:
+    async def enable_remnawave_user(self, user_uuid: str, *, db: AsyncSession | None = None) -> bool:
         """Включить пользователя в RemnaWave (реактивация)."""
+        if db is None:
+            # There is no safe way to decide whether this UUID belongs to a
+            # financial tombstone without a database session.  Fail closed;
+            # all supported callers pass their request/job session.
+            logger.error('enable_remnawave_user_requires_db_for_financial_closure_fence', user_uuid=user_uuid)
+            return False
+        if await self._panel_uuid_is_financially_closing(db, user_uuid):
+            logger.warning('panel_enable_blocked_for_financial_account_closure', user_uuid=user_uuid)
+            return False
         try:
             async with self.get_api_client() as api:
                 await api.enable_user(user_uuid)

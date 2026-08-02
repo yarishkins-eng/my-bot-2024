@@ -1944,6 +1944,12 @@ class User(Base):
     yandex_id = Column(String(255), unique=True, nullable=True, index=True)
     discord_id = Column(String(255), unique=True, nullable=True, index=True)
     vk_id = Column(BigInteger, unique=True, nullable=True, index=True)
+    # Financial account erasure is intentionally distinct from the ordinary
+    # inactive-user soft delete.  The latter is reversible after a proven
+    # Telegram login; an erasure request freezes that identity until its
+    # provider invoices are reconciled and, once complete, releases all PII.
+    account_erasure_requested_at = Column(AwareDateTime(), nullable=True, index=True)
+    account_erased_at = Column(AwareDateTime(), nullable=True, index=True)
     broadcasts = relationship('BroadcastHistory', back_populates='admin')
     referrals = relationship(
         'User', backref='referrer', remote_side=[id], foreign_keys='User.referred_by_id', post_update=True
@@ -2088,6 +2094,54 @@ class User(Base):
             self.balance_kopeks -= kopeks
             return True
         return False
+
+
+class AccountErasureRequest(Base):
+    """Durable lifecycle for closing an account with retained payment evidence.
+
+    A user row remains the immutable foreign-key anchor for payment/audit data.
+    This record separates an owner-requested financial erasure from a normal
+    inactive-account soft delete and makes retries/reconciliation auditable.
+    """
+
+    __tablename__ = 'account_erasure_requests'
+    __table_args__ = (
+        UniqueConstraint('user_id', name='uq_account_erasure_request_user'),
+        Index('ix_account_erasure_requests_state_created', 'state', 'created_at'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    requested_by_user_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    # awaiting_reconciliation -> ready_for_anonymization -> completed.
+    # ``awaiting_manual_resolution`` and ``panel_cleanup_retry`` are safe
+    # holding states; neither permits revival or a new checkout.
+    state = Column(String(48), nullable=False, default='awaiting_reconciliation')
+    panel_state = Column(String(32), nullable=False, default='not_required')
+    # Legacy provider records are retained too, but their heterogeneous
+    # callbacks cannot be auto-reconciled by the Device-First state machine.
+    # Persist that distinction so no retry can silently anonymize them.
+    has_legacy_financial_history = Column(Boolean, nullable=False, default=False)
+    financial_resolution_at = Column(AwareDateTime(), nullable=True)
+    financial_resolved_by_user_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    financial_resolution_code = Column(String(64), nullable=True)
+    financial_resolution_note = Column(Text, nullable=True)
+    # UUIDs discovered after a concurrent panel write are kept only until the
+    # closing worker has physically deleted them.  This is an operational
+    # cleanup queue, not financial evidence, and is emptied before final
+    # anonymisation.
+    panel_cleanup_uuids = Column(JSON, nullable=False, default=list)
+    # Database-level balance/subscription safety rails record any late legacy
+    # callback even after the identity itself was anonymised.
+    last_late_payment_blocked_at = Column(AwareDateTime(), nullable=True)
+    resolution_code = Column(String(64), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
+    finalized_at = Column(AwareDateTime(), nullable=True)
+
+    user = relationship('User', foreign_keys=[user_id])
+    requested_by = relationship('User', foreign_keys=[requested_by_user_id])
+    financial_resolved_by = relationship('User', foreign_keys=[financial_resolved_by_user_id])
 
 
 class Subscription(Base):

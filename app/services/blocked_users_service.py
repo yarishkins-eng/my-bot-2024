@@ -22,7 +22,6 @@ from app.database.models import (
     AdvertisingCampaignRegistration,
     ButtonClickLog,
     CabinetRefreshToken,
-    CheckoutPaymentAttempt,
     CloudPaymentsPayment,
     ContestAttempt,
     CryptoBotPayment,
@@ -39,7 +38,6 @@ from app.database.models import (
     ReferralEarning,
     SentNotification,
     Subscription,
-    SubscriptionCheckout,
     SubscriptionConversion,
     SubscriptionEvent,
     SubscriptionServer,
@@ -316,21 +314,26 @@ class BlockedUsersService:
             # legacy cleanup path *before* deleting any dependent row: a
             # database FK is a last line of defence, not an operator-facing
             # workflow.
-            has_financial_history = bool(
-                await db.scalar(
-                    select(CheckoutPaymentAttempt.id)
-                    .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-                    .where(SubscriptionCheckout.user_id == user.id)
-                    .limit(1)
-                )
-            )
+            from app.services.user_service import UserService
+
+            has_financial_history, _has_legacy_history = await UserService._get_financial_history_kind(db, user.id)
             if has_financial_history:
-                logger.warning(
-                    'Удаление пользователя заблокировано: сохранена финансовая история',
+                # Route the exceptional immutable-payment case through the
+                # same financial-erasure lifecycle as every other admin
+                # surface instead of reporting a misleading deletion failure.
+                result = await UserService().delete_user_account(
+                    db,
+                    user.id,
+                    admin_id=0,
+                    force_panel_delete=False,
+                )
+                logger.info(
+                    'Финансовое закрытие обработано из cleanup заблокированных пользователей',
                     user_id=user.id,
                     user_display=user_display,
+                    state=result.erasure_state,
                 )
-                return False
+                return result.bot_deleted or result.account_closed
 
             # Удаляем связанные записи (порядок важен из-за foreign keys)
 

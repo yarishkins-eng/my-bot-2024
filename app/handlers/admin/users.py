@@ -10,6 +10,7 @@ from aiogram import Dispatcher, F, types
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -50,13 +51,26 @@ from app.utils.decorators import admin_required, error_handler
 from app.utils.formatters import format_datetime, format_time_ago
 from app.utils.formatting import user_html_link
 from app.utils.photo_message import safe_edit_or_resend
-from app.utils.subscription_utils import (
-    resolve_hwid_device_limit_for_payload,
-)
 from app.utils.user_utils import get_effective_referral_commission_percent
 
 
 logger = structlog.get_logger(__name__)
+
+
+async def _is_financial_account_closing(db: AsyncSession, user_id: int) -> bool:
+    """Fresh, shared guard for every chat-admin mutation/panel write.
+
+    The legacy admin handler has several independent callbacks and a few raw
+    RemnaWave calls.  They must not rely on a ``User`` object loaded before a
+    financial closure committed in another request.
+    """
+    return (
+        await db.scalar(
+            select(User.account_erasure_requested_at)
+            .where(User.id == user_id)
+            .execution_options(populate_existing=True)
+        )
+    ) is not None
 
 
 # =============================================================================
@@ -1134,9 +1148,9 @@ async def delete_user_account(callback: types.CallbackQuery, db_user: User, db: 
     user_service = UserService()
     delete_result = await user_service.delete_user_account(db, user_id, db_user.id, force_panel_delete=True)
 
-    if delete_result.bot_deleted:
+    if delete_result.bot_deleted or delete_result.account_closed:
         await callback.message.edit_text(
-            '✅ Пользователь успешно удален',
+            f'✅ {delete_result.message or "Пользователь успешно удалён"}',
             reply_markup=types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [types.InlineKeyboardButton(text='👥 К списку пользователей', callback_data='admin_users_list')]
@@ -2640,6 +2654,10 @@ async def save_restriction_reason(message: types.Message, db_user: User, db: Asy
         await message.answer('Ошибка: пользователь не найден')
         await state.clear()
         return
+    if await _is_financial_account_closing(db, user_id):
+        await message.answer('Аккаунт закрывается после финансовой сверки; изменять его нельзя.')
+        await state.clear()
+        return
 
     reason = message.text.strip()[:500]  # Ограничение 500 символов
     user.restriction_reason = reason
@@ -2682,6 +2700,9 @@ async def clear_user_restrictions(callback: types.CallbackQuery, db_user: User, 
 
     if not user:
         await callback.answer('Пользователь не найден', show_alert=True)
+        return
+    if getattr(user, 'account_erasure_requested_at', None) is not None:
+        await callback.answer('Аккаунт закрывается после финансовой сверки; ограничения менять нельзя.', show_alert=True)
         return
 
     # Снимаем все ограничения
@@ -2771,6 +2792,14 @@ async def confirm_user_unblock(callback: types.CallbackQuery, db_user: User):
 @error_handler
 async def unblock_user(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     user_id = int(callback.data.split('_')[-1])
+
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        await callback.answer('Пользователь не найден', show_alert=True)
+        return
+    if getattr(user, 'account_erasure_requested_at', None) is not None:
+        await callback.answer('Аккаунт закрывается после финансовой сверки; разблокировка недоступна.', show_alert=True)
+        return
 
     user_service = UserService()
     success = await user_service.unblock_user(db, user_id, db_user.id)
@@ -3819,6 +3848,9 @@ async def toggle_user_server(callback: types.CallbackQuery, db_user: User, db: A
         if not user or not subscription:
             await callback.answer('❌ Пользователь или подписка не найдены', show_alert=True)
             return
+        if await _is_financial_account_closing(db, user_id):
+            await callback.answer('Аккаунт закрывается после финансовой сверки; серверы менять нельзя.', show_alert=True)
+            return
 
         server = await get_server_squad_by_id(db, server_id)
         if not server:
@@ -3847,13 +3879,22 @@ async def toggle_user_server(callback: types.CallbackQuery, db_user: User, db: A
             try:
                 remnawave_service = RemnaWaveService()
                 async with remnawave_service.get_api_client() as api:
-                    await api.update_user(
-                        uuid=_uuid,
-                        active_internal_squads=current_squads,
-                        description=settings.format_remnawave_user_description(
-                            full_name=user.full_name, username=user.username, telegram_id=user.telegram_id
+                    updated = await SubscriptionService().run_guarded_panel_write(
+                        db,
+                        user_id=user_id,
+                        api=api,
+                        panel_uuid=_uuid,
+                        operation=lambda: api.update_user(
+                            uuid=_uuid,
+                            active_internal_squads=current_squads,
+                            description=settings.format_remnawave_user_description(
+                                full_name=user.full_name, username=user.username, telegram_id=user.telegram_id
+                            ),
                         ),
                     )
+                    if updated is None:
+                        logger.warning('Admin server sync blocked for financial closure', user_id=user_id)
+                        return
                 logger.info('✅ Обновлены серверы в RemnaWave для пользователя', telegram_id=user.telegram_id)
             except Exception as rw_error:
                 logger.error('❌ Ошибка обновления RemnaWave', rw_error=rw_error)
@@ -4272,6 +4313,9 @@ async def reset_user_devices(callback: types.CallbackQuery, db_user: User, db: A
 
     try:
         user = await get_user_by_id(db, user_id)
+        if user and await _is_financial_account_closing(db, user_id):
+            await callback.answer('Аккаунт закрывается после финансовой сверки; устройства менять нельзя.', show_alert=True)
+            return
         _uuid = None
         if subscription_id and settings.is_multi_tariff_enabled():
             from app.database.crud.subscription import get_subscription_by_id_for_user
@@ -4341,13 +4385,21 @@ async def _update_user_devices(
             try:
                 remnawave_service = RemnaWaveService()
                 async with remnawave_service.get_api_client() as api:
-                    await api.update_user(
-                        uuid=_uuid,
-                        hwid_device_limit=devices,
-                        description=settings.format_remnawave_user_description(
-                            full_name=user.full_name, username=user.username, telegram_id=user.telegram_id
+                    updated = await SubscriptionService().run_guarded_panel_write(
+                        db,
+                        user_id=user_id,
+                        api=api,
+                        panel_uuid=_uuid,
+                        operation=lambda: api.update_user(
+                            uuid=_uuid,
+                            hwid_device_limit=devices,
+                            description=settings.format_remnawave_user_description(
+                                full_name=user.full_name, username=user.username, telegram_id=user.telegram_id
+                            ),
                         ),
                     )
+                    if updated is None:
+                        return False
                 logger.info('✅ Обновлен лимит устройств в RemnaWave для пользователя', telegram_id=user.telegram_id)
             except Exception as rw_error:
                 logger.error('❌ Ошибка обновления лимита устройств в RemnaWave', rw_error=rw_error)
@@ -4394,16 +4446,24 @@ async def _update_user_traffic(
 
                 remnawave_service = RemnaWaveService()
                 async with remnawave_service.get_api_client() as api:
-                    await api.update_user(
-                        uuid=_uuid,
-                        traffic_limit_bytes=traffic_gb * (1024**3) if traffic_gb > 0 else 0,
-                        traffic_limit_strategy=get_traffic_reset_strategy(
-                            subscription.tariff if subscription else None
-                        ),
-                        description=settings.format_remnawave_user_description(
-                            full_name=user.full_name, username=user.username, telegram_id=user.telegram_id
+                    updated = await SubscriptionService().run_guarded_panel_write(
+                        db,
+                        user_id=user_id,
+                        api=api,
+                        panel_uuid=_uuid,
+                        operation=lambda: api.update_user(
+                            uuid=_uuid,
+                            traffic_limit_bytes=traffic_gb * (1024**3) if traffic_gb > 0 else 0,
+                            traffic_limit_strategy=get_traffic_reset_strategy(
+                                subscription.tariff if subscription else None
+                            ),
+                            description=settings.format_remnawave_user_description(
+                                full_name=user.full_name, username=user.username, telegram_id=user.telegram_id
+                            ),
                         ),
                     )
+                    if updated is None:
+                        return False
                 logger.info('✅ Обновлен лимит трафика в RemnaWave для пользователя', telegram_id=user.telegram_id)
             except Exception as rw_error:
                 logger.error('❌ Ошибка обновления лимита трафика в RemnaWave', rw_error=rw_error)
@@ -4436,6 +4496,10 @@ async def _resolve_admin_subscription(
     - Multiple → prefer non-daily with most days remaining
     - 0 active → return None
     """
+    if await _is_financial_account_closing(db, user_id):
+        logger.warning('admin_subscription_mutation_blocked_for_financial_closure', user_id=user_id)
+        return None
+
     if settings.is_multi_tariff_enabled():
         if subscription_id:
             from app.database.crud.subscription import get_subscription_by_id_for_user
@@ -4541,7 +4605,7 @@ async def _add_subscription_traffic(
                 user = await get_user_by_id(db, user_id)
                 _uuid = getattr(user, 'remnawave_uuid', None)
             if _uuid:
-                await subscription_service.enable_remnawave_user(_uuid)
+                await subscription_service.enable_remnawave_user(_uuid, db=db)
 
         traffic_text = 'безлимитный' if gb == 0 else f'{gb} ГБ'
         logger.info('Админ добавил трафик пользователю', admin_id=admin_id, traffic_text=traffic_text, user_id=user_id)
@@ -5004,6 +5068,9 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
 
     target_user = profile['user']
     subscription = profile['subscription']
+    if await _is_financial_account_closing(db, target_user.id):
+        await callback.answer('Аккаунт закрывается после финансовой сверки; покупка недоступна.', show_alert=True)
+        return
 
     if not subscription:
         await callback.answer('❌ У пользователя нет подписки', show_alert=True)
@@ -5015,6 +5082,9 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
     from app.database.crud.user import lock_user_for_pricing
 
     target_user = await lock_user_for_pricing(db, target_user.id)
+    if await _is_financial_account_closing(db, target_user.id):
+        await callback.answer('Аккаунт закрывается после финансовой сверки; покупка недоступна.', show_alert=True)
+        return
 
     try:
         price_kopeks = await _calculate_subscription_period_price(
@@ -5107,106 +5177,12 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
             )
 
             try:
-                from app.external.remnawave_api import UserStatus
-                from app.services.remnawave_service import RemnaWaveService
-                from app.services.subscription_service import get_traffic_reset_strategy
-
-                remnawave_service = RemnaWaveService()
-
-                hwid_limit = resolve_hwid_device_limit_for_payload(subscription)
-
-                # Загружаем tariff для внешнего сквада
-                try:
-                    await db.refresh(subscription, ['tariff'])
-                except Exception:
-                    pass
-                ext_squad_uuid = subscription.tariff.external_squad_uuid if subscription.tariff else None
-
-                _uuid = (
-                    getattr(subscription, 'remnawave_uuid', None) if settings.is_multi_tariff_enabled() else None
-                ) or getattr(target_user, 'remnawave_uuid', None)
-                if _uuid:
-                    async with remnawave_service.get_api_client() as api:
-                        update_kwargs = dict(
-                            uuid=_uuid,
-                            status=UserStatus.ACTIVE if subscription.is_active else UserStatus.DISABLED,
-                            expire_at=subscription.end_date,
-                            traffic_limit_bytes=subscription.traffic_limit_gb * (1024**3)
-                            if subscription.traffic_limit_gb > 0
-                            else 0,
-                            traffic_limit_strategy=get_traffic_reset_strategy(subscription.tariff),
-                            description=settings.format_remnawave_user_description(
-                                full_name=target_user.full_name,
-                                username=target_user.username,
-                                telegram_id=target_user.telegram_id,
-                                email=target_user.email,
-                                user_id=target_user.id,
-                            ),
-                            active_internal_squads=subscription.connected_squads,
-                        )
-
-                        if hwid_limit is not None:
-                            update_kwargs['hwid_device_limit'] = hwid_limit
-
-                        # Внешний сквад: синхронизируем из тарифа (если задан)
-                        # Не отправляем null — RemnaWave API не принимает null для externalSquadUuid (A039)
-                        if ext_squad_uuid is not None:
-                            update_kwargs['external_squad_uuid'] = ext_squad_uuid
-
-                        remnawave_user = await api.update_user(**update_kwargs)
-                else:
-                    # При multi-tariff подписке username должен включать
-                    # `_<remnawave_short_id>` (как и в трёх других create-path'ах:
-                    # subscription_service, cabinet admin sync, bulk sync) — иначе
-                    # подписки, созданные через админский extend, имеют другой
-                    # формат username'а и не уникальны per-subscription.
-                    username_suffix = (
-                        f'_{subscription.remnawave_short_id}'
-                        if (settings.is_multi_tariff_enabled() and getattr(subscription, 'remnawave_short_id', None))
-                        else ''
-                    )
-                    username = settings.build_remnawave_subscription_username(
-                        full_name=target_user.full_name,
-                        username=target_user.username,
-                        telegram_id=target_user.telegram_id,
-                        email=target_user.email,
-                        user_id=target_user.id,
-                        suffix=username_suffix,
-                    )
-                    async with remnawave_service.get_api_client() as api:
-                        create_kwargs = dict(
-                            username=username,
-                            expire_at=subscription.end_date,
-                            status=UserStatus.ACTIVE if subscription.is_active else UserStatus.DISABLED,
-                            traffic_limit_bytes=subscription.traffic_limit_gb * (1024**3)
-                            if subscription.traffic_limit_gb > 0
-                            else 0,
-                            traffic_limit_strategy=get_traffic_reset_strategy(subscription.tariff),
-                            telegram_id=target_user.telegram_id,
-                            email=target_user.email,
-                            description=settings.format_remnawave_user_description(
-                                full_name=target_user.full_name,
-                                username=target_user.username,
-                                telegram_id=target_user.telegram_id,
-                                email=target_user.email,
-                            ),
-                            active_internal_squads=subscription.connected_squads,
-                        )
-
-                        if hwid_limit is not None:
-                            create_kwargs['hwid_device_limit'] = hwid_limit
-                        if ext_squad_uuid is not None:
-                            create_kwargs['external_squad_uuid'] = ext_squad_uuid
-
-                        remnawave_user = await api.create_user(**create_kwargs)
-
-                    if remnawave_user and hasattr(remnawave_user, 'uuid'):
-                        if settings.is_multi_tariff_enabled() and subscription:
-                            subscription.remnawave_uuid = remnawave_user.uuid
-                        else:
-                            target_user.remnawave_uuid = remnawave_user.uuid
-                        await db.commit()
-
+                remnawave_user = await subscription_service.create_remnawave_user(
+                    db,
+                    subscription,
+                    reset_traffic=False,
+                    reset_reason='продление подписки (администратор)',
+                )
                 if remnawave_user:
                     logger.info('Пользователь успешно обновлен в RemnaWave', telegram_id=target_user.telegram_id)
                 else:
@@ -5492,6 +5468,9 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
         return
 
     target_user = profile['user']
+    if await _is_financial_account_closing(db, target_user.id):
+        await callback.answer('Аккаунт закрывается после финансовой сверки; покупка недоступна.', show_alert=True)
+        return
 
     from app.database.crud.tariff import get_tariff_by_id
 

@@ -225,6 +225,12 @@ class UserDetailResponse(BaseModel):
     restriction_subscription: bool = False
     restriction_reason: str | None = None
 
+    # Financial closures are intentionally not reported as an ordinary
+    # deleted user until their provider/ledger reconciliation is complete.
+    account_erasure_state: str | None = None
+    account_erasure_resolution_code: str | None = None
+    account_erasure_requested_at: datetime | None = None
+
     # Promo offer
     promo_offer_discount_percent: int = 0
     promo_offer_discount_source: str | None = None
@@ -733,6 +739,25 @@ class FullDeleteUserResponse(BaseModel):
     deleted_from_bot: bool = False
     deleted_from_panel: bool = False
     panel_error: str | None = None
+    account_closed: bool = False
+    deletion_state: str | None = None
+
+
+class ResolveFinancialAccountErasureRequest(BaseModel):
+    """Audited confirmation that an account-closure financial hold is settled."""
+
+    resolution_code: str = Field(
+        ...,
+        pattern='^(provider_terminal_verified|refund_completed|chargeback_resolved|balance_writeoff_approved)$',
+    )
+    resolution_note: str = Field(..., min_length=8, max_length=1000)
+
+
+class ResolveFinancialAccountErasureResponse(BaseModel):
+    success: bool
+    message: str
+    deletion_state: str | None = None
+    account_closed: bool = False
 
 
 class ResetTrialRequest(BaseModel):

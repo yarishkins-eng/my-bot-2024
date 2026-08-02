@@ -16,7 +16,7 @@ from app.database.crud.user import (
     set_user_oauth_provider_id,
 )
 from app.database.models import User, UserStatus
-from app.services.user_revival_service import revive_deleted_user
+from app.services.user_revival_service import AccountErasurePendingError, revive_deleted_user
 
 from ..auth.oauth_providers import (
     OAuthUserInfo,
@@ -193,7 +193,13 @@ async def oauth_callback(
         # dependencies guard would 403 right after login.
         was_deleted = user.status == UserStatus.DELETED.value
         if was_deleted:
-            await revive_deleted_user(db, user, source=f'oauth_{provider}_provider_id')
+            try:
+                await revive_deleted_user(db, user, source=f'oauth_{provider}_provider_id')
+            except AccountErasurePendingError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={'code': 'account_erasure_pending', 'message': 'Account closure is being reconciled.'},
+                ) from error
         logger.info('OAuth login for existing user', provider=provider, user_id=user.id, revived=was_deleted)
         return await _finalize_oauth_login(db, user, provider, request.campaign_slug, request.referral_code)
 
@@ -236,7 +242,13 @@ async def oauth_callback(
             # silently create a duplicate account.
             was_deleted = user.status == UserStatus.DELETED.value
             if was_deleted:
-                await revive_deleted_user(db, user, source=f'oauth_{provider}_email_merge')
+                try:
+                    await revive_deleted_user(db, user, source=f'oauth_{provider}_email_merge')
+                except AccountErasurePendingError as error:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={'code': 'account_erasure_pending', 'message': 'Account closure is being reconciled.'},
+                    ) from error
             await set_user_oauth_provider_id(db, user, provider, user_info.provider_id)
             logger.info(
                 'OAuth provider linked to existing email user',

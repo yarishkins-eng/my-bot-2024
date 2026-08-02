@@ -4,7 +4,7 @@ from typing import Any
 
 import structlog
 from aiogram import Bot, types
-from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -27,22 +27,38 @@ from app.database.crud.user import (
 from app.database.models import (
     AdvertisingCampaign,
     AdvertisingCampaignRegistration,
+    AntilopayPayment,
+    AppleIAPAccount,
+    AppleTransaction,
+    AuraPayPayment,
     BroadcastHistory,
+    CheckoutPaymentAttempt,
     CloudPaymentsPayment,
     CryptoBotPayment,
+    DonutPayment,
+    EtoplatezhiPayment,
     FreekassaPayment,
+    GuestPurchase,
     HeleketPayment,
+    JupiterPayment,
     KassaAiPayment,
+    LavaPayment,
     MulenPayPayment,
+    OverpayPayment,
     Pal24Payment,
     PaymentMethod,
+    PayPearPayment,
     PlategaPayment,
     PromoCode,
     PromoCodeUse,
     PromoGroup,
     ReferralEarning,
+    RioPayPayment,
+    RollyPayPayment,
     SentNotification,
+    SeverPayPayment,
     Subscription,
+    SubscriptionCheckout,
     SubscriptionConversion,
     SubscriptionServer,
     Transaction,
@@ -51,6 +67,7 @@ from app.database.models import (
     UserStatus,
     WataPayment,
     WelcomeText,
+    WithdrawalRequest,
     YooKassaPayment,
 )
 from app.localization.texts import get_texts
@@ -70,9 +87,106 @@ class DeleteUserResult:
     bot_deleted: bool = False
     panel_deleted: bool = False
     panel_error: str | None = None
+    # A financial tombstone is deliberately not a physical DB delete, but it
+    # does close access and eventually releases the identity for a clean
+    # re-registration. Keep that contract explicit for every admin surface.
+    account_closed: bool = False
+    erasure_state: str | None = None
+    message: str | None = None
 
 
 class UserService:
+    @staticmethod
+    async def _get_financial_history_kind(db: AsyncSession, user_id: int) -> tuple[bool, bool]:
+        """Return ``(has_any_history, has_legacy_history)`` without deleting it.
+
+        Device-First attempts have their own canonical reconciliation model.
+        Every other provider row and every non-Device-First ledger transaction
+        is financial evidence as well: erase neither records nor their user
+        anchor automatically.  The second value sends such accounts to a
+        manual financial-resolution state instead of guessing a provider's
+        finality.
+        """
+        has_device_first = bool(
+            await db.scalar(
+                select(CheckoutPaymentAttempt.id)
+                .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+                .where(SubscriptionCheckout.user_id == user_id)
+                .limit(1)
+            )
+        )
+
+        legacy_models = (
+            AppleTransaction,
+            # An Apple account token can receive a delayed StoreKit event even
+            # before a local transaction row is materialised. Keep it behind
+            # the same manual close/reconciliation policy.
+            AppleIAPAccount,
+            YooKassaPayment,
+            CryptoBotPayment,
+            HeleketPayment,
+            MulenPayPayment,
+            Pal24Payment,
+            WataPayment,
+            CloudPaymentsPayment,
+            FreekassaPayment,
+            KassaAiPayment,
+            RioPayPayment,
+            SeverPayPayment,
+            PayPearPayment,
+            RollyPayPayment,
+            OverpayPayment,
+            AuraPayPayment,
+            EtoplatezhiPayment,
+            AntilopayPayment,
+            JupiterPayment,
+            DonutPayment,
+            LavaPayment,
+            WithdrawalRequest,
+        )
+        has_legacy_provider = False
+        for model in legacy_models:
+            if await db.scalar(select(model.id).where(model.user_id == user_id).limit(1)) is not None:
+                has_legacy_provider = True
+                break
+
+        # Landing/guest orders are provider-facing financial obligations. A
+        # late payment can be fulfilled for either the buyer or the linked
+        # recipient, so both ends retain an auditable manual-close state.
+        has_guest_purchase = bool(
+            await db.scalar(
+                select(GuestPurchase.id)
+                .where(or_(GuestPurchase.buyer_user_id == user_id, GuestPurchase.user_id == user_id))
+                .limit(1)
+            )
+        )
+
+        # The Platega model is shared by direct Device-First and historical
+        # wallet flows. Only a row with no Device-First attempt is legacy.
+        has_legacy_platega = bool(
+            await db.scalar(
+                select(PlategaPayment.id)
+                .outerjoin(
+                    CheckoutPaymentAttempt,
+                    CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id,
+                )
+                .where(PlategaPayment.user_id == user_id, CheckoutPaymentAttempt.id.is_(None))
+                .limit(1)
+            )
+        )
+
+        # Direct Device-First receipts are already represented by an attempt;
+        # do not make them a separate legacy/manual case.
+        has_legacy_transaction = bool(
+            await db.scalar(
+                select(Transaction.id)
+                .where(Transaction.user_id == user_id, Transaction.device_first_checkout_id.is_(None))
+                .limit(1)
+            )
+        )
+        has_legacy_history = has_legacy_provider or has_guest_purchase or has_legacy_platega or has_legacy_transaction
+        return has_device_first or has_legacy_history, has_legacy_history
+
     async def send_topup_success_to_user(
         self,
         bot: Bot,
@@ -741,6 +855,13 @@ class UserService:
             user = await get_user_by_id(db, user_id)
             if not user:
                 return False
+            if getattr(user, 'account_erasure_requested_at', None) is not None:
+                logger.warning(
+                    'Разблокировка отклонена: идёт финансовое закрытие аккаунта',
+                    admin_id=admin_id,
+                    user_id=user_id,
+                )
+                return False
 
             await update_user(db, user, status=UserStatus.ACTIVE.value)
 
@@ -786,40 +907,82 @@ class UserService:
             return False
 
     async def delete_user_account(
-        self, db: AsyncSession, user_id: int, admin_id: int, *, force_panel_delete: bool = False
+        self,
+        db: AsyncSession,
+        user_id: int,
+        admin_id: int,
+        *,
+        force_panel_delete: bool = False,
+        soft_delete_if_no_financial_history: bool = False,
     ) -> DeleteUserResult:
-        """Полное удаление пользователя из бота и (опционально) из панели RemnaWave.
+        """Удалить обычный аккаунт или безопасно закрыть финансовый.
 
         force_panel_delete=True: пропускает проверку активной подписки и принудительно
         удаляет (не деактивирует) пользователя из панели RemnaWave. Используется
         при полном удалении через кабинет администратора.
+
+        ``soft_delete_if_no_financial_history`` preserves the legacy inactive
+        cleanup behaviour only for users who have never entered checkout. It
+        can never select the soft-delete path for financial accounts: they
+        always go through the account-closure lifecycle.
         """
         result = DeleteUserResult()
         try:
-            user = await get_user_by_id(db, user_id)
+            # Keep the same payment lock order as Device-First settlement:
+            # payment -> user -> attempt -> checkout.  A plain existence
+            # check followed by a physical delete could otherwise race a
+            # callback which has already locked a provider payment.
+            await db.execute(
+                select(PlategaPayment)
+                .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
+                .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+                .where(SubscriptionCheckout.user_id == user_id)
+                .with_for_update(of=PlategaPayment)
+            )
+            user = (
+                await db.execute(select(User).where(User.id == user_id).with_for_update())
+            ).scalar_one_or_none()
             if not user:
                 logger.warning('Пользователь не найден для удаления', user_id=user_id)
                 return result
 
             # Financial checkout evidence is deliberately retained (attempts
-            # have RESTRICT FKs). Refuse the legacy hard-delete path before
-            # touching panel/subscription state, rather than discovering an
-            # opaque FK error after a partial destructive operation.
-            from app.database.models import CheckoutPaymentAttempt, SubscriptionCheckout
-
-            has_financial_history = bool(
-                await db.scalar(
-                    select(CheckoutPaymentAttempt.id)
-                    .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-                    .where(SubscriptionCheckout.user_id == user_id)
-                    .limit(1)
-                )
-            )
+            # have RESTRICT FKs). A user with such history takes the single
+            # account-erasure path: close access first, reconcile known
+            # invoices, then anonymize the identity without breaking audit.
+            has_financial_history, has_legacy_financial_history = await self._get_financial_history_kind(db, user_id)
             if has_financial_history:
-                logger.warning(
-                    'Полное удаление пользователя заблокировано: сохранена финансовая история',
+                from app.services.account_erasure_service import request_financial_account_erasure
+
+                erasure = await request_financial_account_erasure(
+                    db,
                     user_id=user_id,
+                    requested_by_user_id=admin_id or None,
+                    # Financial closure always removes the remote identity.
+                    # ``force_panel_delete`` applies only to the legacy path
+                    # below and must not leave paid-account access alive.
+                    deactivate_panel=True,
+                    has_legacy_financial_history=has_legacy_financial_history,
                 )
+                result.bot_deleted = erasure.completed
+                result.panel_deleted = erasure.panel_deactivated
+                result.account_closed = erasure.state != 'not_found'
+                result.erasure_state = erasure.state
+                result.message = erasure.message
+                logger.info(
+                    'Финансовое закрытие пользователя обработано',
+                    user_id=user_id,
+                    state=erasure.state,
+                    completed=erasure.completed,
+                )
+                return result
+
+            if soft_delete_if_no_financial_history:
+                user.status = UserStatus.DELETED.value
+                user.updated_at = datetime.now(UTC)
+                await db.commit()
+                result.bot_deleted = True
+                result.message = 'Пользователь помечен как удалён.'
                 return result
 
             user_id_display = user.telegram_id or user.email or f'#{user.id}'

@@ -13,7 +13,7 @@ from app.database.database import AsyncSessionLocal
 from app.database.models import User, UserStatus
 from app.services.blacklist_service import blacklist_service
 from app.services.maintenance_service import maintenance_service
-from app.services.user_revival_service import NotDeletedError, revive_deleted_user
+from app.services.user_revival_service import AccountErasurePendingError, NotDeletedError, revive_deleted_user
 
 from .auth.jwt_handler import get_token_payload
 from .auth.telegram_auth import validate_telegram_init_data
@@ -164,6 +164,14 @@ async def get_current_cabinet_user(
             except NotDeletedError:
                 # Raced — another request already revived. Treat as success.
                 logger.info('Auto-revival race: user already revived by concurrent request', user_id=user.id)
+            except AccountErasurePendingError:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        'code': 'account_erasure_pending',
+                        'message': 'Account closure is being reconciled. Do not create a new payment; contact support if it does not finish.',
+                    },
+                )
         elif user.status == UserStatus.DELETED.value:
             # DELETED but no proof of identity (no initData or token-only
             # request) → structured friendly error so the frontend can

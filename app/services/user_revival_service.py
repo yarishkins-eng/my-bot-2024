@@ -46,6 +46,10 @@ class NotDeletedError(RuntimeError):
     """
 
 
+class AccountErasurePendingError(RuntimeError):
+    """Raised when a financial account closure must never be auto-revived."""
+
+
 async def revive_deleted_user(
     db: AsyncSession,
     user: User,
@@ -87,6 +91,11 @@ async def revive_deleted_user(
         raise NotDeletedError(
             f'revive_deleted_user called on user {user.id} with status={user.status!r}; '
             'caller must verify status==DELETED before invoking'
+        )
+    if getattr(user, 'account_erasure_requested_at', None) is not None:
+        raise AccountErasurePendingError(
+            f'revive_deleted_user refused financial erasure for user {user.id}; '
+            'payment reconciliation must finish before a new identity is allowed'
         )
 
     # Touch the session ref so a static analyser doesn't flag `db` as

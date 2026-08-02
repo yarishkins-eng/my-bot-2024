@@ -1502,6 +1502,15 @@ async def settle_device_first_platega_payment(
         )
     ).scalar_one()
     user = (await db.execute(select(User).where(User.id == payment.user_id).with_for_update())).scalar_one()
+    if getattr(user, 'account_erasure_requested_at', None) is not None:
+        return await _fence_account_erasure_payment(
+            db,
+            checkout=checkout,
+            attempt=attempt,
+            payment=payment,
+            provider_payment_id=transaction_id,
+            verified=verified,
+        )
     amount_kopeks, _ = verified
     ledger_key = f'deposit:{attempt.id}'
     existing = (
@@ -1647,6 +1656,54 @@ async def _store_reconciliation_credit(
     return credit
 
 
+async def _fence_account_erasure_payment(
+    db: AsyncSession,
+    *,
+    checkout: SubscriptionCheckout,
+    attempt: CheckoutPaymentAttempt,
+    payment: PlategaPayment,
+    provider_payment_id: str,
+    verified: tuple[int, str] | None,
+) -> PlategaPayment:
+    """Keep a late payment reviewable, never creditable, after account closure.
+
+    The old user row remains a financial anchor but no longer represents an
+    accessible customer identity.  In particular, this must run before the
+    historical "late invoice -> wallet" branch: a later Telegram account with
+    the same ID is a new person/account for payment purposes.
+    """
+    attempt.status = 'operator_review'
+    attempt.reconciliation_reason = 'account_erasure_requested'
+    payment.status = 'OPERATOR_REVIEW'
+    payment.is_paid = True
+    payment.metadata_json = {**(payment.metadata_json or {}), 'account_erasure_review': True}
+    checkout.lifecycle_state = 'operator_review'
+    checkout.terminal_reason = 'account_erasure_requested'
+    from app.services.account_erasure_service import invalidate_financial_resolution_for_late_payment
+
+    await invalidate_financial_resolution_for_late_payment(db, payment.user_id)
+    if verified is not None and provider_payment_id:
+        amount_kopeks, currency = verified
+        attempt.credited_amount_kopeks = amount_kopeks
+        await _store_reconciliation_credit(
+            db,
+            checkout=checkout,
+            attempt=attempt,
+            payment=payment,
+            provider_payment_id=provider_payment_id,
+            amount_kopeks=amount_kopeks,
+            currency=currency,
+        )
+    await db.commit()
+    logger.warning(
+        'device_first_account_erasure_payment_requires_operator_review',
+        checkout_id=checkout.public_id,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+    )
+    return payment
+
+
 async def _settle_direct_platega_payment_locked(
     db: AsyncSession,
     *,
@@ -1726,6 +1783,16 @@ async def _settle_direct_platega_payment_locked(
         provider_status='CONFIRMED',
         source='settlement',
     )
+
+    if getattr(user, 'account_erasure_requested_at', None) is not None:
+        return await _fence_account_erasure_payment(
+            db,
+            checkout=checkout,
+            attempt=attempt,
+            payment=payment,
+            provider_payment_id=provider_payment_id,
+            verified=verified,
+        )
 
     if mismatch_reason is not None:
         if (

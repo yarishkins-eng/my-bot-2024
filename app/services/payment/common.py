@@ -372,6 +372,15 @@ async def send_cart_notification_after_topup(
     Само сообщение «Баланс пополнен…» больше не шлётся — оно дублировало
     основное «Пополнение успешно!» и ломало MAIN_MENU_MODE=cabinet.
     """
+    # A delayed legacy provider callback may have reached its own recorded
+    # payment state. Never let it resume a cart, subscription or notification
+    # chain for an identity that has entered financial account closure. The
+    # database trigger is a separate final guard for direct balance writes.
+    from app.services.account_erasure_service import mark_late_legacy_payment_for_manual_review
+
+    if await mark_late_legacy_payment_for_manual_review(db, user):
+        return False
+
     # Единственная общая точка после зачисления во ВСЕХ провайдерах — поэтому
     # email/WS-канал для юзеров без Telegram подключён здесь, а не в 18+
     # webhook-обработчиках. Уходит до автопокупки, чтобы уведомления пришли в

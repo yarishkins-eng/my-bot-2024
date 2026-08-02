@@ -18,7 +18,6 @@ from app.database.crud.subscription import (
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.crud.user import (
     add_user_balance,
-    delete_user as soft_delete_user,
     get_referrals,
     get_user_by_id,
     get_user_by_telegram_id,
@@ -36,13 +35,12 @@ from app.database.crud.user_device_alias import (
 )
 from app.database.crud.user_promo_group import sync_user_primary_promo_group
 from app.database.models import (
-    CheckoutPaymentAttempt,
+    AccountErasureRequest,
     GuestPurchase,
     PaymentMethod,
     PromoGroup,
     ReferralEarning,
     Subscription,
-    SubscriptionCheckout,
     SubscriptionServer,
     SubscriptionStatus,
     TrafficPurchase,
@@ -82,6 +80,8 @@ from ..schemas.users import (
     ResetSubscriptionResponse,
     ResetTrialRequest,
     ResetTrialResponse,
+    ResolveFinancialAccountErasureRequest,
+    ResolveFinancialAccountErasureResponse,
     SortByEnum,
     SubscriptionListItem,
     SyncFromPanelRequest,
@@ -122,19 +122,19 @@ from ..schemas.users import (
 logger = structlog.get_logger(__name__)
 
 
-async def _has_retained_device_first_financial_history(db: AsyncSession, user_id: int) -> bool:
-    """Hard-deletion guard for immutable provider/ledger evidence."""
-    return bool(
-        await db.scalar(
-            select(CheckoutPaymentAttempt.id)
-            .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-            .where(SubscriptionCheckout.user_id == user_id)
-            .limit(1)
-        )
-    )
-
-
 router = APIRouter(prefix='/admin/users', tags=['Cabinet Admin Users'])
+
+
+def _reject_account_erasure_mutation(user: User) -> None:
+    """Financial closure is a lifecycle, not an ordinary mutable deletion."""
+    if getattr(user, 'account_erasure_requested_at', None) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                'code': 'account_erasure_pending',
+                'message': 'Аккаунт закрывается после финансовой сверки; статус и ограничения изменять нельзя.',
+            },
+        )
 
 
 def _build_user_list_item(user: User, spending_stats: dict = None) -> UserListItem:
@@ -306,10 +306,19 @@ async def _sync_subscription_to_panel(
     Returns dict with changes/errors.
     """
     try:
+        if (
+            await db.scalar(
+                select(User.account_erasure_requested_at)
+                .where(User.id == user.id)
+                .execution_options(populate_existing=True)
+            )
+        ) is not None:
+            logger.warning('Admin panel sync blocked for financial account closure', user_id=user.id)
+            return {'skipped': True, 'reason': 'account_erasure_pending'}
         from app.config import settings
         from app.external.remnawave_api import UserStatus as PanelUserStatus
         from app.services.remnawave_service import RemnaWaveService
-        from app.services.subscription_service import get_traffic_reset_strategy
+        from app.services.subscription_service import SubscriptionService, get_traffic_reset_strategy
         from app.utils.subscription_utils import resolve_hwid_device_limit_for_payload
 
         service = RemnaWaveService()
@@ -416,7 +425,15 @@ async def _sync_subscription_to_panel(
                     update_kwargs['external_squad_uuid'] = ext_squad_uuid
 
                 try:
-                    updated_panel_user = await api.update_user(**update_kwargs)
+                    updated_panel_user = await SubscriptionService().run_guarded_panel_write(
+                        db,
+                        user_id=user.id,
+                        api=api,
+                        panel_uuid=panel_uuid,
+                        operation=lambda: api.update_user(**update_kwargs),
+                    )
+                    if updated_panel_user is None:
+                        return {'skipped': True, 'reason': 'account_erasure_pending'}
                     subscription.subscription_url = updated_panel_user.subscription_url
                     subscription.subscription_crypto_link = updated_panel_user.happ_crypto_link
                     subscription.remnawave_short_uuid = updated_panel_user.short_uuid
@@ -452,7 +469,14 @@ async def _sync_subscription_to_panel(
                 # multi-tariff suffix уже встроен в `username` через
                 # build_remnawave_subscription_username — больше ничего не клеим.
 
-                new_panel_user = await api.create_user(**create_kwargs)
+                new_panel_user = await SubscriptionService().run_guarded_panel_write(
+                    db,
+                    user_id=user.id,
+                    api=api,
+                    operation=lambda: api.create_user(**create_kwargs),
+                )
+                if new_panel_user is None:
+                    return {'skipped': True, 'reason': 'account_erasure_pending'}
                 subscription.remnawave_uuid = new_panel_user.uuid
                 subscription.remnawave_short_uuid = new_panel_user.short_uuid
                 subscription.subscription_url = new_panel_user.subscription_url
@@ -696,6 +720,9 @@ async def get_user_detail(
     # Get spending stats
     spending_stats = await get_users_spending_stats(db, [user.id])
     user_stats = spending_stats.get(user.id, {'total_spent': 0, 'purchase_count': 0})
+    erasure_request = await db.scalar(
+        select(AccountErasureRequest).where(AccountErasureRequest.user_id == user.id)
+    )
 
     # Build subscription info (all subscriptions + legacy single)
     subs = getattr(user, 'subscriptions', None) or []
@@ -812,6 +839,9 @@ async def get_user_detail(
         restriction_topup=user.restriction_topup,
         restriction_subscription=user.restriction_subscription,
         restriction_reason=user.restriction_reason,
+        account_erasure_state=erasure_request.state if erasure_request else None,
+        account_erasure_resolution_code=erasure_request.resolution_code if erasure_request else None,
+        account_erasure_requested_at=user.account_erasure_requested_at,
         promo_offer_discount_percent=user.promo_offer_discount_percent,
         promo_offer_discount_source=user.promo_offer_discount_source,
         promo_offer_discount_expires_at=user.promo_offer_discount_expires_at,
@@ -1091,6 +1121,7 @@ async def update_user_balance(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     old_balance = user.balance_kopeks
 
@@ -1177,6 +1208,7 @@ async def update_user_subscription(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     subs = getattr(user, 'subscriptions', None) or []
     is_multi_tariff = settings.is_multi_tariff_enabled()
@@ -1594,7 +1626,7 @@ async def update_user_subscription(
             from app.services.subscription_service import SubscriptionService
 
             subscription_service = SubscriptionService()
-            await subscription_service.enable_remnawave_user(_enable_uuid)
+            await subscription_service.enable_remnawave_user(_enable_uuid, db=db)
 
         logger.info('Admin added traffic for user', admin_id=admin.id, traffic_gb=request.traffic_gb, user_id=user_id)
 
@@ -1816,6 +1848,7 @@ async def update_user_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     old_status = user.status
     new_status = request.status.value
@@ -1884,6 +1917,11 @@ async def unblock_user(
     """Unblock a user — sets DB status AND re-enables panel user in RemnaWave."""
     from app.services.user_service import UserService
 
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
+    _reject_account_erasure_mutation(user)
+
     user_service = UserService()
     success = await user_service.unblock_user(db, user_id, admin.id)
     if not success:
@@ -1914,6 +1952,7 @@ async def update_user_restrictions(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     if request.restriction_topup is not None:
         user.restriction_topup = request.restriction_topup
@@ -1962,6 +2001,7 @@ async def update_user_promo_group(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     old_promo_group_id = user.promo_group_id
     new_promo_group_id = request.promo_group_id
@@ -2038,6 +2078,7 @@ async def update_user_referral_commission(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     old_commission = user.referral_commission_percent
     user.referral_commission_percent = request.commission_percent
@@ -2088,6 +2129,7 @@ async def assign_user_referrer(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     if user_id == request.referrer_id:
         raise HTTPException(
@@ -2108,6 +2150,7 @@ async def assign_user_referrer(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Referrer user not found',
         )
+    _reject_account_erasure_mutation(referrer)
 
     # Prevent circular referral chains of any depth via recursive CTE
     if await _would_create_referral_cycle(db, user_id, request.referrer_id):
@@ -2161,6 +2204,7 @@ async def remove_user_referrer(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     if user.referred_by_id is None:
         raise HTTPException(
@@ -2213,6 +2257,7 @@ async def remove_user_referral(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Referrer user not found',
         )
+    _reject_account_erasure_mutation(referrer)
 
     referral_user = await get_user_by_id(db, referral_user_id)
     if not referral_user:
@@ -2220,6 +2265,7 @@ async def remove_user_referral(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Referral user not found',
         )
+    _reject_account_erasure_mutation(referral_user)
 
     if referral_user.referred_by_id != user_id:
         raise HTTPException(
@@ -2369,6 +2415,7 @@ async def delete_user_device(
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
+    _reject_account_erasure_mutation(user)
 
     _uuid = None
     if settings.is_multi_tariff_enabled() and subscription_id:
@@ -2417,6 +2464,7 @@ async def rename_user_device(
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
+    _reject_account_erasure_mutation(user)
 
     hwid = (hwid or '').strip()
     if not hwid:
@@ -2458,6 +2506,7 @@ async def reset_user_devices(
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
+    _reject_account_erasure_mutation(user)
 
     _rst_uuid = None
     if settings.is_multi_tariff_enabled() and subscription_id:
@@ -2525,22 +2574,21 @@ async def delete_user(
             detail='User not found',
         )
 
-    if request.soft_delete:
-        await soft_delete_user(db, user)
-        action = 'soft deleted'
-    else:
-        if await _has_retained_device_first_financial_history(db, user_id):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    'code': 'financial_history_retained',
-                    'message': 'Permanent deletion is unavailable while immutable payment history exists; use soft delete.',
-                },
-            )
-        # Hard delete
-        await db.delete(user)
-        await db.commit()
-        action = 'permanently deleted'
+    # Both delete modes enter the central service. A default soft delete is
+    # allowed only for an account that never reached checkout; otherwise it
+    # would remain revivable and could bypass the payment callback fence.
+    from app.services.user_service import UserService
+
+    result = await UserService().delete_user_account(
+        db,
+        user_id,
+        admin.id,
+        force_panel_delete=False,
+        soft_delete_if_no_financial_history=request.soft_delete,
+    )
+    if not (result.bot_deleted or result.account_closed):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.message or 'User deletion failed')
+    action = result.erasure_state or ('soft deleted' if request.soft_delete else 'permanently deleted')
 
     reason_text = f' (reason: {request.reason})' if request.reason else ''
     logger.info('Admin user', admin_id=admin.id, action=action, user_id=user_id, reason_text=reason_text)
@@ -2559,12 +2607,13 @@ async def full_delete_user(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """
-    Full user deletion - removes from bot database AND Remnawave panel.
+    Full user deletion for accounts without payment history; financial accounts
+    are closed through an immutable-audit erasure lifecycle instead.
 
     Uses UserService.delete_user_account() which handles:
     - Deleting/disabling user in Remnawave panel
-    - Removing all related records (payments, transactions, etc.)
-    - Removing user from database
+    - Physically removing accounts with no payment attempt
+    - Closing/anonymizing accounts with payment evidence without losing audit
     """
     from app.services.user_service import UserService
 
@@ -2578,16 +2627,7 @@ async def full_delete_user(
     # Pre-fetch admin.id to avoid MissingGreenlet after transaction rollback
     admin_id_val = admin.id
 
-    if await _has_retained_device_first_financial_history(db, user_id):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                'code': 'financial_history_retained',
-                'message': 'Permanent deletion is unavailable while immutable payment history exists; use soft delete.',
-            },
-        )
-
-    # UserService.delete_user_account handles both bot DB and Remnawave panel
+    # UserService owns both physical deletion and the financial tombstone.
     user_service = UserService()
     delete_result = await user_service.delete_user_account(
         db, user_id, admin_id_val, force_panel_delete=request.delete_from_panel
@@ -2605,11 +2645,49 @@ async def full_delete_user(
     )
 
     return FullDeleteUserResponse(
-        success=delete_result.bot_deleted,
-        message='User fully deleted from bot and panel' if delete_result.bot_deleted else 'Failed to delete user',
+        success=delete_result.bot_deleted or delete_result.account_closed,
+        message=(
+            delete_result.message
+            or ('User fully deleted from bot and panel' if delete_result.bot_deleted else 'Failed to delete user')
+        ),
         deleted_from_bot=delete_result.bot_deleted,
         deleted_from_panel=delete_result.panel_deleted,
         panel_error=delete_result.panel_error,
+        account_closed=delete_result.account_closed,
+        deletion_state=delete_result.erasure_state,
+    )
+
+
+@router.post('/{user_id}/account-erasure/resolve', response_model=ResolveFinancialAccountErasureResponse)
+async def resolve_financial_account_erasure(
+    user_id: int,
+    request: ResolveFinancialAccountErasureRequest,
+    admin: User = Depends(require_permission('users:delete')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Finalize a manual financial closure only after an operator records its outcome."""
+    from app.services.account_erasure_service import resolve_financial_account_erasure as resolve_erasure
+
+    result = await resolve_erasure(
+        db,
+        user_id=user_id,
+        resolved_by_user_id=admin.id,
+        resolution_code=request.resolution_code,
+        resolution_note=request.resolution_note,
+    )
+    if not result.completed:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.message)
+    logger.warning(
+        'Admin finalized financial account erasure',
+        admin_id=admin.id,
+        user_id=user_id,
+        resolution_code=request.resolution_code,
+    )
+    return ResolveFinancialAccountErasureResponse(
+        success=True,
+        message=result.message,
+        deletion_state=result.state,
+        account_closed=True,
     )
 
 
@@ -2633,6 +2711,7 @@ async def reset_user_trial(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     subscription_deleted = False
 
@@ -2708,6 +2787,7 @@ async def reset_user_subscription(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     subscription_deleted = False
     panel_deactivated = False
@@ -2788,6 +2868,7 @@ async def disable_user(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     subscription_deactivated = False
     panel_deactivated = False
@@ -3170,6 +3251,7 @@ async def sync_user_from_panel(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     try:
         from app.services.remnawave_service import RemnaWaveService
@@ -3461,6 +3543,7 @@ async def sync_user_to_panel(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+    _reject_account_erasure_mutation(user)
 
     push_subs = getattr(user, 'subscriptions', None) or []
     if subscription_id:
@@ -3482,7 +3565,7 @@ async def sync_user_to_panel(
         from app.config import settings
         from app.external.remnawave_api import UserStatus as PanelUserStatus
         from app.services.remnawave_service import RemnaWaveService
-        from app.services.subscription_service import get_traffic_reset_strategy
+        from app.services.subscription_service import SubscriptionService, get_traffic_reset_strategy
         from app.utils.subscription_utils import resolve_hwid_device_limit_for_payload
 
         service = RemnaWaveService()
@@ -3539,6 +3622,18 @@ async def sync_user_to_panel(
         except Exception:
             pass
         ext_squad_uuid = sub.tariff.external_squad_uuid if sub.tariff else None
+
+        if (
+            await db.scalar(
+                select(User.account_erasure_requested_at)
+                .where(User.id == user.id)
+                .execution_options(populate_existing=True)
+            )
+        ) is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={'code': 'account_erasure_pending', 'message': 'Account closure is in progress.'},
+            )
 
         async with service.get_api_client() as api:
             # Validate existing UUID
@@ -3600,7 +3695,18 @@ async def sync_user_to_panel(
                     update_kwargs['external_squad_uuid'] = ext_squad_uuid
 
                 try:
-                    await api.update_user(**update_kwargs)
+                    updated_panel_user = await SubscriptionService().run_guarded_panel_write(
+                        db,
+                        user_id=user.id,
+                        api=api,
+                        panel_uuid=panel_uuid,
+                        operation=lambda: api.update_user(**update_kwargs),
+                    )
+                    if updated_panel_user is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail={'code': 'account_erasure_pending', 'message': 'Account closure is in progress.'},
+                        )
                     action = 'updated'
                 except Exception as update_error:
                     error_code = (getattr(update_error, 'response_data', None) or {}).get('errorCode', '')
@@ -3634,7 +3740,17 @@ async def sync_user_to_panel(
                 # multi-tariff suffix уже встроен в `username` через
                 # build_remnawave_subscription_username — больше ничего не клеим.
 
-                new_panel_user = await api.create_user(**create_kwargs)
+                new_panel_user = await SubscriptionService().run_guarded_panel_write(
+                    db,
+                    user_id=user.id,
+                    api=api,
+                    operation=lambda: api.create_user(**create_kwargs),
+                )
+                if new_panel_user is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={'code': 'account_erasure_pending', 'message': 'Account closure is in progress.'},
+                    )
                 panel_uuid = new_panel_user.uuid
                 sub.remnawave_uuid = new_panel_user.uuid
                 sub.remnawave_short_uuid = new_panel_user.short_uuid

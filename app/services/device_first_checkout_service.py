@@ -511,6 +511,12 @@ async def create_checkout(
     # new quote.  Every direct financial commit takes this same lock before it
     # can create an invoice or debit the wallet.
     user = (await db.execute(select(User).where(User.id == user.id).with_for_update())).scalar_one()
+    if getattr(user, 'account_erasure_requested_at', None) is not None:
+        raise DeviceFirstError(
+            'account_closing',
+            'Account closure is in progress; new checkout creation is unavailable',
+            status_code=403,
+        )
     if user.restriction_subscription:
         raise DeviceFirstError('subscription_restricted', 'Subscription purchase is restricted', status_code=403)
 

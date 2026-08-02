@@ -1126,6 +1126,13 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         return
 
     if user and user.status == UserStatus.DELETED.value:
+        if user.account_erasure_requested_at is not None:
+            await message.answer(
+                'Аккаунт закрывается. Ранее созданный счёт ещё сверяется; не создавайте новый платёж. '
+                'Если статус долго не меняется, обратитесь в поддержку.'
+            )
+            await state.clear()
+            return
         logger.info('🔄 Удаленный пользователь начинает повторную регистрацию', telegram_id=user.telegram_id)
 
         try:
@@ -1804,6 +1811,10 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
             referrer_id = referrer.id
 
     if existing_user and existing_user.status == UserStatus.DELETED.value:
+        if existing_user.account_erasure_requested_at is not None:
+            await callback.answer('Аккаунт закрывается; новый вход будет доступен после сверки счёта.', show_alert=True)
+            await state.clear()
+            return
         logger.info('🔄 Восстанавливаем удаленного пользователя', from_user_id=callback.from_user.id)
 
         # Prevent self-referral when partner re-registers via own campaign link
@@ -2128,6 +2139,13 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
             referrer_id = referrer.id
 
     if existing_user and existing_user.status == UserStatus.DELETED.value:
+        if existing_user.account_erasure_requested_at is not None:
+            await message.answer(
+                'Аккаунт закрывается. Ранее созданный счёт ещё сверяется; не создавайте новый платёж. '
+                'Если статус долго не меняется, обратитесь в поддержку.'
+            )
+            await state.clear()
+            return
         logger.info('🔄 Восстанавливаем удаленного пользователя', from_user_id=message.from_user.id)
 
         # Prevent self-referral when partner re-registers via own campaign link
