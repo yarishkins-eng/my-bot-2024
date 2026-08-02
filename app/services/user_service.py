@@ -801,6 +801,27 @@ class UserService:
                 logger.warning('Пользователь не найден для удаления', user_id=user_id)
                 return result
 
+            # Financial checkout evidence is deliberately retained (attempts
+            # have RESTRICT FKs). Refuse the legacy hard-delete path before
+            # touching panel/subscription state, rather than discovering an
+            # opaque FK error after a partial destructive operation.
+            from app.database.models import CheckoutPaymentAttempt, SubscriptionCheckout
+
+            has_financial_history = bool(
+                await db.scalar(
+                    select(CheckoutPaymentAttempt.id)
+                    .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+                    .where(SubscriptionCheckout.user_id == user_id)
+                    .limit(1)
+                )
+            )
+            if has_financial_history:
+                logger.warning(
+                    'Полное удаление пользователя заблокировано: сохранена финансовая история',
+                    user_id=user_id,
+                )
+                return result
+
             user_id_display = user.telegram_id or user.email or f'#{user.id}'
             logger.info('🗑️ Начинаем полное удаление пользователя', user_id=user_id, user_id_display=user_id_display)
 

@@ -36,11 +36,13 @@ from app.database.crud.user_device_alias import (
 )
 from app.database.crud.user_promo_group import sync_user_primary_promo_group
 from app.database.models import (
+    CheckoutPaymentAttempt,
     GuestPurchase,
     PaymentMethod,
     PromoGroup,
     ReferralEarning,
     Subscription,
+    SubscriptionCheckout,
     SubscriptionServer,
     SubscriptionStatus,
     TrafficPurchase,
@@ -118,6 +120,18 @@ from ..schemas.users import (
 
 
 logger = structlog.get_logger(__name__)
+
+
+async def _has_retained_device_first_financial_history(db: AsyncSession, user_id: int) -> bool:
+    """Hard-deletion guard for immutable provider/ledger evidence."""
+    return bool(
+        await db.scalar(
+            select(CheckoutPaymentAttempt.id)
+            .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+            .where(SubscriptionCheckout.user_id == user_id)
+            .limit(1)
+        )
+    )
 
 router = APIRouter(prefix='/admin/users', tags=['Cabinet Admin Users'])
 
@@ -2514,6 +2528,14 @@ async def delete_user(
         await soft_delete_user(db, user)
         action = 'soft deleted'
     else:
+        if await _has_retained_device_first_financial_history(db, user_id):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    'code': 'financial_history_retained',
+                    'message': 'Permanent deletion is unavailable while immutable payment history exists; use soft delete.',
+                },
+            )
         # Hard delete
         await db.delete(user)
         await db.commit()
@@ -2554,6 +2576,15 @@ async def full_delete_user(
 
     # Pre-fetch admin.id to avoid MissingGreenlet after transaction rollback
     admin_id_val = admin.id
+
+    if await _has_retained_device_first_financial_history(db, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                'code': 'financial_history_retained',
+                'message': 'Permanent deletion is unavailable while immutable payment history exists; use soft delete.',
+            },
+        )
 
     # UserService.delete_user_account handles both bot DB and Remnawave panel
     user_service = UserService()

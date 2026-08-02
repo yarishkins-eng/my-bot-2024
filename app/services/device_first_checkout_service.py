@@ -263,8 +263,23 @@ async def expire_checkout_quote_if_needed(
     # Once an exact provider payment or balance debit has been atomically
     # committed, the user already approved this snapshot. Do not turn a slow
     # outbox worker into a surprise repricing; only pre-payment quotes expire.
+    # A quote remains a cancellable draft only until the customer chooses an
+    # external method.  Once an exact provider invoice exists, its immutable
+    # amount is the customer's approved financial snapshot.  A local UI TTL
+    # must never invalidate it while Platega can still confirm it; the
+    # provider-status lifecycle owns that transition from this point on.
+    has_direct_provider_attempt = (
+        settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE
+        and await db.scalar(
+            select(CheckoutPaymentAttempt.id)
+            .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
+            .limit(1)
+        )
+        is not None
+    )
     if (
         checkout.lifecycle_state not in OPEN_STATES
+        or has_direct_provider_attempt
         or (
             getattr(checkout, 'fulfillment_state', 'not_started') == 'in_progress'
             and getattr(checkout, 'quote_state', None) == 'committed'
@@ -309,10 +324,20 @@ async def get_owned_checkout(
         getattr(checkout, 'fulfillment_state', 'not_started') == 'in_progress'
         and getattr(checkout, 'quote_state', None) == 'committed'
     )
+    has_direct_provider_attempt = (
+        settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE
+        and await db.scalar(
+            select(CheckoutPaymentAttempt.id)
+            .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
+            .limit(1)
+        )
+        is not None
+    )
     if (
         checkout.lifecycle_state in OPEN_STATES
         and checkout.fulfillment_state != 'fulfilled'
         and not fulfillment_committed
+        and not has_direct_provider_attempt
         and checkout.expires_at <= datetime.now(UTC)
     ):
         checkout.lifecycle_state = 'expired'
@@ -338,24 +363,15 @@ async def get_open_checkout_for_user(
         SubscriptionCheckout.fulfillment_state == 'fulfilled',
         SubscriptionCheckout.provisioning_state.in_(['pending', 'retry']),
     )
-    # A terminal *direct-sale* record is still a recovery record: an amount
-    # mismatch, post-paid reversal, or operator hold must not disappear after
-    # a WebView restart and silently allow a second order to start. Historical
-    # legacy terminals stay out of this projection to preserve their old UI.
-    # A user-cancelled quote with no provider attempt is safe to leave behind
-    # as audit history and must not reopen after a WebView restart. A cancelled
-    # checkout that *does* have an external attempt stays visible: historical
-    # versions allowed that unsafe transition and a late provider payment must
-    # still be fenced from a new sale.
+    # Only an explicit financial/operator hold remains owner-visible as a
+    # blocker. Every other terminal record is immutable audit history and must
+    # not trap the customer in an old calculation. In particular a verified
+    # cancelled/expired/failed invoice releases the next quote; a late
+    # CONFIRMED is still fenced by its attempt and becomes a reconciliation
+    # credit rather than an old subscription.
     terminal_recovery = and_(
         SubscriptionCheckout.settlement_mode == DIRECT_SETTLEMENT_MODE,
-        or_(
-            SubscriptionCheckout.lifecycle_state.in_(TERMINAL_STATES - {'cancelled'}),
-            and_(
-                SubscriptionCheckout.lifecycle_state == 'cancelled',
-                exists().where(CheckoutPaymentAttempt.checkout_id == SubscriptionCheckout.id),
-            ),
-        ),
+        SubscriptionCheckout.lifecycle_state == 'operator_review',
     )
     checkout = (
         await db.execute(
@@ -388,7 +404,19 @@ async def get_open_checkout_for_user(
     direct_operator_hold = (
         settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE and checkout.lifecycle_state == 'operator_review'
     )
-    if not (direct_paid_recovery or direct_operator_hold) and checkout.expires_at <= datetime.now(UTC):
+    has_direct_provider_attempt = (
+        settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE
+        and await db.scalar(
+            select(CheckoutPaymentAttempt.id)
+            .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
+            .limit(1)
+        )
+        is not None
+    )
+    if (
+        not (direct_paid_recovery or direct_operator_hold or has_direct_provider_attempt)
+        and checkout.expires_at <= datetime.now(UTC)
+    ):
         checkout.lifecycle_state = 'expired'
         checkout.terminal_reason = 'checkout_expired'
         checkout.quote_state = 'expired'
@@ -505,6 +533,10 @@ async def create_checkout(
                 SubscriptionCheckout.fulfillment_state == 'in_progress',
                 SubscriptionCheckout.quote_state == 'committed',
             ),
+            ~and_(
+                SubscriptionCheckout.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                exists().where(CheckoutPaymentAttempt.checkout_id == SubscriptionCheckout.id),
+            ),
         )
         .values(
             lifecycle_state='expired',
@@ -531,6 +563,35 @@ async def create_checkout(
             'operator_review_required',
             'An earlier direct payment requires operator review before a new checkout',
         )
+
+    # A new explicit configuration replaces only an uncommitted direct quote.
+    # This closes the Cabinet C1 state (create → confirm, no provider method
+    # yet) atomically under the per-user fence.  Once an attempt exists it is
+    # never touched here: it must resume, be locally abandoned by the
+    # dedicated P->U->A->C path, or be reconciled from the provider.
+    stale_pre_invoice = list(
+        (
+            await db.execute(
+                select(SubscriptionCheckout)
+                .where(
+                    SubscriptionCheckout.user_id == user.id,
+                    SubscriptionCheckout.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                    SubscriptionCheckout.lifecycle_state.in_({'draft', 'confirmed', 'awaiting_funds'}),
+                    SubscriptionCheckout.fulfillment_state == 'not_started',
+                    ~exists().where(CheckoutPaymentAttempt.checkout_id == SubscriptionCheckout.id),
+                )
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    for stale_checkout in stale_pre_invoice:
+        stale_checkout.lifecycle_state = 'cancelled'
+        stale_checkout.quote_state = 'expired'
+        stale_checkout.funding_state = 'not_started'
+        stale_checkout.terminal_reason = 'superseded_before_payment_method'
+        stale_checkout.updated_at = now
+    if stale_pre_invoice:
+        await db.flush()
 
     options = await build_purchase_options(db, user)
     if not options.get('eligible'):

@@ -7,9 +7,12 @@ second provider invoice.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import structlog
@@ -20,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import (
     CheckoutPaymentAttempt,
+    DeviceFirstProviderEvent,
     DeviceFirstReconciliationCredit,
     PaymentMethodConfig,
     PlategaPayment,
@@ -52,8 +56,27 @@ PLATEGA_METHODS = {
     'cards_ru': 11,
     'crypto': 13,
 }
+# Canonical GET returns method names, while the signed callback returns an
+# integer. These are the explicit provider spellings we accept; an unfamiliar
+# label is an identity failure, never a permissive match.
+PLATEGA_CANONICAL_METHOD_CODES = {
+    'SBPQR': 2,
+    'SBP_QR': 2,
+    'SBP': 2,
+    # Card method 11 is the active Russian card-acquiring route in this bot.
+    # ``CARDRU`` is retained for the provider's historical response spelling.
+    'CARD': 11,
+    'CARDRU': 11,
+    'CARD_RU': 11,
+    'CARDACQUIRING': 11,
+    'CARD_ACQUIRING': 11,
+    'CRYPTO': 13,
+    'CRYPTOCURRENCY': 13,
+}
 logger = structlog.get_logger(__name__)
 PENDING_ATTEMPT_STATUSES = frozenset({'creating', 'pending', 'paid_processing', 'reconciliation'})
+PROVIDER_TERMINAL_STATUSES = frozenset({'FAILED', 'CANCELED', 'EXPIRED'})
+POST_PAID_REVERSAL_STATUSES = frozenset({'CHARGEBACKED'})
 
 
 def platega_method_label(method_key: str, *, language: str) -> str:
@@ -102,13 +125,253 @@ def _safe_provider_redirect_url(payload: dict | None) -> str | None:
     return redirect_url
 
 
+def _provider_method_code(payload: dict | None) -> int | None:
+    """Return Platega's numeric method code without guessing semantic labels."""
+    raw_method = (payload or {}).get('paymentMethod')
+    if raw_method is None:
+        raw_method = (payload or {}).get('paymentMethodCode')
+    # Platega's canonical GET documents a human-readable ``SBPQR`` while its
+    # signed callback documents numeric method codes. Unknown labels remain
+    # unknown and are fenced for review rather than guessed.
+    if isinstance(raw_method, str):
+        normalized = raw_method.strip().upper().replace('-', '_').replace(' ', '_')
+        if normalized in PLATEGA_CANONICAL_METHOD_CODES:
+            return PLATEGA_CANONICAL_METHOD_CODES[normalized]
+    try:
+        return int(raw_method) if raw_method is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _has_exact_direct_invoice_details(attempt: CheckoutPaymentAttempt, payload: dict | None) -> bool:
-    """A live invoice must prove its own id, amount and currency before exposure."""
+    """Require immutable provider identity, method, amount and currency."""
     verified = PlategaService.parse_amount_currency(payload)
-    return _provider_transaction_id(payload) == str(attempt.provider_payment_id or '') and verified == (
-        int(attempt.requested_amount_kopeks),
-        'RUB',
+    method_code = _provider_method_code(payload)
+    return (
+        _provider_transaction_id(payload) == str(attempt.provider_payment_id or '')
+        and method_code == int(attempt.provider_method_code)
+        and verified == (
+            int(attempt.requested_amount_kopeks),
+            'RUB',
+        )
     )
+
+
+def _redacted_provider_payload_hash(payload: dict | None, *, observed_status: str | None = None) -> str:
+    """Hash only normalized financial evidence; never persist callback secrets."""
+    verified = PlategaService.parse_amount_currency(payload)
+    evidence = {
+        'provider_payment_id': _provider_transaction_id(payload),
+        'provider_status': str(observed_status or (payload or {}).get('status') or '').upper(),
+        'provider_method_code': _provider_method_code(payload),
+        'amount_kopeks': verified[0] if verified else None,
+        'currency': verified[1] if verified else None,
+    }
+    encoded = json.dumps(evidence, sort_keys=True, separators=(',', ':')).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def _append_direct_provider_event(
+    db: AsyncSession,
+    *,
+    checkout: SubscriptionCheckout,
+    attempt: CheckoutPaymentAttempt,
+    payload: dict[str, Any] | None,
+    provider_status: str,
+    source: str,
+) -> None:
+    """Append a redacted provider receipt, separate from settlement proof."""
+    verified = PlategaService.parse_amount_currency(payload)
+    provider_payment_id = _provider_transaction_id(payload) or str(attempt.provider_payment_id or '')
+    if not provider_payment_id:
+        return
+    amount_kopeks, currency = verified if verified is not None else (None, None)
+    normalized_status = str(provider_status or '').upper()
+    payload_hash = _redacted_provider_payload_hash(payload, observed_status=normalized_status)
+    existing_event = await db.scalar(
+        select(DeviceFirstProviderEvent.id).where(
+            DeviceFirstProviderEvent.attempt_id == attempt.id,
+            DeviceFirstProviderEvent.source == source,
+            DeviceFirstProviderEvent.provider_status == normalized_status,
+            DeviceFirstProviderEvent.payload_hash == payload_hash,
+        )
+    )
+    if existing_event is None:
+        db.add(
+            DeviceFirstProviderEvent(
+                checkout_id=checkout.id,
+                attempt_id=attempt.id,
+                provider_payment_id=provider_payment_id,
+                provider_status=normalized_status,
+                source=source,
+                amount_kopeks=amount_kopeks,
+                currency=currency,
+                method_key=attempt.method_key if verified is not None else None,
+                payload_hash=payload_hash,
+                authenticated=True,
+                observed_at=datetime.now(UTC),
+            )
+        )
+
+
+async def _release_direct_terminal_invoice(
+    db: AsyncSession,
+    *,
+    attempt_id: int,
+    payment_id: int,
+    payload: dict[str, Any] | None,
+    provider_status: str,
+    source: str,
+    lease_token: str | None = None,
+    lease_epoch: int | None = None,
+) -> bool:
+    """Archive an exact terminal provider invoice and release a fresh quote.
+
+    This is intentionally the only automatic release path after an external
+    invoice exists. It records compact append-only provider evidence and keeps
+    every later callback fenced by the original attempt. Any missing or
+    conflicting immutable field becomes operator review instead of a reset.
+    """
+    normalized_status = str(provider_status or '').upper()
+    if normalized_status not in PROVIDER_TERMINAL_STATUSES:
+        raise ValueError('direct terminal release requires a provider terminal status')
+    if not isinstance(attempt_id, int):
+        return False
+
+    # All direct provider transitions use the same lock order:
+    # PlategaPayment → User → Attempt → Checkout.  Webhooks already start
+    # from the provider payment, while checkout creation/fulfilment fence on
+    # the user; keeping this order avoids an inverse P↔U wait during a late
+    # callback and a concurrent fresh quote.
+    payment = (
+        await db.execute(
+            select(PlategaPayment)
+            .where(PlategaPayment.id == payment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if payment is None or payment.user_id is None:
+        return False
+    await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
+    attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
+    if lease_token is not None and lease_epoch is not None:
+        attempt_query = attempt_query.where(
+            CheckoutPaymentAttempt.lease_token == lease_token,
+            CheckoutPaymentAttempt.lease_epoch == lease_epoch,
+            CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
+        )
+    attempt = (
+        await db.execute(attempt_query.with_for_update().execution_options(populate_existing=True))
+    ).scalar_one_or_none()
+    if attempt is None:
+        return False
+    checkout = (
+        await db.execute(
+            select(SubscriptionCheckout)
+            .where(SubscriptionCheckout.id == attempt.checkout_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if checkout is None:
+        return False
+
+    metadata_attempt_id = (payment.metadata_json or {}).get('device_first_attempt_id')
+    if (
+        checkout.user_id != payment.user_id
+        or attempt.platega_payment_id != payment.id
+        or metadata_attempt_id != attempt.id
+    ):
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'direct_payment_binding_mismatch'
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'direct_payment_binding_mismatch'
+        await db.commit()
+        logger.error(
+            'device_first_terminal_invoice_binding_mismatch',
+            checkout_id=checkout.public_id,
+            attempt_id=attempt.id,
+            payment_id=payment.id,
+        )
+        return False
+
+    if payment.is_paid:
+        # A caller that observes this must take the explicit post-paid
+        # reversal path. Never overwrite a paid settlement with an archive.
+        return False
+    # Keep the signed/canonical receipt even when its financial fields are
+    # incomplete. The release gate below remains strictly ID+method+amount+RUB.
+    await _append_direct_provider_event(
+        db,
+        checkout=checkout,
+        attempt=attempt,
+        payload=payload,
+        provider_status=normalized_status,
+        source=source,
+    )
+    # A callback is authenticated evidence, but it is not the canonical
+    # account view.  In particular, a delayed terminal callback can race a
+    # successful payment or a provider-side status correction.  It therefore
+    # only wakes canonical reconciliation; only GET/poll may release a new
+    # quote after an external invoice has been issued.
+    if source == 'callback':
+        attempt.status = 'reconciliation'
+        attempt.reconciliation_reason = 'provider_terminal_callback_awaiting_canonical'
+        attempt.next_reconcile_at = datetime.now(UTC)
+        payment.status = 'VERIFYING'
+        await db.commit()
+        logger.info(
+            'device_first_terminal_invoice_callback_queued_for_canonical_check',
+            checkout_id=checkout.public_id,
+            attempt_id=attempt.id,
+            provider_status=normalized_status,
+        )
+        return False
+
+    if not _has_exact_direct_invoice_details(attempt, payload):
+        # Webhooks may deliberately be sparse.  A sparse *callback* is not
+        # evidence that a new checkout is safe: schedule the authenticated
+        # canonical GET first.  A sparse/conflicting canonical response,
+        # however, is a real identity failure and requires an operator.
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'provider_terminal_identity_mismatch'
+        payment.status = 'OPERATOR_REVIEW'
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'provider_terminal_identity_mismatch'
+        await db.commit()
+        logger.error(
+            'device_first_terminal_invoice_identity_mismatch',
+            checkout_id=checkout.public_id,
+            attempt_id=attempt.id,
+            source=source,
+        )
+        return False
+
+    attempt.status = 'failed'
+    attempt.reconciliation_reason = f'provider_terminal:{normalized_status.lower()}'
+    # Keep reconciling historical provider invoices at a low frequency.  A
+    # late exact CONFIRMED is credited to the wallet, never applied to this
+    # archived checkout.  We do not assume terminal-status finality that is
+    # not documented by the provider.
+    if source == 'poll' and checkout.lifecycle_state == 'cancelled':
+        attempt.terminal_observations += 1
+    attempt.next_reconcile_at = datetime.now(UTC) + timedelta(hours=6)
+    payment.status = normalized_status
+    checkout.lifecycle_state = 'cancelled'
+    checkout.quote_state = 'expired'
+    checkout.funding_state = 'invoice_terminal'
+    checkout.terminal_reason = f'provider_terminal:{normalized_status.lower()}'
+    await db.commit()
+    logger.info(
+        'device_first_terminal_invoice_released',
+        checkout_id=checkout.public_id,
+        attempt_id=attempt.id,
+        provider_status=normalized_status,
+        source=source,
+    )
+    return True
 
 
 async def _hold_direct_invoice_for_review(
@@ -122,18 +385,33 @@ async def _hold_direct_invoice_for_review(
 ) -> bool:
     """Fence an ambiguous direct invoice without retrying the provider POST.
 
-    The lock order follows direct fulfilment: User -> Attempt -> Checkout.
-    A worker that lost its lease must not overwrite a newer webhook decision.
+    With a provider payment this follows the direct financial lock contract:
+    Payment -> User -> Attempt -> Checkout. A worker that lost its lease must
+    not overwrite a newer webhook decision.
     """
-    attempt = await db.get(CheckoutPaymentAttempt, attempt_id)
-    if attempt is None:
-        return False
-    checkout_owner_id = await db.scalar(
-        select(SubscriptionCheckout.user_id).where(SubscriptionCheckout.id == attempt.checkout_id)
-    )
-    if checkout_owner_id is None:
-        return False
-    await db.execute(select(User).where(User.id == checkout_owner_id).with_for_update())
+    payment = None
+    if payment_id is not None:
+        payment = (
+            await db.execute(
+                select(PlategaPayment)
+                .where(PlategaPayment.id == payment_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if payment is None or payment.user_id is None:
+            return False
+        owner_id = payment.user_id
+    else:
+        attempt_stub = await db.get(CheckoutPaymentAttempt, attempt_id)
+        if attempt_stub is None:
+            return False
+        owner_id = await db.scalar(
+            select(SubscriptionCheckout.user_id).where(SubscriptionCheckout.id == attempt_stub.checkout_id)
+        )
+        if owner_id is None:
+            return False
+    await db.execute(select(User).where(User.id == owner_id).with_for_update())
     attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
     if lease_token is not None and lease_epoch is not None:
         attempt_query = attempt_query.where(
@@ -154,16 +432,19 @@ async def _hold_direct_invoice_for_review(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    payment = None
-    if payment_id is not None:
-        payment = (
-            await db.execute(
-                select(PlategaPayment)
-                .where(PlategaPayment.id == payment_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
+    if payment is not None and (
+        payment.user_id != owner_id
+        or payment.id != owned_attempt.platega_payment_id
+        or (payment.metadata_json or {}).get('device_first_attempt_id') != owned_attempt.id
+    ):
+        payment.status = 'OPERATOR_REVIEW'
+        owned_attempt.status = 'operator_review'
+        owned_attempt.reconciliation_reason = 'direct_payment_binding_mismatch'
+        if checkout is not None:
+            checkout.lifecycle_state = 'operator_review'
+            checkout.terminal_reason = 'direct_payment_binding_mismatch'
+        await db.commit()
+        return False
     owned_attempt.status = 'operator_review'
     owned_attempt.reconciliation_reason = reason
     if payment is not None:
@@ -173,6 +454,417 @@ async def _hold_direct_invoice_for_review(
         checkout.terminal_reason = reason
     await db.commit()
     return True
+
+
+async def _apply_direct_pending_provider_observation(
+    db: AsyncSession,
+    *,
+    attempt_id: int,
+    payment_id: int,
+    payload: dict[str, Any],
+    observed_after: datetime,
+    lease_token: str | None = None,
+    lease_epoch: int | None = None,
+) -> bool:
+    """Apply a canonical live-invoice observation without stale regression.
+
+    A poll reads the provider outside the database transaction.  It must
+    re-enter through the same P -> U -> A -> C lock fence as terminal and
+    confirmed paths; otherwise an older ``PENDING`` answer could overwrite a
+    newer callback that already settled or archived the payment.
+    """
+    payment = (
+        await db.execute(
+            select(PlategaPayment)
+            .where(PlategaPayment.id == payment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if payment is None or payment.user_id is None:
+        return False
+    await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
+    attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
+    if lease_token is not None and lease_epoch is not None:
+        attempt_query = attempt_query.where(
+            CheckoutPaymentAttempt.lease_token == lease_token,
+            CheckoutPaymentAttempt.lease_epoch == lease_epoch,
+            CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
+        )
+    attempt = (
+        await db.execute(attempt_query.with_for_update().execution_options(populate_existing=True))
+    ).scalar_one_or_none()
+    if attempt is None:
+        return False
+    checkout = (
+        await db.execute(
+            select(SubscriptionCheckout)
+            .where(SubscriptionCheckout.id == attempt.checkout_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if checkout is None:
+        return False
+
+    metadata_attempt_id = (payment.metadata_json or {}).get('device_first_attempt_id')
+    if (
+        checkout.user_id != payment.user_id
+        or attempt.platega_payment_id != payment.id
+        or metadata_attempt_id != attempt.id
+    ):
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'direct_payment_binding_mismatch'
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'direct_payment_binding_mismatch'
+        await db.commit()
+        return False
+
+    # A local terminal/paid transition whose write is newer than the provider
+    # request proves this PENDING payload is stale. Ignore it, never demote it.
+    last_local_change = max(
+        (
+            value
+            for value in (getattr(payment, 'updated_at', None), getattr(checkout, 'updated_at', None))
+            if value is not None
+        ),
+        default=None,
+    )
+    if last_local_change is not None and last_local_change > observed_after and (
+        payment.is_paid
+        or attempt.status in {'failed', 'paid_processing', 'credited', 'operator_review'}
+        or checkout.lifecycle_state in {'cancelled', 'fulfilling', 'ready', 'operator_review'}
+    ):
+        return False
+
+    # If the canonical provider still says PENDING *after* our own terminal
+    # transition, that is a real contradiction, not a stale poll response.
+    if attempt.status == 'failed' and str(attempt.reconciliation_reason or '').startswith('provider_terminal:'):
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'provider_terminal_status_regressed'
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'provider_terminal_status_regressed'
+        await db.commit()
+        return False
+
+    if (
+        payment.is_paid
+        or attempt.status not in {'creating', 'pending', 'reconciliation'}
+        or checkout.lifecycle_state != 'awaiting_funds'
+        or checkout.funding_state != 'invoice_pending'
+        or checkout.fulfillment_state != 'not_started'
+    ):
+        return False
+    if not _has_exact_direct_invoice_details(attempt, payload):
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'provider_invoice_verification_mismatch'
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'provider_invoice_verification_mismatch'
+        await db.commit()
+        return False
+    observed_expiry = PlategaService.parse_expires_at(payload.get('expiresIn'))
+    # The provider documents a duration (``expiresIn``), not an absolute
+    # timestamp.  Anchor it on the first verified canonical observation and
+    # never extend it later: a static TTL in repeated GET responses must not
+    # keep an invoice alive forever.
+    # ``checkout.expires_at`` is a pre-invoice quote TTL until this first
+    # canonical observation. It must not shorten or otherwise masquerade as a
+    # provider deadline; after this function succeeds we persist the canonical
+    # deadline on ``payment`` and can safely apply the monotonic min rule.
+    existing_expiry = payment.expires_at
+    provider_expires_at = (
+        min(existing_expiry, observed_expiry)
+        if existing_expiry is not None and observed_expiry is not None
+        else existing_expiry or observed_expiry
+    )
+    if provider_expires_at is None or provider_expires_at <= datetime.now(UTC):
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'provider_invoice_missing_or_elapsed_expiry'
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'provider_invoice_missing_or_elapsed_expiry'
+        await db.commit()
+        return False
+
+    amount_kopeks, currency = PlategaService.parse_amount_currency(payload) or (0, '')
+    attempt.provider_returned_amount_kopeks = amount_kopeks
+    attempt.provider_returned_currency = currency
+    attempt.status = 'pending'
+    attempt.reconciliation_reason = None
+    attempt.next_reconcile_at = min(datetime.now(UTC) + timedelta(minutes=2), provider_expires_at)
+    payment.status = 'PENDING'
+    payment.expires_at = provider_expires_at
+    checkout.expires_at = provider_expires_at
+    await db.commit()
+    return True
+
+
+async def _queue_direct_callback_for_canonical_reconciliation(
+    db: AsyncSession,
+    *,
+    payment_id: int,
+    payload: dict[str, Any],
+    reason: str,
+) -> bool:
+    """Journal a direct callback without letting it project payment state.
+
+    A callback can arrive before the create response has bound the provider
+    transaction id, or after a canonical result has become newer.  In both
+    cases the callback is valuable audit evidence but cannot be allowed to
+    downgrade/terminalise the checkout.  It only schedules canonical GET.
+    """
+    payment = (
+        await db.execute(
+            select(PlategaPayment)
+            .where(PlategaPayment.id == payment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if payment is None or payment.user_id is None:
+        return False
+    await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
+    attempt_id = (payment.metadata_json or {}).get('device_first_attempt_id')
+    if not isinstance(attempt_id, int):
+        payment.status = 'OPERATOR_REVIEW'
+        await db.commit()
+        return False
+    attempt = (
+        await db.execute(
+            select(CheckoutPaymentAttempt)
+            .where(CheckoutPaymentAttempt.id == attempt_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if attempt is None:
+        payment.status = 'OPERATOR_REVIEW'
+        await db.commit()
+        return False
+    checkout = (
+        await db.execute(
+            select(SubscriptionCheckout)
+            .where(SubscriptionCheckout.id == attempt.checkout_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if checkout is None or (
+        checkout.user_id != payment.user_id
+        or attempt.platega_payment_id != payment.id
+        or attempt.settlement_mode != DIRECT_SETTLEMENT_MODE
+    ):
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'direct_payment_binding_mismatch'
+        if checkout is not None:
+            checkout.lifecycle_state = 'operator_review'
+            checkout.terminal_reason = 'direct_payment_binding_mismatch'
+        await db.commit()
+        return False
+    await _append_direct_provider_event(
+        db,
+        checkout=checkout,
+        attempt=attempt,
+        payload=payload,
+        provider_status=str(payload.get('status') or '').upper(),
+        source='callback',
+    )
+    if payment.is_paid or attempt.status in {'paid_processing', 'credited', 'operator_review'}:
+        await db.commit()
+        return False
+    attempt.status = 'reconciliation'
+    attempt.reconciliation_reason = reason
+    attempt.next_reconcile_at = datetime.now(UTC)
+    payment.status = 'VERIFYING'
+    await db.commit()
+    return True
+
+
+async def _bind_direct_provider_identity(
+    db: AsyncSession,
+    *,
+    attempt_id: int,
+    payment_id: int,
+    provider_payment_id: str,
+    redirect_url: str | None,
+) -> CheckoutPaymentAttempt | None:
+    """Bind the POST response through the direct P -> U -> A -> C fence.
+
+    The attempt/payment intent is persisted before POST so a callback may win
+    the race with this response.  Binding therefore never writes a blind
+    ``PENDING`` projection and always rechecks the fresh locked rows.
+    """
+    payment = (
+        await db.execute(
+            select(PlategaPayment)
+            .where(PlategaPayment.id == payment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if payment is None or payment.user_id is None:
+        return None
+    await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
+    attempt = (
+        await db.execute(
+            select(CheckoutPaymentAttempt)
+            .where(CheckoutPaymentAttempt.id == attempt_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if attempt is None:
+        return None
+    checkout = (
+        await db.execute(
+            select(SubscriptionCheckout)
+            .where(SubscriptionCheckout.id == attempt.checkout_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if checkout is None or (
+        checkout.user_id != payment.user_id
+        or attempt.platega_payment_id != payment.id
+        or (payment.metadata_json or {}).get('device_first_attempt_id') != attempt.id
+        or attempt.settlement_mode != DIRECT_SETTLEMENT_MODE
+    ):
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'direct_payment_binding_mismatch'
+        if checkout is not None:
+            checkout.lifecycle_state = 'operator_review'
+            checkout.terminal_reason = 'direct_payment_binding_mismatch'
+        await db.commit()
+        return None
+    if attempt.provider_payment_id and attempt.provider_payment_id != provider_payment_id:
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'provider_identity_binding_conflict'
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'provider_identity_binding_conflict'
+        await db.commit()
+        return None
+    if payment.is_paid or attempt.status in {'paid_processing', 'credited', 'operator_review'}:
+        # Nothing in create may overwrite a callback/worker that reached a
+        # later financial transition while the HTTP POST was in flight.
+        await db.commit()
+        return attempt
+    attempt.provider_payment_id = provider_payment_id
+    payment.platega_transaction_id = provider_payment_id
+    if redirect_url is not None:
+        payment.redirect_url = redirect_url
+        attempt.redirect_url = redirect_url
+    attempt.status = 'reconciliation'
+    attempt.reconciliation_reason = 'provider_invoice_verification_pending'
+    attempt.next_reconcile_at = datetime.now(UTC)
+    payment.status = 'VERIFYING'
+    await db.commit()
+    return attempt
+
+
+async def abandon_direct_checkout_for_new_calculation(
+    db: AsyncSession,
+    *,
+    checkout_public_id: str,
+    user_id: int,
+) -> SubscriptionCheckout | None:
+    """Locally abandon an opened direct invoice and release a new choice.
+
+    Platega has no documented void-without-refund endpoint, so this deliberately
+    does *not* claim that the provider invoice was cancelled.  The immutable
+    attempt remains reconciled; an exact late CONFIRMED is credited once to the
+    wallet and cannot fulfil this abandoned configuration.  Lock order stays
+    Payment -> User -> Attempt -> Checkout, never Checkout -> Payment.
+    """
+    # Resolve identity without locking joined rows. PostgreSQL's bare
+    # ``FOR UPDATE`` on a join locks *all* relations and would effectively
+    # acquire Attempt/Checkout before User. The actual lock sequence below is
+    # the contractual Payment -> User -> Attempt -> Checkout.
+    payment_id = await db.scalar(
+        select(PlategaPayment.id)
+            .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
+            .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+            .where(
+                SubscriptionCheckout.public_id == checkout_public_id,
+                SubscriptionCheckout.user_id == user_id,
+                CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
+            )
+            .order_by(CheckoutPaymentAttempt.id.desc())
+            .limit(1)
+    )
+    if payment_id is None:
+        return None
+    payment = (
+        await db.execute(
+            select(PlategaPayment)
+            .where(PlategaPayment.id == payment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if payment is None:
+        return None
+    if payment.user_id != user_id:
+        return None
+    await db.execute(select(User).where(User.id == user_id).with_for_update())
+    attempt = (
+        await db.execute(
+            select(CheckoutPaymentAttempt)
+            .where(CheckoutPaymentAttempt.platega_payment_id == payment.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if attempt is None:
+        payment.status = 'OPERATOR_REVIEW'
+        await db.commit()
+        return None
+    checkout = (
+        await db.execute(
+            select(SubscriptionCheckout)
+            .where(
+                SubscriptionCheckout.id == attempt.checkout_id,
+                SubscriptionCheckout.public_id == checkout_public_id,
+                SubscriptionCheckout.user_id == user_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if checkout is None or attempt.settlement_mode != DIRECT_SETTLEMENT_MODE:
+        payment.status = 'OPERATOR_REVIEW'
+        attempt.status = 'operator_review'
+        attempt.reconciliation_reason = 'direct_checkout_abandon_binding_mismatch'
+        await db.commit()
+        return checkout
+    if payment.is_paid or attempt.status in {'paid_processing', 'credited'} or checkout.fulfillment_state != 'not_started':
+        # A paid/fulfilling purchase must remain visible; only a live external
+        # invoice can be superseded by a fresh user configuration.
+        return checkout
+    if checkout.lifecycle_state not in {'draft', 'confirmed', 'awaiting_funds'}:
+        return checkout
+
+    checkout.lifecycle_state = 'cancelled'
+    checkout.quote_state = 'expired'
+    checkout.funding_state = 'invoice_abandoned'
+    checkout.terminal_reason = 'cancelled_by_user_after_invoice'
+    attempt.status = 'reconciliation'
+    attempt.reconciliation_reason = 'provider_invoice_abandoned_by_user'
+    attempt.next_reconcile_at = datetime.now(UTC)
+    payment.status = 'VERIFYING'
+    await db.commit()
+    logger.info(
+        'device_first_direct_invoice_locally_abandoned',
+        checkout_id=checkout.public_id,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+    )
+    return checkout
 
 
 def _checkout_return_url(checkout_public_id: str, *, failed: bool = False) -> str | None:
@@ -538,19 +1230,20 @@ async def _create_direct_platega_attempt(
         await db.commit()
         raise DeviceFirstError('reconciliation_required', 'Provider invoice identity requires reconciliation')
 
-    # The creation API returns an id and a payment page, but its documented
-    # amount shape differs by API version. Persist the owned identity and
-    # protected redirect first, then obtain the canonical amount via GET.  A
-    # failed GET can safely be retried by the reconciler without a second POST.
-    attempt.provider_payment_id = transaction_id
-    payment.platega_transaction_id = transaction_id
-    if redirect_url is not None:
-        payment.redirect_url = redirect_url
-    payment.expires_at = PlategaService.parse_expires_at((response or {}).get('expiresIn'))
-    attempt.status = 'pending'
-    attempt.reconciliation_reason = 'provider_invoice_verification_pending'
-    payment.status = 'VERIFYING'
-    await db.commit()
+    # POST and webhook are independent channels.  A callback may have been
+    # recorded while this request was in flight, so bind the provider identity
+    # under the same direct financial fence and never write ``PENDING`` here.
+    # Only the following canonical GET can publish a live invoice.
+    bound_attempt = await _bind_direct_provider_identity(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        provider_payment_id=transaction_id,
+        redirect_url=redirect_url,
+    )
+    if bound_attempt is None:
+        raise DeviceFirstError('reconciliation_required', 'Provider invoice requires operator review')
+    attempt = bound_attempt
 
     if redirect_url is None:
         await _hold_direct_invoice_for_review(
@@ -561,6 +1254,7 @@ async def _create_direct_platega_attempt(
         )
         raise DeviceFirstError('reconciliation_required', 'Provider invoice requires operator review')
 
+    canonical_requested_at = datetime.now(UTC)
     try:
         details = await service.get_transaction(transaction_id)
     except Exception as error:
@@ -583,14 +1277,20 @@ async def _create_direct_platega_attempt(
         # a field is missing or conflicts it becomes operator review instead.
         await settle_device_first_platega_payment(db, payment=payment, payload=details)
         return attempt
-    if provider_status in {'FAILED', 'CANCELED', 'EXPIRED'}:
-        # The provider has authoritatively closed this exact invoice. Preserve
-        # it as failed evidence, but never send the user to a dead payment URL.
-        attempt.status = 'failed'
-        attempt.reconciliation_reason = f'provider_terminal:{provider_status.lower()}'
-        payment.status = provider_status
-        await db.commit()
-        raise DeviceFirstError('reconciliation_required', 'Provider invoice is no longer payable')
+    if provider_status in PROVIDER_TERMINAL_STATUSES:
+        released = await _release_direct_terminal_invoice(
+            db,
+            attempt_id=attempt.id,
+            payment_id=payment.id,
+            payload=details,
+            provider_status=provider_status,
+            source='canonical_get',
+        )
+        if released:
+            # A terminal invoice is not a support-only error. Its historical
+            # checkout has been archived and a new choice can start safely.
+            raise DeviceFirstError('invoice_terminal', 'Provider invoice is no longer payable')
+        raise DeviceFirstError('reconciliation_required', 'Provider invoice requires operator review')
     if provider_status not in {'PENDING', 'INPROGRESS'}:
         # An undocumented/incomplete state is not equivalent to a live
         # invoice. Keep the known identity in VERIFYING so only GET polling
@@ -601,14 +1301,15 @@ async def _create_direct_platega_attempt(
         await db.commit()
         raise DeviceFirstError('reconciliation_required', 'Provider invoice is being verified')
 
-    returned_amount, returned_currency = PlategaService.parse_amount_currency(details) or (0, '')
-    attempt.provider_returned_amount_kopeks = returned_amount
-    attempt.provider_returned_currency = returned_currency
-    attempt.status = 'pending'
-    attempt.reconciliation_reason = None
-    payment.status = 'PENDING'
-    attempt.next_reconcile_at = datetime.now(UTC)
-    await db.commit()
+    applied = await _apply_direct_pending_provider_observation(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload=details,
+        observed_after=canonical_requested_at,
+    )
+    if not applied:
+        raise DeviceFirstError('reconciliation_required', 'Provider invoice is being verified')
     await db.refresh(attempt)
     logger.info(
         'device_first_event',
@@ -668,6 +1369,59 @@ async def settle_device_first_platega_payment(
     ).scalar_one()
     metadata = dict(payment.metadata_json or {})
     attempt_id = metadata.get('device_first_attempt_id')
+    direct_payment = metadata.get('settlement_mode') == DIRECT_SETTLEMENT_MODE
+
+    # Direct-sale financial transitions have one non-negotiable order:
+    # Payment -> User -> Attempt -> Checkout.  The payment is already locked
+    # above; acquire the user before the attempt so a new quote, a webhook and
+    # the reconciler cannot form an inverse P<->U lock cycle.
+    if direct_payment:
+        if not isinstance(attempt_id, int) or payment.user_id is None:
+            payment.status = 'OPERATOR_REVIEW'
+            await db.commit()
+            logger.error('device_first_direct_payment_attempt_missing', payment_id=payment.id)
+            return payment
+        user = (
+            await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
+        ).scalar_one()
+        attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
+        if lease_token is not None:
+            attempt_query = attempt_query.where(
+                CheckoutPaymentAttempt.lease_token == lease_token,
+                CheckoutPaymentAttempt.lease_epoch == lease_epoch,
+                CheckoutPaymentAttempt.lease_expires_at >= datetime.now(UTC),
+            )
+        attempt = (
+            await db.execute(attempt_query.with_for_update().execution_options(populate_existing=True))
+        ).scalar_one_or_none()
+        if attempt is None:
+            if lease_token is not None:
+                logger.warning('device_first_direct_payment_lease_lost', payment_id=payment.id)
+                return None
+            payment.status = 'OPERATOR_REVIEW'
+            await db.commit()
+            logger.error('device_first_direct_payment_attempt_missing', payment_id=payment.id)
+            return payment
+        if (
+            settlement_mode(attempt) != DIRECT_SETTLEMENT_MODE
+            or attempt.platega_payment_id != payment.id
+        ):
+            payment.status = 'OPERATOR_REVIEW'
+            attempt.status = 'operator_review'
+            attempt.reconciliation_reason = 'direct_payment_attempt_mode_or_binding_mismatch'
+            await db.commit()
+            logger.error('device_first_direct_payment_mode_mismatch', payment_id=payment.id, attempt_id=attempt.id)
+            return payment
+        return await _settle_direct_platega_payment_locked(
+            db,
+            payment=payment,
+            attempt=attempt,
+            user=user,
+            payload=payload,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
+        )
+
     attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
     if lease_token is not None:
         attempt_query = attempt_query.where(
@@ -681,31 +1435,6 @@ async def settle_device_first_platega_payment(
     if attempt is None and lease_token is not None:
         logger.warning('device_first_direct_payment_lease_lost', payment_id=payment.id)
         return None
-    direct_payment = metadata.get('settlement_mode') == DIRECT_SETTLEMENT_MODE
-    if direct_payment and attempt is None:
-        # A protected direct provider row without its matching attempt cannot
-        # be classified as a legacy deposit. Preserve the evidence and require
-        # an operator; do not credit balance or synthesize a sale.
-        payment.status = 'OPERATOR_REVIEW'
-        await db.commit()
-        logger.error('device_first_direct_payment_attempt_missing', payment_id=payment.id)
-        return payment
-    if direct_payment and settlement_mode(attempt) != DIRECT_SETTLEMENT_MODE:
-        payment.status = 'OPERATOR_REVIEW'
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'direct_payment_attempt_mode_mismatch'
-        await db.commit()
-        logger.error('device_first_direct_payment_mode_mismatch', payment_id=payment.id, attempt_id=attempt.id)
-        return payment
-    if attempt is not None and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
-        return await _settle_direct_platega_payment_locked(
-            db,
-            payment=payment,
-            attempt=attempt,
-            payload=payload,
-            lease_token=lease_token,
-            lease_epoch=lease_epoch,
-        )
     transaction_id = str((payload or {}).get('id') or (payload or {}).get('transactionId') or '').strip()
     method_raw = (payload or {}).get('paymentMethod')
     if method_raw is None:
@@ -893,6 +1622,7 @@ async def _settle_direct_platega_payment_locked(
     *,
     payment: PlategaPayment,
     attempt: CheckoutPaymentAttempt,
+    user: User,
     payload: dict | None,
     lease_token: str | None = None,
     lease_epoch: int | None = None,
@@ -904,13 +1634,12 @@ async def _settle_direct_platega_payment_locked(
     client polling only observe the resulting checkout state.
     """
     provider_payment_id = str((payload or {}).get('id') or (payload or {}).get('transactionId') or '').strip()
-    method_raw = (payload or {}).get('paymentMethod', (payload or {}).get('paymentMethodCode'))
     verified = _verified_amount(payload)
     identity_ok = bool(provider_payment_id and provider_payment_id == attempt.provider_payment_id)
-    try:
-        method_ok = method_raw is not None and int(method_raw) == attempt.provider_method_code
-    except (TypeError, ValueError):
-        method_ok = False
+    # Canonical Platega GET uses semantic strings (e.g. ``SBPQR``), while a
+    # callback uses numeric codes.  The shared allow-list accepts only known
+    # equivalences; unknown labels never become an identity match.
+    method_ok = _provider_method_code(payload) == attempt.provider_method_code
     mismatch_reason: str | None = None
     if not identity_ok:
         mismatch_reason = 'provider_identity_mismatch'
@@ -929,12 +1658,21 @@ async def _settle_direct_platega_payment_locked(
     # inspect the now-``ready`` checkout or downgrade it to operator review.
     if mismatch_reason is None and attempt.status == 'paid_processing':
         return payment
+    # A late exact confirmation after an already terminal provider invoice is
+    # settled into the customer's wallet, never into the stale subscription.
+    # The same signed/canonical confirmation may arrive again, so that credit
+    # must be as idempotent as the ordinary paid-processing path.
+    if (
+        mismatch_reason is None
+        and payment.is_paid
+        and attempt.status == 'credited'
+        and attempt.reconciliation_reason == 'late_paid_wallet_credit'
+    ):
+        return payment
 
-    # Use the same per-user lock as direct checkout creation/final commit
-    # before this callback can write an operator hold.  This prevents an old
-    # provider contradiction from racing a newer direct draft into payment.
-    if payment.user_id is not None:
-        await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
+    # ``settle_device_first_platega_payment`` already holds Payment -> User
+    # -> Attempt.  Acquire Checkout last; do not take any new earlier lock
+    # here or a callback can deadlock with a concurrent direct quote.
     checkout = (
         await db.execute(
             select(SubscriptionCheckout)
@@ -946,7 +1684,77 @@ async def _settle_direct_platega_payment_locked(
     if mismatch_reason is None and checkout.lifecycle_state not in {'awaiting_funds', 'fulfilling'}:
         mismatch_reason = 'late_paid_direct_checkout'
 
+    # Record every normalized CONFIRMED observation, including a late or
+    # mismatched one. The current payment/checkout rows remain projections;
+    # this compact evidence is what explains why money was fulfilled or sent
+    # to reconciliation instead.
+    await _append_direct_provider_event(
+        db,
+        checkout=checkout,
+        attempt=attempt,
+        payload=payload,
+        provider_status='CONFIRMED',
+        source='settlement',
+    )
+
     if mismatch_reason is not None:
+        if (
+            mismatch_reason == 'late_paid_direct_checkout'
+            and verified is not None
+            and checkout.lifecycle_state == 'cancelled'
+            and (
+                str(checkout.terminal_reason or '').startswith('provider_terminal:')
+                or checkout.terminal_reason == 'cancelled_by_user_after_invoice'
+            )
+        ):
+            # The provider accepted money after it had authoritatively closed
+            # the old invoice. Never fulfil that stale order, but do give the
+            # exact, idempotent amount back to the owner as spendable wallet
+            # credit so they can purchase their current configuration.
+            amount_kopeks, currency = verified
+            ledger_key = f'direct_late_invoice:{attempt.id}'
+            transaction = (
+                await db.execute(
+                    select(Transaction).where(Transaction.device_first_ledger_key == ledger_key).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if transaction is None:
+                user.balance_kopeks += amount_kopeks
+                transaction = Transaction(
+                    user_id=user.id,
+                    type=TransactionType.DEPOSIT.value,
+                    amount_kopeks=amount_kopeks,
+                    description=f'Late Platega invoice for checkout {checkout.public_id}',
+                    payment_method='platega',
+                    external_id=payment.platega_transaction_id or provider_payment_id,
+                    device_first_checkout_id=checkout.id,
+                    device_first_ledger_key=ledger_key,
+                    is_completed=True,
+                )
+                db.add(transaction)
+                await db.flush()
+            payment.transaction_id = transaction.id
+            payment.status = 'CONFIRMED'
+            payment.is_paid = True
+            payment.metadata_json = {
+                **(payment.metadata_json or {}),
+                'late_invoice_wallet_credit': True,
+            }
+            attempt.status = 'credited'
+            attempt.credited_amount_kopeks = amount_kopeks
+            attempt.reconciliation_reason = 'late_paid_wallet_credit'
+            checkout.funding_state = 'late_paid_wallet_credit'
+            checkout.terminal_reason = 'late_paid_wallet_credit'
+            await db.commit()
+            logger.warning(
+                'device_first_late_archived_invoice_credited_to_wallet',
+                checkout_id=checkout.public_id,
+                attempt_id=attempt.id,
+                amount_kopeks=amount_kopeks,
+                currency=currency,
+            )
+            return payment
+
         attempt.status = 'operator_review'
         attempt.reconciliation_reason = mismatch_reason
         payment.status = 'OPERATOR_REVIEW'
@@ -1068,6 +1876,18 @@ async def reconcile_device_first_payments(
                 CheckoutPaymentAttempt.status.in_(['creating', 'reconciliation']),
                 CheckoutPaymentAttempt.provider_payment_id.is_(None),
             ),
+            # Archive releases the customer, but the historical provider
+            # invoice remains under low-frequency reconciliation forever. A
+            # later exact confirmation is wallet credit, never stale VPN
+            # fulfillment; without a documented provider-finality contract we
+            # must not stop looking for it after an arbitrary number of polls.
+            and_(
+                CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
+                CheckoutPaymentAttempt.status == 'failed',
+                CheckoutPaymentAttempt.reconciliation_reason.like('provider_terminal:%'),
+                CheckoutPaymentAttempt.provider_payment_id.is_not(None),
+                CheckoutPaymentAttempt.platega_payment_id.is_not(None),
+            ),
         ),
     ]
     if direct_only:
@@ -1181,6 +2001,7 @@ async def reconcile_device_first_payments(
                 minutes=min(60, 2 ** min(attempt.reconcile_attempts, 6))
             )
             await db.commit()
+            provider_request_started_at = datetime.now(UTC)
             try:
                 payload = await service.get_transaction(attempt.provider_payment_id)
             except Exception as error:
@@ -1213,48 +2034,22 @@ async def reconcile_device_first_payments(
             payment = await db.get(PlategaPayment, attempt.platega_payment_id)
             if payment is None:
                 continue
-            if settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE and str(payment.status).upper() == 'VERIFYING':
-                if not _has_exact_direct_invoice_details(attempt, payload):
-                    held = await _hold_direct_invoice_for_review(
-                        db,
-                        attempt_id=attempt_id,
-                        payment_id=payment.id,
-                        reason='provider_invoice_verification_mismatch',
-                        lease_token=lease_token,
-                        lease_epoch=lease_epoch,
-                    )
-                    if not held:
-                        continue
-                    continue
-                # A redirect is live only while the canonical provider status
-                # says that the invoice is payable.  Terminal/confirmed and
-                # undocumented states must stay VERIFYING until the branches
-                # below settle, fence, or record their reconciliation state.
-                if status in {'PENDING', 'INPROGRESS'}:
-                    payment = (
-                        await db.execute(
-                            select(PlategaPayment)
-                            .where(PlategaPayment.id == payment.id)
-                            .with_for_update()
-                            .execution_options(populate_existing=True)
-                        )
-                    ).scalar_one()
-                    if lease_token is not None and lease_epoch is not None:
-                        attempt = await _lock_owned_direct_attempt_lease(
-                            db,
-                            attempt_id=attempt_id,
-                            lease_token=lease_token,
-                            lease_epoch=lease_epoch,
-                        )
-                        if attempt is None:
-                            continue
-                    payment.status = 'PENDING'
-                    attempt.reconciliation_reason = None
-                    await db.commit()
-            if status in {'FAILED', 'CANCELED', 'EXPIRED'} and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
-                # The fence takes User → Attempt → Checkout.  Do not acquire
-                # Attempt here first: a paid fulfilment takes that same order
-                # and an inverted worker path would deadlock the reversal.
+            if settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE and status in {'PENDING', 'INPROGRESS'}:
+                await _apply_direct_pending_provider_observation(
+                    db,
+                    attempt_id=attempt_id,
+                    payment_id=payment.id,
+                    payload=payload,
+                    # This is deliberately captured before the provider GET:
+                    # a callback that wins while the HTTP request is in
+                    # flight makes the PENDING answer stale and unwriteable.
+                    observed_after=provider_request_started_at,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                )
+                continue
+            if status in PROVIDER_TERMINAL_STATUSES and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
+                # This enters the central P -> U -> A -> C terminal fence.
                 from app.services.payment.platega import PlategaPaymentMixin
 
                 payment = (
@@ -1274,6 +2069,40 @@ async def reconcile_device_first_payments(
                         lease_epoch=lease_epoch,
                     )
                     continue
+                released = await _release_direct_terminal_invoice(
+                    db,
+                    attempt_id=attempt_id,
+                    payment_id=payment.id,
+                    payload=payload,
+                    provider_status=status,
+                    source='poll',
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                )
+                reconciled += int(released)
+                continue
+            if status in POST_PAID_REVERSAL_STATUSES and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
+                # A chargeback is never an ordinary unpaid cancellation. It
+                # freezes the direct sale for an accountable financial review,
+                # regardless of whether an earlier worker already marked it paid.
+                from app.services.payment.platega import PlategaPaymentMixin
+
+                payment = (
+                    await db.execute(
+                        select(PlategaPayment)
+                        .where(PlategaPayment.id == payment.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one()
+                await PlategaPaymentMixin()._mark_direct_post_paid_reversal(
+                    db,
+                    payment=payment,
+                    provider_status=status,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                )
+                continue
             if status == 'CONFIRMED':
                 settled = await settle_device_first_platega_payment(
                     db,
@@ -1284,14 +2113,6 @@ async def reconcile_device_first_payments(
                 )
                 reconciled += int(settled is not None)
             else:
-                payment = (
-                    await db.execute(
-                        select(PlategaPayment)
-                        .where(PlategaPayment.id == payment.id)
-                        .with_for_update()
-                        .execution_options(populate_existing=True)
-                    )
-                ).scalar_one()
                 if lease_token is not None and lease_epoch is not None:
                     attempt = await _lock_owned_direct_attempt_lease(
                         db,
@@ -1310,12 +2131,7 @@ async def reconcile_device_first_payments(
                             .execution_options(populate_existing=True)
                         )
                     ).scalar_one()
-                if status in {'FAILED', 'CANCELED', 'EXPIRED'}:
-                    attempt.status = 'failed'
-                    attempt.reconciliation_reason = f'provider_terminal:{status.lower()}'
-                    payment.status = status
-                else:
-                    attempt.reconciliation_reason = f'provider_pending:{status or "unknown"}'
+                attempt.reconciliation_reason = f'provider_pending:{status or "unknown"}'
                 await db.commit()
         finally:
             await _release_direct_attempt_lease(

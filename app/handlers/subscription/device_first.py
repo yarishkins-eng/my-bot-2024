@@ -29,14 +29,17 @@ from app.services.device_first_checkout_service import (
     get_open_checkout_for_user,
     get_owned_checkout,
     serialize_checkout,
+    settlement_mode,
 )
 from app.services.device_first_payment_service import (
+    abandon_direct_checkout_for_new_calculation,
     available_platega_methods_for_db,
     create_platega_attempt,
     get_pending_platega_attempt,
     platega_method_label,
 )
 from app.utils.photo_message import edit_or_answer_photo
+from app.utils.timezone import format_local_datetime
 
 
 def _en(user: User) -> bool:
@@ -55,6 +58,19 @@ def _money(user: User, kopeks: int) -> str:
         separator = '.' if _en(user) else ','
         value = f'{value}{separator}{remainder:02d}'
     return f'-{value}' if kopeks < 0 else value
+
+
+def _invoice_expiry_label(user: User, expires_at: datetime | None) -> str:
+    """Render the provider-confirmed deadline in the bot's configured timezone."""
+
+    if expires_at is None:
+        return ''
+    local_deadline = format_local_datetime(expires_at, '%d.%m %H:%M')
+    return _text(
+        user,
+        f'\n\nСчёт действует до <b>{local_deadline}</b>.',
+        f'\n\nThis invoice is valid until <b>{local_deadline}</b>.',
+    )
 
 
 def _device_label(user: User, limit: int) -> str:
@@ -243,8 +259,8 @@ async def _device_page(
             f'📱 <b>{options["tariff"]["name"]}</b>\n\n'
             + _text(
                 user,
-                f'Срок: <b>{_period_summary_label(user, days)}</b>\n\nНа скольких устройствах будете пользоваться VPN?',
-                f'Period: <b>{_period_summary_label(user, days)}</b>\n\nHow many devices will use the VPN?',
+                f'Срок: <b>{_period_summary_label(user, days)}</b>\n\nСколько устройств подключить?',
+                f'Period: <b>{_period_summary_label(user, days)}</b>\n\nHow many devices to connect?',
             )
         ),
         keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -278,7 +294,7 @@ async def _period_page(
         callback=callback,
         caption=(
             f'📱 <b>{options["tariff"]["name"]}</b>\n\n'
-            + _text(user, '📅 Сначала выберите срок VPN.', '📅 First choose the VPN period.')
+            + _text(user, '📅 Выберите срок.', '📅 Choose a period.')
         ),
         keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
         parse_mode='HTML',
@@ -294,21 +310,29 @@ async def show_device_first_entry(
     options: dict | None = None,
     origin_callback: str | None = None,
 ) -> bool:
-    # “Tariffs” is an explicit intent to configure a new purchase.  A stale
-    # quote with no external payment, including the historical pre-attempt
-    # ``awaiting_funds`` state, can be discarded before showing periods again.
-    # A live or ambiguous invoice must remain recoverable instead: silently
-    # replacing it could hide money in flight.
+    # “Tariffs” is an explicit intent to configure a new purchase.  A quote
+    # with no provider invoice is discarded outright.  A direct invoice is
+    # locally abandoned through its financial lock fence: it remains audited
+    # and reconciled, but can never fulfil this stale configuration if paid
+    # late (that money is credited once to the wallet instead).
     existing = await get_open_checkout_for_user(db, user_id=db_user.id)
     if existing is not None:
         try:
-            locked_checkout = await get_owned_checkout(
-                db,
-                public_id=existing.public_id,
-                user_id=db_user.id,
-                for_update=True,
-            )
-            cancelled_checkout = await cancel_checkout_for_new_calculation(db, locked_checkout)
+            cancelled_checkout = None
+            if settlement_mode(existing) == DIRECT_SETTLEMENT_MODE:
+                cancelled_checkout = await abandon_direct_checkout_for_new_calculation(
+                    db,
+                    checkout_public_id=existing.public_id,
+                    user_id=db_user.id,
+                )
+            if cancelled_checkout is None:
+                locked_checkout = await get_owned_checkout(
+                    db,
+                    public_id=existing.public_id,
+                    user_id=db_user.id,
+                    for_update=True,
+                )
+                cancelled_checkout = await cancel_checkout_for_new_calculation(db, locked_checkout)
         except DeviceFirstError:
             # The row can turn into an external-invoice recovery record
             # between the read and the lock.  Do not start another order.
@@ -857,9 +881,11 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                 callback_data=f'df:s:{checkout.public_id}',
             )
             redirect_url = pending_attempt.redirect_url
+            provider_expires_at = None
             if direct and pending_attempt.platega_payment_id:
                 payment = await db.get(PlategaPayment, pending_attempt.platega_payment_id)
                 redirect_url = payment.redirect_url if payment else None
+                provider_expires_at = payment.expires_at if payment else None
             if pending_attempt.status == 'pending' and redirect_url:
                 caption = _text(
                     user,
@@ -869,12 +895,14 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                         f'К оплате: <b>{amount} ₽</b>\n\n'
                         'Оплатите этот счёт или проверьте его статус. Новый счёт не создаётся, '
                         'чтобы не было двойной оплаты.'
+                        + _invoice_expiry_label(user, provider_expires_at)
                     ),
                     (
                         '💳 <b>Invoice awaiting payment</b>\n\n'
                         f'Method: <b>{method}</b>\n'
                         f'To pay: <b>₽{amount}</b>\n\n'
                         'Pay this invoice or check its status. A new invoice is blocked to prevent a duplicate payment.'
+                        + _invoice_expiry_label(user, provider_expires_at)
                     ),
                 )
                 keyboard = InlineKeyboardMarkup(
@@ -937,18 +965,24 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                     caption=_text(
                         user,
                         (
-                            '⚠️ <b>Проверяем предыдущий счёт</b>\n\n'
-                            'Новый способ оплаты сейчас не показываем, чтобы не создать повторный счёт. '
-                            'Обратитесь в поддержку: она проверит счёт и поможет продолжить безопасно.'
+                            '⏳ <b>Проверяем счёт</b>\n\n'
+                            'Не создавайте новую оплату, пока проверяем статус этого счёта. '
+                            'Если он отменён или истёк, новый расчёт откроется автоматически.'
                         ),
                         (
-                            '⚠️ <b>Checking the previous invoice</b>\n\n'
-                            'We are not showing a new payment method to avoid creating a duplicate invoice. '
-                            'Contact support so it can check the invoice and help you continue safely.'
+                            '⏳ <b>Checking the invoice</b>\n\n'
+                            'Do not create another payment while we check this invoice. '
+                            'If it is cancelled or expired, a new quote will become available automatically.'
                         ),
                     ),
                     keyboard=InlineKeyboardMarkup(
                         inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text=_text(user, 'Обновить статус', 'Refresh status'),
+                                    callback_data=f'df:s:{checkout.public_id}',
+                                )
+                            ],
                             [
                                 InlineKeyboardButton(
                                     text=_text(user, 'Связаться с поддержкой', 'Contact support'),
@@ -1144,14 +1178,32 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
         caption = _text(user, '✅ <b>VPN готов</b>', '✅ <b>VPN is ready</b>')
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[button], [_main_menu(user)]])
     elif result['ui_state'] == 'cancelled':
+        provider_terminal = str(getattr(checkout, 'terminal_reason', '')).startswith('provider_terminal:')
         caption = _text(
             user,
-            '🛑 <b>Заказ отменён</b>\n\nЭтот заказ больше не будет оформлен.',
-            '🛑 <b>Order cancelled</b>\n\nThis order will not be completed.',
+            (
+                '✅ <b>Предыдущий счёт закрыт</b>\n\nВыберите срок и устройства для нового заказа.'
+                if provider_terminal
+                else '🛑 <b>Заказ отменён</b>\n\nЭтот заказ больше не будет оформлен.'
+            ),
+            (
+                '✅ <b>The previous invoice is closed</b>\n\nChoose a period and devices for a new order.'
+                if provider_terminal
+                else '🛑 <b>Order cancelled</b>\n\nThis order will not be completed.'
+            ),
         )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=_text(user, 'Новый расчёт', 'New quote'), callback_data='df:start')],
+                [
+                    InlineKeyboardButton(
+                        text=_text(
+                            user,
+                            'Выбрать тариф' if provider_terminal else 'Новый расчёт',
+                            'Choose a plan' if provider_terminal else 'New quote',
+                        ),
+                        callback_data='df:start',
+                    )
+                ],
                 [_main_menu(user)],
             ]
         )
@@ -1325,23 +1377,15 @@ async def change_selection(
         return
     origin = data.get('df_origin_callback') or 'back_to_menu'
     await state.update_data(df_checkout_id=None)
-    if checkout.period_days not in options['period_options']:
-        await _period_page(
-            callback,
-            db_user,
-            state,
-            options,
-            view_id=uuid.uuid4().hex[:8],
-            origin_callback=origin,
-        )
-        return
-    await _device_page(
+    # The button promises to change the complete configuration, not merely a
+    # device count. Returning to the first choice also makes Telegram Back
+    # deterministic: period -> devices -> payment methods.
+    await _period_page(
         callback,
         db_user,
         state,
         options,
         view_id=uuid.uuid4().hex[:8],
-        days=checkout.period_days,
         origin_callback=origin,
     )
 
@@ -1462,6 +1506,11 @@ def _safe_error_detail(user: User, error: DeviceFirstError | str) -> str:
             'Мы проверяем созданный счёт. Не оплачивайте повторно: откройте проверку статуса или обратитесь в поддержку.',
             'We are checking the created invoice. Do not pay again: check its status or contact support.',
         ),
+        'invoice_terminal': _text(
+            user,
+            'Этот счёт уже закрыт. Выберите срок и устройства для нового заказа.',
+            'This invoice is closed. Choose a period and devices for a new order.',
+        ),
     }
     return messages.get(
         error.code,
@@ -1493,6 +1542,11 @@ async def _render_error(callback: types.CallbackQuery, user: User, error: Device
                 ],
                 [_main_menu(user)],
             ]
+    elif isinstance(error, DeviceFirstError) and error.code == 'invoice_terminal':
+        rows = [
+            [InlineKeyboardButton(text=_text(user, 'Выбрать тариф', 'Choose a plan'), callback_data='df:start')],
+            [_main_menu(user)],
+        ]
     await edit_or_answer_photo(
         callback=callback,
         caption=f'⚠️ {_safe_error_detail(user, error)}',
