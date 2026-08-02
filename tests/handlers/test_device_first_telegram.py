@@ -551,11 +551,110 @@ async def test_open_draft_remains_reviewable_when_new_device_first_orders_are_di
     ):
         assert await show_device_first_entry(callback, user, db, state) is True
 
-    build_options.assert_not_awaited()
+    build_options.assert_awaited_once_with(db, user)
     callback.answer.assert_awaited_once()
     state.update_data.assert_awaited_once_with(df_checkout_id='draft-17')
     db.get.assert_awaited_once_with(Tariff, 9)
     render.assert_awaited_once_with(callback, user, db, checkout, tariff_name='Premium')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lifecycle_state', ['draft', 'confirmed'])
+async def test_tariffs_starts_a_new_calculation_after_discarding_a_safe_quote(lifecycle_state: str) -> None:
+    callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
+    state = AsyncMock()
+    user = SimpleNamespace(id=17, language='ru')
+    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state=lifecycle_state)
+    cancelled_checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='cancelled')
+    options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=checkout),
+        ),
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
+        patch(
+            'app.handlers.subscription.device_first.get_owned_checkout',
+            AsyncMock(return_value=checkout),
+        ) as get_owned,
+        patch(
+            'app.handlers.subscription.device_first.cancel_checkout',
+            AsyncMock(return_value=cancelled_checkout),
+        ) as cancel_checkout,
+        patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
+    ):
+        assert await show_device_first_entry(callback, user, db, state) is True
+
+    get_owned.assert_awaited_once_with(db, public_id='quote-17', user_id=17, for_update=True)
+    cancel_checkout.assert_awaited_once_with(db, checkout)
+    state.clear.assert_awaited_once()
+    period_page.assert_awaited_once()
+    assert period_page.await_args.args[3] == options
+
+
+@pytest.mark.asyncio
+async def test_tariffs_keeps_recovery_when_cancellation_did_not_take_effect() -> None:
+    callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
+    state = AsyncMock()
+    user = SimpleNamespace(id=17, language='ru')
+    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='confirmed')
+    settled_checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='ready')
+    options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=checkout),
+        ),
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
+        patch(
+            'app.handlers.subscription.device_first.get_owned_checkout',
+            AsyncMock(return_value=checkout),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.cancel_checkout',
+            AsyncMock(return_value=settled_checkout),
+        ),
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
+        patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
+    ):
+        assert await show_device_first_entry(callback, user, db, state) is True
+
+    render.assert_awaited_once_with(callback, user, db, settled_checkout)
+    period_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tariffs_keeps_recovery_when_a_quote_becomes_an_external_invoice() -> None:
+    callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
+    state = AsyncMock()
+    user = SimpleNamespace(id=17, language='ru')
+    checkout = SimpleNamespace(public_id='quote-17', lifecycle_state='confirmed')
+    options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
+    invoice_exists = DeviceFirstError('external_invoice_active', 'External invoice exists')
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=checkout),
+        ),
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
+        patch(
+            'app.handlers.subscription.device_first.get_owned_checkout',
+            AsyncMock(side_effect=[checkout, checkout]),
+        ),
+        patch('app.handlers.subscription.device_first.cancel_checkout', AsyncMock(side_effect=invoice_exists)),
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
+        patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
+    ):
+        assert await show_device_first_entry(callback, user, db, state) is True
+
+    render.assert_awaited_once_with(callback, user, db, checkout)
+    period_page.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -292,11 +292,35 @@ async def show_device_first_entry(
     options: dict | None = None,
     origin_callback: str | None = None,
 ) -> bool:
-    # An order already created by this user remains theirs to review or cancel,
-    # even if an administrator later disables new device-first orders or edits
-    # the tariff so that it is no longer eligible.  Otherwise an old draft
-    # would become an unreachable row with no honest recovery path.
+    # “Tariffs” is an explicit intent to configure a new purchase.  A stale
+    # draft/confirmed quote has no payment attempt and can be discarded before
+    # showing periods again.  An invoice or any post-payment state must remain
+    # recoverable instead: silently replacing it could hide money in flight.
     existing = await get_open_checkout_for_user(db, user_id=db_user.id)
+    if existing is not None and existing.lifecycle_state in {'draft', 'confirmed'}:
+        options = options or await build_purchase_options(db, db_user)
+        if options.get('eligible'):
+            try:
+                locked_checkout = await get_owned_checkout(
+                    db,
+                    public_id=existing.public_id,
+                    user_id=db_user.id,
+                    for_update=True,
+                )
+                cancelled_checkout = await cancel_checkout(db, locked_checkout)
+            except DeviceFirstError:
+                # The row can turn into an external-invoice recovery record
+                # between the read and the lock.  Do not start another order.
+                existing = await get_owned_checkout(db, public_id=existing.public_id, user_id=db_user.id)
+            else:
+                if cancelled_checkout.lifecycle_state == 'cancelled':
+                    await state.clear()
+                    existing = None
+                else:
+                    # A concurrent settlement can move the row to a terminal
+                    # state before cancellation.  Keep that order visible.
+                    existing = cancelled_checkout
+
     if existing is not None:
         await callback.answer()
         await state.update_data(df_checkout_id=existing.public_id)
