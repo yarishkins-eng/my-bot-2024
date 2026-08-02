@@ -5,19 +5,67 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
+from app.cabinet.dependencies import get_current_native_launch_user
 from app.cabinet.routes.device_first import (
     CheckoutCommitRequest,
+    NativeCheckoutLaunchRequest,
     PaymentAttemptRequest,
     _checkout_command,
     _mutation,
     _rehydrate_owned_direct_redirect,
     checkout_commit,
     checkout_get,
+    checkout_native_launch,
     checkout_open,
     checkout_pending_payment,
     checkout_resume_invoice,
 )
 from app.services.device_first_checkout_service import DeviceFirstError, checkout_ui_state
+
+
+@pytest.mark.asyncio
+async def test_native_launch_requires_valid_telegram_identity_before_any_checkout_lookup() -> None:
+    user = SimpleNamespace(id=17, telegram_id=7001)
+    request = SimpleNamespace(headers={})
+
+    with pytest.raises(HTTPException) as raised:
+        await get_current_native_launch_user(request, user)
+
+    assert raised.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_native_launch_rejects_a_signed_identity_for_another_telegram_account() -> None:
+    user = SimpleNamespace(id=17, telegram_id=7001)
+    request = SimpleNamespace(headers={'X-Telegram-Init-Data': 'signed-but-other-user'})
+
+    with patch('app.cabinet.dependencies.validate_telegram_init_data', return_value={'id': 7002}):
+        with pytest.raises(HTTPException) as raised:
+            await get_current_native_launch_user(request, user)
+
+    assert raised.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_native_launch_delegates_to_the_same_direct_payment_state_machine_and_cannot_debit_wallet() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0, telegram_id=7001)
+    db = AsyncMock()
+    expected = {'checkout': {'id': 'owned-checkout'}, 'redirect_url': 'https://pay.example/live'}
+
+    with patch('app.cabinet.routes.device_first._commit_checkout', AsyncMock(return_value=expected)) as commit:
+        response = await checkout_native_launch(
+            'owned-checkout',
+            NativeCheckoutLaunchRequest(method_key='sbp'),
+            idempotency_key='native-launch-owned-checkout-sbp',
+            user=user,
+            db=db,
+        )
+
+    assert response == expected
+    request = commit.await_args.kwargs['request']
+    assert request.funding_mode == 'platega'
+    assert request.method_key == 'sbp'
+    assert commit.await_args.kwargs['action'] == 'native_launch'
 
 
 @pytest.mark.asyncio

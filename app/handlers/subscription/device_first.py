@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from itertools import islice
+from urllib.parse import urlencode
 
 from aiogram import F, types
 from aiogram.fsm.context import FSMContext
@@ -137,7 +138,7 @@ def _main_menu(user: User) -> InlineKeyboardButton:
 
 def _change_selection(user: User, checkout_id: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(
-        text=_text(user, '‹ Изменить выбор', '‹ Change selection'),
+        text=_text(user, '‹ Изменить параметры', '‹ Change options'),
         callback_data=f'df:e:{checkout_id}',
     )
 
@@ -147,6 +148,49 @@ def _cancel_order(user: User, checkout_id: str) -> InlineKeyboardButton:
         text=_text(user, 'Отменить заказ', 'Cancel order'),
         callback_data=f'df:x:{checkout_id}',
     )
+
+
+def _direct_method_label(user: User, method_key: str) -> str:
+    labels = {
+        'sbp': ('СБП (QR-код)', 'SBP (QR code)'),
+        'cards_ru': ('Карта российского банка', 'Russian bank card'),
+        'crypto': ('Криптовалюта', 'Cryptocurrency'),
+    }
+    return (
+        _text(user, *labels[method_key])
+        if method_key in labels
+        else platega_method_label(method_key, language=user.language)
+    )
+
+
+def _native_payment_button(
+    user: User,
+    *,
+    checkout_id: str,
+    method_key: str,
+    total: str,
+) -> InlineKeyboardButton:
+    """Open the trusted Mini App for one authenticated external payment launch.
+
+    The URL holds only untrusted navigation hints.  It has no price, provider
+    redirect or capability to debit: the Cabinet validates Telegram identity,
+    checkout owner, live price and payment method again before its POST.
+    Callback fallback preserves the recovery path if the Mini App is not
+    configured, without ever exposing a provider URL in Telegram.
+    """
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    cabinet_url = build_cabinet_url(
+        f'/subscription/purchase?{urlencode({"checkout": checkout_id, "method": method_key, "autostart": "1"})}'
+    )
+    text = _text(
+        user,
+        f'{_direct_method_label(user, method_key)} · {total} ₽',
+        f'{_direct_method_label(user, method_key)} · ₽{total}',
+    )
+    if cabinet_url:
+        return InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=cabinet_url))
+    return InlineKeyboardButton(text=text, callback_data=f'df:y:{method_key}:{checkout_id}')
 
 
 async def _answer_stale(callback: types.CallbackQuery, user: User) -> None:
@@ -258,9 +302,10 @@ async def show_device_first_entry(
         await state.update_data(df_checkout_id=existing.public_id)
         if existing.lifecycle_state == 'draft':
             tariff = await db.get(Tariff, existing.tariff_id)
-            await _render_confirmation(
+            await _render_new_checkout(
                 callback,
                 db_user,
+                db,
                 existing,
                 tariff_name=getattr(tariff, 'name', None) or _text(db_user, 'Тариф', 'Tariff'),
             )
@@ -405,9 +450,10 @@ async def choose_devices(
             if existing is not None:
                 await state.update_data(df_checkout_id=existing.public_id)
                 if existing.lifecycle_state == 'draft':
-                    await _render_confirmation(
+                    await _render_new_checkout(
                         callback,
                         db_user,
+                        db,
                         existing,
                         tariff_name=options['tariff']['name'],
                     )
@@ -417,9 +463,10 @@ async def choose_devices(
         await _render_error(callback, db_user, error)
         return
     await state.update_data(df_checkout_id=checkout.public_id)
-    await _render_confirmation(
+    await _render_new_checkout(
         callback,
         db_user,
+        db,
         checkout,
         tariff_name=options['tariff']['name'],
     )
@@ -542,6 +589,30 @@ async def _render_confirmation(
     )
 
 
+async def _render_new_checkout(
+    callback: types.CallbackQuery,
+    user: User,
+    db: AsyncSession,
+    checkout,
+    *,
+    tariff_name: str,
+) -> None:
+    """Skip only the redundant non-financial confirmation for new v2 orders."""
+    if getattr(checkout, 'settlement_mode', None) != DIRECT_SETTLEMENT_MODE:
+        await _render_confirmation(callback, user, checkout, tariff_name=tariff_name)
+        return
+    try:
+        if checkout.lifecycle_state == 'draft':
+            checkout = await confirm_checkout(db, checkout)
+    except DeviceFirstError as error:
+        await _render_error(callback, user, error)
+        return
+    if checkout.lifecycle_state == 'confirmed':
+        await _render_direct_payment_methods(callback, user, db, checkout)
+        return
+    await _render_checkout(callback, user, db, checkout)
+
+
 def _checkout_id(callback: types.CallbackQuery) -> str | None:
     parts = (callback.data or '').split(':', 3)
     # Payment callbacks carry both the method and the checkout id
@@ -572,6 +643,10 @@ async def confirm(
 
     if checkout.lifecycle_state != 'confirmed':
         await _render_checkout(callback, db_user, db, checkout)
+        return
+
+    if getattr(checkout, 'settlement_mode', None) == DIRECT_SETTLEMENT_MODE:
+        await _render_direct_payment_methods(callback, db_user, db, checkout)
         return
 
     await _render_arm_confirmation(callback, db_user, checkout)
@@ -668,33 +743,53 @@ async def _render_direct_payment_methods(
     db: AsyncSession,
     checkout,
 ) -> None:
-    """v2 external funding is one full-price invoice, never a top-up shortfall."""
+    """Show one concise direct-purchase order and its available payment methods."""
     methods = await available_platega_methods_for_db(db, user)
     total = _money(user, checkout.tariff_total_kopeks)
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=_text(
-                    user,
-                    f'Оплатить {total} ₽ через {platega_method_label(item["key"], language=user.language)}',
-                    f'Pay ₽{total} with {platega_method_label(item["key"], language=user.language)}',
-                ),
-                callback_data=f'df:y:{item["key"]}:{checkout.public_id}',
-            )
+    tariff = await db.get(Tariff, checkout.tariff_id)
+    tariff_name = getattr(tariff, 'name', None) or _text(user, 'Тариф', 'Tariff')
+    has_full_wallet_balance = user.balance_kopeks >= checkout.tariff_total_kopeks
+    rows: list[list[InlineKeyboardButton]]
+    if has_full_wallet_balance:
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=_text(
+                        user,
+                        f'Оплатить с баланса · {total} ₽',
+                        f'Pay from balance · ₽{total}',
+                    ),
+                    callback_data=f'df:a:{checkout.public_id}',
+                )
+            ]
         ]
-        for item in methods
-    ]
-    rows.append([_cancel_order(user, checkout.public_id)])
+    else:
+        rows = [
+            [_native_payment_button(user, checkout_id=checkout.public_id, method_key=item['key'], total=total)]
+            for item in methods
+        ]
     caption = _text(
         user,
-        f'💳 <b>Оплата заказа</b>\n\nК оплате одним счётом: <b>{total} ₽</b>. Баланс не используется частично.',
-        f'💳 <b>Pay for your order</b>\n\nOne full invoice: <b>₽{total}</b>. Balance is not partially used.',
+        (
+            '💳 <b>Ваш заказ</b>\n\n'
+            f'<b>{tariff_name}</b>\n'
+            f'{_device_label(user, checkout.selected_device_limit)} · {_period_short_label(user, checkout.period_days)}\n'
+            f'К оплате: <b>{total} ₽</b>\n\n'
+            + ('Оплатите с баланса.' if has_full_wallet_balance else 'Выберите способ оплаты.')
+        ),
+        (
+            '💳 <b>Your order</b>\n\n'
+            f'<b>{tariff_name}</b>\n'
+            f'{_device_label(user, checkout.selected_device_limit)} · {_period_short_label(user, checkout.period_days)}\n'
+            f'To pay: <b>₽{total}</b>\n\n'
+            + ('Pay from your balance.' if has_full_wallet_balance else 'Choose a payment method.')
+        ),
     )
-    if not methods:
+    if not has_full_wallet_balance and not methods:
         caption += _text(
             user,
-            '\n\nСпособ оплаты сейчас недоступен. Обратитесь в поддержку.',
-            '\n\nPayment is unavailable. Contact support.',
+            '\n\nОплата временно недоступна. Обратитесь в поддержку.',
+            '\n\nPayment is temporarily unavailable. Contact support.',
         )
         rows = [
             [
@@ -702,8 +797,10 @@ async def _render_direct_payment_methods(
                     text=_text(user, 'Связаться с поддержкой', 'Contact support'), callback_data='menu_support'
                 )
             ],
-            [_cancel_order(user, checkout.public_id)],
+            [_change_selection(user, checkout.public_id)],
         ]
+    elif methods or has_full_wallet_balance:
+        rows.append([_change_selection(user, checkout.public_id)])
     await edit_or_answer_photo(
         callback=callback,
         caption=caption,
@@ -715,6 +812,9 @@ async def _render_direct_payment_methods(
 async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncSession, checkout) -> None:
     result = serialize_checkout(checkout, balance_kopeks=user.balance_kopeks)
     if result['ui_state'] == 'confirmation':
+        if getattr(checkout, 'settlement_mode', None) == DIRECT_SETTLEMENT_MODE:
+            await _render_direct_payment_methods(callback, user, db, checkout)
+            return
         await _render_arm_confirmation(callback, user, checkout)
         return
     if result['ui_state'] == 'awaiting_payment':
@@ -756,12 +856,12 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                     inline_keyboard=[
                         [
                             InlineKeyboardButton(
-                                text=_text(user, 'Перейти к оплате', 'Open payment'),
+                                text=_text(user, 'Продолжить оплату', 'Continue payment'),
                                 url=redirect_url,
                             )
                         ],
                         [status_button],
-                        [_cancel_order(user, checkout.public_id)],
+                        [_main_menu(user)],
                     ]
                 )
             elif pending_attempt.status in {'creating', 'reconciliation'} or (
@@ -789,7 +889,7 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                                 callback_data='menu_support',
                             )
                         ],
-                        [_cancel_order(user, checkout.public_id)],
+                        [_main_menu(user)],
                     ]
                 )
             else:
@@ -1330,7 +1430,7 @@ async def _render_error(callback: types.CallbackQuery, user: User, error: Device
                         callback_data='menu_support',
                     )
                 ],
-                [_cancel_order(user, public_id)],
+                [_main_menu(user)],
             ]
     await edit_or_answer_photo(
         callback=callback,

@@ -14,6 +14,7 @@ from app.handlers.subscription.device_first import (
     _render_checkout,
     _render_confirmation,
     _render_error,
+    _render_new_checkout,
     arm,
     cancel,
     change_selection,
@@ -359,10 +360,7 @@ async def test_choose_devices_creates_owned_telegram_checkout_and_renders_confir
             'app.handlers.subscription.device_first.create_checkout',
             AsyncMock(return_value=checkout),
         ) as create,
-        patch(
-            'app.handlers.subscription.device_first._render_confirmation',
-            AsyncMock(),
-        ) as render,
+        patch('app.handlers.subscription.device_first._render_new_checkout', AsyncMock()) as render,
     ):
         await choose_devices(callback, user, AsyncMock(), state)
 
@@ -374,7 +372,58 @@ async def test_choose_devices_creates_owned_telegram_checkout_and_renders_confir
         'source': 'telegram',
     }
     state.update_data.assert_awaited_once_with(df_checkout_id='owned-checkout')
-    render.assert_awaited_once_with(callback, user, checkout, tariff_name='Premium')
+    render.assert_awaited_once_with(callback, user, ANY, checkout, tariff_name='Premium')
+
+
+@pytest.mark.asyncio
+async def test_new_direct_checkout_skips_duplicate_confirmations_and_opens_only_the_trusted_miniapp() -> None:
+    callback = SimpleNamespace()
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    draft = SimpleNamespace(
+        public_id='owned-checkout',
+        lifecycle_state='draft',
+        settlement_mode='direct_purchase_v2',
+        tariff_id=7,
+        tariff_total_kopeks=36_900,
+        selected_device_limit=4,
+        period_days=30,
+    )
+    confirmed = SimpleNamespace(**{**draft.__dict__, 'lifecycle_state': 'confirmed'})
+    db = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(name='Базовый')))
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.confirm_checkout', AsyncMock(return_value=confirmed)
+        ) as confirm_quote,
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}, {'key': 'cards_ru', 'provider_code': 11}]),
+        ),
+        patch(
+            'app.utils.miniapp_buttons.build_cabinet_url',
+            return_value='https://cabinet.example/subscription/purchase?safe',
+        ) as build_cabinet_url,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output,
+    ):
+        await _render_new_checkout(callback, user, db, draft, tariff_name='Базовый')
+
+    confirm_quote.assert_awaited_once_with(db, draft)
+    caption = output.await_args.kwargs['caption']
+    keyboard = output.await_args.kwargs['keyboard'].inline_keyboard
+    assert 'Ваш заказ' in caption
+    assert 'Базовый' in caption
+    assert '4 устройства · 1 месяц' in caption
+    assert '369 ₽' in caption
+    assert 'Подтвердить конфигурацию' not in caption
+    assert keyboard[0][0].text == 'СБП (QR-код) · 369 ₽'
+    assert keyboard[0][0].web_app.url == 'https://cabinet.example/subscription/purchase?safe'
+    assert build_cabinet_url.call_args_list[0].args[0] == (
+        '/subscription/purchase?checkout=owned-checkout&method=sbp&autostart=1'
+    )
+    assert keyboard[1][0].text == 'Карта российского банка · 369 ₽'
+    assert keyboard[-1][0].callback_data == 'df:e:owned-checkout'
+    callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
+    assert all(not callback.startswith(('df:c:', 'df:a:', 'df:x:')) for callback in callbacks)
 
 
 @pytest.mark.asyncio
@@ -498,10 +547,7 @@ async def test_open_draft_remains_reviewable_when_new_device_first_orders_are_di
             'app.handlers.subscription.device_first.build_purchase_options',
             AsyncMock(return_value={'eligible': False, 'reason': 'feature_disabled'}),
         ) as build_options,
-        patch(
-            'app.handlers.subscription.device_first._render_confirmation',
-            AsyncMock(),
-        ) as render,
+        patch('app.handlers.subscription.device_first._render_new_checkout', AsyncMock()) as render,
     ):
         assert await show_device_first_entry(callback, user, db, state) is True
 
@@ -509,7 +555,7 @@ async def test_open_draft_remains_reviewable_when_new_device_first_orders_are_di
     callback.answer.assert_awaited_once()
     state.update_data.assert_awaited_once_with(df_checkout_id='draft-17')
     db.get.assert_awaited_once_with(Tariff, 9)
-    render.assert_awaited_once_with(callback, user, checkout, tariff_name='Premium')
+    render.assert_awaited_once_with(callback, user, db, checkout, tariff_name='Premium')
 
 
 @pytest.mark.asyncio
@@ -726,12 +772,12 @@ async def test_pending_invoice_uses_a_localized_method_name_and_blocks_second_me
     assert 'cards_ru' not in caption
     assert keyboard[0][0].url == 'https://pay.example/invoice'
     assert keyboard[1][0].callback_data == 'df:s:owned-checkout'
-    assert keyboard[2][0].callback_data == 'df:x:owned-checkout'
+    assert keyboard[2][0].callback_data == 'back_to_menu'
     methods.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_pending_invoice_without_a_payment_url_offers_status_support_and_cancel() -> None:
+async def test_pending_invoice_without_a_payment_url_offers_only_safe_recovery_actions() -> None:
     callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
     user = SimpleNamespace(id=17, language='en', balance_kopeks=0)
     checkout = SimpleNamespace(
@@ -764,7 +810,8 @@ async def test_pending_invoice_without_a_payment_url_offers_status_support_and_c
     assert 'Checking the invoice' in caption
     assert 'df:s:owned-checkout' in callbacks
     assert 'menu_support' in callbacks
-    assert 'df:x:owned-checkout' in callbacks
+    assert 'back_to_menu' in callbacks
+    assert all(not callback.startswith('df:x:') for callback in callbacks)
 
 
 @pytest.mark.asyncio
@@ -967,3 +1014,7 @@ async def test_reconciliation_error_tells_telegram_user_not_to_pay_again_and_off
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert keyboard[0][0].callback_data == 'df:s:owned-checkout'
     assert keyboard[1][0].callback_data == 'menu_support'
+    assert keyboard[2][0].callback_data == 'back_to_menu'
+    assert all(
+        not button.callback_data.startswith('df:x:') for row in keyboard for button in row if button.callback_data
+    )

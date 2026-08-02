@@ -246,6 +246,46 @@ async def get_current_cabinet_user(
     return user
 
 
+async def get_current_native_launch_user(
+    request: Request,
+    user: User = Depends(get_current_cabinet_user),
+) -> User:
+    """Return a Cabinet user only after proving the current Telegram WebApp identity.
+
+    A regular Cabinet session may also be used in a browser, so the base
+    dependency intentionally permits a JWT without WebApp ``initData``.  A
+    Telegram-native payment launch is different: it may create an external
+    provider invoice immediately after one Telegram button tap.  Require the
+    signed Telegram identity for that narrow mutation and bind it to the JWT
+    owner before any checkout is read or changed.
+    """
+    init_data_raw = request.headers.get('X-Telegram-Init-Data')
+    if not init_data_raw or user.telegram_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Telegram WebApp authentication is required for this payment launch',
+            headers={'WWW-Authenticate': 'Bearer'},
+        )
+
+    # Telegram Desktop can keep a valid WebApp initData payload longer than a
+    # normal mobile session.  Keep the same verified age window as the Cabinet
+    # session guard; the HMAC signature and exact Telegram id remain mandatory.
+    telegram_user = validate_telegram_init_data(init_data_raw, max_age_seconds=86400 * 30)
+    if telegram_user is None or telegram_user.get('id') != user.telegram_id:
+        logger.warning(
+            'Native payment launch rejected: Telegram identity does not match Cabinet session',
+            jwt_user_id=user.id,
+            jwt_telegram_id=user.telegram_id,
+            init_data_telegram_id=(telegram_user or {}).get('id'),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Telegram identity does not match this Cabinet session',
+            headers={'WWW-Authenticate': 'Bearer'},
+        )
+    return user
+
+
 async def get_optional_cabinet_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(security),

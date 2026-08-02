@@ -44,7 +44,12 @@ from app.services.device_first_payment_service import (
 )
 from app.utils.cache import RateLimitCache
 
-from ..dependencies import get_cabinet_db, get_current_cabinet_user, require_permission
+from ..dependencies import (
+    get_cabinet_db,
+    get_current_cabinet_user,
+    get_current_native_launch_user,
+    require_permission,
+)
 
 
 router = APIRouter(prefix='/device-first', tags=['Cabinet Device First'])
@@ -64,6 +69,12 @@ class CheckoutCommitRequest(BaseModel):
 
     funding_mode: str = Field(..., pattern='^(wallet|platega)$')
     method_key: str | None = Field(None, min_length=1, max_length=32)
+
+
+class NativeCheckoutLaunchRequest(BaseModel):
+    """A provider method selected from a Telegram-native Mini App button."""
+
+    method_key: str = Field(..., min_length=1, max_length=32)
 
 
 class ReconciliationResolutionRequest(BaseModel):
@@ -380,24 +391,25 @@ async def checkout_arm(
     )
 
 
-@router.post('/checkout/{checkout_id}/commit')
-async def checkout_commit(
+async def _commit_checkout(
+    *,
     checkout_id: str,
     request: CheckoutCommitRequest,
-    idempotency_key: str | None = Header(None, alias='Idempotency-Key'),
-    user: User = Depends(get_current_cabinet_user),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
+    idempotency_key: str | None,
+    user: User,
+    db: AsyncSession,
+    action: str,
+) -> dict[str, Any]:
     """Commit one v2 sale or create its exact full-price provider invoice.
 
     The redirect is deliberately returned only by this authenticated, owned
     mutation response.  Status reads and public values never expose it.
     """
-    await _rate_limit(user.id, 'commit', limit=5)
+    await _rate_limit(user.id, action, limit=5)
     mutation, replay = await _mutation(
         db,
         user_id=user.id,
-        action='commit',
+        action=action,
         key=idempotency_key,
         payload={'checkout_id': checkout_id, **request.model_dump()},
     )
@@ -449,6 +461,50 @@ async def checkout_commit(
         _raise(error)
     await store_mutation_result(db, mutation, response=_redact_mutation_response(response))
     return response
+
+
+@router.post('/checkout/{checkout_id}/commit')
+async def checkout_commit(
+    checkout_id: str,
+    request: CheckoutCommitRequest,
+    idempotency_key: str | None = Header(None, alias='Idempotency-Key'),
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Explicit Cabinet checkout action, including deliberate wallet payment."""
+    return await _commit_checkout(
+        checkout_id=checkout_id,
+        request=request,
+        idempotency_key=idempotency_key,
+        user=user,
+        db=db,
+        action='commit',
+    )
+
+
+@router.post('/checkout/{checkout_id}/native-launch')
+async def checkout_native_launch(
+    checkout_id: str,
+    request: NativeCheckoutLaunchRequest,
+    idempotency_key: str | None = Header(None, alias='Idempotency-Key'),
+    user: User = Depends(get_current_native_launch_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Launch one provider invoice from an authenticated Telegram Mini App.
+
+    Query parameters that opened the Mini App are not an authority.  This
+    mutation requires a signed Telegram identity matching the Cabinet session,
+    then delegates to the exact same owner-scoped direct-payment state machine
+    as the normal Cabinet button.  It can never debit the wallet.
+    """
+    return await _commit_checkout(
+        checkout_id=checkout_id,
+        request=CheckoutCommitRequest(funding_mode='platega', method_key=request.method_key),
+        idempotency_key=idempotency_key,
+        user=user,
+        db=db,
+        action='native_launch',
+    )
 
 
 @router.post('/checkout/{checkout_id}/resume-invoice')
