@@ -188,6 +188,8 @@ async def create_trial_subscription(
     squad_uuid: str = None,
     connected_squads: list[str] = None,
     tariff_id: int | None = None,
+    *,
+    commit: bool = True,
 ) -> Subscription:
     """Создает триальную подписку.
 
@@ -250,8 +252,11 @@ async def create_trial_subscription(
         existing.tariff_id = tariff_id
         if not existing.remnawave_short_id:
             existing.remnawave_short_id = await generate_unique_short_id(db)
-        await db.commit()
-        await db.refresh(existing)
+        if commit:
+            await db.commit()
+            await db.refresh(existing)
+        else:
+            await db.flush()
         logger.info(
             '🎁 Обновлена PENDING триальная подписка для пользователя', existing_id=existing.id, user_id=user_id
         )
@@ -295,8 +300,16 @@ async def create_trial_subscription(
 
     db.add(subscription)
     try:
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
     except IntegrityError as exc:
+        # A caller that owns a larger financial transaction must decide how to
+        # recover.  Rolling its transaction back here would silently undo
+        # unrelated fenced state (for example an abandoned external invoice).
+        if not commit:
+            raise
         # Всегда откатываем транзакцию и убираем объект из сессии — независимо от
         # причины ошибки, сессию нельзя оставлять в broken-состоянии.
         await db.rollback()
@@ -320,7 +333,8 @@ async def create_trial_subscription(
         if concurrent:
             return concurrent
         raise
-    await db.refresh(subscription)
+    if commit:
+        await db.refresh(subscription)
 
     logger.info(
         f'🎁 Создана триальная подписка для пользователя {user_id}'

@@ -16,9 +16,9 @@ from app.database.crud.subscription import (
     create_trial_subscription,
     should_carry_trial_remaining_days,
 )
-from app.database.crud.transaction import create_transaction
+from app.database.crud.transaction import create_transaction, emit_transaction_side_effects
 from app.database.crud.user import subtract_user_balance
-from app.database.models import PaymentMethod, Subscription, SubscriptionStatus, TransactionType, User
+from app.database.models import PaymentMethod, Subscription, SubscriptionStatus, Transaction, TransactionType, User
 from app.keyboards.inline import (
     get_back_keyboard,
     get_countries_keyboard,
@@ -48,9 +48,12 @@ from app.services.subscription_checkout_service import (
 )
 from app.services.subscription_service import SubscriptionService
 from app.services.trial_activation_service import (
+    TrialCheckoutResolutionError,
     TrialPaymentChargeFailed,
     TrialPaymentInsufficientFunds,
+    activate_trial_with_checkout_resolution,
     charge_trial_activation_if_required,
+    get_trial_checkout_context,
     revert_trial_activation,
     rollback_trial_subscription_activation,
 )
@@ -66,6 +69,175 @@ async def _resolve_subscription(callback, db_user, db, state=None):
     from .common import resolve_subscription_from_context
 
     return await resolve_subscription_from_context(callback, db_user, db, state)
+
+
+async def _show_trial_checkout_resolution(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+) -> bool:
+    """Send legacy Telegram paths into the explicit `/trial` decision screen.
+
+    The old callback protocol has no signed order identifier or persistent
+    idempotency key.  It must therefore never guess whether an outstanding
+    direct invoice is safe to replace.
+    """
+
+    context = await get_trial_checkout_context(db, user_id=db_user.id)
+    if context.state == 'ready':
+        return False
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    texts = get_texts(db_user.language)
+    if context.state == 'pending_invoice' and context.checkout is not None:
+        message = (
+            '🧾 <b>Есть незавершённый заказ</b>\n\n'
+            f'{html.escape(context.checkout.tariff_name)} · {context.checkout.device_limit} устройств · '
+            f'{context.checkout.period_days} дней\n'
+            f'К оплате: {settings.format_price(context.checkout.amount_kopeks)}\n\n'
+            'Откройте кабинет: там можно вернуться к оплате или начать пробный период.'
+        )
+    else:
+        message = (
+            '⏳ <b>Проверяем предыдущую оплату</b>\n\n'
+            'Чтобы не создать повторный счёт, откройте кабинет и обновите статус заказа.'
+        )
+    # Keep the fallback valid even for installations where Cabinet is disabled
+    # or its URL is not configured.  During the backend-first rollout this is
+    # deliberately the existing Cabinet root; the CTA switches to `/trial`
+    # only after that route is live in the separately deployed frontend.
+    cabinet_url = build_cabinet_url('/')
+    if cabinet_url:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text='Открыть кабинет', web_app=types.WebAppInfo(url=cabinet_url))],
+                [InlineKeyboardButton(text=texts.BACK, callback_data='menu_trial')],
+            ]
+        )
+    else:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text='Связаться с поддержкой', callback_data='menu_support')],
+                [InlineKeyboardButton(text='В главное меню', callback_data='back_to_menu')],
+            ]
+        )
+    await callback.message.edit_text(message, reply_markup=keyboard, parse_mode='HTML')
+    await callback.answer()
+    return True
+
+
+async def _activate_trial_with_coordinator_from_telegram(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+) -> None:
+    """Post-commit trial activation for Telegram callback fallbacks.
+
+    The subscription/order decision is committed by the common coordinator
+    first.  RemnaWave and Telegram are best-effort follow-ups and cannot undo a
+    paid or locally-fenced decision.
+    """
+
+    texts = get_texts(db_user.language)
+    forced_devices = None
+    if not settings.is_devices_selection_enabled():
+        forced_devices = settings.get_disabled_mode_device_limit()
+    try:
+        result = await activate_trial_with_checkout_resolution(
+            db,
+            user_id=db_user.id,
+            forced_device_limit=forced_devices,
+            charge_description='Активация триала через бота',
+        )
+    except TrialPaymentInsufficientFunds as error:
+        await callback.message.edit_text(
+            texts.t(
+                'TRIAL_PAYMENT_INSUFFICIENT_FUNDS',
+                '⚠️ Недостаточно средств для активации триала.\n'
+                'Необходимо: {required}\nНа балансе: {balance}\nНе хватает: {missing}\n\n'
+                'Пополните баланс и попробуйте снова.',
+            ).format(
+                required=settings.format_price(error.required_amount, round_kopeks=False),
+                balance=settings.format_price(error.balance_amount, round_kopeks=False),
+                missing=settings.format_price(error.missing_amount, round_kopeks=False),
+            ),
+            reply_markup=get_insufficient_balance_keyboard(db_user.language, amount_kopeks=error.required_amount),
+        )
+        await callback.answer()
+        return
+    except TrialPaymentChargeFailed:
+        await callback.message.edit_text(
+            texts.t('TRIAL_PAYMENT_FAILED', 'Не удалось списать средства. Попробуйте ещё раз.'),
+            reply_markup=get_back_keyboard(db_user.language),
+        )
+        await callback.answer()
+        return
+    except TrialCheckoutResolutionError:
+        # The dedicated screen knows the exact invoice identity and has the
+        # explicit action required by the server; callbacks deliberately do not.
+        await _show_trial_checkout_resolution(callback, db_user, db)
+        return
+
+    subscription = result.subscription
+    remnawave_user = None
+    if not result.already_active:
+        if result.charge_transaction_id is not None:
+            transaction = await db.get(Transaction, result.charge_transaction_id)
+            if transaction is not None:
+                await emit_transaction_side_effects(
+                    db,
+                    transaction,
+                    amount_kopeks=result.charged_amount_kopeks,
+                    user_id=db_user.id,
+                    type=TransactionType.SUBSCRIPTION_PAYMENT,
+                    payment_method=PaymentMethod.BALANCE,
+                    description='Активация триала через бота',
+                )
+        subscription_service = SubscriptionService()
+        try:
+            if subscription_service.is_configured:
+                remnawave_user = await subscription_service.create_remnawave_user(db, subscription)
+                await db.refresh(subscription)
+        except Exception as error:
+            logger.error('Telegram trial provisioning failed', subscription_id=subscription.id, error=error)
+        if subscription_service.is_configured and remnawave_user is None:
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+            remnawave_retry_queue.enqueue(subscription_id=subscription.id, user_id=db_user.id, action='create')
+        try:
+            await AdminNotificationService(callback.bot).send_trial_activation_notification(
+                db,
+                db_user,
+                subscription,
+                charged_amount_kopeks=result.charged_amount_kopeks or None,
+            )
+        except Exception as error:
+            logger.debug('Telegram trial notification failed', user_id=db_user.id, error=error)
+        try:
+            from app.utils.funnel_notify import notify_trial_menu
+
+            await notify_trial_menu(db, db_user)
+        except Exception as error:
+            logger.debug('Telegram trial menu refresh failed', user_id=db_user.id, error=error)
+
+    await db.refresh(db_user)
+    await db.refresh(subscription)
+    subscription_link = get_display_subscription_link(subscription)
+    success_text = texts.TRIAL_ACTIVATED
+    if result.charged_amount_kopeks:
+        success_text += '\n\n💳 С вашего баланса списано ' + settings.format_price(result.charged_amount_kopeks) + '.'
+    if not subscription_link:
+        success_text += '\n\n⚠️ Ссылка генерируется. Откройте «Моя подписка» через несколько секунд.'
+    await callback.message.edit_text(
+        success_text,
+        reply_markup=(
+            _build_trial_success_keyboard(texts, subscription_link, settings.CONNECT_BUTTON_MODE)
+            if subscription_link
+            else get_back_keyboard(db_user.language)
+        ),
+        parse_mode='HTML',
+    )
+    await callback.answer()
 
 
 def _serialize_markup(markup: InlineKeyboardMarkup | None) -> Any | None:
@@ -635,6 +807,12 @@ async def show_trial_offer(callback: types.CallbackQuery, db_user: User, db: Asy
         await callback.answer()
         return
 
+    # Telegram callback fallbacks have no authority to discard a direct
+    # provider invoice.  Make the user-facing choice in the signed Cabinet
+    # `/trial` route instead of treating a stale checkout as a subscription.
+    if await _show_trial_checkout_resolution(callback, db_user, db):
+        return
+
     # Получаем параметры триала (из тарифа или из глобальных настроек)
     trial_days = settings.TRIAL_DURATION_DAYS
     trial_traffic = settings.TRIAL_TRAFFIC_LIMIT_GB
@@ -733,57 +911,23 @@ async def show_trial_offer(callback: types.CallbackQuery, db_user: User, db: Asy
 
 
 def _get_trial_payment_keyboard(language: str, can_pay_from_balance: bool = False) -> types.InlineKeyboardMarkup:
-    """Создает клавиатуру с методами оплаты для платного триала."""
-    texts = get_texts(language)
-    keyboard = []
+    """Return only the serialized balance path for a paid trial.
 
-    # Кнопка оплаты с баланса (если хватает средств)
+    A direct Device-First sale and the historical external paid-trial flow
+    previously owned two separate pending subscription records.  They could
+    race and turn a paid trial callback into an unfulfilled entitlement.  A
+    top-up is an ordinary balance deposit (not a pending trial subscription),
+    so the final charge and trial creation can stay in the common locked
+    coordinator.
+    """
+
+    texts = get_texts(language)
+    keyboard: list[list[types.InlineKeyboardButton]] = []
     if can_pay_from_balance:
         keyboard.append(
             [types.InlineKeyboardButton(text='✅ Оплатить с баланса', callback_data='trial_pay_with_balance')]
         )
-
-    # Добавляем доступные методы оплаты
-    if settings.TELEGRAM_STARS_ENABLED:
-        keyboard.append([types.InlineKeyboardButton(text='⭐ Telegram Stars', callback_data='trial_payment_stars')])
-
-    if settings.is_yookassa_enabled():
-        yookassa_methods = []
-        if settings.YOOKASSA_SBP_ENABLED:
-            yookassa_methods.append(
-                types.InlineKeyboardButton(text='🏦 YooKassa (СБП)', callback_data='trial_payment_yookassa_sbp')
-            )
-        yookassa_methods.append(
-            types.InlineKeyboardButton(text='💳 YooKassa (Карта)', callback_data='trial_payment_yookassa')
-        )
-        if yookassa_methods:
-            keyboard.append(yookassa_methods)
-
-    if settings.is_cryptobot_enabled():
-        keyboard.append([types.InlineKeyboardButton(text='🪙 CryptoBot', callback_data='trial_payment_cryptobot')])
-
-    if settings.is_heleket_enabled():
-        keyboard.append([types.InlineKeyboardButton(text='🪙 Heleket', callback_data='trial_payment_heleket')])
-
-    if settings.is_mulenpay_enabled():
-        mulenpay_name = settings.get_mulenpay_display_name()
-        keyboard.append(
-            [types.InlineKeyboardButton(text=f'💳 {mulenpay_name}', callback_data='trial_payment_mulenpay')]
-        )
-
-    if settings.is_pal24_enabled():
-        keyboard.append([types.InlineKeyboardButton(text='💳 PayPalych', callback_data='trial_payment_pal24')])
-
-    if settings.is_wata_enabled():
-        keyboard.append([types.InlineKeyboardButton(text='💳 WATA', callback_data='trial_payment_wata')])
-
-    if settings.is_platega_enabled():
-        platega_name = settings.get_platega_display_name()
-        keyboard.append([types.InlineKeyboardButton(text=f'💳 {platega_name}', callback_data='trial_payment_platega')])
-
-    # Кнопка назад
     keyboard.append([types.InlineKeyboardButton(text=texts.BACK, callback_data='menu_trial')])
-
     return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
@@ -827,6 +971,9 @@ async def activate_trial(callback: types.CallbackQuery, db_user: User, db: Async
     if db_user.is_trial_already_used():
         await callback.message.edit_text(texts.TRIAL_ALREADY_USED, reply_markup=get_back_keyboard(db_user.language))
         await callback.answer()
+        return
+
+    if await _show_trial_checkout_resolution(callback, db_user, db):
         return
 
     # Проверяем, платный ли триал
@@ -877,20 +1024,37 @@ async def activate_trial(callback: types.CallbackQuery, db_user: User, db: Async
             message_lines.append(
                 texts.t(
                     'PAID_TRIAL_CAN_PAY_BALANCE',
-                    'Вы можете оплатить пробную подписку с баланса или выбрать другой способ оплаты.',
+                    'Оплатите пробную подписку с баланса.',
                 )
             )
+            keyboard = _get_trial_payment_keyboard(db_user.language, True)
         else:
-            message_lines.append(texts.t('PAID_TRIAL_SELECT_PAYMENT', 'Выберите подходящий способ оплаты:'))
+            message_lines.append(
+                texts.t(
+                    'PAID_TRIAL_BALANCE_REQUIRED',
+                    'Сначала пополните баланс. После пополнения вернитесь сюда: триал будет активирован одной '
+                    'защищённой операцией.',
+                )
+            )
+            keyboard = get_insufficient_balance_keyboard(
+                db_user.language,
+                resume_callback='trial_activate',
+                amount_kopeks=trial_price_kopeks - user_balance_kopeks,
+            )
 
         message_text = '\n'.join(message_lines)
-        keyboard = _get_trial_payment_keyboard(db_user.language, can_pay_from_balance)
 
         await callback.message.edit_text(message_text, reply_markup=keyboard, parse_mode='HTML')
         await callback.answer()
         return
 
-    # Бесплатный триал - текущее поведение
+    # Free trial: all state mutation is performed by the shared coordinator.
+    # The legacy implementation below is intentionally unreachable until it
+    # can be removed in a later cleanup release.
+    await _activate_trial_with_coordinator_from_telegram(callback, db_user, db)
+    return
+
+    # Бесплатный триал - legacy behavior (unreachable)
     charged_amount = 0
     subscription: Subscription | None = None
     remnawave_user = None
@@ -3265,6 +3429,15 @@ async def handle_trial_pay_with_balance(callback: types.CallbackQuery, db_user: 
         await callback.answer('❌ Ошибка: триал бесплатный', show_alert=True)
         return
 
+    if await _show_trial_checkout_resolution(callback, db_user, db):
+        return
+
+    # Balance-paid trial uses the same atomic coordinator as the Cabinet.
+    # It owns the balance charge and subscription creation in one transaction.
+    await _activate_trial_with_coordinator_from_telegram(callback, db_user, db)
+    return
+
+    # Legacy balance-charge path (unreachable).
     user_balance_kopeks = getattr(db_user, 'balance_kopeks', 0) or 0
     if user_balance_kopeks < trial_price_kopeks:
         await callback.answer(texts.t('INSUFFICIENT_BALANCE', '❌ Недостаточно средств на балансе'), show_alert=True)
@@ -3657,10 +3830,39 @@ async def handle_trial_payment_method(callback: types.CallbackQuery, db_user: Us
         await callback.answer()
         return
 
+    if await _show_trial_checkout_resolution(callback, db_user, db):
+        return
+
     trial_price_kopeks = get_trial_activation_charge_amount()
     if trial_price_kopeks <= 0:
         await callback.answer('❌ Ошибка: триал бесплатный', show_alert=True)
         return
+
+    # Legacy external paid-trial callbacks may still arrive from an already
+    # rendered Telegram message.  Do not create the historical PENDING trial
+    # subscription: it is a separate payment ownership model and can race a
+    # Device-First sale.  A normal balance top-up creates no trial entitlement;
+    # the common coordinator then atomically charges the balance and activates
+    # the trial under the same P→U→A→C fence as every other active checkout.
+    balance_kopeks = int(getattr(db_user, 'balance_kopeks', 0) or 0)
+    if balance_kopeks >= trial_price_kopeks:
+        reply_markup = _get_trial_payment_keyboard(db_user.language, True)
+    else:
+        reply_markup = get_insufficient_balance_keyboard(
+            db_user.language,
+            resume_callback='trial_activate',
+            amount_kopeks=trial_price_kopeks - balance_kopeks,
+        )
+    await callback.message.edit_text(
+        texts.t(
+            'PAID_TRIAL_EXTERNAL_PAYMENT_RETIRED',
+            'Для безопасной активации пробного периода сначала пополните баланс. '
+            'После пополнения вернитесь сюда и оплатите триал с баланса.',
+        ),
+        reply_markup=reply_markup,
+    )
+    await callback.answer()
+    return
 
     # Определяем метод оплаты
     payment_method = callback.data.replace('trial_payment_', '')

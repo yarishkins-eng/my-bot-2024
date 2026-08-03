@@ -15,7 +15,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,10 +32,19 @@ from app.database.crud.subscription import (
     should_carry_trial_remaining_days,
 )
 from app.database.crud.tariff import get_tariff_by_id, get_tariffs_for_user
-from app.database.crud.transaction import create_transaction
+from app.database.crud.transaction import create_transaction, emit_transaction_side_effects
 from app.database.crud.user import add_user_balance, get_user_by_id, subtract_user_balance
 from app.database.database import AsyncSessionLocal
-from app.database.models import PaymentMethod, Subscription, Tariff, Transaction, TransactionType, User
+from app.database.models import (
+    DeviceFirstMutation,
+    PaymentMethod,
+    Subscription,
+    Tariff,
+    Transaction,
+    TransactionType,
+    User,
+)
+from app.services.device_first_checkout_service import request_hash, store_mutation_result
 from app.services.notification_delivery_service import (
     NotificationType,
     notification_delivery_service,
@@ -46,6 +56,16 @@ from app.services.subscription_purchase_service import (
     PurchaseValidationError,
 )
 from app.services.subscription_service import SubscriptionService
+from app.services.trial_activation_service import (
+    TrialActivationResult,
+    TrialCheckoutResolutionError,
+    TrialPaymentChargeFailed,
+    TrialPaymentInsufficientFunds,
+    activate_trial_with_checkout_resolution,
+    get_trial_activation_charge_amount,
+    get_trial_checkout_context,
+    get_trial_offer_parameters,
+)
 from app.services.user_cart_service import user_cart_service
 from app.utils.pricing_utils import format_period_description
 
@@ -105,6 +125,246 @@ async def _persist_failed_refund(user_id: int, amount_kopeks: int, reason: str, 
             original_error=str(error),
             persist_error=persist_error,
         )
+
+
+async def _trial_info_response(user: User, db: AsyncSession) -> TrialInfoResponse:
+    """The single read model for every `/trial` client.
+
+    A stale order is deliberately not hidden: it is shown as a choice only when
+    the server can prove it is a single, unpaid, direct provider invoice.  All
+    other non-terminal payment states fail closed into reconciliation.
+    """
+
+    await db.refresh(user, ['subscriptions'])
+    parameters = await get_trial_offer_parameters(db)
+    checkout_context = await get_trial_checkout_context(db, user_id=user.id)
+    price_kopeks = get_trial_activation_charge_amount()
+
+    is_available = True
+    reason: str | None = None
+    if settings.TRIAL_DURATION_DAYS <= 0 or settings.is_trial_disabled_for_user(getattr(user, 'auth_type', 'telegram')):
+        is_available = False
+        reason = 'Trial is not available for your account type'
+    else:
+        subscriptions = getattr(user, 'subscriptions', None) or []
+        has_live = any(
+            subscription.status in {'active', 'trial', 'limited'}
+            and (subscription.end_date is None or subscription.end_date > datetime.now(UTC))
+            for subscription in subscriptions
+        )
+        if has_live:
+            is_available = False
+            reason = 'You already have an active subscription'
+        elif user.is_trial_already_used():
+            is_available = False
+            reason = 'Trial already used'
+
+    return TrialInfoResponse(
+        is_available=is_available,
+        duration_days=int(parameters['duration_days']),
+        traffic_limit_gb=int(parameters['traffic_limit_gb']),
+        device_limit=int(parameters['device_limit']),
+        requires_payment=bool(price_kopeks),
+        price_kopeks=price_kopeks,
+        price_rubles=price_kopeks / 100,
+        reason_unavailable=reason,
+        checkout_state=checkout_context.state,
+        checkout=checkout_context.checkout.as_dict() if checkout_context.checkout is not None else None,
+    )
+
+
+async def _find_or_create_trial_mutation(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    idempotency_key: str | None,
+    payload: dict[str, Any],
+) -> tuple[DeviceFirstMutation | None, dict[str, Any] | None]:
+    """Persist a client retry key without making legacy clients unsafe.
+
+    Old Mini Apps post no header, so they rely on the transaction coordinator's
+    user lock.  Current Cabinet sends a key and gets durable replay semantics.
+    """
+
+    if not idempotency_key:
+        return None, None
+    key = idempotency_key.strip()
+    if not key or len(key) > 128:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid Idempotency-Key')
+    digest = request_hash(payload)
+    existing = (
+        await db.execute(
+            select(DeviceFirstMutation).where(
+                DeviceFirstMutation.owner_user_id == user_id,
+                DeviceFirstMutation.action == 'trial_activate',
+                DeviceFirstMutation.idempotency_key == key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.request_hash != digest:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Idempotency key payload mismatch')
+        return existing, existing.response_json
+
+    mutation = DeviceFirstMutation(
+        owner_user_id=user_id,
+        action='trial_activate',
+        idempotency_key=key,
+        request_hash=digest,
+    )
+    db.add(mutation)
+    try:
+        # The key must survive a browser retry even if the user closes the
+        # Mini App immediately after the transactional activation commits.
+        await db.commit()
+        await db.refresh(mutation)
+        return mutation, None
+    except IntegrityError:
+        await db.rollback()
+        existing = (
+            await db.execute(
+                select(DeviceFirstMutation).where(
+                    DeviceFirstMutation.owner_user_id == user_id,
+                    DeviceFirstMutation.action == 'trial_activate',
+                    DeviceFirstMutation.idempotency_key == key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None or existing.request_hash != digest:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Idempotency conflict')
+        return existing, existing.response_json
+
+
+async def _run_trial_post_commit(
+    db: AsyncSession,
+    *,
+    user: User,
+    result: TrialActivationResult,
+    yandex_cid: str | None,
+) -> None:
+    """Best-effort effects after the atomic order/trial transaction is durable."""
+
+    if result.already_active:
+        return
+
+    subscription = result.subscription
+    subscription_service = SubscriptionService()
+    panel_user = None
+    try:
+        if subscription_service.is_configured:
+            async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
+                panel_user = await subscription_service.create_remnawave_user(db, subscription)
+                await db.refresh(subscription)
+    except Exception as error:
+        logger.error('Failed to create RemnaWave user for trial', user_id=user.id, error=error)
+    if subscription_service.is_configured and panel_user is None:
+        from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+        remnawave_retry_queue.enqueue(subscription_id=subscription.id, user_id=user.id, action='create')
+
+    if result.charge_transaction_id is not None:
+        transaction = await db.get(Transaction, result.charge_transaction_id)
+        if transaction is not None:
+            await emit_transaction_side_effects(
+                db,
+                transaction,
+                amount_kopeks=result.charged_amount_kopeks,
+                user_id=user.id,
+                type=TransactionType.SUBSCRIPTION_PAYMENT,
+                payment_method=PaymentMethod.BALANCE,
+                description='Активация триальной подписки',
+            )
+
+    try:
+        from app.bot_factory import create_bot
+        from app.services.admin_notification_service import AdminNotificationService
+
+        if getattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', False):
+            bot = create_bot()
+            try:
+                await AdminNotificationService(bot).send_trial_activation_notification(
+                    db,
+                    user,
+                    subscription,
+                    charged_amount_kopeks=result.charged_amount_kopeks or None,
+                )
+            finally:
+                await bot.session.close()
+    except Exception as error:
+        logger.error('Failed to send trial activation notification', user_id=user.id, error=error)
+
+    try:
+        from app.services import yandex_offline_conv_service as yandex_conv
+
+        await yandex_conv.store_cid_and_fire_trial(user.id, yandex_cid)
+    except Exception as error:
+        logger.debug('Yandex trial conversion hook failed', user_id=user.id, error=error)
+
+    try:
+        from app.utils.funnel_notify import notify_trial_menu
+
+        await notify_trial_menu(db, user)
+    except Exception as error:
+        logger.debug('Trial funnel menu refresh failed', user_id=user.id, error=error)
+
+
+async def _activate_trial_v2(
+    *,
+    request: TrialActivateRequest | None,
+    user: User,
+    db: AsyncSession,
+    idempotency_key: str | None,
+) -> SubscriptionResponse:
+    request = request or TrialActivateRequest()
+    payload = {
+        'resolution': request.resolution,
+        'expected_checkout_id': request.expected_checkout_id,
+    }
+    mutation, replay = await _find_or_create_trial_mutation(
+        db,
+        user_id=user.id,
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if replay is not None:
+        return SubscriptionResponse.model_validate(replay)
+
+    # Preserve the existing paid-trial analytics order: CID is durable before
+    # its committed SUBSCRIPTION_PAYMENT can emit a purchase event.
+    if get_trial_activation_charge_amount() > 0 and request.yandex_cid:
+        try:
+            from app.services import yandex_offline_conv_service as yandex_conv
+
+            await yandex_conv.store_cid_only(user.id, request.yandex_cid)
+        except Exception as error:
+            logger.debug('Yandex trial CID persist failed', user_id=user.id, error=error)
+
+    try:
+        result = await activate_trial_with_checkout_resolution(
+            db,
+            user_id=user.id,
+            resolution=request.resolution,
+            expected_checkout_public_id=request.expected_checkout_id,
+        )
+    except TrialPaymentInsufficientFunds as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Insufficient balance. Need {error.required_amount / 100:.2f} RUB',
+        ) from error
+    except TrialPaymentChargeFailed as error:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED, detail='Failed to charge trial activation fee'
+        ) from error
+    except TrialCheckoutResolutionError as error:
+        detail = {'code': error.code, 'message': str(error), **error.context}
+        raise HTTPException(status_code=error.status_code, detail=detail) from error
+
+    await db.refresh(user)
+    response = _subscription_to_response(result.subscription, user=user).model_dump(mode='json')
+    if mutation is not None:
+        await store_mutation_result(db, mutation, response=response)
+    await _run_trial_post_commit(db, user=user, result=result, yandex_cid=request.yandex_cid)
+    return SubscriptionResponse.model_validate(response)
 
 
 # ============ Full Purchase Flow (like MiniApp) ============
@@ -1294,6 +1554,11 @@ async def get_trial_info(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get trial subscription info and availability."""
+    return await _trial_info_response(user, db)
+
+    # Legacy implementation retained below temporarily for a review-friendly
+    # diff.  The return above is the sole read path and includes the explicit
+    # direct-checkout state required by the new `/trial` journey.
     await db.refresh(user, ['subscriptions'])
 
     # Проверяем, отключён ли триал для этого типа пользователя
@@ -1384,8 +1649,18 @@ async def activate_trial(
     request: TrialActivateRequest | None = None,
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
+    idempotency_key: str | None = Header(None, alias='Idempotency-Key'),
 ):
     """Activate trial subscription."""
+    return await _activate_trial_v2(
+        request=request,
+        user=user,
+        db=db,
+        idempotency_key=idempotency_key,
+    )
+
+    # Legacy implementation retained below temporarily for a review-friendly
+    # diff.  All Cabinet mutation traffic reaches the atomic coordinator above.
     await db.refresh(user, ['subscriptions'])
 
     # Проверяем, отключён ли триал для этого типа пользователя

@@ -1253,3 +1253,21 @@ async def test_reconciliation_error_tells_telegram_user_not_to_pay_again_and_off
     assert all(
         not button.callback_data.startswith('df:x:') for row in keyboard for button in row if button.callback_data
     )
+
+
+@pytest.mark.asyncio
+async def test_legacy_trial_reconciliation_error_explains_the_hold_and_offers_support() -> None:
+    callback = SimpleNamespace(data='df:d:2')
+    error = DeviceFirstError('legacy_trial_reconciliation_required', 'Legacy trial payment requires review')
+
+    with patch(
+        'app.handlers.subscription.device_first.edit_or_answer_photo',
+        AsyncMock(),
+    ) as render:
+        await _render_error(callback, _user(), error)
+
+    assert 'незавершённая предыдущая оплата' in render.await_args.kwargs['caption']
+    assert 'Не оплачивайте повторно' in render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert keyboard[0][0].callback_data == 'menu_support'
+    assert keyboard[1][0].callback_data == 'back_to_menu'

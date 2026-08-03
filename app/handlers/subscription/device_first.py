@@ -1583,6 +1583,11 @@ def _safe_error_detail(user: User, error: DeviceFirstError | str) -> str:
             'Мы проверяем созданный счёт. Не оплачивайте повторно: откройте проверку статуса или обратитесь в поддержку.',
             'We are checking the created invoice. Do not pay again: check its status or contact support.',
         ),
+        'legacy_trial_reconciliation_required': _text(
+            user,
+            'Есть незавершённая предыдущая оплата. Не оплачивайте повторно — обратитесь в поддержку.',
+            'A previous payment is unfinished. Do not pay again — contact support.',
+        ),
         'invoice_terminal': _text(
             user,
             'Этот счёт уже закрыт. Выберите срок и устройства для нового заказа.',
@@ -1619,6 +1624,16 @@ async def _render_error(callback: types.CallbackQuery, user: User, error: Device
                 ],
                 [_main_menu(user)],
             ]
+    elif isinstance(error, DeviceFirstError) and error.code == 'legacy_trial_reconciliation_required':
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=_text(user, 'Связаться с поддержкой', 'Contact support'),
+                    callback_data='menu_support',
+                )
+            ],
+            [_main_menu(user)],
+        ]
     elif isinstance(error, DeviceFirstError) and error.code == 'invoice_terminal':
         rows = [
             [InlineKeyboardButton(text=_text(user, 'Выбрать тариф', 'Choose a plan'), callback_data='df:start')],

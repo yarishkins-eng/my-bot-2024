@@ -185,6 +185,48 @@ async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliat
 
 
 @pytest.mark.asyncio
+async def test_paid_pre_release_direct_checkout_is_held_if_a_legacy_trial_is_still_pending(monkeypatch):
+    """A paid direct callback never overwrites the entitlement of an old trial invoice."""
+    user = SimpleNamespace(id=7)
+    attempt = SimpleNamespace(id=41, status='paid_processing', reconciliation_reason=None)
+    checkout = SimpleNamespace(
+        id=9,
+        public_id='checkout-9',
+        user_id=7,
+        target_subscription_id=None,
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='fulfilling',
+        funding_state='paid',
+        fulfillment_state='not_started',
+        terminal_reason=None,
+    )
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=7),
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_checkout_service._has_locked_legacy_pending_trial',
+        AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(DeviceFirstError) as raised:
+        await fulfill_direct_external_checkout(
+            db,
+            checkout_id=checkout.id,
+            provider_payment_id='provider-1',
+            payment_attempt_id=attempt.id,
+        )
+
+    assert raised.value.code == 'legacy_trial_reconciliation_required'
+    assert checkout.lifecycle_state == 'operator_review'
+    assert checkout.terminal_reason == 'legacy_pending_trial_reconciliation_required'
+    assert attempt.status == 'operator_review'
+    assert attempt.reconciliation_reason == 'legacy_pending_trial_reconciliation_required'
+    assert db.commit.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_direct_fulfilment_uses_the_same_user_attempt_checkout_lock_order_as_reversal():
     """A post-paid reversal and its fulfilment cannot circularly wait on their fence rows."""
     user = SimpleNamespace(id=7)

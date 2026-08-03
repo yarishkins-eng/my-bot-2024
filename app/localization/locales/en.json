@@ -1634,6 +1634,8 @@
   "PAID_TRIAL_HEADER": "⚡ <b>Trial Subscription</b>",
   "PAID_TRIAL_SELECT_PAYMENT": "Choose a payment method:",
   "PAID_TRIAL_CAN_PAY_BALANCE": "You can pay for the trial from your balance or choose another payment method.",
+  "PAID_TRIAL_BALANCE_REQUIRED": "Top up your balance first. Then return here: the trial will be activated in one protected operation.",
+  "PAID_TRIAL_EXTERNAL_PAYMENT_RETIRED": "To activate the trial safely, top up your balance first. Then return here and pay for the trial from your balance.",
   "PAID_TRIAL_PAYMENT_DESC": "Trial subscription for {days} days",
   "PAID_TRIAL_INVOICE_TITLE": "Trial subscription for {days} days",
   "PAID_TRIAL_STARS_LABEL": "Trial subscription",

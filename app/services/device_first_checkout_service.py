@@ -28,6 +28,7 @@ from app.database.models import (
     DeviceFirstOutbox,
     Subscription,
     SubscriptionCheckout,
+    SubscriptionStatus,
     Tariff,
     Transaction,
     TransactionType,
@@ -422,6 +423,61 @@ async def _current_subscription(db: AsyncSession, user_id: int) -> Subscription 
     return await get_subscription_by_user_id(db, user_id)
 
 
+async def _has_locked_legacy_pending_trial(db: AsyncSession, *, user_id: int) -> bool:
+    """Return whether an old externally-paid trial still owns a payment outcome.
+
+    The historical paid-trial implementation created a ``PENDING, is_trial``
+    subscription *before* redirecting to its payment provider.  Device-first
+    sales must never repurpose that row: a later legacy callback would then
+    have accepted money but find no pending trial to activate.  There is no
+    safe generic provider cancellation contract for those old invoices, so the
+    only correct transition is to reconcile that payment before a direct sale
+    can be created or finalised.
+
+    Every caller already holds the per-user financial lock.  Taking the
+    subscription row lock here preserves the direct-flow order of User →
+    Checkout/Attempt → Subscription and makes the callback race deterministic.
+    """
+    result = await db.execute(
+        select(Subscription.id)
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.status == SubscriptionStatus.PENDING.value,
+            Subscription.is_trial.is_(True),
+        )
+        .with_for_update()
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def _require_no_legacy_pending_trial(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    checkout: SubscriptionCheckout | None = None,
+) -> None:
+    """Fence a direct sale while a historical paid-trial callback is possible."""
+    if not await _has_locked_legacy_pending_trial(db, user_id=user_id):
+        return
+
+    if checkout is not None:
+        # An already-created older checkout must not mutate the historical
+        # trial row after this release.  If it has already been paid, its
+        # receipt stays durable and this explicit hold gives an operator one
+        # auditable reconciliation point instead of silently losing either
+        # payment's entitlement.
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'legacy_pending_trial_reconciliation_required'
+        await db.commit()
+        _event('operator_review', checkout, reason=checkout.terminal_reason)
+
+    raise DeviceFirstError(
+        'legacy_trial_reconciliation_required',
+        'A previous trial payment is still awaiting reconciliation before another purchase can continue',
+    )
+
+
 def _subscription_snapshot(subscription: Subscription | None) -> dict[str, Any]:
     if subscription is None:
         return {}
@@ -562,6 +618,12 @@ async def create_checkout(
             'operator_review_required',
             'An earlier direct payment requires operator review before a new checkout',
         )
+
+    # ``PENDING + is_trial`` belongs exclusively to the retired external
+    # paid-trial flow.  Do not let a new direct quote target or overwrite it:
+    # provider callbacks for that historical invoice must retain an intact
+    # local entitlement until they are reconciled.
+    await _require_no_legacy_pending_trial(db, user_id=user.id)
 
     # A new explicit configuration replaces only an uncommitted direct quote.
     # This closes the Cabinet C1 state (create → confirm, no provider method
@@ -1002,6 +1064,7 @@ async def _validate_direct_pre_commit(
     tariff: Tariff,
 ) -> bool:
     """Fail before money if the quoted target is no longer safe to sell."""
+    await _require_no_legacy_pending_trial(db, user_id=user.id, checkout=checkout)
     now = datetime.now(UTC)
     if checkout.lifecycle_state != 'confirmed':
         raise DeviceFirstError('invalid_state', 'Checkout is not ready for final confirmation')
@@ -1136,6 +1199,7 @@ async def _complete_direct_sale_locked(
     provider_payment_id: str | None = None,
 ) -> SubscriptionCheckout:
     """Create exactly one direct-sale ledger and local subscription in this transaction."""
+    await _require_no_legacy_pending_trial(db, user_id=user.id, checkout=checkout)
     snapshot = dict(checkout.sale_snapshot or {})
     total = int(snapshot.get('tariff_total_kopeks') or 0)
     if (
@@ -1380,7 +1444,14 @@ async def fulfill_direct_external_checkout(
             target=target,
             provider_payment_id=provider_payment_id,
         )
-    except DeviceFirstError:
+    except DeviceFirstError as error:
+        if error.code == 'legacy_trial_reconciliation_required':
+            # A pre-release direct invoice may be paid after a historical
+            # pending trial has been discovered.  Do not let the recovery
+            # worker spin or silently overwrite the old trial; hold this exact
+            # paid attempt for one explicit financial reconciliation.
+            owned_attempt.status = 'operator_review'
+            owned_attempt.reconciliation_reason = 'legacy_pending_trial_reconciliation_required'
         await db.commit()
         raise
     await db.commit()

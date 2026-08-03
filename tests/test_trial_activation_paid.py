@@ -6,8 +6,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.models import User
-from app.handlers.subscription.purchase import activate_trial
-from app.services.trial_activation_service import TrialPaymentInsufficientFunds
+from app.handlers.subscription.purchase import (
+    _activate_trial_with_coordinator_from_telegram,
+    _show_trial_checkout_resolution,
+    activate_trial,
+    handle_trial_payment_method,
+)
+from app.services.trial_activation_service import (
+    TrialActivationResult,
+    TrialCheckoutContext,
+    TrialCheckoutSummary,
+    TrialPaymentInsufficientFunds,
+)
 
 
 @pytest.fixture
@@ -40,8 +50,8 @@ async def test_activate_trial_paid_shows_payment_screen_with_trial_price(
     trial_db,
 ):
     # Paid-trial entrypoint: when the activation charge is positive and the
-    # balance cannot cover it, activate_trial must render the paid-trial payment
-    # screen (price + balance lines + payment keyboard), NOT silently activate.
+    # balance cannot cover it, activation must require a normal balance top-up,
+    # not create a separate external pending-trial payment flow.
     trial_price_kopeks = 15900
     balance_kopeks = 100
 
@@ -70,21 +80,27 @@ async def test_activate_trial_paid_shows_payment_screen_with_trial_price(
         patch('app.config.Settings.is_trial_disabled_for_user', return_value=False),
         patch('app.config.Settings.is_tariffs_mode', return_value=False),
         patch(
-            'app.handlers.subscription.purchase._get_trial_payment_keyboard',
+            'app.handlers.subscription.purchase.get_trial_checkout_context',
+            new=AsyncMock(return_value=TrialCheckoutContext('ready')),
+        ),
+        patch(
+            'app.handlers.subscription.purchase.get_insufficient_balance_keyboard',
             return_value=mock_keyboard,
-        ) as payment_keyboard,
+        ) as topup_keyboard,
     ):
         await activate_trial(trial_callback_query, trial_user, trial_db)
 
-    # The paid-trial keyboard is shown for the can_pay_from_balance=False case.
-    payment_keyboard.assert_called_once_with(trial_user.language, False)
+    topup_keyboard.assert_called_once_with(
+        trial_user.language,
+        resume_callback='trial_activate',
+        amount_kopeks=trial_price_kopeks - balance_kopeks,
+    )
 
     trial_callback_query.message.edit_text.assert_called_once()
     _args, kwargs = trial_callback_query.message.edit_text.call_args
     body = trial_callback_query.message.edit_text.call_args[0][0]
 
-    # The payment screen must surface the exact trial price and balance, and use
-    # the paid-trial keyboard sentinel.
+    # The top-up screen must surface the exact trial price and balance.
     assert kwargs['reply_markup'] is mock_keyboard
     assert settings.format_price(trial_price_kopeks) in body
     assert settings.format_price(balance_kopeks) in body
@@ -93,15 +109,14 @@ async def test_activate_trial_paid_shows_payment_screen_with_trial_price(
 
 
 @pytest.mark.asyncio
-async def test_activate_free_trial_insufficient_funds_redirects_to_topup(
+async def test_activate_trial_coordinator_insufficient_funds_redirects_to_topup(
     trial_callback_query,
     trial_user,
     trial_db,
 ):
-    # Free-trial path (activation charge == 0): the subscription is created
-    # first, then charge_trial_activation_if_required raises
-    # TrialPaymentInsufficientFunds. activate_trial must roll back and redirect
-    # the user to the top-up keyboard for the EXACT required amount.
+    # The Telegram fallback must not construct a subscription itself.  The
+    # common coordinator rejects an unaffordable paid trial before it changes
+    # checkout, balance or subscription state, then the UI points to top-up.
     error = TrialPaymentInsufficientFunds(required_amount=15900, balance_amount=100)
 
     mock_keyboard = InlineKeyboardMarkup(inline_keyboard=[])
@@ -112,8 +127,7 @@ async def test_activate_free_trial_insufficient_funds_redirects_to_topup(
     trial_user.id = 42
 
     with (
-        # Paid branch skipped (price 0) -> free-trial activation flow runs.
-        # Locally imported from the service module -> patch at the source.
+        # Paid branch skipped so activation calls the shared coordinator.
         patch(
             'app.services.trial_activation_service.get_trial_activation_charge_amount',
             return_value=0,
@@ -127,23 +141,14 @@ async def test_activate_free_trial_insufficient_funds_redirects_to_topup(
         patch('app.config.Settings.is_trial_disabled_for_user', return_value=False),
         patch('app.config.Settings.is_tariffs_mode', return_value=False),
         patch('app.config.Settings.is_devices_selection_enabled', return_value=True),
-        # Imported locally inside activate_trial -> patch at the source module.
         patch(
-            'app.database.crud.server_squad.get_random_trial_squad_uuid',
-            new=AsyncMock(return_value='squad-uuid'),
+            'app.handlers.subscription.purchase.get_trial_checkout_context',
+            new=AsyncMock(return_value=TrialCheckoutContext('ready')),
         ),
         patch(
-            'app.handlers.subscription.purchase.create_trial_subscription',
-            new=AsyncMock(return_value=MagicMock()),
-        ),
-        patch(
-            'app.handlers.subscription.purchase.charge_trial_activation_if_required',
+            'app.handlers.subscription.purchase.activate_trial_with_checkout_resolution',
             new=AsyncMock(side_effect=error),
         ),
-        patch(
-            'app.handlers.subscription.purchase.rollback_trial_subscription_activation',
-            new=AsyncMock(return_value=True),
-        ) as rollback_mock,
         patch(
             'app.handlers.subscription.purchase.get_insufficient_balance_keyboard',
             return_value=mock_keyboard,
@@ -151,13 +156,143 @@ async def test_activate_free_trial_insufficient_funds_redirects_to_topup(
     ):
         await activate_trial(trial_callback_query, trial_user, trial_db)
 
-    # Rollback must run before redirecting (no orphaned trial subscription).
-    rollback_mock.assert_awaited_once()
-
-    # Top-up redirect must target the EXACT required amount, not the balance.
+    # Top-up redirect must target the exact required amount, not the balance.
     insufficient_keyboard.assert_called_once_with(
         trial_user.language,
         amount_kopeks=error.required_amount,
     )
     trial_callback_query.message.edit_text.assert_called_once()
     trial_callback_query.answer.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_paid_balance_trial_emits_side_effects_after_committed_coordinator_result(
+    trial_callback_query,
+    trial_user,
+    trial_db,
+):
+    """A paid Telegram trial must not crash after the common commit.
+
+    This covers the real post-commit branch that loads ``Transaction`` before
+    emitting its durable ledger side effects.  It used to raise ``NameError``
+    after money and entitlement were already committed.
+    """
+
+    trial_user.id = 42
+    subscription = MagicMock()
+    subscription.id = 77
+    transaction = MagicMock()
+    trial_db.get = AsyncMock(return_value=transaction)
+    result = TrialActivationResult(
+        subscription=subscription,
+        charged_amount_kopeks=15_900,
+        abandoned_checkout=None,
+        charge_transaction_id=123,
+    )
+
+    texts = MagicMock()
+    texts.TRIAL_ACTIVATED = 'Активировано'
+    service = MagicMock()
+    service.is_configured = False
+
+    with (
+        patch(
+            'app.handlers.subscription.purchase.activate_trial_with_checkout_resolution',
+            new=AsyncMock(return_value=result),
+        ),
+        patch('app.handlers.subscription.purchase.get_texts', return_value=texts),
+        patch('app.handlers.subscription.purchase.SubscriptionService', return_value=service),
+        patch('app.handlers.subscription.purchase.get_display_subscription_link', return_value=None),
+        patch('app.handlers.subscription.purchase.emit_transaction_side_effects', new=AsyncMock()) as emit,
+        patch(
+            'app.handlers.subscription.purchase.AdminNotificationService.send_trial_activation_notification',
+            new=AsyncMock(),
+        ),
+        patch('app.utils.funnel_notify.notify_trial_menu', new=AsyncMock()),
+    ):
+        await _activate_trial_with_coordinator_from_telegram(trial_callback_query, trial_user, trial_db)
+
+    trial_db.get.assert_awaited_once()
+    emit.assert_awaited_once()
+    assert emit.await_args.args[1] is transaction
+    trial_callback_query.message.edit_text.assert_called_once()
+    trial_callback_query.answer.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_external_trial_button_never_creates_pending_trial_subscription(
+    trial_callback_query,
+    trial_user,
+    trial_db,
+):
+    """Old rendered external buttons must become a safe balance-topup route.
+
+    Creating a new ``PENDING`` trial here would reintroduce the competing
+    paid-trial / Device-First ownership race.
+    """
+
+    trial_user.id = 42
+    trial_user.balance_kopeks = 0
+    trial_user.is_trial_already_used.return_value = False
+    trial_callback_query.data = 'trial_payment_platega'
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    texts = MagicMock()
+    texts.t.side_effect = lambda _key, default, **_kwargs: default
+
+    with (
+        patch('app.handlers.subscription.purchase.get_texts', return_value=texts),
+        patch(
+            'app.handlers.subscription.purchase.get_trial_checkout_context',
+            new=AsyncMock(return_value=TrialCheckoutContext('ready')),
+        ),
+        patch(
+            'app.services.trial_activation_service.get_trial_activation_charge_amount',
+            return_value=15_900,
+        ),
+        patch('app.handlers.subscription.purchase.get_insufficient_balance_keyboard', return_value=keyboard),
+        patch(
+            'app.handlers.subscription.purchase.create_pending_trial_subscription',
+            new=AsyncMock(),
+        ) as create_pending,
+    ):
+        await handle_trial_payment_method(trial_callback_query, trial_user, trial_db)
+
+    create_pending.assert_not_awaited()
+    trial_callback_query.message.edit_text.assert_called_once()
+    trial_callback_query.answer.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_trial_fallback_without_cabinet_url_never_builds_invalid_webapp_button(
+    trial_callback_query,
+    trial_user,
+    trial_db,
+):
+    """A missing Mini App URL must degrade to support, not BUTTON_URL_INVALID."""
+
+    context = TrialCheckoutContext(
+        'pending_invoice',
+        TrialCheckoutSummary(
+            public_id='checkout-9',
+            tariff_name='Базовый',
+            period_days=30,
+            device_limit=2,
+            amount_kopeks=24_900,
+        ),
+    )
+    texts = MagicMock()
+    texts.BACK = 'Назад'
+
+    with (
+        patch('app.handlers.subscription.purchase.get_texts', return_value=texts),
+        patch(
+            'app.handlers.subscription.purchase.get_trial_checkout_context',
+            new=AsyncMock(return_value=context),
+        ),
+        patch('app.utils.miniapp_buttons.build_cabinet_url', return_value=''),
+    ):
+        shown = await _show_trial_checkout_resolution(trial_callback_query, trial_user, trial_db)
+
+    assert shown is True
+    keyboard = trial_callback_query.message.edit_text.call_args.kwargs['reply_markup']
+    assert all(button.web_app is None for row in keyboard.inline_keyboard for button in row)

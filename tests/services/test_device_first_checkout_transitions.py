@@ -383,6 +383,7 @@ async def test_new_quote_does_not_bulk_expire_an_exact_paid_checkout_waiting_for
                 ScalarResult(user),
                 SimpleNamespace(),
                 SimpleNamespace(scalar_one_or_none=lambda: None),
+                ScalarResult(None),
                 SimpleNamespace(scalars=list),
             ]
         ),
@@ -441,6 +442,70 @@ async def test_new_direct_quote_is_blocked_while_a_paid_order_needs_operator_rev
 
     assert raised.value.code == 'operator_review_required'
     build_options.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_direct_quote_never_reuses_a_historical_pending_paid_trial(monkeypatch):
+    """A new sale must not mutate the row owned by an old trial invoice."""
+    user = SimpleNamespace(id=7, restriction_subscription=False)
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                ScalarResult(user),
+                SimpleNamespace(),
+                SimpleNamespace(scalar_one_or_none=lambda: None),
+            ]
+        ),
+        commit=AsyncMock(),
+    )
+    monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+    legacy_pending = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, '_has_locked_legacy_pending_trial', legacy_pending)
+    build_options = AsyncMock()
+    monkeypatch.setattr(service, 'build_purchase_options', build_options)
+
+    with pytest.raises(service.DeviceFirstError) as raised:
+        await service.create_checkout(
+            db,
+            user=user,
+            period_days=30,
+            selected_device_limit=2,
+            source='cabinet',
+        )
+
+    assert raised.value.code == 'legacy_trial_reconciliation_required'
+    legacy_pending.assert_awaited_once_with(db, user_id=user.id)
+    build_options.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_invoice_is_not_created_while_a_historical_trial_is_pending(monkeypatch):
+    user = SimpleNamespace(id=7)
+    checkout = SimpleNamespace(
+        id=101,
+        public_id='checkout-101',
+        user_id=user.id,
+        lifecycle_state='confirmed',
+        terminal_reason=None,
+        financial_committed_at=None,
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+    monkeypatch.setattr(service, '_lock_direct_context', AsyncMock(return_value=(checkout, user, None, object())))
+    monkeypatch.setattr(service, 'device_first_new_checkouts_enabled', lambda: True)
+    monkeypatch.setattr(service, 'is_device_first_canary_user', lambda _user: True)
+    monkeypatch.setattr(service, '_has_locked_legacy_pending_trial', AsyncMock(return_value=True))
+
+    with pytest.raises(service.DeviceFirstError) as raised:
+        await service.prepare_direct_external_checkout(
+            db,
+            public_id=checkout.public_id,
+            user_id=user.id,
+        )
+
+    assert raised.value.code == 'legacy_trial_reconciliation_required'
+    assert checkout.lifecycle_state == 'operator_review'
+    assert checkout.terminal_reason == 'legacy_pending_trial_reconciliation_required'
+    db.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -626,6 +691,7 @@ async def test_create_rejects_a_direct_cross_tariff_device_downgrade_before_crea
                 ScalarResult(user),
                 SimpleNamespace(),
                 SimpleNamespace(scalar_one_or_none=lambda: None),
+                ScalarResult(None),
                 SimpleNamespace(scalars=list),
             ]
         ),

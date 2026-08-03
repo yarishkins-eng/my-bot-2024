@@ -42,6 +42,7 @@ from app.database.crud.subscription import (
 from app.database.crud.tariff import get_tariff_by_id, get_tariffs_for_user
 from app.database.crud.transaction import (
     create_transaction,
+    emit_transaction_side_effects,
     get_user_total_spent_kopeks,
 )
 from app.database.crud.user import get_user_by_telegram_id, subtract_user_balance
@@ -83,8 +84,10 @@ from app.services.subscription_renewal_service import (
 )
 from app.services.subscription_service import SubscriptionService
 from app.services.trial_activation_service import (
+    TrialCheckoutResolutionError,
     TrialPaymentChargeFailed,
     TrialPaymentInsufficientFunds,
+    activate_trial_with_checkout_resolution,
     charge_trial_activation_if_required,
     preview_trial_activation_charge,
     revert_trial_activation,
@@ -3808,6 +3811,113 @@ async def activate_subscription_trial_endpoint(
 ) -> MiniAppSubscriptionTrialResponse:
     user = await _authorize_miniapp_user(payload.init_data, db)
 
+    # This legacy endpoint cannot express the explicit choice required to
+    # supersede a provider invoice.  Route its mutation through the same
+    # coordinator as Cabinet `/trial`: it may start a ready trial, but it can
+    # never silently replace an existing direct invoice.
+    forced_devices = None
+    if not settings.is_devices_selection_enabled():
+        forced_devices = settings.get_disabled_mode_device_limit()
+    try:
+        result = await activate_trial_with_checkout_resolution(
+            db,
+            user_id=user.id,
+            forced_device_limit=forced_devices,
+        )
+    except TrialPaymentInsufficientFunds as error:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                'code': 'insufficient_funds',
+                'message': 'Not enough funds to activate the trial',
+                'missing_amount_kopeks': error.missing_amount,
+                'required_amount_kopeks': error.required_amount,
+                'balance_kopeks': error.balance_amount,
+            },
+        ) from error
+    except TrialPaymentChargeFailed as error:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            detail={'code': 'charge_failed', 'message': 'Failed to charge trial activation'},
+        ) from error
+    except TrialCheckoutResolutionError as error:
+        raise HTTPException(
+            error.status_code,
+            detail={'code': error.code, 'message': str(error), **error.context},
+        ) from error
+
+    subscription = result.subscription
+    if not result.already_active:
+        if result.charge_transaction_id is not None:
+            transaction = await db.get(Transaction, result.charge_transaction_id)
+            if transaction is not None:
+                await emit_transaction_side_effects(
+                    db,
+                    transaction,
+                    amount_kopeks=result.charged_amount_kopeks,
+                    user_id=user.id,
+                    type=TransactionType.SUBSCRIPTION_PAYMENT,
+                    payment_method=PaymentMethod.BALANCE,
+                    description='Активация триальной подписки',
+                )
+        subscription_service = SubscriptionService()
+        panel_user = None
+        try:
+            if subscription_service.is_configured:
+                panel_user = await subscription_service.create_remnawave_user(db, subscription)
+                await db.refresh(subscription)
+        except Exception as error:  # committed access is retried; never roll it back
+            logger.error('Legacy miniapp trial provisioning failed', subscription_id=subscription.id, error=error)
+        if subscription_service.is_configured and panel_user is None:
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+            remnawave_retry_queue.enqueue(subscription_id=subscription.id, user_id=user.id, action='create')
+
+        try:
+            await with_admin_notification_service(
+                lambda service: service.send_trial_activation_notification(
+                    db,
+                    user,
+                    subscription,
+                    charged_amount_kopeks=result.charged_amount_kopeks or None,
+                )
+            )
+        except Exception as error:
+            logger.debug('Legacy miniapp trial notification failed', user_id=user.id, error=error)
+        try:
+            from app.utils.funnel_notify import notify_trial_menu
+
+            await notify_trial_menu(db, user)
+        except Exception as error:
+            logger.debug('Legacy miniapp trial menu update failed', user_id=user.id, error=error)
+
+    await db.refresh(user)
+    await db.refresh(subscription)
+    duration_days = settings.TRIAL_DURATION_DAYS
+    if subscription.start_date and subscription.end_date:
+        duration_days = max(0, (subscription.end_date.date() - subscription.start_date.date()).days)
+    language_code = _normalize_language_code(user)
+    message = (
+        f'Триал активирован на {duration_days} дн. Приятного пользования!'
+        if language_code in {'ru', 'fa'}
+        else f'Trial activated for {duration_days} days. Enjoy!'
+    )
+    charged_amount_label = (
+        settings.format_price(result.charged_amount_kopeks) if result.charged_amount_kopeks > 0 else None
+    )
+    return MiniAppSubscriptionTrialResponse(
+        message=message,
+        subscription_id=subscription.id,
+        trial_status='activated',
+        trial_duration_days=duration_days,
+        charged_amount_kopeks=result.charged_amount_kopeks or None,
+        charged_amount_label=charged_amount_label,
+        balance_kopeks=user.balance_kopeks,
+        balance_label=settings.format_price(user.balance_kopeks),
+    )
+
+    # Legacy pre-coordinator implementation retained for one release as a
+    # forensic reference.  It is unreachable: all mutations return above.
     existing_subscription = getattr(user, 'subscription', None)
     if existing_subscription is not None:
         raise HTTPException(

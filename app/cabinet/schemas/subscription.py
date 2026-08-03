@@ -1,6 +1,7 @@
 """Subscription schemas for cabinet."""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -181,6 +182,20 @@ class TrialActivateRequest(BaseModel):
         max_length=128,
         pattern=r'^[A-Za-z0-9._:-]{4,128}$',
     )
+    # `/trial` is the only client entry that may explicitly choose the free
+    # period over an already-issued direct provider invoice.  These values are
+    # identifiers of server-owned rows only; price, status and payment details
+    # never come from the client.
+    resolution: Literal['activate', 'abandon_pending_invoice'] = 'activate'
+    expected_checkout_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class TrialCheckoutSummaryResponse(BaseModel):
+    id: str
+    tariff_name: str
+    period_days: int
+    device_limit: int
+    amount_kopeks: int
 
 
 class TrialInfoResponse(BaseModel):
@@ -194,6 +209,8 @@ class TrialInfoResponse(BaseModel):
     price_kopeks: int = 0
     price_rubles: float = 0.0
     reason_unavailable: str | None = None
+    checkout_state: Literal['ready', 'discardable_quote', 'pending_invoice', 'reconciliation_required'] = 'ready'
+    checkout: TrialCheckoutSummaryResponse | None = None
 
 
 # ============ Purchase Options Schemas ============
