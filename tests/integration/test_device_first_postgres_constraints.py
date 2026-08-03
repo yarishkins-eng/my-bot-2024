@@ -386,3 +386,159 @@ async def test_two_concurrent_first_topups_award_only_one_bonus_pair(monkeypatch
         await second.close()
         await engine.dispose()
         await setup.close()
+
+
+async def _seed_terminal_direct_erasure_graph(connection: asyncpg.Connection) -> tuple[int, int, int, int]:
+    """Create one exact unpaid direct invoice that is safe to anonymize."""
+    user_id, tariff_id = await _seed_owner_and_tariff(connection)
+    checkout_id = await connection.fetchval(
+        """
+        INSERT INTO subscription_checkouts (
+            public_id, user_id, source, tariff_id, expect_no_subscription,
+            target_snapshot, period_days, selected_device_limit, price_breakdown,
+            quoted_price_kopeks, max_price_kopeks, pricing_revision,
+            quote_expires_at, expires_at, lifecycle_state, quote_state,
+            settlement_mode, funding_state, fulfillment_state, terminal_reason
+        )
+        VALUES (
+            $1, $2, 'cabinet', $3, true, '{}'::json, 30, 2, '{}'::json,
+            35000, 35000, 1, now() - interval '1 minute', now() + interval '24 hours',
+            'cancelled', 'expired', 'direct_purchase_v2', 'invoice_terminal', 'not_started',
+            'provider_terminal:canceled'
+        )
+        RETURNING id
+        """,
+        str(uuid.uuid4()),
+        user_id,
+        tariff_id,
+    )
+    payment_id = await connection.fetchval(
+        """
+        INSERT INTO platega_payments (
+            user_id, platega_transaction_id, correlation_id, amount_kopeks,
+            currency, payment_method_code, status, is_paid, metadata_json,
+            callback_payload
+        )
+        VALUES ($1, $2, $3, 35000, 'RUB', 2, 'CANCELED', false, $4::json, '{}'::json)
+        RETURNING id
+        """,
+        user_id,
+        f'erasure-provider-{uuid.uuid4()}',
+        str(uuid.uuid4()),
+        '{"device_first_attempt_id": 0, "settlement_mode": "direct_purchase_v2"}',
+    )
+    attempt_id = await connection.fetchval(
+        """
+        INSERT INTO checkout_payment_attempts (
+            checkout_id, merchant_order_key, provider, method_key,
+            provider_method_code, currency, requested_amount_kopeks,
+            settlement_mode, status, provider_payment_id, platega_payment_id,
+            reconciliation_reason, terminal_observations, next_reconcile_at
+        )
+        VALUES (
+            $1, $2, 'platega', 'sbp', 2, 'RUB', 35000,
+            'direct_purchase_v2', 'failed', $3, $4,
+            'provider_terminal:canceled', 0, now()
+        )
+        RETURNING id
+        """,
+        checkout_id,
+        f'erasure-attempt-{uuid.uuid4()}',
+        await connection.fetchval('SELECT platega_transaction_id FROM platega_payments WHERE id = $1', payment_id),
+        payment_id,
+    )
+    await connection.execute(
+        """
+        UPDATE platega_payments
+        SET metadata_json = jsonb_build_object(
+            'device_first_attempt_id', $2::int, 'settlement_mode', 'direct_purchase_v2'
+        )
+        WHERE id = $1
+        """,
+        payment_id,
+        attempt_id,
+    )
+    await connection.execute(
+        """
+        INSERT INTO account_erasure_requests (user_id, state, panel_state, has_legacy_financial_history)
+        VALUES ($1, 'ready_for_anonymization', 'deactivated', false)
+        """,
+        user_id,
+    )
+    return user_id, checkout_id, attempt_id, payment_id
+
+
+async def test_final_erasure_wins_lock_race_against_late_terminal_reconciliation() -> None:
+    """The late poll waits for redaction, then performs a no-op on fresh rows."""
+    from app.services.account_erasure_service import _complete_ready_financial_account_erasure
+    from app.services.device_first_payment_service import _release_direct_terminal_invoice
+
+    setup = await asyncpg.connect(DATABASE_URL)
+    engine_url = DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://', 1)
+    engine = create_async_engine(engine_url, pool_size=2, max_overflow=0)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    erasure_db = session_factory()
+    reconciliation_db = session_factory()
+    final_commit_reached = asyncio.Event()
+    allow_final_commit = asyncio.Event()
+    original_commit = erasure_db.commit
+
+    async def commit_after_reconciliation_is_waiting() -> None:
+        final_commit_reached.set()
+        await asyncio.wait_for(allow_final_commit.wait(), timeout=5)
+        await original_commit()
+
+    try:
+        user_id, checkout_id, attempt_id, payment_id = await _seed_terminal_direct_erasure_graph(setup)
+        erasure_db.commit = commit_after_reconciliation_is_waiting  # type: ignore[method-assign]
+        erasure_task = asyncio.create_task(
+            _complete_ready_financial_account_erasure(erasure_db, user_id=user_id, deactivate_panel=True)
+        )
+        await asyncio.wait_for(final_commit_reached.wait(), timeout=5)
+
+        reconciliation_task = asyncio.create_task(
+            _release_direct_terminal_invoice(
+                reconciliation_db,
+                attempt_id=attempt_id,
+                payment_id=payment_id,
+                payload={
+                    'id': await setup.fetchval(
+                        'SELECT platega_transaction_id FROM platega_payments WHERE id = $1', payment_id
+                    ),
+                    'status': 'CANCELED',
+                    'paymentMethod': 'SBPQR',
+                    'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+                },
+                provider_status='CANCELED',
+                source='poll',
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not reconciliation_task.done()
+
+        allow_final_commit.set()
+        completed = await asyncio.wait_for(erasure_task, timeout=5)
+        released = await asyncio.wait_for(reconciliation_task, timeout=5)
+        assert completed.completed is True
+        assert released is False
+        assert await setup.fetchval('SELECT account_erased_at IS NOT NULL FROM users WHERE id = $1', user_id)
+        assert (
+            await setup.fetchval('SELECT state FROM account_erasure_requests WHERE user_id = $1', user_id)
+            == 'completed'
+        )
+        assert await setup.fetchval('SELECT metadata_json FROM platega_payments WHERE id = $1', payment_id) == '{}'
+        assert await setup.fetchval('SELECT status FROM platega_payments WHERE id = $1', payment_id) == 'CANCELED'
+        assert (
+            await setup.fetchval('SELECT status FROM checkout_payment_attempts WHERE id = $1', attempt_id) == 'failed'
+        )
+        assert (
+            await setup.fetchval('SELECT lifecycle_state FROM subscription_checkouts WHERE id = $1', checkout_id)
+            == 'cancelled'
+        )
+    finally:
+        await reconciliation_db.rollback()
+        await erasure_db.rollback()
+        await reconciliation_db.close()
+        await erasure_db.close()
+        await engine.dispose()
+        await setup.close()

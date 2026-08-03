@@ -38,6 +38,21 @@ class PlategaPaymentMixin:
         metadata = getattr(payment, 'metadata_json', None) or {}
         return metadata.get('settlement_mode') == 'direct_purchase_v2'
 
+    @staticmethod
+    async def _get_durable_direct_attempt(db: AsyncSession, payment_id: int) -> CheckoutPaymentAttempt | None:
+        """Classify a redacted payment through its retained Direct attempt.
+
+        This does not validate or mutate financial state.  The Device-First
+        service re-locks and verifies the full payment -> attempt -> checkout
+        graph before a terminal result can change any projection.
+        """
+        return await db.scalar(
+            select(CheckoutPaymentAttempt).where(
+                CheckoutPaymentAttempt.platega_payment_id == payment_id,
+                CheckoutPaymentAttempt.settlement_mode == 'direct_purchase_v2',
+            )
+        )
+
     async def _mark_direct_post_paid_reversal(
         self,
         db: AsyncSession,
@@ -56,6 +71,9 @@ class PlategaPaymentMixin:
         """
         metadata = getattr(payment, 'metadata_json', None) or {}
         attempt_id = metadata.get('device_first_attempt_id')
+        if not isinstance(attempt_id, int):
+            durable_attempt = await self._get_durable_direct_attempt(db, payment.id)
+            attempt_id = getattr(durable_attempt, 'id', None)
         reason = f'post_paid_provider_terminal:{provider_status.lower()}'
         # Direct sale creation/final commit lock this row first.  Taking the
         # same per-user lock before the old checkout becomes operator_review
@@ -266,6 +284,10 @@ class PlategaPaymentMixin:
             return False
         payment = locked
         direct_device_first = self._is_direct_device_first_payment(payment)
+        durable_attempt = None
+        if not direct_device_first:
+            durable_attempt = await self._get_durable_direct_attempt(db, payment.id)
+            direct_device_first = durable_attempt is not None
 
         status_raw = str(payload.get('status') or '').upper()
         if not status_raw:
@@ -285,8 +307,8 @@ class PlategaPaymentMixin:
             )
 
             attempt_id = (payment.metadata_json or {}).get('device_first_attempt_id')
-            attempt = None
-            if isinstance(attempt_id, int):
+            attempt = durable_attempt
+            if attempt is None and isinstance(attempt_id, int):
                 attempt = (
                     await db.execute(
                         select(CheckoutPaymentAttempt)
@@ -300,6 +322,7 @@ class PlategaPaymentMixin:
                     payment_id=payment.id,
                     payload=payload,
                     reason='provider_callback_before_identity_binding',
+                    attempt_id=getattr(attempt, 'id', None),
                 )
                 return True
 
@@ -346,6 +369,7 @@ class PlategaPaymentMixin:
                 payment_id=payment.id,
                 payload=payload,
                 reason=callback_reason,
+                attempt_id=getattr(attempt, 'id', None),
             )
             return True
 
@@ -420,7 +444,7 @@ class PlategaPaymentMixin:
         # Device-first v2 is settled only by its verified callback or its
         # lease-fenced worker. Generic user-initiated checks are local reads:
         # they may observe state but cannot contact the provider or settle it.
-        if self._is_direct_device_first_payment(payment):
+        if self._is_direct_device_first_payment(payment) or await self._get_durable_direct_attempt(db, payment.id):
             return {
                 'payment': payment,
                 'status': payment.status,
@@ -521,7 +545,9 @@ class PlategaPaymentMixin:
         # Device-first owns its exact provider amount, ledger idempotency and
         # explicit-arm fulfillment. It must not fall through to the generic
         # top-up/cart/autopay hooks.
-        if metadata.get('device_first_attempt_id') is not None:
+        if metadata.get('device_first_attempt_id') is not None or await self._get_durable_direct_attempt(
+            db, payment.id
+        ):
             from app.services.device_first_payment_service import settle_device_first_platega_payment
 
             return await settle_device_first_platega_payment(

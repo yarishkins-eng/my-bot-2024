@@ -38,6 +38,7 @@ def _pending_context():
     user = SimpleNamespace(id=7, auth_type='telegram', restriction_subscription=False, balance_kopeks=0)
     checkout = SimpleNamespace(
         id=9,
+        user_id=user.id,
         public_id='checkout-9',
         tariff_id=3,
         period_days=90,
@@ -46,6 +47,7 @@ def _pending_context():
         quoted_price_kopeks=64_900,
         lifecycle_state='awaiting_funds',
         quote_state='valid',
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
         funding_state='invoice_pending',
         fulfillment_state='not_started',
         financial_committed_at=None,
@@ -55,11 +57,13 @@ def _pending_context():
     attempt = SimpleNamespace(
         id=41,
         checkout_id=checkout.id,
+        provider='platega',
         settlement_mode=DIRECT_SETTLEMENT_MODE,
         platega_payment_id=51,
         provider_payment_id='provider-1',
         provider_method_code=2,
         requested_amount_kopeks=64_900,
+        currency='RUB',
         credited_amount_kopeks=0,
         method_key='sbp',
         status='pending',
@@ -72,6 +76,9 @@ def _pending_context():
         is_paid=False,
         status='PENDING',
         platega_transaction_id='provider-1',
+        amount_kopeks=64_900,
+        currency='RUB',
+        payment_method_code=2,
         transaction_id=None,
         metadata_json={'device_first_attempt_id': attempt.id, 'settlement_mode': DIRECT_SETTLEMENT_MODE},
     )
@@ -223,6 +230,7 @@ async def test_trial_resolution_then_late_exact_callback_credits_once_without_to
         Row(payment),
         Row(locked.user),
         Row(attempt),
+        Row(checkout),
     ]
     payload = {
         'id': 'provider-1',

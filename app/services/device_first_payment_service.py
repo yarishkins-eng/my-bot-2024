@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.models import (
+    AccountErasureRequest,
     CheckoutPaymentAttempt,
     DeviceFirstProviderEvent,
     DeviceFirstReconciliationCredit,
@@ -77,6 +78,78 @@ logger = structlog.get_logger(__name__)
 PENDING_ATTEMPT_STATUSES = frozenset({'creating', 'pending', 'paid_processing', 'reconciliation'})
 PROVIDER_TERMINAL_STATUSES = frozenset({'FAILED', 'CANCELED', 'EXPIRED'})
 POST_PAID_REVERSAL_STATUSES = frozenset({'CHARGEBACKED'})
+
+
+def _has_durable_direct_payment_binding(
+    payment: PlategaPayment,
+    attempt: CheckoutPaymentAttempt,
+    checkout: SubscriptionCheckout,
+) -> bool:
+    """Verify the immutable direct-sale graph without relying on redacted JSON.
+
+    ``PlategaPayment.metadata_json`` is operational data and is intentionally
+    cleared when a financial account erasure is finalized.  It may therefore
+    only be an additional live-account fence, never the sole proof that an
+    erased historical payment belongs to its retained attempt.
+    """
+    return bool(
+        payment.user_id is not None
+        and checkout.user_id == payment.user_id
+        and attempt.checkout_id == checkout.id
+        and attempt.platega_payment_id == payment.id
+        and attempt.provider == 'platega'
+        and attempt.settlement_mode == DIRECT_SETTLEMENT_MODE
+        and checkout.settlement_mode == DIRECT_SETTLEMENT_MODE
+        and payment.platega_transaction_id
+        and payment.platega_transaction_id == attempt.provider_payment_id
+        and payment.amount_kopeks == attempt.requested_amount_kopeks
+        and str(payment.currency or '').upper() == 'RUB'
+        and str(attempt.currency or '').upper() == 'RUB'
+        and payment.payment_method_code == attempt.provider_method_code
+    )
+
+
+async def _is_finalized_account_erasure(
+    db: AsyncSession,
+    *,
+    user: User,
+) -> bool:
+    """Return true only for the irreversibly redacted account state.
+
+    The request row is locked after Payment -> User -> Attempt -> Checkout,
+    matching the closure service's lock order.  An ordinary deletion request
+    is deliberately insufficient: its invoices must remain fail-closed.
+    """
+    if getattr(user, 'account_erased_at', None) is None:
+        return False
+    request = (
+        await db.execute(
+            select(AccountErasureRequest)
+            .where(AccountErasureRequest.user_id == user.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    return bool(request is not None and request.state == 'completed')
+
+
+async def get_durable_direct_attempt_id(
+    db: AsyncSession,
+    *,
+    payment_id: int,
+) -> int | None:
+    """Identify a retained Direct attempt when payment metadata was redacted.
+
+    This is classification only; state-changing callers must still acquire the
+    standard Payment -> User -> Attempt -> Checkout locks and validate every
+    immutable financial field before doing anything.
+    """
+    return await db.scalar(
+        select(CheckoutPaymentAttempt.id).where(
+            CheckoutPaymentAttempt.platega_payment_id == payment_id,
+            CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
+        )
+    )
 
 
 def platega_method_label(method_key: str, *, language: str) -> str:
@@ -254,7 +327,9 @@ async def _release_direct_terminal_invoice(
     ).scalar_one_or_none()
     if payment is None or payment.user_id is None:
         return False
-    await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
+    user = (await db.execute(select(User).where(User.id == payment.user_id).with_for_update())).scalar_one_or_none()
+    if user is None:
+        return False
     attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
     if lease_token is not None and lease_epoch is not None:
         attempt_query = attempt_query.where(
@@ -279,11 +354,12 @@ async def _release_direct_terminal_invoice(
         return False
 
     metadata_attempt_id = (payment.metadata_json or {}).get('device_first_attempt_id')
-    if (
-        checkout.user_id != payment.user_id
-        or attempt.platega_payment_id != payment.id
-        or metadata_attempt_id != attempt.id
-    ):
+    durable_binding = _has_durable_direct_payment_binding(payment, attempt, checkout)
+    metadata_binding = metadata_attempt_id == attempt.id
+    finalized_erasure = False
+    if durable_binding and not metadata_binding:
+        finalized_erasure = await _is_finalized_account_erasure(db, user=user)
+    if not durable_binding or (not metadata_binding and not finalized_erasure):
         payment.status = 'OPERATOR_REVIEW'
         attempt.status = 'operator_review'
         attempt.reconciliation_reason = 'direct_payment_binding_mismatch'
@@ -296,6 +372,21 @@ async def _release_direct_terminal_invoice(
             attempt_id=attempt.id,
             payment_id=payment.id,
         )
+        return False
+
+    # Final privacy redaction deliberately removed the transient JSON marker.
+    # A later *canonical* exact terminal-unpaid observation is harmless: it
+    # must not recreate metadata, turn the immutable history into review, or
+    # emit a false binding-mismatch LogError.  Callback evidence reaches this
+    # function only after a canonical GET, so a callback alone cannot use the
+    # exception.
+    if (
+        finalized_erasure
+        and not metadata_binding
+        and source in {'poll', 'canonical_get'}
+        and not payment.is_paid
+        and _has_exact_direct_invoice_details(attempt, payload)
+    ):
         return False
 
     if payment.is_paid:
@@ -639,6 +730,7 @@ async def _queue_direct_callback_for_canonical_reconciliation(
     payment_id: int,
     payload: dict[str, Any],
     reason: str,
+    attempt_id: int | None = None,
 ) -> bool:
     """Journal a direct callback without letting it project payment state.
 
@@ -657,8 +749,11 @@ async def _queue_direct_callback_for_canonical_reconciliation(
     ).scalar_one_or_none()
     if payment is None or payment.user_id is None:
         return False
-    await db.execute(select(User).where(User.id == payment.user_id).with_for_update())
-    attempt_id = (payment.metadata_json or {}).get('device_first_attempt_id')
+    user = (await db.execute(select(User).where(User.id == payment.user_id).with_for_update())).scalar_one_or_none()
+    if user is None:
+        return False
+    metadata_attempt_id = (payment.metadata_json or {}).get('device_first_attempt_id')
+    attempt_id = attempt_id if isinstance(attempt_id, int) else metadata_attempt_id
     if not isinstance(attempt_id, int):
         payment.status = 'OPERATOR_REVIEW'
         await db.commit()
@@ -683,11 +778,12 @@ async def _queue_direct_callback_for_canonical_reconciliation(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if checkout is None or (
-        checkout.user_id != payment.user_id
-        or attempt.platega_payment_id != payment.id
-        or attempt.settlement_mode != DIRECT_SETTLEMENT_MODE
-    ):
+    durable_binding = checkout is not None and _has_durable_direct_payment_binding(payment, attempt, checkout)
+    metadata_binding = metadata_attempt_id == attempt.id
+    finalized_erasure = False
+    if durable_binding and not metadata_binding:
+        finalized_erasure = await _is_finalized_account_erasure(db, user=user)
+    if not durable_binding or (not metadata_binding and not finalized_erasure):
         payment.status = 'OPERATOR_REVIEW'
         attempt.status = 'operator_review'
         attempt.reconciliation_reason = 'direct_payment_binding_mismatch'
@@ -696,6 +792,12 @@ async def _queue_direct_callback_for_canonical_reconciliation(
             checkout.terminal_reason = 'direct_payment_binding_mismatch'
         await db.commit()
         return False
+    if finalized_erasure and not metadata_binding:
+        # Finalized accounts retain no callback payload.  A signed callback is
+        # not canonical settlement proof, so leave the already archived graph
+        # untouched; the historical worker will still perform its canonical
+        # GET according to its durable schedule.
+        return True
     await _append_direct_provider_event(
         db,
         checkout=checkout,
@@ -1422,6 +1524,9 @@ async def settle_device_first_platega_payment(
     metadata = dict(payment.metadata_json or {})
     attempt_id = metadata.get('device_first_attempt_id')
     direct_payment = metadata.get('settlement_mode') == DIRECT_SETTLEMENT_MODE
+    if not direct_payment and not isinstance(attempt_id, int):
+        attempt_id = await get_durable_direct_attempt_id(db, payment_id=payment.id)
+        direct_payment = attempt_id is not None
 
     # Direct-sale financial transitions have one non-negotiable order:
     # Payment -> User -> Attempt -> Checkout.  The payment is already locked
@@ -1452,10 +1557,31 @@ async def settle_device_first_platega_payment(
             await db.commit()
             logger.error('device_first_direct_payment_attempt_missing', payment_id=payment.id)
             return payment
-        if settlement_mode(attempt) != DIRECT_SETTLEMENT_MODE or attempt.platega_payment_id != payment.id:
+        metadata_binding = metadata.get('device_first_attempt_id') == attempt.id
+        checkout = (
+            await db.execute(
+                select(SubscriptionCheckout)
+                .where(SubscriptionCheckout.id == attempt.checkout_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        # ``metadata_json`` is deliberately erased after a completed account
+        # erasure, and it is never the financial authority in either case.
+        # A present marker can route the payment here, but the immutable graph
+        # still has to prove the exact direct-sale invoice before any balance
+        # or subscription transition is possible.
+        durable_binding = checkout is not None and _has_durable_direct_payment_binding(payment, attempt, checkout)
+        finalized_erasure = (
+            await _is_finalized_account_erasure(db, user=user) if durable_binding and not metadata_binding else False
+        )
+        if not durable_binding or (not metadata_binding and not finalized_erasure):
             payment.status = 'OPERATOR_REVIEW'
             attempt.status = 'operator_review'
             attempt.reconciliation_reason = 'direct_payment_attempt_mode_or_binding_mismatch'
+            if checkout is not None:
+                checkout.lifecycle_state = 'operator_review'
+                checkout.terminal_reason = 'direct_payment_attempt_mode_or_binding_mismatch'
             await db.commit()
             logger.error('device_first_direct_payment_mode_mismatch', payment_id=payment.id, attempt_id=attempt.id)
             return payment
@@ -1463,10 +1589,12 @@ async def settle_device_first_platega_payment(
             db,
             payment=payment,
             attempt=attempt,
+            checkout=checkout,
             user=user,
             payload=payload,
             lease_token=lease_token,
             lease_epoch=lease_epoch,
+            finalized_erasure=finalized_erasure,
         )
 
     attempt_query = select(CheckoutPaymentAttempt).where(CheckoutPaymentAttempt.id == attempt_id)
@@ -1681,6 +1809,7 @@ async def _fence_account_erasure_payment(
     payment: PlategaPayment,
     provider_payment_id: str,
     verified: tuple[int, str] | None,
+    finalized_erasure: bool = False,
 ) -> PlategaPayment:
     """Keep a late payment reviewable, never creditable, after account closure.
 
@@ -1690,12 +1819,18 @@ async def _fence_account_erasure_payment(
     the same ID is a new person/account for payment purposes.
     """
     attempt.status = 'operator_review'
-    attempt.reconciliation_reason = 'account_erasure_requested'
+    attempt.reconciliation_reason = (
+        'account_erased_late_confirmed' if finalized_erasure else 'account_erasure_requested'
+    )
     payment.status = 'OPERATOR_REVIEW'
     payment.is_paid = True
-    payment.metadata_json = {**(payment.metadata_json or {}), 'account_erasure_review': True}
+    # A finalized account must never reacquire a new JSON marker or payload.
+    # The retained reconciliation credit/request is the privacy-safe audit
+    # record for a later real payment.
+    if not finalized_erasure:
+        payment.metadata_json = {**(payment.metadata_json or {}), 'account_erasure_review': True}
     checkout.lifecycle_state = 'operator_review'
-    checkout.terminal_reason = 'account_erasure_requested'
+    checkout.terminal_reason = attempt.reconciliation_reason
     from app.services.account_erasure_service import invalidate_financial_resolution_for_late_payment
 
     await invalidate_financial_resolution_for_late_payment(db, payment.user_id)
@@ -1726,10 +1861,12 @@ async def _settle_direct_platega_payment_locked(
     *,
     payment: PlategaPayment,
     attempt: CheckoutPaymentAttempt,
+    checkout: SubscriptionCheckout,
     user: User,
     payload: dict | None,
     lease_token: str | None = None,
     lease_epoch: int | None = None,
+    finalized_erasure: bool = False,
 ) -> PlategaPayment:
     """Settle only an authenticated exact direct-sale provider payment.
 
@@ -1775,16 +1912,8 @@ async def _settle_direct_platega_payment_locked(
         return payment
 
     # ``settle_device_first_platega_payment`` already holds Payment -> User
-    # -> Attempt.  Acquire Checkout last; do not take any new earlier lock
-    # here or a callback can deadlock with a concurrent direct quote.
-    checkout = (
-        await db.execute(
-            select(SubscriptionCheckout)
-            .where(SubscriptionCheckout.id == attempt.checkout_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one()
+    # -> Attempt -> Checkout.  It passes that locked checkout here so this
+    # transition never reorders or reacquires the financial graph.
     if mismatch_reason is None and checkout.lifecycle_state not in {'awaiting_funds', 'fulfilling'}:
         mismatch_reason = 'late_paid_direct_checkout'
 
@@ -1809,6 +1938,7 @@ async def _settle_direct_platega_payment_locked(
             payment=payment,
             provider_payment_id=provider_payment_id,
             verified=verified,
+            finalized_erasure=finalized_erasure,
         )
 
     if mismatch_reason is not None:
