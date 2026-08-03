@@ -1885,6 +1885,8 @@
   "CONTEST_EMOJI_PROMPT": "根据表情猜服务：{q}",
   "ADMIN_EDIT_PRIZE": "🏅 奖品（天）",
   "PAID_TRIAL_CAN_PAY_BALANCE": "您可以用余额支付试用订阅，或选择其他支付方式。",
+  "PAID_TRIAL_BALANCE_REQUIRED": "请先充值余额。充值后回到这里：试用期会通过一次安全操作激活。",
+  "PAID_TRIAL_EXTERNAL_PAYMENT_RETIRED": "为安全激活试用期，请先充值余额。充值后回到这里并使用余额支付试用期费用。",
   "ADMIN_CONTESTS_COMING_SOON": "该功能稍后推出。",
   "ADMIN_CONTEST_EDIT_SUMMARY_TIMES": "🕒 每日汇总次数",
   "PAID_TRIAL_SELECT_PAYMENT": "请选择合适的支付方式：",

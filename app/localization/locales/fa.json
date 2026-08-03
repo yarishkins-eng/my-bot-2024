@@ -1656,6 +1656,8 @@
   "PAID_TRIAL_HEADER": "🎁 <b>دوره آزمایشی</b>",
   "PAID_TRIAL_SELECT_PAYMENT": "روش پرداخت مناسب انتخاب کنید:",
   "PAID_TRIAL_CAN_PAY_BALANCE": "می‌توانید آزمایشی را از موجودی پرداخت یا روش دیگر انتخاب کنید.",
+  "PAID_TRIAL_BALANCE_REQUIRED": "ابتدا موجودی را شارژ کنید. سپس به اینجا بازگردید: دوره آزمایشی با یک عملیات امن فعال می‌شود.",
+  "PAID_TRIAL_EXTERNAL_PAYMENT_RETIRED": "برای فعال‌سازی امن دوره آزمایشی، ابتدا موجودی را شارژ کنید. سپس به اینجا بازگردید و هزینه دوره آزمایشی را از موجودی بپردازید.",
   "PAID_TRIAL_PAYMENT_DESC": "اشتراک آزمایشی {days} روزه",
   "PAID_TRIAL_INVOICE_TITLE": "اشتراک آزمایشی {days} روزه",
   "PAID_TRIAL_STARS_LABEL": "اشتراک آزمایشی",
