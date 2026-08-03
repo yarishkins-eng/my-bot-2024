@@ -804,13 +804,17 @@ async def abandon_direct_checkout_for_new_calculation(
     checkout_public_id: str,
     user_id: int,
 ) -> SubscriptionCheckout | None:
-    """Locally abandon an opened direct invoice and release a new choice.
+    """Locally abandon one canonical pending invoice and release a new choice.
 
-    Platega has no documented void-without-refund endpoint, so this deliberately
-    does *not* claim that the provider invoice was cancelled.  The immutable
-    attempt remains reconciled; an exact late CONFIRMED is credited once to the
-    wallet and cannot fulfil this abandoned configuration.  Lock order stays
-    Payment -> User -> Attempt -> Checkout, never Checkout -> Payment.
+    This is deliberately a *local* customer decision, not a provider refund or
+    void request.  The immutable attempt remains reconciled; an exact late
+    CONFIRMED is credited once to the wallet and cannot fulfil this abandoned
+    configuration.  It is only safe once the one provider invoice is fully
+    bound and canonically observed as PENDING/INPROGRESS.  In particular, an
+    in-flight POST or an identity-less reconciliation record is not
+    cancellable: releasing a new configuration then could create two live
+    provider invoices.  Lock order stays Payment -> User -> Attempt ->
+    Checkout, never Checkout -> Payment.
     """
     # Resolve identity without locking joined rows. PostgreSQL's bare
     # ``FOR UPDATE`` on a join locks *all* relations and would effectively
@@ -875,14 +879,27 @@ async def abandon_direct_checkout_for_new_calculation(
         return checkout
     if (
         payment.is_paid
-        or attempt.status in {'paid_processing', 'credited'}
+        or attempt.status in {'paid_processing', 'credited', 'operator_review'}
         or checkout.fulfillment_state != 'not_started'
+        or checkout.lifecycle_state not in {'draft', 'confirmed', 'awaiting_funds'}
     ):
         # A paid/fulfilling purchase must remain visible; only a live external
         # invoice can be superseded by a fresh user configuration.
         return checkout
-    if checkout.lifecycle_state not in {'draft', 'confirmed', 'awaiting_funds'}:
-        return checkout
+    if (
+        not attempt.platega_payment_id
+        or not attempt.provider_payment_id
+        or attempt.status != 'pending'
+        or str(payment.status).upper() not in {'PENDING', 'INPROGRESS'}
+        or checkout.lifecycle_state != 'awaiting_funds'
+        or checkout.funding_state != 'invoice_pending'
+    ):
+        # Never turn an unbound/ambiguous provider POST into an opportunity to
+        # create another invoice.  Canonical reconciliation owns this state.
+        raise DeviceFirstError(
+            'reconciliation_required',
+            'Provider invoice must be reconciled before this checkout can be replaced',
+        )
 
     checkout.lifecycle_state = 'cancelled'
     checkout.quote_state = 'expired'

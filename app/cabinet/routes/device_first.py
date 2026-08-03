@@ -301,14 +301,24 @@ async def checkout_create(
         # late payment becomes wallet credit rather than stale fulfilment.
         # Repeating the same selection resumes its existing invoice instead.
         existing = await get_open_checkout_for_user(db, user_id=user.id)
-        if (
-            existing is not None
-            and existing.settlement_mode == DIRECT_SETTLEMENT_MODE
-            and (
+        if existing is not None and existing.settlement_mode == DIRECT_SETTLEMENT_MODE:
+            configuration_changed = (
                 existing.period_days != request.period_days
                 or existing.selected_device_limit != request.selected_device_limit
             )
-        ):
+            if not configuration_changed:
+                # A repeated choice must be a true resume, not an error that
+                # makes the client wonder whether it can safely pay.  It is
+                # also deliberately not a new provider invoice.
+                response = await _serialize_cabinet_checkout(
+                    db,
+                    existing,
+                    balance_kopeks=user.balance_kopeks,
+                )
+                mutation.checkout_id = existing.id
+                await store_mutation_result(db, mutation, response=response)
+                return response
+
             abandoned = await abandon_direct_checkout_for_new_calculation(
                 db,
                 checkout_public_id=existing.public_id,
@@ -325,6 +335,18 @@ async def checkout_create(
                     for_update=True,
                 )
                 await cancel_checkout_for_new_calculation(db, locked_quote)
+            elif abandoned.lifecycle_state != 'cancelled':
+                # A callback can win the financial lock while the customer is
+                # changing parameters.  Return that canonical state instead
+                # of attempting a second checkout/invoice.
+                response = await _serialize_cabinet_checkout(
+                    db,
+                    abandoned,
+                    balance_kopeks=user.balance_kopeks,
+                )
+                mutation.checkout_id = abandoned.id
+                await store_mutation_result(db, mutation, response=response)
+                return response
         checkout = await create_checkout(
             db,
             user=user,
@@ -413,6 +435,10 @@ async def _checkout_command(
         elif action == 'arm':
             checkout = await arm_checkout(db, checkout)
         elif action == 'cancel':
+            # ``cancel`` remains the inexpensive pre-invoice operation.  An
+            # issued provider invoice has a separate, explicitly named
+            # abandon endpoint below; treating it as an ordinary cancellation
+            # would hide the different late-payment contract from callers.
             checkout = await cancel_checkout(db, checkout)
         else:  # pragma: no cover - internal programming guard
             raise RuntimeError(action)
@@ -713,6 +739,58 @@ async def checkout_cancel(
         user=user,
         db=db,
     )
+
+
+@router.post('/checkout/{checkout_id}/abandon')
+async def checkout_abandon(
+    checkout_id: str,
+    idempotency_key: str | None = Header(None, alias='Idempotency-Key'),
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Explicitly supersede one already verified direct invoice.
+
+    This is intentionally not a provider cancellation and not an alias for
+    ``/cancel``.  The payment evidence stays available for canonical polling;
+    a late exact confirmation can only become a one-time wallet credit.
+    """
+    await _rate_limit(user.id, 'abandon')
+    mutation, replay = await _mutation(
+        db,
+        user_id=user.id,
+        action='abandon',
+        key=idempotency_key,
+        payload={'checkout_id': checkout_id},
+    )
+    if replay is not None:
+        return replay
+    if mutation.checkout_id is not None:
+        recovered = await db.get(SubscriptionCheckout, mutation.checkout_id)
+        if recovered is not None:
+            response = await _serialize_cabinet_checkout(db, recovered, balance_kopeks=user.balance_kopeks)
+            await store_mutation_result(db, mutation, response=response)
+            return response
+    try:
+        checkout = await abandon_direct_checkout_for_new_calculation(
+            db,
+            checkout_public_id=checkout_id,
+            user_id=user.id,
+        )
+        if checkout is None:
+            raise DeviceFirstError('invalid_state', 'This checkout has no provider invoice to abandon')
+        mutation.checkout_id = checkout.id
+    except DeviceFirstError as error:
+        await store_mutation_result(
+            db,
+            mutation,
+            response={'code': error.code, 'message': str(error)},
+            status_code=error.status_code,
+        )
+        _raise(error)
+    await db.refresh(user)
+    response = await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)
+    await store_mutation_result(db, mutation, response=response)
+    return response
 
 
 @router.post('/checkout/{checkout_id}/payment-attempt')

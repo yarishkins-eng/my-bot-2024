@@ -19,6 +19,7 @@ from app.services.device_first_payment_service import (
     _release_direct_terminal_invoice,
     _safe_provider_redirect_url,
     _verified_amount,
+    abandon_direct_checkout_for_new_calculation,
     available_platega_methods,
     create_platega_attempt,
     reconcile_device_first_payments,
@@ -127,6 +128,7 @@ def _terminal_direct_rows(*, lifecycle_state: str = 'awaiting_funds'):
         id=41,
         checkout_id=9,
         platega_payment_id=51,
+        settlement_mode='direct_purchase_v2',
         provider_payment_id='provider-1',
         provider_method_code=2,
         requested_amount_kopeks=35_000,
@@ -214,6 +216,127 @@ async def test_sparse_signed_terminal_callback_is_journaled_then_requires_canoni
     assert event.amount_kopeks is None
     assert event.currency is None
     db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_explicit_abandon_archives_only_a_fully_bound_canonical_pending_invoice():
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=payment.id),
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+    )
+
+    archived = await abandon_direct_checkout_for_new_calculation(
+        db,
+        checkout_public_id=checkout.public_id,
+        user_id=user.id,
+    )
+
+    assert archived is checkout
+    assert checkout.lifecycle_state == 'cancelled'
+    assert checkout.quote_state == 'expired'
+    assert checkout.funding_state == 'invoice_abandoned'
+    assert checkout.terminal_reason == 'cancelled_by_user_after_invoice'
+    assert attempt.status == 'reconciliation'
+    assert attempt.reconciliation_reason == 'provider_invoice_abandoned_by_user'
+    assert payment.status == 'VERIFYING'
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_late_exact_confirmation_after_explicit_abandon_credits_wallet_once_without_old_fulfilment():
+    """The customer-facing abandon promise: old money never activates old VPN."""
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    user.balance_kopeks = 0
+    payment.platega_transaction_id = 'provider-1'
+    payment.transaction_id = None
+    db = SimpleNamespace(
+        scalar=AsyncMock(side_effect=[payment.id, None]),
+        execute=AsyncMock(
+            side_effect=[
+                # Explicit customer abandon: Payment -> User -> Attempt -> Checkout.
+                Result(payment),
+                Result(user),
+                Result(attempt),
+                Result(checkout),
+                # First exact late CONFIRMED: same lock order, then checkout
+                # and the absent one-time ledger row.
+                Result(payment),
+                Result(user),
+                Result(attempt),
+                Result(checkout),
+                Result(None),
+                # A duplicate callback stops at the credited idempotency fence.
+                Result(payment),
+                Result(user),
+                Result(attempt),
+            ]
+        ),
+        add=MagicMock(),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+    )
+    payload = {
+        'id': 'provider-1',
+        'paymentMethod': 2,
+        'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+    }
+
+    abandoned = await abandon_direct_checkout_for_new_calculation(
+        db,
+        checkout_public_id=checkout.public_id,
+        user_id=user.id,
+    )
+    assert abandoned is checkout
+    assert checkout.terminal_reason == 'cancelled_by_user_after_invoice'
+
+    with patch(
+        'app.services.device_first_payment_service.fulfill_direct_external_checkout',
+        AsyncMock(),
+    ) as fulfill:
+        await settle_device_first_platega_payment(db, payment=payment, payload=payload)
+        await settle_device_first_platega_payment(db, payment=payment, payload=payload)
+
+    assert checkout.lifecycle_state == 'cancelled'
+    assert checkout.fulfillment_state == 'not_started'
+    assert payment.is_paid is True
+    assert attempt.status == 'credited'
+    assert attempt.reconciliation_reason == 'late_paid_wallet_credit'
+    assert user.balance_kopeks == 35_000
+    ledger_rows = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if getattr(call.args[0], 'device_first_ledger_key', None) == 'direct_late_invoice:41'
+    ]
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0].amount_kopeks == 35_000
+    fulfill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_abandon_refuses_an_unbound_or_ambiguous_invoice_creation():
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    payment.status = 'CREATING'
+    attempt.status = 'creating'
+    attempt.provider_payment_id = None
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=payment.id),
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+    )
+
+    with pytest.raises(DeviceFirstError) as raised:
+        await abandon_direct_checkout_for_new_calculation(
+            db,
+            checkout_public_id=checkout.public_id,
+            user_id=user.id,
+        )
+
+    assert raised.value.code == 'reconciliation_required'
+    assert checkout.lifecycle_state == 'awaiting_funds'
+    assert attempt.status == 'creating'
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio

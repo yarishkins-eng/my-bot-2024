@@ -14,6 +14,7 @@ from app.handlers.subscription.device_first import (
     _render_confirmation,
     _render_error,
     _render_new_checkout,
+    abandon,
     arm,
     cancel,
     change_selection,
@@ -355,6 +356,7 @@ async def test_choose_devices_creates_owned_telegram_checkout_and_renders_confir
     checkout = SimpleNamespace(public_id='owned-checkout')
 
     with (
+        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock(return_value=None)),
         patch(
             'app.handlers.subscription.device_first.create_checkout',
             AsyncMock(return_value=checkout),
@@ -600,38 +602,35 @@ async def test_tariffs_starts_a_new_calculation_after_discarding_a_safe_quote(li
 
 
 @pytest.mark.asyncio
-async def test_tariffs_discards_a_direct_quote_before_payment_method_selection() -> None:
-    """A direct C1 quote has no financial attempt and is safe to replace."""
+async def test_tariffs_resumes_a_direct_checkout_without_silently_abandoning_it() -> None:
+    """Opening Tariffs must not invalidate a provider-owned payment link."""
     callback = SimpleNamespace(data='tariff_list', answer=AsyncMock())
     state = AsyncMock()
     user = SimpleNamespace(id=17, language='ru')
     quote = SimpleNamespace(
         public_id='direct-quote-17', lifecycle_state='confirmed', settlement_mode='direct_purchase_v2'
     )
-    cancelled_quote = SimpleNamespace(public_id='direct-quote-17', lifecycle_state='cancelled')
-    options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
     db = AsyncMock()
 
     with (
         patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock(return_value=quote)),
-        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
         patch(
-            'app.handlers.subscription.device_first.abandon_direct_checkout_for_new_calculation',
-            AsyncMock(return_value=None),
+            'app.handlers.subscription.device_first.abandon_direct_checkout_for_new_calculation', AsyncMock()
         ) as abandon,
-        patch('app.handlers.subscription.device_first.get_owned_checkout', AsyncMock(return_value=quote)) as locked,
+        patch('app.handlers.subscription.device_first.get_owned_checkout', AsyncMock()) as locked,
         patch(
-            'app.handlers.subscription.device_first.cancel_checkout_for_new_calculation',
-            AsyncMock(return_value=cancelled_quote),
+            'app.handlers.subscription.device_first.cancel_checkout_for_new_calculation', AsyncMock()
         ) as cancel_quote,
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
         patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
     ):
         assert await show_device_first_entry(callback, user, db, state) is True
 
-    abandon.assert_awaited_once_with(db, checkout_public_id='direct-quote-17', user_id=17)
-    locked.assert_awaited_once_with(db, public_id='direct-quote-17', user_id=17, for_update=True)
-    cancel_quote.assert_awaited_once_with(db, quote)
-    period_page.assert_awaited_once()
+    abandon.assert_not_awaited()
+    locked.assert_not_awaited()
+    cancel_quote.assert_not_awaited()
+    render.assert_awaited_once_with(callback, user, db, quote)
+    period_page.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -914,7 +913,9 @@ async def test_pending_invoice_uses_a_localized_method_name_and_blocks_second_me
     assert 'cards_ru' not in caption
     assert keyboard[0][0].url == 'https://pay.example/invoice'
     assert keyboard[1][0].callback_data == 'df:s:owned-checkout'
-    assert keyboard[2][0].callback_data == 'back_to_menu'
+    assert keyboard[2][0].callback_data == 'df:e:owned-checkout'
+    assert keyboard[2][1].callback_data == 'df:x:owned-checkout'
+    assert keyboard[3][0].callback_data == 'back_to_menu'
     methods.assert_not_awaited()
 
 
@@ -1048,33 +1049,78 @@ async def test_payment_amount_mismatch_tells_the_user_that_money_is_on_balance()
 
 
 @pytest.mark.asyncio
-async def test_change_selection_does_not_cancel_an_order_with_a_pending_invoice() -> None:
+async def test_change_selection_navigates_without_cancelling_a_pending_invoice() -> None:
     callback = SimpleNamespace(data='df:e:owned-checkout', answer=AsyncMock())
     user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
     checkout = SimpleNamespace(id=101, public_id='owned-checkout')
 
+    state = AsyncMock()
+    options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
     with (
+        patch('app.handlers.subscription.device_first.get_owned_checkout', AsyncMock(return_value=checkout)),
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
         patch(
-            'app.handlers.subscription.device_first.get_owned_checkout',
-            AsyncMock(return_value=checkout),
-        ),
-        patch(
-            'app.handlers.subscription.device_first.get_pending_platega_attempt',
-            AsyncMock(return_value=SimpleNamespace(status='pending')),
-        ),
-        patch(
-            'app.handlers.subscription.device_first.cancel_checkout',
-            AsyncMock(),
-        ) as cancel_checkout,
-        patch(
-            'app.handlers.subscription.device_first._render_checkout',
-            AsyncMock(),
-        ) as render_checkout,
+            'app.handlers.subscription.device_first.abandon_direct_checkout_for_new_calculation', AsyncMock()
+        ) as abandon,
+        patch('app.handlers.subscription.device_first.cancel_checkout', AsyncMock()) as cancel_checkout,
+        patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
     ):
-        await change_selection(callback, user, AsyncMock(), AsyncMock())
+        await change_selection(callback, user, AsyncMock(), state)
 
+    abandon.assert_not_awaited()
     cancel_checkout.assert_not_awaited()
-    render_checkout.assert_awaited_once()
+    period_page.assert_awaited_once()
+    assert state.update_data.await_args.kwargs['df_checkout_id'] == 'owned-checkout'
+
+
+@pytest.mark.asyncio
+async def test_changed_completed_telegram_selection_supersedes_one_safe_pending_invoice() -> None:
+    callback = SimpleNamespace(data='df:d:view1234:4', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    options = {
+        'eligible': True,
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2, 4],
+        'price_matrix': [],
+    }
+    state = SimpleNamespace(
+        get_data=AsyncMock(
+            return_value={
+                'df_options': options,
+                'df_view_id': 'view1234',
+                'df_days': 30,
+                'df_origin_callback': 'back_to_menu',
+            }
+        ),
+        update_data=AsyncMock(),
+    )
+    existing = SimpleNamespace(
+        public_id='old-checkout',
+        lifecycle_state='awaiting_funds',
+        settlement_mode='direct_purchase_v2',
+        period_days=30,
+        selected_device_limit=2,
+    )
+    archived = SimpleNamespace(public_id='old-checkout', lifecycle_state='cancelled')
+    fresh = SimpleNamespace(public_id='fresh-checkout')
+
+    with (
+        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock(return_value=existing)),
+        patch(
+            'app.handlers.subscription.device_first.abandon_direct_checkout_for_new_calculation',
+            AsyncMock(return_value=archived),
+        ) as abandon_service,
+        patch('app.handlers.subscription.device_first.create_checkout', AsyncMock(return_value=fresh)) as create,
+        patch('app.handlers.subscription.device_first._render_new_checkout', AsyncMock()) as render,
+    ):
+        await choose_devices(callback, user, SimpleNamespace(), state)
+
+    abandon_service.assert_awaited_once_with(ANY, checkout_public_id='old-checkout', user_id=user.id)
+    create.assert_awaited_once()
+    assert create.await_args.kwargs['period_days'] == 30
+    assert create.await_args.kwargs['selected_device_limit'] == 4
+    render.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1105,26 +1151,17 @@ async def test_processing_checkout_shows_paid_message_without_cancel_button() ->
 
 
 @pytest.mark.asyncio
-async def test_cancel_after_credit_rerenders_processing_instead_of_claiming_cancelled() -> None:
-    callback = SimpleNamespace(data='df:x:owned-checkout', answer=AsyncMock())
+async def test_explicit_abandon_after_credit_rerenders_processing_instead_of_claiming_cancelled() -> None:
+    callback = SimpleNamespace(data='df:xa:owned-checkout', answer=AsyncMock())
     user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
-    checkout = SimpleNamespace(public_id='owned-checkout')
+    checkout = SimpleNamespace(public_id='owned-checkout', lifecycle_state='processing')
     state = SimpleNamespace(clear=AsyncMock())
     db = AsyncMock()
-    invalid_state = DeviceFirstError('invalid_state', 'A fulfilled checkout cannot be cancelled')
 
     with (
         patch(
-            'app.handlers.subscription.device_first.get_owned_checkout',
+            'app.handlers.subscription.device_first.abandon_direct_checkout_for_new_calculation',
             AsyncMock(return_value=checkout),
-        ),
-        patch(
-            'app.handlers.subscription.device_first.cancel_checkout',
-            AsyncMock(side_effect=invalid_state),
-        ),
-        patch(
-            'app.handlers.subscription.device_first.get_pending_platega_attempt',
-            AsyncMock(return_value=None),
         ),
         patch(
             'app.handlers.subscription.device_first._render_checkout',
@@ -1135,11 +1172,32 @@ async def test_cancel_after_credit_rerenders_processing_instead_of_claiming_canc
             AsyncMock(),
         ) as render_cancelled,
     ):
-        await cancel(callback, user, db, state)
+        await abandon(callback, user, db, state)
 
-    state.clear.assert_awaited_once()
+    state.clear.assert_not_awaited()
     render_checkout.assert_awaited_once_with(callback, user, db, checkout)
     render_cancelled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_invoice_cancel_first_requires_explicit_customer_confirmation() -> None:
+    callback = SimpleNamespace(data='df:x:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    checkout = SimpleNamespace(public_id='owned-checkout', settlement_mode='direct_purchase_v2')
+
+    with (
+        patch('app.handlers.subscription.device_first.get_owned_checkout', AsyncMock(return_value=checkout)),
+        patch(
+            'app.handlers.subscription.device_first.abandon_direct_checkout_for_new_calculation', AsyncMock()
+        ) as abandon_service,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output,
+    ):
+        await cancel(callback, user, AsyncMock(), AsyncMock())
+
+    abandon_service.assert_not_awaited()
+    keyboard = output.await_args.kwargs['keyboard'].inline_keyboard
+    assert keyboard[0][0].callback_data == 'df:xa:owned-checkout'
+    assert keyboard[1][0].callback_data == 'df:s:owned-checkout'
 
 
 @pytest.mark.asyncio

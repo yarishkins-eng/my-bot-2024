@@ -309,22 +309,15 @@ async def show_device_first_entry(
     options: dict | None = None,
     origin_callback: str | None = None,
 ) -> bool:
-    # “Tariffs” is an explicit intent to configure a new purchase.  A quote
-    # with no provider invoice is discarded outright.  A direct invoice is
-    # locally abandoned through its financial lock fence: it remains audited
-    # and reconciled, but can never fulfil this stale configuration if paid
-    # late (that money is credited once to the wallet instead).
+    # A direct provider invoice is resumable until the customer explicitly
+    # changes the completed configuration or confirms an abandon action.
+    # Opening “Tariffs” (or closing/reopening a browser) must never silently
+    # invalidate a live payment link.  Legacy/pre-invoice quotes remain
+    # disposable because they have no external money path.
     existing = await get_open_checkout_for_user(db, user_id=db_user.id)
     if existing is not None:
         try:
-            cancelled_checkout = None
-            if settlement_mode(existing) == DIRECT_SETTLEMENT_MODE:
-                cancelled_checkout = await abandon_direct_checkout_for_new_calculation(
-                    db,
-                    checkout_public_id=existing.public_id,
-                    user_id=db_user.id,
-                )
-            if cancelled_checkout is None:
+            if settlement_mode(existing) != DIRECT_SETTLEMENT_MODE:
                 locked_checkout = await get_owned_checkout(
                     db,
                     public_id=existing.public_id,
@@ -332,6 +325,8 @@ async def show_device_first_entry(
                     for_update=True,
                 )
                 cancelled_checkout = await cancel_checkout_for_new_calculation(db, locked_checkout)
+            else:
+                cancelled_checkout = existing
         except DeviceFirstError:
             # The row can turn into an external-invoice recovery record
             # between the read and the lock.  Do not start another order.
@@ -485,17 +480,34 @@ async def choose_devices(
     await callback.answer()
     days = int(data['df_days'])
     try:
-        checkout = await create_checkout(
-            db,
-            user=db_user,
-            period_days=days,
-            selected_device_limit=devices,
-            source='telegram',
-        )
-    except DeviceFirstError as error:
-        if error.code == 'open_checkout_exists':
-            existing = await get_open_checkout_for_user(db, user_id=db_user.id)
-            if existing is not None:
+        # Selecting another complete configuration is the explicit point at
+        # which a resumable direct invoice may be superseded.  Merely opening
+        # this chooser never does that.  The service accepts only a fully
+        # bound canonical PENDING/INPROGRESS invoice; ambiguous/paid states
+        # remain on their recovery screen rather than creating a second link.
+        existing = await get_open_checkout_for_user(db, user_id=db_user.id)
+        if existing is not None:
+            if settlement_mode(existing) == DIRECT_SETTLEMENT_MODE and (
+                existing.period_days != days or existing.selected_device_limit != devices
+            ):
+                archived = await abandon_direct_checkout_for_new_calculation(
+                    db,
+                    checkout_public_id=existing.public_id,
+                    user_id=db_user.id,
+                )
+                if archived is None:
+                    locked_quote = await get_owned_checkout(
+                        db,
+                        public_id=existing.public_id,
+                        user_id=db_user.id,
+                        for_update=True,
+                    )
+                    archived = await cancel_checkout_for_new_calculation(db, locked_quote)
+                if archived.lifecycle_state != 'cancelled':
+                    await state.update_data(df_checkout_id=archived.public_id)
+                    await _render_checkout(callback, db_user, db, archived)
+                    return
+            else:
                 await state.update_data(df_checkout_id=existing.public_id)
                 if existing.lifecycle_state == 'draft':
                     await _render_new_checkout(
@@ -508,6 +520,14 @@ async def choose_devices(
                 else:
                     await _render_checkout(callback, db_user, db, existing)
                 return
+        checkout = await create_checkout(
+            db,
+            user=db_user,
+            period_days=days,
+            selected_device_limit=devices,
+            source='telegram',
+        )
+    except DeviceFirstError as error:
         await _render_error(callback, db_user, error)
         return
     await state.update_data(df_checkout_id=checkout.public_id)
@@ -892,14 +912,14 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                         '💳 <b>Счёт ожидает оплаты</b>\n\n'
                         f'Способ: <b>{method}</b>\n'
                         f'К оплате: <b>{amount} ₽</b>\n\n'
-                        'Оплатите этот счёт или проверьте его статус. Новый счёт не создаётся, '
-                        'чтобы не было двойной оплаты.' + _invoice_expiry_label(user, provider_expires_at)
+                        'Оплатите счёт или измените параметры заказа. При выборе другой конфигурации этот счёт '
+                        'не сможет оформить прежнюю подписку.' + _invoice_expiry_label(user, provider_expires_at)
                     ),
                     (
                         '💳 <b>Invoice awaiting payment</b>\n\n'
                         f'Method: <b>{method}</b>\n'
                         f'To pay: <b>₽{amount}</b>\n\n'
-                        'Pay this invoice or check its status. A new invoice is blocked to prevent a duplicate payment.'
+                        'Pay this invoice or change the order. If you choose another configuration, this invoice cannot activate the old subscription.'
                         + _invoice_expiry_label(user, provider_expires_at)
                     ),
                 )
@@ -912,6 +932,7 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                             )
                         ],
                         [status_button],
+                        [_change_selection(user, checkout.public_id), _cancel_order(user, checkout.public_id)],
                         [_main_menu(user)],
                     ]
                 )
@@ -1338,26 +1359,16 @@ async def change_selection(
     db: AsyncSession,
     state: FSMContext,
 ) -> None:
-    """Cancel an uncharged checkout before returning to the device choices."""
+    """Navigate to choices without touching a resumable provider invoice."""
     await callback.answer()
     public_id = _checkout_id(callback)
     if not public_id:
         await _render_error(callback, db_user, _text(db_user, 'Заказ не найден.', 'Order not found.'))
         return
     try:
-        checkout = await get_owned_checkout(db, public_id=public_id, user_id=db_user.id, for_update=True)
-        pending_attempt = None
-        if getattr(checkout, 'id', None) is not None:
-            pending_attempt = await get_pending_platega_attempt(db, checkout_id=checkout.id)
-        if pending_attempt is not None:
-            await _render_checkout(callback, db_user, db, checkout)
-            return
-        checkout = await cancel_checkout(db, checkout)
+        checkout = await get_owned_checkout(db, public_id=public_id, user_id=db_user.id)
     except DeviceFirstError as error:
-        if error.code == 'invalid_state' and 'checkout' in locals():
-            await _render_checkout(callback, db_user, db, checkout)
-        else:
-            await _render_error(callback, db_user, error)
+        await _render_error(callback, db_user, error)
         return
 
     data = await state.get_data()
@@ -1374,10 +1385,10 @@ async def change_selection(
         )
         return
     origin = data.get('df_origin_callback') or 'back_to_menu'
-    await state.update_data(df_checkout_id=None)
-    # The button promises to change the complete configuration, not merely a
-    # device count. Returning to the first choice also makes Telegram Back
-    # deterministic: period -> devices -> payment methods.
+    await state.update_data(df_checkout_id=checkout.public_id)
+    # This is navigation only.  A changed completed configuration supersedes
+    # the invoice atomically in ``choose_devices``; choosing the same one
+    # resumes the existing invoice.
     await _period_page(
         callback,
         db_user,
@@ -1433,17 +1444,89 @@ async def cancel(
         )
         return
     try:
-        checkout = await get_owned_checkout(db, public_id=public_id, user_id=db_user.id, for_update=True)
-        pending_attempt = None
-        if getattr(checkout, 'id', None) is not None:
-            pending_attempt = await get_pending_platega_attempt(db, checkout_id=checkout.id)
+        checkout = await get_owned_checkout(db, public_id=public_id, user_id=db_user.id)
+        if settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE:
+            # An issued external invoice has a materially different contract
+            # from a pre-payment quote.  Make the customer acknowledge it
+            # before invoking the dedicated server-side abandon action.
+            await edit_or_answer_photo(
+                callback=callback,
+                caption=_text(
+                    db_user,
+                    (
+                        '⚠️ <b>Отменить заказ?</b>\n\n'
+                        'Платёжная ссылка может оставаться доступной некоторое время. Не оплачивайте её. '
+                        'Если оплата всё же подтвердится позже, сумма один раз зачислится на баланс — '
+                        'прежняя подписка не оформится.'
+                    ),
+                    (
+                        '⚠️ <b>Cancel this order?</b>\n\n'
+                        'The payment link can remain available for a while. Do not pay it. '
+                        'If a payment is confirmed later, the amount is credited to your balance once — '
+                        'the previous subscription will not be activated.'
+                    ),
+                ),
+                keyboard=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=_text(db_user, 'Да, отменить заказ', 'Yes, cancel order'),
+                                callback_data=f'df:xa:{checkout.public_id}',
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                text=_text(db_user, '‹ Вернуться к оплате', '‹ Return to payment'),
+                                callback_data=f'df:s:{checkout.public_id}',
+                            )
+                        ],
+                    ]
+                ),
+                parse_mode='HTML',
+            )
+            return
         checkout = await cancel_checkout(db, checkout)
     except DeviceFirstError as error:
-        await state.clear()
-        if error.code == 'invalid_state' and 'checkout' in locals():
-            await _render_checkout(callback, db_user, db, checkout)
-        else:
-            await _render_error(callback, db_user, error)
+        await _render_error(callback, db_user, error)
+        return
+    await state.clear()
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=_text(
+            db_user,
+            'Заказ отменён. Деньги не списаны.',
+            'Order cancelled. No money was charged.',
+        ),
+        keyboard=InlineKeyboardMarkup(inline_keyboard=[[_main_menu(db_user)]]),
+        parse_mode='HTML',
+    )
+
+
+async def abandon(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+) -> None:
+    """Confirm the explicit local supersession of one direct provider invoice."""
+    await callback.answer()
+    public_id = _checkout_id(callback)
+    if not public_id:
+        await _render_error(callback, db_user, _text(db_user, 'Заказ не найден.', 'Order not found.'))
+        return
+    try:
+        checkout = await abandon_direct_checkout_for_new_calculation(
+            db,
+            checkout_public_id=public_id,
+            user_id=db_user.id,
+        )
+        if checkout is None:
+            raise DeviceFirstError('invalid_state', 'This checkout has no provider invoice to abandon')
+    except DeviceFirstError as error:
+        await _render_error(callback, db_user, error)
+        return
+    if checkout.lifecycle_state != 'cancelled':
+        await _render_checkout(callback, db_user, db, checkout)
         return
     await state.clear()
     await edit_or_answer_photo(
@@ -1452,17 +1535,13 @@ async def cancel(
             db_user,
             (
                 'Заказ отменён. Деньги не списаны.\n\n'
-                'Если вы позже оплатите уже созданный счёт, деньги попадут только на баланс: '
-                'VPN автоматически не оформится.'
-                if pending_attempt is not None
-                else 'Заказ отменён. Деньги не списаны.'
+                'Если старая ссылка будет оплачена позднее, сумма один раз зачислится на баланс. '
+                'Прежняя подписка не оформится.'
             ),
             (
                 'Order cancelled. No money was charged.\n\n'
-                'If you pay an already issued invoice later, the money goes to your balance only; '
-                'VPN will not be activated automatically.'
-                if pending_attempt is not None
-                else 'Order cancelled. No money was charged.'
+                'If the old link is paid later, the amount is credited to your balance once. '
+                'The previous subscription will not be activated.'
             ),
         ),
         keyboard=InlineKeyboardMarkup(inline_keyboard=[[_main_menu(db_user)]]),
@@ -1565,4 +1644,5 @@ def register_device_first_handlers(dp) -> None:
     dp.callback_query.register(change_selection, F.data.startswith('df:e:'))
     dp.callback_query.register(pay, F.data.startswith('df:y:'))
     dp.callback_query.register(refresh_status, F.data.startswith('df:s:'))
+    dp.callback_query.register(abandon, F.data.startswith('df:xa:'))
     dp.callback_query.register(cancel, F.data.startswith('df:x:'))

@@ -13,6 +13,7 @@ from app.cabinet.routes.device_first import (
     _checkout_command,
     _mutation,
     _rehydrate_owned_direct_redirect,
+    checkout_abandon,
     checkout_commit,
     checkout_create,
     checkout_get,
@@ -108,6 +109,7 @@ async def test_new_different_cabinet_selection_archives_only_the_old_direct_invo
     user = SimpleNamespace(id=17, balance_kopeks=0)
     mutation = SimpleNamespace(checkout_id=None)
     old_invoice = SimpleNamespace(
+        id=41,
         public_id='old-checkout',
         settlement_mode='direct_purchase_v2',
         period_days=30,
@@ -199,6 +201,7 @@ async def test_same_cabinet_selection_resumes_a_live_invoice_instead_of_abandoni
     user = SimpleNamespace(id=17, balance_kopeks=0)
     mutation = SimpleNamespace(checkout_id=None)
     old_invoice = SimpleNamespace(
+        id=41,
         public_id='old-checkout',
         settlement_mode='direct_purchase_v2',
         period_days=30,
@@ -211,26 +214,108 @@ async def test_same_cabinet_selection_resumes_a_live_invoice_instead_of_abandoni
         patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
         patch('app.cabinet.routes.device_first.get_open_checkout_for_user', AsyncMock(return_value=old_invoice)),
         patch('app.cabinet.routes.device_first.abandon_direct_checkout_for_new_calculation', AsyncMock()) as abandon,
+        patch('app.cabinet.routes.device_first.create_checkout', AsyncMock()) as create,
         patch(
-            'app.cabinet.routes.device_first.create_checkout',
-            AsyncMock(side_effect=DeviceFirstError('open_checkout_exists', 'resume invoice')),
+            'app.cabinet.routes.device_first._serialize_cabinet_checkout',
+            AsyncMock(return_value={'id': 'old-checkout'}),
         ),
-        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
     ):
-        with pytest.raises(HTTPException) as raised:
-            await checkout_create(
-                SimpleNamespace(
-                    period_days=30,
-                    selected_device_limit=4,
-                    model_dump=lambda: {'period_days': 30, 'selected_device_limit': 4},
-                ),
-                idempotency_key='same-choice',
-                user=user,
-                db=db,
-            )
+        response = await checkout_create(
+            SimpleNamespace(
+                period_days=30,
+                selected_device_limit=4,
+                model_dump=lambda: {'period_days': 30, 'selected_device_limit': 4},
+            ),
+            idempotency_key='same-choice',
+            user=user,
+            db=db,
+        )
 
-    assert raised.value.detail['code'] == 'open_checkout_exists'
+    assert response == {'id': 'old-checkout'}
     abandon.assert_not_awaited()
+    create.assert_not_awaited()
+    assert mutation.checkout_id == 41
+    store.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_different_selection_keeps_the_current_checkout_when_abandon_loses_to_settlement() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    old_invoice = SimpleNamespace(
+        id=91,
+        public_id='old-checkout',
+        settlement_mode='direct_purchase_v2',
+        period_days=30,
+        selected_device_limit=4,
+        lifecycle_state='processing',
+    )
+    db = AsyncMock()
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch('app.cabinet.routes.device_first.get_open_checkout_for_user', AsyncMock(return_value=old_invoice)),
+        patch(
+            'app.cabinet.routes.device_first.abandon_direct_checkout_for_new_calculation',
+            AsyncMock(return_value=old_invoice),
+        ) as abandon,
+        patch('app.cabinet.routes.device_first.create_checkout', AsyncMock()) as create,
+        patch(
+            'app.cabinet.routes.device_first._serialize_cabinet_checkout',
+            AsyncMock(return_value={'id': 'old-checkout'}),
+        ),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
+    ):
+        response = await checkout_create(
+            SimpleNamespace(
+                period_days=90,
+                selected_device_limit=2,
+                model_dump=lambda: {'period_days': 90, 'selected_device_limit': 2},
+            ),
+            idempotency_key='changed-choice-after-settlement',
+            user=user,
+            db=db,
+        )
+
+    assert response == {'id': 'old-checkout'}
+    abandon.assert_awaited_once_with(db, checkout_public_id='old-checkout', user_id=user.id)
+    create.assert_not_awaited()
+    store.assert_awaited_once_with(db, mutation, response={'id': 'old-checkout'})
+
+
+@pytest.mark.asyncio
+async def test_explicit_abandon_uses_its_own_idempotent_owner_scoped_action() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    archived = SimpleNamespace(id=91, public_id='old-checkout', lifecycle_state='cancelled')
+    db = AsyncMock()
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch(
+            'app.cabinet.routes.device_first.abandon_direct_checkout_for_new_calculation',
+            AsyncMock(return_value=archived),
+        ) as abandon,
+        patch(
+            'app.cabinet.routes.device_first._serialize_cabinet_checkout',
+            AsyncMock(return_value={'id': 'old-checkout'}),
+        ),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
+    ):
+        response = await checkout_abandon(
+            'old-checkout',
+            idempotency_key='abandon-old-checkout',
+            user=user,
+            db=db,
+        )
+
+    assert response == {'id': 'old-checkout'}
+    abandon.assert_awaited_once_with(db, checkout_public_id='old-checkout', user_id=user.id)
+    assert mutation.checkout_id == archived.id
+    store.assert_awaited_once_with(db, mutation, response={'id': 'old-checkout'})
 
 
 @pytest.mark.asyncio
