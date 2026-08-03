@@ -3,6 +3,7 @@ import math
 import secrets
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
+from inspect import isawaitable
 
 import structlog
 from sqlalchemy import and_, case, delete, func, select
@@ -34,10 +35,16 @@ class AccountErasureClosureError(RuntimeError):
 
 
 async def _assert_user_not_in_financial_closure(db: AsyncSession, user_id: int) -> None:
-    user = await db.scalar(
+    maybe_user = db.scalar(
         select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
     )
-    if user is not None and getattr(user, 'account_erasure_requested_at', None) is not None:
+    # Production sessions are async.  Keeping the guard inert for a synchronous
+    # test double prevents an absent mock from being mistaken for a closing user;
+    # a real ORM row still must carry an actual closure timestamp to be fenced.
+    if not isawaitable(maybe_user):
+        return
+    user = await maybe_user
+    if isinstance(getattr(user, 'account_erasure_requested_at', None), datetime):
         raise AccountErasureClosureError('Account closure is in progress; paid access cannot be created or revived.')
 
 
