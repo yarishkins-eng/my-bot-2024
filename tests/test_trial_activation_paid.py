@@ -296,3 +296,43 @@ async def test_trial_fallback_without_cabinet_url_never_builds_invalid_webapp_bu
     assert shown is True
     keyboard = trial_callback_query.message.edit_text.call_args.kwargs['reply_markup']
     assert all(button.web_app is None for row in keyboard.inline_keyboard for button in row)
+
+
+@pytest.mark.asyncio
+async def test_pending_trial_checkout_resolution_opens_dedicated_trial_decision(
+    trial_callback_query,
+    trial_user,
+    trial_db,
+):
+    """A free-trial intent must never be redirected to the generic dashboard."""
+
+    context = TrialCheckoutContext(
+        'pending_invoice',
+        TrialCheckoutSummary(
+            public_id='checkout-9',
+            tariff_name='Базовый',
+            period_days=30,
+            device_limit=2,
+            amount_kopeks=24_900,
+        ),
+    )
+    texts = MagicMock()
+    texts.BACK = 'Назад'
+
+    with (
+        patch('app.handlers.subscription.purchase.get_texts', return_value=texts),
+        patch(
+            'app.handlers.subscription.purchase.get_trial_checkout_context',
+            new=AsyncMock(return_value=context),
+        ),
+        patch(
+            'app.utils.miniapp_buttons.build_cabinet_url',
+            return_value='https://cabinet.example/trial?startapp=signed',
+        ) as build_cabinet_url,
+    ):
+        shown = await _show_trial_checkout_resolution(trial_callback_query, trial_user, trial_db)
+
+    assert shown is True
+    build_cabinet_url.assert_called_once_with('/trial')
+    keyboard = trial_callback_query.message.edit_text.call_args.kwargs['reply_markup']
+    assert keyboard.inline_keyboard[0][0].web_app.url == 'https://cabinet.example/trial?startapp=signed'

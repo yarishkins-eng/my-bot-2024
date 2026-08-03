@@ -138,6 +138,22 @@ def _callbacks(keyboard) -> list[str]:
     return [button.callback_data for row in keyboard.inline_keyboard for button in row]
 
 
+def test_newbie_trial_cta_opens_dedicated_trial_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The primary free-trial CTA must preserve intent despite an open paid order."""
+
+    monkeypatch.setattr(settings, 'TRIAL_DURATION_DAYS', 3)
+    monkeypatch.setattr(settings, 'TRIAL_DISABLED_FOR', '')
+    monkeypatch.setattr(
+        'app.utils.miniapp_buttons.build_cabinet_url',
+        lambda path: f'https://cabinet.example{path}',
+    )
+
+    keyboard = build_funnel_menu_keyboard(FunnelState.NEWBIE, 'ru', get_texts('ru'))
+
+    assert keyboard is not None
+    assert keyboard.inline_keyboard[0][0].web_app.url == 'https://cabinet.example/trial'
+
+
 def test_trial_menu_places_connection_link_above_referral() -> None:
     keyboard = build_funnel_menu_keyboard(
         FunnelState.TRIAL_ACTIVE,

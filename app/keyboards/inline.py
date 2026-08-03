@@ -51,7 +51,10 @@ def build_funnel_menu_keyboard(
         trial_available = settings.TRIAL_DURATION_DAYS > 0 and settings.TRIAL_DISABLED_FOR != 'all'
         if trial_available:
             trial_text = texts.t('FUNNEL_TRY_FREE', '🎁 Попробовать бесплатно')
-            cabinet_url = build_cabinet_url('/')
+            # The trial CTA is an intent, not a generic dashboard visit.  A
+            # dedicated route prevents an unfinished paid checkout from
+            # shadowing the user's explicit decision to start the free trial.
+            cabinet_url = build_cabinet_url('/trial')
             if cabinet_url:
                 rows.append([InlineKeyboardButton(text=trial_text, web_app=types.WebAppInfo(url=cabinet_url))])
             else:

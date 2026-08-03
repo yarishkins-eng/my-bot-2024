@@ -103,10 +103,10 @@ async def _show_trial_checkout_resolution(
             'Чтобы не создать повторный счёт, откройте кабинет и обновите статус заказа.'
         )
     # Keep the fallback valid even for installations where Cabinet is disabled
-    # or its URL is not configured.  During the backend-first rollout this is
-    # deliberately the existing Cabinet root; the CTA switches to `/trial`
-    # only after that route is live in the separately deployed frontend.
-    cabinet_url = build_cabinet_url('/')
+    # or its URL is not configured.  The dedicated route is already deployed
+    # before this handler is enabled, so the CTA preserves the customer's
+    # explicit trial intent instead of returning to the generic dashboard.
+    cabinet_url = build_cabinet_url('/trial')
     if cabinet_url:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
