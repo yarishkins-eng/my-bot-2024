@@ -79,11 +79,7 @@ class _ErasureContext:
 
 def _queued_panel_cleanup_uuids(request: AccountErasureRequest | None) -> set[str]:
     """Return the durable list of panel identities still awaiting deletion."""
-    return {
-        str(value)
-        for value in (getattr(request, 'panel_cleanup_uuids', None) or [])
-        if value
-    }
+    return {str(value) for value in (getattr(request, 'panel_cleanup_uuids', None) or []) if value}
 
 
 async def record_panel_cleanup_retry_for_financial_closure(*, user_id: int, panel_uuid: str) -> bool:
@@ -101,9 +97,7 @@ async def record_panel_cleanup_retry_for_financial_closure(*, user_id: int, pane
     async with AsyncSessionLocal() as cleanup_db:
         request = (
             await cleanup_db.execute(
-                select(AccountErasureRequest)
-                .where(AccountErasureRequest.user_id == user_id)
-                .with_for_update()
+                select(AccountErasureRequest).where(AccountErasureRequest.user_id == user_id).with_for_update()
             )
         ).scalar_one_or_none()
         if request is None:
@@ -127,15 +121,19 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
     # table makes PostgreSQL lock exactly the intended relation, not joined
     # checkout rows in a different order.
     payments = (
-        await db.execute(
-            select(PlategaPayment)
-            .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
-            .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-            .where(SubscriptionCheckout.user_id == user_id)
-            .with_for_update(of=PlategaPayment)
-            .execution_options(populate_existing=True)
+        (
+            await db.execute(
+                select(PlategaPayment)
+                .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
+                .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+                .where(SubscriptionCheckout.user_id == user_id)
+                .with_for_update(of=PlategaPayment)
+                .execution_options(populate_existing=True)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     user = (
         await db.execute(
@@ -146,22 +144,30 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
         return None
 
     attempts = (
-        await db.execute(
-            select(CheckoutPaymentAttempt)
-            .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-            .where(SubscriptionCheckout.user_id == user_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+        (
+            await db.execute(
+                select(CheckoutPaymentAttempt)
+                .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+                .where(SubscriptionCheckout.user_id == user_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     checkouts = (
-        await db.execute(
-            select(SubscriptionCheckout)
-            .where(SubscriptionCheckout.user_id == user_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+        (
+            await db.execute(
+                select(SubscriptionCheckout)
+                .where(SubscriptionCheckout.user_id == user_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     request = (
         await db.execute(
             select(AccountErasureRequest)
@@ -171,13 +177,17 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
         )
     ).scalar_one_or_none()
     subscriptions = (
-        await db.execute(
-            select(Subscription)
-            .where(Subscription.user_id == user_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+        (
+            await db.execute(
+                select(Subscription)
+                .where(Subscription.user_id == user_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return _ErasureContext(
         user=user,
         request=request,
@@ -189,7 +199,10 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
 
 
 def _has_live_subscription(subscriptions: list[Subscription]) -> bool:
-    return any(getattr(subscription, 'actual_status', subscription.status) in {'active', 'trial', 'limited'} for subscription in subscriptions)
+    return any(
+        getattr(subscription, 'actual_status', subscription.status) in {'active', 'trial', 'limited'}
+        for subscription in subscriptions
+    )
 
 
 def _safe_terminal_attempt(attempt: CheckoutPaymentAttempt) -> bool:
@@ -212,7 +225,9 @@ def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
         payment = payments_by_id.get(attempt.platega_payment_id)
         if attempt.status == 'operator_review' or (
             payment is not None
-            and (payment.is_paid or str(getattr(payment, 'status', '') or '').upper() in {'CONFIRMED', 'OPERATOR_REVIEW'})
+            and (
+                payment.is_paid or str(getattr(payment, 'status', '') or '').upper() in {'CONFIRMED', 'OPERATOR_REVIEW'}
+            )
         ):
             return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
         if not _safe_terminal_attempt(attempt):
@@ -752,18 +767,24 @@ async def resolve_financial_account_erasure(
     if resolution_code not in FINANCIAL_RESOLUTION_CODES:
         return AccountErasureResult(state='invalid_resolution', message='Недопустимый код финансового решения.')
     if not resolution_note or len(resolution_note.strip()) < 8:
-        return AccountErasureResult(state='invalid_resolution', message='Укажите краткое основание финансового решения.')
+        return AccountErasureResult(
+            state='invalid_resolution', message='Укажите краткое основание финансового решения.'
+        )
 
     context = await _lock_context(db, user_id=user_id)
     if context is None or context.request is None:
         return AccountErasureResult(state='not_found', message='Запрос на закрытие аккаунта не найден.')
     request = context.request
     if context.user.account_erased_at is not None or request.state == ERASURE_COMPLETED:
-        return AccountErasureResult(state=ERASURE_COMPLETED, message=_message_for_state(ERASURE_COMPLETED, None), completed=True)
+        return AccountErasureResult(
+            state=ERASURE_COMPLETED, message=_message_for_state(ERASURE_COMPLETED, None), completed=True
+        )
     current_state, current_reason = _target_state(context)
     requires_settlement = current_state == ERASURE_AWAITING_MANUAL or _legacy_requires_manual_resolution(request)
     if not requires_settlement:
-        return AccountErasureResult(state='not_required', message='Для этого аккаунта ручная финансовая сверка не требуется.')
+        return AccountErasureResult(
+            state='not_required', message='Для этого аккаунта ручная финансовая сверка не требуется.'
+        )
 
     has_balance = int(context.user.balance_kopeks or 0) > 0
     has_active_subscription = _has_live_subscription(context.subscriptions)
@@ -775,9 +796,7 @@ async def resolve_financial_account_erasure(
     # ``provider_terminal_verified`` is proof of a negative provider outcome,
     # not settlement for a payment already observed as paid/reviewable.
     if (
-        current_reason == 'paid_or_review_payment'
-        or has_balance
-        or has_active_subscription
+        current_reason == 'paid_or_review_payment' or has_balance or has_active_subscription
     ) and resolution_code not in settlement_resolution_codes:
         return AccountErasureResult(
             state='settlement_required',
@@ -818,20 +837,24 @@ async def resolve_financial_account_erasure(
 async def process_pending_financial_account_erasures(db: AsyncSession, *, limit: int = 20) -> int:
     """Advance requests after canonical payment reconciliation, never by TTL."""
     request_ids = (
-        await db.execute(
-            select(AccountErasureRequest.id)
-            .where(
-                or_(
-                    AccountErasureRequest.state.in_(
-                        [ERASURE_AWAITING_RECONCILIATION, ERASURE_READY, ERASURE_PANEL_RETRY]
-                    ),
-                    AccountErasureRequest.panel_state.in_(['pending', 'retry']),
+        (
+            await db.execute(
+                select(AccountErasureRequest.id)
+                .where(
+                    or_(
+                        AccountErasureRequest.state.in_(
+                            [ERASURE_AWAITING_RECONCILIATION, ERASURE_READY, ERASURE_PANEL_RETRY]
+                        ),
+                        AccountErasureRequest.panel_state.in_(['pending', 'retry']),
+                    )
                 )
+                .order_by(AccountErasureRequest.created_at.asc())
+                .limit(limit)
             )
-            .order_by(AccountErasureRequest.created_at.asc())
-            .limit(limit)
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     completed = 0
     for request_id in request_ids:
         request = await db.get(AccountErasureRequest, request_id)

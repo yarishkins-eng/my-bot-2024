@@ -166,10 +166,7 @@ class SubscriptionService:
         this an explicit database re-read rather than an identity-map hit.
         """
         user = await db.scalar(
-            select(User)
-            .where(User.id == user_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+            select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
         )
         if user is None:
             return None
@@ -301,7 +298,10 @@ class SubscriptionService:
         try:
             user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
-                logger.warning('Создание VPN-профиля отклонено: пользователь не найден или закрывается', user_id=subscription.user_id)
+                logger.warning(
+                    'Создание VPN-профиля отклонено: пользователь не найден или закрывается',
+                    user_id=subscription.user_id,
+                )
                 return None
 
             validation_success = await self.validate_and_clean_subscription(db, subscription, user)
@@ -325,6 +325,7 @@ class SubscriptionService:
 
                 # Multi-tariff mode: each subscription has its own Remnawave user
                 if settings.is_multi_tariff_enabled():
+
                     async def operation() -> RemnaWaveUser:
                         return await self._create_or_update_remnawave_user_multi(
                             api,
@@ -337,6 +338,7 @@ class SubscriptionService:
                             reset_reason=reset_reason,
                         )
                 else:
+
                     async def operation() -> RemnaWaveUser:
                         return await self._create_or_update_remnawave_user_single(
                             api,
@@ -348,6 +350,7 @@ class SubscriptionService:
                             reset_traffic=reset_traffic,
                             reset_reason=reset_reason,
                         )
+
                 # Re-acquire the closure fence immediately before the actual
                 # provider mutation. Validation above may have committed a
                 # stale-UUID repair and therefore released an earlier lock.
@@ -567,7 +570,10 @@ class SubscriptionService:
         try:
             user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
-                logger.warning('Обновление VPN-профиля отклонено: пользователь не найден или закрывается', user_id=subscription.user_id)
+                logger.warning(
+                    'Обновление VPN-профиля отклонено: пользователь не найден или закрывается',
+                    user_id=subscription.user_id,
+                )
                 return None
 
             # Resolve the Remnawave UUID: prefer subscription-level in multi-tariff mode

@@ -939,9 +939,7 @@ class UserService:
                 .where(SubscriptionCheckout.user_id == user_id)
                 .with_for_update(of=PlategaPayment)
             )
-            user = (
-                await db.execute(select(User).where(User.id == user_id).with_for_update())
-            ).scalar_one_or_none()
+            user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one_or_none()
             if not user:
                 logger.warning('Пользователь не найден для удаления', user_id=user_id)
                 return result

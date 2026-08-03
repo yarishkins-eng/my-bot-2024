@@ -35,13 +35,11 @@ class AccountErasureClosureError(RuntimeError):
 
 async def _assert_user_not_in_financial_closure(db: AsyncSession, user_id: int) -> None:
     user = await db.scalar(
-        select(User)
-        .where(User.id == user_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+        select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
     )
     if user is not None and getattr(user, 'account_erasure_requested_at', None) is not None:
         raise AccountErasureClosureError('Account closure is in progress; paid access cannot be created or revived.')
+
 
 # Статусы, при которых подписка считается «живой» (индекс uq_subscriptions_user_tariff_active
 # защищает именно эти статусы). Используется в нескольких местах модуля.

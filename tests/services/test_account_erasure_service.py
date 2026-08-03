@@ -207,7 +207,9 @@ async def test_initial_closure_disables_autopay_and_removes_saved_payment_method
         restriction_reason=None,
     )
     subscription = SimpleNamespace(status='active', autopay_enabled=True)
-    context = SimpleNamespace(user=user, request=None, attempts=[], checkouts=[], payments=[], subscriptions=[subscription])
+    context = SimpleNamespace(
+        user=user, request=None, attempts=[], checkouts=[], payments=[], subscriptions=[subscription]
+    )
     db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock(), add=MagicMock())
 
     def add_request(request):
@@ -307,7 +309,9 @@ async def test_monitoring_autopay_query_joins_user_before_excluding_closed_accou
 
 @pytest.mark.asyncio
 async def test_manual_resolution_debits_balance_disables_access_and_then_completes(monkeypatch) -> None:
-    user = SimpleNamespace(id=7, account_erased_at=None, account_erasure_requested_at=datetime.now(UTC), balance_kopeks=500)
+    user = SimpleNamespace(
+        id=7, account_erased_at=None, account_erasure_requested_at=datetime.now(UTC), balance_kopeks=500
+    )
     subscription = SimpleNamespace(status='active', autopay_enabled=True)
     request = SimpleNamespace(
         state=service.ERASURE_AWAITING_MANUAL,
@@ -410,17 +414,47 @@ async def test_completion_redacts_guest_order_credentials_but_not_financial_rows
         account_erasure_requested_at=datetime.now(UTC),
         balance_kopeks=0,
         telegram_id=123,
-        auth_type='telegram', username='old', first_name='Old', last_name='Name', email='old@example.test',
-        email_verified=True, email_verified_at=None, email_verification_source=None,
-        password_hash=None, email_verification_token=None, email_verification_expires=None,
-        password_reset_token=None, password_reset_expires=None, email_change_new=None, email_change_code=None,
-        email_change_expires=None, google_id=None, yandex_id=None, discord_id=None, vk_id=None,
-        referral_code=None, referred_by_id=None, remnawave_uuid=None, trojan_password=None,
-        vless_uuid=None, ss_password=None, pending_campaign_slug=None, notification_settings={},
-        last_pinned_message_id=None, status='deleted', restriction_subscription=True,
-        restriction_topup=True, restriction_reason='account_erasure_requested',
+        auth_type='telegram',
+        username='old',
+        first_name='Old',
+        last_name='Name',
+        email='old@example.test',
+        email_verified=True,
+        email_verified_at=None,
+        email_verification_source=None,
+        password_hash=None,
+        email_verification_token=None,
+        email_verification_expires=None,
+        password_reset_token=None,
+        password_reset_expires=None,
+        email_change_new=None,
+        email_change_code=None,
+        email_change_expires=None,
+        google_id=None,
+        yandex_id=None,
+        discord_id=None,
+        vk_id=None,
+        referral_code=None,
+        referred_by_id=None,
+        remnawave_uuid=None,
+        trojan_password=None,
+        vless_uuid=None,
+        ss_password=None,
+        pending_campaign_slug=None,
+        notification_settings={},
+        last_pinned_message_id=None,
+        status='deleted',
+        restriction_subscription=True,
+        restriction_topup=True,
+        restriction_reason='account_erasure_requested',
     )
-    request = SimpleNamespace(id=10, state=service.ERASURE_READY, panel_state='deactivated', has_legacy_financial_history=False, resolution_code=None)
+    request = SimpleNamespace(
+        id=10,
+        state=service.ERASURE_READY,
+        panel_state='deactivated',
+        has_legacy_financial_history=False,
+        resolution_code=None,
+    )
     context = SimpleNamespace(user=user, request=request, attempts=[], checkouts=[], payments=[], subscriptions=[])
     db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock())
     monkeypatch.setattr(service, '_lock_context', AsyncMock(side_effect=[context, context]))
@@ -428,9 +462,17 @@ async def test_completion_redacts_guest_order_credentials_but_not_financial_rows
     result = await service._complete_ready_financial_account_erasure(db, user_id=7, deactivate_panel=True)
 
     assert result.completed is True
-    guest_redaction = next(call.args[0] for call in db.execute.await_args_list if 'guest_purchases' in str(call.args[0]))
+    guest_redaction = next(
+        call.args[0] for call in db.execute.await_args_list if 'guest_purchases' in str(call.args[0])
+    )
     compiled = str(guest_redaction)
-    for protected_field in ('contact_value', 'cabinet_password', 'auto_login_token', 'subscription_url', 'subscription_crypto_link'):
+    for protected_field in (
+        'contact_value',
+        'cabinet_password',
+        'auto_login_token',
+        'subscription_url',
+        'subscription_crypto_link',
+    ):
         assert protected_field in compiled
     assert 'amount_kopeks' not in compiled
     assert 'payment_id' not in compiled
@@ -440,33 +482,79 @@ async def test_completion_redacts_guest_order_credentials_but_not_financial_rows
 async def test_completion_redacts_payment_links_and_purges_nonfinancial_account_data(monkeypatch) -> None:
     """Final erasure retains money facts, not payment URLs or user-content."""
     user = SimpleNamespace(
-        id=7, account_erased_at=None, account_erasure_requested_at=datetime.now(UTC), balance_kopeks=0,
-        telegram_id=123, auth_type='telegram', username='old', first_name='Old', last_name='Name', email='old@test',
-        email_verified=True, email_verified_at=None, email_verification_source=None,
-        password_hash=None, email_verification_token=None, email_verification_expires=None,
-        password_reset_token=None, password_reset_expires=None, email_change_new=None, email_change_code=None,
-        email_change_expires=None, google_id=None, yandex_id=None, discord_id=None, vk_id=None,
-        referral_code=None, referred_by_id=None, remnawave_uuid=None, trojan_password=None,
-        vless_uuid=None, ss_password=None, pending_campaign_slug=None, notification_settings={},
-        last_pinned_message_id=None, status='deleted', restriction_subscription=True,
-        restriction_topup=True, restriction_reason='account_erasure_requested',
+        id=7,
+        account_erased_at=None,
+        account_erasure_requested_at=datetime.now(UTC),
+        balance_kopeks=0,
+        telegram_id=123,
+        auth_type='telegram',
+        username='old',
+        first_name='Old',
+        last_name='Name',
+        email='old@test',
+        email_verified=True,
+        email_verified_at=None,
+        email_verification_source=None,
+        password_hash=None,
+        email_verification_token=None,
+        email_verification_expires=None,
+        password_reset_token=None,
+        password_reset_expires=None,
+        email_change_new=None,
+        email_change_code=None,
+        email_change_expires=None,
+        google_id=None,
+        yandex_id=None,
+        discord_id=None,
+        vk_id=None,
+        referral_code=None,
+        referred_by_id=None,
+        remnawave_uuid=None,
+        trojan_password=None,
+        vless_uuid=None,
+        ss_password=None,
+        pending_campaign_slug=None,
+        notification_settings={},
+        last_pinned_message_id=None,
+        status='deleted',
+        restriction_subscription=True,
+        restriction_topup=True,
+        restriction_reason='account_erasure_requested',
     )
     payment = SimpleNamespace(
-        id=51, is_paid=False, status='CANCELED',
-        redirect_url='https://provider/pay/secret', return_url='https://return/secret', failed_url='https://fail/secret',
-        payload='tg=123', metadata_json={'email': 'old@test'}, callback_payload={'token': 'secret'}, description='Old',
+        id=51,
+        is_paid=False,
+        status='CANCELED',
+        redirect_url='https://provider/pay/secret',
+        return_url='https://return/secret',
+        failed_url='https://fail/secret',
+        payload='tg=123',
+        metadata_json={'email': 'old@test'},
+        callback_payload={'token': 'secret'},
+        description='Old',
     )
     attempt = SimpleNamespace(
-        id=41, platega_payment_id=51, status='failed', reconciliation_reason='provider_terminal:canceled',
+        id=41,
+        platega_payment_id=51,
+        status='failed',
+        reconciliation_reason='provider_terminal:canceled',
         redirect_url='https://provider/attempt/secret',
     )
     request = SimpleNamespace(
-        id=10, state=service.ERASURE_READY, panel_state='deactivated', panel_cleanup_uuids=[],
-        has_legacy_financial_history=False, resolution_code=None,
+        id=10,
+        state=service.ERASURE_READY,
+        panel_state='deactivated',
+        panel_cleanup_uuids=[],
+        has_legacy_financial_history=False,
+        resolution_code=None,
     )
     context = SimpleNamespace(
-        user=user, request=request, attempts=[attempt], checkouts=[SimpleNamespace(id=9)],
-        payments=[payment], subscriptions=[],
+        user=user,
+        request=request,
+        attempts=[attempt],
+        checkouts=[SimpleNamespace(id=9)],
+        payments=[payment],
+        subscriptions=[],
     )
     db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock())
     monkeypatch.setattr(service, '_lock_context', AsyncMock(side_effect=[context, context]))
@@ -481,8 +569,13 @@ async def test_completion_redacts_payment_links_and_purges_nonfinancial_account_
     assert attempt.redirect_url is None
     all_sql = '\n'.join(str(call.args[0]) for call in db.execute.await_args_list)
     for table in (
-        'device_first_outbox', 'device_first_deposit_outbox', 'device_first_notification_outbox',
-        'device_first_mutations', 'ticket_notifications', 'tickets', 'user_device_aliases',
+        'device_first_outbox',
+        'device_first_deposit_outbox',
+        'device_first_notification_outbox',
+        'device_first_mutations',
+        'ticket_notifications',
+        'tickets',
+        'user_device_aliases',
     ):
         assert table in all_sql
     assert 'platega_payments' not in all_sql
@@ -490,7 +583,9 @@ async def test_completion_redacts_payment_links_and_purges_nonfinancial_account_
 
 @pytest.mark.asyncio
 async def test_late_payment_after_closure_is_reviewed_never_credited() -> None:
-    checkout = SimpleNamespace(id=9, public_id='checkout-9', lifecycle_state='cancelled', terminal_reason='provider_terminal:canceled')
+    checkout = SimpleNamespace(
+        id=9, public_id='checkout-9', lifecycle_state='cancelled', terminal_reason='provider_terminal:canceled'
+    )
     attempt = SimpleNamespace(
         id=41,
         checkout_id=9,

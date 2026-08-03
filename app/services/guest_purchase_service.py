@@ -65,9 +65,7 @@ async def _purchase_touches_financially_closing_account(db: AsyncSession, purcha
         return False
     return bool(
         await db.scalar(
-            select(User.id)
-            .where(User.id.in_(user_ids), User.account_erasure_requested_at.is_not(None))
-            .limit(1)
+            select(User.id).where(User.id.in_(user_ids), User.account_erasure_requested_at.is_not(None)).limit(1)
         )
     )
 
@@ -1237,7 +1235,9 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     user = user_result.scalars().first()
     if user is None:
         raise GuestPurchaseError('User not found', status_code=500)
-    if getattr(user, 'account_erasure_requested_at', None) is not None or await _purchase_touches_financially_closing_account(db, purchase):
+    if getattr(
+        user, 'account_erasure_requested_at', None
+    ) is not None or await _purchase_touches_financially_closing_account(db, purchase):
         await _hold_purchase_for_account_erasure(db, purchase)
         raise GuestPurchaseError('Account is under financial closure review', status_code=409)
 

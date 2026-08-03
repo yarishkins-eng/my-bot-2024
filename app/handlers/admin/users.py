@@ -2702,7 +2702,9 @@ async def clear_user_restrictions(callback: types.CallbackQuery, db_user: User, 
         await callback.answer('Пользователь не найден', show_alert=True)
         return
     if getattr(user, 'account_erasure_requested_at', None) is not None:
-        await callback.answer('Аккаунт закрывается после финансовой сверки; ограничения менять нельзя.', show_alert=True)
+        await callback.answer(
+            'Аккаунт закрывается после финансовой сверки; ограничения менять нельзя.', show_alert=True
+        )
         return
 
     # Снимаем все ограничения
@@ -3849,7 +3851,9 @@ async def toggle_user_server(callback: types.CallbackQuery, db_user: User, db: A
             await callback.answer('❌ Пользователь или подписка не найдены', show_alert=True)
             return
         if await _is_financial_account_closing(db, user_id):
-            await callback.answer('Аккаунт закрывается после финансовой сверки; серверы менять нельзя.', show_alert=True)
+            await callback.answer(
+                'Аккаунт закрывается после финансовой сверки; серверы менять нельзя.', show_alert=True
+            )
             return
 
         server = await get_server_squad_by_id(db, server_id)
@@ -4314,7 +4318,9 @@ async def reset_user_devices(callback: types.CallbackQuery, db_user: User, db: A
     try:
         user = await get_user_by_id(db, user_id)
         if user and await _is_financial_account_closing(db, user_id):
-            await callback.answer('Аккаунт закрывается после финансовой сверки; устройства менять нельзя.', show_alert=True)
+            await callback.answer(
+                'Аккаунт закрывается после финансовой сверки; устройства менять нельзя.', show_alert=True
+            )
             return
         _uuid = None
         if subscription_id and settings.is_multi_tariff_enabled():

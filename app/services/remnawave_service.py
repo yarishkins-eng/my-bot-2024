@@ -2436,205 +2436,203 @@ class RemnaWaveService:
                     # Подготавливаем задачи для параллельного выполнения
                     async def process_subscription(sub):
                         try:
-                                user = sub.user
-                                if await closure_guard._account_erasure_started(db, user.id):
-                                    return ('skipped', sub, None)
-                                original_sub_uuid = sub.remnawave_uuid
-                                original_user_uuid = user.remnawave_uuid
-                                hwid_limit = resolve_hwid_device_limit_for_payload(sub)
+                            user = sub.user
+                            if await closure_guard._account_erasure_started(db, user.id):
+                                return ('skipped', sub, None)
+                            original_sub_uuid = sub.remnawave_uuid
+                            original_user_uuid = user.remnawave_uuid
+                            hwid_limit = resolve_hwid_device_limit_for_payload(sub)
 
-                                # Определяем статус для панели. Grace-aware: пока идёт
-                                # «бонус 2 дня» (in_grace), держим ACTIVE с expireAt=grace_until,
-                                # чтобы массовый sync не отрубил живой VPN.
-                                _now = datetime.now(UTC)
-                                if is_in_grace(sub, _now):
-                                    is_subscription_active = True
-                                    expire_at = self._safe_expire_at_for_panel(sub.grace_until)
-                                else:
-                                    is_subscription_active = (
-                                        sub.status
-                                        in (
-                                            SubscriptionStatus.ACTIVE.value,
-                                            SubscriptionStatus.TRIAL.value,
-                                        )
-                                        and sub.end_date > _now
+                            # Определяем статус для панели. Grace-aware: пока идёт
+                            # «бонус 2 дня» (in_grace), держим ACTIVE с expireAt=grace_until,
+                            # чтобы массовый sync не отрубил живой VPN.
+                            _now = datetime.now(UTC)
+                            if is_in_grace(sub, _now):
+                                is_subscription_active = True
+                                expire_at = self._safe_expire_at_for_panel(sub.grace_until)
+                            else:
+                                is_subscription_active = (
+                                    sub.status
+                                    in (
+                                        SubscriptionStatus.ACTIVE.value,
+                                        SubscriptionStatus.TRIAL.value,
                                     )
-                                    expire_at = self._safe_expire_at_for_panel(sub.end_date)
-                                status = UserStatus.ACTIVE if is_subscription_active else UserStatus.DISABLED
-
-                                # multi-tariff create-path в bulk-sync приклеивает
-                                # `_<remnawave_short_id>` — helper резервирует под него
-                                # место и гарантирует ≤ REMNAWAVE_USERNAME_MAX_LENGTH.
-                                username_suffix = (
-                                    f'_{sub.remnawave_short_id}'
-                                    if (settings.is_multi_tariff_enabled() and sub.remnawave_short_id)
-                                    else ''
+                                    and sub.end_date > _now
                                 )
-                                username = settings.build_remnawave_subscription_username(
+                                expire_at = self._safe_expire_at_for_panel(sub.end_date)
+                            status = UserStatus.ACTIVE if is_subscription_active else UserStatus.DISABLED
+
+                            # multi-tariff create-path в bulk-sync приклеивает
+                            # `_<remnawave_short_id>` — helper резервирует под него
+                            # место и гарантирует ≤ REMNAWAVE_USERNAME_MAX_LENGTH.
+                            username_suffix = (
+                                f'_{sub.remnawave_short_id}'
+                                if (settings.is_multi_tariff_enabled() and sub.remnawave_short_id)
+                                else ''
+                            )
+                            username = settings.build_remnawave_subscription_username(
+                                full_name=user.full_name,
+                                username=user.username,
+                                telegram_id=user.telegram_id,
+                                email=user.email,
+                                user_id=user.id,
+                                suffix=username_suffix,
+                            )
+
+                            create_kwargs = dict(
+                                username=username,
+                                expire_at=expire_at,
+                                status=status,
+                                traffic_limit_bytes=sub.traffic_limit_gb * (1024**3) if sub.traffic_limit_gb > 0 else 0,
+                                traffic_limit_strategy=get_traffic_reset_strategy(sub.tariff),
+                                telegram_id=user.telegram_id,
+                                email=user.email,
+                                description=settings.format_remnawave_user_description(
                                     full_name=user.full_name,
                                     username=user.username,
                                     telegram_id=user.telegram_id,
                                     email=user.email,
-                                    user_id=user.id,
-                                    suffix=username_suffix,
-                                )
+                                ),
+                                active_internal_squads=sub.connected_squads,
+                            )
 
-                                create_kwargs = dict(
-                                    username=username,
-                                    expire_at=expire_at,
+                            if hwid_limit is not None:
+                                create_kwargs['hwid_device_limit'] = hwid_limit
+
+                            # Внешний сквад: синхронизируем из тарифа (если задан)
+                            # Не отправляем null — RemnaWave API не принимает null для externalSquadUuid (A039)
+                            if sub.tariff and sub.tariff.external_squad_uuid:
+                                create_kwargs['external_squad_uuid'] = sub.tariff.external_squad_uuid
+
+                            # Определяем UUID для обновления
+                            panel_uuid = (
+                                sub.remnawave_uuid if settings.is_multi_tariff_enabled() else user.remnawave_uuid
+                            )
+
+                            # Если нет UUID в базе, ищем пользователя по telegram_id в панели
+                            if not panel_uuid and user.telegram_id:
+                                existing_users = await api.get_user_by_telegram_id(user.telegram_id)
+                                if existing_users:
+                                    if settings.is_multi_tariff_enabled():
+                                        if sub.remnawave_short_id:
+                                            _suffix = f'_{sub.remnawave_short_id}'
+                                            _matched = next(
+                                                (
+                                                    eu
+                                                    for eu in existing_users
+                                                    if eu.username and eu.username.endswith(_suffix)
+                                                ),
+                                                None,
+                                            )
+                                            if _matched:
+                                                panel_uuid = _matched.uuid
+                                        # else: no short_id — can't match safely, skip
+                                    else:
+                                        panel_uuid = existing_users[0].uuid
+                                    if panel_uuid:
+                                        logger.debug(
+                                            'Найден пользователь в панели',
+                                            telegram_id=user.telegram_id,
+                                            panel_uuid=panel_uuid,
+                                        )
+
+                            # Fallback: поиск по email (для OAuth юзеров без telegram_id)
+                            if not panel_uuid and user.email:
+                                existing_users = await api.get_user_by_email(user.email)
+                                if existing_users:
+                                    if settings.is_multi_tariff_enabled():
+                                        if sub.remnawave_short_id:
+                                            _suffix = f'_{sub.remnawave_short_id}'
+                                            _matched = next(
+                                                (
+                                                    eu
+                                                    for eu in existing_users
+                                                    if eu.username and eu.username.endswith(_suffix)
+                                                ),
+                                                None,
+                                            )
+                                            if _matched:
+                                                panel_uuid = _matched.uuid
+                                        # else: no short_id — can't match safely, skip
+                                    else:
+                                        panel_uuid = existing_users[0].uuid
+                                    if panel_uuid:
+                                        logger.debug(
+                                            'Найден пользователь в панели по email',
+                                            email=user.email,
+                                            panel_uuid=panel_uuid,
+                                        )
+
+                            if panel_uuid:
+                                update_kwargs = dict(
+                                    uuid=panel_uuid,
                                     status=status,
-                                    traffic_limit_bytes=sub.traffic_limit_gb * (1024**3)
-                                    if sub.traffic_limit_gb > 0
-                                    else 0,
+                                    expire_at=expire_at,
+                                    traffic_limit_bytes=create_kwargs['traffic_limit_bytes'],
                                     traffic_limit_strategy=get_traffic_reset_strategy(sub.tariff),
-                                    telegram_id=user.telegram_id,
                                     email=user.email,
-                                    description=settings.format_remnawave_user_description(
-                                        full_name=user.full_name,
-                                        username=user.username,
-                                        telegram_id=user.telegram_id,
-                                        email=user.email,
-                                    ),
+                                    description=create_kwargs['description'],
                                     active_internal_squads=sub.connected_squads,
                                 )
 
                                 if hwid_limit is not None:
-                                    create_kwargs['hwid_device_limit'] = hwid_limit
+                                    update_kwargs['hwid_device_limit'] = hwid_limit
 
                                 # Внешний сквад: синхронизируем из тарифа (если задан)
                                 # Не отправляем null — RemnaWave API не принимает null для externalSquadUuid (A039)
                                 if sub.tariff and sub.tariff.external_squad_uuid:
-                                    create_kwargs['external_squad_uuid'] = sub.tariff.external_squad_uuid
+                                    update_kwargs['external_squad_uuid'] = sub.tariff.external_squad_uuid
 
-                                # Определяем UUID для обновления
-                                panel_uuid = (
-                                    sub.remnawave_uuid if settings.is_multi_tariff_enabled() else user.remnawave_uuid
-                                )
-
-                                # Если нет UUID в базе, ищем пользователя по telegram_id в панели
-                                if not panel_uuid and user.telegram_id:
-                                    existing_users = await api.get_user_by_telegram_id(user.telegram_id)
-                                    if existing_users:
-                                        if settings.is_multi_tariff_enabled():
-                                            if sub.remnawave_short_id:
-                                                _suffix = f'_{sub.remnawave_short_id}'
-                                                _matched = next(
-                                                    (
-                                                        eu
-                                                        for eu in existing_users
-                                                        if eu.username and eu.username.endswith(_suffix)
-                                                    ),
-                                                    None,
-                                                )
-                                                if _matched:
-                                                    panel_uuid = _matched.uuid
-                                            # else: no short_id — can't match safely, skip
-                                        else:
-                                            panel_uuid = existing_users[0].uuid
-                                        if panel_uuid:
-                                            logger.debug(
-                                                'Найден пользователь в панели',
-                                                telegram_id=user.telegram_id,
-                                                panel_uuid=panel_uuid,
-                                            )
-
-                                # Fallback: поиск по email (для OAuth юзеров без telegram_id)
-                                if not panel_uuid and user.email:
-                                    existing_users = await api.get_user_by_email(user.email)
-                                    if existing_users:
-                                        if settings.is_multi_tariff_enabled():
-                                            if sub.remnawave_short_id:
-                                                _suffix = f'_{sub.remnawave_short_id}'
-                                                _matched = next(
-                                                    (
-                                                        eu
-                                                        for eu in existing_users
-                                                        if eu.username and eu.username.endswith(_suffix)
-                                                    ),
-                                                    None,
-                                                )
-                                                if _matched:
-                                                    panel_uuid = _matched.uuid
-                                            # else: no short_id — can't match safely, skip
-                                        else:
-                                            panel_uuid = existing_users[0].uuid
-                                        if panel_uuid:
-                                            logger.debug(
-                                                'Найден пользователь в панели по email',
-                                                email=user.email,
-                                                panel_uuid=panel_uuid,
-                                            )
-
-                                if panel_uuid:
-                                    update_kwargs = dict(
-                                        uuid=panel_uuid,
-                                        status=status,
-                                        expire_at=expire_at,
-                                        traffic_limit_bytes=create_kwargs['traffic_limit_bytes'],
-                                        traffic_limit_strategy=get_traffic_reset_strategy(sub.tariff),
-                                        email=user.email,
-                                        description=create_kwargs['description'],
-                                        active_internal_squads=sub.connected_squads,
-                                    )
-
-                                    if hwid_limit is not None:
-                                        update_kwargs['hwid_device_limit'] = hwid_limit
-
-                                    # Внешний сквад: синхронизируем из тарифа (если задан)
-                                    # Не отправляем null — RemnaWave API не принимает null для externalSquadUuid (A039)
-                                    if sub.tariff and sub.tariff.external_squad_uuid:
-                                        update_kwargs['external_squad_uuid'] = sub.tariff.external_squad_uuid
-
-                                    try:
-                                        updated_user = await closure_guard.run_guarded_panel_write(
-                                            db,
-                                            user_id=user.id,
-                                            api=api,
-                                            panel_uuid=panel_uuid,
-                                            operation=lambda: api.update_user(**update_kwargs),
-                                        )
-                                        if updated_user is None:
-                                            sub.remnawave_uuid = original_sub_uuid
-                                            user.remnawave_uuid = original_user_uuid
-                                            return ('skipped', sub, None)
-                                        # Сохраняем UUID если его не было
-                                        if settings.is_multi_tariff_enabled():
-                                            if not sub.remnawave_uuid:
-                                                sub.remnawave_uuid = panel_uuid
-                                        elif not user.remnawave_uuid:
-                                            user.remnawave_uuid = panel_uuid
-                                        return ('updated', sub, None)
-                                    except RemnaWaveAPIError as api_error:
-                                        # UUID в БД протух — панель-юзера уже нет. Разные версии
-                                        # RemnaWave сообщают это по-разному: A018 или A063, и не всегда
-                                        # со статусом 404. Пересоздаём по любому из этих признаков, чтобы
-                                        # синхронизация в панель чинила рассинхрон, а не падала в ошибку.
-                                        error_code = (api_error.response_data or {}).get('errorCode', '')
-                                        if api_error.status_code == 404 or error_code in ('A018', 'A063'):
-                                            new_user = await closure_guard.run_guarded_panel_write(
-                                                db,
-                                                user_id=user.id,
-                                                api=api,
-                                                operation=lambda: api.create_user(**create_kwargs),
-                                            )
-                                            if new_user is None:
-                                                sub.remnawave_uuid = original_sub_uuid
-                                                user.remnawave_uuid = original_user_uuid
-                                                return ('skipped', sub, None)
-                                            return ('created', sub, new_user)
-                                        raise
-                                else:
-                                    new_user = await closure_guard.run_guarded_panel_write(
+                                try:
+                                    updated_user = await closure_guard.run_guarded_panel_write(
                                         db,
                                         user_id=user.id,
                                         api=api,
-                                        operation=lambda: api.create_user(**create_kwargs),
+                                        panel_uuid=panel_uuid,
+                                        operation=lambda: api.update_user(**update_kwargs),
                                     )
-                                    if new_user is None:
+                                    if updated_user is None:
                                         sub.remnawave_uuid = original_sub_uuid
                                         user.remnawave_uuid = original_user_uuid
                                         return ('skipped', sub, None)
-                                    return ('created', sub, new_user)
+                                    # Сохраняем UUID если его не было
+                                    if settings.is_multi_tariff_enabled():
+                                        if not sub.remnawave_uuid:
+                                            sub.remnawave_uuid = panel_uuid
+                                    elif not user.remnawave_uuid:
+                                        user.remnawave_uuid = panel_uuid
+                                    return ('updated', sub, None)
+                                except RemnaWaveAPIError as api_error:
+                                    # UUID в БД протух — панель-юзера уже нет. Разные версии
+                                    # RemnaWave сообщают это по-разному: A018 или A063, и не всегда
+                                    # со статусом 404. Пересоздаём по любому из этих признаков, чтобы
+                                    # синхронизация в панель чинила рассинхрон, а не падала в ошибку.
+                                    error_code = (api_error.response_data or {}).get('errorCode', '')
+                                    if api_error.status_code == 404 or error_code in ('A018', 'A063'):
+                                        new_user = await closure_guard.run_guarded_panel_write(
+                                            db,
+                                            user_id=user.id,
+                                            api=api,
+                                            operation=lambda: api.create_user(**create_kwargs),
+                                        )
+                                        if new_user is None:
+                                            sub.remnawave_uuid = original_sub_uuid
+                                            user.remnawave_uuid = original_user_uuid
+                                            return ('skipped', sub, None)
+                                        return ('created', sub, new_user)
+                                    raise
+                            else:
+                                new_user = await closure_guard.run_guarded_panel_write(
+                                    db,
+                                    user_id=user.id,
+                                    api=api,
+                                    operation=lambda: api.create_user(**create_kwargs),
+                                )
+                                if new_user is None:
+                                    sub.remnawave_uuid = original_sub_uuid
+                                    user.remnawave_uuid = original_user_uuid
+                                    return ('skipped', sub, None)
+                                return ('created', sub, new_user)
 
                         except Exception as e:
                             logger.error(

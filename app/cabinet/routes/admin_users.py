@@ -720,9 +720,7 @@ async def get_user_detail(
     # Get spending stats
     spending_stats = await get_users_spending_stats(db, [user.id])
     user_stats = spending_stats.get(user.id, {'total_spent': 0, 'purchase_count': 0})
-    erasure_request = await db.scalar(
-        select(AccountErasureRequest).where(AccountErasureRequest.user_id == user.id)
-    )
+    erasure_request = await db.scalar(select(AccountErasureRequest).where(AccountErasureRequest.user_id == user.id))
 
     # Build subscription info (all subscriptions + legacy single)
     subs = getattr(user, 'subscriptions', None) or []
