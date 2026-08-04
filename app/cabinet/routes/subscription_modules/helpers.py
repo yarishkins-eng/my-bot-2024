@@ -220,19 +220,19 @@ def _subscription_to_response(
     is_daily_paused = getattr(subscription, 'is_daily_paused', False) or False
     tariff_id = getattr(subscription, 'tariff_id', None)
 
-    # Use subscription's is_daily_tariff property if available
-    is_daily = False
+    # This builder is synchronous but is called from async routes.  Never
+    # access ``subscription.tariff`` (or a property that accesses it) unless
+    # the relationship is already present in the instance dictionary: an
+    # unloaded SQLAlchemy relationship would attempt async IO here and raise
+    # MissingGreenlet after the subscription transaction has already committed.
+    loaded_tariff = subscription.__dict__.get('tariff')
+    is_daily = bool(getattr(loaded_tariff, 'is_daily', False))
     daily_price_kopeks = None
-
-    if hasattr(subscription, 'is_daily_tariff'):
-        is_daily = subscription.is_daily_tariff
-    elif tariff_id and hasattr(subscription, 'tariff') and subscription.tariff:
-        is_daily = getattr(subscription.tariff, 'is_daily', False)
 
     # Get daily_price_kopeks, tariff_name, traffic_reset_mode from tariff
     traffic_reset_mode = None
-    if tariff_id and hasattr(subscription, 'tariff') and subscription.tariff:
-        daily_price_kopeks = getattr(subscription.tariff, 'daily_price_kopeks', None)
+    if tariff_id and loaded_tariff is not None:
+        daily_price_kopeks = getattr(loaded_tariff, 'daily_price_kopeks', None)
         # Применяем скидку промогруппы + promo-offer для отображения
         if daily_price_kopeks and daily_price_kopeks > 0 and user:
             from app.services.pricing_engine import PricingEngine
@@ -246,9 +246,9 @@ def _subscription_to_response(
                     daily_price_kopeks, _group_pct, _offer_pct
                 )
         if not tariff_name:  # Only set if not passed as parameter
-            tariff_name = getattr(subscription.tariff, 'name', None)
+            tariff_name = getattr(loaded_tariff, 'name', None)
         traffic_reset_mode = (
-            getattr(subscription.tariff, 'traffic_reset_mode', None) or settings.DEFAULT_TRAFFIC_RESET_STRATEGY
+            getattr(loaded_tariff, 'traffic_reset_mode', None) or settings.DEFAULT_TRAFFIC_RESET_STRATEGY
         )
 
     # Calculate next daily charge time (24 hours after last charge)
@@ -268,9 +268,8 @@ def _subscription_to_response(
     # relationship via __dict__ (NEVER lazy-load here: this is a sync builder
     # called from several async handlers; status.py sets subscription.tariff,
     # classic/unloaded paths yield None → gates hidden, the safe default).
-    _tariff = subscription.__dict__.get('tariff')
-    can_topup_devices, device_addon_price_kopeks = compute_device_topup_gate(subscription, _tariff)
-    can_topup_traffic = compute_traffic_topup_gate(subscription, _tariff)
+    can_topup_devices, device_addon_price_kopeks = compute_device_topup_gate(subscription, loaded_tariff)
+    can_topup_traffic = compute_traffic_topup_gate(subscription, loaded_tariff)
     restriction_subscription = bool(getattr(user, 'restriction_subscription', False))
 
     return SubscriptionResponse(

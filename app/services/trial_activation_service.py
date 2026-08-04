@@ -615,6 +615,10 @@ async def activate_trial_with_checkout_resolution(
     )
     existing_trial = next((subscription for subscription in live_subscriptions if subscription.is_trial), None)
     if existing_trial is not None:
+        # The coordinator acquired Payment/User/Subscription row locks above.
+        # Release them before callers run any post-commit RemnaWave recovery;
+        # an idempotent replay must never hold database locks across network IO.
+        await db.commit()
         return TrialActivationResult(existing_trial, 0, None, already_active=True)
     if live_subscriptions:
         raise TrialCheckoutResolutionError(

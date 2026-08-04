@@ -96,6 +96,31 @@ def _pending_context():
 
 
 @pytest.mark.asyncio
+async def test_existing_trial_replay_commits_before_post_commit_recovery():
+    """Idempotent recovery must release coordinator locks before RemnaWave IO."""
+
+    user = SimpleNamespace(id=7, auth_type='telegram', restriction_subscription=False)
+    subscription = SimpleNamespace(id=111, is_trial=True)
+    locked = _LockedDirectContext(
+        user=user,
+        checkouts=[],
+        attempts_by_checkout_id={},
+        payments_by_id={},
+    )
+    db = SimpleNamespace(execute=AsyncMock(return_value=Rows([subscription])), commit=AsyncMock())
+
+    with patch(
+        'app.services.trial_activation_service._lock_direct_context_for_trial',
+        AsyncMock(return_value=locked),
+    ):
+        result = await activate_trial_with_checkout_resolution(db, user_id=user.id)
+
+    assert result.subscription is subscription
+    assert result.already_active is True
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_pending_direct_invoice_requires_explicit_trial_resolution():
     locked, checkout, _attempt, _payment = _pending_context()
     db = SimpleNamespace(execute=AsyncMock(side_effect=[Rows([]), Rows([])]))

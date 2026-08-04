@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.exc import MissingGreenlet
 
 from app.cabinet.routes.subscription_modules.helpers import (
     _resolve_device_addon_price,
@@ -239,3 +240,25 @@ def test_response_passes_disabled_reason_hint_through() -> None:
     resp = _subscription_to_response(sub, user=None, disabled_reason_hint='channel')
     assert resp.status == 'disabled'
     assert resp.disabled_reason_hint == 'channel'
+
+
+def test_response_never_lazy_loads_unloaded_tariff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sync response builder must not perform async ORM IO.
+
+    Production created and committed a trial, then accessed
+    ``Subscription.is_daily_tariff`` while ``tariff`` was unloaded.  That
+    property attempted a lazy query and raised MissingGreenlet, leaving the
+    user with an active DB trial but no HTTP success or RemnaWave entitlement.
+    """
+
+    def _forbidden_lazy_access(_subscription: Subscription) -> bool:
+        raise MissingGreenlet('tariff relationship must be loaded by the async caller')
+
+    monkeypatch.setattr(Subscription, 'is_daily_tariff', property(_forbidden_lazy_access))
+    sub = _make_subscription(tariff_id=5)
+
+    response = _subscription_to_response(sub, user=None)
+
+    assert response.tariff_id == 5
+    assert response.tariff_name is None
+    assert response.is_daily is False

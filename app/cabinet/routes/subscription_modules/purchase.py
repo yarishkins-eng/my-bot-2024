@@ -244,23 +244,33 @@ async def _run_trial_post_commit(
 ) -> None:
     """Best-effort effects after the atomic order/trial transaction is durable."""
 
-    if result.already_active:
-        return
-
     subscription = result.subscription
     subscription_service = SubscriptionService()
+    needs_panel_create = not result.already_active
+    if result.already_active:
+        # A previous request may have committed the trial and then failed
+        # before its post-commit RemnaWave call.  Retry only that missing
+        # entitlement; do not replay analytics, notifications or menu effects.
+        if settings.is_multi_tariff_enabled():
+            needs_panel_create = not bool(getattr(subscription, 'remnawave_uuid', None))
+        else:
+            needs_panel_create = not bool(getattr(user, 'remnawave_uuid', None))
+
     panel_user = None
     try:
-        if subscription_service.is_configured:
+        if subscription_service.is_configured and needs_panel_create:
             async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
                 panel_user = await subscription_service.create_remnawave_user(db, subscription)
                 await db.refresh(subscription)
     except Exception as error:
         logger.error('Failed to create RemnaWave user for trial', user_id=user.id, error=error)
-    if subscription_service.is_configured and panel_user is None:
+    if subscription_service.is_configured and needs_panel_create and panel_user is None:
         from app.services.remnawave_retry_queue import remnawave_retry_queue
 
         remnawave_retry_queue.enqueue(subscription_id=subscription.id, user_id=user.id, action='create')
+
+    if result.already_active:
+        return
 
     if result.charge_transaction_id is not None:
         transaction = await db.get(Transaction, result.charge_transaction_id)
@@ -359,6 +369,11 @@ async def _activate_trial_v2(
         detail = {'code': error.code, 'message': str(error), **error.context}
         raise HTTPException(status_code=error.status_code, detail=detail) from error
 
+    # The response builder is intentionally synchronous and must never lazy
+    # load ORM relationships.  Load the tariff explicitly while async IO is
+    # legal so the response remains complete and cannot fail after the trial
+    # transaction has committed.
+    await db.refresh(result.subscription, ['tariff'])
     await db.refresh(user)
     response = _subscription_to_response(result.subscription, user=user).model_dump(mode='json')
     if mutation is not None:
