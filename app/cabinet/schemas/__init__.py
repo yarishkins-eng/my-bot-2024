@@ -21,6 +21,7 @@ from .balance import (
     TransactionListResponse,
     TransactionResponse,
 )
+from .device_first import DirectCheckoutCommitRequest
 from .referral import (
     ReferralEarningResponse,
     ReferralInfoResponse,
@@ -52,6 +53,7 @@ __all__ = [
     # Balance
     'BalanceResponse',
     'DevicePurchaseRequest',
+    'DirectCheckoutCommitRequest',
     'EmailLoginRequest',
     'EmailRegisterRequest',
     'EmailVerifyRequest',

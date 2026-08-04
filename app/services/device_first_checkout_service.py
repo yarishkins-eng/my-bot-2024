@@ -7,7 +7,7 @@ import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 from sqlalchemy import and_, exists, or_, select, update
@@ -560,7 +560,17 @@ async def create_checkout(
     selected_device_limit: int,
     source: str,
     mutation: DeviceFirstMutation | None = None,
+    initial_lifecycle_state: str = 'draft',
 ) -> SubscriptionCheckout:
+    """Persist one checkout; ``initial_lifecycle_state`` never changes legacy births.
+
+    The deprecated showcase callers keep the ``draft`` default untouched.  The
+    fused pay-time resolver passes ``confirmed`` so the row is born ready for
+    the existing direct commit chains inside the same payment request; that
+    ``confirmed`` state lives for microseconds and is never a browsing draft.
+    """
+    if initial_lifecycle_state not in {'draft', 'confirmed'}:
+        raise ValueError(f'Unsupported initial checkout lifecycle state: {initial_lifecycle_state}')
     if not device_first_new_checkouts_enabled():
         raise DeviceFirstError('feature_disabled', 'New device-first checkouts are disabled', status_code=404)
     # The per-user direct-sale fence serializes a late provider reversal with a
@@ -698,6 +708,8 @@ async def create_checkout(
         wallet_applied_kopeks=0,
         external_payable_kopeks=0,
         pricing_revision=int(tariff.pricing_revision or 1),
+        lifecycle_state=initial_lifecycle_state,
+        confirmed_at=now if initial_lifecycle_state == 'confirmed' else None,
         quote_expires_at=now + timedelta(minutes=30),
         expires_at=now + timedelta(hours=24),
     )
@@ -714,8 +726,11 @@ async def create_checkout(
             'An active checkout already exists; resume or cancel it first',
         ) from error
     await db.refresh(checkout)
+    # ``quote_created`` stays the deprecated-showcase metric: on the transition
+    # it still means "a browsing draft appeared".  A fused pay-time birth is a
+    # different funnel and gets its own event so the two never mix.
     _event(
-        'quote_created',
+        'quote_created' if initial_lifecycle_state == 'draft' else 'fused_checkout_created',
         checkout,
         tariff_id=checkout.tariff_id,
         period_days=checkout.period_days,
@@ -723,6 +738,275 @@ async def create_checkout(
         quoted_price_kopeks=checkout.quoted_price_kopeks,
     )
     return checkout
+
+
+class FusedDirectCheckout(NamedTuple):
+    """Outcome of the pay-time checkout resolver.
+
+    ``proceed_to_payment`` is False when an already-paid or operator-held
+    checkout won the race: the caller must render that canonical state and
+    never create or fund anything else in this request.
+    """
+
+    checkout: SubscriptionCheckout
+    proceed_to_payment: bool
+
+
+def _fused_selection_price(options: dict[str, Any], *, period_days: int, selected_device_limit: int) -> int:
+    """Extract the raw server price for one selection from purchase options."""
+    selected = next(
+        (
+            price
+            for row in options['price_matrix']
+            if row['period_days'] == period_days
+            for price in row['prices']
+            if price['device_limit'] == selected_device_limit
+        ),
+        None,
+    )
+    if selected is None:
+        raise DeviceFirstError('invalid_selection', 'Unsupported period or device limit', status_code=422)
+    # Raw kopeks, never rounded: the client token is optimistic and only an
+    # exact match proves it was rendered from the current server price.
+    return int(selected['price_kopeks'])
+
+
+async def _resume_fused_direct_checkout(
+    db: AsyncSession,
+    *,
+    checkout: SubscriptionCheckout,
+    user_id: int,
+    funding_mode: str,
+    lock_row: bool,
+    mutation: DeviceFirstMutation | None,
+) -> FusedDirectCheckout:
+    """Resume the one open direct checkout after a fresh re-read.
+
+    A paid/provisioning/held checkout is its own canonical answer.  A live
+    committed invoice rejects a funding switch instead of a silent supersede.
+    Only a committable row proceeds to payment (``confirmed``, or a committed
+    invoice in ``awaiting_funds``): an expired draft comes back from
+    ``confirm_checkout`` as ``reprice_required`` and a pre-commit
+    ``awaiting_funds`` crash row can never pass the direct pre-commit
+    validation, so both get the canonical reprice flow instead of a generic
+    commit-chain error.
+
+    ``lock_row`` must be False whenever the per-user fence is not held (the
+    optimistic phase): a surviving Checkout lock would be followed by the
+    commit chain's User lock, inverting the canonical U -> C order that the
+    provider settle/reversal paths rely on (``prepare_direct_external_checkout``
+    deliberately does not pre-lock the checkout for the same reason).  The
+    resume verdicts here are read-only decisions; the commit chain
+    authoritatively re-validates everything under U -> C in
+    ``_lock_direct_context``/``_validate_direct_pre_commit``.
+    """
+    locked = await get_owned_checkout(db, public_id=checkout.public_id, user_id=user_id, for_update=lock_row)
+    if locked.lifecycle_state not in {'draft', 'confirmed', 'awaiting_funds'}:
+        # armed/fulfilling/operator_review/recovery already took money or are
+        # provisioning it: their canonical state is the answer.
+        if mutation is not None:
+            mutation.checkout_id = locked.id
+        return FusedDirectCheckout(checkout=locked, proceed_to_payment=False)
+    if (
+        locked.financial_committed_at is not None
+        and locked.funding_mode is not None
+        and locked.funding_mode != funding_mode
+    ):
+        # A funding switch over a live provider invoice is never a silent
+        # supersede: the client must show its explicit abandon screen (a late
+        # payment becomes one wallet credit).
+        raise DeviceFirstError('funding_mode_locked', 'Funding method is already fixed')
+    # The immutable invoice/quote owns its approved price, so a resume
+    # deliberately ignores the optimistic expected price.
+    if locked.lifecycle_state == 'draft':
+        locked = await confirm_checkout(db, locked)
+    committable = locked.lifecycle_state == 'confirmed' or (
+        locked.lifecycle_state == 'awaiting_funds' and locked.financial_committed_at is not None
+    )
+    if not committable:
+        raise DeviceFirstError('reprice_required', 'The quote changed; review the new quote')
+    if mutation is not None:
+        mutation.checkout_id = locked.id
+    return FusedDirectCheckout(checkout=locked, proceed_to_payment=True)
+
+
+async def create_or_resume_direct_checkout(
+    db: AsyncSession,
+    *,
+    user: User,
+    period_days: int,
+    selected_device_limit: int,
+    expected_tariff_total_kopeks: int,
+    funding_mode: str,
+    method_key: str | None,
+    source: str,
+    mutation: DeviceFirstMutation | None = None,
+) -> FusedDirectCheckout:
+    """Resolve the one direct checkout at the moment of payment.
+
+    New purchase paths never persist a browsing draft: a click on «Pay» is the
+    only event that may birth a durable checkout, and it is born ``confirmed``
+    for the existing direct commit chains.  The order is contractual: the raw
+    server price first, and only then resume/supersede/create — so a stale
+    optimistic price can never insert a junk row or cancel a live invoice.
+    """
+    # Deferred import: the payment service already imports this module.
+    from app.services.device_first_payment_service import abandon_direct_checkout_for_new_calculation
+
+    if funding_mode not in {'wallet', 'platega'}:
+        raise DeviceFirstError('invalid_funding_request', 'Unknown funding mode', status_code=422)
+    logger.info(
+        'direct_pay_clicked',
+        user_id=user.id,
+        period_days=period_days,
+        device_limit=selected_device_limit,
+        funding_mode=funding_mode,
+        method_key=method_key,
+        expected_tariff_total_kopeks=int(expected_tariff_total_kopeks),
+        source=source,
+        flow_version='fused_v1',
+    )
+    # Lock-order contract: the provider settle/reversal paths take their locks
+    # as Payment -> User -> Attempt -> Checkout, so this resolver must never
+    # hold the per-user fence while reaching for a PlategaPayment lock.  The
+    # price/selection reads, the open-checkout read and the supersede below
+    # therefore run WITHOUT the fence; the authoritative re-read in phase 4
+    # and every money step afterwards (``create_checkout``,
+    # ``_lock_direct_context``) take the fence first and re-validate under it.
+
+    # Phase 1: optimistic, lock-free price and selection validation.
+    options = await build_purchase_options(db, user)
+    if not options.get('eligible'):
+        raise DeviceFirstError('legacy_only', 'Device-first checkout is unavailable', status_code=404)
+    server_price_kopeks = _fused_selection_price(
+        options, period_days=period_days, selected_device_limit=selected_device_limit
+    )
+    expected_kopeks = int(expected_tariff_total_kopeks)
+
+    # Phase 2: cheap rejections that must leave every live row untouched.
+    if funding_mode == 'platega' and not (
+        settings.PLATEGA_MIN_AMOUNT_KOPEKS <= server_price_kopeks <= settings.PLATEGA_MAX_AMOUNT_KOPEKS
+    ):
+        # A checkout committed at an out-of-range amount could never produce
+        # its provider invoice: reject before any INSERT, not after.
+        raise DeviceFirstError(
+            'provider_amount_out_of_range', 'Required amount is outside Platega limits', status_code=422
+        )
+    if funding_mode == 'wallet' and user.balance_kopeks < server_price_kopeks:
+        # An unfunded wallet click must neither leave a durable checkout row
+        # nor abandon a live invoice; the wallet commit chain re-checks the
+        # balance under its own fence.
+        raise DeviceFirstError('wallet_insufficient', 'The balance does not cover this checkout', status_code=422)
+
+    # Phase 3: optimistic open-checkout read; any supersede happens here,
+    # before the per-user fence, so the abandon path keeps its canonical
+    # P -> U -> A -> C lock order.
+    existing = await get_open_checkout_for_user(db, user_id=user.id)
+    if existing is not None and settlement_mode(existing) == DIRECT_SETTLEMENT_MODE:
+        same_configuration = (
+            existing.period_days == period_days and existing.selected_device_limit == selected_device_limit
+        )
+        if same_configuration:
+            # No fence is held here, so the resume must not leave a Checkout
+            # row lock behind: the commit chain takes User -> Checkout itself
+            # and a held C lock would invert that canonical order.
+            return await _resume_fused_direct_checkout(
+                db,
+                checkout=existing,
+                user_id=user.id,
+                funding_mode=funding_mode,
+                lock_row=False,
+                mutation=mutation,
+            )
+        # A different selection is replaced only after the client token is
+        # proven fresh; a stale price must never cancel the live invoice.
+        if expected_kopeks != server_price_kopeks:
+            raise DeviceFirstError('reprice_required', 'The price changed; review the new quote')
+        abandoned = await abandon_direct_checkout_for_new_calculation(
+            db,
+            checkout_public_id=existing.public_id,
+            user_id=user.id,
+        )
+        if abandoned is None:
+            # No provider attempt exists: a disposable pre-invoice quote is
+            # replaced atomically, exactly like the deprecated create route.
+            locked_quote = await get_owned_checkout(
+                db,
+                public_id=existing.public_id,
+                user_id=user.id,
+                for_update=True,
+            )
+            cancelled = await cancel_checkout_for_new_calculation(db, locked_quote)
+            if cancelled.lifecycle_state != 'cancelled':
+                # A recovery transition won the row meanwhile: never fall
+                # through to a second INSERT; answer its canonical state.
+                if mutation is not None:
+                    mutation.checkout_id = cancelled.id
+                return FusedDirectCheckout(checkout=cancelled, proceed_to_payment=False)
+        elif abandoned.lifecycle_state != 'cancelled':
+            # A provider callback won the financial lock while the customer
+            # changed parameters; its canonical state is the response.
+            if mutation is not None:
+                mutation.checkout_id = abandoned.id
+            return FusedDirectCheckout(checkout=abandoned, proceed_to_payment=False)
+    elif expected_kopeks != server_price_kopeks:
+        # No live checkout to preserve and a stale optimistic price: reject
+        # before any INSERT, so browsing never leaves junk rows behind.
+        raise DeviceFirstError('reprice_required', 'The price changed; review the new quote')
+
+    # Phase 4: the authoritative pass under the per-user fence.  Everything
+    # above was optimistic; re-read and re-price before any INSERT.
+    user = (await db.execute(select(User).where(User.id == user.id).with_for_update())).scalar_one()
+    fenced_open = await get_open_checkout_for_user(db, user_id=user.id)
+    if fenced_open is not None and settlement_mode(fenced_open) == DIRECT_SETTLEMENT_MODE:
+        fenced_same_configuration = (
+            fenced_open.period_days == period_days and fenced_open.selected_device_limit == selected_device_limit
+        )
+        if fenced_same_configuration:
+            # A concurrent click created/resumed this checkout between the
+            # optimistic read and the fence: resume it, never a second order.
+            # The fence is held, so the row lock follows the canonical U -> C.
+            return await _resume_fused_direct_checkout(
+                db,
+                checkout=fenced_open,
+                user_id=user.id,
+                funding_mode=funding_mode,
+                lock_row=True,
+                mutation=mutation,
+            )
+        # A different fresh checkout won the race: its canonical state is the
+        # answer, never a competing INSERT.
+        if mutation is not None:
+            mutation.checkout_id = fenced_open.id
+        return FusedDirectCheckout(checkout=fenced_open, proceed_to_payment=False)
+
+    fenced_options = await build_purchase_options(db, user)
+    if not fenced_options.get('eligible'):
+        raise DeviceFirstError('legacy_only', 'Device-first checkout is unavailable', status_code=404)
+    fenced_price_kopeks = _fused_selection_price(
+        fenced_options, period_days=period_days, selected_device_limit=selected_device_limit
+    )
+    if expected_kopeks != fenced_price_kopeks:
+        raise DeviceFirstError('reprice_required', 'The price changed; review the new quote')
+    if funding_mode == 'platega' and not (
+        settings.PLATEGA_MIN_AMOUNT_KOPEKS <= fenced_price_kopeks <= settings.PLATEGA_MAX_AMOUNT_KOPEKS
+    ):
+        raise DeviceFirstError(
+            'provider_amount_out_of_range', 'Required amount is outside Platega limits', status_code=422
+        )
+    if funding_mode == 'wallet' and user.balance_kopeks < fenced_price_kopeks:
+        raise DeviceFirstError('wallet_insufficient', 'The balance does not cover this checkout', status_code=422)
+
+    checkout = await create_checkout(
+        db,
+        user=user,
+        period_days=period_days,
+        selected_device_limit=selected_device_limit,
+        source=source,
+        mutation=mutation,
+        initial_lifecycle_state='confirmed',
+    )
+    return FusedDirectCheckout(checkout=checkout, proceed_to_payment=True)
 
 
 async def confirm_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> SubscriptionCheckout:

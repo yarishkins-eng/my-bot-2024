@@ -23,7 +23,7 @@ from app.services.device_first_checkout_service import (
     cancel_checkout_for_new_calculation,
     commit_direct_wallet_checkout,
     confirm_checkout,
-    create_checkout,
+    create_or_resume_direct_checkout,
     device_first_top_up_kopeks,
     device_first_top_up_surplus_kopeks,
     get_open_checkout_for_user,
@@ -168,6 +168,22 @@ def _cancel_order(user: User, checkout_id: str) -> InlineKeyboardButton:
     )
 
 
+def _change_selection_fused(user: User) -> InlineKeyboardButton:
+    """Restart the checkout-free showcase; no order exists to reference."""
+    return InlineKeyboardButton(
+        text=_text(user, '‹ Изменить параметры', '‹ Change options'),
+        callback_data='df:e2',
+    )
+
+
+def _cancel_order_fused(user: User) -> InlineKeyboardButton:
+    """Discard the checkout-free showcase; nothing was persisted or charged."""
+    return InlineKeyboardButton(
+        text=_text(user, 'Отменить заказ', 'Cancel order'),
+        callback_data='df:x2',
+    )
+
+
 def _direct_method_label(user: User, method_key: str) -> str:
     labels = {
         'sbp': ('СБП (QR-код)', 'SBP (QR code)'),
@@ -209,6 +225,37 @@ def _native_payment_button(
     if cabinet_url:
         return InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=cabinet_url))
     return InlineKeyboardButton(text=text, callback_data=f'df:y:{method_key}:{checkout_id}')
+
+
+def _fused_native_payment_button(
+    user: User,
+    *,
+    days: int,
+    devices: int,
+    kopeks: int,
+    method_key: str,
+    total: str,
+) -> InlineKeyboardButton:
+    """Open the trusted Mini App for one authenticated fused payment launch.
+
+    The URL holds only untrusted navigation hints (period/devices/method): the
+    Cabinet validates the Telegram identity, the live server price and the
+    payment method again before its fused commit.  The callback fallback
+    carries the optimistic price, so a stale screen is repriced, never charged.
+    """
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    cabinet_url = build_cabinet_url(
+        f'/subscription/purchase?{urlencode({"period": days, "devices": devices, "method": method_key, "autostart": "1"})}'
+    )
+    text = _text(
+        user,
+        f'{_direct_method_label(user, method_key)} · {total} ₽',
+        f'{_direct_method_label(user, method_key)} · ₽{total}',
+    )
+    if cabinet_url:
+        return InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=cabinet_url))
+    return InlineKeyboardButton(text=text, callback_data=f'df:y2:{method_key}:{days}:{devices}:{kopeks}')
 
 
 async def _answer_stale(callback: types.CallbackQuery, user: User) -> None:
@@ -479,65 +526,22 @@ async def choose_devices(
         return
     await callback.answer()
     days = int(data['df_days'])
-    try:
-        # Selecting another complete configuration is the explicit point at
-        # which a resumable direct invoice may be superseded.  Merely opening
-        # this chooser never does that.  The service accepts only a fully
-        # bound canonical PENDING/INPROGRESS invoice; ambiguous/paid states
-        # remain on their recovery screen rather than creating a second link.
-        existing = await get_open_checkout_for_user(db, user_id=db_user.id)
-        if existing is not None:
-            if settlement_mode(existing) == DIRECT_SETTLEMENT_MODE and (
-                existing.period_days != days or existing.selected_device_limit != devices
-            ):
-                archived = await abandon_direct_checkout_for_new_calculation(
-                    db,
-                    checkout_public_id=existing.public_id,
-                    user_id=db_user.id,
-                )
-                if archived is None:
-                    locked_quote = await get_owned_checkout(
-                        db,
-                        public_id=existing.public_id,
-                        user_id=db_user.id,
-                        for_update=True,
-                    )
-                    archived = await cancel_checkout_for_new_calculation(db, locked_quote)
-                if archived.lifecycle_state != 'cancelled':
-                    await state.update_data(df_checkout_id=archived.public_id)
-                    await _render_checkout(callback, db_user, db, archived)
-                    return
-            else:
-                await state.update_data(df_checkout_id=existing.public_id)
-                if existing.lifecycle_state == 'draft':
-                    await _render_new_checkout(
-                        callback,
-                        db_user,
-                        db,
-                        existing,
-                        tariff_name=options['tariff']['name'],
-                    )
-                else:
-                    await _render_checkout(callback, db_user, db, existing)
-                return
-        checkout = await create_checkout(
-            db,
-            user=db_user,
-            period_days=days,
-            selected_device_limit=devices,
-            source='telegram',
+    if _price_for(options, days=days, devices=devices) is None:
+        await _answer_stale(callback, db_user)
+        await _device_page(
+            callback,
+            db_user,
+            state,
+            options,
+            view_id=uuid.uuid4().hex[:8],
+            days=days,
+            origin_callback=data.get('df_origin_callback') or 'back_to_menu',
         )
-    except DeviceFirstError as error:
-        await _render_error(callback, db_user, error)
         return
-    await state.update_data(df_checkout_id=checkout.public_id)
-    await _render_new_checkout(
-        callback,
-        db_user,
-        db,
-        checkout,
-        tariff_name=options['tariff']['name'],
-    )
+    # The showcase is checkout-free: a durable order is born only when the
+    # customer taps a pay button (``df:y2:``/``df:a2:``).  Resuming or
+    # superseding any existing checkout is the fused resolver's job then.
+    await _render_fused_confirmation(callback, db_user, db, options, days=days, devices=devices)
 
 
 async def choose_period(
@@ -869,6 +873,96 @@ async def _render_direct_payment_methods(
         ]
     elif methods or has_full_wallet_balance:
         rows.append([_change_selection(user, checkout.public_id)])
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=caption,
+        keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode='HTML',
+    )
+
+
+async def _render_fused_confirmation(
+    callback: types.CallbackQuery,
+    user: User,
+    db: AsyncSession,
+    options: dict,
+    *,
+    days: int,
+    devices: int,
+    notice: str | None = None,
+) -> None:
+    """Show the pay-time order built only from FSM options — no checkout row.
+
+    The optimistic price travels inside the pay callbacks (``df:y2:``/``df:a2:``)
+    so a stale screen is rejected with a repriced confirmation instead of ever
+    charging or invoicing an outdated amount.
+    """
+    methods = await available_platega_methods_for_db(db, user)
+    price = _price_for(options, days=days, devices=devices)
+    total = _money(user, price)
+    tariff_name = options['tariff']['name']
+    has_full_wallet_balance = user.balance_kopeks >= price
+    rows: list[list[InlineKeyboardButton]]
+    if has_full_wallet_balance:
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=_text(
+                        user,
+                        f'Оплатить с баланса · {total} ₽',
+                        f'Pay from balance · ₽{total}',
+                    ),
+                    callback_data=f'df:a2:{days}:{devices}:{price}',
+                )
+            ]
+        ]
+    else:
+        rows = [
+            [
+                _fused_native_payment_button(
+                    user,
+                    days=days,
+                    devices=devices,
+                    kopeks=price,
+                    method_key=item['key'],
+                    total=total,
+                )
+            ]
+            for item in methods
+        ]
+    caption = _text(
+        user,
+        (
+            '💳 <b>Ваш заказ</b>\n\n'
+            f'<b>{tariff_name}</b>\n'
+            f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
+            f'К оплате: <b>{total} ₽</b>\n\n'
+            + ('Оплатите с баланса.' if has_full_wallet_balance else 'Выберите способ оплаты.')
+        ),
+        (
+            '💳 <b>Your order</b>\n\n'
+            f'<b>{tariff_name}</b>\n'
+            f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
+            f'To pay: <b>₽{total}</b>\n\n'
+            + ('Pay from your balance.' if has_full_wallet_balance else 'Choose a payment method.')
+        ),
+    )
+    if notice:
+        caption = f'{notice}\n\n{caption}'
+    if not has_full_wallet_balance and not methods:
+        caption += _text(
+            user,
+            '\n\nОплата временно недоступна. Обратитесь в поддержку.',
+            '\n\nPayment is temporarily unavailable. Contact support.',
+        )
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=_text(user, 'Связаться с поддержкой', 'Contact support'), callback_data='menu_support'
+                )
+            ]
+        ]
+    rows.append([_change_selection_fused(user), _cancel_order_fused(user)])
     await edit_or_answer_photo(
         callback=callback,
         caption=caption,
@@ -1387,8 +1481,9 @@ async def change_selection(
     origin = data.get('df_origin_callback') or 'back_to_menu'
     await state.update_data(df_checkout_id=checkout.public_id)
     # This is navigation only.  A changed completed configuration supersedes
-    # the invoice atomically in ``choose_devices``; choosing the same one
-    # resumes the existing invoice.
+    # the invoice atomically in the fused pay-time resolver
+    # (``create_or_resume_direct_checkout``); choosing the same one resumes
+    # the existing invoice.
     await _period_page(
         callback,
         db_user,
@@ -1583,6 +1678,13 @@ def _safe_error_detail(user: User, error: DeviceFirstError | str) -> str:
             'Мы проверяем созданный счёт. Не оплачивайте повторно: откройте проверку статуса или обратитесь в поддержку.',
             'We are checking the created invoice. Do not pay again: check its status or contact support.',
         ),
+        'provider_amount_out_of_range': _text(
+            user,
+            'Эту сумму нельзя оплатить через платёжную систему. Пополните баланс на нужную сумму и оплатите с баланса, '
+            'или обратитесь в поддержку.',
+            'This amount cannot be paid through the payment provider. Top up your balance and pay from it, '
+            'or contact support.',
+        ),
         'legacy_trial_reconciliation_required': _text(
             user,
             'Есть незавершённая предыдущая оплата. Не оплачивайте повторно — обратитесь в поддержку.',
@@ -1647,8 +1749,232 @@ async def _render_error(callback: types.CallbackQuery, user: User, error: Device
     )
 
 
+async def _render_fused_refresh(
+    callback: types.CallbackQuery,
+    user: User,
+    db: AsyncSession,
+    state: FSMContext,
+    *,
+    days: int,
+    devices: int,
+    error: DeviceFirstError,
+) -> None:
+    """Reprice the checkout-free confirmation after a stale pay token.
+
+    The failed fused click left no row behind, so the honest recovery is a
+    freshly priced confirmation screen — never an error dead end.
+    """
+    options = await build_purchase_options(db, user)
+    price = _price_for(options, days=days, devices=devices) if options.get('eligible') else None
+    if price is None:
+        await _render_error(callback, user, error)
+        return
+    notices = {
+        'reprice_required': _text(
+            user,
+            '⚠️ Цена обновилась. Проверьте заказ ещё раз.',
+            '⚠️ The price changed. Review the order again.',
+        ),
+        'wallet_insufficient': _text(
+            user,
+            '⚠️ Баланс больше не покрывает заказ. Выберите способ оплаты.',
+            '⚠️ Your balance no longer covers the order. Choose a payment method.',
+        ),
+    }
+    notice = notices.get(
+        error.code,
+        _text(
+            user,
+            '⚠️ Условия заказа изменились. Проверьте его ещё раз.',
+            '⚠️ The order terms changed. Review it again.',
+        ),
+    )
+    await state.update_data(df_options=options, df_days=days)
+    await _render_fused_confirmation(callback, user, db, options, days=days, devices=devices, notice=notice)
+
+
+async def _render_fused_pay_error(
+    callback: types.CallbackQuery,
+    user: User,
+    db: AsyncSession,
+    state: FSMContext,
+    error: DeviceFirstError,
+    *,
+    days: int,
+    devices: int,
+) -> None:
+    """Route a fused pay failure to its one honest recovery screen."""
+    if error.code in {'reprice_required', 'wallet_insufficient', 'invalid_selection'}:
+        await _render_fused_refresh(callback, user, db, state, days=days, devices=devices, error=error)
+        return
+    if error.code in {'funding_mode_locked', 'reconciliation_required', 'open_checkout_exists', 'invalid_state'}:
+        # A live or ambiguous provider invoice owns the screen: it offers the
+        # explicit abandon action (late payment becomes one wallet credit) or
+        # the canonical status check, never a silent supersede.  A
+        # cross-configuration race loser can also land here via ``invalid_state``
+        # when its fresh row was superseded by the winner's create sweep.
+        existing = await get_open_checkout_for_user(db, user_id=user.id)
+        if existing is not None:
+            await _render_checkout(callback, user, db, existing)
+            return
+        if error.code == 'invalid_state':
+            # No live order survived the race: the honest recovery is a
+            # freshly priced confirmation, not a generic error dead end.
+            await _render_fused_refresh(callback, user, db, state, days=days, devices=devices, error=error)
+            return
+    await _render_error(callback, user, error)
+
+
+async def pay_fused(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+) -> None:
+    """Birth/resume the direct checkout and its one provider invoice at «Pay»."""
+    await callback.answer()
+    parts = (callback.data or '').split(':')
+    if len(parts) != 6:
+        return
+    try:
+        method_key = parts[2]
+        days, devices, kopeks = int(parts[3]), int(parts[4]), int(parts[5])
+    except ValueError:
+        return
+    try:
+        resolved = await create_or_resume_direct_checkout(
+            db,
+            user=db_user,
+            period_days=days,
+            selected_device_limit=devices,
+            expected_tariff_total_kopeks=kopeks,
+            funding_mode='platega',
+            method_key=method_key,
+            source='telegram',
+        )
+    except DeviceFirstError as error:
+        await _render_fused_pay_error(callback, db_user, db, state, error, days=days, devices=devices)
+        return
+    if not resolved.proceed_to_payment:
+        await _render_checkout(callback, db_user, db, resolved.checkout)
+        return
+    try:
+        await create_platega_attempt(
+            db,
+            checkout_public_id=resolved.checkout.public_id,
+            user_id=db_user.id,
+            method_key=method_key,
+        )
+        checkout = await get_owned_checkout(db, public_id=resolved.checkout.public_id, user_id=db_user.id)
+    except DeviceFirstError as error:
+        await _render_fused_pay_error(callback, db_user, db, state, error, days=days, devices=devices)
+        return
+    await _render_checkout(callback, db_user, db, checkout)
+
+
+async def pay_wallet_fused(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+) -> None:
+    """Birth/resume the direct checkout and debit the wallet at «Pay from balance»."""
+    await callback.answer()
+    parts = (callback.data or '').split(':')
+    if len(parts) != 5:
+        return
+    try:
+        days, devices, kopeks = int(parts[2]), int(parts[3]), int(parts[4])
+    except ValueError:
+        return
+    try:
+        resolved = await create_or_resume_direct_checkout(
+            db,
+            user=db_user,
+            period_days=days,
+            selected_device_limit=devices,
+            expected_tariff_total_kopeks=kopeks,
+            funding_mode='wallet',
+            method_key=None,
+            source='telegram',
+        )
+    except DeviceFirstError as error:
+        await _render_fused_pay_error(callback, db_user, db, state, error, days=days, devices=devices)
+        return
+    if not resolved.proceed_to_payment:
+        await _render_checkout(callback, db_user, db, resolved.checkout)
+        return
+    try:
+        checkout = await commit_direct_wallet_checkout(
+            db,
+            public_id=resolved.checkout.public_id,
+            user_id=db_user.id,
+        )
+    except DeviceFirstError as error:
+        await _render_fused_pay_error(callback, db_user, db, state, error, days=days, devices=devices)
+        return
+    await _render_checkout(callback, db_user, db, checkout)
+
+
+async def change_selection_fused(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+) -> None:
+    """Restart the checkout-free showcase; there is no order to preserve."""
+    await callback.answer()
+    data = await state.get_data()
+    options = await build_purchase_options(db, db_user)
+    if not options.get('eligible'):
+        await _render_error(
+            callback,
+            db_user,
+            _text(
+                db_user,
+                'Варианты тарифа изменились. Вернитесь в главное меню и начните новый заказ.',
+                'Tariff options changed. Return to the main menu and start a new order.',
+            ),
+        )
+        return
+    await _period_page(
+        callback,
+        db_user,
+        state,
+        options,
+        view_id=uuid.uuid4().hex[:8],
+        origin_callback=data.get('df_origin_callback') or 'back_to_menu',
+    )
+
+
+async def cancel_fused(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+) -> None:
+    """Cancel the checkout-free showcase; nothing was persisted or charged."""
+    del db
+    await callback.answer()
+    await state.clear()
+    await edit_or_answer_photo(
+        callback=callback,
+        caption=_text(
+            db_user,
+            'Заказ отменён. Деньги не списаны.',
+            'Order cancelled. No money was charged.',
+        ),
+        keyboard=InlineKeyboardMarkup(inline_keyboard=[[_main_menu(db_user)]]),
+        parse_mode='HTML',
+    )
+
+
 def register_device_first_handlers(dp) -> None:
     dp.callback_query.register(restart_device_first_or_show_legacy_tariffs, F.data == 'df:start')
+    dp.callback_query.register(change_selection_fused, F.data == 'df:e2')
+    dp.callback_query.register(cancel_fused, F.data == 'df:x2')
+    dp.callback_query.register(pay_fused, F.data.startswith('df:y2:'))
+    dp.callback_query.register(pay_wallet_fused, F.data.startswith('df:a2:'))
     # Keep old pagination callbacks replay-safe after deploy; new keyboards do
     # not emit `df:p:` at all.
     dp.callback_query.register(legacy_device_page, F.data.startswith('df:p:'))

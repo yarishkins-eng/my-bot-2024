@@ -33,6 +33,7 @@ from app.services.device_first_checkout_service import (
     commit_direct_wallet_checkout,
     confirm_checkout,
     create_checkout,
+    create_or_resume_direct_checkout,
     fulfill_checkout,
     get_open_checkout_for_user,
     get_owned_checkout,
@@ -53,6 +54,7 @@ from ..dependencies import (
     get_current_native_launch_user,
     require_permission,
 )
+from ..schemas.device_first import DirectCheckoutCommitRequest
 
 
 router = APIRouter(prefix='/device-first', tags=['Cabinet Device First'])
@@ -603,6 +605,142 @@ async def checkout_native_launch(
         user=user,
         db=db,
         action='native_launch',
+    )
+
+
+async def _fused_commit_checkout(
+    *,
+    request: DirectCheckoutCommitRequest,
+    idempotency_key: str | None,
+    user: User,
+    db: AsyncSession,
+    action: str,
+) -> dict[str, Any]:
+    """Resolve or birth one direct checkout at pay time, then fund it.
+
+    No durable checkout exists before this mutation: the fused resolver either
+    resumes the one open checkout, supersedes it through the canonical abandon
+    path, or creates a fresh ``confirmed`` row — then the existing wallet or
+    provider-invoice commit chains finish the request unchanged.
+    """
+    await _rate_limit(user.id, action, limit=5)
+    mutation, replay = await _mutation(
+        db,
+        user_id=user.id,
+        action=action,
+        key=idempotency_key,
+        payload=request.model_dump(),
+    )
+    if replay is not None:
+        return await _rehydrate_owned_direct_redirect(db, user=user, stored_response=replay)
+    try:
+        if request.funding_mode == 'wallet':
+            if request.method_key is not None:
+                raise DeviceFirstError(
+                    'invalid_funding_request', 'Wallet checkout has no provider method', status_code=422
+                )
+        elif not request.method_key:
+            raise DeviceFirstError('payment_method_required', 'Select an available payment method', status_code=422)
+        resolved = await create_or_resume_direct_checkout(
+            db,
+            user=user,
+            period_days=request.period_days,
+            selected_device_limit=request.selected_device_limit,
+            expected_tariff_total_kopeks=request.expected_tariff_total_kopeks,
+            funding_mode=request.funding_mode,
+            method_key=request.method_key,
+            source='cabinet',
+            mutation=mutation,
+        )
+        checkout = resolved.checkout
+        mutation.checkout_id = checkout.id
+        if not resolved.proceed_to_payment:
+            # A provider callback won the race while the customer was paying:
+            # answer with that canonical checkout state, never a second order.
+            response = {'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)}
+        elif request.funding_mode == 'wallet':
+            checkout = await commit_direct_wallet_checkout(db, public_id=checkout.public_id, user_id=user.id)
+            await db.refresh(user)
+            response = {'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)}
+        else:
+            attempt = await create_platega_attempt(
+                db,
+                checkout_public_id=checkout.public_id,
+                user_id=user.id,
+                method_key=request.method_key,
+            )
+            payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+            checkout = await get_owned_checkout(db, public_id=checkout.public_id, user_id=user.id)
+            if _is_live_direct_provider_invoice(checkout, attempt, payment):
+                response = {
+                    'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks),
+                    'redirect_url': payment.redirect_url,
+                }
+            elif checkout.lifecycle_state in {'fulfilling', 'ready'}:
+                # The canonical create-follow-up may have found an already
+                # paid invoice and completed the same strict settlement path.
+                # Return its owned checkout state, never a stale provider URL.
+                response = {
+                    'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)
+                }
+            else:
+                raise DeviceFirstError('reconciliation_required', 'Provider invoice requires reconciliation')
+    except DeviceFirstError as error:
+        await store_mutation_result(
+            db,
+            mutation,
+            response={'code': error.code, 'message': str(error)},
+            status_code=error.status_code,
+        )
+        _raise(error)
+    await store_mutation_result(db, mutation, response=_redact_mutation_response(response))
+    return response
+
+
+@router.post('/commit')
+async def direct_checkout_commit(
+    request: DirectCheckoutCommitRequest,
+    idempotency_key: str | None = Header(None, alias='Idempotency-Key'),
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Fused pay-time mutation: the order is born only now, at «Pay»."""
+    return await _fused_commit_checkout(
+        request=request,
+        idempotency_key=idempotency_key,
+        user=user,
+        db=db,
+        action='fused_commit',
+    )
+
+
+@router.post('/native-launch')
+async def direct_native_launch(
+    request: DirectCheckoutCommitRequest,
+    idempotency_key: str | None = Header(None, alias='Idempotency-Key'),
+    user: User = Depends(get_current_native_launch_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Fused provider launch from an authenticated Telegram Mini App.
+
+    The signed Telegram identity is verified before any order exists, and —
+    exactly like the deprecated per-checkout native launch — this endpoint can
+    never debit the wallet.
+    """
+    if request.funding_mode != 'platega':
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                'code': 'invalid_funding_request',
+                'message': 'A native launch can only start an external provider payment',
+            },
+        )
+    return await _fused_commit_checkout(
+        request=request,
+        idempotency_key=idempotency_key,
+        user=user,
+        db=db,
+        action='fused_native_launch',
     )
 
 

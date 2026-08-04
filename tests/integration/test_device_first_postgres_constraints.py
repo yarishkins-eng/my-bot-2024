@@ -7,6 +7,7 @@ import importlib
 import os
 import sys
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import asyncpg
@@ -540,5 +541,104 @@ async def test_final_erasure_wins_lock_race_against_late_terminal_reconciliation
         await erasure_db.rollback()
         await reconciliation_db.close()
         await erasure_db.close()
+        await engine.dispose()
+        await setup.close()
+
+
+async def test_two_concurrent_fused_pay_clicks_birth_exactly_one_checkout(monkeypatch) -> None:
+    """The unique open-checkout index decides: the loser resumes the winner."""
+    from app.services import device_first_checkout_service as service
+
+    setup = await asyncpg.connect(DATABASE_URL)
+    engine_url = DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://', 1)
+    engine = create_async_engine(engine_url, pool_size=2, max_overflow=0)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    first = session_factory()
+    second = session_factory()
+
+    try:
+        user_id, tariff_id = await _seed_owner_and_tariff(setup)
+        options = {
+            'eligible': True,
+            'version': 2,
+            'tariff': {
+                'id': tariff_id,
+                'name': 'Test',
+                'traffic_limit_gb': 0,
+                'base_device_limit': 2,
+                'pricing_revision': 1,
+            },
+            'period_options': [30],
+            'device_options': [2],
+            'default_period_days': 30,
+            'current_subscription': None,
+            'balance_kopeks': 0,
+            'price_matrix': [
+                {
+                    'period_days': 30,
+                    'prices': [
+                        {
+                            'device_limit': 2,
+                            'price_kopeks': 30000,
+                            'breakdown': {
+                                'base_price_kopeks': 30000,
+                                'devices_price_kopeks': 0,
+                                'promo_group_discount_kopeks': 0,
+                                'promo_offer_discount_kopeks': 0,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
+        monkeypatch.setattr(service, 'build_purchase_options', AsyncMock(return_value=options))
+        user = SimpleNamespace(id=user_id, balance_kopeks=0)
+
+        results = await asyncio.gather(
+            service.create_or_resume_direct_checkout(
+                first,
+                user=user,
+                period_days=30,
+                selected_device_limit=2,
+                expected_tariff_total_kopeks=30000,
+                funding_mode='platega',
+                method_key='sbp',
+                source='cabinet',
+            ),
+            service.create_or_resume_direct_checkout(
+                second,
+                user=user,
+                period_days=30,
+                selected_device_limit=2,
+                expected_tariff_total_kopeks=30000,
+                funding_mode='platega',
+                method_key='sbp',
+                source='cabinet',
+            ),
+            return_exceptions=True,
+        )
+
+        failures = [result for result in results if isinstance(result, Exception)]
+        assert failures == []
+        assert [result.proceed_to_payment for result in results] == [True, True]
+        assert results[0].checkout.public_id == results[1].checkout.public_id
+        assert (
+            await setup.fetchval(
+                'SELECT count(*) FROM subscription_checkouts WHERE user_id = $1',
+                user_id,
+            )
+            == 1
+        )
+        assert (
+            await setup.fetchval(
+                'SELECT lifecycle_state FROM subscription_checkouts WHERE user_id = $1',
+                user_id,
+            )
+            == 'confirmed'
+        )
+    finally:
+        await first.close()
+        await second.close()
         await engine.dispose()
         await setup.close()

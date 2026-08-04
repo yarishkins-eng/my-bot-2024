@@ -21,7 +21,10 @@ from app.cabinet.routes.device_first import (
     checkout_open,
     checkout_pending_payment,
     checkout_resume_invoice,
+    direct_checkout_commit,
+    direct_native_launch,
 )
+from app.cabinet.schemas.device_first import DirectCheckoutCommitRequest
 from app.services.device_first_checkout_service import DeviceFirstError, checkout_ui_state
 
 
@@ -665,3 +668,303 @@ async def test_direct_commit_never_exposes_a_non_live_provider_redirect(payment_
 
     assert raised.value.detail['code'] == 'reconciliation_required'
     assert store.await_args.kwargs['response']['code'] == 'reconciliation_required'
+
+
+def _fused_request(**overrides):
+    payload = {
+        'period_days': 30,
+        'selected_device_limit': 2,
+        'funding_mode': 'platega',
+        'method_key': 'sbp',
+        'expected_tariff_total_kopeks': 36_900,
+    }
+    return DirectCheckoutCommitRequest(**{**payload, **overrides})
+
+
+@pytest.mark.asyncio
+async def test_fused_commit_wallet_births_and_debits_only_at_pay_time() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=100_000)
+    mutation = SimpleNamespace(checkout_id=None)
+    checkout = SimpleNamespace(id=91, public_id='fused-checkout')
+    resolved = SimpleNamespace(checkout=checkout, proceed_to_payment=True)
+    db = AsyncMock()
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch(
+            'app.cabinet.routes.device_first.create_or_resume_direct_checkout',
+            AsyncMock(return_value=resolved),
+        ) as fused,
+        patch(
+            'app.cabinet.routes.device_first.commit_direct_wallet_checkout',
+            AsyncMock(return_value=checkout),
+        ) as commit,
+        patch(
+            'app.cabinet.routes.device_first._serialize_cabinet_checkout',
+            AsyncMock(return_value={'id': 'fused-checkout'}),
+        ),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
+    ):
+        response = await direct_checkout_commit(
+            _fused_request(funding_mode='wallet', method_key=None),
+            idempotency_key='pay:30:2:wallet:36900',
+            user=user,
+            db=db,
+        )
+
+    assert response == {'checkout': {'id': 'fused-checkout'}}
+    assert fused.await_args.kwargs['funding_mode'] == 'wallet'
+    assert fused.await_args.kwargs['expected_tariff_total_kopeks'] == 36_900
+    assert fused.await_args.kwargs['source'] == 'cabinet'
+    assert fused.await_args.kwargs['mutation'] is mutation
+    commit.assert_awaited_once_with(db, public_id='fused-checkout', user_id=17)
+    assert mutation.checkout_id == 91
+    store.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fused_commit_wallet_rejects_a_provider_method() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    db = AsyncMock()
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch('app.cabinet.routes.device_first.create_or_resume_direct_checkout', AsyncMock()) as fused,
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()),
+    ):
+        with pytest.raises(HTTPException) as raised:
+            await direct_checkout_commit(
+                _fused_request(funding_mode='wallet', method_key='sbp'),
+                idempotency_key='pay:30:2:wallet:36900',
+                user=user,
+                db=db,
+            )
+
+    assert raised.value.status_code == 422
+    assert raised.value.detail['code'] == 'invalid_funding_request'
+    fused.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fused_commit_platega_returns_a_live_redirect_and_stores_it_redacted() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    checkout = SimpleNamespace(
+        id=91,
+        public_id='fused-checkout',
+        settlement_mode='direct_purchase_v2',
+        lifecycle_state='awaiting_funds',
+        funding_state='invoice_pending',
+        fulfillment_state='not_started',
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    resolved = SimpleNamespace(checkout=checkout, proceed_to_payment=True)
+    attempt = SimpleNamespace(platega_payment_id=51, status='pending')
+    payment = SimpleNamespace(
+        redirect_url='https://pay.example/live',
+        is_paid=False,
+        status='PENDING',
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=payment), refresh=AsyncMock())
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch(
+            'app.cabinet.routes.device_first.create_or_resume_direct_checkout',
+            AsyncMock(return_value=resolved),
+        ) as fused,
+        patch(
+            'app.cabinet.routes.device_first.create_platega_attempt',
+            AsyncMock(return_value=attempt),
+        ) as create_attempt,
+        patch(
+            'app.cabinet.routes.device_first.get_owned_checkout',
+            AsyncMock(return_value=checkout),
+        ),
+        patch(
+            'app.cabinet.routes.device_first._serialize_cabinet_checkout',
+            AsyncMock(return_value={'id': 'fused-checkout'}),
+        ),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
+    ):
+        response = await direct_checkout_commit(
+            _fused_request(),
+            idempotency_key='pay:30:2:platega:sbp:36900',
+            user=user,
+            db=db,
+        )
+
+    assert response == {'checkout': {'id': 'fused-checkout'}, 'redirect_url': 'https://pay.example/live'}
+    assert fused.await_args.kwargs['method_key'] == 'sbp'
+    create_attempt.assert_awaited_once_with(db, checkout_public_id='fused-checkout', user_id=17, method_key='sbp')
+    assert store.await_args.kwargs['response'] == {'checkout': {'id': 'fused-checkout'}}
+
+
+@pytest.mark.asyncio
+async def test_fused_commit_reprice_leaves_no_row_no_post_and_no_cancel() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    reprice = DeviceFirstError('reprice_required', 'The price changed')
+    db = AsyncMock()
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch(
+            'app.cabinet.routes.device_first.create_or_resume_direct_checkout',
+            AsyncMock(side_effect=reprice),
+        ),
+        patch('app.cabinet.routes.device_first.create_platega_attempt', AsyncMock()) as create_attempt,
+        patch('app.cabinet.routes.device_first.commit_direct_wallet_checkout', AsyncMock()) as commit,
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
+    ):
+        with pytest.raises(HTTPException) as raised:
+            await direct_checkout_commit(
+                _fused_request(expected_tariff_total_kopeks=35_000),
+                idempotency_key='pay:30:2:platega:sbp:35000',
+                user=user,
+                db=db,
+            )
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail['code'] == 'reprice_required'
+    create_attempt.assert_not_awaited()
+    commit.assert_not_awaited()
+    assert store.await_args.kwargs['response']['code'] == 'reprice_required'
+    assert store.await_args.kwargs['status_code'] == 409
+
+
+@pytest.mark.asyncio
+async def test_fused_commit_funding_locked_demands_the_explicit_abandon_screen() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=100_000)
+    mutation = SimpleNamespace(checkout_id=None)
+    locked = DeviceFirstError('funding_mode_locked', 'Funding method is already fixed')
+    db = AsyncMock()
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch(
+            'app.cabinet.routes.device_first.create_or_resume_direct_checkout',
+            AsyncMock(side_effect=locked),
+        ),
+        patch('app.cabinet.routes.device_first.commit_direct_wallet_checkout', AsyncMock()) as commit,
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()),
+    ):
+        with pytest.raises(HTTPException) as raised:
+            await direct_checkout_commit(
+                _fused_request(funding_mode='wallet', method_key=None),
+                idempotency_key='pay:30:2:wallet:36900',
+                user=user,
+                db=db,
+            )
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail['code'] == 'funding_mode_locked'
+    commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fused_commit_resume_of_a_paid_race_returns_the_canonical_checkout() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    settled = SimpleNamespace(id=91, public_id='settled-checkout')
+    resolved = SimpleNamespace(checkout=settled, proceed_to_payment=False)
+    db = AsyncMock()
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch(
+            'app.cabinet.routes.device_first.create_or_resume_direct_checkout',
+            AsyncMock(return_value=resolved),
+        ),
+        patch('app.cabinet.routes.device_first.create_platega_attempt', AsyncMock()) as create_attempt,
+        patch(
+            'app.cabinet.routes.device_first._serialize_cabinet_checkout',
+            AsyncMock(return_value={'id': 'settled-checkout', 'ui_state': 'processing'}),
+        ),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()),
+    ):
+        response = await direct_checkout_commit(
+            _fused_request(),
+            idempotency_key='pay:30:2:platega:sbp:36900',
+            user=user,
+            db=db,
+        )
+
+    assert response == {'checkout': {'id': 'settled-checkout', 'ui_state': 'processing'}}
+    create_attempt.assert_not_awaited()
+    assert mutation.checkout_id == 91
+
+
+@pytest.mark.asyncio
+async def test_fused_commit_replay_rehydrates_the_owned_redirect() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    replay = {'checkout': {'id': 'fused-checkout'}}
+    db = AsyncMock()
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(SimpleNamespace(), replay))),
+        patch(
+            'app.cabinet.routes.device_first._rehydrate_owned_direct_redirect',
+            AsyncMock(return_value={'checkout': {'id': 'fused-checkout'}, 'redirect_url': 'https://pay.example/live'}),
+        ) as rehydrate,
+        patch('app.cabinet.routes.device_first.create_or_resume_direct_checkout', AsyncMock()) as fused,
+    ):
+        response = await direct_checkout_commit(
+            _fused_request(),
+            idempotency_key='pay:30:2:platega:sbp:36900',
+            user=user,
+            db=db,
+        )
+
+    assert response['redirect_url'] == 'https://pay.example/live'
+    rehydrate.assert_awaited_once()
+    fused.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fused_native_launch_delegates_with_its_own_action_and_never_debits_wallet() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=100_000, telegram_id=7001)
+    db = AsyncMock()
+    expected = {'checkout': {'id': 'fused-checkout'}, 'redirect_url': 'https://pay.example/live'}
+
+    with patch(
+        'app.cabinet.routes.device_first._fused_commit_checkout', AsyncMock(return_value=expected)
+    ) as fused_commit:
+        response = await direct_native_launch(
+            _fused_request(),
+            idempotency_key='native-pay:30:2:platega:sbp:36900',
+            user=user,
+            db=db,
+        )
+
+    assert response == expected
+    assert fused_commit.await_args.kwargs['action'] == 'fused_native_launch'
+    assert fused_commit.await_args.kwargs['request'].funding_mode == 'platega'
+
+
+@pytest.mark.asyncio
+async def test_fused_native_launch_rejects_wallet_funding_before_any_mutation() -> None:
+    user = SimpleNamespace(id=17, balance_kopeks=100_000, telegram_id=7001)
+    db = AsyncMock()
+
+    with patch('app.cabinet.routes.device_first._fused_commit_checkout', AsyncMock()) as fused_commit:
+        with pytest.raises(HTTPException) as raised:
+            await direct_native_launch(
+                _fused_request(funding_mode='wallet', method_key=None),
+                idempotency_key='native-pay:30:2:wallet:36900',
+                user=user,
+                db=db,
+            )
+
+    assert raised.value.status_code == 422
+    assert raised.value.detail['code'] == 'invalid_funding_request'
+    fused_commit.assert_not_awaited()

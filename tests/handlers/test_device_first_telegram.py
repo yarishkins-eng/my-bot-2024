@@ -13,15 +13,20 @@ from app.handlers.subscription.device_first import (
     _render_checkout,
     _render_confirmation,
     _render_error,
+    _render_fused_confirmation,
     _render_new_checkout,
     abandon,
     arm,
     cancel,
+    cancel_fused,
     change_selection,
+    change_selection_fused,
     choose_devices,
     choose_period,
     confirm,
     pay,
+    pay_fused,
+    pay_wallet_fused,
     restart_device_first_or_show_legacy_tariffs,
     show_device_first_entry,
 )
@@ -340,40 +345,61 @@ async def test_annual_confirmation_keeps_the_exact_365_day_term() -> None:
 
 
 @pytest.mark.asyncio
-async def test_choose_devices_creates_owned_telegram_checkout_and_renders_confirmation() -> None:
+async def test_choose_devices_renders_a_checkout_free_pay_confirmation() -> None:
+    """Device selection never persists a draft: the order is born at «Pay»."""
     callback = SimpleNamespace(data='df:d:view1234:5', answer=AsyncMock())
     state = AsyncMock()
+    options = {
+        'tariff': {'name': 'Premium'},
+        'period_options': [30, 90],
+        'device_options': [2, 5],
+        'price_matrix': [
+            {
+                'period_days': 90,
+                'prices': [
+                    {'device_limit': 2, 'price_kopeks': 89_000},
+                    {'device_limit': 5, 'price_kopeks': 109_000},
+                ],
+            }
+        ],
+    }
     state.get_data.return_value = {
         'df_view_id': 'view1234',
         'df_days': 90,
-        'df_options': {
-            'tariff': {'name': 'Premium'},
-            'period_options': [30, 90],
-            'device_options': [2, 5],
-        },
+        'df_options': options,
     }
     user = SimpleNamespace(id=17, language='ru', balance_kopeks=50000)
-    checkout = SimpleNamespace(public_id='owned-checkout')
+    db = AsyncMock()
 
     with (
-        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock(return_value=None)),
+        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock()) as get_open,
+        patch('app.handlers.subscription.device_first.create_or_resume_direct_checkout', AsyncMock()) as create,
         patch(
-            'app.handlers.subscription.device_first.create_checkout',
-            AsyncMock(return_value=checkout),
-        ) as create,
-        patch('app.handlers.subscription.device_first._render_new_checkout', AsyncMock()) as render,
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch(
+            'app.utils.miniapp_buttons.build_cabinet_url',
+            return_value='https://cabinet.example/subscription/purchase?safe',
+        ) as build_cabinet_url,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
     ):
-        await choose_devices(callback, user, AsyncMock(), state)
+        await choose_devices(callback, user, db, state)
 
-    create.assert_awaited_once()
-    assert create.await_args.kwargs == {
-        'user': user,
-        'period_days': 90,
-        'selected_device_limit': 5,
-        'source': 'telegram',
-    }
-    state.update_data.assert_awaited_once_with(df_checkout_id='owned-checkout')
-    render.assert_awaited_once_with(callback, user, ANY, checkout, tariff_name='Premium')
+    get_open.assert_not_awaited()
+    create.assert_not_awaited()
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert 'Ваш заказ' in caption
+    assert 'Premium' in caption
+    assert '5 устройств · 3 месяца' in caption
+    assert '1 090 ₽' in caption
+    assert keyboard[0][0].web_app.url == 'https://cabinet.example/subscription/purchase?safe'
+    assert build_cabinet_url.call_args_list[0].args[0] == (
+        '/subscription/purchase?period=90&devices=5&method=sbp&autostart=1'
+    )
+    callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
+    assert callbacks == ['df:e2', 'df:x2']
 
 
 @pytest.mark.asyncio
@@ -1074,7 +1100,9 @@ async def test_change_selection_navigates_without_cancelling_a_pending_invoice()
 
 
 @pytest.mark.asyncio
-async def test_changed_completed_telegram_selection_supersedes_one_safe_pending_invoice() -> None:
+async def test_choose_devices_never_touches_an_existing_checkout() -> None:
+    """The showcase renders from FSM even with a live invoice: resume/supersede
+    of that invoice moved into the fused pay handlers (``df:y2:``/``df:a2:``)."""
     callback = SimpleNamespace(data='df:d:view1234:4', answer=AsyncMock())
     user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
     options = {
@@ -1082,7 +1110,7 @@ async def test_changed_completed_telegram_selection_supersedes_one_safe_pending_
         'tariff': {'name': 'Базовый'},
         'period_options': [30],
         'device_options': [2, 4],
-        'price_matrix': [],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 4, 'price_kopeks': 36_900}]}],
     }
     state = SimpleNamespace(
         get_data=AsyncMock(
@@ -1095,32 +1123,28 @@ async def test_changed_completed_telegram_selection_supersedes_one_safe_pending_
         ),
         update_data=AsyncMock(),
     )
-    existing = SimpleNamespace(
-        public_id='old-checkout',
-        lifecycle_state='awaiting_funds',
-        settlement_mode='direct_purchase_v2',
-        period_days=30,
-        selected_device_limit=2,
-    )
-    archived = SimpleNamespace(public_id='old-checkout', lifecycle_state='cancelled')
-    fresh = SimpleNamespace(public_id='fresh-checkout')
 
     with (
-        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock(return_value=existing)),
+        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock()) as get_open,
         patch(
-            'app.handlers.subscription.device_first.abandon_direct_checkout_for_new_calculation',
-            AsyncMock(return_value=archived),
+            'app.handlers.subscription.device_first.abandon_direct_checkout_for_new_calculation', AsyncMock()
         ) as abandon_service,
-        patch('app.handlers.subscription.device_first.create_checkout', AsyncMock(return_value=fresh)) as create,
-        patch('app.handlers.subscription.device_first._render_new_checkout', AsyncMock()) as render,
+        patch('app.handlers.subscription.device_first.create_or_resume_direct_checkout', AsyncMock()) as create,
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch('app.handlers.subscription.device_first._render_fused_confirmation', AsyncMock()) as render,
     ):
         await choose_devices(callback, user, SimpleNamespace(), state)
 
-    abandon_service.assert_awaited_once_with(ANY, checkout_public_id='old-checkout', user_id=user.id)
-    create.assert_awaited_once()
-    assert create.await_args.kwargs['period_days'] == 30
-    assert create.await_args.kwargs['selected_device_limit'] == 4
+    get_open.assert_not_awaited()
+    abandon_service.assert_not_awaited()
+    create.assert_not_awaited()
+    state.update_data.assert_not_awaited()
     render.assert_awaited_once()
+    assert render.await_args.kwargs['days'] == 30
+    assert render.await_args.kwargs['devices'] == 4
 
 
 @pytest.mark.asyncio
@@ -1271,3 +1295,454 @@ async def test_legacy_trial_reconciliation_error_explains_the_hold_and_offers_su
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert keyboard[0][0].callback_data == 'menu_support'
     assert keyboard[1][0].callback_data == 'back_to_menu'
+
+
+@pytest.mark.asyncio
+async def test_fused_confirmation_offers_the_wallet_button_when_balance_covers() -> None:
+    callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=50_000)
+    options = {
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 36_900}]}],
+    }
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ) as methods,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_fused_confirmation(callback, user, AsyncMock(), options, days=30, devices=2)
+
+    methods.assert_awaited_once()
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert 'Оплатите с баланса.' in caption
+    assert keyboard[0][0].callback_data == 'df:a2:30:2:36900'
+    callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
+    assert callbacks == ['df:a2:30:2:36900', 'df:e2', 'df:x2']
+
+
+def test_fused_pay_callbacks_fit_the_telegram_byte_budget() -> None:
+    from app.services.device_first_payment_service import PLATEGA_METHODS
+
+    # Telegram allows at most 64 bytes of callback_data; the fused callbacks
+    # carry the whole order plus the optimistic price, so check the worst case
+    # with every real method key and maximal realistic values.
+    for method_key in PLATEGA_METHODS:
+        data = f'df:y2:{method_key}:365:10:9999999'
+        assert len(data.encode()) <= 64, data
+    assert len(b'df:a2:365:10:9999999') <= 64
+    # The fused prefixes must never collide with the legacy startswith filters.
+    assert not 'df:y2:sbp:30:2:36900'.startswith('df:y:')
+    assert not 'df:a2:30:2:36900'.startswith('df:a:')
+
+
+@pytest.mark.asyncio
+async def test_pay_fused_births_the_checkout_and_its_invoice_only_at_pay_time() -> None:
+    callback = SimpleNamespace(data='df:y2:sbp:30:2:36900', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    checkout = SimpleNamespace(public_id='fused-checkout')
+    resolved = SimpleNamespace(checkout=checkout, proceed_to_payment=True)
+    attempt = SimpleNamespace(redirect_url='https://pay.example/invoice')
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_or_resume_direct_checkout',
+            AsyncMock(return_value=resolved),
+        ) as fused,
+        patch(
+            'app.handlers.subscription.device_first.create_platega_attempt',
+            AsyncMock(return_value=attempt),
+        ) as create_attempt,
+        patch(
+            'app.handlers.subscription.device_first.get_owned_checkout',
+            AsyncMock(return_value=checkout),
+        ),
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
+    ):
+        await pay_fused(callback, user, db, AsyncMock())
+
+    assert fused.await_args.kwargs == {
+        'user': user,
+        'period_days': 30,
+        'selected_device_limit': 2,
+        'expected_tariff_total_kopeks': 36_900,
+        'funding_mode': 'platega',
+        'method_key': 'sbp',
+        'source': 'telegram',
+    }
+    create_attempt.assert_awaited_once_with(db, checkout_public_id='fused-checkout', user_id=17, method_key='sbp')
+    render.assert_awaited_once_with(callback, user, db, checkout)
+
+
+@pytest.mark.asyncio
+async def test_pay_wallet_fused_debits_the_balance_only_at_pay_time() -> None:
+    callback = SimpleNamespace(data='df:a2:30:2:36900', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=50_000)
+    checkout = SimpleNamespace(public_id='fused-checkout')
+    resolved = SimpleNamespace(checkout=checkout, proceed_to_payment=True)
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_or_resume_direct_checkout',
+            AsyncMock(return_value=resolved),
+        ) as fused,
+        patch(
+            'app.handlers.subscription.device_first.commit_direct_wallet_checkout',
+            AsyncMock(return_value=checkout),
+        ) as commit,
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
+    ):
+        await pay_wallet_fused(callback, user, db, AsyncMock())
+
+    assert fused.await_args.kwargs == {
+        'user': user,
+        'period_days': 30,
+        'selected_device_limit': 2,
+        'expected_tariff_total_kopeks': 36_900,
+        'funding_mode': 'wallet',
+        'method_key': None,
+        'source': 'telegram',
+    }
+    commit.assert_awaited_once_with(db, public_id='fused-checkout', user_id=17)
+    render.assert_awaited_once_with(callback, user, db, checkout)
+
+
+@pytest.mark.asyncio
+async def test_pay_fused_reprice_rerenders_a_fresh_confirmation_without_a_row_or_a_post() -> None:
+    callback = SimpleNamespace(data='df:y2:sbp:30:2:36900', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    options = {
+        'eligible': True,
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 39_900}]}],
+    }
+    state = AsyncMock()
+    db = AsyncMock()
+    reprice = DeviceFirstError('reprice_required', 'The price changed')
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_or_resume_direct_checkout',
+            AsyncMock(side_effect=reprice),
+        ),
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch('app.utils.miniapp_buttons.build_cabinet_url', return_value=None),
+        patch('app.handlers.subscription.device_first.create_platega_attempt', AsyncMock()) as create_attempt,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await pay_fused(callback, user, db, state)
+
+    create_attempt.assert_not_awaited()
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert 'Цена обновилась' in caption
+    assert '399 ₽' in caption
+    assert keyboard[0][0].callback_data == 'df:y2:sbp:30:2:39900'
+
+
+@pytest.mark.asyncio
+async def test_pay_wallet_fused_with_a_live_invoice_requires_the_explicit_abandon_screen() -> None:
+    callback = SimpleNamespace(data='df:a2:30:2:36900', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=50_000)
+    existing = SimpleNamespace(public_id='live-invoice')
+    locked = DeviceFirstError('funding_mode_locked', 'Funding method is already fixed')
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_or_resume_direct_checkout',
+            AsyncMock(side_effect=locked),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=existing),
+        ),
+        patch('app.handlers.subscription.device_first.commit_direct_wallet_checkout', AsyncMock()) as commit,
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
+        patch('app.handlers.subscription.device_first._render_error', AsyncMock()) as render_error,
+    ):
+        await pay_wallet_fused(callback, user, db, AsyncMock())
+
+    commit.assert_not_awaited()
+    render.assert_awaited_once_with(callback, user, db, existing)
+    render_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pay_fused_resume_of_a_paid_race_renders_the_canonical_checkout_state() -> None:
+    callback = SimpleNamespace(data='df:y2:sbp:30:2:36900', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    settled = SimpleNamespace(public_id='settled-checkout')
+    resolved = SimpleNamespace(checkout=settled, proceed_to_payment=False)
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_or_resume_direct_checkout',
+            AsyncMock(return_value=resolved),
+        ),
+        patch('app.handlers.subscription.device_first.create_platega_attempt', AsyncMock()) as create_attempt,
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
+    ):
+        await pay_fused(callback, user, db, AsyncMock())
+
+    create_attempt.assert_not_awaited()
+    render.assert_awaited_once_with(callback, user, db, settled)
+
+
+@pytest.mark.asyncio
+async def test_pay_wallet_fused_insufficient_balance_rerenders_the_confirmation() -> None:
+    callback = SimpleNamespace(data='df:a2:30:2:36900', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=10_000)
+    checkout = SimpleNamespace(public_id='fused-checkout')
+    resolved = SimpleNamespace(checkout=checkout, proceed_to_payment=True)
+    options = {
+        'eligible': True,
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 36_900}]}],
+    }
+    insufficient = DeviceFirstError('wallet_insufficient', 'The balance does not cover this checkout', status_code=422)
+    state = AsyncMock()
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_or_resume_direct_checkout',
+            AsyncMock(return_value=resolved),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.commit_direct_wallet_checkout',
+            AsyncMock(side_effect=insufficient),
+        ),
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch('app.utils.miniapp_buttons.build_cabinet_url', return_value=None),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await pay_wallet_fused(callback, user, db, state)
+
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert 'Баланс больше не покрывает заказ' in caption
+    assert keyboard[0][0].callback_data == 'df:y2:sbp:30:2:36900'
+
+
+@pytest.mark.asyncio
+async def test_change_selection_fused_restarts_the_period_page_without_a_checkout() -> None:
+    callback = SimpleNamespace(data='df:e2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru')
+    options = {'eligible': True, 'tariff': {'name': 'Базовый'}, 'period_options': [30], 'device_options': [2]}
+    state = SimpleNamespace(
+        get_data=AsyncMock(return_value={'df_origin_callback': 'funnel_tariffs'}),
+        update_data=AsyncMock(),
+    )
+
+    with (
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
+        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock()) as get_open,
+        patch('app.handlers.subscription.device_first._period_page', AsyncMock()) as period_page,
+    ):
+        await change_selection_fused(callback, user, AsyncMock(), state)
+
+    get_open.assert_not_awaited()
+    period_page.assert_awaited_once()
+    assert period_page.await_args.kwargs['origin_callback'] == 'funnel_tariffs'
+
+
+@pytest.mark.asyncio
+async def test_cancel_fused_clears_state_without_touching_any_checkout() -> None:
+    callback = SimpleNamespace(data='df:x2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru')
+    state = SimpleNamespace(clear=AsyncMock())
+
+    with (
+        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock()) as get_open,
+        patch('app.handlers.subscription.device_first.cancel_checkout', AsyncMock()) as cancel_checkout,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await cancel_fused(callback, user, AsyncMock(), state)
+
+    get_open.assert_not_awaited()
+    cancel_checkout.assert_not_awaited()
+    state.clear.assert_awaited_once()
+    assert 'Деньги не списаны' in render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert keyboard[0][0].callback_data == 'back_to_menu'
+
+
+@pytest.mark.asyncio
+async def test_legacy_pay_button_on_a_cancelled_draft_renders_an_error_not_a_hang() -> None:
+    """After migration 0099 cancels a stale draft, its old ``df:y:`` button must
+    land on the honest recovery screen instead of hanging or charging."""
+    callback = SimpleNamespace(data='df:y:sbp:cancelled-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru')
+    invalid = DeviceFirstError('invalid_state', 'Checkout is not ready for a payment attempt')
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_platega_attempt',
+            AsyncMock(side_effect=invalid),
+        ),
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render_checkout,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await pay(callback, user, AsyncMock(), AsyncMock())
+
+    render_checkout.assert_not_awaited()
+    caption = render.await_args.kwargs['caption']
+    assert '⚠️' in caption
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert keyboard[-1][0].callback_data == 'back_to_menu'
+
+
+@pytest.mark.asyncio
+async def test_pay_fused_open_checkout_conflict_renders_the_live_order_not_an_error() -> None:
+    """A unique-index race loser sees the winner's canonical checkout screen."""
+    callback = SimpleNamespace(data='df:y2:sbp:30:2:36900', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    existing = SimpleNamespace(public_id='live-checkout')
+    conflict = DeviceFirstError('open_checkout_exists', 'An active checkout already exists')
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_or_resume_direct_checkout',
+            AsyncMock(side_effect=conflict),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=existing),
+        ),
+        patch('app.handlers.subscription.device_first.create_platega_attempt', AsyncMock()) as create_attempt,
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
+        patch('app.handlers.subscription.device_first._render_error', AsyncMock()) as render_error,
+    ):
+        await pay_fused(callback, user, db, AsyncMock())
+
+    create_attempt.assert_not_awaited()
+    render.assert_awaited_once_with(callback, user, db, existing)
+    render_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pay_fused_invalid_state_with_a_live_order_renders_its_canonical_screen() -> None:
+    callback = SimpleNamespace(data='df:a2:30:2:36900', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=50_000)
+    existing = SimpleNamespace(public_id='live-checkout')
+    invalid = DeviceFirstError('invalid_state', 'Checkout is not ready for final confirmation')
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_or_resume_direct_checkout',
+            AsyncMock(side_effect=invalid),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=existing),
+        ),
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
+        patch('app.handlers.subscription.device_first._render_fused_refresh', AsyncMock()) as refresh,
+        patch('app.handlers.subscription.device_first._render_error', AsyncMock()) as render_error,
+    ):
+        await pay_wallet_fused(callback, user, db, AsyncMock())
+
+    render.assert_awaited_once_with(callback, user, db, existing)
+    refresh.assert_not_awaited()
+    render_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pay_fused_invalid_state_without_a_live_order_rerenders_a_fresh_confirmation() -> None:
+    """A race loser whose fresh row was swept gets a fresh quote, not a dead end."""
+    callback = SimpleNamespace(data='df:y2:sbp:30:2:36900', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    options = {
+        'eligible': True,
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 36_900}]}],
+    }
+    invalid = DeviceFirstError('invalid_state', 'Checkout is not ready for final confirmation')
+    state = AsyncMock()
+    db = AsyncMock()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.create_or_resume_direct_checkout',
+            AsyncMock(side_effect=invalid),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=None),
+        ),
+        patch('app.handlers.subscription.device_first.build_purchase_options', AsyncMock(return_value=options)),
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch('app.utils.miniapp_buttons.build_cabinet_url', return_value=None),
+        patch('app.handlers.subscription.device_first.create_platega_attempt', AsyncMock()) as create_attempt,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await pay_fused(callback, user, db, state)
+
+    create_attempt.assert_not_awaited()
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert 'Условия заказа изменились' in caption
+    assert 'Ваш заказ' in caption
+    assert keyboard[0][0].callback_data == 'df:y2:sbp:30:2:36900'
+
+
+@pytest.mark.asyncio
+async def test_provider_amount_out_of_range_offers_balance_top_up_or_support() -> None:
+    callback = SimpleNamespace(data='df:y2:sbp:30:2:5000')
+    error = DeviceFirstError('provider_amount_out_of_range', 'Required amount is outside Platega limits')
+
+    with patch(
+        'app.handlers.subscription.device_first.edit_or_answer_photo',
+        AsyncMock(),
+    ) as render:
+        await _render_error(callback, _user(), error)
+
+    caption = render.await_args.kwargs['caption']
+    assert 'платёжную систему' in caption
+    assert 'Пополните баланс' in caption
+    assert 'поддержку' in caption
+
+
+@pytest.mark.asyncio
+async def test_provider_amount_out_of_range_offers_balance_top_up_or_support_in_english() -> None:
+    callback = SimpleNamespace(data='df:y2:sbp:30:2:5000')
+    error = DeviceFirstError('provider_amount_out_of_range', 'Required amount is outside Platega limits')
+
+    with patch(
+        'app.handlers.subscription.device_first.edit_or_answer_photo',
+        AsyncMock(),
+    ) as render:
+        await _render_error(callback, _user('en'), error)
+
+    caption = render.await_args.kwargs['caption']
+    assert 'payment provider' in caption
+    assert 'Top up your balance' in caption
+    assert 'contact support' in caption
