@@ -936,6 +936,7 @@ async def get_users_list(
     promo_group_id: int | None = None,
     campaign_id: int | None = None,
     partner_id: int | None = None,
+    exclude_deleted: bool = True,
     order_by_balance: bool = False,
     order_by_traffic: bool = False,
     order_by_last_activity: bool = False,
@@ -950,6 +951,8 @@ async def get_users_list(
 
     if status:
         query = query.where(User.status == status.value)
+    elif exclude_deleted:
+        query = query.where(or_(User.status.is_(None), User.status != UserStatus.DELETED.value))
 
     # Subscription-level filters via subquery
     if subscription_status or tariff_ids:
@@ -1065,11 +1068,14 @@ async def get_users_count(
     promo_group_id: int | None = None,
     campaign_id: int | None = None,
     partner_id: int | None = None,
+    exclude_deleted: bool = True,
 ) -> int:
     query = select(func.count(User.id))
 
     if status:
         query = query.where(User.status == status.value)
+    elif exclude_deleted:
+        query = query.where(or_(User.status.is_(None), User.status != UserStatus.DELETED.value))
 
     if subscription_status or tariff_ids:
         sub_conditions = []

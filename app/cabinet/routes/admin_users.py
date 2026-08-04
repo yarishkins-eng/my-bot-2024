@@ -535,7 +535,8 @@ async def list_users(
     - **limit**: Number of users per page (max 200)
     - **search**: Search by telegram_id, username, first_name, last_name
     - **email**: Search by email
-    - **status**: Filter by user status (active, blocked, deleted)
+    - **status**: Filter by user status. With no status, only operational
+      accounts are returned; the anonymised deletion archive is explicit.
     - **sort_by**: Sort field (created_at, balance, traffic, last_activity, total_spent, purchase_count)
     """
     # Convert status enum to model enum
@@ -570,6 +571,7 @@ async def list_users(
         promo_group_id=promo_group_id,
         campaign_id=campaign_id,
         partner_id=partner_id,
+        exclude_deleted=status is None,
         order_by_balance=order_by_balance,
         order_by_traffic=order_by_traffic,
         order_by_last_activity=order_by_last_activity,
@@ -587,6 +589,7 @@ async def list_users(
         promo_group_id=promo_group_id,
         campaign_id=campaign_id,
         partner_id=partner_id,
+        exclude_deleted=status is None,
     )
 
     # Get spending stats for all users
@@ -612,27 +615,33 @@ async def get_users_stats(
     stats = await get_users_statistics(db)
 
     # Get subscription stats
-    sub_stats_query = select(
-        func.count(Subscription.id).label('total'),
-        func.sum(
-            func.cast(
-                and_(
-                    Subscription.status == SubscriptionStatus.ACTIVE.value,
-                    Subscription.end_date > datetime.now(UTC),
-                ),
-                Integer,
-            )
-        ).label('active'),
-        func.sum(func.cast(Subscription.is_trial == True, Integer)).label('trial'),
-        func.sum(
-            func.cast(
-                or_(
-                    Subscription.status == SubscriptionStatus.EXPIRED.value,
-                    Subscription.end_date <= datetime.now(UTC),
-                ),
-                Integer,
-            )
-        ).label('expired'),
+    operational_user = or_(User.status.is_(None), User.status != UserStatus.DELETED.value)
+
+    sub_stats_query = (
+        select(
+            func.count(Subscription.id).label('total'),
+            func.sum(
+                func.cast(
+                    and_(
+                        Subscription.status == SubscriptionStatus.ACTIVE.value,
+                        Subscription.end_date > datetime.now(UTC),
+                    ),
+                    Integer,
+                )
+            ).label('active'),
+            func.sum(func.cast(Subscription.is_trial == True, Integer)).label('trial'),
+            func.sum(
+                func.cast(
+                    or_(
+                        Subscription.status == SubscriptionStatus.EXPIRED.value,
+                        Subscription.end_date <= datetime.now(UTC),
+                    ),
+                    Integer,
+                )
+            ).label('expired'),
+        )
+        .join(User, Subscription.user_id == User.id)
+        .where(operational_user)
     )
     sub_result = await db.execute(sub_stats_query)
     sub_row = sub_result.one_or_none()
@@ -679,10 +688,13 @@ async def get_users_stats(
     deleted_q = select(func.count(User.id)).where(User.status == UserStatus.DELETED.value)
     deleted_count = (await db.execute(deleted_q)).scalar() or 0
 
+    blocked_q = select(func.count(User.id)).where(User.status == UserStatus.BLOCKED.value)
+    blocked_count = (await db.execute(blocked_q)).scalar() or 0
+
     return UsersStatsResponse(
-        total_users=stats['total_users'],
+        total_users=(stats['total_users'] or 0) - deleted_count,
         active_users=stats['active_users'],
-        blocked_users=stats['blocked_users'],
+        blocked_users=blocked_count,
         deleted_users=deleted_count,
         new_today=stats['new_today'],
         new_week=stats['new_week'],
