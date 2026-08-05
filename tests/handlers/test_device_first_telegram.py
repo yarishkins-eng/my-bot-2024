@@ -140,11 +140,12 @@ async def test_device_page_shows_all_ten_choices_on_one_screen_without_paginatio
         )
 
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    assert [len(row) for row in keyboard] == [2, 2, 2, 2, 2, 1]
+    # One button per row: two columns clip the price on narrow phones.
+    assert [len(row) for row in keyboard] == [1] * 10 + [1]
     assert keyboard[0][0].callback_data == 'df:d:view1234:1'
-    assert keyboard[4][1].callback_data == 'df:d:view1234:10'
+    assert keyboard[9][0].callback_data == 'df:d:view1234:10'
     assert keyboard[0][0].text == '1 device'
-    assert keyboard[0][1].text == '2 devices'
+    assert keyboard[1][0].text == '2 devices'
     assert all(not button.callback_data.startswith('df:p:') for row in keyboard for button in row)
     assert keyboard[-1][0].callback_data == 'df:start'
 

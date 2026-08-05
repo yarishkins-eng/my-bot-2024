@@ -281,9 +281,10 @@ async def _device_page(
 ) -> None:
     values = list(options['device_options'])
     rows = []
-    # The ordinary 1–10-device tariff contract fits into two columns, so every
-    # choice is visible on one Telegram screen and no faux pagination is used.
-    for chunk in _chunks(values, 2):
+    # One full-width button per device option: two columns truncate the price on
+    # narrow phones (Telegram clips button text client-side), and a clipped price
+    # is worse than a longer list. Every choice still fits one screen (≤10 options).
+    for chunk in _chunks(values, 1):
         row = []
         for limit in chunk:
             price = _price_for(options, days=days, devices=limit)
