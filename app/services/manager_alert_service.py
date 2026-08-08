@@ -72,7 +72,9 @@ class ManagerAlertSettingsService:
         cls._load()
         configured_chat_id = cls._data.get('chat_id')
         if configured_chat_id is not None and configured_chat_id != chat_id:
-            logger.warning('Refusing manager topic from another chat', configured_chat_id=configured_chat_id, chat_id=chat_id)
+            logger.warning(
+                'Refusing manager topic from another chat', configured_chat_id=configured_chat_id, chat_id=chat_id
+            )
             return False
 
         cls._data['chat_id'] = chat_id

@@ -23,9 +23,7 @@ def isolated_manager_alert_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_bind_topics_requires_one_group() -> None:
-    assert ManagerAlertSettingsService.bind_topic(
-        chat_id=-100123456, topic=ManagerAlertTopic.TICKETS, thread_id=10
-    )
+    assert ManagerAlertSettingsService.bind_topic(chat_id=-100123456, topic=ManagerAlertTopic.TICKETS, thread_id=10)
     assert not ManagerAlertSettingsService.bind_topic(
         chat_id=-100654321, topic=ManagerAlertTopic.PAYMENTS, thread_id=11
     )
@@ -35,9 +33,7 @@ def test_bind_topics_requires_one_group() -> None:
 
 @pytest.mark.asyncio
 async def test_mirror_admin_category_uses_allow_list_without_keyboard() -> None:
-    assert ManagerAlertSettingsService.bind_topic(
-        chat_id=-100123456, topic=ManagerAlertTopic.PAYMENTS, thread_id=20
-    )
+    assert ManagerAlertSettingsService.bind_topic(chat_id=-100123456, topic=ManagerAlertTopic.PAYMENTS, thread_id=20)
     bot = MagicMock()
     bot.send_message = AsyncMock()
 
@@ -78,9 +74,7 @@ async def test_service_status_does_not_include_node_identity() -> None:
 
 @pytest.mark.asyncio
 async def test_admin_notification_mirrors_only_safe_copy_without_admin_keyboard() -> None:
-    assert ManagerAlertSettingsService.bind_topic(
-        chat_id=-100123456, topic=ManagerAlertTopic.PAYMENTS, thread_id=20
-    )
+    assert ManagerAlertSettingsService.bind_topic(chat_id=-100123456, topic=ManagerAlertTopic.PAYMENTS, thread_id=20)
     bot = MagicMock()
     bot.send_message = AsyncMock()
     service = AdminNotificationService(bot)
