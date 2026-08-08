@@ -45,6 +45,10 @@ class SubscriptionRenewalChargeError(SubscriptionRenewalError):
     """Raised when the balance charge step fails."""
 
 
+class SubscriptionRenewalEntitlementError(SubscriptionRenewalError):
+    """Raised before charge when an immutable tariff entitlement is unusable."""
+
+
 @dataclass(slots=True)
 class SubscriptionRenewalPricing:
     period_days: int
@@ -386,6 +390,29 @@ class SubscriptionRenewalService:
 
         description_text = description or f'Продление подписки на {period_days} дней'
 
+        # Validate the exact immutable entitlement before charging.  The
+        # central CRUD guard validates again under the subscription lock, but
+        # that second check is too late if a balance debit has already
+        # committed.  Tariff renewals may not recover access from mutable
+        # policy or a raw cart when their issued snapshot is absent.
+        resolved_entitlement = None
+        if subscription.tariff_id is not None:
+            try:
+                from app.services.public_location_entitlement_service import get_subscription_resolved_entitlement
+
+                resolved_entitlement = await get_subscription_resolved_entitlement(db, subscription.id)
+            except Exception as error:
+                logger.warning(
+                    'Subscription renewal stopped before charge: immutable entitlement unavailable',
+                    subscription_id=subscription.id,
+                    tariff_id=subscription.tariff_id,
+                    error=error,
+                    manual_reconcile_required=True,
+                )
+                raise SubscriptionRenewalEntitlementError(
+                    'Immutable subscription entitlement is unavailable'
+                ) from error
+
         # Save promo offer state before charge so we can restore on failure
         saved_promo_percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0) if consume_promo_offer else 0
         saved_promo_source = getattr(user, 'promo_offer_discount_source', None) if consume_promo_offer else None
@@ -425,7 +452,12 @@ class SubscriptionRenewalService:
         )
 
         try:
-            subscription_after = await extend_subscription(db, subscription_before, period_days)
+            subscription_after = await extend_subscription(
+                db,
+                subscription_before,
+                period_days,
+                _resolved_entitlement=resolved_entitlement,
+            )
         except Exception:
             # Session may be in a failed state after a broken commit — rollback first
             await db.rollback()

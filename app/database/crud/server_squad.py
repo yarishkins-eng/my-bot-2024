@@ -167,14 +167,17 @@ async def get_effective_tariff_squad_uuids(
     db: AsyncSession,
     allowed_squads: Sequence[str] | None,
 ) -> list[str]:
-    """Resolve tariff squads, treating an empty list as "all available squads"."""
+    """Normalize an already-resolved technical squad set.
+
+    This compatibility helper intentionally no longer interprets an empty
+    tariff list as "all available squads".  New tariff issuance must use the
+    PublicLocation resolver, which owns the business-to-technical mapping.
+    """
 
     normalized = [str(squad_uuid) for squad_uuid in (allowed_squads or []) if squad_uuid]
     if normalized:
         return list(dict.fromkeys(normalized))
-
-    available = await get_available_server_squads(db)
-    return [squad.squad_uuid for squad in available if squad.squad_uuid]
+    raise ValueError('empty tariff squad list is not an entitlement; use PublicLocation resolver')
 
 
 async def get_active_server_squads(db: AsyncSession) -> list[ServerSquad]:

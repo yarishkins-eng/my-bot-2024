@@ -617,6 +617,11 @@ async def update_squad(
     admin: User = Depends(require_permission('remnawave:manage')),
 ) -> SquadOperationResponse:
     """Update a squad in RemnaWave."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Raw Squad mutation is retired; use a controlled PublicLocation plan',
+    )
+
     service = _get_service()
     _ensure_configured(service)
 
@@ -648,6 +653,11 @@ async def perform_squad_action(
     admin: User = Depends(require_permission('remnawave:manage')),
 ) -> SquadOperationResponse:
     """Perform an action on a squad."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Raw Squad actions are retired; use a controlled PublicLocation plan',
+    )
+
     service = _get_service()
     _ensure_configured(service)
 
@@ -693,6 +703,11 @@ async def delete_squad(
     admin: User = Depends(require_permission('remnawave:manage')),
 ) -> SquadOperationResponse:
     """Delete a squad."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Raw Squad deletion is retired; use a controlled PublicLocation plan',
+    )
+
     service = _get_service()
     _ensure_configured(service)
 
@@ -742,6 +757,11 @@ async def migrate_squad_users(
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> MigrationResponse:
     """Migrate users from one squad to another."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Raw Squad migration is retired; use a controlled PublicLocation plan',
+    )
+
     service = _get_service()
     _ensure_configured(service)
 

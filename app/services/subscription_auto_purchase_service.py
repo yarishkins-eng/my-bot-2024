@@ -125,7 +125,12 @@ async def _prepare_auto_purchase(
     user: User,
     cart_data: dict,
 ) -> AutoPurchaseContext | None:
-    """Builds purchase context and pricing for a saved cart."""
+    """Refuse the retired generic cart format before it can replay raw UUIDs."""
+    logger.warning(
+        'Legacy generic auto-purchase cart is retired pending a PublicLocation migration',
+        user_id=getattr(user, 'id', None),
+    )
+    return None
 
     period_days = int(cart_data.get('period_days') or 0)
     if period_days <= 0:
@@ -385,8 +390,18 @@ async def _prepare_auto_extend_context(
     # Формируем описание с учётом тарифа
     if tariff_id:
         from app.database.crud.tariff import get_tariff_by_id
+        from app.services.public_location_entitlement_service import (
+            get_subscription_resolved_entitlement,
+            resolve_tariff_entitlement,
+        )
 
         tariff = await get_tariff_by_id(db, tariff_id)
+        if tariff is None:
+            return None
+        if subscription.tariff_id == tariff_id:
+            await get_subscription_resolved_entitlement(db, subscription.id)
+        else:
+            await resolve_tariff_entitlement(db, tariff)
         tariff_name = tariff.name if tariff else 'тариф'
         description = (
             cart_data.get('description') or f'Продление тарифа {tariff_name} на {format_days_declension(period_days)}'
@@ -402,9 +417,13 @@ async def _prepare_auto_extend_context(
     if traffic_limit_gb is not None:
         traffic_limit_gb = _safe_int(traffic_limit_gb, subscription.traffic_limit_gb or 0)
 
-    squad_uuid = cart_data.get('squad_uuid')
+    # A saved legacy cart can contain a raw technical UUID.  It has no
+    # approved PublicLocation provenance and must never be replayed during an
+    # automatic renewal.
+    squad_uuid = None
     consume_promo_offer = get_user_active_promo_discount_percent(user) > 0
-    allowed_squads = cart_data.get('allowed_squads')
+    # Legacy cart UUIDs are untrusted migration residue and are never applied.
+    allowed_squads = None
 
     return AutoExtendContext(
         subscription=subscription,
@@ -816,10 +835,11 @@ async def _auto_purchase_tariff(
         notify_user_subscription_activated,
         notify_user_subscription_renewed,
     )
-    from app.database.crud.server_squad import get_all_server_squads
     from app.database.crud.subscription import (
         create_paid_subscription,
         extend_subscription,
+        get_subscription_by_id_for_user,
+        get_subscription_by_user_and_tariff,
         get_subscription_by_user_id,
     )
     from app.database.crud.tariff import get_tariff_by_id
@@ -877,22 +897,25 @@ async def _auto_purchase_tariff(
     from app.database.crud.user import lock_user_for_pricing
 
     if settings.is_multi_tariff_enabled():
-        from app.database.crud.subscription import get_active_subscriptions_by_user_id
-
-        active_subs = await get_active_subscriptions_by_user_id(db, user.id)
         _cart_sub_id = cart_data.get('subscription_id')
         if _cart_sub_id:
-            existing_subscription = next(
-                (s for s in active_subs if s.id == int(_cart_sub_id)),
-                None,
-            )
+            existing_subscription = await get_subscription_by_id_for_user(db, int(_cart_sub_id), user.id)
         else:
-            existing_subscription = next(
-                (s for s in active_subs if s.tariff_id == tariff_id),
-                None,
+            existing_subscription = await get_subscription_by_user_and_tariff(
+                db, user.id, tariff_id, include_inactive=True
             )
     else:
         existing_subscription = await get_subscription_by_user_id(db, user.id)
+
+    if existing_subscription and existing_subscription.tariff_id != tariff_id:
+        logger.warning(
+            'Автопокупка отклонена: сохранённая корзина указывает на другой тариф',
+            subscription_id=existing_subscription.id,
+            subscription_tariff_id=existing_subscription.tariff_id,
+            cart_tariff_id=tariff_id,
+            format_user_id=_format_user_id(user),
+        )
+        return False
 
     user = await lock_user_for_pricing(db, user.id)
 
@@ -917,6 +940,23 @@ async def _auto_purchase_tariff(
             balance_kopeks=user.balance_kopeks,
             final_price=final_price,
         )
+        return False
+
+    from app.services.public_location_entitlement_service import (
+        EntitlementResolutionError,
+        get_subscription_resolved_entitlement,
+        resolve_tariff_entitlement,
+    )
+
+    try:
+        entitlement = (
+            await get_subscription_resolved_entitlement(db, existing_subscription.id)
+            if existing_subscription and not existing_subscription.is_trial
+            else await resolve_tariff_entitlement(db, tariff)
+        )
+        squads = list(entitlement.squad_uuids)
+    except EntitlementResolutionError as error:
+        logger.warning('Автопокупка отклонена: политика локаций неразрешима', tariff_id=tariff_id, error=str(error))
         return False
 
     # Save promo offer state before deduction (for restore on failure)
@@ -949,12 +989,6 @@ async def _auto_purchase_tariff(
         )
         return False
 
-    # Получаем список серверов из тарифа
-    squads = tariff.allowed_squads or []
-    if not squads:
-        all_servers, _ = await get_all_server_squads(db, available_only=True)
-        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-
     try:
         if existing_subscription:
             # Продлеваем существующую подписку
@@ -971,6 +1005,7 @@ async def _auto_purchase_tariff(
                 traffic_limit_gb=tariff.traffic_limit_gb,
                 device_limit=effective_device_limit,
                 connected_squads=squads,
+                _resolved_entitlement=entitlement,
             )
             was_trial_conversion = existing_subscription.is_trial
             if was_trial_conversion:
@@ -987,6 +1022,7 @@ async def _auto_purchase_tariff(
                 device_limit=tariff.device_limit,
                 connected_squads=squads,
                 tariff_id=tariff.id,
+                _resolved_entitlement=entitlement,
             )
             was_trial_conversion = False
     except Exception as error:
@@ -1194,12 +1230,21 @@ async def _auto_purchase_daily_tariff(
 ) -> bool:
     """Автоматическая покупка суточного тарифа из сохранённой корзины."""
 
+    # Saved daily-cart checkout still rewrites a subscription in place after a
+    # balance charge.  It cannot safely express an immutable cross-tariff
+    # entitlement transition, so require the user to start a fresh controlled
+    # checkout instead of replaying stale raw cart state.
+    logger.warning(
+        'Daily saved-cart auto-purchase is retired pending a controlled location entitlement transition',
+        user_id=getattr(user, 'id', None),
+    )
+    return False
+
     # Lazy imports to avoid circular dependency
     from app.cabinet.routes.websocket import (
         notify_user_subscription_activated,
         notify_user_subscription_renewed,
     )
-    from app.database.crud.server_squad import get_all_server_squads
     from app.database.crud.subscription import create_paid_subscription, get_subscription_by_user_id
     from app.database.crud.tariff import get_tariff_by_id
     from app.database.crud.transaction import create_transaction
@@ -1262,6 +1307,14 @@ async def _auto_purchase_daily_tariff(
         )
         return False
 
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+
+    try:
+        squads = list((await resolve_tariff_entitlement(db, tariff)).squad_uuids)
+    except EntitlementResolutionError as error:
+        logger.warning('Автопокупка отклонена: политика локаций неразрешима', tariff_id=tariff_id, error=str(error))
+        return False
+
     # Списываем баланс за первый день
     try:
         description = f'Активация суточного тарифа {tariff.name}'
@@ -1287,12 +1340,6 @@ async def _auto_purchase_daily_tariff(
             exc_info=True,
         )
         return False
-
-    # Получаем список серверов из тарифа
-    squads = tariff.allowed_squads or []
-    if not squads:
-        all_servers, _ = await get_all_server_squads(db, available_only=True)
-        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
 
     # Проверяем есть ли уже подписка
     if settings.is_multi_tariff_enabled():
@@ -2380,6 +2427,25 @@ async def try_auto_extend_expired_after_topup(
         )
         return False
 
+    # This top-up-triggered renewal has no fresh user confirmation after the
+    # balance arrives.  Validate the originally issued entitlement before the
+    # debit, never by falling through to extend_subscription afterwards.
+    resolved_entitlement = None
+    if subscription.tariff_id is not None:
+        try:
+            from app.services.public_location_entitlement_service import get_subscription_resolved_entitlement
+
+            resolved_entitlement = await get_subscription_resolved_entitlement(db, subscription.id)
+        except Exception as error:
+            logger.warning(
+                'Автопродление expired остановлено: immutable entitlement недоступен до списания',
+                subscription_id=subscription.id,
+                tariff_id=subscription.tariff_id,
+                error=error,
+                manual_reconcile_required=True,
+            )
+            return False
+
     # Check balance (skip for 100% discount)
     if renewal_cost > 0 and user.balance_kopeks < renewal_cost:
         logger.info(
@@ -2449,7 +2515,12 @@ async def try_auto_extend_expired_after_topup(
 
     # Extend subscription
     try:
-        updated_subscription = await extend_subscription(db, subscription, period_days)
+        updated_subscription = await extend_subscription(
+            db,
+            subscription,
+            period_days,
+            _resolved_entitlement=resolved_entitlement,
+        )
 
         # Convert trial to paid if needed
         if was_trial and subscription.is_trial:
@@ -2724,6 +2795,32 @@ async def try_resume_disabled_daily_after_topup(
 
     user = await lock_user_for_pricing(db, user.id)
 
+    # Deactivation may have cleared the panel projection.  Validate immutable
+    # entitlement evidence before the first balance write; a missing snapshot
+    # is manual reconciliation, never a charge followed by mutable restore.
+    restored_squads: list[str] | None = None
+    try:
+        from app.services.public_location_entitlement_service import get_subscription_entitlement_squads
+
+        snapshot_squads = list(await get_subscription_entitlement_squads(db, subscription.id))
+    except Exception as error:
+        logger.warning(
+            'Daily auto-resume stopped: immutable entitlement snapshot is unavailable',
+            subscription_id=subscription.id,
+            error=error,
+            manual_reconcile_required=True,
+        )
+        return False
+    if not subscription.connected_squads:
+        restored_squads = snapshot_squads
+    elif set(subscription.connected_squads) != set(snapshot_squads):
+        logger.warning(
+            'Daily auto-resume stopped: panel projection differs from immutable entitlement',
+            subscription_id=subscription.id,
+            manual_reconcile_required=True,
+        )
+        return False
+
     # Apply group discount to daily price (consistent with PricingEngine._calculate_switch_to_daily)
     from app.services.pricing_engine import PricingEngine
 
@@ -2791,6 +2888,8 @@ async def try_resume_disabled_daily_after_topup(
 
     # Activate the subscription (balance already deducted)
     subscription.status = SubscriptionStatus.ACTIVE.value
+    if restored_squads is not None:
+        subscription.connected_squads = restored_squads
     try:
         await db.commit()
         await db.refresh(subscription)
@@ -2859,26 +2958,6 @@ async def try_resume_disabled_daily_after_topup(
     except Exception as error:
         logger.error(
             '⚠️ Авто-возобновление daily: не удалось обновить время списания',
-            format_user_id=_format_user_id(user),
-            error=error,
-        )
-
-    # Restore connected_squads from tariff if cleared by deactivation sync
-    try:
-        if not subscription.connected_squads:
-            squads = tariff.allowed_squads or []
-            if not squads:
-                from app.database.crud.server_squad import get_all_server_squads
-
-                all_servers, _ = await get_all_server_squads(db, available_only=True, limit=10000)
-                squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-            if squads:
-                subscription.connected_squads = squads
-                await db.commit()
-                await db.refresh(subscription)
-    except Exception as error:
-        logger.warning(
-            '⚠️ Авто-возобновление daily: не удалось восстановить connected_squads',
             format_user_id=_format_user_id(user),
             error=error,
         )
@@ -3232,9 +3311,10 @@ async def auto_purchase_saved_cart_after_topup(
             continue
 
         # Legacy generic purchase flow (no cart_mode -- old-style cart from FSM state)
-        result = await _process_legacy_generic_cart(db, user, cart_data, bot=bot)
-        if result:
-            any_succeeded = True
+        logger.warning(
+            'Autopurchase skipped an unversioned legacy cart without cart_mode',
+            user_id=user.id,
+        )
 
     # Намерение одноразовое: гасим его только когда покупка реально прошла. При
     # неуспехе (например, частичное пополнение всё ещё меньше цены) метка остаётся
@@ -3252,7 +3332,13 @@ async def _process_legacy_generic_cart(
     *,
     bot: Bot | None = None,
 ) -> bool:
-    """Handle old-style carts without an explicit cart_mode (generic FSM carts)."""
+    """Refuse old-style carts without an explicit safe cart mode."""
+    logger.warning(
+        'Legacy generic auto-purchase cart is retired pending a PublicLocation migration',
+        user_id=getattr(user, 'id', None),
+    )
+    return False
+
     # Lazy imports to avoid circular dependency
     from app.cabinet.routes.websocket import (
         notify_user_subscription_activated,

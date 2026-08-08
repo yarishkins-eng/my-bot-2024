@@ -307,6 +307,11 @@ async def create_squad(
     payload: RemnaWaveSquadCreateRequest,
     _: Any = Security(require_api_token),
 ) -> RemnaWaveOperationResponse:
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        'Raw Squad mutation is retired; use a controlled PublicLocation plan',
+    )
+
     service = _get_service()
     _ensure_service_configured(service)
 
@@ -325,6 +330,11 @@ async def update_squad(
     payload: RemnaWaveSquadUpdateRequest,
     _: Any = Security(require_api_token),
 ) -> RemnaWaveOperationResponse:
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        'Raw Squad mutation is retired; use a controlled PublicLocation plan',
+    )
+
     service = _get_service()
     _ensure_service_configured(service)
 
@@ -348,6 +358,11 @@ async def squad_actions(
     payload: RemnaWaveSquadActionRequest,
     _: Any = Security(require_api_token),
 ) -> RemnaWaveOperationResponse:
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        'Raw Squad actions are retired; use a controlled PublicLocation plan',
+    )
+
     service = _get_service()
     _ensure_service_configured(service)
 
@@ -518,6 +533,11 @@ async def migrate_squad(
     _: Any = Security(require_api_token),
     db: AsyncSession = Depends(get_db_session),
 ) -> RemnaWaveSquadMigrationResponse:
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        'Raw Squad migration is retired; use a controlled PublicLocation plan',
+    )
+
     service = _get_service()
     _ensure_service_configured(service)
 

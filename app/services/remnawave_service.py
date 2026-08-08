@@ -1037,6 +1037,12 @@ class RemnaWaveService:
             return False
 
     async def update_squad_inbounds(self, squad_uuid: str, inbound_uuids: list[str]) -> bool:
+        logger.warning(
+            'Raw squad inbound mutation is retired pending a controlled PublicLocation plan',
+            squad_uuid=squad_uuid,
+        )
+        return False
+
         try:
             async with self.get_api_client() as api:
                 data = {'uuid': squad_uuid, 'inbounds': inbound_uuids}
@@ -1086,6 +1092,9 @@ class RemnaWaveService:
             return None
 
     async def update_squad(self, uuid: str, name: str = None, inbounds: list[str] = None) -> bool:
+        logger.warning('Raw squad mutation is retired pending a controlled PublicLocation plan', squad_uuid=uuid)
+        return False
+
         try:
             async with self.get_api_client() as api:
                 await api.update_internal_squad(uuid, name, inbounds)
@@ -1098,6 +1107,9 @@ class RemnaWaveService:
             return False
 
     async def delete_squad(self, uuid: str) -> bool:
+        logger.warning('Raw squad deletion is retired pending a controlled PublicLocation plan', squad_uuid=uuid)
+        return False
+
         try:
             async with self.get_api_client() as api:
                 result = await api.delete_internal_squad(uuid)
@@ -1118,6 +1130,17 @@ class RemnaWaveService:
         target_uuid: str,
     ) -> dict[str, Any]:
         """Переносит активных подписок с одного сквада на другой."""
+
+        logger.warning(
+            'Raw squad migration is retired pending a controlled PublicLocation plan',
+            source_uuid=source_uuid,
+            target_uuid=target_uuid,
+        )
+        return {
+            'success': False,
+            'error': 'controlled_plan_required',
+            'message': 'Требуется одобренный план публичных прав доступа',
+        }
 
         if source_uuid == target_uuid:
             return {
@@ -1320,6 +1343,17 @@ class RemnaWaveService:
             await exit_stack.aclose()
 
     async def sync_users_from_panel(self, db: AsyncSession, sync_type: str = 'all') -> dict[str, int]:
+        # Panel inventory is observational in tariff mode.  It must not create
+        # or overwrite subscriptions from raw activeInternalSquads; reconcile
+        # requires an owner-approved PublicLocation plan, and this release
+        # intentionally ships no executor.
+        if settings.is_tariffs_mode():
+            logger.warning(
+                'Panel user import is retired in tariff mode; manual entitlement reconciliation is required',
+                sync_type=sync_type,
+            )
+            return {'created': 0, 'updated': 0, 'errors': 0, 'deleted': 0}
+
         # In multi-tariff mode, match panel users to subscriptions by remnawave_uuid
         if settings.is_multi_tariff_enabled():
             return await self._sync_users_from_panel_multi(db, sync_type)
@@ -2025,6 +2059,17 @@ class RemnaWaveService:
                     if any(s.remnawave_uuid == panel_uuid for s in _user_subs):
                         continue
 
+                    # Panel inventory is evidence, not a new entitlement source.
+                    # An unmatched panel identity cannot be imported into a
+                    # subscription with raw internal squads; preserve it for
+                    # manual reconciliation instead of guessing a tariff.
+                    logger.warning(
+                        'Panel-only multi-tariff identity requires manual entitlement reconciliation',
+                        user_id=_bot_user.id,
+                    )
+                    stats['errors'] += 1
+                    continue
+
                     try:
                         from app.database.crud.subscription import generate_unique_short_id
 
@@ -2129,7 +2174,10 @@ class RemnaWaveService:
                             elif isinstance(_sq, str):
                                 _squad_uuids.append(_sq)
                     if _squad_uuids and set(_squad_uuids) != set(subscription.connected_squads or []):
-                        subscription.connected_squads = _squad_uuids
+                        logger.warning(
+                            'Panel entitlement drift requires manual reconciliation',
+                            subscription_id=subscription.id,
+                        )
 
                     stats['updated'] += 1
                 except Exception as e:
@@ -2355,11 +2403,9 @@ class RemnaWaveService:
                         panel_squad_uuids.append(squad)
 
             if panel_squad_uuids and set(panel_squad_uuids) != set(subscription.connected_squads or []):
-                subscription.connected_squads = panel_squad_uuids
-                logger.info(
-                    'Обновлены connected_squads из панели',
+                logger.warning(
+                    'Panel entitlement drift requires manual reconciliation',
                     user_telegram_id=getattr(user, 'telegram_id', '?'),
-                    new_squads=panel_squad_uuids,
                 )
 
             new_short_uuid = panel_user.get('shortUuid')
@@ -2883,6 +2929,9 @@ class RemnaWaveService:
             return None
 
     async def add_all_users_to_squad(self, squad_uuid: str) -> bool:
+        logger.warning('Raw bulk squad add is retired pending a controlled PublicLocation plan', squad_uuid=squad_uuid)
+        return False
+
         try:
             async with self.get_api_client() as api:
                 response = await api._make_request('POST', f'/api/internal-squads/{squad_uuid}/bulk-actions/add-users')
@@ -2892,6 +2941,9 @@ class RemnaWaveService:
             return False
 
     async def remove_all_users_from_squad(self, squad_uuid: str) -> bool:
+        logger.warning('Raw bulk squad remove is retired pending a controlled PublicLocation plan', squad_uuid=squad_uuid)
+        return False
+
         try:
             async with self.get_api_client() as api:
                 response = await api._make_request(

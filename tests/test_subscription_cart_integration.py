@@ -110,8 +110,8 @@ async def test_save_cart_and_redirect_to_topup(mock_callback_query, mock_state, 
         mock_callback_query.answer.assert_not_called()
 
 
-async def test_return_to_saved_cart_success(mock_callback_query, mock_state, mock_user, mock_db):
-    """Тест возврата к сохраненной корзине с достаточным балансом"""
+async def test_return_to_saved_cart_closes_legacy_raw_cart_before_redis(mock_callback_query, mock_state, mock_user, mock_db):
+    """A stale classic callback must not read raw-country cart data into FSM."""
     # Подготовим данные корзины
     cart_data = {
         'period_days': 30,
@@ -154,13 +154,13 @@ async def test_return_to_saved_cart_success(mock_callback_query, mock_state, moc
         # Вызываем функцию
         await return_to_saved_cart(mock_callback_query, mock_state, mock_user, mock_db)
 
-        # Проверяем, что корзина была загружена
-        mock_cart_service.get_user_cart.assert_called_once_with(mock_user.id)
+        # The fence is before Redis/cart reads, pricing and raw-country parsing.
+        mock_cart_service.get_user_cart.assert_not_called()
 
         # Проверяем, что сообщение было отредактировано
         mock_callback_query.message.edit_text.assert_called_once()
 
-        # В успешном сценарии вызывается callback.answer()
+        mock_state.clear.assert_awaited_once()
         mock_callback_query.answer.assert_called_once()
 
 
@@ -228,10 +228,11 @@ async def test_return_to_saved_cart_skips_edit_when_message_matches(
 
         await return_to_saved_cart(mock_callback_query, mock_state, mock_user, mock_db)
 
-        mock_callback_query.message.edit_text.assert_not_called()
-        mock_callback_query.answer.assert_called_once_with('✅ Корзина восстановлена!')
-        mock_state.set_data.assert_called_once_with(cart_data)
-        mock_state.set_state.assert_called_once()
+        mock_callback_query.message.edit_text.assert_called_once()
+        mock_callback_query.answer.assert_called_once()
+        mock_state.clear.assert_awaited_once()
+        mock_state.set_data.assert_not_called()
+        mock_state.set_state.assert_not_called()
         mock_cart_service.save_user_cart.assert_not_called()
 
 
@@ -296,21 +297,10 @@ async def test_return_to_saved_cart_normalizes_devices_when_disabled(
 
         await return_to_saved_cart(mock_callback_query, mock_state, mock_user, mock_db)
 
-        mock_cart_service.save_user_cart.assert_called_once()
-        _, saved_payload = mock_cart_service.save_user_cart.call_args[0]
-        assert saved_payload['devices'] == 3
-        assert saved_payload['total_price'] == 30000
-        assert saved_payload['saved_cart'] is True
-
-        mock_state.set_data.assert_called_once()
-        normalized_data = mock_state.set_data.call_args[0][0]
-        assert normalized_data['devices'] == 3
-        assert normalized_data['total_price'] == 30000
-        assert normalized_data['saved_cart'] is True
-
-        edited_text = mock_callback_query.message.edit_text.call_args[0][0]
-        assert '📱' not in edited_text
-
+        mock_cart_service.save_user_cart.assert_not_called()
+        mock_state.clear.assert_awaited_once()
+        mock_state.set_data.assert_not_called()
+        mock_callback_query.message.edit_text.assert_called_once()
         mock_callback_query.answer.assert_called_once()
 
 
@@ -353,15 +343,14 @@ async def test_return_to_saved_cart_insufficient_funds(mock_callback_query, mock
         # Вызываем функцию
         await return_to_saved_cart(mock_callback_query, mock_state, mock_user, mock_db)
 
-        # Проверяем, что FSM не был изменен (данные не установлены)
+        # The legacy callback is rejected before reading price/balance data.
+        mock_state.clear.assert_awaited_once()
         mock_state.set_data.assert_not_called()
 
         # Проверяем, что сообщение было отредактировано с сообщением о недостатке средств
         mock_callback_query.message.edit_text.assert_called_once()
 
-        # В этой функции в сценарии недостатка средств вызова callback.answer() не происходит
-        # (ответ отправляется через return до вызова callback.answer())
-        mock_callback_query.answer.assert_not_called()
+        mock_callback_query.answer.assert_called_once()
 
 
 async def test_clear_saved_cart(mock_callback_query, mock_state, mock_user, mock_db):

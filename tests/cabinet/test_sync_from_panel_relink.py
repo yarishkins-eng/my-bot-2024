@@ -101,7 +101,9 @@ async def test_relinks_uuid_wiped_sub_and_restores_status_and_squads():
     assert resp.success is True
     assert sub.remnawave_uuid == '44bd15ff'  # re-linked to the live panel user
     assert sub.status == SubscriptionStatus.ACTIVE.value  # restored from panel ACTIVE
-    assert sub.connected_squads == ['sq1', 'sq2']  # squads restored (dict extraction fixed)
+    # Panel sync may report drift but must never import raw internal squads as
+    # a new entitlement.  Only the safely re-linked identity/status changes.
+    assert sub.connected_squads == []
     assert sub.subscription_url == 'https://panel/44bd15ff'
 
 

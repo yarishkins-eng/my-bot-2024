@@ -24,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.database.crud import subscription as sub_crud
 from app.database.models import SubscriptionStatus
+from app.services.public_location_entitlement_service import ResolvedEntitlement
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,20 @@ def _db() -> AsyncMock:
     db.add = MagicMock()
     db.expunge = MagicMock()  # синхронный метод SQLAlchemy
     return db
+
+
+@pytest.fixture(autouse=True)
+def _resolved_tariff_entitlement(monkeypatch):
+    """This suite covers idempotency, not mapping validation."""
+    entitlement = ResolvedEntitlement((), ('squad-1',), 1, 'test')
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=entitlement),
+    )
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.persist_subscription_entitlement_snapshot',
+        AsyncMock(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +417,7 @@ async def test_creates_new_subscription_when_no_existing(monkeypatch):
     result = await sub_crud.create_trial_subscription(
         db,
         user_id=99,
-        connected_squads=['squad-new'],
+        connected_squads=['squad-1'],
         tariff_id=2,
     )
 

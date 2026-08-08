@@ -1087,11 +1087,11 @@ async def activate_trial(callback: types.CallbackQuery, db_user: User, db: Async
                         trial_tariff = await get_tariff_by_id(db, trial_tariff_id)
 
                 if trial_tariff:
-                    from app.database.crud.server_squad import get_effective_tariff_squad_uuids
+                    from app.services.public_location_entitlement_service import resolve_tariff_entitlement
 
                     trial_traffic_limit = trial_tariff.traffic_limit_gb
                     trial_device_limit = trial_tariff.device_limit
-                    trial_squads = await get_effective_tariff_squad_uuids(db, trial_tariff.allowed_squads)
+                    trial_squads = list((await resolve_tariff_entitlement(db, trial_tariff)).squad_uuids)
                     tariff_id_for_trial = trial_tariff.id
                     tariff_trial_days = getattr(trial_tariff, 'trial_duration_days', None)
                     if tariff_trial_days:
@@ -1104,12 +1104,9 @@ async def activate_trial(callback: types.CallbackQuery, db_user: User, db: Async
             except Exception as e:
                 logger.error('Ошибка получения триального тарифа', error=e)
 
-        # No trial tariff configured, use the legacy random trial squad fallback.
         if not trial_squads:
-            from app.database.crud.server_squad import get_random_trial_squad_uuid
-
-            trial_squad_uuid = await get_random_trial_squad_uuid(db)
-            trial_squads = [trial_squad_uuid] if trial_squad_uuid else []
+            await callback.answer('❌ Пробный тариф временно недоступен.', show_alert=True)
+            return
 
         subscription = await create_trial_subscription(
             db,
@@ -1492,12 +1489,25 @@ async def start_subscription_purchase(
 ):
     texts = get_texts(db_user.language)
 
-    # Проверяем режим продаж - если tariffs, перенаправляем на выбор тарифов
+    # Public-location entitlement is available only through tariff checkout.
+    # Classic checkout owns raw technical-country FSM data, so it must never be
+    # revived by a stale button or a future non-tariff configuration.
     if settings.is_tariffs_mode():
         from .tariff_purchase import show_tariffs_list
 
         await show_tariffs_list(callback, db_user, db, state)
         return
+
+    await _edit_message_text_or_caption(
+        callback.message,
+        texts.t(
+            'PUBLIC_LOCATION_TARIFF_CHECKOUT_REQUIRED',
+            'Этот устаревший способ покупки отключён. Выберите тариф, чтобы оформить подписку.',
+        ),
+        get_back_keyboard(db_user.language),
+    )
+    await callback.answer()
+    return
 
     keyboard = get_subscription_period_keyboard(db_user.language, db_user)
     prompt_text = await _build_subscription_period_prompt(db_user, texts, db)
@@ -1617,6 +1627,21 @@ async def save_cart_and_redirect_to_topup(
 
 
 async def return_to_saved_cart(callback: types.CallbackQuery, state: FSMContext, db_user: User, db: AsyncSession):
+    # The unversioned classic cart contains raw country UUIDs.  A stale
+    # callback must not read it into FSM or recover a raw checkout after the
+    # PublicLocation cutover.
+    texts = get_texts(db_user.language)
+    await state.clear()
+    await callback.message.edit_text(
+        texts.t(
+            'PUBLIC_LOCATION_TARIFF_CHECKOUT_REQUIRED',
+            'Сохранённый старый заказ отключён. Выберите тариф, чтобы оформить подписку.',
+        ),
+        reply_markup=get_back_keyboard(db_user.language),
+    )
+    await callback.answer()
+    return
+
     # Получаем данные корзины из Redis
     cart_data = await user_cart_service.get_user_cart(db_user.id)
 
@@ -2375,6 +2400,21 @@ async def devices_continue(callback: types.CallbackQuery, state: FSMContext, db_
 
 
 async def confirm_purchase(callback: types.CallbackQuery, state: FSMContext, db_user: User, db: AsyncSession):
+    # ``subscription_confirm`` belongs only to the retired classic checkout.
+    # It must stay fenced even while tariff mode is enabled, because a stale
+    # Telegram callback otherwise reaches raw ``countries`` after this guard.
+    texts = get_texts(db_user.language)
+    await state.clear()
+    await callback.message.edit_text(
+        texts.t(
+            'PUBLIC_LOCATION_TARIFF_CHECKOUT_REQUIRED',
+            'Этот устаревший способ покупки отключён. Выберите тариф, чтобы оформить подписку.',
+        ),
+        reply_markup=get_back_keyboard(db_user.language),
+    )
+    await callback.answer()
+    return
+
     # Проверка ограничения на покупку/продление подписки
     if getattr(db_user, 'restriction_subscription', False):
         reason = html.escape(getattr(db_user, 'restriction_reason', None) or 'Действие ограничено администратором')
@@ -3035,6 +3075,19 @@ async def resume_subscription_checkout(
 ):
     texts = get_texts(db_user.language)
 
+    # A legacy draft holds raw country selection.  Clear it from FSM before
+    # inspecting Redis so a stale button cannot recreate the classic checkout.
+    await state.clear()
+    await callback.message.edit_text(
+        texts.t(
+            'PUBLIC_LOCATION_TARIFF_CHECKOUT_REQUIRED',
+            'Сохранённый старый заказ отключён. Выберите тариф, чтобы оформить подписку.',
+        ),
+        reply_markup=get_back_keyboard(db_user.language),
+    )
+    await callback.answer()
+    return
+
     draft = await get_subscription_checkout_draft(db_user.id)
 
     if not draft:
@@ -3251,6 +3304,16 @@ async def handle_toggle_daily_subscription_pause(callback: types.CallbackQuery, 
 
     # При возобновлении проверяем баланс
     if needs_resume:
+        from app.services.public_location_entitlement_service import (
+            EntitlementResolutionError,
+            get_subscription_entitlement_squads,
+        )
+
+        try:
+            restore_squads = list(await get_subscription_entitlement_squads(db, subscription.id))
+        except EntitlementResolutionError:
+            await callback.answer('❌ Подписка требует ручной проверки прав доступа', show_alert=True)
+            return
         raw_daily_price = getattr(tariff, 'daily_price_kopeks', 0)
         from app.database.crud.user import lock_user_for_pricing
         from app.services.pricing_engine import PricingEngine
@@ -3316,16 +3379,9 @@ async def handle_toggle_daily_subscription_pause(callback: types.CallbackQuery, 
         # Восстанавливаем connected_squads из тарифа, если очищены деактивацией
         try:
             if not subscription.connected_squads:
-                squads = tariff.allowed_squads or []
-                if not squads:
-                    from app.database.crud.server_squad import get_all_server_squads
-
-                    all_servers, _ = await get_all_server_squads(db, available_only=True, limit=10000)
-                    squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-                if squads:
-                    subscription.connected_squads = squads
-                    await db.commit()
-                    await db.refresh(subscription)
+                subscription.connected_squads = restore_squads
+                await db.commit()
+                await db.refresh(subscription)
         except Exception as sq_err:
             logger.warning('Не удалось восстановить connected_squads', error=sq_err)
 
@@ -3499,11 +3555,11 @@ async def handle_trial_pay_with_balance(callback: types.CallbackQuery, db_user: 
                     if trial_tariff_id > 0:
                         trial_tariff = await _get_tariff(db, trial_tariff_id)
                 if trial_tariff:
-                    from app.database.crud.server_squad import get_effective_tariff_squad_uuids
+                    from app.services.public_location_entitlement_service import resolve_tariff_entitlement
 
                     trial_traffic_limit = trial_tariff.traffic_limit_gb
                     trial_device_limit = trial_tariff.device_limit
-                    trial_squads = await get_effective_tariff_squad_uuids(db, trial_tariff.allowed_squads)
+                    trial_squads = list((await resolve_tariff_entitlement(db, trial_tariff)).squad_uuids)
                     tariff_id_for_trial = trial_tariff.id
                     tariff_trial_days = getattr(trial_tariff, 'trial_duration_days', None)
                     if tariff_trial_days:
@@ -3516,12 +3572,9 @@ async def handle_trial_pay_with_balance(callback: types.CallbackQuery, db_user: 
             except Exception as e:
                 logger.error('Ошибка получения триального тарифа для платного триала', error=e)
 
-        # No trial tariff configured, use the legacy random trial squad fallback.
         if not trial_squads:
-            from app.database.crud.server_squad import get_random_trial_squad_uuid
-
-            trial_squad_uuid = await get_random_trial_squad_uuid(db)
-            trial_squads = [trial_squad_uuid] if trial_squad_uuid else []
+            await callback.answer('❌ Пробный тариф временно недоступен.', show_alert=True)
+            return
 
         subscription = await create_trial_subscription(
             db,
@@ -3891,11 +3944,11 @@ async def handle_trial_payment_method(callback: types.CallbackQuery, db_user: Us
                     if trial_tariff_id > 0:
                         trial_tariff = await _get_tariff(db, trial_tariff_id)
                 if trial_tariff:
-                    from app.database.crud.server_squad import get_effective_tariff_squad_uuids
+                    from app.services.public_location_entitlement_service import resolve_tariff_entitlement
 
                     trial_traffic = trial_tariff.traffic_limit_gb
                     trial_devices = trial_tariff.device_limit
-                    trial_squads_list = await get_effective_tariff_squad_uuids(db, trial_tariff.allowed_squads)
+                    trial_squads_list = list((await resolve_tariff_entitlement(db, trial_tariff)).squad_uuids)
                     tariff_id_for_trial = trial_tariff.id
                     tariff_trial_days = getattr(trial_tariff, 'trial_duration_days', None)
                     if tariff_trial_days:
@@ -3908,12 +3961,9 @@ async def handle_trial_payment_method(callback: types.CallbackQuery, db_user: Us
             except Exception as e:
                 logger.error('Ошибка получения триального тарифа для платного триала', error=e)
 
-        # Если триальный тариф не найден, используем legacy fallback со случайным сквадом.
         if not trial_squads_list:
-            from app.database.crud.server_squad import get_random_trial_squad_uuid
-
-            trial_squad_uuid = await get_random_trial_squad_uuid(db)
-            trial_squads_list = [trial_squad_uuid] if trial_squad_uuid else []
+            await callback.answer('❌ Пробный тариф временно недоступен.', show_alert=True)
+            return
 
         # Создаем pending триальную подписку
         pending_subscription = await create_pending_trial_subscription(
@@ -4536,7 +4586,12 @@ async def handle_simple_subscription_purchase(
     db: AsyncSession,
 ):
     """Обрабатывает простую покупку подписки."""
-    texts = get_texts(db_user.language)
+    await state.clear()
+    await callback.answer(
+        'Этот устаревший способ покупки отключён. Выберите тариф для оформления подписки.',
+        show_alert=True,
+    )
+    return
 
     if not settings.SIMPLE_SUBSCRIPTION_ENABLED:
         await callback.answer('❌ Простая покупка подписки временно недоступна', show_alert=True)

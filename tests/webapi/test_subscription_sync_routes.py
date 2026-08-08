@@ -44,7 +44,7 @@ def _build_subscription() -> SimpleNamespace:
 
 
 @pytest.mark.anyio('asyncio')
-async def test_users_subscription_trial_calls_remnawave_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_users_subscription_trial_raw_writer_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_user = SimpleNamespace(id=1)
     created_subscription = _build_subscription()
     service_instance = SimpleNamespace(
@@ -60,15 +60,16 @@ async def test_users_subscription_trial_calls_remnawave_sync(monkeypatch: pytest
     monkeypatch.setattr(users, '_serialize_user', lambda user: {'id': user.id})
 
     payload = UserSubscriptionCreateRequest(is_trial=True, duration_days=7, replace_existing=False)
-    result = await users.create_user_subscription(user_id=1, payload=payload, _=None, db=SimpleNamespace())
+    with pytest.raises(HTTPException) as error:
+        await users.create_user_subscription(user_id=1, payload=payload, _=None, db=SimpleNamespace())
 
-    assert result == {'id': 1}
-    service_instance.update_remnawave_user.assert_awaited_once()
-    service_instance.create_remnawave_user.assert_awaited_once()
+    assert error.value.status_code == 410
+    service_instance.update_remnawave_user.assert_not_awaited()
+    service_instance.create_remnawave_user.assert_not_awaited()
 
 
 @pytest.mark.anyio('asyncio')
-async def test_users_subscription_paid_calls_remnawave_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_users_subscription_paid_raw_writer_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_user = SimpleNamespace(id=1)
     created_subscription = _build_subscription()
     created_subscription.is_trial = False
@@ -89,11 +90,12 @@ async def test_users_subscription_paid_calls_remnawave_sync(monkeypatch: pytest.
         duration_days=30,
         replace_existing=False,
     )
-    result = await users.create_user_subscription(user_id=1, payload=payload, _=None, db=SimpleNamespace())
+    with pytest.raises(HTTPException) as error:
+        await users.create_user_subscription(user_id=1, payload=payload, _=None, db=SimpleNamespace())
 
-    assert result == {'id': 1}
-    service_instance.update_remnawave_user.assert_awaited_once()
-    service_instance.create_remnawave_user.assert_awaited_once()
+    assert error.value.status_code == 410
+    service_instance.update_remnawave_user.assert_not_awaited()
+    service_instance.create_remnawave_user.assert_not_awaited()
 
 
 def test_users_search_filter_adds_internal_id_for_int32() -> None:
@@ -192,10 +194,8 @@ async def test_subscriptions_extend_returns_500_when_rollback_fails(monkeypatch:
 
 
 @pytest.mark.anyio('asyncio')
-async def test_users_patch_subscription_delegates_to_post(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PATCH /users/{id}/subscription is a documented alias for POST and must route
-    through the same handler. Without this test a refactor of the delegation chain could
-    silently break the PATCH endpoint while the POST tests stay green."""
+async def test_users_patch_subscription_is_closed_with_post(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The retained PATCH alias must fail closed with the raw POST writer."""
     fake_user = SimpleNamespace(id=42)
     created_subscription = _build_subscription()
     service_instance = SimpleNamespace(
@@ -211,10 +211,11 @@ async def test_users_patch_subscription_delegates_to_post(monkeypatch: pytest.Mo
     monkeypatch.setattr(users, '_serialize_user', lambda user: {'id': user.id})
 
     payload = UserSubscriptionCreateRequest(is_trial=True, duration_days=7, replace_existing=False)
-    result = await users.patch_user_subscription(user_id=42, payload=payload, _=None, db=SimpleNamespace())
+    with pytest.raises(HTTPException) as error:
+        await users.patch_user_subscription(user_id=42, payload=payload, _=None, db=SimpleNamespace())
 
-    assert result == {'id': 42}
-    service_instance.update_remnawave_user.assert_awaited_once()
+    assert error.value.status_code == 410
+    service_instance.update_remnawave_user.assert_not_awaited()
 
 
 def test_users_patch_subscription_route_returns_201() -> None:
@@ -264,8 +265,6 @@ async def test_users_subscription_replace_existing_restores_on_sync_failure(
     with pytest.raises(HTTPException) as error:
         await users.create_user_subscription(user_id=7, payload=payload, _=None, db=SimpleNamespace())
 
-    assert error.value.status_code == 500
-    restore_mock.assert_awaited_once()
-    restore_args = restore_mock.await_args
-    assert restore_args.args[1] == existing_subscription.id
+    assert error.value.status_code == 410
+    restore_mock.assert_not_awaited()
     delete_mock.assert_not_awaited()

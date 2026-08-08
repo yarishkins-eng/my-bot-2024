@@ -184,6 +184,14 @@ class AdvertisingCampaignService:
             logger.info('ℹ️ Кампания не содержит корректной длительности подписки', campaign_id=campaign.id)
             return CampaignBonusResult(success=False)
 
+        # Legacy campaign-level technical squads have no PublicLocation policy
+        # or immutable tariff evidence.  Do not issue them implicitly.
+        logger.error(
+            'Campaign subscription bonus without tariff entitlement is retired',
+            campaign_id=campaign.id,
+        )
+        return CampaignBonusResult(success=False)
+
         traffic_limit = campaign.subscription_traffic_gb
         device_limit = campaign.subscription_device_limit
         if device_limit is None:
@@ -333,12 +341,12 @@ class AdvertisingCampaignService:
         traffic_limit = tariff.traffic_limit_gb
         device_limit = tariff.device_limit
         try:
-            from app.database.crud.server_squad import get_effective_tariff_squad_uuids
+            from app.services.public_location_entitlement_service import resolve_tariff_entitlement
 
-            squads = await get_effective_tariff_squad_uuids(db, tariff.allowed_squads)
+            squads = list((await resolve_tariff_entitlement(db, tariff)).squad_uuids)
         except Exception as error:
-            logger.error('Не удалось подобрать сквады для тарифа кампании', campaign_id=campaign.id, error=error)
-            squads = list(tariff.allowed_squads or [])
+            logger.error('Не удалось разрешить entitlement тарифа кампании', campaign_id=campaign.id, error=error)
+            return CampaignBonusResult(success=False)
 
         if existing_subscription:
             # Multi-tariff: extend the existing subscription for this tariff

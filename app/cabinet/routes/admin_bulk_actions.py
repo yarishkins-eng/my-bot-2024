@@ -271,6 +271,16 @@ async def _do_change_tariff(
             username=user.username,
         )
 
+    # A bulk tariff relabel used to write raw Squad UUIDs directly.  It needs
+    # a reviewed entitlement-change plan, so it is deliberately unavailable
+    # until that plan workflow exists.
+    return BulkUserResult(
+        user_id=user.id,
+        success=False,
+        message='Bulk tariff changes require an approved location entitlement plan',
+        username=user.username,
+    )
+
     # Preserve extra purchased devices above the old tariff's base limit
     from app.database.crud.subscription import calc_device_limit_on_tariff_switch
 
@@ -652,7 +662,7 @@ async def _do_grant_subscription(
             subscriptions=_build_subscription_info(subs),
         )
 
-    connected_squads = tariff.allowed_squads or []
+    connected_squads = None
 
     from sqlalchemy.exc import IntegrityError
 

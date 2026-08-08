@@ -25,6 +25,11 @@ from app.database.database import AsyncSessionLocal
 from app.database.models import Tariff, Transaction, TransactionType, User
 from app.localization.texts import get_texts
 from app.services.admin_notification_service import AdminNotificationService
+from app.services.public_location_entitlement_service import (
+    EntitlementResolutionError,
+    get_subscription_resolved_entitlement,
+    resolve_tariff_entitlement,
+)
 from app.services.subscription_service import SubscriptionService
 from app.services.user_cart_service import user_cart_service
 from app.utils.decorators import error_handler
@@ -899,7 +904,6 @@ async def select_tariff(
                 'description': f'Покупка суточного тарифа {tariff.name}',
                 'traffic_limit_gb': tariff.traffic_limit_gb,
                 'device_limit': tariff.device_limit,
-                'allowed_squads': tariff.allowed_squads or [],
                 'subscription_id': _daily_existing_sub.id if _daily_existing_sub else None,
             }
             await user_cart_service.save_user_cart(db_user.id, cart_data)
@@ -1155,6 +1159,33 @@ async def handle_custom_confirm(
         await callback.answer('Выбранный период недоступен для этого тарифа', show_alert=True)
         return
 
+    # Locate the renewal target and obtain its frozen entitlement before any
+    # balance effect.  A paid renewal must never fall back to today's mutable
+    # tariff policy: a missing/corrupt snapshot is a fail-closed sale.
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_subscription_by_user_and_tariff
+
+        existing_subscription = await get_subscription_by_user_and_tariff(
+            db, db_user.id, tariff.id, include_inactive=True
+        )
+    else:
+        existing_subscription = await get_subscription_by_user_id(db, db_user.id)
+        if existing_subscription and existing_subscription.tariff_id != tariff.id:
+            await callback.answer('Смена тарифа через этот сценарий недоступна', show_alert=True)
+            return
+
+    try:
+        entitlement = (
+            await get_subscription_resolved_entitlement(db, existing_subscription.id)
+            if existing_subscription and not existing_subscription.is_trial
+            else await resolve_tariff_entitlement(db, tariff)
+        )
+        squads = list(entitlement.squad_uuids)
+    except EntitlementResolutionError as error:
+        await callback.message.edit_text('❌ Этот тариф временно недоступен.')
+        logger.warning('Tariff entitlement rejected before charge', tariff_id=tariff.id, error=str(error))
+        return
+
     # Проверяем баланс (при 100% скидке — пропускаем)
     user_balance = db_user.balance_kopeks or 0
     if total_price > 0 and user_balance < total_price:
@@ -1200,25 +1231,8 @@ async def handle_custom_confirm(
             pass
         return
 
-    # Получаем список серверов из тарифа
-    squads = tariff.allowed_squads or []
-
-    # Если allowed_squads пустой - значит "все серверы", получаем их
-    if not squads:
-        from app.database.crud.server_squad import get_all_server_squads
-
-        all_servers, _ = await get_all_server_squads(db, available_only=True)
-        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-
     # Определяем трафик
     traffic_limit = custom_traffic if tariff.can_purchase_custom_traffic() else tariff.traffic_limit_gb
-
-    # Проверяем есть ли уже подписка
-    if settings.is_multi_tariff_enabled():
-        active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
-        existing_subscription = next((s for s in active_subs if s.tariff_id == tariff.id), None)
-    else:
-        existing_subscription = await get_subscription_by_user_id(db, db_user.id)
 
     try:
         if existing_subscription:
@@ -1236,6 +1250,7 @@ async def handle_custom_confirm(
                 traffic_limit_gb=traffic_limit,
                 device_limit=effective_device_limit,
                 connected_squads=squads,
+                _resolved_entitlement=entitlement,
             )
         else:
             # Создаем новую подписку
@@ -1247,6 +1262,7 @@ async def handle_custom_confirm(
                 device_limit=tariff.device_limit,
                 connected_squads=squads,
                 tariff_id=tariff.id,
+                _resolved_entitlement=entitlement,
             )
     except Exception as e:
         logger.error('Ошибка создания/продления подписки при покупке кастомного тарифа', error=e, exc_info=True)
@@ -1557,7 +1573,6 @@ async def select_tariff_period(
             'description': f'Покупка тарифа {tariff.name} на {period} дней',
             'traffic_limit_gb': tariff.traffic_limit_gb,
             'device_limit': effective_device_limit,
-            'allowed_squads': tariff.allowed_squads or [],
             'discount_percent': discount_percent,
             'subscription_id': existing_subscription.id if existing_subscription else None,
         }
@@ -1661,7 +1676,9 @@ async def confirm_tariff_purchase(
                 )
                 existing_sub = None
         if existing_sub is None:
-            existing_sub = await get_subscription_by_user_and_tariff(db, db_user.id, tariff_id)
+            existing_sub = await get_subscription_by_user_and_tariff(
+                db, db_user.id, tariff_id, include_inactive=True
+            )
     else:
         existing_sub = await get_subscription_by_user_id(db, db_user.id)
 
@@ -1676,6 +1693,24 @@ async def confirm_tariff_purchase(
         user=db_user,
     )
     final_price = result.final_total
+
+    # A paid renewal consumes the immutable snapshot that was issued with the
+    # subscription.  Resolve a mutable tariff only for a new/trial issuance,
+    # and do all of this before a balance debit.
+    if not settings.is_multi_tariff_enabled() and existing_sub and existing_sub.tariff_id != tariff.id:
+        await callback.answer('Смена тарифа через этот сценарий недоступна', show_alert=True)
+        return
+    try:
+        entitlement = (
+            await get_subscription_resolved_entitlement(db, existing_sub.id)
+            if existing_sub and not existing_sub.is_trial
+            else await resolve_tariff_entitlement(db, tariff)
+        )
+        squads = list(entitlement.squad_uuids)
+    except EntitlementResolutionError as error:
+        await callback.message.edit_text('❌ Этот тариф временно недоступен.')
+        logger.warning('Tariff entitlement rejected before charge', tariff_id=tariff.id, error=str(error))
+        return
 
     # Проверяем баланс (user already locked, balance is fresh)
     user_balance = db_user.balance_kopeks or 0
@@ -1698,6 +1733,7 @@ async def confirm_tariff_purchase(
     saved_promo_percent = int(getattr(db_user, 'promo_offer_discount_percent', 0) or 0) if consume_promo else 0
     saved_promo_source = getattr(db_user, 'promo_offer_discount_source', None) if consume_promo else None
     saved_promo_expires = getattr(db_user, 'promo_offer_discount_expires_at', None) if consume_promo else None
+
     try:
         success = await subtract_user_balance(
             db,
@@ -1721,16 +1757,6 @@ async def confirm_tariff_purchase(
             pass
         return
 
-    # Получаем список серверов из тарифа
-    squads = tariff.allowed_squads or []
-
-    # Если allowed_squads пустой - значит "все серверы", получаем их
-    if not squads:
-        from app.database.crud.server_squad import get_all_server_squads
-
-        all_servers, _ = await get_all_server_squads(db, available_only=True)
-        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-
     # Reuse existing_sub fetched above for device pricing
     existing_subscription = existing_sub
 
@@ -1747,6 +1773,7 @@ async def confirm_tariff_purchase(
                     traffic_limit_gb=tariff.traffic_limit_gb,
                     device_limit=effective_device_limit,
                     connected_squads=squads,
+                    _resolved_entitlement=entitlement,
                 )
             else:
                 # Guard: enforce MAX_ACTIVE_SUBSCRIPTIONS limit
@@ -1793,6 +1820,7 @@ async def confirm_tariff_purchase(
                     device_limit=tariff.device_limit,
                     connected_squads=squads,
                     tariff_id=tariff.id,
+                    _resolved_entitlement=entitlement,
                 )
         elif existing_subscription:
             # Legacy single-subscription: extend or switch
@@ -1809,6 +1837,7 @@ async def confirm_tariff_purchase(
                 traffic_limit_gb=tariff.traffic_limit_gb,
                 device_limit=effective_device_limit,
                 connected_squads=squads,
+                _resolved_entitlement=entitlement,
             )
         else:
             # Создаем новую подписку
@@ -1820,6 +1849,7 @@ async def confirm_tariff_purchase(
                 device_limit=tariff.device_limit,
                 connected_squads=squads,
                 tariff_id=tariff.id,
+                _resolved_entitlement=entitlement,
             )
     except IntegrityError as e:
         # Partial unique index violation: user already has active subscription for this tariff
@@ -2069,6 +2099,30 @@ async def confirm_daily_tariff_purchase(
     final_daily_price = pricing_result.final_total
     consume_promo = pricing_result.breakdown.get('offer_discount_pct', 0) > 0
 
+    # Resolve the exact entitlement before balance mutation.  Re-buying the
+    # same daily tariff preserves its immutable snapshot; changing an existing
+    # subscription's tariff requires the separately controlled replacement
+    # workflow and is not allowed to reuse this raw direct-write branch.
+    if settings.is_multi_tariff_enabled():
+        active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
+        existing_subscription = next((s for s in active_subs if s.tariff_id == tariff.id), None)
+    else:
+        existing_subscription = await get_subscription_by_user_id(db, db_user.id)
+    if existing_subscription is not None and existing_subscription.tariff_id != tariff.id:
+        await callback.answer('Смена тарифа временно недоступна: откройте новый тариф после ручной сверки прав.', show_alert=True)
+        return
+    try:
+        entitlement = (
+            await get_subscription_resolved_entitlement(db, existing_subscription.id)
+            if existing_subscription is not None
+            else await resolve_tariff_entitlement(db, tariff)
+        )
+        squads = list(entitlement.squad_uuids)
+    except EntitlementResolutionError as error:
+        await callback.message.edit_text('❌ Этот тариф временно недоступен.')
+        logger.warning('Tariff entitlement rejected before charge', tariff_id=tariff.id, error=str(error))
+        return
+
     # Проверяем баланс (user already locked, balance is fresh)
     user_balance = db_user.balance_kopeks or 0
     if final_daily_price > 0 and user_balance < final_daily_price:
@@ -2107,23 +2161,6 @@ async def confirm_daily_tariff_purchase(
         except Exception:
             pass
         return
-
-    # Получаем список серверов из тарифа
-    squads = tariff.allowed_squads or []
-
-    # Если allowed_squads пустой - значит "все серверы", получаем их
-    if not squads:
-        from app.database.crud.server_squad import get_all_server_squads
-
-        all_servers, _ = await get_all_server_squads(db, available_only=True)
-        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-
-    # Проверяем есть ли уже подписка
-    if settings.is_multi_tariff_enabled():
-        active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
-        existing_subscription = next((s for s in active_subs if s.tariff_id == tariff.id), None)
-    else:
-        existing_subscription = await get_subscription_by_user_id(db, db_user.id)
 
     try:
         if existing_subscription:
@@ -2174,6 +2211,7 @@ async def confirm_daily_tariff_purchase(
                 device_limit=tariff.device_limit,
                 connected_squads=squads,
                 tariff_id=tariff.id,
+                _resolved_entitlement=entitlement,
             )
             # Устанавливаем время последнего списания
             subscription.last_daily_charge_at = datetime.now(UTC)
@@ -2658,7 +2696,6 @@ async def select_tariff_extend_period(
             'description': f'Продление тарифа {tariff.name} на {period} дней',
             'traffic_limit_gb': tariff.traffic_limit_gb,
             'device_limit': actual_device_limit,
-            'allowed_squads': tariff.allowed_squads or [],
             'discount_percent': discount_percent,
         }
         await user_cart_service.save_user_cart(db_user.id, cart_data)
@@ -2739,6 +2776,18 @@ async def confirm_tariff_extend(
         await callback.answer('Несоответствие подписки и тарифа, откройте продление заново', show_alert=True)
         return
 
+    try:
+        entitlement = (
+            await get_subscription_resolved_entitlement(db, subscription.id)
+            if subscription.tariff_id == tariff.id and not subscription.is_trial
+            else await resolve_tariff_entitlement(db, tariff)
+        )
+        squads = list(entitlement.squad_uuids)
+    except EntitlementResolutionError as error:
+        logger.warning('Tariff renewal entitlement rejected before charge', tariff_id=tariff.id, error=str(error))
+        await callback.answer('Этот тариф временно недоступен. Откройте продление позже.', show_alert=True)
+        return
+
     actual_device_limit = subscription.device_limit or tariff.device_limit
 
     from app.database.crud.user import lock_user_for_pricing
@@ -2800,6 +2849,8 @@ async def confirm_tariff_extend(
             tariff_id=tariff.id if was_trial else None,
             traffic_limit_gb=tariff.traffic_limit_gb if was_trial else None,
             device_limit=actual_device_limit if was_trial else None,
+            connected_squads=squads,
+            _resolved_entitlement=entitlement,
         )
 
         # Обновляем пользователя в Remnawave
@@ -3432,6 +3483,20 @@ async def confirm_tariff_switch(
         await callback.answer('У вас нет активной подписки', show_alert=True)
         return
 
+    if subscription.tariff_id != tariff.id:
+        await callback.answer(
+            'Смена тарифа требует отдельной ручной сверки прав и сейчас недоступна.',
+            show_alert=True,
+        )
+        return
+    try:
+        entitlement = await get_subscription_resolved_entitlement(db, subscription.id)
+        squads = list(entitlement.squad_uuids)
+    except EntitlementResolutionError as error:
+        logger.warning('Tariff switch entitlement rejected before charge', tariff_id=tariff.id, error=str(error))
+        await callback.answer('Права подписки требуют ручной сверки.', show_alert=True)
+        return
+
     # Проверяем разрешение на смену в данном направлении
     if subscription.tariff_id and subscription.tariff_id != tariff_id:
         cur_tariff_obj = await get_tariff_by_id(db, subscription.tariff_id)
@@ -3491,16 +3556,6 @@ async def confirm_tariff_switch(
                 pass
             return
 
-        # Получаем список серверов из тарифа
-        squads = tariff.allowed_squads or []
-
-        # Если allowed_squads пустой - значит "все серверы", получаем их
-        if not squads:
-            from app.database.crud.server_squad import get_all_server_squads
-
-            all_servers, _ = await get_all_server_squads(db, available_only=True)
-            squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-
         # При смене тарифа пользователь получает оплаченный период + оставшиеся дни
         # (остаток добавляется в extend_subscription автоматически)
         days_for_new_tariff = period
@@ -3519,6 +3574,7 @@ async def confirm_tariff_switch(
             traffic_limit_gb=tariff.traffic_limit_gb,
             device_limit=effective_device_limit,
             connected_squads=squads,
+            _resolved_entitlement=entitlement,
         )
 
         # Обновляем пользователя в Remnawave
@@ -3680,6 +3736,12 @@ async def confirm_daily_tariff_switch(
         await callback.answer('Некорректная цена тарифа', show_alert=True)
         return
 
+    # This legacy switch rewrites raw panel squads in place.  A public-location
+    # replacement must be a separately approved plan, so stop before price or
+    # balance handling rather than risking a partial entitlement transition.
+    await callback.answer('Смена тарифа временно недоступна: требуется ручная сверка прав.', show_alert=True)
+    return
+
     # Lock user BEFORE price computation to prevent TOCTOU on promo offer
     from app.database.crud.user import lock_user_for_pricing
 
@@ -3732,6 +3794,13 @@ async def confirm_daily_tariff_switch(
     texts = get_texts(db_user.language)
 
     try:
+        squads = list((await resolve_tariff_entitlement(db, tariff)).squad_uuids)
+    except EntitlementResolutionError as error:
+        await callback.message.edit_text('❌ Этот тариф временно недоступен.')
+        logger.warning('Tariff entitlement rejected before charge', tariff_id=tariff.id, error=str(error))
+        return
+
+    try:
         # Списываем первый день сразу
         success = await subtract_user_balance(
             db,
@@ -3747,16 +3816,6 @@ async def confirm_daily_tariff_switch(
             except Exception:
                 pass
             return
-
-        # Получаем список серверов из тарифа
-        squads = tariff.allowed_squads or []
-
-        # Если allowed_squads пустой - значит "все серверы", получаем их
-        if not squads:
-            from app.database.crud.server_squad import get_all_server_squads
-
-            all_servers, _ = await get_all_server_squads(db, available_only=True)
-            squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
 
         # Обновляем подписку на суточный тариф
         # Сбрасываем лимит устройств на базу нового тарифа (докупленные не переносятся)
@@ -4413,6 +4472,11 @@ async def confirm_instant_switch(
         await callback.answer('Тариф недоступен', show_alert=True)
         return
 
+    # Instant switch is another raw in-place mutation path.  It remains
+    # intentionally disabled until the controlled entitlement executor exists.
+    await callback.answer('Смена тарифа временно недоступна: требуется ручная сверка прав.', show_alert=True)
+    return
+
     # Проверяем подписку (switched FROM — resolved via FSM state)
     subscription, _isw_confirm_sub_id = await _resolve_switch_subscription(callback, db_user, db, state)
     if not subscription:
@@ -4474,6 +4538,13 @@ async def confirm_instant_switch(
     texts = get_texts(db_user.language)
 
     try:
+        squads = list((await resolve_tariff_entitlement(db, new_tariff)).squad_uuids)
+    except EntitlementResolutionError as error:
+        await callback.message.edit_text('❌ Этот тариф временно недоступен.')
+        logger.warning('Tariff entitlement rejected before charge', tariff_id=new_tariff.id, error=str(error))
+        return
+
+    try:
         # Списываем баланс если это upgrade
         # upgrade_cost includes both group + offer discounts from PricingEngine
         if is_upgrade and upgrade_cost > 0:
@@ -4491,16 +4562,6 @@ async def confirm_instant_switch(
                 except Exception:
                     pass
                 return
-
-        # Получаем список серверов из нового тарифа
-        squads = new_tariff.allowed_squads or []
-
-        # Если allowed_squads пустой - значит "все серверы", получаем их
-        if not squads:
-            from app.database.crud.server_squad import get_all_server_squads
-
-            all_servers, _ = await get_all_server_squads(db, available_only=True)
-            squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
 
         # Проверяем, суточный ли новый тариф
         is_new_daily = getattr(new_tariff, 'is_daily', False)

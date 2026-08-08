@@ -12,7 +12,6 @@ from app.config import settings
 from app.database.crud.server_squad import get_effective_tariff_squad_uuids
 from app.database.crud.subscription import (
     add_subscription_devices,
-    add_subscription_squad,
     add_subscription_traffic,
     create_paid_subscription,
     create_trial_subscription,
@@ -20,7 +19,6 @@ from app.database.crud.subscription import (
     extend_subscription,
     get_subscription_by_user_id,
     reactivate_subscription,
-    remove_subscription_squad,
     replace_subscription,
 )
 from app.database.crud.user import get_user_by_id
@@ -63,7 +61,8 @@ def _serialize_subscription(subscription: Subscription) -> SubscriptionResponse:
         autopay_days_before=subscription.autopay_days_before,
         subscription_url=subscription.subscription_url,
         subscription_crypto_link=subscription.subscription_crypto_link,
-        connected_squads=list(subscription.connected_squads or []),
+        # Technical panel UUIDs are never exposed through user/API DTOs.
+        connected_squads=[],
         created_at=subscription.created_at,
         updated_at=subscription.updated_at,
     )
@@ -141,6 +140,17 @@ async def create_subscription(
     payload: SubscriptionCreateRequest,
     _: Any = Security(require_api_token),
     db: AsyncSession = Depends(get_db_session),
+) -> SubscriptionResponse:
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Legacy raw subscription creation is retired; use the public-location purchase flow.',
+    )
+
+
+async def _retired_create_subscription(
+    payload: SubscriptionCreateRequest,
+    _: Any,
+    db: AsyncSession,
 ) -> SubscriptionResponse:
     if settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import get_active_subscriptions_by_user_id
@@ -371,13 +381,7 @@ async def add_subscription_squad_endpoint(
     _: Any = Security(require_api_token),
     db: AsyncSession = Depends(get_db_session),
 ) -> SubscriptionResponse:
-    if not payload.squad_uuid:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, 'squad_uuid is required')
-
-    subscription = await _get_subscription(db, subscription_id)
-    subscription = await add_subscription_squad(db, subscription, payload.squad_uuid)
-    subscription = await _get_subscription(db, subscription.id)
-    return _serialize_subscription(subscription)
+    raise HTTPException(status_code=status.HTTP_410_GONE, detail='Raw Squad mutation is retired.')
 
 
 @router.delete('/{subscription_id}/squads/{squad_uuid}', response_model=SubscriptionResponse)
@@ -387,10 +391,7 @@ async def remove_subscription_squad_endpoint(
     _: Any = Security(require_api_token),
     db: AsyncSession = Depends(get_db_session),
 ) -> SubscriptionResponse:
-    subscription = await _get_subscription(db, subscription_id)
-    subscription = await remove_subscription_squad(db, subscription, squad_uuid)
-    subscription = await _get_subscription(db, subscription.id)
-    return _serialize_subscription(subscription)
+    raise HTTPException(status_code=status.HTTP_410_GONE, detail='Raw Squad mutation is retired.')
 
 
 @router.delete('/{subscription_id}', response_model=SubscriptionResponse)

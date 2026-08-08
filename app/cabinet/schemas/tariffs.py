@@ -154,7 +154,9 @@ class TariffCreateRequest(BaseModel):
     device_purchase_options: list[int] | None = None
     tier_level: int = Field(1, ge=1, le=10)
     period_prices: list[PeriodPrice] = Field(default_factory=list)
-    allowed_squads: list[str] = Field(default_factory=list, description='Server UUIDs')
+    # Deprecated raw field is retained only so the route can return a clear
+    # 410 instead of silently ignoring an old client payload.
+    allowed_squads: list[str] | None = Field(None, description='Retired: use PublicLocation policy')
     server_traffic_limits: dict[str, ServerTrafficLimit] = Field(
         default_factory=dict, description='Per-server traffic limits'
     )

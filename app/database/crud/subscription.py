@@ -198,6 +198,19 @@ async def create_trial_subscription(
         tariff_id: ID тарифа (для режима тарифов)
     """
     await _assert_user_not_in_financial_closure(db, user_id)
+    entitlement = None
+    if tariff_id is not None:
+        from app.database.models import Tariff
+        from app.services.public_location_entitlement_service import resolve_tariff_entitlement
+
+        tariff = await db.get(Tariff, tariff_id)
+        if tariff is None:
+            raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
+        entitlement = await resolve_tariff_entitlement(db, tariff)
+        supplied = set(connected_squads or [])
+        if supplied and supplied != set(entitlement.squad_uuids):
+            raise ValueError('tariff entitlement mismatch: caller supplied technical squads')
+        connected_squads = list(entitlement.squad_uuids)
     duration_days = duration_days or settings.TRIAL_DURATION_DAYS
     # 0 ГБ — это осознанный БЕЗЛИМИТ (валидное значение), поэтому отличаем
     # «не передано» (None → берём конфиг) от «0» (оставляем безлимит). `or` тут
@@ -207,26 +220,15 @@ async def create_trial_subscription(
     if device_limit is None:
         device_limit = settings.TRIAL_DEVICE_LIMIT
 
-    # Если переданы connected_squads, используем их.
-    # Иначе используем squad_uuid или все доступные сквады по умолчанию.
+    # Non-tariff legacy paths may still specify a concrete squad.  A tariff
+    # path is resolved above and can never fall back to an arbitrary squad.
     final_squads = []
     if connected_squads:
         final_squads = connected_squads
     elif squad_uuid:
         final_squads = [squad_uuid]
-    else:
-        try:
-            from app.database.crud.server_squad import get_effective_tariff_squad_uuids
-
-            final_squads = await get_effective_tariff_squad_uuids(db, None)
-            if final_squads:
-                logger.debug(
-                    'Выбраны дефолтные сквады для триальной подписки пользователя',
-                    final_squads=final_squads,
-                    user_id=user_id,
-                )
-        except Exception as error:
-            logger.error('Не удалось получить сквад для триальной подписки пользователя', user_id=user_id, error=error)
+    elif tariff_id is not None:
+        raise ValueError('tariff entitlement resolution produced no squads')
 
     end_date = datetime.now(UTC) + timedelta(days=duration_days)
 
@@ -243,6 +245,10 @@ async def create_trial_subscription(
         existing = await get_subscription_by_user_id(db, user_id)
 
     if existing and existing.is_trial and existing.status == SubscriptionStatus.PENDING.value:
+        if entitlement is not None:
+            from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
+
+            await persist_subscription_entitlement_snapshot(db, existing.id, tariff_id, entitlement)
         existing.status = SubscriptionStatus.ACTIVE.value
         existing.start_date = datetime.now(UTC)
         existing.end_date = end_date
@@ -300,10 +306,13 @@ async def create_trial_subscription(
 
     db.add(subscription)
     try:
+        await db.flush()
+        if entitlement is not None:
+            from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
+
+            await persist_subscription_entitlement_snapshot(db, subscription.id, tariff_id, entitlement)
         if commit:
             await db.commit()
-        else:
-            await db.flush()
     except IntegrityError as exc:
         # A caller that owns a larger financial transaction must decide how to
         # recover.  Rolling its transaction back here would silently undo
@@ -374,6 +383,8 @@ async def _revive_paid_subscription(
     connected_squads: list[str] | None,
     update_server_counters: bool,
     commit: bool,
+    entitlement=None,
+    tariff_id: int | None = None,
 ) -> Subscription:
     """Revive/extend an existing (possibly expired) tariff subscription in place.
 
@@ -383,6 +394,10 @@ async def _revive_paid_subscription(
     alive, otherwise start a fresh period from now and reset used traffic.
     """
     await _assert_user_not_in_financial_closure(db, subscription.user_id)
+    if entitlement is not None:
+        from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
+
+        await persist_subscription_entitlement_snapshot(db, subscription.id, tariff_id, entitlement)
     now = datetime.now(UTC)
     was_alive = subscription.end_date is not None and subscription.end_date > now
 
@@ -462,10 +477,27 @@ async def create_paid_subscription(
     is_trial: bool = False,
     tariff_id: int | None = None,
     commit: bool = True,
+    _resolved_entitlement=None,
 ) -> Subscription:
     # This central gate runs before any subscription row or later panel sync
     # can be created. The DB trigger is retained as a final independent rail.
     await _assert_user_not_in_financial_closure(db, user_id)
+    entitlement = None
+    if tariff_id is not None:
+        from app.database.models import Tariff
+        from app.services.public_location_entitlement_service import resolve_tariff_entitlement
+
+        if _resolved_entitlement is not None:
+            entitlement = _resolved_entitlement
+        else:
+            tariff = await db.get(Tariff, tariff_id)
+            if tariff is None:
+                raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
+            entitlement = await resolve_tariff_entitlement(db, tariff)
+        supplied = set(connected_squads or [])
+        if supplied and supplied != set(entitlement.squad_uuids):
+            raise ValueError('tariff entitlement mismatch: caller supplied technical squads')
+        connected_squads = list(entitlement.squad_uuids)
     # Multi-tariff invariant: at most ONE subscription per (user, tariff). If a
     # subscription for this tariff has EXPIRED, revive it in place instead of
     # inserting a duplicate — the partial unique index only guards the alive
@@ -489,6 +521,8 @@ async def create_paid_subscription(
                 connected_squads=connected_squads,
                 update_server_counters=update_server_counters,
                 commit=commit,
+                entitlement=entitlement,
+                tariff_id=tariff_id,
             )
 
     end_date = datetime.now(UTC) + timedelta(days=duration_days)
@@ -496,22 +530,11 @@ async def create_paid_subscription(
     if device_limit is None:
         device_limit = settings.DEFAULT_DEVICE_LIMIT
 
-    # Fallback: если connected_squads пустой — берём первый доступный сквад
+    # Only non-tariff legacy flows may use a caller-provided concrete squad.
+    # Tariff issuance never falls back to an arbitrary server.
     final_squads = list(connected_squads or [])
-    if not final_squads:
-        try:
-            from app.database.crud.server_squad import get_available_server_squads
-
-            available = await get_available_server_squads(db)
-            if available:
-                final_squads = [available[0].squad_uuid]
-                logger.warning(
-                    '⚠️ connected_squads пустой при создании подписки, используем fallback сквад',
-                    user_id=user_id,
-                    fallback_squad=final_squads[0],
-                )
-        except Exception as error:
-            logger.error('❌ Не удалось получить fallback сквад', user_id=user_id, error=error)
+    if tariff_id is not None and not final_squads:
+        raise ValueError('tariff entitlement resolution produced no squads')
 
     short_id = await generate_unique_short_id(db)
 
@@ -538,11 +561,14 @@ async def create_paid_subscription(
             subscription.grace_eligible_period_days = _grace_period
 
     db.add(subscription)
+    await db.flush()
+    if entitlement is not None:
+        from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
+
+        await persist_subscription_entitlement_snapshot(db, subscription.id, tariff_id, entitlement)
     if commit:
         await db.commit()
         await db.refresh(subscription)
-    else:
-        await db.flush()
 
     # Kill all trial subscriptions when creating a paid subscription
     # Trial = probe, must die on any paid purchase (regardless of path: bot, cabinet, webhook)
@@ -610,8 +636,38 @@ async def replace_subscription(
     autopay_days_before: int | None = None,
     update_server_counters: bool = False,
     commit: bool = True,
+    tariff_id: int | None = None,
+    _resolved_entitlement=None,
 ) -> Subscription:
     """Перезаписывает параметры существующей подписки пользователя."""
+
+    # A replacement is still issuance. Resolve the tariff policy and validate
+    # the immutable subscription evidence before mutating any ORM fields.
+    entitlement = None
+    # ``tariff_id`` is the target tariff, not merely the value currently stored
+    # on a (possibly expired) subscription.  Resolving the old value and then
+    # assigning the new tariff after this function would bind paid access to the
+    # wrong policy/snapshot.
+    effective_tariff_id = tariff_id if tariff_id is not None else subscription.tariff_id
+    if effective_tariff_id is not None:
+        from app.database.models import Tariff
+        from app.services.public_location_entitlement_service import (
+            persist_subscription_entitlement_snapshot,
+            resolve_tariff_entitlement,
+        )
+
+        if _resolved_entitlement is not None:
+            entitlement = _resolved_entitlement
+        else:
+            tariff = await db.get(Tariff, effective_tariff_id)
+            if tariff is None:
+                raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
+            entitlement = await resolve_tariff_entitlement(db, tariff)
+        supplied = set(connected_squads or [])
+        if supplied and supplied != set(entitlement.squad_uuids):
+            raise ValueError('tariff entitlement mismatch: caller supplied technical squads')
+        connected_squads = list(entitlement.squad_uuids)
+        await persist_subscription_entitlement_snapshot(db, subscription.id, effective_tariff_id, entitlement)
 
     # Lock — защита от гонки с параллельным add_subscription_traffic / housekeeping
     # (юзер мог докупить трафик ровно в момент replace). Берём ДО любых мутаций.
@@ -620,22 +676,10 @@ async def replace_subscription(
     current_time = datetime.now(UTC)
     old_squads = set(subscription.connected_squads or [])
 
-    # Fallback: если connected_squads пустой — берём первый доступный сквад
+    # No tariff path can fall back to an arbitrary server.
     final_connected = list(connected_squads or [])
-    if not final_connected:
-        try:
-            from app.database.crud.server_squad import get_available_server_squads
-
-            available = await get_available_server_squads(db)
-            if available:
-                final_connected = [available[0].squad_uuid]
-                logger.warning(
-                    '⚠️ connected_squads пустой при замене подписки, используем fallback сквад',
-                    subscription_id=subscription.id,
-                    fallback_squad=final_connected[0],
-                )
-        except Exception as error:
-            logger.error('❌ Не удалось получить fallback сквад', subscription_id=subscription.id, error=error)
+    if effective_tariff_id is not None and not final_connected:
+        raise ValueError('tariff entitlement resolution produced no squads')
 
     new_squads = set(final_connected)
 
@@ -677,6 +721,7 @@ async def replace_subscription(
     subscription.autopay_enabled = new_autopay_enabled
     subscription.autopay_days_before = new_autopay_days_before
     subscription.updated_at = current_time
+    subscription.tariff_id = effective_tariff_id
 
     if commit:
         await db.commit()
@@ -951,6 +996,7 @@ async def extend_subscription(
     connected_squads: list[str] | None = None,
     convert_trial: bool = True,
     commit: bool = True,
+    _resolved_entitlement=None,
 ) -> Subscription:
     """Продлевает подписку на указанное количество дней.
 
@@ -969,6 +1015,34 @@ async def extend_subscription(
             (баг #629889).
     """
     await _assert_user_not_in_financial_closure(db, subscription.user_id)
+    entitlement = None
+    effective_tariff_id = tariff_id if tariff_id is not None else subscription.tariff_id
+    if effective_tariff_id is not None:
+        from app.services.public_location_entitlement_service import (
+            get_subscription_resolved_entitlement,
+            resolve_tariff_entitlement,
+        )
+
+        if _resolved_entitlement is not None:
+            entitlement = _resolved_entitlement
+        elif tariff_id is None or tariff_id == subscription.tariff_id:
+            # Renewal/restoration preserves the first issued entitlement.
+            # Policy changes apply only to a future, distinct issuance.
+            entitlement = await get_subscription_resolved_entitlement(db, subscription.id)
+        else:
+            from app.database.models import Tariff
+
+            tariff = await db.get(Tariff, effective_tariff_id)
+            if tariff is None:
+                raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
+            entitlement = await resolve_tariff_entitlement(db, tariff)
+        supplied = set(connected_squads or [])
+        if supplied and supplied != set(entitlement.squad_uuids):
+            raise ValueError('tariff entitlement mismatch: caller supplied technical squads')
+        connected_squads = list(entitlement.squad_uuids)
+        from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
+
+        await persist_subscription_entitlement_snapshot(db, subscription.id, effective_tariff_id, entitlement)
     current_time = datetime.now(UTC)
 
     # Lock + refresh traffic-полей ДО любых чтений и расчёта base_limit для веток.
@@ -2303,6 +2377,19 @@ async def create_pending_subscription(
     trial_label = 'триальная ' if is_trial else ''
     current_time = datetime.now(UTC)
     end_date = current_time + timedelta(days=duration_days)
+    entitlement = None
+    if tariff_id is not None:
+        from app.database.models import Tariff
+        from app.services.public_location_entitlement_service import resolve_tariff_entitlement
+
+        tariff = await db.get(Tariff, tariff_id)
+        if tariff is None:
+            raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
+        entitlement = await resolve_tariff_entitlement(db, tariff)
+        supplied = set(connected_squads or [])
+        if supplied and supplied != set(entitlement.squad_uuids):
+            raise ValueError('tariff entitlement mismatch: caller supplied technical squads')
+        connected_squads = list(entitlement.squad_uuids)
 
     if settings.is_multi_tariff_enabled() and tariff_id:
         active_subs = await get_active_subscriptions_by_user_id(db, user_id)
@@ -2333,6 +2420,11 @@ async def create_pending_subscription(
                 user_id=user_id,
             )
             return existing_subscription
+
+        if entitlement is not None:
+            from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
+
+            await persist_subscription_entitlement_snapshot(db, existing_subscription.id, tariff_id, entitlement)
 
         existing_subscription.status = SubscriptionStatus.PENDING.value
         existing_subscription.is_trial = is_trial
@@ -2375,6 +2467,11 @@ async def create_pending_subscription(
     )
 
     db.add(subscription)
+    await db.flush()
+    if entitlement is not None:
+        from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
+
+        await persist_subscription_entitlement_snapshot(db, subscription.id, tariff_id, entitlement)
     await db.commit()
     await db.refresh(subscription)
 

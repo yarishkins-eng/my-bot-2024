@@ -1,26 +1,34 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
 from app.database.crud.subscription import create_trial_subscription
+from app.services.public_location_entitlement_service import ResolvedEntitlement
 
 
-async def test_create_trial_subscription_uses_all_available_squads_by_default(monkeypatch):
+@pytest.fixture(autouse=True)
+def _resolved_tariff_entitlement(monkeypatch):
+    entitlement = ResolvedEntitlement((), ('squad-1',), 1, 'test')
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=entitlement),
+    )
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.persist_subscription_entitlement_snapshot',
+        AsyncMock(),
+    )
+
+
+async def test_create_trial_subscription_does_not_expand_to_all_squads_by_default(monkeypatch):
     db = Mock()
     db.add = Mock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
+    db.flush = AsyncMock()
 
     monkeypatch.setattr('app.database.crud.subscription.get_subscription_by_user_id', AsyncMock(return_value=None))
     monkeypatch.setattr('app.database.crud.subscription.generate_unique_short_id', AsyncMock(return_value='abc123'))
-    monkeypatch.setattr(
-        'app.database.crud.server_squad.get_available_server_squads',
-        AsyncMock(
-            return_value=[
-                SimpleNamespace(squad_uuid='fi-uuid'),
-                SimpleNamespace(squad_uuid='ru-uuid'),
-            ]
-        ),
-    )
     get_server_ids_mock = AsyncMock(return_value=[11, 12])
     add_user_to_servers_mock = AsyncMock()
     monkeypatch.setattr('app.database.crud.server_squad.get_server_ids_by_uuids', get_server_ids_mock)
@@ -34,12 +42,12 @@ async def test_create_trial_subscription_uses_all_available_squads_by_default(mo
         device_limit=5,
     )
 
-    assert subscription.connected_squads == ['fi-uuid', 'ru-uuid']
+    assert subscription.connected_squads == []
     db.add.assert_called_once_with(subscription)
     db.commit.assert_awaited_once()
     db.refresh.assert_awaited_once_with(subscription)
-    get_server_ids_mock.assert_awaited_once_with(db, ['fi-uuid', 'ru-uuid'])
-    add_user_to_servers_mock.assert_awaited_once_with(db, [11, 12])
+    get_server_ids_mock.assert_not_awaited()
+    add_user_to_servers_mock.assert_not_awaited()
 
 
 async def test_extend_subscription_convert_trial_false_keeps_trial(monkeypatch):

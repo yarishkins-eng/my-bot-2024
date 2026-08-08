@@ -18,6 +18,7 @@ from app.database.models import PaymentMethod, SubscriptionStatus, User
 from app.services.pricing_engine import pricing_engine
 from app.services.subscription_renewal_service import (
     SubscriptionRenewalChargeError,
+    SubscriptionRenewalEntitlementError,
     SubscriptionRenewalService,
 )
 from app.services.user_cart_service import user_cart_service
@@ -188,14 +189,12 @@ async def renew_subscription(
         tariff_id = subscription.tariff_id
         tariff_name = None
         tariff_traffic_limit_gb = None
-        tariff_allowed_squads = None
 
         if tariff_id:
             tariff = await get_tariff_by_id(db, tariff_id)
             if tariff:
                 tariff_name = tariff.name
                 tariff_traffic_limit_gb = tariff.traffic_limit_gb
-                tariff_allowed_squads = tariff.allowed_squads or []
 
         # Save cart for auto-purchase after balance top-up
         cart_data: dict[str, Any] = {
@@ -220,7 +219,6 @@ async def renew_subscription(
             cart_data['traffic_limit_gb'] = tariff_traffic_limit_gb
             # Сохраняем актуальный device_limit подписки (включая докупленные устройства)
             cart_data['device_limit'] = subscription.device_limit
-            cart_data['allowed_squads'] = tariff_allowed_squads
         else:
             # Classic mode: сохраняем текущие параметры подписки для корректной автопокупки
             cart_data['device_limit'] = subscription.device_limit
@@ -264,6 +262,11 @@ async def renew_subscription(
                 'code': 'insufficient_funds',
                 'message': 'Недостаточно средств (concurrent check)',
             },
+        )
+    except SubscriptionRenewalEntitlementError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Subscription entitlement requires manual reconciliation before renewal',
         )
 
     # Yandex.Metrika offline conversion — see /purchase endpoint for context (#558449).

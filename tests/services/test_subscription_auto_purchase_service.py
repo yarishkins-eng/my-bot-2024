@@ -44,7 +44,7 @@ class DummyTexts:
         return f'{value / 100:.0f} ₽'
 
 
-async def test_auto_purchase_saved_cart_after_topup_success(monkeypatch):
+async def test_auto_purchase_skips_unversioned_legacy_cart_after_topup(monkeypatch):
     monkeypatch.setattr(settings, 'AUTO_PURCHASE_AFTER_TOPUP_ENABLED', True)
 
     user = MagicMock(spec=User)
@@ -207,11 +207,11 @@ async def test_auto_purchase_saved_cart_after_topup_success(monkeypatch):
 
     result = await auto_purchase_saved_cart_after_topup(db_session, user, bot=bot)
 
-    assert result is True
-    delete_cart_mock.assert_awaited_once_with(user.id)
-    clear_draft_mock.assert_awaited_once_with(user.id)
-    bot.send_message.assert_awaited()
-    admin_service_mock.send_subscription_purchase_notification.assert_awaited()
+    assert result is False
+    delete_cart_mock.assert_not_awaited()
+    clear_draft_mock.assert_not_awaited()
+    bot.send_message.assert_not_awaited()
+    admin_service_mock.send_subscription_purchase_notification.assert_not_awaited()
 
 
 async def test_auto_purchase_saved_cart_after_topup_extension(monkeypatch):
@@ -387,7 +387,8 @@ async def test_auto_purchase_saved_cart_after_topup_extension(monkeypatch):
     )
     assert subscription.device_limit == 2
     assert subscription.traffic_limit_gb == 500
-    assert 'squad-b' in subscription.connected_squads
+    # Legacy raw cart data must not widen an existing entitlement.
+    assert subscription.connected_squads == ['squad-a']
     delete_cart_mock.assert_awaited_once_with(user.id, subscription.id)
     clear_draft_mock.assert_awaited_once_with(user.id)
     admin_service_mock.send_subscription_extension_notification.assert_awaited()

@@ -368,9 +368,18 @@ async def _process_referral_code(
 
 async def _sync_subscription_from_panel_by_email(db: AsyncSession, user: User) -> None:
     """
-    Check if user has subscription in RemnaWave panel by email and sync it.
-    Called after email verification to import existing subscriptions.
+    Retired Panel import/relink hook kept for email-verification compatibility.
+
+    Panel state can report entitlement drift but cannot create or overwrite a
+    subscription's technical entitlement.  Historical raw UUID import needs a
+    separate owner-approved reconciliation release with immutable provenance.
     """
+    logger.warning(
+        'Panel subscription import by email is retired pending controlled entitlement reconciliation',
+        user_id=getattr(user, 'id', None),
+    )
+    return
+
     if not user.email:
         return
 

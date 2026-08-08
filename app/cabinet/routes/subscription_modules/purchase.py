@@ -50,6 +50,11 @@ from app.services.notification_delivery_service import (
     notification_delivery_service,
 )
 from app.services.pricing_engine import pricing_engine
+from app.services.public_location_entitlement_service import (
+    EntitlementResolutionError,
+    get_subscription_resolved_entitlement,
+    resolve_tariff_entitlement,
+)
 from app.services.subscription_purchase_service import (
     MiniAppSubscriptionPurchaseService,
     PurchaseBalanceError,
@@ -1067,6 +1072,11 @@ async def purchase_tariff(
                 )
         else:
             existing_subscription = await get_subscription_by_user_id(db, user.id)
+            if existing_subscription and existing_subscription.tariff_id != tariff.id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail='Tariff replacement must use the controlled replacement workflow',
+                )
         device_limit = None
         effective_device_limit = tariff.device_limit
         if existing_subscription and existing_subscription.tariff_id == tariff.id:
@@ -1100,6 +1110,19 @@ async def purchase_tariff(
                 detail='Invalid tariff period or pricing configuration',
             )
 
+        # Renew a paid tariff from the immutable entitlement issued with that
+        # subscription.  New and trial issuances resolve the current policy.
+        # This happens before cart persistence and, crucially, before money.
+        try:
+            entitlement = (
+                await get_subscription_resolved_entitlement(db, existing_subscription.id)
+                if existing_subscription and not existing_subscription.is_trial
+                else await resolve_tariff_entitlement(db, tariff)
+            )
+            squads = list(entitlement.squad_uuids)
+        except EntitlementResolutionError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
         # Check balance
         if price_kopeks > 0 and user.balance_kopeks < price_kopeks:
             missing = price_kopeks - user.balance_kopeks
@@ -1119,7 +1142,6 @@ async def purchase_tariff(
                     'description': f'Покупка суточного тарифа {tariff.name}',
                     'traffic_limit_gb': tariff.traffic_limit_gb,
                     'device_limit': effective_device_limit,
-                    'allowed_squads': tariff.allowed_squads or [],
                     'consume_promo_offer': promo_offer_discount_value > 0,
                     'source': 'cabinet',
                     'subscription_id': existing_subscription.id if existing_subscription else None,
@@ -1137,7 +1159,6 @@ async def purchase_tariff(
                     'description': f'Покупка тарифа {tariff.name} на {period_days} дней',
                     'traffic_limit_gb': traffic_limit_gb,
                     'device_limit': effective_device_limit,
-                    'allowed_squads': tariff.allowed_squads or [],
                     'discount_percent': discount_percent,
                     'consume_promo_offer': promo_offer_discount_value > 0,
                     'source': 'cabinet',
@@ -1162,16 +1183,6 @@ async def purchase_tariff(
             )
 
         subscription = existing_subscription
-
-        # Get server squads from tariff
-        squads = tariff.allowed_squads or []
-
-        # If allowed_squads is empty, it means "all servers"
-        if not squads:
-            from app.database.crud.server_squad import get_all_server_squads
-
-            all_servers, _ = await get_all_server_squads(db, available_only=True)
-            squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
 
         # Charge balance
         if is_daily_tariff:
@@ -1310,6 +1321,7 @@ async def purchase_tariff(
                     traffic_limit_gb=traffic_limit_gb,
                     device_limit=effective_device_limit,
                     connected_squads=squads,
+                    _resolved_entitlement=entitlement,
                 )
             else:
                 # Create new subscription
@@ -1322,6 +1334,7 @@ async def purchase_tariff(
                         device_limit=tariff.device_limit,
                         connected_squads=squads,
                         tariff_id=tariff.id,
+                        _resolved_entitlement=entitlement,
                     )
                 except IntegrityError:
                     # Partial unique index violation: user already has active subscription for this tariff
@@ -1781,11 +1794,10 @@ async def activate_trial(
                 trial_tariff = await get_tariff_by_id(db, trial_tariff_id)
 
         if trial_tariff:
-            from app.database.crud.server_squad import get_effective_tariff_squad_uuids
 
             trial_traffic_limit = trial_tariff.traffic_limit_gb
             trial_device_limit = trial_tariff.device_limit
-            trial_squads = await get_effective_tariff_squad_uuids(db, trial_tariff.allowed_squads)
+            trial_squads = list((await resolve_tariff_entitlement(db, trial_tariff)).squad_uuids)
             tariff_id_for_trial = trial_tariff.id
             tariff_trial_days = getattr(trial_tariff, 'trial_duration_days', None)
             if tariff_trial_days:

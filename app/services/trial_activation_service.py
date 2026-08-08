@@ -537,26 +537,24 @@ async def _trial_parameters(db: AsyncSession, *, forced_device_limit: int | None
     device_limit = forced_device_limit if forced_device_limit is not None else settings.TRIAL_DEVICE_LIMIT
     connected_squads: list[str] = []
     tariff_id: int | None = None
-    try:
-        from app.database.crud.server_squad import get_effective_tariff_squad_uuids
-        from app.database.crud.tariff import get_tariff_by_id, get_trial_tariff
+    from app.database.crud.tariff import get_tariff_by_id, get_trial_tariff
+    from app.services.public_location_entitlement_service import resolve_tariff_entitlement
 
-        tariff = await get_trial_tariff(db)
-        if tariff is None and settings.get_trial_tariff_id() > 0:
-            tariff = await get_tariff_by_id(db, settings.get_trial_tariff_id())
-        if tariff is not None:
-            duration_days = getattr(tariff, 'trial_duration_days', None) or duration_days
-            traffic_limit_gb = tariff.traffic_limit_gb
-            device_limit = tariff.device_limit
-            connected_squads = await get_effective_tariff_squad_uuids(db, tariff.allowed_squads)
-            tariff_id = tariff.id
-    except Exception as error:  # pragma: no cover - legacy config fallback
-        logger.error('Unable to read trial tariff parameters', error=error)
-    if not connected_squads:
-        from app.database.crud.server_squad import get_random_trial_squad_uuid
-
-        squad = await get_random_trial_squad_uuid(db)
-        connected_squads = [squad] if squad else []
+    tariff = await get_trial_tariff(db)
+    if tariff is None and settings.get_trial_tariff_id() > 0:
+        tariff = await get_tariff_by_id(db, settings.get_trial_tariff_id())
+    if tariff is None:
+        raise TrialCheckoutResolutionError(
+            'trial_tariff_not_configured',
+            'Trial cannot be issued until its location policy is configured.',
+            status_code=409,
+        )
+    duration_days = getattr(tariff, 'trial_duration_days', None) or duration_days
+    traffic_limit_gb = tariff.traffic_limit_gb
+    device_limit = tariff.device_limit
+    entitlement = await resolve_tariff_entitlement(db, tariff)
+    connected_squads = list(entitlement.squad_uuids)
+    tariff_id = tariff.id
     return {
         'duration_days': duration_days,
         'traffic_limit_gb': traffic_limit_gb,

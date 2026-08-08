@@ -3834,6 +3834,15 @@ async def _show_servers_for_user(
 @admin_required
 @error_handler
 async def toggle_user_server(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+    # Per-user server selection is a raw Squad expansion/revoke path without
+    # immutable provenance.  Do not let a stale Telegram admin button bypass
+    # the controlled PublicLocation entitlement workflow.
+    await callback.answer(
+        'Ручное изменение технических серверов отключено: нужна сверка прав доступа.',
+        show_alert=True,
+    )
+    return
+
     parts = callback.data.split('_')
     user_id = int(parts[4])
     server_id = int(parts[5])
@@ -4688,6 +4697,9 @@ async def _grant_trial_subscription(
     db: AsyncSession, user_id: int, admin_id: int, subscription_id: int | None = None
 ) -> bool:
     try:
+        logger.error('Legacy admin trial grant is retired; select a tariff location policy instead', admin_id=admin_id)
+        return False
+
         from app.database.crud.subscription import create_trial_subscription
         from app.services.subscription_service import SubscriptionService
 
@@ -4721,6 +4733,9 @@ async def _grant_paid_subscription(
     db: AsyncSession, user_id: int, days: int, admin_id: int, subscription_id: int | None = None
 ) -> bool:
     try:
+        logger.error('Legacy admin paid grant is retired; select a tariff location policy instead', admin_id=admin_id)
+        return False
+
         from app.config import settings
         from app.database.crud.subscription import create_paid_subscription
         from app.services.subscription_service import SubscriptionService
@@ -4870,6 +4885,12 @@ async def change_subscription_type(callback: types.CallbackQuery, db_user: User,
 @admin_required
 @error_handler
 async def admin_buy_subscription(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+    # This legacy admin renewal mutates a subscription directly and cannot
+    # carry immutable PublicLocation provenance.  Keep stale callbacks
+    # fail-closed until a controlled entitlement-plan executor exists.
+    await callback.answer('Старое продление отключено: требуется сверка прав доступа.', show_alert=True)
+    return
+
     user_id, subscription_id = _extract_admin_sub_context(callback.data)
 
     back_cb = (
@@ -4958,6 +4979,9 @@ async def admin_buy_subscription(callback: types.CallbackQuery, db_user: User, d
 @admin_required
 @error_handler
 async def admin_buy_subscription_confirm(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+    await callback.answer('Старое продление отключено: требуется сверка прав доступа.', show_alert=True)
+    return
+
     parts = callback.data.split('_')
     user_id = int(parts[4])
     period_days = int(parts[5])
@@ -5060,6 +5084,9 @@ async def admin_buy_subscription_confirm(callback: types.CallbackQuery, db_user:
 @admin_required
 @error_handler
 async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+    await callback.answer('Старое продление отключено: требуется сверка прав доступа.', show_alert=True)
+    return
+
     parts = callback.data.split('_')
     user_id = int(parts[4])
     period_days = int(parts[5])
@@ -5253,6 +5280,9 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
 @error_handler
 async def admin_buy_tariff(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Показывает список тарифов для покупки админом."""
+    await callback.answer('Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True)
+    return
+
     user_id, subscription_id = _extract_admin_sub_context(callback.data)
 
     back_cb = (
@@ -5320,6 +5350,9 @@ async def admin_buy_tariff(callback: types.CallbackQuery, db_user: User, db: Asy
 @error_handler
 async def admin_buy_tariff_period(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Показывает выбор периода для тарифа."""
+    await callback.answer('Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True)
+    return
+
     parts = callback.data.split('_')
     user_id = int(parts[4])
     tariff_id = int(parts[5])
@@ -5380,6 +5413,9 @@ async def admin_buy_tariff_period(callback: types.CallbackQuery, db_user: User, 
 @error_handler
 async def admin_buy_tariff_confirm(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Подтверждение покупки тарифа."""
+    await callback.answer('Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True)
+    return
+
     parts = callback.data.split('_')
     user_id = int(parts[4])
     tariff_id = int(parts[5])
@@ -5460,6 +5496,9 @@ async def admin_buy_tariff_confirm(callback: types.CallbackQuery, db_user: User,
 @error_handler
 async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Выполняет покупку тарифа для пользователя."""
+    await callback.answer('Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True)
+    return
+
     parts = callback.data.split('_')
     user_id = int(parts[4])
     tariff_id = int(parts[5])
@@ -5530,6 +5569,14 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
         await callback.answer('❌ Недостаточно средств на балансе', show_alert=True)
         return
 
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+
+    try:
+        squads = list((await resolve_tariff_entitlement(db, tariff)).squad_uuids)
+    except EntitlementResolutionError:
+        await callback.answer('❌ Тариф не имеет одобренных прав доступа.', show_alert=True)
+        return
+
     try:
         from app.database.crud.subscription import (
             create_paid_subscription,
@@ -5551,9 +5598,6 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
         if not success:
             await callback.answer('❌ Ошибка списания средств', show_alert=True)
             return
-
-        # Получаем серверы из тарифа
-        squads = tariff.allowed_squads or []
 
         # Проверяем есть ли подписка с этим тарифом
         existing_subscription = await _resolve_admin_subscription(db, target_user.id, tariff_id=tariff_id)
@@ -5852,6 +5896,9 @@ async def select_admin_tariff_change(callback: types.CallbackQuery, db_user: Use
         await callback.answer('❌ Тариф не найден', show_alert=True)
         return
 
+    await callback.answer('Смена тарифа требует одобренного плана прав доступа.', show_alert=True)
+    return
+
     if subscription_id and settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import get_subscription_by_id_for_user
 
@@ -5898,6 +5945,13 @@ async def select_admin_tariff_change(callback: types.CallbackQuery, db_user: Use
 @error_handler
 async def confirm_admin_tariff_change(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Применяет смену тарифа."""
+    # A stale confirmation used to relabel a subscription and copy raw
+    # ``allowed_squads``.  A tariff transition must instead be represented by
+    # a reviewed location entitlement plan, which has no executor in this
+    # release.
+    await callback.answer('Смена тарифа требует одобренного плана прав доступа.', show_alert=True)
+    return
+
     parts = callback.data.split('_')
     # admin_sub_tariff_confirm_{tariff_id}_{user_id} or admin_sub_tariff_confirm_{tariff_id}_{user_id}_s{sub_id}
     user_id, subscription_id = _extract_admin_sub_context(callback.data)

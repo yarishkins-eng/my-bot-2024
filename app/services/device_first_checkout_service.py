@@ -1175,6 +1175,17 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         _event('conflict', checkout, reason=checkout.terminal_reason)
         return checkout
 
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+
+    try:
+        entitlement = await resolve_tariff_entitlement(db, tariff)
+    except EntitlementResolutionError as error:
+        checkout.lifecycle_state = 'conflict'
+        checkout.terminal_reason = 'location_policy_not_sellable'
+        await db.commit()
+        _event('conflict', checkout, reason=checkout.terminal_reason, error=str(error))
+        return checkout
+
     current_price = await pricing_engine.calculate_tariff_purchase_price(
         tariff,
         checkout.period_days,
@@ -1246,7 +1257,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
             duration_days=checkout.period_days,
             traffic_limit_gb=tariff.traffic_limit_gb,
             device_limit=checkout.selected_device_limit,
-            connected_squads=list(tariff.allowed_squads or []),
+            connected_squads=list(entitlement.squad_uuids),
             tariff_id=tariff.id,
             commit=False,
         )
@@ -1258,7 +1269,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
             tariff_id=tariff.id,
             traffic_limit_gb=tariff.traffic_limit_gb,
             device_limit=checkout.selected_device_limit,
-            connected_squads=list(tariff.allowed_squads or []),
+            connected_squads=list(entitlement.squad_uuids),
             convert_trial=True,
             commit=False,
         )
@@ -1403,7 +1414,7 @@ async def _validate_direct_pre_commit(
     return True
 
 
-def _direct_sale_snapshot(checkout: SubscriptionCheckout, tariff: Tariff, *, funding_mode: str) -> dict[str, Any]:
+def _direct_sale_snapshot(checkout: SubscriptionCheckout, tariff: Tariff, *, funding_mode: str, entitlement) -> dict[str, Any]:
     """The post-confirmation source of truth; no later tariff repricing is allowed."""
     return {
         'tariff_id': checkout.tariff_id,
@@ -1411,9 +1422,11 @@ def _direct_sale_snapshot(checkout: SubscriptionCheckout, tariff: Tariff, *, fun
         'period_days': checkout.period_days,
         'device_limit': checkout.selected_device_limit,
         'traffic_limit_gb': tariff.traffic_limit_gb,
-        # Required to fulfil an immutable entitlement without consulting a
-        # mutable tariff after an exact external payment.
-        'allowed_squads': list(tariff.allowed_squads or []),
+        # Immutable business and technical evidence captured before provider
+        # invoice creation.  Fulfilment after capture must not re-resolve the
+        # mutable tariff policy.
+        'entitlement': entitlement.snapshot_payload(),
+        'entitlement_hash': entitlement.snapshot_hash,
         'currency': 'RUB',
         'tariff_total_kopeks': checkout.tariff_total_kopeks,
         'price_breakdown': checkout.price_breakdown,
@@ -1458,11 +1471,19 @@ async def prepare_direct_external_checkout(
         return checkout
     if not await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff):
         raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+
+    try:
+        entitlement = await resolve_tariff_entitlement(db, tariff)
+    except EntitlementResolutionError as error:
+        raise DeviceFirstError('location_policy_not_sellable', str(error)) from error
     total = checkout.tariff_total_kopeks
     checkout.wallet_applied_kopeks = 0
     checkout.external_payable_kopeks = total
     checkout.funding_mode = 'platega'
-    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='platega')
+    checkout.sale_snapshot = _direct_sale_snapshot(
+        checkout, tariff, funding_mode='platega', entitlement=entitlement
+    )
     checkout.financial_committed_at = datetime.now(UTC)
     checkout.lifecycle_state = 'awaiting_funds'
     checkout.funding_state = 'invoice_pending'
@@ -1496,6 +1517,24 @@ async def _complete_direct_sale_locked(
         checkout.lifecycle_state = 'operator_review'
         checkout.terminal_reason = 'invalid_sale_snapshot'
         raise DeviceFirstError('operator_review_required', 'The immutable sale snapshot is invalid')
+    from app.services.public_location_entitlement_service import ResolvedEntitlement
+
+    raw_entitlement = snapshot.get('entitlement') or {}
+    try:
+        entitlement = ResolvedEntitlement(
+            tuple(raw_entitlement['location_ids']),
+            tuple(raw_entitlement['technical_squad_uuids']),
+            int(raw_entitlement['policy_revision']),
+            str(raw_entitlement['provenance']),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'invalid_entitlement_snapshot'
+        raise DeviceFirstError('operator_review_required', 'The entitlement snapshot is invalid') from error
+    if entitlement.snapshot_hash != snapshot.get('entitlement_hash'):
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'entitlement_snapshot_hash_mismatch'
+        raise DeviceFirstError('operator_review_required', 'The entitlement snapshot was modified')
     if checkout.expect_no_subscription:
         if await _current_subscription(db, user.id) is not None:
             checkout.lifecycle_state = 'operator_review'
@@ -1570,9 +1609,10 @@ async def _complete_direct_sale_locked(
             duration_days=int(snapshot['period_days']),
             traffic_limit_gb=int(snapshot['traffic_limit_gb']),
             device_limit=int(snapshot['device_limit']),
-            connected_squads=list(snapshot['allowed_squads']),
+            connected_squads=list(entitlement.squad_uuids),
             tariff_id=int(snapshot['tariff_id']),
             commit=False,
+            _resolved_entitlement=entitlement,
         )
     else:
         target = await extend_subscription(
@@ -1582,9 +1622,10 @@ async def _complete_direct_sale_locked(
             tariff_id=int(snapshot['tariff_id']),
             traffic_limit_gb=int(snapshot['traffic_limit_gb']),
             device_limit=int(snapshot['device_limit']),
-            connected_squads=list(snapshot['allowed_squads']),
+            connected_squads=list(entitlement.squad_uuids),
             convert_trial=True,
             commit=False,
+            _resolved_entitlement=entitlement,
         )
     user.has_had_paid_subscription = True
     checkout.created_subscription_id = target.id
@@ -1636,7 +1677,15 @@ async def commit_direct_wallet_checkout(
     checkout.wallet_applied_kopeks = total
     checkout.external_payable_kopeks = 0
     checkout.funding_mode = 'wallet'
-    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='wallet')
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+
+    try:
+        entitlement = await resolve_tariff_entitlement(db, tariff)
+    except EntitlementResolutionError as error:
+        raise DeviceFirstError('location_policy_not_sellable', str(error)) from error
+    checkout.sale_snapshot = _direct_sale_snapshot(
+        checkout, tariff, funding_mode='wallet', entitlement=entitlement
+    )
     checkout.financial_committed_at = datetime.now(UTC)
     await _complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
     await db.commit()

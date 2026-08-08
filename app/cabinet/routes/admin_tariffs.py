@@ -169,24 +169,11 @@ async def get_available_servers(
 async def get_available_external_squads(
     admin: User = Depends(require_permission('tariffs:read')),
 ):
-    """Fetch external squads from RemnaWave panel."""
-    from app.services.remnawave_service import RemnaWaveService
-
-    try:
-        service = RemnaWaveService()
-        async with service.get_api_client() as api:
-            squads = await api.get_external_squads()
-            return [
-                {
-                    'uuid': s.uuid,
-                    'name': s.name,
-                    'members_count': s.members_count,
-                }
-                for s in squads
-            ]
-    except Exception:
-        logger.warning('Failed to fetch external squads from RemnaWave', exc_info=True)
-        return []
+    """Retire raw RemnaWave selection from the normal tariff editor."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Raw external Squad selection is retired; use the audited privileged control.',
+    )
 
 
 @router.put('/order')
@@ -218,9 +205,11 @@ async def get_tariff(
             detail='Tariff not found',
         )
 
-    allowed_squads = tariff.allowed_squads or []
-    server_traffic_limits = tariff.server_traffic_limits or {}
-    servers = await _get_tariff_servers(db, allowed_squads, server_traffic_limits)
+    # Normal tariff-management responses are business-only.  Raw UUIDs stay
+    # server-side for legacy reconciliation and are never returned to React.
+    allowed_squads: list[str] = []
+    server_traffic_limits: dict = {}
+    servers: list[ServerInfo] = []
     promo_groups = await _get_tariff_promo_groups(db, tariff)
     subs_count = await get_tariff_subscriptions_count(db, tariff.id)
 
@@ -272,7 +261,7 @@ async def get_tariff(
         # Режим сброса трафика
         traffic_reset_mode=tariff.traffic_reset_mode,
         # Внешний сквад
-        external_squad_uuid=tariff.external_squad_uuid,
+        external_squad_uuid=None,
         # Показывать в подарках
         show_in_gift=tariff.show_in_gift,
         created_at=tariff.created_at,
@@ -287,6 +276,15 @@ async def create_new_tariff(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Create a new tariff."""
+    if (
+        request.allowed_squads is not None
+        or request.external_squad_uuid is not None
+        or request.server_traffic_limits
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail='Raw Squad tariff mutation is retired; assign PublicLocations after creating an inactive tariff.',
+        )
     period_prices_dict = _period_prices_to_dict(request.period_prices)
 
     # Преобразуем ServerTrafficLimit в dict для хранения
@@ -313,7 +311,7 @@ async def create_new_tariff(
             device_purchase_options=request.device_purchase_options,
             tier_level=request.tier_level,
             period_prices=period_prices_dict,
-            allowed_squads=request.allowed_squads,
+            allowed_squads=[],
             server_traffic_limits=server_limits_dict,
             promo_group_ids=request.promo_group_ids or None,
             # Произвольное количество дней
@@ -332,7 +330,7 @@ async def create_new_tariff(
             # Режим сброса трафика
             traffic_reset_mode=request.traffic_reset_mode,
             # Внешний сквад
-            external_squad_uuid=request.external_squad_uuid,
+            external_squad_uuid=None,
             # Показывать в подарках
             show_in_gift=request.show_in_gift,
         )
@@ -356,6 +354,15 @@ async def update_existing_tariff(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Update an existing tariff."""
+    if (
+        'allowed_squads' in request.model_fields_set
+        or 'external_squad_uuid' in request.model_fields_set
+        or 'server_traffic_limits' in request.model_fields_set
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail='Raw Squad tariff mutation is retired; use the PublicLocation policy endpoint.',
+        )
     tariff = await get_tariff_by_id(db, tariff_id)
     if not tariff:
         raise HTTPException(
@@ -718,12 +725,23 @@ async def sync_tariff_squads(
     admin: User = Depends(require_permission('tariffs:edit')),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Sync squads from tariff to all active/trial subscriptions in Remnawave panel.
+    """Retired fire-and-forget sync; execution needs a confirmed entitlement plan.
 
     Updates connected_squads and external_squad_uuid for every active or trial
     subscription linked to this tariff.  Only users that have a remnawave_uuid
     (i.e. already exist in the panel) are touched.
     """
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Mass squad sync is retired; prepare and confirm an entitlement plan instead.',
+    )
+
+
+async def _retired_sync_tariff_squads(
+    tariff_id: int,
+    admin: User,
+    db: AsyncSession,
+) -> SyncSquadsResponse:
     tariff = await get_tariff_by_id(db, tariff_id)
     if not tariff:
         raise HTTPException(

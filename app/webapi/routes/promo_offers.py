@@ -102,7 +102,8 @@ def _serialize_template(template: PromoOfferTemplate) -> PromoOfferTemplateRespo
         bonus_amount_kopeks=template.bonus_amount_kopeks,
         active_discount_hours=template.active_discount_hours,
         test_duration_hours=template.test_duration_hours,
-        test_squad_uuids=[str(uuid) for uuid in (template.test_squad_uuids or [])],
+        # Never expose historical technical UUIDs through an API DTO.
+        test_squad_uuids=[],
         is_active=template.is_active,
         created_by=template.created_by,
         created_at=template.created_at,
@@ -430,9 +431,11 @@ async def update_promo_offer_template_endpoint(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, 'bonus_amount_kopeks must be non-negative')
 
     if payload.test_squad_uuids is not None:
-        normalized_squads = [str(uuid).strip() for uuid in payload.test_squad_uuids if str(uuid).strip()]
-    else:
-        normalized_squads = None
+        raise HTTPException(
+            status.HTTP_410_GONE,
+            'Raw test-squad UUID configuration is retired; use a future approved public-location workflow',
+        )
+    normalized_squads = None
 
     updated_template = await update_promo_offer_template(
         db,

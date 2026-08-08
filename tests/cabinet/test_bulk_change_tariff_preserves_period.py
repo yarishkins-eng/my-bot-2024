@@ -105,12 +105,13 @@ async def test_change_tariff_preserves_remaining_period(db: AsyncMock) -> None:
             sub_override=sub,
         )
 
-    assert result.success is True
-    # The crux: the subscription's end date is UNTOUCHED — no fresh 30-day term.
+    assert result.success is False
+    assert 'approved location entitlement plan' in result.message
+    # A direct bulk relabel is deliberately retired: it must not mutate an
+    # active entitlement outside a separately previewed and approved plan.
     assert sub.end_date == end_date
-    # The tariff/limits ARE relabelled to the new tariff.
-    assert sub.tariff_id == 2
-    assert sub.traffic_limit_gb == 200
+    assert sub.tariff_id == 1
+    assert sub.traffic_limit_gb == 50
 
 
 @pytest.mark.asyncio
@@ -174,6 +175,6 @@ async def test_change_tariff_keeps_trial_a_trial(db: AsyncMock) -> None:
     assert sub.status == 'trial'
     # 1-day trial term preserved, never widened to the new tariff's period.
     assert sub.end_date == end_date
-    # The relabel itself still happened.
-    assert sub.tariff_id == 2
-    assert sub.traffic_limit_gb == 200
+    # The direct relabel itself is now forbidden without a plan.
+    assert sub.tariff_id == 1
+    assert sub.traffic_limit_gb == 50

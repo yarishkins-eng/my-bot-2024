@@ -198,7 +198,9 @@ async def test_instant_confirm_refuses_free_source_and_never_charges(monkeypatch
     callback = _mk_callback(f'instant_sw_confirm:{PAID_TARIFF.id}')
     await tp.confirm_instant_switch(callback, db_user, AsyncMock(), _mk_state())
 
-    switch_list.assert_awaited_once()
+    # The raw in-place tariff switch itself is now retired.  A stale callback
+    # must stop before it reads the source entitlement or charges anything.
+    switch_list.assert_not_awaited()
     charge.assert_not_called()
 
 

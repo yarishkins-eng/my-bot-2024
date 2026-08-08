@@ -83,7 +83,8 @@ def _serialize_subscription(subscription: Subscription | None) -> SubscriptionSu
         autopay_days_before=subscription.autopay_days_before,
         subscription_url=subscription.subscription_url,
         subscription_crypto_link=subscription.subscription_crypto_link,
-        connected_squads=list(subscription.connected_squads or []),
+        # Technical panel UUIDs are not part of the user-facing Web API.
+        connected_squads=[],
         tariff_id=subscription.tariff_id,
         tariff_name=tariff.name if tariff is not None else None,
     )
@@ -390,6 +391,18 @@ async def create_user_subscription(
     Создать или заменить подписку для пользователя.
     Поддерживает создание как триальных, так и платных подписок.
     """
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Legacy raw subscription mutation is retired; use the public-location entitlement flow.',
+    )
+
+
+async def _retired_create_user_subscription(
+    user_id: int,
+    payload: UserSubscriptionCreateRequest,
+    _: Any,
+    db: AsyncSession,
+) -> UserResponse:
     user = await _get_user_by_id_or_telegram_id(db, user_id)
 
     if settings.is_multi_tariff_enabled():

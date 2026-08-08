@@ -1,6 +1,5 @@
 """Admin routes for managing users in cabinet."""
 
-import math
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -1269,8 +1268,7 @@ async def update_user_subscription(
                     traffic_limit = tariff.traffic_limit_gb
                 if not request.device_limit:
                     device_limit = tariff.device_limit
-                if tariff.allowed_squads:
-                    connected_squads = tariff.allowed_squads
+                connected_squads = None
 
         from sqlalchemy.exc import IntegrityError
 
@@ -1419,6 +1417,11 @@ async def update_user_subscription(
                     status_code=status.HTTP_409_CONFLICT,
                     detail='User already has an active subscription for the target tariff',
                 )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Tariff relabel requires an approved location entitlement plan',
+        )
 
         # Preserve extra purchased devices above the old tariff's base limit
         from app.database.crud.subscription import calc_device_limit_on_tariff_switch
@@ -3458,8 +3461,8 @@ async def sync_user_from_panel(
 
                 # Update connected squads
                 if active_squads and sub.connected_squads != active_squads:
-                    changes['connected_squads'] = {'old': sub.connected_squads, 'new': active_squads}
-                    sub.connected_squads = active_squads
+                    changes['entitlement_drift'] = {'detected': True}
+                    errors.append('Panel squads differ from immutable entitlement; manual reconcile required')
 
                 # Update subscription URL
                 if panel_user.subscription_url and sub.subscription_url != panel_user.subscription_url:
@@ -3485,25 +3488,7 @@ async def sync_user_from_panel(
 
             # Create subscription if missing but user exists in panel
             if request.create_if_missing and not sync_sub and panel_user.expire_at:
-                from app.database.crud.subscription import create_paid_subscription
-
-                panel_traffic_limit = (
-                    int(panel_user.traffic_limit_bytes / (1024**3)) if panel_user.traffic_limit_bytes else 100
-                )
-                panel_expire_utc = panel_datetime_to_utc(panel_user.expire_at)
-                days_remaining = max(1, math.ceil((panel_expire_utc - datetime.now(UTC)).total_seconds() / 86400))
-
-                new_sub = await create_paid_subscription(
-                    db=db,
-                    user_id=user.id,
-                    duration_days=days_remaining,
-                    traffic_limit_gb=panel_traffic_limit,
-                    device_limit=coerce_panel_device_limit(panel_user.hwid_device_limit),
-                    connected_squads=active_squads,
-                )
-                new_sub.remnawave_short_uuid = panel_user.short_uuid
-                new_sub.subscription_url = panel_user.subscription_url
-                changes['subscription_created'] = True
+                errors.append('Panel-only subscription requires manual entitlement reconciliation; no subscription was created')
 
             # Update last sync time
             user.last_remnawave_sync = datetime.now(UTC)

@@ -442,16 +442,13 @@ async def fulfill_purchase(
             )
             return purchase
 
-        squads = list(tariff.allowed_squads or [])
-        if not squads:
-            from app.database.crud.server_squad import get_all_server_squads
+        from app.services.public_location_entitlement_service import resolve_tariff_entitlement
 
-            all_servers, _ = await get_all_server_squads(db, available_only=True)
-            squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
+        entitlement = await resolve_tariff_entitlement(db, tariff)
+        squads = list(entitlement.squad_uuids)
 
         if existing_subscription is not None:
             # Expired/inactive subscription — replace it
-            existing_subscription.tariff_id = tariff.id
             subscription = await replace_subscription(
                 db,
                 existing_subscription,
@@ -461,6 +458,8 @@ async def fulfill_purchase(
                 connected_squads=squads,
                 is_trial=False,
                 update_server_counters=True,
+                tariff_id=tariff.id,
+                _resolved_entitlement=entitlement,
             )
         else:
             # No subscription at all — create new
@@ -1259,12 +1258,10 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     try:
         subscription_service = SubscriptionService()
 
-        squads = list(tariff.allowed_squads or [])
-        if not squads:
-            from app.database.crud.server_squad import get_all_server_squads
+        from app.services.public_location_entitlement_service import resolve_tariff_entitlement
 
-            all_servers, _ = await get_all_server_squads(db, available_only=True)
-            squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
+        entitlement = await resolve_tariff_entitlement(db, tariff)
+        squads = list(entitlement.squad_uuids)
 
         # In multi-tariff mode, always create a new subscription (new Remnawave user)
         if settings.is_multi_tariff_enabled():
@@ -1299,8 +1296,9 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                     is_trial=False,
                     update_server_counters=True,
                     commit=False,
+                    tariff_id=tariff.id,
+                    _resolved_entitlement=entitlement,
                 )
-                subscription.tariff_id = tariff.id
             else:
                 subscription = await create_paid_subscription(
                     db=db,
@@ -1344,8 +1342,9 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                     is_trial=False,
                     update_server_counters=True,
                     commit=False,
+                    tariff_id=tariff.id,
+                    _resolved_entitlement=entitlement,
                 )
-                subscription.tariff_id = tariff.id
             else:
                 subscription = await create_paid_subscription(
                     db=db,

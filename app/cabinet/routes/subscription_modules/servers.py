@@ -1,7 +1,9 @@
-"""Server/country management endpoints.
+"""Public-location subscription endpoints.
 
-GET /subscription/countries
-POST /subscription/countries
+The historical ``/countries`` mutation accepted raw RemnaWave UUIDs.  It is
+kept only as a hard-closed compatibility boundary; clients must move to the
+versioned, entitlement-filtered read endpoint.  No money, database mutation,
+or Panel call is reachable through the retired route.
 """
 
 from __future__ import annotations
@@ -11,10 +13,10 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query as QueryParam, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import User
-from app.services.subscription_service import SubscriptionService
+from app.database.models import PublicLocation, SubscriptionEntitlementSnapshot, User
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from .helpers import resolve_subscription
@@ -31,68 +33,35 @@ async def get_available_countries(
     db: AsyncSession = Depends(get_cabinet_db),
     subscription_id: int | None = QueryParam(None, description='Subscription ID for multi-tariff'),
 ) -> dict[str, Any]:
-    """Get available countries/servers for the user."""
-    from app.database.crud.server_squad import get_available_server_squads
-    from app.utils.pricing_utils import apply_percentage_discount, calculate_prorated_price
-
+    """Legacy read adapter returning public DTOs only, never UUIDs."""
     subscription = await resolve_subscription(db, user, subscription_id)
-
-    promo_group_id = user.promo_group_id
-    available_servers = await get_available_server_squads(db, promo_group_id=promo_group_id)
-
-    connected_squads = []
-    days_left = 0
-    if subscription:
-        connected_squads = subscription.connected_squads or []
-        if subscription.end_date:
-            delta = subscription.end_date - datetime.now(UTC)
-            days_left = max(0, delta.days)
-
-    # Get discount from promo group via PricingEngine (respects apply_discounts_to_addons flag)
-    from app.services.pricing_engine import PricingEngine
-
-    servers_discount_percent = PricingEngine.get_addon_discount_percent(user, 'servers', None)
-
-    countries = []
-    for server in available_servers:
-        base_price = server.price_kopeks
-
-        # Apply discount
-        if servers_discount_percent > 0:
-            discounted_price, _ = apply_percentage_discount(base_price, servers_discount_percent)
-        else:
-            discounted_price = base_price
-
-        # Calculate prorated price if subscription exists
-        prorated_price = discounted_price
-        if subscription and subscription.end_date:
-            prorated_price, _ = calculate_prorated_price(
-                discounted_price,
-                subscription.end_date,
-            )
-
-        countries.append(
-            {
-                'uuid': server.squad_uuid,
-                'name': server.display_name,
-                'country_code': server.country_code,
-                'base_price_kopeks': base_price,
-                'price_kopeks': prorated_price,  # Prorated price with discount
-                'price_per_month_kopeks': discounted_price,  # Monthly price with discount
-                'price_rubles': prorated_price / 100,
-                'is_available': server.is_available and not server.is_full,
-                'is_connected': server.squad_uuid in connected_squads,
-                'has_discount': servers_discount_percent > 0,
-                'discount_percent': servers_discount_percent,
-            }
-        )
-
+    if not subscription:
+        return {'locations': [], 'has_subscription': False, 'legacy_adapter': True}
+    snapshot = await db.scalar(
+        select(SubscriptionEntitlementSnapshot).where(SubscriptionEntitlementSnapshot.subscription_id == subscription.id)
+    )
+    if not snapshot:
+        # A pre-cutover subscription has no owner-approved public presentation
+        # manifest.  Returning an empty DTO is safer than leaking raw squads.
+        return {'locations': [], 'has_subscription': True, 'legacy_adapter': True, 'reason': 'legacy_snapshot_unavailable'}
+    locations = list(
+        (await db.execute(select(PublicLocation).where(PublicLocation.id.in_(snapshot.location_ids or []))))
+        .scalars()
+    )
     return {
-        'countries': countries,
-        'connected_count': len(connected_squads),
-        'has_subscription': subscription is not None,
-        'days_left': days_left,
-        'discount_percent': servers_discount_percent,
+        'locations': [
+            {
+                'id': location.id,
+                'iso_code': location.iso_code,
+                'label_ru': location.label_ru,
+                'label_en': location.label_en,
+                'flag': location.flag,
+                'lifecycle': location.lifecycle,
+            }
+            for location in sorted(locations, key=lambda item: (item.sort_order, item.label_en))
+        ],
+        'has_subscription': True,
+        'legacy_adapter': True,
     }
 
 
@@ -103,7 +72,30 @@ async def update_countries(
     db: AsyncSession = Depends(get_cabinet_db),
     subscription_id: int | None = QueryParam(None, description='Subscription ID for multi-tariff'),
 ) -> dict[str, Any]:
-    """Update subscription countries/servers."""
+    """Hard-close raw UUID writes before any side effect."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Raw country UUID mutation is retired; use the public-location entitlement flow.',
+    )
+
+
+@router.get('/v2/locations')
+async def get_effective_locations(
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+    subscription_id: int | None = QueryParam(None, description='Subscription ID for multi-tariff'),
+) -> dict[str, Any]:
+    """Versioned public DTO; technical squads are never present in this API."""
+    return await get_available_countries(user=user, db=db, subscription_id=subscription_id)
+
+
+async def _retired_raw_update_countries(
+    request: dict[str, Any],
+    user: User,
+    db: AsyncSession,
+    subscription_id: int | None,
+) -> dict[str, Any]:
+    """Unreachable old implementation retained only for short-term source diff review."""
     from app.database.crud.server_squad import add_user_to_servers, get_available_server_squads, get_server_ids_by_uuids
     from app.database.crud.subscription import add_subscription_servers
     from app.database.crud.transaction import create_transaction

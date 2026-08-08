@@ -6,6 +6,16 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.services import device_first_checkout_service as service
+from app.services.public_location_entitlement_service import ResolvedEntitlement
+
+
+@pytest.fixture(autouse=True)
+def _resolved_tariff_entitlement(monkeypatch):
+    """Transition tests use a valid frozen policy, not raw squad fallback."""
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=ResolvedEntitlement((), ('squad-1',), 1, 'test')),
+    )
 
 
 class ScalarResult:

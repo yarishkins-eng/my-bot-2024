@@ -42,6 +42,9 @@ async def _resolve_subscription(callback, db_user, db, state=None):
 
 
 async def handle_add_countries(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    await callback.answer('Выбор технических серверов временно недоступен.', show_alert=True)
+    return
+
     if not await _should_show_countries_management(db_user):
         texts = get_texts(db_user.language)
         await callback.answer(
@@ -235,6 +238,9 @@ async def handle_manage_country(callback: types.CallbackQuery, db_user: User, db
 
 
 async def apply_countries_changes(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    await callback.answer('Выбор технических серверов временно недоступен.', show_alert=True)
+    return
+
     logger.info('🔧 Применение изменений стран')
 
     data = await state.get_data()
@@ -807,6 +813,9 @@ async def _should_show_countries_management(user: User | None = None) -> bool:
 async def confirm_add_countries_to_subscription(
     callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext
 ):
+    await callback.answer('Выбор технических серверов временно недоступен.', show_alert=True)
+    return
+
     data = await state.get_data()
     texts = get_texts(db_user.language)
     subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)

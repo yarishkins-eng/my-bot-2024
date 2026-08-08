@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 from app.database.crud import subscription as sub_crud
 from app.database.crud.subscription import get_expired_subscriptions, get_subscriptions_grace_ended
 from app.database.models import SubscriptionStatus
+from app.services.public_location_entitlement_service import ResolvedEntitlement
 
 
 MIN = 30  # matches GRACE_MIN_PERIOD_DAYS default
@@ -186,6 +187,15 @@ async def test_tariff_switch_during_grace_keeps_all_bonus_time(monkeypatch):
     monkeypatch.setattr(
         'app.database.crud.tariff.get_tariff_by_id',
         AsyncMock(return_value=SimpleNamespace(is_daily=False)),
+    )
+    entitlement = ResolvedEntitlement((), ('squad-1',), 1, 'test')
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=entitlement),
+    )
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.persist_subscription_entitlement_snapshot',
+        AsyncMock(),
     )
 
     await sub_crud.extend_subscription(db, sub, 30, tariff_id=20, commit=False)

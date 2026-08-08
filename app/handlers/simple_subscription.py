@@ -2450,34 +2450,23 @@ async def confirm_simple_subscription_purchase(
 
 
 def register_simple_subscription_handlers(dp):
-    """Регистрирует обработчики простой покупки подписки."""
+    """Fence every legacy simple-checkout callback before any side effect.
 
-    dp.callback_query.register(start_simple_subscription_purchase, F.data == 'simple_subscription_purchase')
+    This checkout stores a raw technical squad in FSM/payment state.  It is
+    deliberately retired rather than conditionally enabled: a stale Telegram
+    button must not restore the raw-country sale path if configuration changes.
+    """
 
-    dp.callback_query.register(confirm_simple_subscription_purchase, F.data == 'simple_subscription_confirm_purchase')
+    async def retired_simple_checkout(
+        callback: types.CallbackQuery,
+        state: FSMContext,
+        **_kwargs: Any,
+    ) -> None:
+        await state.clear()
+        await callback.answer(
+            'Этот устаревший способ покупки отключён. Выберите тариф для оформления подписки.',
+            show_alert=True,
+        )
 
-    dp.callback_query.register(
-        handle_simple_subscription_pay_with_balance, F.data == 'simple_subscription_pay_with_balance'
-    )
-
-    dp.callback_query.register(
-        handle_simple_subscription_pay_with_balance_disabled, F.data == 'simple_subscription_pay_with_balance_disabled'
-    )
-
-    dp.callback_query.register(
-        handle_simple_subscription_other_payment_methods, F.data == 'simple_subscription_other_payment_methods'
-    )
-
-    dp.callback_query.register(handle_simple_subscription_payment_method, F.data.startswith('simple_subscription_'))
-
-    dp.callback_query.register(check_simple_pal24_payment_status, F.data.startswith('check_simple_pal24_'))
-
-    dp.callback_query.register(check_simple_mulenpay_payment_status, F.data.startswith('check_simple_mulenpay_'))
-
-    dp.callback_query.register(check_simple_cryptobot_payment_status, F.data.startswith('check_simple_cryptobot_'))
-
-    dp.callback_query.register(check_simple_heleket_payment_status, F.data.startswith('check_simple_heleket_'))
-
-    dp.callback_query.register(check_simple_wata_payment_status, F.data.startswith('check_simple_wata_'))
-
-    dp.callback_query.register(check_simple_pal24_payment_status, F.data.startswith('check_simple_pal24_'))
+    dp.callback_query.register(retired_simple_checkout, F.data.startswith('simple_subscription_'))
+    dp.callback_query.register(retired_simple_checkout, F.data.startswith('check_simple_'))

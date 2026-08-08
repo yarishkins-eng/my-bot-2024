@@ -128,6 +128,33 @@ class DailySubscriptionService:
             logger.warning('Некорректная суточная цена для тарифа', tariff_id=tariff.id)
             return 'error'
 
+        # A deactivation may have cleared the panel projection.  Validate and
+        # stage the immutable evidence *before* balance/transaction mutation;
+        # a missing or corrupt snapshot is a manual-reconcile condition, never
+        # a reason to charge a user and later restore mutable tariff squads.
+        restored_squads: list[str] | None = None
+        try:
+            from app.services.public_location_entitlement_service import get_subscription_entitlement_squads
+
+            snapshot_squads = list(await get_subscription_entitlement_squads(db, subscription.id))
+        except Exception as error:
+            logger.error(
+                'Суточное списание остановлено: нет валидного immutable entitlement snapshot',
+                subscription_id=subscription.id,
+                error=error,
+                manual_reconcile_required=True,
+            )
+            return 'error'
+        if not subscription.connected_squads:
+            restored_squads = snapshot_squads
+        elif set(subscription.connected_squads) != set(snapshot_squads):
+            logger.error(
+                'Суточное списание остановлено: panel projection расходится с immutable entitlement',
+                subscription_id=subscription.id,
+                manual_reconcile_required=True,
+            )
+            return 'error'
+
         # Lock user row to prevent TOCTOU between discount read and balance charge
         from app.database.crud.user import lock_user_for_pricing
 
@@ -205,8 +232,10 @@ class DailySubscriptionService:
             # Обновляем время последнего списания и продлеваем подписку (без коммита)
             old_end_date = subscription.end_date
             subscription = await update_daily_charge_time(db, subscription, commit=False)
+            if restored_squads is not None:
+                subscription.connected_squads = restored_squads
 
-            # Атомарный коммит: баланс + транзакция + charge_time
+            # Атомарный коммит: баланс + транзакция + charge_time + staged entitlement restore.
             await db.commit()
             await db.refresh(user)
 
@@ -217,22 +246,6 @@ class DailySubscriptionService:
                 daily_price=daily_price,
                 user_id_display=user_id_display,
             )
-
-            # Восстанавливаем connected_squads из тарифа, если очищены деактивацией
-            try:
-                if not subscription.connected_squads:
-                    squads = tariff.allowed_squads or []
-                    if not squads:
-                        from app.database.crud.server_squad import get_all_server_squads
-
-                        all_servers, _ = await get_all_server_squads(db, available_only=True, limit=10000)
-                        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-                    if squads:
-                        subscription.connected_squads = squads
-                        await db.commit()
-                        await db.refresh(subscription)
-            except Exception as sq_err:
-                logger.warning('Не удалось восстановить connected_squads', error=sq_err)
 
             # Синхронизируем с Remnawave (обновляем срок подписки)
             try:

@@ -712,6 +712,12 @@ async def confirm_squad_migration(
     db: AsyncSession,
     state: FSMContext,
 ):
+    await callback.answer(
+        'Переезд технических групп отключён: нужен одобренный план публичных прав.',
+        show_alert=True,
+    )
+    return
+
     current_state = await state.get_state()
     if current_state != SquadMigrationStates.confirming:
         await callback.answer()
@@ -1510,6 +1516,12 @@ async def show_squad_details(callback: types.CallbackQuery, db_user: User, db: A
 @admin_required
 @error_handler
 async def manage_squad_action(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+    await callback.answer(
+        'Массовое изменение технических групп отключено: нужен одобренный план публичных прав.',
+        show_alert=True,
+    )
+    return
+
     parts = callback.data.split('_')
     action = parts[1]
     squad_uuid = parts[-1]
@@ -1827,6 +1839,12 @@ async def toggle_squad_inbound(callback: types.CallbackQuery, db_user: User, db:
 @admin_required
 @error_handler
 async def save_squad_inbounds(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+    await callback.answer(
+        'Изменение технических inbound отключено: нужен одобренный план публичных прав.',
+        show_alert=True,
+    )
+    return
+
     short_squad_uuid = callback.data.split('_')[-1]
 
     remnawave_service = RemnaWaveService()

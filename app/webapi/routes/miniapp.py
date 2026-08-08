@@ -2382,22 +2382,11 @@ def _determine_offer_icon(offer_type: str | None, effect_type: str) -> str:
 
 
 def _extract_offer_test_squad_uuids(offer: Any) -> list[str]:
-    extra = _extract_offer_extra(offer)
-    raw = extra.get('test_squad_uuids') or extra.get('squads') or []
-
-    if isinstance(raw, str):
-        raw = [raw]
-
-    uuids: list[str] = []
-    try:
-        for item in raw:
-            if not item:
-                continue
-            uuids.append(str(item))
-    except TypeError:
-        return []
-
-    return uuids
+    # Historical test-access offer payloads contain technical squad UUIDs.
+    # They are not a user entitlement source and must not be surfaced by the
+    # MiniApp while the public-location exception workflow is unavailable.
+    del offer
+    return []
 
 
 def _format_offer_message(
@@ -3980,11 +3969,12 @@ async def activate_subscription_trial_endpoint(
                     trial_tariff = await get_tariff_by_id(db, trial_tariff_id)
 
             if trial_tariff:
-                from app.database.crud.server_squad import get_effective_tariff_squad_uuids
 
                 trial_traffic_limit = trial_tariff.traffic_limit_gb
                 trial_device_limit = trial_tariff.device_limit
-                trial_squads = await get_effective_tariff_squad_uuids(db, trial_tariff.allowed_squads)
+                from app.services.public_location_entitlement_service import resolve_tariff_entitlement
+
+                trial_squads = list((await resolve_tariff_entitlement(db, trial_tariff)).squad_uuids)
                 tariff_id_for_trial = trial_tariff.id
                 tariff_trial_days = getattr(trial_tariff, 'trial_duration_days', None)
                 if tariff_trial_days:
@@ -5809,6 +5799,15 @@ async def update_subscription_servers_endpoint(
     payload: MiniAppSubscriptionServersUpdateRequest,
     db: AsyncSession = Depends(get_db_session),
 ) -> MiniAppSubscriptionUpdateResponse:
+    # The legacy contract accepts technical RemnaWave UUIDs from a customer.
+    # It is deliberately retired before authentication, balance, DB, or Panel
+    # side effects.  A future location-based replacement must use the public
+    # entitlement policy and resolver, never revive this route.
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Raw server selection is retired; use the location entitlement flow.',
+    )
+
     user = await _authorize_miniapp_user(payload.init_data, db)
     subscription = _ensure_paid_subscription(
         user,
@@ -6743,6 +6742,24 @@ async def purchase_tariff_endpoint(
     matching_sub = next((s for s in subs if s.tariff_id == tariff.id and s.is_active), None)
     device_limit = matching_sub.device_limit if matching_sub else None
 
+    # Decide the exact subscription transition before pricing or a balance
+    # mutation.  This endpoint may renew the same tariff or create a distinct
+    # multi-tariff row; it must never repurpose an unrelated tariff row.
+    if settings.is_multi_tariff_enabled():
+        subscription = matching_sub
+    else:
+        subscription = getattr(user, 'subscription', None)
+        if subscription is None:
+            subscription = next((s for s in subs if s.is_active), None)
+    if subscription is not None and subscription.tariff_id != tariff.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                'code': 'tariff_transition_requires_plan',
+                'message': 'Changing an existing tariff requires an approved location entitlement plan.',
+            },
+        )
+
     result = await pricing_engine.calculate_tariff_purchase_price(
         tariff,
         payload.period_days,
@@ -6766,6 +6783,25 @@ async def purchase_tariff_endpoint(
                 'missing_amount': missing,
             },
         )
+
+    # Resolve the exact entitlement before any debit/transaction/Panel side
+    # effect.  Paid renewals preserve their immutable issued snapshot; a new
+    # sale or trial conversion is checked against the current target policy.
+    from app.services.public_location_entitlement_service import (
+        EntitlementResolutionError,
+        get_subscription_resolved_entitlement,
+        resolve_tariff_entitlement,
+    )
+
+    try:
+        entitlement = (
+            await get_subscription_resolved_entitlement(db, subscription.id)
+            if subscription is not None and not subscription.is_trial
+            else await resolve_tariff_entitlement(db, tariff)
+        )
+        squads = list(entitlement.squad_uuids)
+    except EntitlementResolutionError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     # Списываем баланс
     if is_daily_tariff:
@@ -6800,16 +6836,6 @@ async def purchase_tariff_endpoint(
         description=description,
     )
 
-    # Получаем список серверов из тарифа
-    squads = tariff.allowed_squads or []
-
-    # Если allowed_squads пустой - значит "все серверы", получаем их
-    if not squads:
-        from app.database.crud.server_squad import get_all_server_squads
-
-        all_servers, _ = await get_all_server_squads(db, available_only=True)
-        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-
     if subscription:
         # Preserve extra purchased devices when renewing the same tariff
         if subscription.tariff_id == tariff.id:
@@ -6825,6 +6851,7 @@ async def purchase_tariff_endpoint(
             traffic_limit_gb=tariff.traffic_limit_gb,
             device_limit=effective_device_limit,
             connected_squads=squads,
+            _resolved_entitlement=entitlement,
         )
     else:
         # Создание новой подписки
@@ -6838,6 +6865,7 @@ async def purchase_tariff_endpoint(
             device_limit=tariff.device_limit,
             connected_squads=squads,
             tariff_id=tariff.id,
+            _resolved_entitlement=entitlement,
         )
 
     # Инициализация daily полей при покупке суточного тарифа
@@ -7054,6 +7082,18 @@ async def switch_tariff_endpoint(
     db: AsyncSession = Depends(get_db_session),
 ):
     """Переключение тарифа без изменения даты окончания."""
+    # Cross-tariff mutation still uses a raw in-place subscription projection.
+    # It needs a confirmed PublicLocation entitlement plan, while this release
+    # intentionally has no executor.  Fence even a stale authenticated client
+    # before authorization, database reads, balance writes, or Panel calls.
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail={
+            'code': 'tariff_switch_retired',
+            'message': 'Tariff switching requires an approved location entitlement plan and is unavailable.',
+        },
+    )
+
     user = await _authorize_miniapp_user(payload.init_data, db)
 
     if not settings.is_tariffs_mode():
@@ -7216,14 +7256,9 @@ async def switch_tariff_endpoint(
         )
 
     # Получаем список серверов из тарифа
-    squads = new_tariff.allowed_squads or []
+    from app.services.public_location_entitlement_service import resolve_tariff_entitlement
 
-    # Если allowed_squads пустой - значит "все серверы", получаем их
-    if not squads:
-        from app.database.crud.server_squad import get_all_server_squads
-
-        all_servers, _ = await get_all_server_squads(db, available_only=True)
-        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
+    squads = list((await resolve_tariff_entitlement(db, new_tariff)).squad_uuids)
 
     # Обновляем подписку - меняем тариф без изменения даты
     from app.database.crud.subscription import calc_device_limit_on_tariff_switch
@@ -7604,6 +7639,41 @@ async def toggle_daily_subscription_pause_endpoint(
         new_paused_state = not is_currently_paused
     subscription.is_daily_paused = new_paused_state
 
+    # A disabled daily subscription may have had its panel projection cleared.
+    # Load immutable evidence before any balance write; fail closed into manual
+    # reconciliation instead of charging first and later consulting a mutable
+    # tariff policy.
+    resume_restore_squads: list[str] | None = None
+    if was_disabled and not new_paused_state:
+        try:
+            from app.services.public_location_entitlement_service import get_subscription_entitlement_squads
+
+            snapshot_squads = list(await get_subscription_entitlement_squads(db, subscription.id))
+        except Exception as error:
+            logger.error(
+                'Daily resume stopped: immutable entitlement snapshot is unavailable',
+                subscription_id=subscription.id,
+                error=error,
+                manual_reconcile_required=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    'code': 'entitlement_manual_reconcile_required',
+                    'message': 'Subscription entitlement needs manual reconciliation before it can be resumed',
+                },
+            )
+        if not subscription.connected_squads:
+            resume_restore_squads = snapshot_squads
+        elif set(subscription.connected_squads) != set(snapshot_squads):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    'code': 'entitlement_manual_reconcile_required',
+                    'message': 'Subscription entitlement projection requires manual reconciliation before it can be resumed',
+                },
+            )
+
     # Apply group discount to daily price (consistent with DailySubscriptionService and resume-after-topup)
     from app.services.pricing_engine import PricingEngine
 
@@ -7669,6 +7739,8 @@ async def toggle_daily_subscription_pause_endpoint(
             subscription.status = SubscriptionStatus.ACTIVE.value
             subscription.last_daily_charge_at = now
             subscription.end_date = now + timedelta(days=1)
+            if resume_restore_squads is not None:
+                subscription.connected_squads = resume_restore_squads
 
             logger.info(
                 'Суточная подписка восстановлена в ACTIVE (miniapp)',
@@ -7702,22 +7774,6 @@ async def toggle_daily_subscription_pause_endpoint(
 
     # Синхронизация с RemnaWave только при возобновлении из DISABLED/EXPIRED
     if not new_paused_state and was_disabled:
-        # Restore connected_squads from tariff if cleared by deactivation sync
-        try:
-            if not subscription.connected_squads:
-                squads = tariff.allowed_squads or []
-                if not squads:
-                    from app.database.crud.server_squad import get_all_server_squads
-
-                    all_servers, _ = await get_all_server_squads(db, available_only=True, limit=10000)
-                    squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
-                if squads:
-                    subscription.connected_squads = squads
-                    await db.commit()
-                    await db.refresh(subscription)
-        except Exception as sq_err:
-            logger.warning('Failed to restore connected_squads (miniapp)', error=sq_err)
-
         # Sync with RemnaWave
         try:
             service = SubscriptionService()

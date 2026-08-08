@@ -12,8 +12,11 @@ Partial unique index ``uq_subscriptions_user_tariff_active`` сторожит т
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from app.database.crud import subscription as sub_crud
 from app.database.models import SubscriptionStatus
+from app.services.public_location_entitlement_service import ResolvedEntitlement
 
 
 def _sub(**kw) -> MagicMock:
@@ -30,6 +33,20 @@ def _db() -> AsyncMock:
     db.flush = AsyncMock()
     db.add = MagicMock()
     return db
+
+
+@pytest.fixture(autouse=True)
+def _resolved_tariff_entitlement(monkeypatch):
+    """Keep these lifecycle tests independent from the policy resolver itself."""
+    entitlement = ResolvedEntitlement((), ('squad-1',), 1, 'test')
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=entitlement),
+    )
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.persist_subscription_entitlement_snapshot',
+        AsyncMock(),
+    )
 
 
 async def test_revive_expired_starts_fresh_period(monkeypatch):

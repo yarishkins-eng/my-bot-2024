@@ -99,6 +99,20 @@ async def preview_tariff_switch(
             detail='Tariff not found or inactive',
         )
 
+    # A preview must not quote a location policy that cannot be issued.  The
+    # execution endpoint stays unavailable, but this read-only calculation is
+    # also fail-closed for hidden, unhealthy, unmapped, or legacy-unapproved
+    # target entitlements.
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+
+    try:
+        await resolve_tariff_entitlement(db, new_tariff)
+    except EntitlementResolutionError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Target tariff entitlement is unavailable; prepare a new policy after reconciliation.',
+        ) from error
+
     if subscription.tariff_id == request.tariff_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -203,6 +217,14 @@ async def switch_tariff(
     subscription_id: int | None = QueryParam(None, description='Subscription ID for multi-tariff'),
 ) -> dict[str, Any]:
     """Switch to a different tariff without changing end date."""
+    # This legacy endpoint mutates a live subscription in place.  Public
+    # location rights require an immutable controlled plan for cross-tariff
+    # transitions, and this release deliberately ships no executor.
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail='Tariff switching requires an approved location entitlement plan and is temporarily unavailable.',
+    )
+
     if not settings.is_tariffs_mode():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -461,7 +483,9 @@ async def switch_tariff(
         new_tariff_device_limit=new_tariff.device_limit,
         max_device_limit=new_tariff.max_device_limit,
     )
-    subscription.connected_squads = new_tariff.allowed_squads or []
+    from app.services.public_location_entitlement_service import resolve_tariff_entitlement
+
+    subscription.connected_squads = list((await resolve_tariff_entitlement(db, new_tariff)).squad_uuids)
 
     # Reset purchased traffic and delete TrafficPurchase records on tariff switch
     from sqlalchemy import delete as sql_delete

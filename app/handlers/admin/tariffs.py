@@ -2279,6 +2279,16 @@ async def start_edit_tariff_squads(
     state: FSMContext,
 ):
     """Показывает меню выбора серверов для тарифа."""
+    # This editor exposes and persists raw technical Squad UUIDs.  Tariff
+    # access is now a PublicLocation policy and active-user changes require a
+    # separately confirmed entitlement plan, so stale admin buttons must stop
+    # before reading or writing the legacy projection.
+    await callback.answer(
+        'Редактор технических серверов отключён. Используйте политику публичных локаций и план прав.',
+        show_alert=True,
+    )
+    return
+
     texts = get_texts(db_user.language)
     tariff_id = int(callback.data.split(':')[1])
     tariff = await get_tariff_by_id(db, tariff_id)
@@ -2337,6 +2347,12 @@ async def toggle_tariff_squad(
     db: AsyncSession,
 ):
     """Переключает выбор сервера для тарифа."""
+    await callback.answer(
+        'Изменение технических серверов отключено; используйте публичные локации.',
+        show_alert=True,
+    )
+    return
+
     parts = callback.data.split(':')
     tariff_id = int(parts[1])
     squad_uuid = parts[2]
@@ -2412,6 +2428,12 @@ async def clear_tariff_squads(
     db: AsyncSession,
 ):
     """Очищает список серверов тарифа."""
+    await callback.answer(
+        'Изменение технических серверов отключено; используйте публичные локации.',
+        show_alert=True,
+    )
+    return
+
     tariff_id = int(callback.data.split(':')[1])
     tariff = await get_tariff_by_id(db, tariff_id)
 
@@ -2475,6 +2497,12 @@ async def select_all_tariff_squads(
     db: AsyncSession,
 ):
     """Выбирает все серверы для тарифа."""
+    await callback.answer(
+        'Изменение технических серверов отключено; используйте публичные локации.',
+        show_alert=True,
+    )
+    return
+
     tariff_id = int(callback.data.split(':')[1])
     tariff = await get_tariff_by_id(db, tariff_id)
 
