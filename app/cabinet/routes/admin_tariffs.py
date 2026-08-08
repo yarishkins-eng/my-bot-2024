@@ -276,11 +276,7 @@ async def create_new_tariff(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Create a new tariff."""
-    if (
-        request.allowed_squads is not None
-        or request.external_squad_uuid is not None
-        or request.server_traffic_limits
-    ):
+    if request.allowed_squads is not None or request.external_squad_uuid is not None or request.server_traffic_limits:
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail='Raw Squad tariff mutation is retired; assign PublicLocations after creating an inactive tariff.',

@@ -5280,7 +5280,9 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
 @error_handler
 async def admin_buy_tariff(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Показывает список тарифов для покупки админом."""
-    await callback.answer('Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True)
+    await callback.answer(
+        'Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True
+    )
     return
 
     user_id, subscription_id = _extract_admin_sub_context(callback.data)
@@ -5350,7 +5352,9 @@ async def admin_buy_tariff(callback: types.CallbackQuery, db_user: User, db: Asy
 @error_handler
 async def admin_buy_tariff_period(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Показывает выбор периода для тарифа."""
-    await callback.answer('Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True)
+    await callback.answer(
+        'Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True
+    )
     return
 
     parts = callback.data.split('_')
@@ -5413,7 +5417,9 @@ async def admin_buy_tariff_period(callback: types.CallbackQuery, db_user: User, 
 @error_handler
 async def admin_buy_tariff_confirm(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Подтверждение покупки тарифа."""
-    await callback.answer('Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True)
+    await callback.answer(
+        'Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True
+    )
     return
 
     parts = callback.data.split('_')
@@ -5496,7 +5502,9 @@ async def admin_buy_tariff_confirm(callback: types.CallbackQuery, db_user: User,
 @error_handler
 async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Выполняет покупку тарифа для пользователя."""
-    await callback.answer('Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True)
+    await callback.answer(
+        'Покупка через старую админ-клавиатуру отключена: требуется контролируемый план прав.', show_alert=True
+    )
     return
 
     parts = callback.data.split('_')

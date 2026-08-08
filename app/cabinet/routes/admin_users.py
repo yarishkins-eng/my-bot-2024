@@ -3488,7 +3488,9 @@ async def sync_user_from_panel(
 
             # Create subscription if missing but user exists in panel
             if request.create_if_missing and not sync_sub and panel_user.expire_at:
-                errors.append('Panel-only subscription requires manual entitlement reconciliation; no subscription was created')
+                errors.append(
+                    'Panel-only subscription requires manual entitlement reconciliation; no subscription was created'
+                )
 
             # Update last sync time
             user.last_remnawave_sync = datetime.now(UTC)

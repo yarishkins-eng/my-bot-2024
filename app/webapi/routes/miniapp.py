@@ -3969,7 +3969,6 @@ async def activate_subscription_trial_endpoint(
                     trial_tariff = await get_tariff_by_id(db, trial_tariff_id)
 
             if trial_tariff:
-
                 trial_traffic_limit = trial_tariff.traffic_limit_gb
                 trial_device_limit = trial_tariff.device_limit
                 from app.services.public_location_entitlement_service import resolve_tariff_entitlement

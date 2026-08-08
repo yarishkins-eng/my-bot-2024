@@ -110,7 +110,9 @@ async def test_save_cart_and_redirect_to_topup(mock_callback_query, mock_state, 
         mock_callback_query.answer.assert_not_called()
 
 
-async def test_return_to_saved_cart_closes_legacy_raw_cart_before_redis(mock_callback_query, mock_state, mock_user, mock_db):
+async def test_return_to_saved_cart_closes_legacy_raw_cart_before_redis(
+    mock_callback_query, mock_state, mock_user, mock_db
+):
     """A stale classic callback must not read raw-country cart data into FSM."""
     # Подготовим данные корзины
     cart_data = {

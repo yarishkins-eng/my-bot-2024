@@ -53,7 +53,11 @@ def test_seed_plan_preserves_explicit_existing_subscription_access(monkeypatch):
         {3: _squad_set_hash(squads), 4: _squad_set_hash(squads), 5: _squad_set_hash(squads)},
     )
     plan = build_legacy_entitlement_seed_plan(
-        [_tariff(3, active=True, squads=squads), _tariff(4, active=True, squads=squads), _tariff(5, active=False, squads=squads)],
+        [
+            _tariff(3, active=True, squads=squads),
+            _tariff(4, active=True, squads=squads),
+            _tariff(5, active=False, squads=squads),
+        ],
         [_subscription(10, 3, squads), _subscription(11, 5, squads), _subscription(12, 3, [])],
     )
 
@@ -66,7 +70,11 @@ def test_seed_plan_preserves_explicit_existing_subscription_access(monkeypatch):
 def test_seed_plan_rejects_unapproved_active_tariff_scope():
     with pytest.raises(LegacyEntitlementSeedError, match='scope differs'):
         build_legacy_entitlement_seed_plan(
-            [_tariff(3, active=True, squads=['a']), _tariff(4, active=True, squads=['a']), _tariff(9, active=True, squads=['a'])],
+            [
+                _tariff(3, active=True, squads=['a']),
+                _tariff(4, active=True, squads=['a']),
+                _tariff(9, active=True, squads=['a']),
+            ],
             [],
         )
 

@@ -1414,7 +1414,9 @@ async def _validate_direct_pre_commit(
     return True
 
 
-def _direct_sale_snapshot(checkout: SubscriptionCheckout, tariff: Tariff, *, funding_mode: str, entitlement) -> dict[str, Any]:
+def _direct_sale_snapshot(
+    checkout: SubscriptionCheckout, tariff: Tariff, *, funding_mode: str, entitlement
+) -> dict[str, Any]:
     """The post-confirmation source of truth; no later tariff repricing is allowed."""
     return {
         'tariff_id': checkout.tariff_id,
@@ -1481,9 +1483,7 @@ async def prepare_direct_external_checkout(
     checkout.wallet_applied_kopeks = 0
     checkout.external_payable_kopeks = total
     checkout.funding_mode = 'platega'
-    checkout.sale_snapshot = _direct_sale_snapshot(
-        checkout, tariff, funding_mode='platega', entitlement=entitlement
-    )
+    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='platega', entitlement=entitlement)
     checkout.financial_committed_at = datetime.now(UTC)
     checkout.lifecycle_state = 'awaiting_funds'
     checkout.funding_state = 'invoice_pending'
@@ -1683,9 +1683,7 @@ async def commit_direct_wallet_checkout(
         entitlement = await resolve_tariff_entitlement(db, tariff)
     except EntitlementResolutionError as error:
         raise DeviceFirstError('location_policy_not_sellable', str(error)) from error
-    checkout.sale_snapshot = _direct_sale_snapshot(
-        checkout, tariff, funding_mode='wallet', entitlement=entitlement
-    )
+    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='wallet', entitlement=entitlement)
     checkout.financial_committed_at = datetime.now(UTC)
     await _complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
     await db.commit()

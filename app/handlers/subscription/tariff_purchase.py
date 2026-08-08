@@ -1676,9 +1676,7 @@ async def confirm_tariff_purchase(
                 )
                 existing_sub = None
         if existing_sub is None:
-            existing_sub = await get_subscription_by_user_and_tariff(
-                db, db_user.id, tariff_id, include_inactive=True
-            )
+            existing_sub = await get_subscription_by_user_and_tariff(db, db_user.id, tariff_id, include_inactive=True)
     else:
         existing_sub = await get_subscription_by_user_id(db, db_user.id)
 
@@ -2109,7 +2107,9 @@ async def confirm_daily_tariff_purchase(
     else:
         existing_subscription = await get_subscription_by_user_id(db, db_user.id)
     if existing_subscription is not None and existing_subscription.tariff_id != tariff.id:
-        await callback.answer('Смена тарифа временно недоступна: откройте новый тариф после ручной сверки прав.', show_alert=True)
+        await callback.answer(
+            'Смена тарифа временно недоступна: откройте новый тариф после ручной сверки прав.', show_alert=True
+        )
         return
     try:
         entitlement = (

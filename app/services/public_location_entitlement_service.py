@@ -161,7 +161,9 @@ async def persist_subscription_entitlement_snapshot(
     """Store first resolved evidence; updates deliberately fail closed."""
 
     existing = await db.scalar(
-        select(SubscriptionEntitlementSnapshot).where(SubscriptionEntitlementSnapshot.subscription_id == subscription_id)
+        select(SubscriptionEntitlementSnapshot).where(
+            SubscriptionEntitlementSnapshot.subscription_id == subscription_id
+        )
     )
     if existing:
         if existing.snapshot_hash != entitlement.snapshot_hash:
@@ -192,9 +194,7 @@ async def get_subscription_entitlement_squads(db: AsyncSession, subscription_id:
     return entitlement.squad_uuids
 
 
-async def get_subscription_resolved_entitlement(
-    db: AsyncSession, subscription_id: int
-) -> ResolvedEntitlement:
+async def get_subscription_resolved_entitlement(db: AsyncSession, subscription_id: int) -> ResolvedEntitlement:
     """Load and validate immutable entitlement evidence for an issued subscription."""
 
     snapshot = await db.scalar(

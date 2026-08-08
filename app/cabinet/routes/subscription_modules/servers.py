@@ -38,12 +38,19 @@ async def get_available_countries(
     if not subscription:
         return {'locations': [], 'has_subscription': False, 'legacy_adapter': True}
     snapshot = await db.scalar(
-        select(SubscriptionEntitlementSnapshot).where(SubscriptionEntitlementSnapshot.subscription_id == subscription.id)
+        select(SubscriptionEntitlementSnapshot).where(
+            SubscriptionEntitlementSnapshot.subscription_id == subscription.id
+        )
     )
     if not snapshot:
         # A pre-cutover subscription has no owner-approved public presentation
         # manifest.  Returning an empty DTO is safer than leaking raw squads.
-        return {'locations': [], 'has_subscription': True, 'legacy_adapter': True, 'reason': 'legacy_snapshot_unavailable'}
+        return {
+            'locations': [],
+            'has_subscription': True,
+            'legacy_adapter': True,
+            'reason': 'legacy_snapshot_unavailable',
+        }
     if snapshot.provenance.startswith('legacy_'):
         manifest = await db.get(TariffLegacyEntitlementManifest, snapshot.tariff_id)
         if not manifest:
@@ -73,8 +80,7 @@ async def get_available_countries(
             'legacy_presentation': True,
         }
     locations = list(
-        (await db.execute(select(PublicLocation).where(PublicLocation.id.in_(snapshot.location_ids or []))))
-        .scalars()
+        (await db.execute(select(PublicLocation).where(PublicLocation.id.in_(snapshot.location_ids or [])))).scalars()
     )
     return {
         'locations': [

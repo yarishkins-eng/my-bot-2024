@@ -3560,9 +3560,7 @@ class PublicLocation(Base):
 
 class PublicLocationSquadMapping(Base):
     __tablename__ = 'public_location_squad_mappings'
-    __table_args__ = (
-        UniqueConstraint('public_location_id', 'internal_squad_uuid', name='uq_public_location_squad'),
-    )
+    __table_args__ = (UniqueConstraint('public_location_id', 'internal_squad_uuid', name='uq_public_location_squad'),)
 
     id = Column(Integer, primary_key=True)
     public_location_id = Column(String(36), ForeignKey('public_locations.id', ondelete='RESTRICT'), nullable=False)
@@ -3575,9 +3573,7 @@ class PublicLocationSquadMapping(Base):
 
 class TariffLocationEntitlement(Base):
     __tablename__ = 'tariff_location_entitlements'
-    __table_args__ = (
-        UniqueConstraint('tariff_id', 'public_location_id', name='uq_tariff_public_location'),
-    )
+    __table_args__ = (UniqueConstraint('tariff_id', 'public_location_id', name='uq_tariff_public_location'),)
 
     id = Column(Integer, primary_key=True)
     tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='RESTRICT'), nullable=False, index=True)
@@ -3659,7 +3655,9 @@ class EntitlementPlanJob(Base):
     __tablename__ = 'entitlement_plan_jobs'
 
     id = Column(String(36), primary_key=True)
-    plan_id = Column(String(36), ForeignKey('entitlement_change_plans.id', ondelete='RESTRICT'), nullable=False, index=True)
+    plan_id = Column(
+        String(36), ForeignKey('entitlement_change_plans.id', ondelete='RESTRICT'), nullable=False, index=True
+    )
     panel_identity = Column(String(255), nullable=False)
     state = Column(String(32), nullable=False, default='pending')
     fencing_token = Column(Integer, nullable=False, default=1)
@@ -3674,7 +3672,9 @@ class EntitlementPlanOutbox(Base):
     __tablename__ = 'entitlement_plan_outbox'
 
     id = Column(Integer, primary_key=True)
-    job_id = Column(String(36), ForeignKey('entitlement_plan_jobs.id', ondelete='RESTRICT'), nullable=False, unique=True)
+    job_id = Column(
+        String(36), ForeignKey('entitlement_plan_jobs.id', ondelete='RESTRICT'), nullable=False, unique=True
+    )
     payload = Column(JSON, nullable=False)
     state = Column(String(32), nullable=False, default='disabled')
     created_at = Column(AwareDateTime(), nullable=False, default=func.now())

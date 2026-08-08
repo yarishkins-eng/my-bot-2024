@@ -1794,7 +1794,6 @@ async def activate_trial(
                 trial_tariff = await get_tariff_by_id(db, trial_tariff_id)
 
         if trial_tariff:
-
             trial_traffic_limit = trial_tariff.traffic_limit_gb
             trial_device_limit = trial_tariff.device_limit
             trial_squads = list((await resolve_tariff_entitlement(db, trial_tariff)).squad_uuids)

@@ -2941,7 +2941,9 @@ class RemnaWaveService:
             return False
 
     async def remove_all_users_from_squad(self, squad_uuid: str) -> bool:
-        logger.warning('Raw bulk squad remove is retired pending a controlled PublicLocation plan', squad_uuid=squad_uuid)
+        logger.warning(
+            'Raw bulk squad remove is retired pending a controlled PublicLocation plan', squad_uuid=squad_uuid
+        )
         return False
 
         try:

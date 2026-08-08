@@ -86,14 +86,21 @@ async def tariff_location_policy(
     if not tariff:
         raise HTTPException(status_code=404, detail='Tariff not found')
     selected = set(
-        (await db.execute(select(TariffLocationEntitlement.public_location_id).where(TariffLocationEntitlement.tariff_id == tariff_id)))
-        .scalars()
+        (
+            await db.execute(
+                select(TariffLocationEntitlement.public_location_id).where(
+                    TariffLocationEntitlement.tariff_id == tariff_id
+                )
+            )
+        ).scalars()
     )
     return {
         'tariff_id': tariff.id,
         'mode': tariff.entitlement_mode,
         'policy_revision': tariff.location_policy_revision,
-        'locations': [_dto(location, selected=location.id in selected) for location in await list_tariff_assignable_locations(db)],
+        'locations': [
+            _dto(location, selected=location.id in selected) for location in await list_tariff_assignable_locations(db)
+        ],
         'execution_enabled': False,
     }
 
@@ -112,23 +119,44 @@ async def replace_tariff_location_policy(
     wanted = tuple(dict.fromkeys(request.location_ids))
     assignable = {location.id for location in await list_tariff_assignable_locations(db)}
     if not set(wanted).issubset(assignable):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='One or more locations are not tariff-assignable')
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail='One or more locations are not tariff-assignable'
+        )
     if not wanted and tariff.is_active:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='An active tariff cannot have no locations')
 
     await db.execute(delete(TariffLocationEntitlement).where(TariffLocationEntitlement.tariff_id == tariff.id))
     next_revision = int(tariff.location_policy_revision or 1) + 1
     for location_id in wanted:
-        db.add(TariffLocationEntitlement(tariff_id=tariff.id, public_location_id=location_id, policy_revision=next_revision))
+        db.add(
+            TariffLocationEntitlement(
+                tariff_id=tariff.id, public_location_id=location_id, policy_revision=next_revision
+            )
+        )
     tariff.location_policy_revision = next_revision
     tariff.entitlement_mode = 'location_managed' if wanted else 'no_locations'
     await AuditLogCRUD.create(
-        db, user_id=admin.id, action='tariff_location_policy_replaced', resource_type='tariff', resource_id=str(tariff.id),
-        details={'location_ids': list(wanted), 'policy_revision': next_revision, 'reason': request.reason, 'execution_enabled': False},
+        db,
+        user_id=admin.id,
+        action='tariff_location_policy_replaced',
+        resource_type='tariff',
+        resource_id=str(tariff.id),
+        details={
+            'location_ids': list(wanted),
+            'policy_revision': next_revision,
+            'reason': request.reason,
+            'execution_enabled': False,
+        },
         status='success',
     )
     await db.commit()
-    return {'tariff_id': tariff.id, 'mode': tariff.entitlement_mode, 'policy_revision': next_revision, 'location_ids': list(wanted), 'execution_enabled': False}
+    return {
+        'tariff_id': tariff.id,
+        'mode': tariff.entitlement_mode,
+        'policy_revision': next_revision,
+        'location_ids': list(wanted),
+        'execution_enabled': False,
+    }
 
 
 @router.post('/tariffs/{tariff_id}/locations/prepare-plan')
@@ -145,28 +173,36 @@ async def prepare_location_plan(
     requested_ids = tuple(sorted(set(request.location_ids)))
     assignable = {location.id for location in await list_tariff_assignable_locations(db)}
     if not requested_ids or not set(requested_ids).issubset(assignable):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Plan requires explicit tariff-assignable locations')
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail='Plan requires explicit tariff-assignable locations'
+        )
 
     current_ids = tuple(
         sorted(
-            (await db.execute(
-                select(TariffLocationEntitlement.public_location_id).where(
-                    TariffLocationEntitlement.tariff_id == tariff_id
+            (
+                await db.execute(
+                    select(TariffLocationEntitlement.public_location_id).where(
+                        TariffLocationEntitlement.tariff_id == tariff_id
+                    )
                 )
-            )).scalars()
+            ).scalars()
         )
     )
     target_mappings = list(
-        (await db.execute(
-            select(PublicLocationSquadMapping).where(
-                PublicLocationSquadMapping.public_location_id.in_(requested_ids),
-                PublicLocationSquadMapping.is_dedicated_verified.is_(True),
+        (
+            await db.execute(
+                select(PublicLocationSquadMapping).where(
+                    PublicLocationSquadMapping.public_location_id.in_(requested_ids),
+                    PublicLocationSquadMapping.is_dedicated_verified.is_(True),
+                )
             )
-        )).scalars()
+        ).scalars()
     )
     mapped_ids = {mapping.public_location_id for mapping in target_mappings if mapping.internal_squad_uuid}
     if mapped_ids != set(requested_ids):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Plan has an incomplete dedicated location mapping')
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail='Plan has an incomplete dedicated location mapping'
+        )
 
     affected_subscriptions = list(
         (await db.execute(select(Subscription).where(Subscription.tariff_id == tariff_id))).scalars()
@@ -175,16 +211,16 @@ async def prepare_location_plan(
     users_by_id: dict[int, User] = {}
     if affected_subscriptions:
         users = list(
-            (await db.execute(
-                select(User).where(User.id.in_([subscription.user_id for subscription in affected_subscriptions]))
-            )).scalars()
+            (
+                await db.execute(
+                    select(User).where(User.id.in_([subscription.user_id for subscription in affected_subscriptions]))
+                )
+            ).scalars()
         )
         users_by_id = {user.id: user for user in users}
     affected_user_ids = set(users_by_id)
     affected_panel_ids = {
-        subscription.remnawave_uuid
-        for subscription in affected_subscriptions
-        if subscription.remnawave_uuid
+        subscription.remnawave_uuid for subscription in affected_subscriptions if subscription.remnawave_uuid
     }
     # A future executor operates by panel identity, not one tariff row at a
     # time.  Its durable preimage must therefore include every subscription
@@ -201,23 +237,29 @@ async def prepare_location_plan(
     panel_user_ids = {subscription.user_id for subscription in panel_subscriptions}
     missing_user_ids = panel_user_ids.difference(users_by_id)
     if missing_user_ids:
-        additional_users = list(
-            (await db.execute(select(User).where(User.id.in_(missing_user_ids)))).scalars()
-        )
+        additional_users = list((await db.execute(select(User).where(User.id.in_(missing_user_ids)))).scalars())
         users_by_id.update({user.id: user for user in additional_users})
     panel_tariff_ids = {subscription.tariff_id for subscription in panel_subscriptions if subscription.tariff_id}
-    panel_tariffs = list(
-        (await db.execute(select(Tariff).where(Tariff.id.in_(panel_tariff_ids)))).scalars()
-    ) if panel_tariff_ids else []
+    panel_tariffs = (
+        list((await db.execute(select(Tariff).where(Tariff.id.in_(panel_tariff_ids)))).scalars())
+        if panel_tariff_ids
+        else []
+    )
     tariff_by_id = {item.id: item for item in panel_tariffs}
     panel_subscription_ids = tuple(sorted(subscription.id for subscription in panel_subscriptions))
-    existing_snapshots = list(
-        (await db.execute(
-            select(SubscriptionEntitlementSnapshot).where(
-                SubscriptionEntitlementSnapshot.subscription_id.in_(panel_subscription_ids)
-            )
-        )).scalars()
-    ) if panel_subscription_ids else []
+    existing_snapshots = (
+        list(
+            (
+                await db.execute(
+                    select(SubscriptionEntitlementSnapshot).where(
+                        SubscriptionEntitlementSnapshot.subscription_id.in_(panel_subscription_ids)
+                    )
+                )
+            ).scalars()
+        )
+        if panel_subscription_ids
+        else []
+    )
     snapshot_by_subscription = {snapshot.subscription_id: snapshot for snapshot in existing_snapshots}
     preimage_subscriptions = []
     panel_identity_scope: dict[str, dict[str, object]] = {}
@@ -276,9 +318,7 @@ async def prepare_location_plan(
                 aggregate['selected_tariff_subscription_ids'].append(subscription.id)
             else:
                 aggregate['excluded_tariff_subscription_ids'].append(subscription.id)
-            aggregate['activeInternalSquads'] = sorted(
-                set(aggregate['activeInternalSquads']).union(active_squads)
-            )
+            aggregate['activeInternalSquads'] = sorted(set(aggregate['activeInternalSquads']).union(active_squads))
             aggregate['externalSquadUuids'] = sorted(
                 set(aggregate['externalSquadUuids']).union(
                     [subscription_external_squad_uuid] if subscription_external_squad_uuid else []
@@ -356,13 +396,22 @@ async def prepare_location_plan(
         json.dumps({'scope': scope, 'preimage': preimage}, sort_keys=True, separators=(',', ':')).encode()
     ).hexdigest()
     plan = EntitlementChangePlan(
-        id=str(uuid4()), actor_user_id=admin.id, reason=request.reason, manifest_hash=manifest_hash,
-        plan_hash=plan_hash, policy_revision=int(tariff.location_policy_revision or 1), scope=scope,
+        id=str(uuid4()),
+        actor_user_id=admin.id,
+        reason=request.reason,
+        manifest_hash=manifest_hash,
+        plan_hash=plan_hash,
+        policy_revision=int(tariff.location_policy_revision or 1),
+        scope=scope,
         preimage=preimage,
     )
     db.add(plan)
     await AuditLogCRUD.create(
-        db, user_id=admin.id, action='tariff_location_plan_previewed', resource_type='entitlement_plan', resource_id=plan.id,
+        db,
+        user_id=admin.id,
+        action='tariff_location_plan_previewed',
+        resource_type='entitlement_plan',
+        resource_id=plan.id,
         details={
             'tariff_id': tariff_id,
             'plan_hash': plan_hash,
@@ -370,7 +419,8 @@ async def prepare_location_plan(
             'affected_subscription_count': len(subscription_ids),
             'reason': request.reason,
             'execution_enabled': False,
-        }, status='success',
+        },
+        status='success',
     )
     await db.commit()
     return {
@@ -399,10 +449,14 @@ async def confirm_location_plan(
         json.dumps({'scope': plan.scope, 'preimage': plan.preimage}, sort_keys=True, separators=(',', ':')).encode()
     ).hexdigest()
     if plan.state != 'previewed' or request.plan_hash != plan.plan_hash or expected_plan_hash != plan.plan_hash:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Plan is stale or its immutable hash does not match')
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail='Plan is stale or its immutable hash does not match'
+        )
     tariff = await db.get(Tariff, tariff_id)
     if tariff is None or int(tariff.location_policy_revision or 1) != plan.policy_revision:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Tariff policy revision changed; prepare a new plan')
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail='Tariff policy revision changed; prepare a new plan'
+        )
     existing_approval = await db.scalar(
         select(EntitlementPlanApproval).where(EntitlementPlanApproval.plan_id == plan.id)
     )

@@ -164,7 +164,9 @@ def validate_approved_shared_squad_inventory(raw_inventory: Mapping[str, Iterabl
     the immutable manifest and is covered by its hash.
     """
 
-    actual_by_reference = {_squad_reference(squad_uuid): inbound_uuids for squad_uuid, inbound_uuids in raw_inventory.items()}
+    actual_by_reference = {
+        _squad_reference(squad_uuid): inbound_uuids for squad_uuid, inbound_uuids in raw_inventory.items()
+    }
     expected_references = set(OWNER_APPROVED_SHARED_SQUAD_INVENTORY)
     if set(actual_by_reference) != expected_references:
         raise LegacyEntitlementSeedError('shared squad inventory has an unknown or missing raw technical squad')
@@ -283,9 +285,7 @@ def build_legacy_entitlement_seed_plan(
     active_tariff_ids = {tariff.id for tariff in tariffs_by_id.values() if tariff.is_active}
     approved_active_ids = set(OWNER_APPROVED_ACTIVE_LEGACY_TARIFF_IDS)
     if active_tariff_ids != approved_active_ids:
-        raise LegacyEntitlementSeedError(
-            'active tariff scope differs from the owner-approved legacy manifest baseline'
-        )
+        raise LegacyEntitlementSeedError('active tariff scope differs from the owner-approved legacy manifest baseline')
 
     required_manifest_ids = set(active_tariff_ids)
     snapshots: list[_SubscriptionSnapshotSeed] = []
@@ -381,29 +381,19 @@ async def seed_approved_legacy_entitlements(
 
     actor = _validate_approval_value(approval_actor, 'approval actor')
     reference = _validate_approval_value(approval_reference, 'approval reference')
-    tariffs = list(
-        (await db.execute(select(Tariff).order_by(Tariff.id).with_for_update()))
-        .scalars()
-        .all()
-    )
+    tariffs = list((await db.execute(select(Tariff).order_by(Tariff.id).with_for_update())).scalars().all())
     subscriptions = list(
-        (await db.execute(select(Subscription).order_by(Subscription.id).with_for_update()))
-        .scalars()
-        .all()
+        (await db.execute(select(Subscription).order_by(Subscription.id).with_for_update())).scalars().all()
     )
     plan = build_legacy_entitlement_seed_plan(tariffs, subscriptions)
 
     existing_manifests = {
         manifest.tariff_id: manifest
-        for manifest in (
-            await db.execute(select(TariffLegacyEntitlementManifest).with_for_update())
-        ).scalars()
+        for manifest in (await db.execute(select(TariffLegacyEntitlementManifest).with_for_update())).scalars()
     }
     existing_snapshots = {
         snapshot.subscription_id: snapshot
-        for snapshot in (
-            await db.execute(select(SubscriptionEntitlementSnapshot).with_for_update())
-        ).scalars()
+        for snapshot in (await db.execute(select(SubscriptionEntitlementSnapshot).with_for_update())).scalars()
     }
 
     for expected in plan.manifests:
@@ -413,7 +403,9 @@ async def seed_approved_legacy_entitlements(
     for expected in plan.subscription_snapshots:
         existing = existing_snapshots.get(expected.subscription_id)
         if existing is not None and not _same_snapshot(existing, expected):
-            raise LegacyEntitlementSeedError('an existing subscription snapshot differs from the immutable legacy baseline')
+            raise LegacyEntitlementSeedError(
+                'an existing subscription snapshot differs from the immutable legacy baseline'
+            )
 
     manifests_created = 0
     snapshots_created = 0
