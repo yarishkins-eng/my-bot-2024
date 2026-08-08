@@ -549,7 +549,17 @@ async def process_topup_amount(message: types.Message, db_user: User, state: FSM
 
         amount_kopeks = int(amount_rubles * 100)
         data = await state.get_data()
-        payment_method = data.get('payment_method', 'stars')
+        payment_method = data.get('payment_method')
+        if not payment_method:
+            # Redis/fallback restart or an old malformed FSM state must not be
+            # guessed as Telegram Stars: it may be disabled and would trap the
+            # user in the amount step. Restart the explicitly chosen-method flow.
+            await state.clear()
+            await message.answer(
+                'Способ оплаты не выбран. Выберите его ещё раз.',
+                reply_markup=get_payment_methods_keyboard(0, db_user.language),
+            )
+            return
 
         if payment_method in ['yookassa', 'yookassa_sbp']:
             if amount_kopeks < settings.YOOKASSA_MIN_AMOUNT_KOPEKS:

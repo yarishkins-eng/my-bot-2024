@@ -1714,6 +1714,19 @@ class MonitoringService:
                     )
                     continue
 
+                # Grace — обещанный пользователю бесплатный доступ после окончания
+                # оплаченного срока. Даже если middleware уже поставил EXPIRED,
+                # recently-expired recovery ниже не должен списывать деньги, пока
+                # этот бонус ещё действует.
+                if is_in_grace(sub, current_time):
+                    logger.info(
+                        'Пропускаем автоплатёж: подписка в активном grace-периоде',
+                        subscription_id=sub.id,
+                        user_id=sub.user_id,
+                        grace_until=sub.grace_until,
+                    )
+                    continue
+
                 # Skip classic subscriptions (tariff_id=NULL) when tariff mode is active
                 if settings.is_tariffs_mode() and not sub.tariff_id:
                     logger.debug(
@@ -1774,6 +1787,17 @@ class MonitoringService:
                     )
                     subscription = refetch_result.scalar_one_or_none()
                     if subscription is None:
+                        continue
+
+                    # Повторно проверяем после refetch: grace мог начаться между
+                    # первоначальной выборкой и обработкой этого пользователя.
+                    if is_in_grace(subscription):
+                        logger.info(
+                            'Пропускаем автоплатёж после refetch: активен grace-период',
+                            subscription_id=subscription.id,
+                            user_id=subscription.user_id,
+                            grace_until=subscription.grace_until,
+                        )
                         continue
 
                     from app.database.crud.subscription import is_recently_updated_by_webhook

@@ -23,7 +23,7 @@ from app.database.models import (
     User,
     UserStatus,
 )
-from app.utils.grace import grace_period_for_term
+from app.utils.grace import grace_period_for_term, is_in_grace
 from app.utils.timezone import format_local_datetime
 
 
@@ -1001,6 +1001,12 @@ async def extend_subscription(
         SubscriptionStatus.LIMITED.value,
     ) or (subscription.end_date is not None and subscription.end_date <= current_time)
 
+    # Grace — оплаченный срок уже закончился, но доступ остаётся подаренным до
+    # grace_until. При платном продлении этот остаток нельзя молча отнять:
+    # новая подписка начинается после фактически доступного времени. Проверка
+    # через is_in_grace не даёт старому флагу/прошедшей дате перенести лишние дни.
+    active_grace_until = subscription.grace_until if days > 0 and is_in_grace(subscription, current_time) else None
+
     if is_tariff_change:
         logger.info('🔄 Обнаружена СМЕНА тарифа', tariff_id=subscription.tariff_id, tariff_id_2=tariff_id)
 
@@ -1014,20 +1020,22 @@ async def extend_subscription(
         # (TARIFF_SWITCH_RESET_FREE_DAYS) — иначе наспамленные на бесплатке дни
         # бесплатно уносятся на платный тариф.
         remaining_seconds = 0
-        if subscription.end_date and subscription.end_date > current_time:
+        carry_until = active_grace_until or subscription.end_date
+        if carry_until and carry_until > current_time:
             source_is_free = bool(
                 settings.TARIFF_SWITCH_RESET_FREE_DAYS
                 and subscription.tariff_id  # ещё старый тариф — переназначается ниже
                 and await _is_free_source_tariff(db, subscription.tariff_id)
             )
             if _should_carry_remaining_days(is_trial=subscription.is_trial, source_is_free=source_is_free):
-                remaining = subscription.end_date - current_time
+                remaining = carry_until - current_time
                 remaining_seconds = max(0, remaining.total_seconds())
                 logger.info(
-                    '🎁 Обнаружен остаток подписки, будет добавлен к новому сроку',
+                    '🎁 Обнаружен остаток доступа, будет добавлен к новому сроку',
                     remaining_seconds=int(remaining_seconds),
                     subscription_id=subscription.id,
                     is_trial=subscription.is_trial,
+                    grace_until=active_grace_until,
                 )
             elif source_is_free:
                 logger.info(
@@ -1042,11 +1050,17 @@ async def extend_subscription(
             days=days,
             remaining_seconds=int(remaining_seconds),
         )
-    elif subscription.end_date > current_time:
-        # Подписка активна - просто добавляем дни к текущей дате окончания
-        # БЕЗ бонусных дней (они уже учтены в end_date)
-        subscription.end_date = subscription.end_date + timedelta(days=days)
-        logger.info('📅 Подписка активна, добавляем дней к текущей дате окончания', days=days)
+    elif subscription.end_date > current_time or active_grace_until is not None:
+        # При обычном продлении продолжаем от оплаченного срока. Во время
+        # активного grace берём его конец: бонусные дни остаются пользователю.
+        renewal_base = max(subscription.end_date, active_grace_until or current_time)
+        subscription.end_date = renewal_base + timedelta(days=days)
+        logger.info(
+            '📅 Продление добавлено к концу доступного срока',
+            days=days,
+            renewal_base=renewal_base,
+            grace_until=active_grace_until,
+        )
     else:
         # Подписка истекла - начинаем с текущей даты
         subscription.end_date = current_time + timedelta(days=days)

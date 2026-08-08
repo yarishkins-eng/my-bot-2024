@@ -149,6 +149,72 @@ async def test_extend_clears_grace_flags_on_renewal(monkeypatch):
     assert sub.grace_until is None
 
 
+async def test_extend_during_grace_keeps_all_bonus_time(monkeypatch):
+    """A paid renewal during grace starts after the promised bonus, not now."""
+    db = _extend_env(monkeypatch)
+    now = datetime.now(UTC)
+    grace_until = now + timedelta(days=1, hours=3)
+    sub = _paid_sub(
+        status=SubscriptionStatus.EXPIRED.value,
+        end_date=now - timedelta(hours=2),
+        in_grace=True,
+        grace_until=grace_until,
+        grace_eligible_period_days=30,
+    )
+
+    await sub_crud.extend_subscription(db, sub, 30, commit=False)
+
+    assert sub.end_date == grace_until + timedelta(days=30)
+    assert sub.in_grace is False
+    assert sub.grace_until is None
+
+
+async def test_tariff_switch_during_grace_keeps_all_bonus_time(monkeypatch):
+    """Changing a paid tariff has the same grace guarantee as a same-tariff renewal."""
+    db = _extend_env(monkeypatch)
+    now = datetime.now(UTC)
+    grace_until = now + timedelta(hours=20)
+    sub = _paid_sub(
+        status=SubscriptionStatus.EXPIRED.value,
+        end_date=now - timedelta(hours=2),
+        tariff_id=10,
+        in_grace=True,
+        grace_until=grace_until,
+        grace_eligible_period_days=30,
+    )
+    monkeypatch.setattr(sub_crud.settings, 'TARIFF_SWITCH_RESET_FREE_DAYS', False)
+    monkeypatch.setattr(
+        'app.database.crud.tariff.get_tariff_by_id',
+        AsyncMock(return_value=SimpleNamespace(is_daily=False)),
+    )
+
+    await sub_crud.extend_subscription(db, sub, 30, tariff_id=20, commit=False)
+
+    assert sub.end_date == grace_until + timedelta(days=30)
+    assert sub.in_grace is False
+    assert sub.grace_until is None
+
+
+async def test_extend_after_grace_does_not_resurrect_expired_bonus(monkeypatch):
+    """A stale flag and past grace_until must not add historical free time."""
+    db = _extend_env(monkeypatch)
+    now = datetime.now(UTC)
+    sub = _paid_sub(
+        status=SubscriptionStatus.EXPIRED.value,
+        end_date=now - timedelta(days=3),
+        in_grace=True,
+        grace_until=now - timedelta(minutes=1),
+        grace_eligible_period_days=30,
+    )
+    started_before = datetime.now(UTC)
+
+    await sub_crud.extend_subscription(db, sub, 30, commit=False)
+
+    assert started_before + timedelta(days=30) <= sub.end_date <= datetime.now(UTC) + timedelta(days=30)
+    assert sub.in_grace is False
+    assert sub.grace_until is None
+
+
 # ──────────────────────── period recording in _revive_paid_subscription ────────────────────────
 
 
