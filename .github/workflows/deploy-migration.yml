@@ -44,13 +44,23 @@ jobs:
           test "$BACKUP_AND_RESTORE_EVIDENCE" = 'BACKUP_RESTORE_VERIFIED'
           test "$OWNER_GO_NO_GO" = 'OWNER_APPROVED'
           test -n "$RELEASE_CARD_REFERENCE"
+          case "$RELEASE_CARD_REFERENCE" in
+            *[!A-Za-z0-9._:/@-]*)
+              echo 'Release-card reference contains unsupported characters.' >&2
+              exit 1
+              ;;
+          esac
 
       - name: Deploy the exact migration revision and wait for health
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        env:
+          RELEASE_CARD_REFERENCE: ${{ inputs.release_card_reference }}
+          APPROVAL_ACTOR: ${{ github.actor }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: RELEASE_CARD_REFERENCE,APPROVAL_ACTOR
           command_timeout: 15m
           script: |
             set -Eeuo pipefail
@@ -63,6 +73,8 @@ jobs:
             readonly STATE_FILE="$STATE_DIR/bot-production.state"
             readonly RECOVERY_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
             readonly RECOVERY_IMAGE_TAG="teplo-vpn-rollback/bot:pre-migration-${TARGET_SHA}"
+            readonly RELEASE_CARD_REFERENCE="${RELEASE_CARD_REFERENCE:?missing release-card reference}"
+            readonly APPROVAL_ACTOR="${APPROVAL_ACTOR:?missing protected-deployment actor}"
             BUILD_DIR=''
             BUILD_OVERRIDE=''
             TARGET_SCHEMA_REVISIONS=''
@@ -187,6 +199,26 @@ jobs:
               test "$TARGET_SCHEMA_REVISIONS" = "$actual_revisions"
             }
 
+            prepare_legacy_entitlement_baseline_if_required() {
+              # Revision 0100 makes legacy tariff issuance fail closed until a
+              # separately owner-approved manifest and per-subscription
+              # evidence exist.  This one-time hook runs before the candidate
+              # container switch, after the additive schema is available.
+              if ! printf '%s\n' "$TARGET_SCHEMA_REVISIONS" | tr ',' '\n' | grep -qx '0100'; then
+                return
+              fi
+              if printf '%s\n' "$PREVIOUS_SCHEMA_REVISIONS" | tr ',' '\n' | grep -qx '0100'; then
+                return
+              fi
+              echo 'Applying additive schema and the owner-approved legacy entitlement baseline before service switch.'
+              compose run --rm --no-deps --entrypoint /app/.venv/bin/alembic "$SERVICE" upgrade head
+              verify_migration_revision
+              compose run --rm --no-deps --entrypoint /app/.venv/bin/python "$SERVICE" \
+                -m app.services.legacy_entitlement_manifest_seed \
+                --approval-actor "$APPROVAL_ACTOR" \
+                --approval-reference "$RELEASE_CARD_REFERENCE"
+            }
+
             trap cleanup_build_context EXIT
 
             if [ -n "$(git status --porcelain)" ]; then
@@ -277,6 +309,8 @@ jobs:
             RECOVERY_JOURNAL_PREPARED=1
             PREPARE_IN_PROGRESS=0
             trap - ERR
+
+            prepare_legacy_entitlement_baseline_if_required
 
             # No automatic image rollback: after a committed forward migration the
             # protected recovery workflow is the explicit, rehearsed path.

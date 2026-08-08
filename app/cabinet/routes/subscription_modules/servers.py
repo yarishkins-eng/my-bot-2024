@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query as QueryParam, stat
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import PublicLocation, SubscriptionEntitlementSnapshot, User
+from app.database.models import PublicLocation, SubscriptionEntitlementSnapshot, TariffLegacyEntitlementManifest, User
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from .helpers import resolve_subscription
@@ -44,6 +44,34 @@ async def get_available_countries(
         # A pre-cutover subscription has no owner-approved public presentation
         # manifest.  Returning an empty DTO is safer than leaking raw squads.
         return {'locations': [], 'has_subscription': True, 'legacy_adapter': True, 'reason': 'legacy_snapshot_unavailable'}
+    if snapshot.provenance.startswith('legacy_'):
+        manifest = await db.get(TariffLegacyEntitlementManifest, snapshot.tariff_id)
+        if not manifest:
+            return {
+                'locations': [],
+                'has_subscription': True,
+                'legacy_adapter': True,
+                'reason': 'legacy_presentation_unavailable',
+            }
+        presentation = [
+            {
+                'id': str(item['id']),
+                'iso_code': str(item['iso_code']),
+                'label_ru': str(item['label_ru']),
+                'label_en': str(item['label_en']),
+                'flag': str(item['flag']),
+                'lifecycle': str(item['lifecycle']),
+            }
+            for item in (manifest.presentation_locations or [])
+            if isinstance(item, dict)
+            and all(key in item for key in ('id', 'iso_code', 'label_ru', 'label_en', 'flag', 'lifecycle'))
+        ]
+        return {
+            'locations': presentation,
+            'has_subscription': True,
+            'legacy_adapter': True,
+            'legacy_presentation': True,
+        }
     locations = list(
         (await db.execute(select(PublicLocation).where(PublicLocation.id.in_(snapshot.location_ids or []))))
         .scalars()

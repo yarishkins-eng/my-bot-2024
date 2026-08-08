@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 from app.cabinet.routes import auth as cabinet_auth
 from app.cabinet.routes.admin_public_locations import router as public_location_admin_router
-from app.cabinet.routes.subscription_modules.servers import update_countries
+from app.cabinet.routes.subscription_modules.servers import get_available_countries, update_countries
 from app.cabinet.routes.subscription_modules.tariff_switch import switch_tariff as cabinet_tariff_switch
 from app.database.crud import subscription as subscription_crud
 from app.database.models import SubscriptionStatus
@@ -122,6 +122,36 @@ async def test_raw_country_post_returns_gone_before_database_or_panel_effect():
     assert error.value.status_code == 410
     db.commit.assert_not_awaited()
     db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_subscription_locations_use_nontechnical_presentation_manifest(monkeypatch):
+    subscription = SimpleNamespace(id=22)
+    snapshot = SimpleNamespace(subscription_id=22, tariff_id=3, provenance='legacy_subscription_backfill')
+    manifest = SimpleNamespace(
+        presentation_locations=[
+            {
+                'id': 'legacy-de',
+                'iso_code': 'DE',
+                'label_ru': 'Германия',
+                'label_en': 'Germany',
+                'flag': '🇩🇪',
+                'lifecycle': 'published',
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        'app.cabinet.routes.subscription_modules.servers.resolve_subscription',
+        AsyncMock(return_value=subscription),
+    )
+    db = SimpleNamespace(scalar=AsyncMock(return_value=snapshot), get=AsyncMock(return_value=manifest))
+
+    result = await get_available_countries(SimpleNamespace(), db, None)
+
+    assert result['legacy_presentation'] is True
+    assert result['locations'][0]['iso_code'] == 'DE'
+    assert 'technical_squad_uuids' not in result['locations'][0]
+    db.get.assert_awaited_once()
 
 
 @pytest.mark.asyncio

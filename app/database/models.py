@@ -3593,8 +3593,18 @@ class TariffLegacyEntitlementManifest(Base):
     tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='RESTRICT'), primary_key=True)
     squad_uuids = Column(JSON, nullable=False)
     membership_hashes = Column(JSON, nullable=False, default=dict)
+    # Immutable non-technical DTO for legacy subscribers.  It may describe
+    # historical shared coverage but is never a PublicLocation-to-Squad map.
+    presentation_locations = Column(JSON, nullable=False, default=list)
     manifest_hash = Column(String(128), nullable=False, unique=True)
-    approved_by_user_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    # A protected production migration is approved in GitHub Environment and
+    # may not be truthfully attributable to one of several bot-user records.
+    # Cabinet approval can fill approved_by_user_id; either actor form is
+    # required by the database constraint.
+    approved_by_user_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=True)
+    approved_by_actor = Column(String(255), nullable=True)
+    approval_permission = Column(String(64), nullable=False)
+    approval_reference = Column(String(255), nullable=False)
     approval_reason = Column(Text, nullable=False)
     approved_at = Column(AwareDateTime(), nullable=False, default=func.now())
 
@@ -3609,7 +3619,9 @@ class SubscriptionEntitlementSnapshot(Base):
     technical_squad_uuids = Column(JSON, nullable=False)
     policy_revision = Column(Integer, nullable=False)
     provenance = Column(String(32), nullable=False)
-    snapshot_hash = Column(String(128), nullable=False, unique=True)
+    # Same effective access is normal for several subscribers.  The one-to-one
+    # subscription_id is the identity constraint; this hash detects mutation.
+    snapshot_hash = Column(String(128), nullable=False)
     created_at = Column(AwareDateTime(), nullable=False, default=func.now())
 
 

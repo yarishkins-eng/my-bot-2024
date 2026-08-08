@@ -77,10 +77,22 @@ def upgrade() -> None:
         sa.Column('tariff_id', sa.Integer(), sa.ForeignKey('tariffs.id', ondelete='RESTRICT'), primary_key=True),
         sa.Column('squad_uuids', sa.JSON(), nullable=False),
         sa.Column('membership_hashes', sa.JSON(), nullable=False),
+        sa.Column('presentation_locations', sa.JSON(), nullable=False),
         sa.Column('manifest_hash', sa.String(128), nullable=False, unique=True),
-        sa.Column('approved_by_user_id', sa.Integer(), sa.ForeignKey('users.id', ondelete='RESTRICT'), nullable=False),
+        # Production approval is performed in the protected GitHub Environment.
+        # It is not safe to guess which of several bot superadmin records was
+        # the owner, so the manifest stores the verified deployment actor and
+        # reference.  A future cabinet approval can additionally link a user.
+        sa.Column('approved_by_user_id', sa.Integer(), sa.ForeignKey('users.id', ondelete='RESTRICT'), nullable=True),
+        sa.Column('approved_by_actor', sa.String(255), nullable=True),
+        sa.Column('approval_permission', sa.String(64), nullable=False),
+        sa.Column('approval_reference', sa.String(255), nullable=False),
         sa.Column('approval_reason', sa.Text(), nullable=False),
         sa.Column('approved_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.text('now()')),
+        sa.CheckConstraint(
+            'approved_by_user_id IS NOT NULL OR approved_by_actor IS NOT NULL',
+            name='ck_tariff_legacy_manifest_has_actor',
+        ),
     )
     op.create_table(
         'subscription_entitlement_snapshots',
@@ -91,7 +103,10 @@ def upgrade() -> None:
         sa.Column('technical_squad_uuids', sa.JSON(), nullable=False),
         sa.Column('policy_revision', sa.Integer(), nullable=False),
         sa.Column('provenance', sa.String(32), nullable=False),
-        sa.Column('snapshot_hash', sa.String(128), nullable=False, unique=True),
+        # Equal entitlements are expected for many subscriptions.  The
+        # subscription_id uniqueness above, not this content hash, makes the
+        # immutable snapshot one-per-subscription.
+        sa.Column('snapshot_hash', sa.String(128), nullable=False),
         sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.text('now()')),
     )
     op.create_table(
