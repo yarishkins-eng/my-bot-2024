@@ -219,6 +219,25 @@ jobs:
                 --approval-reference "$RELEASE_CARD_REFERENCE"
             }
 
+            requires_legacy_entitlement_baseline() {
+              printf '%s\n' "$TARGET_SCHEMA_REVISIONS" | tr ',' '\n' | grep -qx '0100' && \
+                ! printf '%s\n' "$PREVIOUS_SCHEMA_REVISIONS" | tr ',' '\n' | grep -qx '0100'
+            }
+
+            quiesce_writer_before_legacy_entitlement_baseline() {
+              # The old bot does not create immutable subscription evidence.
+              # Stop the sole application writer only after candidate build and
+              # recovery journal are proven, so no subscription can be created
+              # between the legacy seed and the new fail-closed code.
+              if ! requires_legacy_entitlement_baseline; then
+                return
+              fi
+              echo 'Quiescing the bot writer before the legacy entitlement schema and seed.'
+              compose stop --timeout 90 "$SERVICE"
+              test "$(docker inspect --format '{{.State.Running}}' remnawave_bot)" = 'false'
+              test "$(docker inspect --format '{{.State.Status}}' remnawave_bot)" = 'exited'
+            }
+
             trap cleanup_build_context EXIT
 
             if [ -n "$(git status --porcelain)" ]; then
@@ -310,10 +329,15 @@ jobs:
             PREPARE_IN_PROGRESS=0
             trap - ERR
 
+            quiesce_writer_before_legacy_entitlement_baseline
             prepare_legacy_entitlement_baseline_if_required
 
-            # No automatic image rollback: after a committed forward migration the
-            # protected recovery workflow is the explicit, rehearsed path.
+            # No automatic code rollback after quiescing the writer: the old
+            # image cannot issue immutable entitlement snapshots and therefore
+            # must never run on schema 0100.  If a forward migration commits
+            # but this candidate cannot start, the bot deliberately remains
+            # stopped for protected manual reconciliation; no old writer is
+            # permitted to create unsupported subscriptions in the meantime.
             compose up -d --wait --wait-timeout 240 "$SERVICE"
             compose ps "$SERVICE"
             verify_migration_revision

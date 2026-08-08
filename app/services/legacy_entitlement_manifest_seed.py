@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -36,6 +37,37 @@ OWNER_APPROVED_LEGACY_TARIFF_SQUAD_SET_HASHES: dict[int, str] = {
     5: '27f79807269b7d07972b0a8c42afd2c3c6bcee7ef19d47d731ee99355227cbd6',
 }
 OWNER_APPROVED_ACTIVE_LEGACY_TARIFF_IDS = frozenset({3, 4})
+# This is the redacted, owner-approved read-only Panel inventory captured for
+# the two technical squads shared by the current active legacy tariffs.  It is
+# deliberately a hash of the *raw inbound membership*, not a claim that a
+# PublicLocation already owns those legacy groups.  An inventory/relink path
+# must validate it with ``validate_approved_shared_squad_inventory`` before it
+# can use those groups as evidence; an unknown squad or changed membership is
+# a manual-reconcile/P0 drift condition.
+OWNER_APPROVED_SHARED_SQUAD_INVENTORY_REFERENCE = 'rw-ro-20260808T235623Z'
+
+
+@dataclass(frozen=True)
+class _ApprovedSharedSquadInventory:
+    raw_inbounds_count: int
+    raw_inbound_membership_sha256: str
+
+
+# Key = sha256(raw technical squad UUID).  Neither the UUID nor raw inbound
+# UUIDs are stored in source, manifests, application logs, or user DTOs.
+OWNER_APPROVED_SHARED_SQUAD_INVENTORY: dict[str, _ApprovedSharedSquadInventory] = {
+    '0188d99e839ab511e9fd344ef5ba2c308178a37b439c4f3a9352aecacfb048f1': _ApprovedSharedSquadInventory(
+        raw_inbounds_count=2,
+        raw_inbound_membership_sha256='3db082c2b180a3b112ce9660eec291cbdafcd87de213c0d85c4be8ca14bf8505',
+    ),
+    '37faff3826fbd3e7845bd63f1200817a63332f26256a57ad7ecf97aa2d13538d': _ApprovedSharedSquadInventory(
+        raw_inbounds_count=2,
+        raw_inbound_membership_sha256='b4a8b18fcbe37863301436b5eddf033bda76361ba7d3f919baa540e90e366ead',
+    ),
+}
+LegacySharedSquadInventoryReader = Callable[
+    [Subscription], Mapping[str, Iterable[str]] | Awaitable[Mapping[str, Iterable[str]]]
+]
 _LEGACY_PRESENTATION_LOCATIONS = (
     {
         'id': 'legacy-de',
@@ -68,7 +100,7 @@ class LegacyEntitlementSeedError(RuntimeError):
 class _ManifestSeed:
     tariff_id: int
     squad_uuids: tuple[str, ...]
-    membership_hashes: dict[str, str]
+    membership_hashes: dict[str, object]
     presentation_locations: tuple[dict[str, object], ...]
     manifest_hash: str
 
@@ -110,10 +142,115 @@ def _squad_set_hash(squad_uuids: Iterable[str]) -> str:
     return sha256(raw).hexdigest()
 
 
+def _squad_reference(squad_uuid: str) -> str:
+    return sha256(squad_uuid.encode()).hexdigest()
+
+
+def _raw_inbound_membership_hash(inbound_uuids: Iterable[str]) -> str:
+    """Hash a canonical set of raw inbound UUIDs without persisting them."""
+
+    canonical = tuple(sorted({value.strip() for value in inbound_uuids if isinstance(value, str) and value.strip()}))
+    if not canonical:
+        raise LegacyEntitlementSeedError('shared squad has no explicit raw inbound membership')
+    return _squad_set_hash(canonical)
+
+
+def validate_approved_shared_squad_inventory(raw_inventory: Mapping[str, Iterable[str]]) -> dict[str, object]:
+    """Fail closed when a read-only raw shared-squad inventory is not exact.
+
+    ``raw_inventory`` is intentionally an in-memory, read-only input: callers
+    may obtain it from Panel, but neither this function nor its result retains
+    technical UUIDs.  The returned redacted evidence is safe to place inside
+    the immutable manifest and is covered by its hash.
+    """
+
+    actual_by_reference = {_squad_reference(squad_uuid): inbound_uuids for squad_uuid, inbound_uuids in raw_inventory.items()}
+    expected_references = set(OWNER_APPROVED_SHARED_SQUAD_INVENTORY)
+    if set(actual_by_reference) != expected_references:
+        raise LegacyEntitlementSeedError('shared squad inventory has an unknown or missing raw technical squad')
+
+    shared_squads: list[dict[str, object]] = []
+    for reference in sorted(expected_references):
+        approved = OWNER_APPROVED_SHARED_SQUAD_INVENTORY[reference]
+        raw_inbound_uuids = actual_by_reference[reference]
+        canonical_inbounds = tuple(
+            sorted({value.strip() for value in raw_inbound_uuids if isinstance(value, str) and value.strip()})
+        )
+        if len(canonical_inbounds) != approved.raw_inbounds_count:
+            raise LegacyEntitlementSeedError('shared squad raw inbound count differs from the approved inventory')
+        if _raw_inbound_membership_hash(canonical_inbounds) != approved.raw_inbound_membership_sha256:
+            raise LegacyEntitlementSeedError('shared squad raw inbound membership differs from the approved inventory')
+        shared_squads.append(
+            {
+                'squad_ref_sha256': reference,
+                'raw_inbounds_count': approved.raw_inbounds_count,
+                'raw_inbound_membership_sha256': approved.raw_inbound_membership_sha256,
+            }
+        )
+    return {
+        'inventory_snapshot_reference': OWNER_APPROVED_SHARED_SQUAD_INVENTORY_REFERENCE,
+        'shared_squads': shared_squads,
+    }
+
+
+async def validate_legacy_shared_squad_inventory_before_panel_sync(
+    db: AsyncSession,
+    subscription: Subscription,
+    *,
+    inventory_reader: LegacySharedSquadInventoryReader | None,
+) -> None:
+    """Fence a legacy shared-squad resync before any Panel mutation.
+
+    The application intentionally has no production Panel inventory reader in
+    this release.  Callers that resync/retry an existing legacy shared-squad
+    subscription must therefore inject a read-only inventory source; otherwise
+    they fail closed for manual reconcile.  Normal purchase issuance uses its
+    immutable owner-approved manifest and is not an import/relink operation.
+    """
+
+    from app.services.public_location_entitlement_service import get_subscription_resolved_entitlement
+
+    entitlement = await get_subscription_resolved_entitlement(db, subscription.id)
+    shared_references = {_squad_reference(squad_uuid) for squad_uuid in entitlement.squad_uuids}
+    expected_references = set(OWNER_APPROVED_SHARED_SQUAD_INVENTORY)
+    if not shared_references.intersection(expected_references):
+        return
+    if shared_references != expected_references:
+        raise LegacyEntitlementSeedError('legacy subscription has an incomplete or unknown shared squad set')
+    if inventory_reader is None:
+        raise LegacyEntitlementSeedError(
+            'legacy shared-squad panel sync requires an injected read-only inventory for manual reconcile'
+        )
+    raw_inventory = inventory_reader(subscription)
+    if inspect.isawaitable(raw_inventory):
+        raw_inventory = await raw_inventory
+    validate_approved_shared_squad_inventory(raw_inventory)
+
+
+def _approved_shared_squad_evidence(tariff_id: int, squad_uuids: tuple[str, ...]) -> dict[str, object]:
+    shared_references = {_squad_reference(squad_uuid) for squad_uuid in squad_uuids}
+    expected_references = set(OWNER_APPROVED_SHARED_SQUAD_INVENTORY)
+    if tariff_id in OWNER_APPROVED_ACTIVE_LEGACY_TARIFF_IDS and shared_references != expected_references:
+        raise LegacyEntitlementSeedError('active legacy tariff shared squad set differs from the approved inventory')
+    return {
+        'inventory_snapshot_reference': OWNER_APPROVED_SHARED_SQUAD_INVENTORY_REFERENCE,
+        'shared_squads': [
+            {
+                'squad_ref_sha256': reference,
+                'raw_inbounds_count': OWNER_APPROVED_SHARED_SQUAD_INVENTORY[reference].raw_inbounds_count,
+                'raw_inbound_membership_sha256': (
+                    OWNER_APPROVED_SHARED_SQUAD_INVENTORY[reference].raw_inbound_membership_sha256
+                ),
+            }
+            for reference in sorted(shared_references & expected_references)
+        ],
+    }
+
+
 def _manifest_hash(
     tariff_id: int,
     squad_uuids: tuple[str, ...],
-    membership_hashes: dict[str, str],
+    membership_hashes: dict[str, object],
     presentation_locations: tuple[dict[str, object], ...],
 ) -> str:
     raw = json.dumps(
@@ -191,10 +328,10 @@ def build_legacy_entitlement_seed_plan(
         expected_hash = OWNER_APPROVED_LEGACY_TARIFF_SQUAD_SET_HASHES.get(tariff_id)
         if not squads or actual_hash != expected_hash:
             raise LegacyEntitlementSeedError('legacy tariff squad set differs from the owner-approved baseline')
-        # The legacy technical squad list is the only stable non-Panel snapshot
-        # available in this release.  Its hash makes future inventory/relink
-        # drift observable without claiming that a live Panel read was made.
-        membership_hashes = {'legacy_technical_squad_set_sha256': actual_hash}
+        membership_hashes = {
+            'legacy_technical_squad_set_sha256': actual_hash,
+            **_approved_shared_squad_evidence(tariff_id, squads),
+        }
         manifests.append(
             _ManifestSeed(
                 tariff_id=tariff_id,

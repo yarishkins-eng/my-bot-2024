@@ -17,6 +17,8 @@ logger = structlog.get_logger(__name__)
 async def resync_user_subscriptions_with_panel(
     db: AsyncSession,
     user: User,
+    *,
+    legacy_shared_squad_inventory_reader=None,
 ) -> dict[str, Any]:
     """Resync all active subscriptions for a user with the RemnaWave panel.
 
@@ -71,6 +73,20 @@ async def resync_user_subscriptions_with_panel(
             panel_user_exists = bool(user.remnawave_uuid)
 
         try:
+            # Identity relink/resync must not write the shared legacy squads
+            # until a read-only inventory matches the approved raw-membership
+            # fixture.  The default production path has no such reader in this
+            # release, so it deliberately records a manual-reconcile failure
+            # before any Panel API call.
+            from app.services.legacy_entitlement_manifest_seed import (
+                validate_legacy_shared_squad_inventory_before_panel_sync,
+            )
+
+            await validate_legacy_shared_squad_inventory_before_panel_sync(
+                db,
+                subscription,
+                inventory_reader=legacy_shared_squad_inventory_reader,
+            )
             if panel_user_exists:
                 result = await service.update_remnawave_user(
                     db,

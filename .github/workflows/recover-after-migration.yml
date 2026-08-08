@@ -215,15 +215,16 @@ jobs:
               test "$(read_schema_revisions)" = "$TARGET_REVISIONS"
             else
               actual_revisions="$(read_schema_revisions)"
-              # Before `compose up` the old container may still be running only
-              # against the old schema.  Once 0095 commits, the candidate image
-              # owns the interrupted switch.  Reject the impossible old-image /
-              # target-schema cross-pair instead of claiming it can be restored.
-              if [ "$CURRENT_IMAGE_ID" = "$RECOVERY_IMAGE_ID" ]; then
-                test "$actual_revisions" = "$PREVIOUS_REVISIONS"
-              elif [ "$CURRENT_IMAGE_ID" = "$MIGRATION_IMAGE_ID" ]; then
-                test "$actual_revisions" = "$PREVIOUS_REVISIONS" -o "$actual_revisions" = "$TARGET_REVISIONS"
-              else
+              # Before `compose up` the captured old image may be stopped on
+              # the old schema.  Once 0100 commits, that image cannot issue
+              # immutable entitlement snapshots, so it must stay stopped: an
+              # additive schema never makes an old entitlement writer safe.
+              if [ "$actual_revisions" = "$TARGET_REVISIONS" ]; then
+                echo 'Refusing recovery: target schema is committed; old entitlement writer must remain stopped.' >&2
+                exit 14
+              fi
+              test "$actual_revisions" = "$PREVIOUS_REVISIONS"
+              if [ "$CURRENT_IMAGE_ID" != "$RECOVERY_IMAGE_ID" ] && [ "$CURRENT_IMAGE_ID" != "$MIGRATION_IMAGE_ID" ]; then
                 echo 'Refusing recovery: prepared state has an unknown running image.' >&2
                 exit 14
               fi

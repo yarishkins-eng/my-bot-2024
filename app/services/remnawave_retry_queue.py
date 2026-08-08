@@ -94,6 +94,21 @@ class RemnaWaveRetryQueue:
                         self._requeue(item, 'RemnaWave not configured')
                         continue
 
+                    # A retry is still an outbound entitlement sync.  Shared
+                    # legacy squads may be retried only with a separately
+                    # injected read-only inventory; this background worker has
+                    # none, so drift/missing evidence remains manual reconcile
+                    # rather than a raw UUID write.
+                    from app.services.legacy_entitlement_manifest_seed import (
+                        validate_legacy_shared_squad_inventory_before_panel_sync,
+                    )
+
+                    await validate_legacy_shared_squad_inventory_before_panel_sync(
+                        db,
+                        sub,
+                        inventory_reader=None,
+                    )
+
                     if item.action == 'create':
                         result = await service.create_remnawave_user(db, sub)
                     else:
