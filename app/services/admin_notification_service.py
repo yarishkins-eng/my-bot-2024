@@ -1493,6 +1493,16 @@ class AdminNotificationService:
             try:
                 await self.bot.send_message(**message_kwargs)
                 logger.info('Уведомление отправлено в чат', chat_id=self.chat_id, category=category)
+                # The manager copy has a strict allow-list and intentionally
+                # drops inline keyboards: a group member must not receive admin
+                # actions just because they can see the alert.
+                from app.services.manager_alert_service import manager_alert_service
+
+                await manager_alert_service.mirror_admin_category(
+                    self.bot,
+                    category.value if category else None,
+                    text,
+                )
                 return True
 
             except TelegramForbiddenError:

@@ -631,6 +631,16 @@ class RemnaWaveWebhookService:
         # _flush_node_events_after_delay уже ловит любые сюрпризы.
         await self._admin_service.send_webhook_notification(text)
 
+        # Never mirror the raw node name/address to the manager group.  It gets
+        # a separate status-only message, with no topology or configuration.
+        from app.services.manager_alert_service import manager_alert_service
+
+        await manager_alert_service.send_service_status(
+            self.bot,
+            restored=event_name == 'node.connection_restored',
+            event_count=total,
+        )
+
     # Жёсткий cap на общую длительность stop() — выше container'овского
     # terminationGracePeriodSeconds выходить нельзя, иначе SIGKILL.
     _STOP_DRAIN_TIMEOUT_SECONDS: float = 15.0

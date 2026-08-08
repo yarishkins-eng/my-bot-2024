@@ -9,6 +9,7 @@ from app.handlers import (
     balance,
     common,
     contests as user_contests,
+    manager_alerts,
     menu,
     polls as user_polls,
     promocode,
@@ -185,6 +186,7 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     dp.message.register(menu.cmd_cabinet, _CmdFilter('cabinet'))
     dp.message.register(menu.cmd_language, _CmdFilter('language'))
     dp.message.register(support.cmd_support, _CmdFilter('support'))
+    manager_alerts.register_handlers(dp)
 
     start.register_handlers(dp)
     menu.register_handlers(dp)

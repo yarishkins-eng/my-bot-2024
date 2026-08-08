@@ -170,6 +170,9 @@ class ReportingService:
                 message_thread_id=topic_id,
                 parse_mode='HTML',
             )
+            from app.services.manager_alert_service import ManagerAlertTopic, manager_alert_service
+
+            await manager_alert_service.send(self.bot, ManagerAlertTopic.REPORTS, report_text)
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
             logger.error('Не удалось отправить отчет', exc=exc)
             raise ReportingServiceError('Не удалось отправить отчет в чат') from exc

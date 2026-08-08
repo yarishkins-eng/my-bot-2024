@@ -36,7 +36,16 @@ class ChatTypeFilterMiddleware(BaseMiddleware):
         elif isinstance(event, CallbackQuery) and event.message:
             chat = event.message.chat
 
-        if chat is not None and chat.type != ChatType.PRIVATE:
+        # The manager-alert forum needs two owner-only setup commands.  Let only
+        # these exact commands through; every other group interaction remains
+        # ignored as before.
+        is_manager_alert_setup = (
+            isinstance(event, Message)
+            and event.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
+            and _is_manager_alert_setup_command(event.text)
+        )
+
+        if chat is not None and chat.type != ChatType.PRIVATE and not is_manager_alert_setup:
             logger.debug(
                 'Dropping non-private chat event',
                 chat_id=chat.id,
@@ -45,3 +54,8 @@ class ChatTypeFilterMiddleware(BaseMiddleware):
             return None
 
         return await handler(event, data)
+
+
+def _is_manager_alert_setup_command(text: str | None) -> bool:
+    command = (text or '').strip().split(maxsplit=1)[0].lower().split('@', maxsplit=1)[0]
+    return command in {'/manager_alert_bind', '/manager_alert_status'}
