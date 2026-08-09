@@ -122,6 +122,13 @@ class DailySubscriptionService:
         if not tariff:
             logger.warning('Тариф не найден для подписки', subscription_id=subscription.id)
             return 'error'
+        if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+            logger.error(
+                'Суточное списание AP-тарифа остановлено до дебета: нужен Device-First term workflow',
+                subscription_id=subscription.id,
+                manual_reconcile_required=True,
+            )
+            return 'error'
 
         raw_daily_price = tariff.daily_price_kopeks
         if raw_daily_price <= 0:

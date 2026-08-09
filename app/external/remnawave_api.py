@@ -119,6 +119,24 @@ class RemnaWaveInbound:
     raw_inbound: Any | None = None
 
 
+@dataclass(frozen=True)
+class RemnaWaveSubscriptionHost:
+    """Narrow, read-only Host shape used by public access-point discovery.
+
+    A Host ``remark`` is presentation data.  The two inbound identifiers are
+    intentionally kept server-side so the inventory adapter can join the Host
+    to Internal Squad inbounds without exposing a Panel implementation detail
+    to a cabinet or subscription response.
+    """
+
+    uuid: str
+    remark: str
+    config_profile_uuid: str
+    config_profile_inbound_uuid: str
+    is_hidden: bool
+    is_disabled: bool
+
+
 @dataclass
 class RemnaWaveInternalSquad:
     uuid: str
@@ -420,12 +438,24 @@ class RemnaWaveAPI:
             await self.session.close()
 
     async def _make_request(
-        self, method: str, endpoint: str, data: dict | None = None, params: dict | None = None
+        self,
+        method: str,
+        endpoint: str,
+        data: dict | None = None,
+        params: dict | None = None,
+        *,
+        log_endpoint: str | None = None,
+        redact_error_details: bool = False,
     ) -> dict:
         if not self.session:
             raise RemnaWaveAPIError('Session not initialized. Use async context manager.')
 
         url = f'{self.base_url}{endpoint}'
+        # A few read-only inventory endpoints require a technical UUID in the
+        # URL.  The request itself must retain it, but observability must not
+        # retain or publish it.  Callers opt in explicitly; normal API calls
+        # preserve their established diagnostics.
+        safe_endpoint = log_endpoint or endpoint
         max_retries = 3
         base_delay = 1.0
 
@@ -450,7 +480,7 @@ class RemnaWaveAPI:
                             'Retryable %s on %s %s, retry %s/%s after %ss',
                             response.status,
                             method,
-                            endpoint,
+                            safe_endpoint,
                             attempt + 1,
                             max_retries,
                             retry_after,
@@ -459,7 +489,11 @@ class RemnaWaveAPI:
                         continue
 
                     if response.status >= 400:
-                        error_message = response_data.get('message', f'HTTP {response.status}')
+                        error_message = (
+                            'Protected inventory request failed'
+                            if redact_error_details
+                            else response_data.get('message', f'HTTP {response.status}')
+                        )
                         # Downgrade known-harmless 400s to warning (caller handles them as success)
                         error_lower = str(error_message).lower()
                         is_harmless = response.status == 400 and (
@@ -476,8 +510,13 @@ class RemnaWaveAPI:
                             else logger.error
                         )
                         log('API Error %s: %s', response.status, error_message)
-                        log('Response: %s', response_text[:500])
-                        raise RemnaWaveAPIError(error_message, response.status, response_data)
+                        if not redact_error_details:
+                            log('Response: %s', response_text[:500])
+                        raise RemnaWaveAPIError(
+                            error_message,
+                            response.status,
+                            {} if redact_error_details else response_data,
+                        )
 
                     return response_data
 
@@ -487,8 +526,8 @@ class RemnaWaveAPI:
                     logger.warning(
                         'Request failed on retry / after s',
                         method=method,
-                        endpoint=endpoint,
-                        e=e,
+                        endpoint=safe_endpoint,
+                        e='redacted' if redact_error_details else e,
                         attempt=attempt + 1,
                         max_retries=max_retries,
                         delay=delay,
@@ -501,9 +540,11 @@ class RemnaWaveAPI:
                 logger.warning(
                     'RemnaWave request failed after retries (panel slow/unreachable)',
                     method=method,
-                    endpoint=endpoint,
-                    error=str(e)[:200],
+                    endpoint=safe_endpoint,
+                    error='redacted' if redact_error_details else str(e)[:200],
                 )
+                if redact_error_details:
+                    raise RemnaWaveTransientError('Protected inventory request failed') from e
                 raise RemnaWaveTransientError(f'Request failed: {e!s}')
             except TimeoutError as e:
                 # Total-request timeout — the panel was slow to respond. Transient:
@@ -512,11 +553,15 @@ class RemnaWaveAPI:
                 logger.warning(
                     'RemnaWave request timed out (panel slow)',
                     method=method,
-                    endpoint=endpoint,
-                    error=str(e)[:200],
+                    endpoint=safe_endpoint,
+                    error='redacted' if redact_error_details else str(e)[:200],
                 )
+                if redact_error_details:
+                    raise RemnaWaveTransientError('Protected inventory request timed out') from e
                 raise RemnaWaveTransientError(f'Request timed out: {method} {endpoint}') from e
 
+        if redact_error_details:
+            raise RemnaWaveTransientError('Protected inventory request retries exhausted')
         raise RemnaWaveTransientError(f'Max retries exceeded for {method} {endpoint}')
 
     async def create_user(
@@ -850,6 +895,38 @@ class RemnaWaveAPI:
         response = await self._make_request('GET', '/api/internal-squads')
         return [self._parse_internal_squad(squad) for squad in response['response']['internalSquads']]
 
+    async def get_access_point_inventory_internal_squads(self) -> list[RemnaWaveInternalSquad]:
+        """Read Internal Squads with inventory-safe diagnostics only."""
+
+        response = await self._make_request(
+            'GET',
+            '/api/internal-squads',
+            log_endpoint='access-point-inventory/internal-squads',
+            redact_error_details=True,
+        )
+        return [self._parse_internal_squad(squad) for squad in response['response']['internalSquads']]
+
+    async def get_subscription_hosts(self) -> list[RemnaWaveSubscriptionHost]:
+        """Read subscription-visible Hosts without returning network metadata.
+
+        RemnaWave 2.8.x returns a top-level list from ``GET /api/hosts``.  Do
+        not generalise this method into a raw Host API: the access-point
+        adapter needs only the title, stable identity and Host-to-Inbound join.
+        """
+
+        response = await self._make_request(
+            'GET',
+            '/api/hosts',
+            log_endpoint='access-point-inventory/hosts',
+            redact_error_details=True,
+        )
+        hosts = response.get('response')
+        if not isinstance(hosts, list):
+            raise RemnaWaveAPIError('GET /api/hosts returned an invalid response')
+        if not all(isinstance(host, dict) for host in hosts):
+            raise RemnaWaveAPIError('GET /api/hosts returned an invalid Host record')
+        return [self._parse_subscription_host(host) for host in hosts]
+
     async def get_internal_squad_by_uuid(self, uuid: str) -> RemnaWaveInternalSquad | None:
         try:
             response = await self._make_request('GET', f'/api/internal-squads/{uuid}')
@@ -883,7 +960,12 @@ class RemnaWaveAPI:
     async def get_internal_squad_accessible_nodes(self, uuid: str) -> list[RemnaWaveAccessibleNode]:
         """Получает список доступных нод для Internal Squad"""
         try:
-            response = await self._make_request('GET', f'/api/internal-squads/{uuid}/accessible-nodes')
+            response = await self._make_request(
+                'GET',
+                f'/api/internal-squads/{uuid}/accessible-nodes',
+                log_endpoint='/api/internal-squads/{redacted}/accessible-nodes',
+                redact_error_details=True,
+            )
             return [self._parse_accessible_node(node) for node in response['response']['accessibleNodes']]
         except RemnaWaveAPIError as e:
             if e.status_code == 404:
@@ -1006,6 +1088,17 @@ class RemnaWaveAPI:
 
     async def get_all_nodes(self) -> list[RemnaWaveNode]:
         response = await self._make_request('GET', '/api/nodes')
+        return [self._parse_node(node) for node in response['response']]
+
+    async def get_access_point_inventory_nodes(self) -> list[RemnaWaveNode]:
+        """Read node health evidence with inventory-safe diagnostics only."""
+
+        response = await self._make_request(
+            'GET',
+            '/api/nodes',
+            log_endpoint='access-point-inventory/nodes',
+            redact_error_details=True,
+        )
         return [self._parse_node(node) for node in response['response']]
 
     async def get_node_by_uuid(self, uuid: str) -> RemnaWaveNode | None:
@@ -1687,6 +1780,35 @@ class RemnaWaveAPI:
             security=inbound_data.get('security'),
             port=inbound_data.get('port'),
             raw_inbound=inbound_data.get('rawInbound'),
+        )
+
+    def _parse_subscription_host(self, host_data: dict) -> RemnaWaveSubscriptionHost:
+        """Parse an access-point Host fail-closed against the verified contract."""
+
+        inbound = host_data.get('inbound')
+        if not isinstance(inbound, dict):
+            raise RemnaWaveAPIError('GET /api/hosts returned an invalid Host inbound')
+
+        def required_string(source: dict, field: str, *, preserve_whitespace: bool = False) -> str:
+            value = source.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise RemnaWaveAPIError('GET /api/hosts returned an incomplete Host record')
+            return value if preserve_whitespace else value.strip()
+
+        def required_bool(source: dict, field: str) -> bool:
+            value = source.get(field)
+            if not isinstance(value, bool):
+                raise RemnaWaveAPIError('GET /api/hosts returned an invalid Host visibility state')
+            return value
+
+        return RemnaWaveSubscriptionHost(
+            uuid=required_string(host_data, 'uuid'),
+            # Host title is presentation evidence: preserve it byte-for-byte.
+            remark=required_string(host_data, 'remark', preserve_whitespace=True),
+            config_profile_uuid=required_string(inbound, 'configProfileUuid'),
+            config_profile_inbound_uuid=required_string(inbound, 'configProfileInboundUuid'),
+            is_hidden=required_bool(host_data, 'isHidden'),
+            is_disabled=required_bool(host_data, 'isDisabled'),
         )
 
     def _parse_internal_squad(self, squad_data: dict) -> RemnaWaveInternalSquad:

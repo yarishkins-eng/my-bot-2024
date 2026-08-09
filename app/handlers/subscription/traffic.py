@@ -518,6 +518,14 @@ async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSes
     if subscription is None:
         return
 
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='traffic top-up')
+    except AccessPointPolicyError:
+        await callback.answer('⚠️ Докупка трафика для этого тарифа пока недоступна.', show_alert=True)
+        return
+
     # Получаем цену: из тарифа или из глобальных настроек
     base_price = 0
     tariff = None

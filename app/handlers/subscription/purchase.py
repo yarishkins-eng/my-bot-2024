@@ -3302,6 +3302,10 @@ async def handle_toggle_daily_subscription_pause(callback: types.CallbackQuery, 
     )
     needs_resume = was_paused or is_inactive
 
+    if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+        await callback.answer('❌ Для этого тарифа требуется защищённое оформление Device-First', show_alert=True)
+        return
+
     # При возобновлении проверяем баланс
     if needs_resume:
         from app.services.public_location_entitlement_service import (

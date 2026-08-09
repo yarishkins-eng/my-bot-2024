@@ -48,6 +48,20 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix='/admin/tariffs', tags=['Cabinet Admin Tariffs'])
 
 
+async def _ensure_tariff_sellable(db: AsyncSession, tariff: Tariff) -> None:
+    """Fence every admin activation/trial path before any persistent effect."""
+
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, assert_tariff_sellable
+
+    try:
+        await assert_tariff_sellable(db, tariff)
+    except EntitlementResolutionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f'Tariff has no verified entitlement policy: {exc}',
+        ) from exc
+
+
 async def _get_tariff_servers(
     db: AsyncSession, allowed_squads: list[str], server_traffic_limits: dict = None
 ) -> list[ServerInfo]:
@@ -151,18 +165,11 @@ async def get_available_servers(
     admin: User = Depends(require_permission('tariffs:read')),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Get list of all servers for tariff selection."""
-    servers, _ = await get_all_server_squads(db, available_only=False)
-    return [
-        ServerInfo(
-            id=server.id,
-            squad_uuid=server.squad_uuid,
-            display_name=server.display_name,
-            country_code=server.country_code,
-            is_selected=False,
-        )
-        for server in servers
-    ]
+    """Hard-close raw Internal Squad discovery for the tariff editor."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Raw Squad catalog is retired; use the access-point catalog.',
+    )
 
 
 @router.get('/available-external-squads', response_model=list[ExternalSquadInfoResponse])
@@ -281,6 +288,11 @@ async def create_new_tariff(
             status_code=status.HTTP_410_GONE,
             detail='Raw Squad tariff mutation is retired; assign PublicLocations after creating an inactive tariff.',
         )
+    if request.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='A tariff must be created inactive until a validated entitlement policy is attached.',
+        )
     period_prices_dict = _period_prices_to_dict(request.period_prices)
 
     # Преобразуем ServerTrafficLimit в dict для хранения
@@ -295,7 +307,7 @@ async def create_new_tariff(
             db=db,
             name=request.name,
             description=request.description,
-            is_active=request.is_active,
+            is_active=False,
             allow_traffic_topup=request.allow_traffic_topup,
             traffic_topup_enabled=request.traffic_topup_enabled,
             traffic_topup_packages=request.traffic_topup_packages,
@@ -333,6 +345,14 @@ async def create_new_tariff(
     except ValueError as error:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
 
+    # New tariffs are explicit non-sellable drafts.  The access-point policy
+    # endpoint is the only path that may transition this to a future-issuance
+    # policy; ordinary create never inherits []/NULL = all semantics.
+    tariff.entitlement_mode = 'no_locations'
+    tariff.access_point_policy_revision = 0
+    await db.commit()
+    await db.refresh(tariff)
+
     logger.info('Admin created tariff', admin_id=admin.id, tariff_id=tariff.id, tariff_name=tariff.name)
 
     # Перезагружаем периоды из БД для синхронизации с ботом
@@ -365,6 +385,9 @@ async def update_existing_tariff(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Tariff not found',
         )
+
+    if request.is_active is True and not tariff.is_active:
+        await _ensure_tariff_sellable(db, tariff)
 
     # Capture old values for change detection
     old_squads = list(tariff.allowed_squads) if tariff.allowed_squads else []
@@ -517,6 +540,8 @@ async def toggle_tariff(
         )
 
     new_status = not tariff.is_active
+    if new_status:
+        await _ensure_tariff_sellable(db, tariff)
     await update_tariff(db, tariff, is_active=new_status)
 
     status_text = 'activated' if new_status else 'deactivated'
@@ -551,6 +576,9 @@ async def toggle_trial_tariff(
         )
 
     new_status = not tariff.is_trial_available
+
+    if new_status:
+        await _ensure_tariff_sellable(db, tariff)
 
     if new_status:
         # При включении триала - снимаем флаг со ВСЕХ тарифов, затем ставим на текущий
@@ -633,6 +661,10 @@ async def get_tariff_stats(
 
 async def _background_sync_squads(tariff_id: int, admin_id: int) -> None:
     """Run squad sync in background with its own DB session (fire-and-forget)."""
+    raise RuntimeError('Tariff save must never execute a Panel squad sync; use a separately released plan executor.')
+
+    # Kept unreachable only for short-term source-history audit.  A production
+    # route/worker has no reference to this body and cannot turn it on by flag.
     from app.database.database import AsyncSessionLocal
     from app.services.remnawave_service import RemnaWaveService
 
@@ -738,6 +770,8 @@ async def _retired_sync_tariff_squads(
     admin: User,
     db: AsyncSession,
 ) -> SyncSquadsResponse:
+    raise RuntimeError('Tariff mass squad execution is retired and cannot be invoked from this release.')
+
     tariff = await get_tariff_by_id(db, tariff_id)
     if not tariff:
         raise HTTPException(

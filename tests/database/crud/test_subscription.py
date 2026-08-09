@@ -136,6 +136,58 @@ async def test_extend_subscription_default_converts_trial_on_purchase(monkeypatc
     assert result.is_trial is False  # genuine purchase converts the trial
 
 
+async def test_early_access_point_renewal_keeps_current_squads_until_projection_boundary(monkeypatch):
+    """The future paid term is captured now, but cannot alter live Panel data."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.database.crud.subscription import extend_subscription
+
+    monkeypatch.setattr('app.database.crud.subscription._assert_user_not_in_financial_closure', AsyncMock())
+    monkeypatch.setattr('app.database.crud.subscription._lock_subscription_row', AsyncMock())
+    monkeypatch.setattr('app.database.crud.subscription._housekeep_expired_purchases', AsyncMock())
+    monkeypatch.setattr('app.database.crud.subscription.clear_notifications', AsyncMock())
+    monkeypatch.setattr(
+        'app.database.crud.subscription.deactivate_user_trial_subscriptions', AsyncMock(return_value=[])
+    )
+    capture = AsyncMock()
+    monkeypatch.setattr('app.services.public_access_point_service.capture_access_point_entitlement_term', capture)
+
+    now = datetime.now(UTC)
+    tariff = SimpleNamespace(id=4, entitlement_mode='access_point_managed', is_daily=False)
+    db = SimpleNamespace(get=AsyncMock(return_value=tariff), flush=AsyncMock())
+    subscription = SimpleNamespace(
+        id=17,
+        user_id=7,
+        status='active',
+        is_trial=False,
+        start_date=now - timedelta(days=25),
+        end_date=now + timedelta(days=5),
+        tariff_id=4,
+        traffic_limit_gb=10,
+        traffic_used_gb=0.0,
+        device_limit=1,
+        connected_squads=['squad-old'],
+        purchased_traffic_gb=0,
+        updated_at=now,
+    )
+    entitlement = ResolvedEntitlement(('point-new',), ('squad-new',), 2, 'access_point_policy', 'fp-new')
+
+    await extend_subscription(
+        db,
+        subscription,
+        30,
+        tariff_id=4,
+        connected_squads=['squad-new'],
+        commit=False,
+        _resolved_entitlement=entitlement,
+        _access_point_term_source_reference='checkout:future',
+    )
+
+    assert subscription.connected_squads == ['squad-old']
+    assert subscription.end_date > now + timedelta(days=30)
+    capture.assert_awaited_once()
+
+
 def _trial_sub(sub_id, user_id, panel_uuid):
     from types import SimpleNamespace
 

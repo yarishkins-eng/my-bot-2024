@@ -322,6 +322,12 @@ async def add_subscription_traffic_endpoint(
     db: AsyncSession = Depends(get_db_session),
 ) -> SubscriptionResponse:
     subscription = await _get_subscription(db, subscription_id)
+    from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='add_traffic')
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     subscription = await add_subscription_traffic(db, subscription, payload.gb)
 
     # Реактивируем подписку если она была DISABLED/EXPIRED (например, после LIMITED/EXPIRED в RemnaWave)
@@ -352,6 +358,12 @@ async def add_subscription_devices_endpoint(
     db: AsyncSession = Depends(get_db_session),
 ) -> SubscriptionResponse:
     subscription = await _get_subscription(db, subscription_id)
+    from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='add_devices')
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     subscription = await add_subscription_devices(db, subscription, payload.devices)
 
     # Реактивируем подписку если она была DISABLED/EXPIRED (например, после LIMITED/EXPIRED в RemnaWave)

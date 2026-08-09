@@ -14,13 +14,172 @@ from __future__ import annotations
 import base64
 from unittest.mock import AsyncMock
 
+import aiohttp
 import pytest
 
-from app.external.remnawave_api import RemnaWaveAPI, RemnaWaveAPIError
+from app.external import remnawave_api as remnawave_api_module
+from app.external.remnawave_api import RemnaWaveAPI, RemnaWaveAPIError, RemnaWaveTransientError
 
 
 def _api() -> RemnaWaveAPI:
     return RemnaWaveAPI('http://panel.local', 'key')
+
+
+@pytest.mark.asyncio
+async def test_get_subscription_hosts_keeps_only_access_point_inventory_fields():
+    api = _api()
+    api._make_request = AsyncMock(
+        return_value={
+            'response': [
+                {
+                    'uuid': 'host-key',
+                    'remark': 'Польша 2',
+                    'inbound': {
+                        'configProfileUuid': 'profile-key',
+                        'configProfileInboundUuid': 'inbound-key',
+                    },
+                    'isHidden': False,
+                    'isDisabled': True,
+                    'address': 'must-not-cross-the-adapter-boundary',
+                }
+            ]
+        }
+    )
+
+    hosts = await api.get_subscription_hosts()
+
+    api._make_request.assert_awaited_once_with(
+        'GET',
+        '/api/hosts',
+        log_endpoint='access-point-inventory/hosts',
+        redact_error_details=True,
+    )
+    assert hosts[0].remark == 'Польша 2'
+    assert hosts[0].config_profile_uuid == 'profile-key'
+    assert hosts[0].config_profile_inbound_uuid == 'inbound-key'
+    assert hosts[0].is_disabled is True
+    assert not hasattr(hosts[0], 'address')
+
+
+@pytest.mark.parametrize(
+    'host',
+    [
+        {'uuid': 'host-key', 'remark': 'Польша', 'inbound': {}},
+        {
+            'uuid': 'host-key',
+            'remark': 'Польша',
+            'inbound': {'configProfileUuid': 'profile', 'configProfileInboundUuid': 'inbound'},
+            'isHidden': 'false',
+            'isDisabled': False,
+        },
+        {
+            'uuid': 'host-key',
+            'remark': 'Польша',
+            'inbound': {'configProfileUuid': 'profile', 'configProfileInboundUuid': 'inbound'},
+            'isHidden': False,
+        },
+    ],
+)
+async def test_get_subscription_hosts_rejects_incomplete_or_untyped_visibility_contract(host):
+    api = _api()
+    api._make_request = AsyncMock(return_value={'response': [host]})
+
+    with pytest.raises(RemnaWaveAPIError, match='Host'):
+        await api.get_subscription_hosts()
+
+
+class _LogCapture:
+    def __init__(self) -> None:
+        self.entries: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def warning(self, *args: object, **kwargs: object) -> None:
+        self.entries.append((args, kwargs))
+
+    def error(self, *args: object, **kwargs: object) -> None:
+        self.entries.append((args, kwargs))
+
+
+class _FakeResponse:
+    def __init__(self, *, status: int, body: str) -> None:
+        self.status = status
+        self._body = body
+        self.headers: dict[str, str] = {}
+
+    async def text(self) -> str:
+        return self._body
+
+
+class _ResponseContext:
+    def __init__(self, response: _FakeResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self._response
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class _ErrorSession:
+    def __init__(self, response: _FakeResponse | None = None, error: Exception | None = None) -> None:
+        self._response = response
+        self._error = error
+
+    def request(self, *_args: object, **_kwargs: object) -> _ResponseContext:
+        if self._error is not None:
+            raise self._error
+        assert self._response is not None
+        return _ResponseContext(self._response)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('method_name', 'requires_squad_uuid'),
+    [
+        ('get_subscription_hosts', False),
+        ('get_access_point_inventory_internal_squads', False),
+        ('get_access_point_inventory_nodes', False),
+        ('get_internal_squad_accessible_nodes', True),
+    ],
+)
+async def test_sensitive_inventory_http_failure_never_logs_or_raises_raw_identifiers(
+    monkeypatch,
+    method_name: str,
+    requires_squad_uuid: bool,
+):
+    squad_uuid = 'private-squad-uuid'
+    host_uuid = 'private-host-uuid'
+    api = _api()
+    api.session = _ErrorSession(response=_FakeResponse(status=500, body=f'{{"message":"{squad_uuid} {host_uuid}"}}'))
+    captured = _LogCapture()
+    monkeypatch.setattr(remnawave_api_module, 'logger', captured)
+
+    with pytest.raises(RemnaWaveAPIError) as exc_info:
+        method = getattr(api, method_name)
+        if requires_squad_uuid:
+            await method(squad_uuid)
+        else:
+            await method()
+
+    evidence = repr((captured.entries, str(exc_info.value), exc_info.value.response_data))
+    assert squad_uuid not in evidence
+    assert host_uuid not in evidence
+
+
+@pytest.mark.asyncio
+async def test_sensitive_accessible_nodes_transient_failure_never_logs_or_raises_raw_identifier(monkeypatch):
+    squad_uuid = 'private-squad-uuid'
+    api = _api()
+    api.session = _ErrorSession(error=aiohttp.ClientError(f'failed for {squad_uuid}'))
+    captured = _LogCapture()
+    monkeypatch.setattr(remnawave_api_module, 'logger', captured)
+    monkeypatch.setattr(remnawave_api_module.asyncio, 'sleep', AsyncMock())
+
+    with pytest.raises(RemnaWaveTransientError) as exc_info:
+        await api.get_internal_squad_accessible_nodes(squad_uuid)
+
+    evidence = repr((captured.entries, str(exc_info.value)))
+    assert squad_uuid not in evidence
 
 
 @pytest.fixture(autouse=True)

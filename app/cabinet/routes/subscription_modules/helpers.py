@@ -19,6 +19,7 @@ from app.database.models import Subscription, User
 from app.utils.grace import is_in_grace
 
 from ...schemas.subscription import (
+    PublicAccessPointInfo,
     ServerInfo,
     SubscriptionResponse,
 )
@@ -171,6 +172,8 @@ def _subscription_to_response(
     traffic_purchases: list[dict[str, Any]] | None = None,
     user: User | None = None,
     disabled_reason_hint: str | None = None,
+    access_points: list[PublicAccessPointInfo] | None = None,
+    redact_technical_access: bool = False,
 ) -> SubscriptionResponse:
     """Convert Subscription model to response."""
     now = datetime.now(UTC)
@@ -226,6 +229,9 @@ def _subscription_to_response(
     # unloaded SQLAlchemy relationship would attempt async IO here and raise
     # MissingGreenlet after the subscription transaction has already committed.
     loaded_tariff = subscription.__dict__.get('tariff')
+    redact_technical_access = redact_technical_access or bool(
+        loaded_tariff is not None and getattr(loaded_tariff, 'entitlement_mode', None) == 'access_point_managed'
+    )
     is_daily = bool(getattr(loaded_tariff, 'is_daily', False))
     daily_price_kopeks = None
 
@@ -286,8 +292,9 @@ def _subscription_to_response(
         traffic_used_gb=round(traffic_used_gb, 2),
         traffic_used_percent=round(traffic_used_percent, 1),
         device_limit=subscription.device_limit or 0,
-        connected_squads=subscription.connected_squads or [],
-        servers=servers or [],
+        connected_squads=[] if redact_technical_access else subscription.connected_squads or [],
+        servers=[] if redact_technical_access else servers or [],
+        access_points=access_points or [],
         autopay_enabled=subscription.autopay_enabled or False,
         autopay_days_before=subscription.autopay_days_before or 3,
         subscription_url=subscription.subscription_url,

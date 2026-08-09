@@ -868,8 +868,28 @@ class UserService:
             from app.database.models import SubscriptionStatus
 
             now = datetime.now(UTC)
+            access_point_reprojection_armed = False
             for sub in getattr(user, 'subscriptions', None) or []:
                 if sub.end_date and sub.end_date > now and sub.status != SubscriptionStatus.ACTIVE.value:
+                    from app.services.public_access_point_service import (
+                        AccessPointPolicyError,
+                        assert_no_manual_access_point_grant,
+                    )
+
+                    try:
+                        await assert_no_manual_access_point_grant(db, sub, action='unblock_reactivation')
+                    except AccessPointPolicyError:
+                        from app.services.public_access_point_service import requeue_active_access_point_term_projection
+
+                        if await requeue_active_access_point_term_projection(
+                            db,
+                            sub,
+                            reason='account_unblock',
+                        ):
+                            sub.status = SubscriptionStatus.ACTIVE.value
+                            access_point_reprojection_armed = True
+                            logger.info('AP subscription rearmed from active captured term', subscription_id=sub.id)
+                        continue
                     sub.status = SubscriptionStatus.ACTIVE.value
                     try:
                         from app.services.subscription_service import SubscriptionService
@@ -898,6 +918,10 @@ class UserService:
                                 action='update',
                             )
             await db.commit()
+            if access_point_reprojection_armed:
+                from app.services.monitoring_service import monitoring_service
+
+                monitoring_service.wake_access_point_term_projection_scheduler()
 
             logger.info('Админ разблокировал пользователя', admin_id=admin_id, user_id=user_id)
             return True

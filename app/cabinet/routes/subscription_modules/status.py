@@ -21,11 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.models import ServerSquad, User
+from app.services.public_access_point_service import get_effective_public_access_points
 from app.services.remnawave_service import RemnaWaveService
 from app.services.system_settings_service import bot_configuration_service
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from ...schemas.subscription import (
+    PublicAccessPointInfo,
     ServerInfo,
     SubscriptionStatusResponse,
 )
@@ -100,9 +102,13 @@ async def get_subscription(
             subscription.tariff = tariff
             tariff_name = tariff.name
 
-    # Fetch server names for connected squads
+    effective_access_points = await get_effective_public_access_points(db, subscription)
+    is_access_point_subscription = effective_access_points is not None
+
+    # Fetch server names for connected squads. AP terms use a separate public
+    # title view below; technical squad UUIDs never leave this endpoint.
     servers: list[ServerInfo] = []
-    connected_squads = subscription.connected_squads or []
+    connected_squads = [] if is_access_point_subscription else subscription.connected_squads or []
     if connected_squads:
         result = await db.execute(select(ServerSquad).where(ServerSquad.squad_uuid.in_(connected_squads)))
         server_squads = result.scalars().all()
@@ -157,6 +163,10 @@ async def get_subscription(
         traffic_purchases_data,
         user=fresh_user,
         disabled_reason_hint=disabled_reason_hint,
+        access_points=[
+            PublicAccessPointInfo(id=point.id, title=point.title) for point in (effective_access_points or ())
+        ],
+        redact_technical_access=is_access_point_subscription,
     )
     return SubscriptionStatusResponse(has_subscription=True, subscription=subscription_data)
 

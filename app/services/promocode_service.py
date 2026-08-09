@@ -143,6 +143,7 @@ class PromoCodeService:
                     'subscription_not_found',
                     'trial_subscription_exists',
                     'trial_provisioning_failed',
+                    'access_point_trial_unsupported',
                 ):
                     return {'success': False, 'error': error_key}
                 raise
@@ -419,6 +420,12 @@ class PromoCodeService:
                     trial_squads = list((await resolve_tariff_entitlement(db, trial_tariff)).squad_uuids)
             except Exception as e:
                 logger.error('Ошибка получения тарифа для триального промокода', error=e)
+
+            # Promo codes are a legacy trial issuer, not a Device-First
+            # financial checkout. Refuse AP tariffs before the helper can
+            # create/revive a subscription or make a raw Panel call.
+            if getattr(trial_tariff, 'entitlement_mode', None) == 'access_point_managed':
+                raise ValueError('access_point_trial_unsupported')
 
             # Check if user already has a subscription with the same tariff
             existing_same_tariff_sub = None

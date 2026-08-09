@@ -256,6 +256,16 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     else:
         logger.info('Мониторинг техработ отключен настройками')
 
+    # A paid access-point term is an authorization boundary.  Start its
+    # dedicated scheduler regardless of the optional housekeeping monitor.
+    try:
+        from app.services.monitoring_service import monitoring_service
+
+        await monitoring_service.start_access_point_term_projection_worker()
+        logger.info('Boundary-проектор access-point entitlement terms запущен')
+    except Exception as e:
+        logger.error('Ошибка запуска boundary-проектора access-point term', error=e)
+
     logger.info('🛡️ GlobalErrorMiddleware активирован - бот защищен от устаревших callback queries')
 
     # Validate CONNECT_BUTTON_MODE dependencies
@@ -350,6 +360,14 @@ async def shutdown_bot():
         logger.info('Мониторинг техработ остановлен')
     except Exception as e:
         logger.error('Ошибка остановки мониторинга', error=e)
+
+    try:
+        from app.services.monitoring_service import monitoring_service
+
+        monitoring_service.stop_access_point_term_projection_worker()
+        logger.info('Boundary-проектор access-point entitlement terms остановлен')
+    except Exception as e:
+        logger.error('Ошибка остановки boundary-проектора access-point term', error=e)
 
     try:
         await cache.close()

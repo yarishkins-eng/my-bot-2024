@@ -1697,6 +1697,9 @@ class Tariff(Base):
     # migration is allowed to infer its meaning.
     entitlement_mode = Column(String(32), nullable=False, default='legacy_snapshot', server_default='legacy_snapshot')
     location_policy_revision = Column(Integer, nullable=False, default=1, server_default='1')
+    # Zero means no subscription-visible Host-title policy has ever been
+    # attached.  The new mode cannot be sold until a non-empty revision exists.
+    access_point_policy_revision = Column(Integer, nullable=False, default=0, server_default='0')
 
     # Лимиты трафика по серверам (JSON: {"uuid": {"traffic_limit_gb": 100}, ...})
     # Если сервер не указан - используется общий traffic_limit_gb
@@ -2521,6 +2524,10 @@ class SubscriptionCheckout(Base):
     wallet_applied_kopeks = Column(Integer, nullable=False, default=0)
     external_payable_kopeks = Column(Integer, nullable=False, default=0)
     funding_mode = Column(String(32), nullable=True)
+    # Captured before a customer can select a funding method.  Unlike the
+    # post-payment ``sale_snapshot`` this is the fence that makes a policy or
+    # inventory change return a requote *before* any debit/invoice can exist.
+    entitlement_quote_snapshot = Column(JSON, nullable=False, default=dict)
     sale_snapshot = Column(JSON, nullable=False, default=dict)
     financial_committed_at = Column(AwareDateTime(), nullable=True)
     funding_state = Column(String(32), nullable=False, default='unfunded')
@@ -3558,6 +3565,156 @@ class PublicLocation(Base):
     updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
 
 
+class PublicAccessPoint(Base):
+    """One independently revocable title exactly as shown in a subscription.
+
+    ``panel_host_key`` is server-only identity material.  It is intentionally
+    not a relationship to ServerSquad because the legacy raw-squad sync can
+    rewrite that projection and must never become an entitlement source.
+    """
+
+    __tablename__ = 'public_access_points'
+
+    id = Column(String(36), primary_key=True)
+    panel_host_key = Column(String(255), nullable=False, unique=True)
+    title = Column(String(255), nullable=False)
+    state = Column(String(32), nullable=False, default='needs_verification')
+    state_reason = Column(Text, nullable=True)
+    presentation_revision = Column(Integer, nullable=False, default=1)
+    entitlement_revision = Column(Integer, nullable=False, default=1)
+    inventory_revision = Column(String(128), nullable=True)
+    inventory_fingerprint = Column(String(128), nullable=False)
+    graph_fingerprint = Column(String(128), nullable=False)
+    tariff_assignable = Column(Boolean, nullable=False, default=False)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now())
+
+
+class PublicAccessPointSquadMapping(Base):
+    """Verified dedicated server-side projection for a public access point."""
+
+    __tablename__ = 'public_access_point_squad_mappings'
+    __table_args__ = (
+        UniqueConstraint('public_access_point_id', 'internal_squad_key', name='uq_public_access_point_squad'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    public_access_point_id = Column(
+        String(36), ForeignKey('public_access_points.id', ondelete='RESTRICT'), nullable=False, index=True
+    )
+    # A unique internal Squad can belong to only one independently selectable
+    # point.  If a graph would share it, discovery marks every Host unsafe.
+    internal_squad_key = Column(String(255), nullable=False, unique=True)
+    is_dedicated_verified = Column(Boolean, nullable=False, default=False)
+    is_current = Column(Boolean, nullable=False, default=True)
+    graph_fingerprint = Column(String(128), nullable=False)
+    inventory_revision = Column(String(128), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+
+
+class TariffAccessPointPolicyRevision(Base):
+    """Append-only selection for future access-point issuance."""
+
+    __tablename__ = 'tariff_access_point_policy_revisions'
+    __table_args__ = (UniqueConstraint('tariff_id', 'revision', name='uq_tariff_access_point_policy_revision'),)
+
+    id = Column(Integer, primary_key=True)
+    tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='RESTRICT'), nullable=False, index=True)
+    revision = Column(Integer, nullable=False)
+    selection_hash = Column(String(128), nullable=False)
+    inventory_fingerprint = Column(String(128), nullable=False)
+    reason = Column(Text, nullable=False)
+    actor_user_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+
+
+class TariffAccessPointPolicyItem(Base):
+    __tablename__ = 'tariff_access_point_policy_items'
+    __table_args__ = (
+        UniqueConstraint('policy_revision_id', 'public_access_point_id', name='uq_tariff_access_point_policy_item'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    policy_revision_id = Column(
+        Integer, ForeignKey('tariff_access_point_policy_revisions.id', ondelete='RESTRICT'), nullable=False, index=True
+    )
+    public_access_point_id = Column(
+        String(36), ForeignKey('public_access_points.id', ondelete='RESTRICT'), nullable=False
+    )
+
+
+class TariffAccessPointConversion(Base):
+    """Owner-approved bridge from a legacy manifest; never inferred by code."""
+
+    __tablename__ = 'tariff_access_point_conversions'
+
+    tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='RESTRICT'), primary_key=True)
+    legacy_manifest_hash = Column(String(128), nullable=False, unique=True)
+    policy_revision = Column(Integer, nullable=False)
+    conversion_hash = Column(String(128), nullable=False, unique=True)
+    # Opaque audit handles from the separately protected Panel preparation.
+    # They are evidence, not browser input, and never contain raw squad keys.
+    prepared_operation_reference = Column(String(255), nullable=False)
+    readback_evidence_hash = Column(String(128), nullable=False)
+    approved_by_user_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    approval_reason = Column(Text, nullable=False)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+
+
+class SubscriptionEntitlementTerm(Base):
+    """Immutable access evidence for one paid or future entitlement term."""
+
+    __tablename__ = 'subscription_entitlement_terms'
+    __table_args__ = (UniqueConstraint('subscription_id', 'term_version', name='uq_subscription_entitlement_term'),)
+
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='RESTRICT'), nullable=False, index=True)
+    tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='RESTRICT'), nullable=True)
+    term_version = Column(Integer, nullable=False)
+    starts_at = Column(AwareDateTime(), nullable=False)
+    ends_at = Column(AwareDateTime(), nullable=False)
+    access_point_ids = Column(JSON, nullable=False)
+    technical_squad_keys = Column(JSON, nullable=False)
+    policy_revision = Column(Integer, nullable=False)
+    inventory_fingerprint = Column(String(128), nullable=False)
+    source_reference = Column(String(255), nullable=True, unique=True)
+    provenance = Column(String(32), nullable=False)
+    grant_hash = Column(String(128), nullable=False, unique=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+
+
+class SubscriptionEntitlementTermProjectionOutbox(Base):
+    """Durable delayed Panel projection for a future paid access-point term.
+
+    A renewal may be bought before its new grant becomes effective.  The
+    immutable term is financial evidence; this outbox is the separately
+    retryable instruction to project that already-captured evidence to the
+    Panel *at* its boundary.  It intentionally stores no mutable tariff
+    policy and no browser-facing technical data.
+    """
+
+    __tablename__ = 'subscription_entitlement_term_projection_outbox'
+
+    id = Column(Integer, primary_key=True)
+    term_id = Column(
+        Integer,
+        ForeignKey('subscription_entitlement_terms.id', ondelete='RESTRICT'),
+        nullable=False,
+        unique=True,
+    )
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='RESTRICT'), nullable=False, index=True)
+    effective_at = Column(AwareDateTime(), nullable=False, index=True)
+    state = Column(String(24), nullable=False, default='pending')
+    attempts = Column(Integer, nullable=False, default=0)
+    # Monotonic lease fence.  A worker may project only the epoch it claimed;
+    # a reclaimed/stale job must abort before any Panel write.
+    claim_epoch = Column(Integer, nullable=False, default=0)
+    claimed_at = Column(AwareDateTime(), nullable=True)
+    delivered_at = Column(AwareDateTime(), nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+
+
 class PublicLocationSquadMapping(Base):
     __tablename__ = 'public_location_squad_mappings'
     __table_args__ = (UniqueConstraint('public_location_id', 'internal_squad_uuid', name='uq_public_location_squad'),)
@@ -3615,6 +3772,10 @@ class SubscriptionEntitlementSnapshot(Base):
     technical_squad_uuids = Column(JSON, nullable=False)
     policy_revision = Column(Integer, nullable=False)
     provenance = Column(String(32), nullable=False)
+    # ``0101`` keeps this nullable for the existing 0100 baseline.  It is
+    # required whenever provenance is access-point based, otherwise the
+    # immutable snapshot hash cannot be reconstructed on renew/restore.
+    inventory_fingerprint = Column(String(128), nullable=True)
     # Same effective access is normal for several subscribers.  The one-to-one
     # subscription_id is the identity constraint; this hash detects mutation.
     snapshot_hash = Column(String(128), nullable=False)

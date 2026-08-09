@@ -4385,6 +4385,10 @@ async def _update_user_devices(
             logger.error('Пользователь или подписка не найдены', user_id=user_id)
             return False
 
+        from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+        await assert_no_manual_access_point_grant(db, subscription, action='device change')
+
         old_devices = subscription.device_limit
         subscription.device_limit = devices
         subscription.updated_at = datetime.now(UTC)
@@ -4443,6 +4447,10 @@ async def _update_user_traffic(
         if not user or not subscription:
             logger.error('Пользователь или подписка не найдены', user_id=user_id)
             return False
+
+        from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+        await assert_no_manual_access_point_grant(db, subscription, action='traffic change')
 
         old_traffic = subscription.traffic_limit_gb
         subscription.traffic_limit_gb = traffic_gb
@@ -4566,6 +4574,10 @@ async def _extend_subscription_by_days(
             logger.error('Подписка не найдена для пользователя', user_id=user_id)
             return False
 
+        from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+        await assert_no_manual_access_point_grant(db, subscription, action='extend')
+
         await extend_subscription(db, subscription, days)
 
         subscription_service = SubscriptionService()
@@ -4598,6 +4610,10 @@ async def _add_subscription_traffic(
         if not subscription:
             logger.error('Подписка не найдена для пользователя', user_id=user_id)
             return False
+
+        from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+        await assert_no_manual_access_point_grant(db, subscription, action='add_traffic')
 
         if gb == 0:
             subscription.traffic_limit_gb = 0
@@ -4674,6 +4690,10 @@ async def _activate_user_subscription(
         if not subscription:
             logger.error('Подписка не найдена для пользователя', user_id=user_id)
             return False
+
+        from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+        await assert_no_manual_access_point_grant(db, subscription, action='activate')
 
         subscription.status = SubscriptionStatus.ACTIVE.value
         if subscription.end_date <= datetime.now(UTC):

@@ -172,6 +172,17 @@ def create_unified_app(
     app.state.dispatcher = dispatcher
     app.state.payment_service = payment_service
 
+    # A normal RemnaWave API configuration is not approval to expose the
+    # inventory path.  Startup injects the GET-only adapter only during the
+    # separately owner-armed, time-bounded dry-run window; the route checks the
+    # window again per request so it also closes without a restart at expiry.
+    if settings.is_access_point_inventory_dry_run_armed():
+        from app.services.remnawave_access_point_inventory import RemnaWaveAccessPointInventoryClient
+
+        inventory_client = RemnaWaveAccessPointInventoryClient()
+        if inventory_client.is_configured:
+            app.state.access_point_inventory_client = inventory_client
+
     payments_router = payments.create_payment_router(bot, payment_service)
     if payments_router:
         app.include_router(payments_router)

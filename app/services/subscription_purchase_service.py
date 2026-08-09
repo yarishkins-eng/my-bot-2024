@@ -992,6 +992,24 @@ class MiniAppSubscriptionPurchaseService:
         user = context.user
         texts = get_texts(getattr(user, 'language', None))
 
+        # The generic classic purchase service can be reached by an old
+        # Cabinet bundle. It has no AP quote/term owner, so reject before its
+        # first balance operation whenever the selected subscription is AP.
+        if context.subscription is not None:
+            from app.services.public_access_point_service import (
+                AccessPointPolicyError,
+                assert_no_manual_access_point_grant,
+            )
+
+            try:
+                await assert_no_manual_access_point_grant(
+                    db,
+                    context.subscription,
+                    action='legacy purchase',
+                )
+            except AccessPointPolicyError as error:
+                raise PurchaseValidationError(str(error), code='device_first_required') from error
+
         # Block only if pricing is genuinely invalid (no base price configured).
         # final_total == 0 with base_original_total > 0 means a valid 100% discount.
         if pricing.final_total <= 0 and pricing.base_original_total <= 0:

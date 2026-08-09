@@ -488,7 +488,11 @@ async def toggle_tariff(
         await callback.answer('Тариф не найден', show_alert=True)
         return
 
-    tariff = await update_tariff(db, tariff, is_active=not tariff.is_active)
+    try:
+        tariff = await update_tariff(db, tariff, is_active=not tariff.is_active)
+    except ValueError as error:
+        await callback.answer(f'Нельзя активировать тариф: {error}', show_alert=True)
+        return
     subs_count = await get_tariff_subscriptions_count(db, tariff_id)
 
     status = 'активирован' if tariff.is_active else 'деактивирован'
@@ -524,7 +528,11 @@ async def toggle_trial_tariff(
         await callback.answer('Триал снят с тарифа', show_alert=True)
     else:
         # Устанавливаем этот тариф как триальный (снимает флаг с других)
-        await set_trial_tariff(db, tariff_id)
+        try:
+            await set_trial_tariff(db, tariff_id)
+        except ValueError as error:
+            await callback.answer(f'Нельзя назначить триал: {error}', show_alert=True)
+            return
         await callback.answer(f'Тариф «{tariff.name}» установлен как триальный', show_alert=True)
 
     # Перезагружаем тариф
@@ -652,14 +660,16 @@ async def process_daily_price_input(
             device_limit=data['tariff_devices'],
             tier_level=data['tariff_tier'],
             period_prices={},
-            is_active=True,
+            is_active=False,
             is_daily=True,
             daily_price_kopeks=price_kopeks,
         )
         await state.clear()
 
         await message.answer(
-            '✅ <b>Суточный тариф создан!</b>\n\n' + format_tariff_info(tariff, db_user.language, 0),
+            '✅ <b>Суточный тариф создан как черновик.</b>\n\n'
+            'Суточные тарифы нельзя назначать на точки подключения; настройте отдельную совместимую политику до активации.\n\n'
+            + format_tariff_info(tariff, db_user.language, 0),
             reply_markup=get_tariff_view_keyboard(tariff, db_user.language),
             parse_mode='HTML',
         )
@@ -983,7 +993,7 @@ async def process_tariff_prices(
         device_limit=data['tariff_devices'],
         tier_level=data['tariff_tier'],
         period_prices=prices,
-        is_active=True,
+        is_active=False,
     )
 
     await state.clear()
@@ -991,7 +1001,9 @@ async def process_tariff_prices(
     subs_count = 0
 
     await message.answer(
-        '✅ <b>Тариф создан!</b>\n\n' + format_tariff_info(tariff, db_user.language, subs_count),
+        '✅ <b>Тариф создан как черновик.</b>\n\n'
+        'Добавьте проверенную политику точек подключения в кабинете, затем активируйте тариф.\n\n'
+        + format_tariff_info(tariff, db_user.language, subs_count),
         reply_markup=get_tariff_view_keyboard(tariff, db_user.language),
         parse_mode='HTML',
     )

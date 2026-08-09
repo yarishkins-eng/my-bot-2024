@@ -2,7 +2,7 @@ import html
 import os
 import re
 from collections import defaultdict
-from datetime import time
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import ClassVar, Literal
 from urllib.parse import quote as _url_quote, urlparse
@@ -155,6 +155,18 @@ class Settings(BaseSettings):
     REMNAWAVE_AUTO_SYNC_ENABLED: bool = False
     REMNAWAVE_AUTO_SYNC_TIMES: str = '03:00'
     CABINET_REMNA_SUB_CONFIG: str | None = None  # UUID конфига страницы подписки из RemnaWave
+
+    # Access-point catalog discovery is off until the owner deliberately arms
+    # one short, read-only production dry run.  Ordinary RemnaWave credentials
+    # must never make this inventory endpoint live by themselves.  Local
+    # catalog apply needs its own separate arm.
+    ACCESS_POINT_INVENTORY_DRY_RUN_ENABLED: bool = False
+    ACCESS_POINT_INVENTORY_DRY_RUN_UNTIL: datetime | None = None
+    ACCESS_POINT_INVENTORY_CATALOG_APPLY_ENABLED: bool = False
+    ACCESS_POINT_INVENTORY_MAX_CONCURRENT_READS: int = 4
+    ACCESS_POINT_INVENTORY_READ_BUDGET_SECONDS: float = 45.0
+    ACCESS_POINT_INVENTORY_MAX_HOSTS: int = 100
+    ACCESS_POINT_INVENTORY_MAX_SQUADS: int = 100
 
     # RemnaWave incoming webhooks (real-time event delivery from backend)
     REMNAWAVE_WEBHOOK_ENABLED: bool = False
@@ -1490,6 +1502,21 @@ class Settings(BaseSettings):
             'caddy_token': self.REMNAWAVE_CADDY_TOKEN,
             'auth_type': self.REMNAWAVE_AUTH_TYPE,
         }
+
+    def is_access_point_inventory_dry_run_armed(self, now: datetime | None = None) -> bool:
+        """Whether an owner-configured inventory read window is still live."""
+
+        deadline = self.ACCESS_POINT_INVENTORY_DRY_RUN_UNTIL
+        if not self.ACCESS_POINT_INVENTORY_DRY_RUN_ENABLED or deadline is None or deadline.tzinfo is None:
+            return False
+        return deadline > (now or datetime.now(UTC))
+
+    def is_access_point_inventory_catalog_apply_armed(self, now: datetime | None = None) -> bool:
+        """Catalog apply is a separate, explicit owner approval from read-only discovery."""
+
+        return bool(self.ACCESS_POINT_INVENTORY_CATALOG_APPLY_ENABLED) and self.is_access_point_inventory_dry_run_armed(
+            now
+        )
 
     def get_pal24_sbp_button_text(self, fallback: str) -> str:
         value = (self.PAL24_SBP_BUTTON_TEXT or '').strip()

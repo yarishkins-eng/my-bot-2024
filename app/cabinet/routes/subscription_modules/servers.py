@@ -16,7 +16,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query as QueryParam, stat
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import PublicLocation, SubscriptionEntitlementSnapshot, TariffLegacyEntitlementManifest, User
+from app.database.models import (
+    PublicAccessPoint,
+    PublicLocation,
+    SubscriptionEntitlementSnapshot,
+    TariffLegacyEntitlementManifest,
+    User,
+)
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from .helpers import resolve_subscription
@@ -121,6 +127,52 @@ async def get_effective_locations(
 ) -> dict[str, Any]:
     """Versioned public DTO; technical squads are never present in this API."""
     return await get_available_countries(user=user, db=db, subscription_id=subscription_id)
+
+
+@router.get('/v3/access-points')
+async def get_effective_access_points(
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+    subscription_id: int | None = QueryParam(None, description='Subscription ID for multi-tariff'),
+) -> dict[str, Any]:
+    """Return only the user's captured Host titles, never Panel identities.
+
+    A retired point remains visible when it belongs to an already-issued term;
+    access for a new term is guarded by the resolver before any payment or
+    Panel effect.  This endpoint is deliberately read-only.
+    """
+
+    subscription = await resolve_subscription(db, user, subscription_id)
+    if not subscription:
+        return {'access_points': [], 'has_subscription': False}
+    from app.services.public_location_entitlement_service import (
+        EntitlementResolutionError,
+        get_effective_subscription_resolved_entitlement,
+    )
+
+    try:
+        entitlement = await get_effective_subscription_resolved_entitlement(db, subscription.id)
+    except EntitlementResolutionError:
+        # A malformed historical snapshot is not permission to leak a raw
+        # projection or guess a current tariff policy.
+        return {'access_points': [], 'has_subscription': True}
+    if entitlement.provenance != 'access_point_policy':
+        return {'access_points': [], 'has_subscription': True}
+    point_ids = list(entitlement.location_ids)
+    points = list((await db.execute(select(PublicAccessPoint).where(PublicAccessPoint.id.in_(point_ids)))).scalars())
+    by_id = {point.id: point for point in points}
+    return {
+        'access_points': [
+            {
+                'id': point.id,
+                'title': point.title,
+                'presentation_revision': int(point.presentation_revision or 1),
+            }
+            for point_id in point_ids
+            if (point := by_id.get(point_id)) is not None
+        ],
+        'has_subscription': True,
+    }
 
 
 async def _retired_raw_update_countries(

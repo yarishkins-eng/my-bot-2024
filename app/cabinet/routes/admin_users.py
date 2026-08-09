@@ -1188,6 +1188,16 @@ async def update_user_balance(
     )
 
 
+async def _reject_manual_access_point_grant(db: AsyncSession, subscription: Subscription, *, action: str) -> None:
+    """Keep cabinet admin writes out of the paid AP term lifecycle."""
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action=action)
+    except AccessPointPolicyError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+
 # === Subscription Management ===
 
 
@@ -1264,6 +1274,11 @@ async def update_user_subscription(
         if request.tariff_id:
             tariff = await get_tariff_by_id(db, request.tariff_id)
             if tariff:
+                if tariff.entitlement_mode == 'access_point_managed':
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail='access-point subscriptions require the tariff checkout flow',
+                    )
                 if not request.traffic_limit_gb:
                     traffic_limit = tariff.traffic_limit_gb
                 if not request.device_limit:
@@ -1311,6 +1326,12 @@ async def update_user_subscription(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User has no subscription',
         )
+
+    # Only explicit revocation/reset remains available to cabinet admins for
+    # AP subscriptions.  Every grant or mutable-panel action needs a captured
+    # paid term, not this legacy administrative route.
+    if request.action not in {'cancel', 'reset'}:
+        await _reject_manual_access_point_grant(db, subscription, action=request.action)
 
     if request.action == 'extend':
         if not request.days or request.days <= 0:
@@ -3557,6 +3578,19 @@ async def sync_user_to_panel(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='User has no subscription to sync',
         )
+
+    # AP Panel writes are exclusively emitted by the claimed immutable-term
+    # projection. An administrative repair must never recreate/update a user
+    # from a raw `connected_squads` snapshot, including the create fallback.
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, push_sub, action='Panel sync')
+    except AccessPointPolicyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={'code': 'access_point_term_projection_required', 'message': str(error)},
+        ) from error
 
     try:
         from app.config import settings

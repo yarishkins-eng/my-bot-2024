@@ -63,6 +63,10 @@ from app.services.pricing_engine import PricingEngine
 from app.services.privacy_policy_service import PrivacyPolicyService
 from app.services.promo_offer_service import promo_offer_service
 from app.services.promocode_service import PromoCodeService
+from app.services.public_access_point_service import (
+    get_effective_public_access_points,
+    get_tariff_public_access_points,
+)
 from app.services.public_offer_service import PublicOfferService
 from app.services.remnawave_service import (
     RemnaWaveConfigurationError,
@@ -145,6 +149,7 @@ from ..schemas.miniapp import (
     MiniAppPromoOffer,
     MiniAppPromoOfferClaimRequest,
     MiniAppPromoOfferClaimResponse,
+    MiniAppPublicAccessPoint,
     MiniAppReferralInfo,
     MiniAppReferralItem,
     MiniAppReferralList,
@@ -3361,6 +3366,7 @@ async def get_subscription_details(
     links_payload: dict[str, Any] = {}
     connected_squads: list[str] = []
     connected_servers: list[MiniAppConnectedServer] = []
+    access_points: list[MiniAppPublicAccessPoint] = []
     links: list[str] = []
     ss_conf_links: dict[str, str] = {}
     subscription_url: str | None = None
@@ -3386,9 +3392,18 @@ async def get_subscription_details(
         subscription_url = links_payload.get('subscription_url') or subscription.subscription_url
         subscription_crypto_link = links_payload.get('happ_crypto_link') or subscription.subscription_crypto_link
         happ_redirect_link = get_happ_cryptolink_redirect_link(subscription_crypto_link)
-        connected_squads = list(subscription.connected_squads or [])
-        connected_servers = await _resolve_connected_servers(db, connected_squads)
-        links = links_payload.get('links') or connected_squads
+        effective_access_points = await get_effective_public_access_points(db, subscription)
+        if effective_access_points is None:
+            connected_squads = list(subscription.connected_squads or [])
+            connected_servers = await _resolve_connected_servers(db, connected_squads)
+            links = links_payload.get('links') or connected_squads
+        else:
+            # Terms own AP technical squads.  Never disclose them (or derive
+            # a fallback link list from them) to a user-facing API.
+            access_points = [
+                MiniAppPublicAccessPoint(id=point.id, title=point.title) for point in effective_access_points
+            ]
+            links = links_payload.get('links') or []
         ss_conf_links = links_payload.get('ss_conf_links') or {}
         remnawave_short_uuid = subscription.remnawave_short_uuid
         device_limit_value = subscription.device_limit
@@ -3537,6 +3552,7 @@ async def get_subscription_details(
         ss_conf_links=ss_conf_links,
         connected_squads=connected_squads,
         connected_servers=connected_servers,
+        access_points=access_points,
         connected_devices_count=devices_count,
         connected_devices=devices,
         happ=links_payload.get('happ') if subscription else None,
@@ -3597,7 +3613,14 @@ async def _get_current_tariff_model(db: AsyncSession, subscription, user=None) -
     if not tariff:
         return None
 
-    servers_count = len(tariff.allowed_squads) if tariff.allowed_squads else 0
+    public_access_points = await get_effective_public_access_points(db, subscription)
+    servers_count = (
+        len(public_access_points)
+        if public_access_points is not None
+        else len(tariff.allowed_squads)
+        if tariff.allowed_squads
+        else 0
+    )
 
     # Скидка на трафик через PricingEngine
     from app.services.pricing_engine import PricingEngine, pricing_engine
@@ -3674,6 +3697,10 @@ async def _get_current_tariff_model(db: AsyncSession, subscription, user=None) -
         is_unlimited_traffic=tariff.traffic_limit_gb == 0,
         device_limit=tariff.device_limit,
         servers_count=servers_count,
+        access_points=[
+            MiniAppPublicAccessPoint(id=access_point.id, title=access_point.title)
+            for access_point in (public_access_points or ())
+        ],
         monthly_price_kopeks=monthly_price,
         traffic_topup_enabled=traffic_topup_enabled,
         traffic_topup_packages=traffic_topup_packages,
@@ -5132,16 +5159,22 @@ async def _build_subscription_settings(
     traffic_discount = PricingEngine.get_addon_discount_percent(user, 'traffic', period_hint_days)
     devices_discount = PricingEngine.get_addon_discount_percent(user, 'devices', period_hint_days)
 
-    current_servers, server_options, _ = await _prepare_server_catalog(
-        db,
-        user,
-        subscription,
-        servers_discount,
-    )
+    effective_access_points = await get_effective_public_access_points(db, subscription)
+    is_access_point_subscription = effective_access_points is not None
+    if is_access_point_subscription:
+        current_servers: list[MiniAppConnectedServer] = []
+        server_options: list[MiniAppSubscriptionServerOption] = []
+    else:
+        current_servers, server_options, _ = await _prepare_server_catalog(
+            db,
+            user,
+            subscription,
+            servers_discount,
+        )
 
     traffic_options: list[MiniAppSubscriptionTrafficOption] = []
     # В режиме fixed_with_topup показываем опции трафика (для докупки)
-    if not settings.is_traffic_topup_blocked():
+    if not is_access_point_subscription and not settings.is_traffic_topup_blocked():
         for package in settings.get_traffic_packages():
             is_enabled = bool(package.get('enabled', True))
             if package.get('is_active') is False:
@@ -5184,7 +5217,7 @@ async def _build_subscription_settings(
         max_devices_setting = settings.MAX_DEVICES_LIMIT if settings.MAX_DEVICES_LIMIT > 0 else None
 
     # If device price is 0 or negative, device purchase is unavailable
-    devices_can_update = bool(base_device_price and base_device_price > 0)
+    devices_can_update = bool(base_device_price and base_device_price > 0) and not is_access_point_subscription
 
     if max_devices_setting is not None:
         max_devices = max(max_devices_setting, current_device_limit, default_device_limit)
@@ -5217,6 +5250,9 @@ async def _build_subscription_settings(
         currency=(getattr(user, 'balance_currency', None) or 'RUB').upper(),
         current=MiniAppSubscriptionCurrentSettings(
             servers=current_servers,
+            access_points=[
+                MiniAppPublicAccessPoint(id=point.id, title=point.title) for point in (effective_access_points or ())
+            ],
             traffic_limit_gb=subscription.traffic_limit_gb,
             traffic_limit_label=None,
             device_limit=current_device_limit,
@@ -5225,12 +5261,12 @@ async def _build_subscription_settings(
             available=server_options,
             min=1 if server_options else 0,
             max=len(server_options) if server_options else 0,
-            can_update=True,
-            hint=None,
+            can_update=not is_access_point_subscription,
+            hint='Access points are managed by the tariff term.' if is_access_point_subscription else None,
         ),
         traffic=MiniAppSubscriptionTrafficSettings(
             options=traffic_options,
-            can_update=not settings.is_traffic_topup_blocked(),
+            can_update=not is_access_point_subscription and not settings.is_traffic_topup_blocked(),
             current_value=subscription.traffic_limit_gb,
         ),
         devices=MiniAppSubscriptionDevicesSettings(
@@ -5627,6 +5663,11 @@ async def get_subscription_purchase_options_endpoint(
     payload: MiniAppSubscriptionPurchaseOptionsRequest,
     db: AsyncSession = Depends(get_db_session),
 ) -> MiniAppSubscriptionPurchaseOptionsResponse:
+    if settings.is_tariffs_mode():
+        raise HTTPException(
+            status.HTTP_410_GONE,
+            detail={'code': 'legacy_purchase_disabled', 'message': 'Use the tariff checkout flow'},
+        )
     user = await _authorize_miniapp_user(payload.init_data, db)
     context = await purchase_service.build_options(db, user)
 
@@ -5654,6 +5695,11 @@ async def subscription_purchase_preview_endpoint(
     payload: MiniAppSubscriptionPurchasePreviewRequest,
     db: AsyncSession = Depends(get_db_session),
 ) -> MiniAppSubscriptionPurchasePreviewResponse:
+    if settings.is_tariffs_mode():
+        raise HTTPException(
+            status.HTTP_410_GONE,
+            detail={'code': 'legacy_purchase_disabled', 'message': 'Use the tariff checkout flow'},
+        )
     user = await _authorize_miniapp_user(payload.init_data, db)
     context = await purchase_service.build_options(db, user)
 
@@ -5686,6 +5732,11 @@ async def subscription_purchase_endpoint(
     payload: MiniAppSubscriptionPurchaseRequest,
     db: AsyncSession = Depends(get_db_session),
 ) -> MiniAppSubscriptionPurchaseResponse:
+    if settings.is_tariffs_mode():
+        raise HTTPException(
+            status.HTTP_410_GONE,
+            detail={'code': 'legacy_purchase_disabled', 'message': 'Use the tariff checkout flow'},
+        )
     user = await _authorize_miniapp_user(payload.init_data, db)
 
     if getattr(user, 'restriction_subscription', False):
@@ -6052,6 +6103,16 @@ async def update_subscription_traffic_endpoint(
     _validate_subscription_id(payload.subscription_id, subscription)
     old_traffic = subscription.traffic_limit_gb
 
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='traffic change')
+    except AccessPointPolicyError as error:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
+        ) from error
+
     raw_value = payload.traffic if payload.traffic is not None else payload.traffic_gb
     if raw_value is None:
         raise HTTPException(
@@ -6207,6 +6268,16 @@ async def update_subscription_devices_endpoint(
         subscription_id=payload.subscription_id,
     )
     _validate_subscription_id(payload.subscription_id, subscription)
+
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='device change')
+    except AccessPointPolicyError as error:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
+        ) from error
 
     raw_value = payload.devices if payload.devices is not None else payload.device_limit
     if raw_value is None:
@@ -6431,17 +6502,15 @@ async def _build_tariff_model(
     servers: list[MiniAppConnectedServer] = []
     servers_count = 0
 
-    if tariff.allowed_squads:
+    public_access_points = await get_tariff_public_access_points(db, tariff)
+    if public_access_points is not None:
+        # ``allowed_squads`` can remain as protected historical evidence after
+        # conversion.  It must never become a customer-visible server UUID.
+        servers_count = len(public_access_points)
+    elif tariff.allowed_squads:
         servers_count = len(tariff.allowed_squads)
-        for squad_uuid in tariff.allowed_squads[:5]:  # Ограничиваем для превью
-            server = await get_server_squad_by_uuid(db, squad_uuid)
-            if server:
-                servers.append(
-                    MiniAppConnectedServer(
-                        uuid=squad_uuid,
-                        name=server.display_name or squad_uuid[:8],
-                    )
-                )
+        # Keep legacy card semantics as a count only.  A customer response
+        # must not turn a tariff's technical Squad list into browser IDs.
 
     periods: list[MiniAppTariffPeriod] = []
     if tariff.period_prices:
@@ -6532,6 +6601,10 @@ async def _build_tariff_model(
         device_limit=tariff.device_limit,
         servers_count=servers_count,
         servers=servers,
+        access_points=[
+            MiniAppPublicAccessPoint(id=access_point.id, title=access_point.title)
+            for access_point in (public_access_points or ())
+        ],
         periods=periods,
         is_current=current_tariff_id == tariff.id if current_tariff_id else False,
         is_available=tariff.is_active,
@@ -6545,9 +6618,28 @@ async def _build_tariff_model(
     )
 
 
-async def _build_current_tariff_model(db: AsyncSession, tariff, promo_group=None, user=None) -> MiniAppCurrentTariff:
+async def _build_current_tariff_model(
+    db: AsyncSession,
+    tariff,
+    subscription: Subscription | None = None,
+    promo_group=None,
+    user=None,
+) -> MiniAppCurrentTariff:
     """Создаёт модель текущего тарифа."""
-    servers_count = len(tariff.allowed_squads) if tariff.allowed_squads else 0
+    # A current subscription must be presented from its captured active term,
+    # never from a later tariff policy that is only valid for future issuance.
+    public_access_points = (
+        await get_effective_public_access_points(db, subscription)
+        if subscription is not None
+        else await get_tariff_public_access_points(db, tariff)
+    )
+    servers_count = (
+        len(public_access_points)
+        if public_access_points is not None
+        else len(tariff.allowed_squads)
+        if tariff.allowed_squads
+        else 0
+    )
     monthly_price = _get_tariff_monthly_price(tariff)
 
     # Применяем скидку промогруппы + promo-offer для 30-дневного периода
@@ -6584,6 +6676,10 @@ async def _build_current_tariff_model(db: AsyncSession, tariff, promo_group=None
         is_unlimited_traffic=tariff.traffic_limit_gb == 0,
         device_limit=tariff.device_limit,
         servers_count=servers_count,
+        access_points=[
+            MiniAppPublicAccessPoint(id=access_point.id, title=access_point.title)
+            for access_point in (public_access_points or ())
+        ],
         monthly_price_kopeks=monthly_price,
         is_daily=is_daily,
         daily_price_kopeks=daily_price_kopeks,
@@ -6640,7 +6736,13 @@ async def get_tariffs_endpoint(
     if current_tariff_id:
         current_tariff = await get_tariff_by_id(db, current_tariff_id)
         if current_tariff:
-            current_tariff_model = await _build_current_tariff_model(db, current_tariff, promo_group, user=user)
+            current_tariff_model = await _build_current_tariff_model(
+                db,
+                current_tariff,
+                subscription=subscription,
+                promo_group=promo_group,
+                user=user,
+            )
 
     # Формируем список тарифов
     tariff_models: list[MiniAppTariff] = []
@@ -7419,6 +7521,16 @@ async def purchase_traffic_topup_endpoint(
             },
         )
 
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='traffic top-up')
+    except AccessPointPolicyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
+        ) from error
+
     # Проверяем, разрешена ли докупка трафика
     if not getattr(tariff, 'traffic_topup_enabled', False):
         raise HTTPException(
@@ -7603,6 +7715,14 @@ async def toggle_daily_subscription_pause_endpoint(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={'code': 'not_daily_tariff', 'message': 'Subscription is not on a daily tariff'},
+        )
+    if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                'code': 'access_point_daily_not_supported',
+                'message': 'Access-point tariffs require the immutable Device-First term workflow',
+            },
         )
 
     raw_daily_price = getattr(tariff, 'daily_price_kopeks', 0)

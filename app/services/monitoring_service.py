@@ -7,7 +7,7 @@ from typing import Any
 
 import structlog
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -40,6 +40,7 @@ from app.database.database import AsyncSessionLocal
 from app.database.models import (
     MonitoringLog,
     Subscription,
+    SubscriptionEntitlementTermProjectionOutbox,
     SubscriptionStatus,
     Ticket,
     TicketStatus,
@@ -202,6 +203,12 @@ class MonitoringService:
         self._notified_users: set[str] = set()
         self._last_cleanup = datetime.now(UTC)
         self._sla_task = None
+        # This worker has a different correctness contract from the broad
+        # monitoring cycle below: an access-point term must switch at its
+        # immutable paid boundary, not on the next hourly housekeeping tick.
+        self._access_point_term_projection_task = None
+        self._access_point_term_projection_wakeup = asyncio.Event()
+        self._access_point_term_projection_running = False
         # In-memory fallback состояния уведомлений об ошибке автоплатежа (на случай
         # недоступности Redis). Ключ — (subscription_id, cycle_token=int(end_date.timestamp())).
         self._autopay_fail_state: dict[tuple[int, int], dict] = {}
@@ -323,7 +330,6 @@ class MonitoringService:
                 self._sla_task = asyncio.create_task(self._sla_loop())
         except Exception as e:
             logger.error('Не удалось запустить SLA-мониторинг', error=e)
-
         while self.is_running:
             try:
                 await self._monitoring_cycle()
@@ -341,6 +347,93 @@ class MonitoringService:
                 self._sla_task.cancel()
         except Exception:
             pass
+
+    async def start_access_point_term_projection_worker(self) -> None:
+        """Start the independent executor for paid AP authorization boundaries."""
+        self._access_point_term_projection_running = True
+        if self._access_point_term_projection_task is None or self._access_point_term_projection_task.done():
+            self._access_point_term_projection_task = asyncio.create_task(self._access_point_term_projection_loop())
+
+    def stop_access_point_term_projection_worker(self) -> None:
+        self._access_point_term_projection_running = False
+        self._access_point_term_projection_wakeup.set()
+        try:
+            if self._access_point_term_projection_task and not self._access_point_term_projection_task.done():
+                self._access_point_term_projection_task.cancel()
+        except Exception:
+            pass
+
+    def wake_access_point_term_projection_scheduler(self) -> None:
+        """Wake the boundary worker after a future AP term is committed."""
+        self._access_point_term_projection_wakeup.set()
+
+    async def _next_access_point_term_projection_wakeup(self, db: AsyncSession) -> datetime | None:
+        """Return the next paid boundary or abandoned-claim reclaim deadline."""
+        pending = await db.scalar(
+            select(SubscriptionEntitlementTermProjectionOutbox)
+            .where(SubscriptionEntitlementTermProjectionOutbox.state == 'pending')
+            .order_by(SubscriptionEntitlementTermProjectionOutbox.effective_at)
+            .limit(1)
+        )
+        pending_at = None
+        if pending is not None:
+            pending_at = pending.effective_at
+            # A due projection which just failed remains auditable/pending,
+            # but must not turn the exact-boundary scheduler into a hot retry
+            # loop while the Panel is unavailable.
+            if pending_at <= datetime.now(UTC) and int(pending.attempts or 0) > 0:
+                pending_at = datetime.now(UTC) + timedelta(seconds=min(60, 2 ** int(pending.attempts)))
+        processing_claim = (
+            await db.execute(
+                select(
+                    SubscriptionEntitlementTermProjectionOutbox.claimed_at,
+                    SubscriptionEntitlementTermProjectionOutbox.effective_at,
+                )
+                .where(SubscriptionEntitlementTermProjectionOutbox.state == 'processing')
+                .order_by(
+                    func.coalesce(
+                        SubscriptionEntitlementTermProjectionOutbox.claimed_at,
+                        SubscriptionEntitlementTermProjectionOutbox.effective_at,
+                    )
+                )
+                .limit(1)
+            )
+        ).first()
+        reclaim_at = None
+        if processing_claim is not None:
+            claimed_at, effective_at = processing_claim
+            reclaim_at = (claimed_at or effective_at) + timedelta(minutes=15)
+        candidates = [value for value in (pending_at, reclaim_at) if value is not None]
+        return min(candidates) if candidates else None
+
+    async def _access_point_term_projection_loop(self) -> None:
+        """Run AP term projection at its exact durable outbox deadline.
+
+        The regular monitoring cycle remains a recovery backstop, but cannot
+        be the scheduler: its configured interval is deliberately much larger
+        than the authorization boundary this worker enforces.
+        """
+        while self._access_point_term_projection_running:
+            self._access_point_term_projection_wakeup.clear()
+            try:
+                async with AsyncSessionLocal() as db:
+                    from app.services.public_access_point_service import process_due_access_point_term_projections
+
+                    await process_due_access_point_term_projections(db)
+                    wake_at = await self._next_access_point_term_projection_wakeup(db)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error('Ошибка в dedicated boundary-проекторе access-point term', error=e, exc_info=True)
+                wake_at = datetime.now(UTC) + timedelta(seconds=5)
+
+            timeout = 60.0 if wake_at is None else max(0.0, (wake_at - datetime.now(UTC)).total_seconds())
+            try:
+                await asyncio.wait_for(self._access_point_term_projection_wakeup.wait(), timeout=timeout)
+            except TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
 
     async def _monitoring_cycle(self):
         async with AsyncSessionLocal() as db:
@@ -368,6 +461,20 @@ class MonitoringService:
                 # экспайрятся до того, как autopay успеет их продлить
                 # Продление с баланса работает всегда, если у подписки autopay_enabled=True
                 await self._process_autopayments(db)
+                # A paid access-point renewal captured before its boundary
+                # must keep the existing access until this durable outbox
+                # projects the exact frozen term.  It never resolves today's
+                # mutable tariff policy here.
+                try:
+                    from app.services.public_access_point_service import process_due_access_point_term_projections
+
+                    await process_due_access_point_term_projections(db)
+                except Exception as access_point_projection_error:
+                    logger.error(
+                        'Ошибка boundary-проекции access-point entitlement term',
+                        error=access_point_projection_error,
+                        exc_info=True,
+                    )
                 # Рекуррентные автоплатежи с карты: требуют ENABLE_AUTOPAY + YOOKASSA_RECURRENT_ENABLED
                 if settings.ENABLE_AUTOPAY and settings.YOOKASSA_RECURRENT_ENABLED:
                     try:
@@ -1135,6 +1242,7 @@ class MonitoringService:
             restored_count = 0
             checked_count = 0
             last_id = 0
+            access_point_reprojection_armed = False
 
             # Build the trial/all filter based on CHANNEL_REQUIRED_FOR_ALL setting
             # Also include paid subs if any channel has disable_paid_on_leave=True,
@@ -1284,6 +1392,38 @@ class MonitoringService:
 
                         # REACTIVATE: was disabled, now subscribed to all
                         elif subscription.status == SubscriptionStatus.DISABLED.value and all_subscribed:
+                            from app.services.public_access_point_service import (
+                                AccessPointPolicyError,
+                                assert_no_manual_access_point_grant,
+                            )
+
+                            try:
+                                await assert_no_manual_access_point_grant(
+                                    batch_db,
+                                    subscription,
+                                    action='channel_resubscribe_reactivation',
+                                )
+                            except AccessPointPolicyError:
+                                from app.services.public_access_point_service import (
+                                    requeue_active_access_point_term_projection,
+                                )
+
+                                subscription = await reactivate_subscription(batch_db, subscription, commit=False)
+                                if (
+                                    subscription.status == SubscriptionStatus.ACTIVE.value
+                                    and await requeue_active_access_point_term_projection(
+                                        batch_db,
+                                        subscription,
+                                        reason='channel_resubscribe',
+                                    )
+                                ):
+                                    access_point_reprojection_armed = True
+                                    restored_count += 1
+                                    logger.info(
+                                        'AP subscription rearmed from active captured term',
+                                        subscription_id=subscription.id,
+                                    )
+                                continue
                             # Guard: traffic limit exhausted
                             if (
                                 subscription.traffic_limit_gb
@@ -1361,6 +1501,9 @@ class MonitoringService:
 
                     # Commit all changes for this batch
                     await batch_db.commit()
+                if access_point_reprojection_armed:
+                    self.wake_access_point_term_projection_scheduler()
+                    access_point_reprojection_armed = False
 
             if disabled_count or restored_count:
                 check_scope = 'all' if settings.CHANNEL_REQUIRED_FOR_ALL else 'trial'
@@ -1824,6 +1967,18 @@ class MonitoringService:
                     # значения из tariff.get_available_periods() или (для классических подписок
                     # без тарифа) settings.get_available_renewal_periods().
                     tariff = getattr(subscription, 'tariff', None)
+                    if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+                        # Legacy balance autopay does not own Device-First's
+                        # immutable quote+term transaction.  Refuse before
+                        # pricing or debit rather than charge and compensate.
+                        logger.warning(
+                            'Автопродление AP-тарифа остановлено до дебета: требуется Device-First workflow',
+                            subscription_id=subscription.id,
+                            user_id=user.id,
+                            manual_reconcile_required=True,
+                        )
+                        failed_count += 1
+                        continue
 
                     autopay_period = (
                         resolve_autopay_period_candidate(getattr(subscription, 'autopay_period_days', None), tariff)

@@ -104,15 +104,21 @@ async def get_trial_tariff(db: AsyncSession) -> Tariff | None:
 
 async def set_trial_tariff(db: AsyncSession, tariff_id: int) -> Tariff | None:
     """Устанавливает тариф как триальный (снимает флаг с других тарифов)."""
+    tariff = await get_tariff_by_id(db, tariff_id)
+    if tariff is None:
+        return None
+    if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+        raise ValueError('access-point tariffs cannot be configured as trials')
+    from app.services.public_location_entitlement_service import assert_tariff_sellable
+
+    await assert_tariff_sellable(db, tariff)
     # Снимаем флаг с всех тарифов
     await db.execute(Tariff.__table__.update().values(is_trial_available=False))
 
     # Устанавливаем флаг на выбранный тариф
-    tariff = await get_tariff_by_id(db, tariff_id)
-    if tariff:
-        tariff.is_trial_available = True
-        await db.commit()
-        await db.refresh(tariff)
+    tariff.is_trial_available = True
+    await db.commit()
+    await db.refresh(tariff)
 
     return tariff
 
@@ -204,6 +210,10 @@ async def create_tariff(
     external_squad_uuid: str | None = None,
 ) -> Tariff:
     """Создает новый тариф."""
+    if is_active or is_trial_available:
+        raise ValueError(
+            'A new tariff must remain an inactive non-trial draft until a validated entitlement policy exists'
+        )
     normalized_prices = _normalize_period_prices(period_prices)
     normalized_device_options = normalize_device_purchase_options(
         device_purchase_options,
@@ -322,6 +332,15 @@ async def update_tariff(
     external_squad_uuid: str | None = ...,  # ... = не передан, None = убрать внешний сквад
 ) -> Tariff:
     """Обновляет существующий тариф."""
+    if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+        if is_daily is True:
+            raise ValueError('access-point tariffs cannot be configured as daily')
+        if is_trial_available is True:
+            raise ValueError('access-point tariffs cannot be configured as trials')
+    if (is_active is True and not tariff.is_active) or (is_trial_available is True and not tariff.is_trial_available):
+        from app.services.public_location_entitlement_service import assert_tariff_sellable
+
+        await assert_tariff_sellable(db, tariff)
     revision_before = (
         tariff.is_active,
         tariff.traffic_limit_gb,

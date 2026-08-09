@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from app.cabinet.apple_iap import apple_iap_only_router, router as apple_iap_router
 
 from .account_linking import merge_router as merge_router, router as account_linking_router
+from .admin_access_points import router as admin_access_points_router
 from .admin_apps import router as admin_apps_router
 from .admin_audit_log import router as admin_audit_log_router
 from .admin_ban_system import router as admin_ban_system_router
@@ -128,6 +129,7 @@ router.include_router(admin_settings_router)
 router.include_router(admin_wheel_router)
 router.include_router(admin_tariffs_router)
 router.include_router(admin_public_locations_router)
+router.include_router(admin_access_points_router)
 router.include_router(admin_servers_router)
 router.include_router(admin_stats_router)
 router.include_router(admin_referral_network_router)

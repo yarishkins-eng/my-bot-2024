@@ -85,6 +85,11 @@ async def tariff_location_policy(
     tariff = await db.get(Tariff, tariff_id)
     if not tariff:
         raise HTTPException(status_code=404, detail='Tariff not found')
+    if tariff.entitlement_mode == 'access_point_managed':
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='This tariff uses Host-title access points; country policy is read-only.',
+        )
     selected = set(
         (
             await db.execute(
@@ -116,6 +121,11 @@ async def replace_tariff_location_policy(
     tariff = await db.get(Tariff, tariff_id)
     if not tariff:
         raise HTTPException(status_code=404, detail='Tariff not found')
+    if tariff.entitlement_mode == 'access_point_managed':
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='This tariff uses Host-title access points; country policy cannot replace it.',
+        )
     wanted = tuple(dict.fromkeys(request.location_ids))
     assignable = {location.id for location in await list_tariff_assignable_locations(db)}
     if not set(wanted).issubset(assignable):

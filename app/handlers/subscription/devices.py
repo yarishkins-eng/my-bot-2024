@@ -281,6 +281,14 @@ async def confirm_change_devices(
     if subscription is None:
         return
 
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
+    except AccessPointPolicyError:
+        await callback.answer('⚠️ Докупка устройств для этого тарифа пока недоступна.', show_alert=True)
+        return
+
     # Проверяем тариф подписки
     tariff = None
     if subscription.tariff_id:
@@ -1460,6 +1468,14 @@ async def confirm_add_devices(callback: types.CallbackQuery, db_user: User, db: 
     texts = get_texts(db_user.language)
     subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
     if subscription is None:
+        return
+
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
+    except AccessPointPolicyError:
+        await callback.answer('⚠️ Докупка устройств для этого тарифа пока недоступна.', show_alert=True)
         return
 
     # Проверяем тариф подписки

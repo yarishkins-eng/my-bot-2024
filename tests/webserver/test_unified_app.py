@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -133,6 +134,34 @@ def test_unified_app_apple_iap_only_mounts_only_apple_cabinet_routes(
     assert '/cabinet/subscription' not in registered_paths
     assert '/cabinet/balance' not in registered_paths
     assert '/cabinet/admin/users' not in registered_paths
+
+
+def test_unified_app_does_not_inject_access_point_inventory_from_ordinary_panel_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = AsyncMock()
+    dispatcher = SimpleNamespace(feed_update=AsyncMock())
+    payment_service = AsyncMock(spec=PaymentService)
+
+    monkeypatch.setattr(settings, 'WEB_API_ENABLED', False, raising=False)
+    monkeypatch.setattr(settings, 'REMNAWAVE_API_URL', 'http://panel.local', raising=False)
+    monkeypatch.setattr(settings, 'REMNAWAVE_API_KEY', 'ordinary-panel-key', raising=False)
+    monkeypatch.setattr(settings, 'ACCESS_POINT_INVENTORY_DRY_RUN_ENABLED', False, raising=False)
+    monkeypatch.setattr(
+        settings,
+        'ACCESS_POINT_INVENTORY_DRY_RUN_UNTIL',
+        datetime.now(UTC) + timedelta(minutes=10),
+        raising=False,
+    )
+
+    app = create_unified_app(
+        bot,
+        dispatcher,  # type: ignore[arg-type]
+        payment_service,
+        enable_telegram_webhook=False,
+    )
+
+    assert not hasattr(app.state, 'access_point_inventory_client')
 
 
 @pytest.mark.anyio
