@@ -128,6 +128,8 @@ async def validate_and_calculate(
     tariff = await get_tariff_by_id(db, tariff_id)
     if tariff is None or not tariff.is_active:
         raise GuestPurchaseError('Tariff not found or inactive')
+    if getattr(tariff, 'entitlement_mode', 'standard') == 'access_point_managed':
+        raise GuestPurchaseError('Access-point tariffs require the tariff checkout flow', status_code=409)
 
     # Check period against landing-level override (if set)
     allowed_periods = landing.allowed_periods or {}

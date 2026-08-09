@@ -16,10 +16,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import (
+    PublicAccessPoint,
+    PublicAccessPointSquadMapping,
     PublicLocation,
     PublicLocationSquadMapping,
     SubscriptionEntitlementSnapshot,
+    SubscriptionEntitlementTerm,
     Tariff,
+    TariffAccessPointPolicyItem,
+    TariffAccessPointPolicyRevision,
     TariffLegacyEntitlementManifest,
     TariffLocationEntitlement,
 )
@@ -35,14 +40,18 @@ class ResolvedEntitlement:
     squad_uuids: tuple[str, ...]
     policy_revision: int
     provenance: str
+    inventory_fingerprint: str | None = None
 
     def snapshot_payload(self) -> dict[str, object]:
-        return {
+        payload = {
             'location_ids': list(self.location_ids),
             'technical_squad_uuids': list(self.squad_uuids),
             'policy_revision': self.policy_revision,
             'provenance': self.provenance,
         }
+        if self.inventory_fingerprint is not None:
+            payload['inventory_fingerprint'] = self.inventory_fingerprint
+        return payload
 
     @property
     def snapshot_hash(self) -> str:
@@ -52,6 +61,25 @@ class ResolvedEntitlement:
 
 def _dedupe(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(value) for value in values if value))
+
+
+def _access_point_policy_inventory_fingerprint(points: Iterable[PublicAccessPoint]) -> str:
+    """Rebuild the policy fence from point-local entitlement evidence."""
+
+    payload = {
+        'points': [
+            {
+                'id': point.id,
+                'entitlement_fingerprint': point.inventory_fingerprint,
+                # Pair graph evidence with the append-only catalog epoch. A
+                # verified→unsafe→verified ABA transition must not revive an
+                # invoice or policy revision that was valid before it.
+                'entitlement_revision': int(getattr(point, 'entitlement_revision', 0) or 0),
+            }
+            for point in sorted(points, key=lambda item: item.id)
+        ]
+    }
+    return sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
 async def list_tariff_assignable_locations(db: AsyncSession) -> list[PublicLocation]:
@@ -79,6 +107,107 @@ async def _legacy_snapshot(db: AsyncSession, tariff: Tariff) -> ResolvedEntitlem
     return ResolvedEntitlement((), approved, int(tariff.location_policy_revision or 1), 'legacy_manifest')
 
 
+async def _access_point_policy(
+    db: AsyncSession,
+    tariff: Tariff,
+    *,
+    selected_access_point_ids: Iterable[str] | None,
+    exception_access_point_ids: Iterable[str] | None,
+    for_new_issuance: bool,
+    lock_evidence: bool = False,
+) -> ResolvedEntitlement:
+    """Resolve an append-only Host-title policy without falling back to raw squads."""
+
+    policy_revision = int(getattr(tariff, 'access_point_policy_revision', 0) or 0)
+    if policy_revision <= 0:
+        raise EntitlementResolutionError('access-point tariff has no active policy revision')
+    policy_query = (
+        select(TariffAccessPointPolicyRevision).where(
+            TariffAccessPointPolicyRevision.tariff_id == tariff.id,
+            TariffAccessPointPolicyRevision.revision == policy_revision,
+        )
+    )
+    if lock_evidence:
+        policy_query = policy_query.with_for_update()
+    policy = await db.scalar(policy_query)
+    if policy is None:
+        raise EntitlementResolutionError('access-point policy revision is missing')
+
+    rows_query = (
+        select(TariffAccessPointPolicyItem, PublicAccessPoint, PublicAccessPointSquadMapping)
+        .join(
+            PublicAccessPoint,
+            PublicAccessPoint.id == TariffAccessPointPolicyItem.public_access_point_id,
+        )
+        .join(
+            PublicAccessPointSquadMapping,
+            PublicAccessPointSquadMapping.public_access_point_id == PublicAccessPoint.id,
+        )
+        .where(
+            TariffAccessPointPolicyItem.policy_revision_id == policy.id,
+            PublicAccessPointSquadMapping.is_current.is_(True),
+        )
+    )
+    if lock_evidence:
+        # The final quote-to-money transition keeps these locks until its
+        # transaction commits.  Catalog discovery/update then blocks on the
+        # same rows instead of invalidating evidence between the recheck and
+        # wallet debit/provider invoice.
+        rows_query = rows_query.with_for_update()
+    rows = await db.execute(rows_query)
+    resolved_rows = list(rows.all())
+    if not resolved_rows:
+        raise EntitlementResolutionError('access-point policy has no verified mappings')
+
+    policy_ids = _dedupe(point.id for _item, point, _mapping in resolved_rows)
+    requested = _dedupe(selected_access_point_ids or policy_ids)
+    exceptions = _dedupe(exception_access_point_ids or requested)
+    if not set(requested).issubset(policy_ids) or not set(exceptions).issubset(policy_ids):
+        raise EntitlementResolutionError('access-point selection or exception expands tariff policy')
+    effective = set(requested).intersection(exceptions)
+    if not effective:
+        raise EntitlementResolutionError('empty access-point entitlement is not sellable')
+
+    squad_keys: list[str] = []
+    mapped_ids: set[str] = set()
+    effective_points: dict[str, PublicAccessPoint] = {}
+    for _item, point, mapping in resolved_rows:
+        if point.id not in effective:
+            continue
+        if (
+            point.state != 'verified'
+            or not point.tariff_assignable
+            or not point.title.strip()
+            or not point.inventory_fingerprint
+        ):
+            raise EntitlementResolutionError('access point is unavailable or inventory drifted')
+        if (
+            not mapping.is_dedicated_verified
+            or not mapping.internal_squad_key
+            or mapping.graph_fingerprint != point.graph_fingerprint
+            or mapping.inventory_revision != point.inventory_revision
+        ):
+            raise EntitlementResolutionError('access point does not have a current verified dedicated mapping')
+        mapped_ids.add(point.id)
+        effective_points[point.id] = point
+        squad_keys.append(mapping.internal_squad_key)
+
+    deduped_squads = _dedupe(squad_keys)
+    if (
+        mapped_ids != effective
+        or not deduped_squads
+        or policy.inventory_fingerprint != _access_point_policy_inventory_fingerprint(list(effective_points.values()))
+    ):
+        raise EntitlementResolutionError('access-point mapping is ambiguous or incomplete')
+    return ResolvedEntitlement(
+        tuple(sorted(effective)),
+        deduped_squads,
+        policy_revision,
+        'access_point_policy',
+        policy.inventory_fingerprint,
+    )
+
+
 async def resolve_tariff_entitlement(
     db: AsyncSession,
     tariff: Tariff,
@@ -86,6 +215,8 @@ async def resolve_tariff_entitlement(
     selected_location_ids: Iterable[str] | None = None,
     exception_location_ids: Iterable[str] | None = None,
     for_new_issuance: bool = True,
+    access_point_quote_context: bool = False,
+    lock_access_point_evidence: bool = False,
 ) -> ResolvedEntitlement:
     """Resolve one tariff to exact, safe internal squads.
 
@@ -103,6 +234,25 @@ async def resolve_tariff_entitlement(
         raise EntitlementResolutionError('this tariff has no sellable locations')
     if mode == 'legacy_snapshot':
         return await _legacy_snapshot(db, tariff)
+    if mode == 'access_point_managed':
+        if getattr(tariff, 'is_daily', False):
+            raise EntitlementResolutionError('access-point tariffs cannot use daily billing')
+        if for_new_issuance and not access_point_quote_context:
+            # Every legacy bot/cabinet/guest/auto purchase invokes this
+            # resolver before its own debit.  Refusing here is the common
+            # before-money fence until a path is migrated to Device-First's
+            # durable entitlement quote and term transaction.
+            raise EntitlementResolutionError(
+                'access-point issuance requires a Device-First immutable checkout quote'
+            )
+        return await _access_point_policy(
+            db,
+            tariff,
+            selected_access_point_ids=selected_location_ids,
+            exception_access_point_ids=exception_location_ids,
+            for_new_issuance=for_new_issuance,
+            lock_evidence=lock_access_point_evidence,
+        )
     if mode != 'location_managed':
         raise EntitlementResolutionError('unknown tariff entitlement mode')
 
@@ -152,6 +302,17 @@ async def resolve_tariff_entitlement(
     )
 
 
+async def assert_tariff_sellable(db: AsyncSession, tariff: Tariff) -> None:
+    """Central activation/trial gate shared by every tariff writer.
+
+    A normal tariff writer must never turn an unconfigured draft into a sale
+    or trial source.  Resolve before any writer commits; the resolver rejects
+    empty, stale, unsafe and legacy-without-manifest policies.
+    """
+
+    await resolve_tariff_entitlement(db, tariff, for_new_issuance=False)
+
+
 async def persist_subscription_entitlement_snapshot(
     db: AsyncSession,
     subscription_id: int,
@@ -176,6 +337,7 @@ async def persist_subscription_entitlement_snapshot(
         technical_squad_uuids=list(entitlement.squad_uuids),
         policy_revision=entitlement.policy_revision,
         provenance=entitlement.provenance,
+        inventory_fingerprint=entitlement.inventory_fingerprint,
         snapshot_hash=entitlement.snapshot_hash,
     )
     db.add(snapshot)
@@ -190,12 +352,90 @@ async def get_subscription_entitlement_squads(db: AsyncSession, subscription_id:
     manual-reconcile condition, not permission to choose arbitrary squads.
     """
 
-    entitlement = await get_subscription_resolved_entitlement(db, subscription_id)
+    entitlement = await get_effective_subscription_resolved_entitlement(db, subscription_id)
     return entitlement.squad_uuids
 
 
-async def get_subscription_resolved_entitlement(db: AsyncSession, subscription_id: int) -> ResolvedEntitlement:
-    """Load and validate immutable entitlement evidence for an issued subscription."""
+async def get_effective_subscription_resolved_entitlement(
+    db: AsyncSession,
+    subscription_id: int,
+    *,
+    at: object | None = None,
+    allow_access_point_baseline: bool = False,
+) -> ResolvedEntitlement:
+    """Return the active captured access-point term, otherwise 0100 baseline.
+
+    A future early-renewal term is intentionally ignored until its half-open
+    validity window begins.  This is the one read model used for subscriber
+    projections and restore/grace paths; it never consults mutable tariff
+    policy after a paid term was captured.
+    """
+
+    from datetime import UTC, datetime
+
+    effective_at = at if isinstance(at, datetime) else datetime.now(UTC)
+    term = await db.scalar(
+        select(SubscriptionEntitlementTerm)
+        .where(
+            SubscriptionEntitlementTerm.subscription_id == subscription_id,
+            SubscriptionEntitlementTerm.starts_at <= effective_at,
+            SubscriptionEntitlementTerm.ends_at > effective_at,
+        )
+        .order_by(SubscriptionEntitlementTerm.term_version.desc())
+        .limit(1)
+    )
+    if term is not None:
+        entitlement = ResolvedEntitlement(
+            _dedupe(term.access_point_ids or []),
+            _dedupe(term.technical_squad_keys or []),
+            int(term.policy_revision),
+            'access_point_policy',
+            str(term.inventory_fingerprint),
+        )
+        if not entitlement.squad_uuids:
+            raise EntitlementResolutionError('effective access-point term has no technical squads')
+        expected_hash = sha256(
+            json.dumps(
+                {
+                    'subscription_id': term.subscription_id,
+                    'term_version': term.term_version,
+                    'tariff_id': term.tariff_id,
+                    'starts_at': term.starts_at.isoformat(),
+                    'ends_at': term.ends_at.isoformat(),
+                    'access_point_ids': list(entitlement.location_ids),
+                    'technical_squad_keys': list(entitlement.squad_uuids),
+                    'policy_revision': entitlement.policy_revision,
+                    'inventory_fingerprint': entitlement.inventory_fingerprint,
+                    'source_reference': term.source_reference,
+                    'provenance': term.provenance,
+                },
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode()
+        ).hexdigest()
+        if expected_hash != term.grant_hash:
+            raise EntitlementResolutionError('effective access-point term hash is invalid')
+        return entitlement
+    return await get_subscription_resolved_entitlement(
+        db,
+        subscription_id,
+        allow_access_point_baseline=allow_access_point_baseline,
+    )
+
+
+async def get_subscription_resolved_entitlement(
+    db: AsyncSession,
+    subscription_id: int,
+    *,
+    allow_access_point_baseline: bool = False,
+) -> ResolvedEntitlement:
+    """Load and validate the one-row 0100 entitlement baseline.
+
+    Access-point calls from a legacy purchase/renewal route are deliberately
+    rejected: the baseline does not prove a future paid term or quote fence.
+    Read-only projection callers use ``get_effective...`` instead, which can
+    safely fall back to this baseline for a pre-term historical subscription.
+    """
 
     snapshot = await db.scalar(
         select(SubscriptionEntitlementSnapshot).where(
@@ -209,7 +449,10 @@ async def get_subscription_resolved_entitlement(db: AsyncSession, subscription_i
         _dedupe(snapshot.technical_squad_uuids or []),
         int(snapshot.policy_revision),
         str(snapshot.provenance),
+        getattr(snapshot, 'inventory_fingerprint', None),
     )
     if not entitlement.squad_uuids or entitlement.snapshot_hash != snapshot.snapshot_hash:
         raise EntitlementResolutionError('subscription entitlement snapshot is invalid')
+    if entitlement.provenance == 'access_point_policy' and not allow_access_point_baseline:
+        raise EntitlementResolutionError('access-point paid renewal requires a direct immutable checkout quote')
     return entitlement

@@ -18,6 +18,7 @@ from app.database.crud.subscription import (
     get_subscription_by_id_for_user,
 )
 from app.database.models import SubscriptionStatus, User
+from app.services.public_access_point_service import get_effective_public_access_points
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 
@@ -43,6 +44,7 @@ class SubscriptionListItem(BaseModel):
     is_daily_paused: bool = False
     autopay_enabled: bool = False
     connected_squads: list[str] | None = None
+    access_points: list[dict[str, str]] = []
 
 
 class SubscriptionsListResponse(BaseModel):
@@ -50,11 +52,12 @@ class SubscriptionsListResponse(BaseModel):
     multi_tariff_enabled: bool
 
 
-def _subscription_to_list_item(sub) -> SubscriptionListItem:
+async def _subscription_to_list_item(db: AsyncSession, sub) -> SubscriptionListItem:
     tariff_name = None
     if sub.tariff:
         tariff_name = sub.tariff.name
 
+    effective_access_points = await get_effective_public_access_points(db, sub)
     return SubscriptionListItem(
         id=sub.id,
         status=sub.actual_status,
@@ -70,7 +73,8 @@ def _subscription_to_list_item(sub) -> SubscriptionListItem:
         is_daily=bool(sub.tariff and getattr(sub.tariff, 'is_daily', False)),
         is_daily_paused=bool(getattr(sub, 'is_daily_paused', False)),
         autopay_enabled=sub.autopay_enabled or False,
-        connected_squads=sub.connected_squads,
+        connected_squads=[] if effective_access_points is not None else sub.connected_squads,
+        access_points=[{'id': point.id, 'title': point.title} for point in (effective_access_points or ())],
     )
 
 
@@ -81,7 +85,7 @@ async def list_subscriptions(
 ) -> SubscriptionsListResponse:
     """List all user subscriptions. Returns all subscriptions regardless of multi-tariff mode."""
     subscriptions = await get_all_subscriptions_by_user_id(db, user.id)
-    items = [_subscription_to_list_item(sub) for sub in subscriptions]
+    items = [await _subscription_to_list_item(db, sub) for sub in subscriptions]
     return SubscriptionsListResponse(
         subscriptions=items,
         multi_tariff_enabled=settings.is_multi_tariff_enabled(),
@@ -101,7 +105,7 @@ async def get_subscription_detail(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Subscription not found',
         )
-    return _subscription_to_list_item(subscription)
+    return await _subscription_to_list_item(db, subscription)
 
 
 @router.delete('/{subscription_id}')

@@ -103,6 +103,16 @@ async def purchase_devices_legacy(
             detail='No subscription found',
         )
 
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
+    except AccessPointPolicyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
+        ) from error
+
     if subscription.status not in ['active', 'trial']:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -367,6 +377,16 @@ async def purchase_devices(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='У вас нет активной подписки',
             )
+
+        from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+        try:
+            await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
+        except AccessPointPolicyError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
+            ) from error
 
         if subscription.status not in ['active', 'trial']:
             raise HTTPException(
@@ -666,6 +686,16 @@ async def save_devices_cart(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='У вас нет активной подписки',
         )
+
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
+    except AccessPointPolicyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
+        ) from error
 
     if subscription.status not in ['active', 'trial']:
         raise HTTPException(
@@ -1262,6 +1292,16 @@ async def reduce_devices(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='No subscription found',
         )
+
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='device reduction')
+    except AccessPointPolicyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
+        ) from error
 
     if subscription.is_trial:
         raise HTTPException(

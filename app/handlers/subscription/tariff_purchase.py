@@ -41,6 +41,23 @@ from app.utils.promo_offer import get_user_active_promo_discount_percent
 logger = structlog.get_logger(__name__)
 
 
+async def _reject_legacy_access_point_purchase(callback: types.CallbackQuery, tariff: Tariff) -> bool:
+    """Keep stale legacy callbacks away from AP money/mutation paths.
+
+    AP tariffs are issued only by Device-First's quote → term transaction.
+    This explicit route gate is intentionally independent of rollout flags:
+    disabling the new-checkout UI must fail closed, not revive an old callback.
+    """
+
+    if getattr(tariff, 'entitlement_mode', None) != 'access_point_managed':
+        return False
+    await callback.answer(
+        'Этот тариф оформляется только через защищённый сценарий покупки. Откройте тарифы заново.',
+        show_alert=True,
+    )
+    return True
+
+
 async def _persist_failed_refund(
     user_id: int,
     amount_kopeks: int,
@@ -1132,6 +1149,8 @@ async def handle_custom_confirm(
     if not tariff or not tariff.is_active:
         await callback.answer('Тариф недоступен', show_alert=True)
         return
+    if await _reject_legacy_access_point_purchase(callback, tariff):
+        return
 
     # Lock user BEFORE price computation to prevent TOCTOU on promo offer
     from app.database.crud.user import lock_user_for_pricing
@@ -1627,6 +1646,8 @@ async def confirm_tariff_purchase(
     if not tariff or not tariff.is_active:
         await callback.answer('Тариф недоступен', show_alert=True)
         return
+    if await _reject_legacy_access_point_purchase(callback, tariff):
+        return
 
     # Validate period is available for this tariff
     if str(period) not in (tariff.period_prices or {}):
@@ -2068,6 +2089,8 @@ async def confirm_daily_tariff_purchase(
 
     if not tariff or not tariff.is_active:
         await callback.answer('Тариф недоступен', show_alert=True)
+        return
+    if await _reject_legacy_access_point_purchase(callback, tariff):
         return
 
     is_daily = getattr(tariff, 'is_daily', False)
@@ -2749,6 +2772,8 @@ async def confirm_tariff_extend(
     tariff = await get_tariff_by_id(db, tariff_id)
     if not tariff or not tariff.is_active:
         await callback.answer('Тариф недоступен', show_alert=True)
+        return
+    if await _reject_legacy_access_point_purchase(callback, tariff):
         return
 
     # Validate period is available for this tariff

@@ -287,6 +287,13 @@ class SubscriptionService:
         )
         return bool(user is not None and getattr(user, 'account_erasure_requested_at', None) is not None)
 
+    @staticmethod
+    async def _is_access_point_subscription(db: AsyncSession, subscription: Subscription) -> bool:
+        """Whether raw Panel writes for this subscription are term-owned."""
+        from app.services.public_access_point_service import is_term_owned_access_point_subscription
+
+        return await is_term_owned_access_point_subscription(db, subscription)
+
     async def create_remnawave_user(
         self,
         db: AsyncSession,
@@ -294,8 +301,26 @@ class SubscriptionService:
         *,
         reset_traffic: bool = False,
         reset_reason: str | None = None,
+        commit: bool = True,
+        access_point_term_projection: bool = False,
+        access_point_term_ends_at: datetime | None = None,
     ) -> RemnaWaveUser | None:
         try:
+            if (
+                await self._is_access_point_subscription(db, subscription)
+                and not access_point_term_projection
+            ):
+                logger.warning(
+                    'raw_panel_create_blocked_for_access_point_term',
+                    subscription_id=subscription.id,
+                )
+                return None
+            if access_point_term_projection and access_point_term_ends_at is None:
+                logger.error(
+                    'access_point_projection_requires_captured_term_end',
+                    subscription_id=subscription.id,
+                )
+                return None
             user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
                 logger.warning(
@@ -336,6 +361,7 @@ class SubscriptionService:
                             ext_squad_uuid=ext_squad_uuid,
                             reset_traffic=reset_traffic,
                             reset_reason=reset_reason,
+                            panel_expire_at=access_point_term_ends_at,
                         )
                 else:
 
@@ -349,6 +375,7 @@ class SubscriptionService:
                             ext_squad_uuid=ext_squad_uuid,
                             reset_traffic=reset_traffic,
                             reset_reason=reset_reason,
+                            panel_expire_at=access_point_term_ends_at,
                         )
 
                 # Re-acquire the closure fence immediately before the actual
@@ -371,7 +398,10 @@ class SubscriptionService:
                 if not settings.is_multi_tariff_enabled():
                     user.remnawave_uuid = updated_user.uuid
 
-                await db.commit()
+                if commit:
+                    await db.commit()
+                else:
+                    await db.flush()
 
                 logger.info('✅ Создан/обновлен RemnaWave пользователь для подписки', subscription_id=subscription.id)
                 logger.info('🔗 Ссылка на подписку', subscription_url=updated_user.subscription_url)
@@ -397,6 +427,7 @@ class SubscriptionService:
         ext_squad_uuid: str | None,
         reset_traffic: bool,
         reset_reason: str | None,
+        panel_expire_at: datetime | None,
     ) -> RemnaWaveUser:
         """Multi-tariff mode: each subscription gets its own Remnawave user."""
         description = settings.format_remnawave_user_description(
@@ -408,7 +439,7 @@ class SubscriptionService:
         )
         common_kwargs = dict(
             status=UserStatus.ACTIVE,
-            expire_at=subscription.end_date,
+            expire_at=panel_expire_at or subscription.end_date,
             traffic_limit_bytes=self._gb_to_bytes(subscription.traffic_limit_gb),
             traffic_limit_strategy=get_traffic_reset_strategy(subscription.tariff),
             telegram_id=user.telegram_id,
@@ -482,6 +513,7 @@ class SubscriptionService:
         ext_squad_uuid: str | None,
         reset_traffic: bool,
         reset_reason: str | None,
+        panel_expire_at: datetime | None,
     ) -> RemnaWaveUser:
         """Single-subscription mode (legacy): one Remnawave user per bot user."""
         description = settings.format_remnawave_user_description(
@@ -513,7 +545,7 @@ class SubscriptionService:
 
         common_kwargs = dict(
             status=UserStatus.ACTIVE,
-            expire_at=subscription.end_date,
+            expire_at=panel_expire_at or subscription.end_date,
             traffic_limit_bytes=self._gb_to_bytes(subscription.traffic_limit_gb),
             traffic_limit_strategy=get_traffic_reset_strategy(subscription.tariff),
             telegram_id=user.telegram_id,
@@ -566,8 +598,26 @@ class SubscriptionService:
         reset_traffic: bool = False,
         reset_reason: str | None = None,
         sync_squads: bool = True,
+        commit: bool = True,
+        access_point_term_projection: bool = False,
+        access_point_term_ends_at: datetime | None = None,
     ) -> RemnaWaveUser | None:
         try:
+            if (
+                await self._is_access_point_subscription(db, subscription)
+                and not access_point_term_projection
+            ):
+                logger.warning(
+                    'raw_panel_update_blocked_for_access_point_term',
+                    subscription_id=subscription.id,
+                )
+                return None
+            if access_point_term_projection and access_point_term_ends_at is None:
+                logger.error(
+                    'access_point_projection_requires_captured_term_end',
+                    subscription_id=subscription.id,
+                )
+                return None
             user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
                 logger.warning(
@@ -605,6 +655,13 @@ class SubscriptionService:
             # (докупка/переименование устройства и т.п.) отрубило бы живой VPN.
             # НЕ меняем статус подписки здесь — это задача scheduled job.
             is_actually_active, panel_expire_at = resolve_panel_active_and_expiry(subscription, current_time)
+            if access_point_term_projection:
+                # A paid AP term is immutable financial evidence.  In
+                # particular, an early renewal may already have advanced the
+                # mutable subscription end date; never let that future end
+                # leak into a current-term re-projection.
+                is_actually_active = True
+                panel_expire_at = access_point_term_ends_at
 
             # Логируем если статус и end_date не согласованы (для отладки), но НЕ для grace
             # (там рассинхрон ожидаемый и корректный).
@@ -686,7 +743,10 @@ class SubscriptionService:
 
                 subscription.subscription_url = updated_user.subscription_url
                 subscription.subscription_crypto_link = updated_user.happ_crypto_link
-                await db.commit()
+                if commit:
+                    await db.commit()
+                else:
+                    await db.flush()
 
                 status_text = 'активным' if is_actually_active else 'истёкшим'
                 logger.info(
@@ -715,6 +775,12 @@ class SubscriptionService:
         Возвращает True при успехе, False если панель не настроена / нет UUID / ошибка API.
         """
         try:
+            if await self._is_access_point_subscription(db, subscription):
+                logger.warning(
+                    'raw_panel_state_push_blocked_for_access_point_term',
+                    subscription_id=subscription.id,
+                )
+                return False
             user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
                 return False
@@ -809,7 +875,13 @@ class SubscriptionService:
             logger.error('Ошибка удаления RemnaWave пользователя', error=e, user_uuid=user_uuid)
             return False
 
-    async def enable_remnawave_user(self, user_uuid: str, *, db: AsyncSession | None = None) -> bool:
+    async def enable_remnawave_user(
+        self,
+        user_uuid: str,
+        *,
+        db: AsyncSession | None = None,
+        access_point_term_projection: bool = False,
+    ) -> bool:
         """Включить пользователя в RemnaWave (реактивация)."""
         if db is None:
             # There is no safe way to decide whether this UUID belongs to a
@@ -820,6 +892,22 @@ class SubscriptionService:
         if await self._panel_uuid_is_financially_closing(db, user_uuid):
             logger.warning('panel_enable_blocked_for_financial_account_closure', user_uuid=user_uuid)
             return False
+        subscriptions = list(
+            (
+                await db.execute(
+                    select(Subscription)
+                    .outerjoin(User, Subscription.user_id == User.id)
+                    .where(or_(Subscription.remnawave_uuid == user_uuid, User.remnawave_uuid == user_uuid))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not access_point_term_projection:
+            for subscription in subscriptions:
+                if await self._is_access_point_subscription(db, subscription):
+                    logger.warning('raw_panel_enable_blocked_for_access_point_term', user_uuid=user_uuid)
+                    return False
         try:
             async with self.get_api_client() as api:
                 await api.enable_user(user_uuid)
@@ -940,6 +1028,11 @@ class SubscriptionService:
         self,
         db: AsyncSession,
         subscription: Subscription,
+        *,
+        force_panel_sync: bool = False,
+        commit: bool = True,
+        access_point_term_projection: bool = False,
+        access_point_term_ends_at: datetime | None = None,
     ) -> tuple[bool, str | None]:
         """
         Проверяет и синхронизирует подписку с RemnaWave при необходимости.
@@ -951,6 +1044,8 @@ class SubscriptionService:
             Tuple[bool, Optional[str]]: (успех, сообщение об ошибке)
         """
         try:
+            if access_point_term_projection and access_point_term_ends_at is None:
+                return False, 'access_point_projection_requires_captured_term_end'
             user = await get_user_by_id(db, subscription.user_id)
             if not user:
                 logger.error('Пользователь не найден для подписки', subscription_id=subscription.id)
@@ -958,7 +1053,7 @@ class SubscriptionService:
 
             # Проверяем, нужна ли синхронизация
             sub_uuid = subscription.remnawave_uuid if settings.is_multi_tariff_enabled() else user.remnawave_uuid
-            needs_sync = not subscription.subscription_url or not sub_uuid
+            needs_sync = force_panel_sync or not subscription.subscription_url or not sub_uuid
 
             if not needs_sync:
                 # Проверяем, существует ли пользователь в RemnaWave
@@ -993,6 +1088,10 @@ class SubscriptionService:
                     db,
                     subscription,
                     reset_traffic=False,
+                    sync_squads=True,
+                    commit=commit,
+                    access_point_term_projection=access_point_term_projection,
+                    access_point_term_ends_at=access_point_term_ends_at,
                 )
                 # Если update не удался (пользователь удалён из RemnaWave) — пробуем создать
                 if not result:
@@ -1009,6 +1108,9 @@ class SubscriptionService:
                         db,
                         subscription,
                         reset_traffic=False,
+                        commit=commit,
+                        access_point_term_projection=access_point_term_projection,
+                        access_point_term_ends_at=access_point_term_ends_at,
                     )
             else:
                 # Создаём нового пользователя
@@ -1016,6 +1118,9 @@ class SubscriptionService:
                     db,
                     subscription,
                     reset_traffic=False,
+                    commit=commit,
+                    access_point_term_projection=access_point_term_projection,
+                    access_point_term_ends_at=access_point_term_ends_at,
                 )
 
             if result:

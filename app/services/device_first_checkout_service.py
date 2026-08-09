@@ -28,6 +28,8 @@ from app.database.models import (
     DeviceFirstOutbox,
     Subscription,
     SubscriptionCheckout,
+    SubscriptionEntitlementTerm,
+    SubscriptionEntitlementTermProjectionOutbox,
     SubscriptionStatus,
     Tariff,
     Transaction,
@@ -680,6 +682,8 @@ async def create_checkout(
         raise DeviceFirstError('invalid_selection', 'Unsupported period or device limit', status_code=422)
 
     tariff = await db.get(Tariff, options['tariff']['id'])
+    if tariff is None:
+        raise DeviceFirstError('tariff_missing', 'The selected tariff no longer exists', status_code=404)
     subscription = await _current_subscription(db, user.id)
     selected = next(
         price
@@ -690,6 +694,15 @@ async def create_checkout(
     )
     if int(selected['price_kopeks']) <= 0:
         raise DeviceFirstError('non_positive_quote', 'Free quotes use the legacy flow', status_code=422)
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+
+    try:
+        quoted_entitlement = await resolve_tariff_entitlement(db, tariff, access_point_quote_context=True)
+    except EntitlementResolutionError as error:
+        # A point tariff with stale/unsafe evidence must fail before creating
+        # even a disposable checkout.  This avoids an unpaid quote that could
+        # later be mistaken for a valid funding intent.
+        raise DeviceFirstError('location_policy_not_sellable', str(error)) from error
     checkout = SubscriptionCheckout(
         public_id=str(uuid.uuid4()),
         user_id=user.id,
@@ -708,6 +721,7 @@ async def create_checkout(
         wallet_applied_kopeks=0,
         external_payable_kopeks=0,
         pricing_revision=int(tariff.pricing_revision or 1),
+        entitlement_quote_snapshot=_entitlement_quote_snapshot(quoted_entitlement),
         lifecycle_state=initial_lifecycle_state,
         confirmed_at=now if initial_lifecycle_state == 'confirmed' else None,
         quote_expires_at=now + timedelta(minutes=30),
@@ -1357,8 +1371,13 @@ async def _validate_direct_pre_commit(
     user: User,
     target: Subscription | None,
     tariff: Tariff,
-) -> bool:
-    """Fail before money if the quoted target is no longer safe to sell."""
+):
+    """Fail before money if price, target or entitlement quote drifted.
+
+    The returned object is the immutable entitlement captured at quote birth.
+    It is intentionally handed to the funding and fulfilment stages so they
+    never resolve a newer tariff policy after the customer accepted a price.
+    """
     await _require_no_legacy_pending_trial(db, user_id=user.id, checkout=checkout)
     now = datetime.now(UTC)
     if checkout.lifecycle_state != 'confirmed':
@@ -1368,23 +1387,23 @@ async def _validate_direct_pre_commit(
         checkout.quote_state = 'expired'
         checkout.terminal_reason = 'quote_expired'
         await db.commit()
-        return False
+        return None
     if checkout.expect_no_subscription:
         if await _current_subscription(db, user.id) is not None:
             checkout.lifecycle_state = 'conflict'
             checkout.terminal_reason = 'subscription_appeared'
             await db.commit()
-            return False
+            return None
     elif target is None or _subscription_snapshot(target) != checkout.target_snapshot:
         checkout.lifecycle_state = 'conflict'
         checkout.terminal_reason = 'target_subscription_changed'
         await db.commit()
-        return False
+        return None
     if target is not None and not target.is_trial and checkout.selected_device_limit < int(target.device_limit or 0):
         checkout.lifecycle_state = 'conflict'
         checkout.terminal_reason = 'device_limit_decrease_not_allowed'
         await db.commit()
-        return False
+        return None
     eligibility = tariff_eligibility(tariff, subscription=target)
     if (
         not eligibility.eligible
@@ -1395,7 +1414,7 @@ async def _validate_direct_pre_commit(
         checkout.quote_state = 'price_changed'
         checkout.terminal_reason = 'tariff_no_longer_eligible'
         await db.commit()
-        return False
+        return None
     current_price = await pricing_engine.calculate_tariff_purchase_price(
         tariff,
         checkout.period_days,
@@ -1410,8 +1429,108 @@ async def _validate_direct_pre_commit(
         checkout.quote_state = 'price_changed'
         checkout.terminal_reason = 'price_changed'
         await db.commit()
-        return False
-    return True
+        return None
+    try:
+        quoted_entitlement = _load_checkout_quoted_entitlement(checkout)
+    except (KeyError, TypeError, ValueError):
+        checkout.lifecycle_state = 'reprice_required'
+        checkout.quote_state = 'price_changed'
+        checkout.terminal_reason = 'entitlement_quote_missing_or_invalid'
+        await db.commit()
+        return None
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+
+    try:
+        # Quote finalisation locks the tariff and every selected AP evidence
+        # row through the debit/invoice transaction.  Discovery/policy writes
+        # acquire the same row locks on UPDATE, eliminating a quote→money
+        # inventory or policy TOCTOU window.
+        locked_tariff = await db.scalar(
+            select(Tariff)
+            .where(Tariff.id == tariff.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if locked_tariff is None:
+            raise EntitlementResolutionError('tariff disappeared during final quote validation')
+        tariff = locked_tariff
+        locked_price = await pricing_engine.calculate_tariff_purchase_price(
+            tariff,
+            checkout.period_days,
+            device_limit=checkout.selected_device_limit,
+            user=user,
+        )
+        if (
+            int(tariff.pricing_revision or 1) != checkout.pricing_revision
+            or locked_price.final_total != checkout.tariff_total_kopeks
+        ):
+            checkout.lifecycle_state = 'reprice_required'
+            checkout.quote_state = 'price_changed'
+            checkout.terminal_reason = 'price_changed'
+            await db.commit()
+            return None
+        current_entitlement = await resolve_tariff_entitlement(
+            db,
+            tariff,
+            access_point_quote_context=True,
+            lock_access_point_evidence=True,
+        )
+    except EntitlementResolutionError:
+        current_entitlement = None
+    if current_entitlement is None or current_entitlement.snapshot_hash != quoted_entitlement.snapshot_hash:
+        # Host title-only presentation changes do not change the AP
+        # fingerprint/hash.  A policy, mapping or health drift does.
+        checkout.lifecycle_state = 'reprice_required'
+        checkout.quote_state = 'price_changed'
+        checkout.terminal_reason = 'entitlement_changed'
+        await db.commit()
+        return None
+    return quoted_entitlement
+
+
+def _entitlement_from_payload(raw_entitlement: object):
+    """Deserialize immutable quote/sale evidence without consulting tariff state."""
+
+    from app.services.public_location_entitlement_service import ResolvedEntitlement
+
+    if not isinstance(raw_entitlement, dict):
+        raise ValueError('entitlement payload is not an object')
+    return ResolvedEntitlement(
+        tuple(raw_entitlement['location_ids']),
+        tuple(raw_entitlement['technical_squad_uuids']),
+        int(raw_entitlement['policy_revision']),
+        str(raw_entitlement['provenance']),
+        (
+            str(raw_entitlement['inventory_fingerprint'])
+            if raw_entitlement.get('inventory_fingerprint') is not None
+            else None
+        ),
+    )
+
+
+def _entitlement_quote_snapshot(entitlement) -> dict[str, Any]:
+    """Store the access fence at quote birth, before funding selection."""
+
+    return {
+        'entitlement': entitlement.snapshot_payload(),
+        'entitlement_hash': entitlement.snapshot_hash,
+        'policy_revision': entitlement.policy_revision,
+        'inventory_fingerprint': entitlement.inventory_fingerprint,
+    }
+
+
+def _load_checkout_quoted_entitlement(checkout: SubscriptionCheckout):
+    """Reject malformed/missing immutable quote evidence before money."""
+
+    snapshot = dict(getattr(checkout, 'entitlement_quote_snapshot', None) or {})
+    entitlement = _entitlement_from_payload(snapshot.get('entitlement'))
+    if (
+        entitlement.snapshot_hash != snapshot.get('entitlement_hash')
+        or entitlement.policy_revision != snapshot.get('policy_revision')
+        or entitlement.inventory_fingerprint != snapshot.get('inventory_fingerprint')
+    ):
+        raise ValueError('checkout entitlement quote hash is invalid')
+    return entitlement
 
 
 def _direct_sale_snapshot(
@@ -1471,14 +1590,9 @@ async def prepare_direct_external_checkout(
         ):
             raise DeviceFirstError('invalid_state', 'Checkout cannot accept another payment invoice')
         return checkout
-    if not await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff):
+    entitlement = await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff)
+    if entitlement is None:
         raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')
-    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
-
-    try:
-        entitlement = await resolve_tariff_entitlement(db, tariff)
-    except EntitlementResolutionError as error:
-        raise DeviceFirstError('location_policy_not_sellable', str(error)) from error
     total = checkout.tariff_total_kopeks
     checkout.wallet_applied_kopeks = 0
     checkout.external_payable_kopeks = total
@@ -1517,7 +1631,7 @@ async def _complete_direct_sale_locked(
         checkout.lifecycle_state = 'operator_review'
         checkout.terminal_reason = 'invalid_sale_snapshot'
         raise DeviceFirstError('operator_review_required', 'The immutable sale snapshot is invalid')
-    from app.services.public_location_entitlement_service import ResolvedEntitlement
+    from app.services.public_location_entitlement_service import EntitlementResolutionError, ResolvedEntitlement
 
     raw_entitlement = snapshot.get('entitlement') or {}
     try:
@@ -1526,6 +1640,11 @@ async def _complete_direct_sale_locked(
             tuple(raw_entitlement['technical_squad_uuids']),
             int(raw_entitlement['policy_revision']),
             str(raw_entitlement['provenance']),
+            (
+                str(raw_entitlement['inventory_fingerprint'])
+                if raw_entitlement.get('inventory_fingerprint') is not None
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as error:
         checkout.lifecycle_state = 'operator_review'
@@ -1553,10 +1672,98 @@ async def _complete_direct_sale_locked(
             raise DeviceFirstError('operator_review_required', 'Invalid wallet settlement values')
         if user.balance_kopeks < total:
             raise DeviceFirstError('wallet_insufficient', 'The balance no longer covers the checkout', status_code=422)
-        user.balance_kopeks -= total
     elif checkout.funding_mode == 'platega':
         if checkout.wallet_applied_kopeks != 0 or checkout.external_payable_kopeks != total or not provider_payment_id:
             raise DeviceFirstError('operator_review_required', 'Invalid provider settlement values')
+    else:
+        raise DeviceFirstError('operator_review_required', 'Unknown funding method')
+
+    if entitlement.provenance == 'access_point_policy':
+        # The invoice may have remained unpaid after the quote-finalisation
+        # transaction released its locks.  A later policy/health/graph change
+        # must not be silently delivered after provider capture.  Re-check
+        # only for equality under the same tariff/evidence locks; never use a
+        # newly resolved policy as the customer's entitlement.
+        from app.services.public_location_entitlement_service import resolve_tariff_entitlement
+
+        try:
+            locked_tariff = await db.scalar(
+                select(Tariff)
+                .where(Tariff.id == int(snapshot['tariff_id']))
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            current_entitlement = (
+                await resolve_tariff_entitlement(
+                    db,
+                    locked_tariff,
+                    access_point_quote_context=True,
+                    lock_access_point_evidence=True,
+                )
+                if locked_tariff is not None
+                else None
+            )
+        except (EntitlementResolutionError, ValueError):
+            current_entitlement = None
+        if current_entitlement is None or current_entitlement.snapshot_hash != entitlement.snapshot_hash:
+            checkout.lifecycle_state = 'operator_review'
+            checkout.terminal_reason = 'captured_entitlement_changed_after_payment'
+            raise DeviceFirstError(
+                'operator_review_required',
+                'The captured access evidence changed after the unpaid invoice',
+            )
+
+    # The subscription row/immutable term is prepared before the debit or
+    # provider receipt is made durable.  A term constraint or source-fence
+    # failure therefore rolls back the entire financial transition.
+    try:
+        # Savepoint rolls back every subscription/snapshot/term mutation if
+        # the captured term cannot be created.  The outer transaction may then
+        # safely commit only the operator-review state for an already-paid
+        # provider callback; no access is granted without exact term evidence.
+        async with db.begin_nested():
+            if target is None:
+                target = await create_paid_subscription(
+                    db,
+                    user_id=user.id,
+                    duration_days=int(snapshot['period_days']),
+                    traffic_limit_gb=int(snapshot['traffic_limit_gb']),
+                    device_limit=int(snapshot['device_limit']),
+                    connected_squads=list(entitlement.squad_uuids),
+                    tariff_id=int(snapshot['tariff_id']),
+                    commit=False,
+                    _resolved_entitlement=entitlement,
+                    _access_point_term_source_reference=f'device-first-checkout:{checkout.public_id}',
+                    _access_point_term_provenance='device_first_checkout',
+                )
+            else:
+                target = await extend_subscription(
+                    db,
+                    target,
+                    int(snapshot['period_days']),
+                    tariff_id=int(snapshot['tariff_id']),
+                    traffic_limit_gb=int(snapshot['traffic_limit_gb']),
+                    device_limit=int(snapshot['device_limit']),
+                    connected_squads=list(entitlement.squad_uuids),
+                    convert_trial=True,
+                    commit=False,
+                    _resolved_entitlement=entitlement,
+                    _access_point_term_source_reference=f'device-first-checkout:{checkout.public_id}',
+                    _access_point_term_provenance='device_first_checkout',
+                )
+    except (ValueError, EntitlementResolutionError, IntegrityError) as error:
+        # A provider may already have accepted funds.  Preserve the exact
+        # checkout for financial reconciliation; never retry against a newer
+        # tariff policy or silently credit a different access term.
+        checkout.lifecycle_state = 'operator_review'
+        checkout.terminal_reason = 'captured_entitlement_term_unavailable'
+        raise DeviceFirstError(
+            'operator_review_required', 'The captured access term requires operator reconciliation'
+        ) from error
+
+    if checkout.funding_mode == 'wallet':
+        user.balance_kopeks -= total
+    else:
         receipt_key = f'provider-receipt:{checkout.id}'
         receipt = (
             await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == receipt_key))
@@ -1576,8 +1783,6 @@ async def _complete_direct_sale_locked(
                     completed_at=now,
                 )
             )
-    else:
-        raise DeviceFirstError('operator_review_required', 'Unknown funding method')
 
     sale_key = f'direct-sale:{checkout.id}'
     sale = (
@@ -1601,32 +1806,6 @@ async def _complete_direct_sale_locked(
         )
         db.add(sale)
         await db.flush()
-
-    if target is None:
-        target = await create_paid_subscription(
-            db,
-            user_id=user.id,
-            duration_days=int(snapshot['period_days']),
-            traffic_limit_gb=int(snapshot['traffic_limit_gb']),
-            device_limit=int(snapshot['device_limit']),
-            connected_squads=list(entitlement.squad_uuids),
-            tariff_id=int(snapshot['tariff_id']),
-            commit=False,
-            _resolved_entitlement=entitlement,
-        )
-    else:
-        target = await extend_subscription(
-            db,
-            target,
-            int(snapshot['period_days']),
-            tariff_id=int(snapshot['tariff_id']),
-            traffic_limit_gb=int(snapshot['traffic_limit_gb']),
-            device_limit=int(snapshot['device_limit']),
-            connected_squads=list(entitlement.squad_uuids),
-            convert_trial=True,
-            commit=False,
-            _resolved_entitlement=entitlement,
-        )
     user.has_had_paid_subscription = True
     checkout.created_subscription_id = target.id
     checkout.debit_transaction_id = sale.id
@@ -1669,7 +1848,8 @@ async def commit_direct_wallet_checkout(
         if checkout.funding_mode != 'wallet':
             raise DeviceFirstError('funding_mode_locked', 'Funding method is already fixed')
         return checkout
-    if not await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff):
+    entitlement = await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff)
+    if entitlement is None:
         raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')
     total = checkout.tariff_total_kopeks
     if user.balance_kopeks < total:
@@ -1677,12 +1857,6 @@ async def commit_direct_wallet_checkout(
     checkout.wallet_applied_kopeks = total
     checkout.external_payable_kopeks = 0
     checkout.funding_mode = 'wallet'
-    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
-
-    try:
-        entitlement = await resolve_tariff_entitlement(db, tariff)
-    except EntitlementResolutionError as error:
-        raise DeviceFirstError('location_policy_not_sellable', str(error)) from error
     checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='wallet', entitlement=entitlement)
     checkout.financial_committed_at = datetime.now(UTC)
     await _complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
@@ -1776,13 +1950,17 @@ async def fulfill_direct_external_checkout(
             provider_payment_id=provider_payment_id,
         )
     except DeviceFirstError as error:
-        if error.code == 'legacy_trial_reconciliation_required':
+        if error.code in {'legacy_trial_reconciliation_required', 'operator_review_required'}:
             # A pre-release direct invoice may be paid after a historical
             # pending trial has been discovered.  Do not let the recovery
             # worker spin or silently overwrite the old trial; hold this exact
             # paid attempt for one explicit financial reconciliation.
             owned_attempt.status = 'operator_review'
-            owned_attempt.reconciliation_reason = 'legacy_pending_trial_reconciliation_required'
+            owned_attempt.reconciliation_reason = (
+                'legacy_pending_trial_reconciliation_required'
+                if error.code == 'legacy_trial_reconciliation_required'
+                else 'captured_entitlement_term_unavailable'
+            )
         await db.commit()
         raise
     await db.commit()
@@ -1799,6 +1977,19 @@ async def _kick_direct_provisioning_post_commit(db: AsyncSession, *, checkout_id
     claims this checkout's direct outbox row; its durable lease/backoff and the
     dedicated recovery loop take over if this first attempt cannot finish.
     """
+    try:
+        # A future access-point term may have been committed by this checkout.
+        # Wake the dedicated boundary executor only after the financial/term
+        # transaction is durable, so it can never miss the newly-created row.
+        from app.services.monitoring_service import monitoring_service
+
+        monitoring_service.wake_access_point_term_projection_scheduler()
+    except Exception as error:
+        logger.warning(
+            'device_first_access_point_projection_wakeup_failed',
+            checkout_id=checkout_id,
+            error=type(error).__name__,
+        )
     try:
         await process_direct_provisioning_outbox(db, checkout_id=checkout_id, limit=1)
     except asyncio.CancelledError:
@@ -1939,6 +2130,37 @@ async def process_direct_provisioning_outbox(
     return await _process_direct_provisioning_outbox(db, limit=limit, checkout_id=checkout_id)
 
 
+async def _access_point_checkout_projection_delivered(
+    db: AsyncSession,
+    *,
+    checkout: SubscriptionCheckout,
+    subscription: Subscription,
+) -> bool | None:
+    """Return whether an AP checkout's sole canonical Panel projection ran.
+
+    ``None`` means a non-AP tariff.  AP direct-provisioning retries may only
+    mark their checkout ready after the immutable-term outbox has performed
+    the Panel write; they must never resurrect raw ``connected_squads``.
+    """
+    tariff_mode = await db.scalar(select(Tariff.entitlement_mode).where(Tariff.id == subscription.tariff_id))
+    if tariff_mode != 'access_point_managed':
+        return None
+    term_id = await db.scalar(
+        select(SubscriptionEntitlementTerm.id).where(
+            SubscriptionEntitlementTerm.subscription_id == subscription.id,
+            SubscriptionEntitlementTerm.source_reference == f'device-first-checkout:{checkout.public_id}',
+        )
+    )
+    if term_id is None:
+        return False
+    state = await db.scalar(
+        select(SubscriptionEntitlementTermProjectionOutbox.state).where(
+            SubscriptionEntitlementTermProjectionOutbox.term_id == term_id
+        )
+    )
+    return state == 'delivered'
+
+
 async def _process_direct_provisioning_outbox(
     db: AsyncSession,
     *,
@@ -2002,11 +2224,25 @@ async def _process_direct_provisioning_outbox(
         if row is None:
             continue
         subscription = await db.get(Subscription, row.payload_json['subscription_id'])
+        sync_error: str | None = None
         try:
-            ok, error = await SubscriptionService().ensure_subscription_synced(db, subscription)
-        except Exception as error:  # no stale write; preserve concise retry evidence
+            if subscription is None:
+                ok, sync_error = False, 'subscription_missing'
+            else:
+                access_point_delivered = await _access_point_checkout_projection_delivered(
+                    db,
+                    checkout=await db.get(SubscriptionCheckout, row.checkout_id),
+                    subscription=subscription,
+                )
+                if access_point_delivered is None:
+                    ok, sync_error = await SubscriptionService().ensure_subscription_synced(db, subscription)
+                elif access_point_delivered:
+                    ok, sync_error = True, None
+                else:
+                    ok, sync_error = False, 'access_point_term_projection_pending'
+        except Exception as exc:  # no stale write; preserve concise retry evidence
             ok = False
-            error = type(error).__name__
+            sync_error = type(exc).__name__
         # Keep the final critical section in the same lock order as the
         # post-paid reversal: Checkout -> Outbox.  The remote sync above is
         # deliberately outside a DB transaction; taking Outbox first here
@@ -2037,7 +2273,7 @@ async def _process_direct_provisioning_outbox(
             continue
         current.lease_token = None
         current.lease_expires_at = None
-        current.last_error = error
+        current.last_error = sync_error
         if ok:
             current.status = 'done'
             checkout.provisioning_state = 'ready'

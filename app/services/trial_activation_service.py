@@ -549,6 +549,15 @@ async def _trial_parameters(db: AsyncSession, *, forced_device_limit: int | None
             'Trial cannot be issued until its location policy is configured.',
             status_code=409,
         )
+    if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+        # This service can debit the balance immediately below. AP entitlement
+        # issuance is intentionally unavailable here because it must begin
+        # with the Device-First immutable checkout quote, never a trial.
+        raise TrialCheckoutResolutionError(
+            'access_point_trial_unsupported',
+            'This tariff cannot be issued as a trial.',
+            status_code=409,
+        )
     duration_days = getattr(tariff, 'trial_duration_days', None) or duration_days
     traffic_limit_gb = tariff.traffic_limit_gb
     device_limit = tariff.device_limit

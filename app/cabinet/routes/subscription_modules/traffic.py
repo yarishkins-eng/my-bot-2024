@@ -170,6 +170,15 @@ async def purchase_traffic(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='No subscription found',
         )
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='traffic top-up')
+    except AccessPointPolicyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
+        ) from error
     tariff = None
     base_price_kopeks = 0
     is_tariff_mode = settings.is_tariffs_mode() and subscription.tariff_id

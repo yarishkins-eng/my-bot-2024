@@ -21,7 +21,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database.crud.server_squad import get_server_squad_by_uuid
 from app.database.crud.subscription import (
     create_paid_subscription,
     create_trial_subscription,
@@ -50,6 +49,7 @@ from app.services.notification_delivery_service import (
     notification_delivery_service,
 )
 from app.services.pricing_engine import pricing_engine
+from app.services.public_access_point_service import get_tariff_public_access_points
 from app.services.public_location_entitlement_service import (
     EntitlementResolutionError,
     get_subscription_resolved_entitlement,
@@ -404,17 +404,16 @@ async def _build_tariff_response(
     servers = []
     servers_count = 0
 
-    if tariff.allowed_squads:
+    public_access_points = await get_tariff_public_access_points(db, tariff)
+    if public_access_points is not None:
+        # A converted legacy tariff deliberately retains ``allowed_squads``
+        # as server-only historical evidence.  Never serialize it back into a
+        # customer card; this legacy response shape has no public-point DTO.
+        servers_count = len(public_access_points)
+    elif tariff.allowed_squads:
         servers_count = len(tariff.allowed_squads)
-        for squad_uuid in tariff.allowed_squads[:5]:  # Limit for preview
-            server = await get_server_squad_by_uuid(db, squad_uuid)
-            if server:
-                servers.append(
-                    {
-                        'uuid': squad_uuid,
-                        'name': server.display_name or squad_uuid[:8],
-                    }
-                )
+        # Generic tariff cards retain a non-sensitive count for backwards
+        # compatible presentation, but never expose technical Squad UUIDs.
 
     # Get promo group for discount calculation
     # Use get_primary_promo_group() for correct promo group resolution
@@ -560,6 +559,9 @@ async def _build_tariff_response(
         'device_price_kopeks': device_price,
         'servers_count': servers_count,
         'servers': servers,
+        'access_points': [
+            {'id': access_point.id, 'title': access_point.title} for access_point in (public_access_points or ())
+        ],
         'periods': periods,
         'is_current': current_tariff_id == tariff.id if current_tariff_id else False,
         'is_available': tariff.is_active,
@@ -969,6 +971,17 @@ async def purchase_tariff(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail='Tariff not found or inactive',
+            )
+        if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+            # This legacy endpoint cannot produce an immutable AP quote/term.
+            # Keep the rejection independent of the Device-First UI rollout
+            # so a stale bundle cannot debit then fail during mutation.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    'code': 'device_first_required',
+                    'message': 'Access-point tariffs require the Device-First checkout.',
+                },
             )
 
         # Lock user BEFORE price computation to prevent TOCTOU on promo offer

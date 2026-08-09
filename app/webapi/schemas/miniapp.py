@@ -86,6 +86,13 @@ class MiniAppConnectedServer(BaseModel):
     name: str
 
 
+class MiniAppPublicAccessPoint(BaseModel):
+    """A user-safe Host title for an immutable access-point term."""
+
+    id: str
+    title: str
+
+
 class MiniAppDevice(BaseModel):
     hwid: str | None = None
     platform: str | None = None
@@ -541,6 +548,9 @@ class MiniAppTariff(BaseModel):
     device_limit: int
     servers_count: int
     servers: list[MiniAppConnectedServer] = Field(default_factory=list)
+    # Access-point tariffs deliberately use a different public DTO.  It never
+    # reuses ``MiniAppConnectedServer.uuid`` for a technical squad key.
+    access_points: list[MiniAppPublicAccessPoint] = Field(default_factory=list)
     periods: list[MiniAppTariffPeriod] = Field(default_factory=list)
     is_current: bool = False
     is_available: bool = True
@@ -579,6 +589,7 @@ class MiniAppCurrentTariff(BaseModel):
     is_unlimited_traffic: bool = False
     device_limit: int
     servers_count: int
+    access_points: list[MiniAppPublicAccessPoint] = Field(default_factory=list)
     # Месячная цена для расчёта стоимости переключения тарифа
     monthly_price_kopeks: int = 0
     # Докупка трафика
@@ -732,6 +743,7 @@ class MiniAppSubscriptionResponse(BaseModel):
     ss_conf_links: dict[str, str] = Field(default_factory=dict)
     connected_squads: list[str] = Field(default_factory=list)
     connected_servers: list[MiniAppConnectedServer] = Field(default_factory=list)
+    access_points: list[MiniAppPublicAccessPoint] = Field(default_factory=list)
     connected_devices_count: int = 0
     connected_devices: list[MiniAppDevice] = Field(default_factory=list)
     happ: dict[str, Any] | None = None
@@ -805,6 +817,7 @@ class MiniAppSubscriptionDeviceOption(BaseModel):
 
 class MiniAppSubscriptionCurrentSettings(BaseModel):
     servers: list[MiniAppConnectedServer] = Field(default_factory=list)
+    access_points: list[MiniAppPublicAccessPoint] = Field(default_factory=list)
     traffic_limit_gb: int | None = None
     traffic_limit_label: str | None = None
     device_limit: int = 0

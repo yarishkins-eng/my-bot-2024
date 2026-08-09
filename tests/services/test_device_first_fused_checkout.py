@@ -2,11 +2,12 @@
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from app.services import device_first_checkout_service as service, device_first_payment_service as payment_service
+from app.services.public_location_entitlement_service import ResolvedEntitlement
 
 
 class ScalarResult:
@@ -53,6 +54,41 @@ def _checkout(**overrides):
     return SimpleNamespace(**{**base, **overrides})
 
 
+def _access_point_sale_checkout(*, entitlement: ResolvedEntitlement):
+    checkout = _checkout(
+        tariff_id=7,
+        tariff_total_kopeks=36_900,
+        wallet_applied_kopeks=0,
+        external_payable_kopeks=36_900,
+        funding_mode='platega',
+        expect_no_subscription=True,
+        target_snapshot={},
+        price_breakdown={},
+        pricing_revision=3,
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+    tariff = SimpleNamespace(id=7, name='AP tariff', traffic_limit_gb=100)
+    checkout.sale_snapshot = service._direct_sale_snapshot(
+        checkout,
+        tariff,
+        funding_mode='platega',
+        entitlement=entitlement,
+    )
+    return checkout, tariff
+
+
+class _Savepoint:
+    def __init__(self):
+        self.exit_exception = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, _traceback):
+        self.exit_exception = exc
+        return False
+
+
 def _db_with_user(user):
     return SimpleNamespace(execute=AsyncMock(side_effect=[ScalarResult(user)]), commit=AsyncMock())
 
@@ -86,6 +122,137 @@ async def test_fused_birth_creates_one_confirmed_checkout_with_matching_price(mo
     assert resolved.proceed_to_payment is True
     assert create.await_args.kwargs['initial_lifecycle_state'] == 'confirmed'
     assert create.await_args.kwargs['source'] == 'telegram'
+
+
+@pytest.mark.asyncio
+async def test_access_point_policy_drift_forces_requote_before_any_funding_transition(monkeypatch):
+    quoted = ResolvedEntitlement(('point-pl',), ('squad-pl',), 4, 'access_point_policy', 'fp-before')
+    checkout = _checkout(
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        expect_no_subscription=True,
+        target_snapshot={},
+        pricing_revision=7,
+        tariff_total_kopeks=36_900,
+        period_days=30,
+        selected_device_limit=2,
+        quote_state='valid',
+        terminal_reason=None,
+        entitlement_quote_snapshot=service._entitlement_quote_snapshot(quoted),
+    )
+    user = _user()
+    tariff = SimpleNamespace(id=7, pricing_revision=7)
+    # Final quote validation must take a real tariff-row lock before it checks
+    # the access-point evidence.  The fake returns the locked, current row.
+    db = SimpleNamespace(commit=AsyncMock(), scalar=AsyncMock(return_value=tariff))
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, '_current_subscription', AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        service,
+        'tariff_eligibility',
+        lambda *_args, **_kwargs: SimpleNamespace(eligible=True, period_options=(30,), device_options=(2,)),
+    )
+    monkeypatch.setattr(
+        service.pricing_engine,
+        'calculate_tariff_purchase_price',
+        AsyncMock(return_value=SimpleNamespace(final_total=36_900)),
+    )
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=ResolvedEntitlement(('point-pl',), ('squad-pl',), 5, 'access_point_policy', 'fp-after')),
+    )
+
+    result = await service._validate_direct_pre_commit(
+        db,
+        checkout=checkout,
+        user=user,
+        target=None,
+        tariff=tariff,
+    )
+
+    assert result is None
+    assert checkout.lifecycle_state == 'reprice_required'
+    assert checkout.terminal_reason == 'entitlement_changed'
+    db.commit.assert_awaited_once()
+    resolver = __import__(
+        'app.services.public_location_entitlement_service',
+        fromlist=['resolve_tariff_entitlement'],
+    ).resolve_tariff_entitlement
+    assert resolver.await_args.kwargs['lock_access_point_evidence'] is True
+
+
+@pytest.mark.asyncio
+async def test_paid_access_point_drift_enters_operator_review_before_term_or_ledger_mutation(monkeypatch):
+    quoted = ResolvedEntitlement(('point-pl',), ('squad-pl',), 4, 'access_point_policy', 'fp-before')
+    changed = ResolvedEntitlement(('point-pl',), ('squad-pl',), 5, 'access_point_policy', 'fp-after')
+    checkout, tariff = _access_point_sale_checkout(entitlement=quoted)
+    user = _user()
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=tariff),
+        execute=AsyncMock(),
+        add=Mock(),
+    )
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, '_current_subscription', AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=changed),
+    )
+    create = AsyncMock()
+    monkeypatch.setattr(service, 'create_paid_subscription', create)
+
+    with pytest.raises(service.DeviceFirstError) as raised:
+        await service._complete_direct_sale_locked(
+            db,
+            checkout=checkout,
+            user=user,
+            target=None,
+            provider_payment_id='provider-paid-id',
+        )
+
+    assert raised.value.code == 'operator_review_required'
+    assert checkout.lifecycle_state == 'operator_review'
+    assert checkout.terminal_reason == 'captured_entitlement_changed_after_payment'
+    create.assert_not_awaited()
+    db.execute.assert_not_awaited()
+    db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_access_point_term_capture_failure_rolls_back_before_ledger_mutation(monkeypatch):
+    quoted = ResolvedEntitlement(('point-pl',), ('squad-pl',), 4, 'access_point_policy', 'fp-before')
+    checkout, tariff = _access_point_sale_checkout(entitlement=quoted)
+    user = _user()
+    savepoint = _Savepoint()
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=tariff),
+        execute=AsyncMock(),
+        add=Mock(),
+        begin_nested=Mock(return_value=savepoint),
+    )
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, '_current_subscription', AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=quoted),
+    )
+    create = AsyncMock(side_effect=ValueError('captured term source conflict'))
+    monkeypatch.setattr(service, 'create_paid_subscription', create)
+
+    with pytest.raises(service.DeviceFirstError) as raised:
+        await service._complete_direct_sale_locked(
+            db,
+            checkout=checkout,
+            user=user,
+            target=None,
+            provider_payment_id='provider-paid-id',
+        )
+
+    assert raised.value.code == 'operator_review_required'
+    assert checkout.lifecycle_state == 'operator_review'
+    assert checkout.terminal_reason == 'captured_entitlement_term_unavailable'
+    assert isinstance(savepoint.exit_exception, ValueError)
+    db.execute.assert_not_awaited()
+    db.add.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -800,6 +967,10 @@ async def test_fused_birth_carries_a_thirty_minute_quote_expiry_and_confirmed_bi
         ),
     )
     monkeypatch.setattr(service, '_current_subscription', AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=ResolvedEntitlement(('point-1',), ('squad-1',), 1, 'access_point_policy', 'fp-1')),
+    )
 
     before = datetime.now(UTC)
     checkout = await service.create_checkout(
@@ -816,6 +987,8 @@ async def test_fused_birth_carries_a_thirty_minute_quote_expiry_and_confirmed_bi
     assert checkout.confirmed_at is not None
     assert before + timedelta(minutes=30) <= checkout.quote_expires_at <= after + timedelta(minutes=30)
     assert checkout.expires_at > checkout.quote_expires_at
+    assert checkout.entitlement_quote_snapshot['entitlement']['location_ids'] == ['point-1']
+    assert checkout.entitlement_quote_snapshot['entitlement_hash']
 
 
 @pytest.mark.asyncio
@@ -856,6 +1029,10 @@ async def test_legacy_create_checkout_default_birth_stays_a_draft(monkeypatch):
         ),
     )
     monkeypatch.setattr(service, '_current_subscription', AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=ResolvedEntitlement(('point-1',), ('squad-1',), 1, 'access_point_policy', 'fp-1')),
+    )
 
     checkout = await service.create_checkout(
         db,

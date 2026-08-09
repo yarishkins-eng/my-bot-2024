@@ -32,6 +32,7 @@ from app.database.models import (
     WheelPrizeType,
     WheelSpinPaymentType,
 )
+from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
 from app.services.subscription_service import SubscriptionService
 
 
@@ -347,6 +348,10 @@ class FortuneWheelService:
         if not subscription or not subscription.is_active:
             raise ValueError('Нет активной подписки')
 
+        from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+        await assert_no_manual_access_point_grant(db, subscription, action='wheel_days_payment')
+
         if subscription.days_left < config.min_subscription_days_for_day_payment + config.spin_cost_days:
             raise ValueError('Недостаточно дней подписки')
 
@@ -431,12 +436,19 @@ class FortuneWheelService:
                     return None
                 subscription = await get_subscription_by_user_id(db, user.id)
             if subscription:
+                try:
+                    await assert_no_manual_access_point_grant(db, subscription, action='wheel_days_prize')
+                    is_access_point = False
+                except AccessPointPolicyError:
+                    # A prize must not create an unpriced mutable AP term.
+                    # Preserve its economic value on balance instead.
+                    is_access_point = True
                 # Проверяем суточный тариф - для него конвертируем дни в баланс
                 is_daily = getattr(subscription, 'is_daily', False) or (
                     subscription.tariff and getattr(subscription.tariff, 'is_daily', False)
                 )
 
-                if is_daily:
+                if is_daily or is_access_point:
                     # Для суточных тарифов: дни * суточная_цена = баланс
                     daily_price = 0
                     if subscription.tariff and hasattr(subscription.tariff, 'daily_price_kopeks'):

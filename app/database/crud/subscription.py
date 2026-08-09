@@ -18,6 +18,7 @@ from app.database.models import (
     Subscription,
     SubscriptionServer,
     SubscriptionStatus,
+    Tariff,
     Transaction,
     TransactionType,
     User,
@@ -206,6 +207,11 @@ async def create_trial_subscription(
         tariff = await db.get(Tariff, tariff_id)
         if tariff is None:
             raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
+        if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+            # An AP grant is always a paid Device-First quote followed by an
+            # immutable entitlement term. A trial has neither artifact, so
+            # reject it before this legacy helper can mutate a row.
+            raise ValueError('access_point_trial_unsupported')
         entitlement = await resolve_tariff_entitlement(db, tariff)
         supplied = set(connected_squads or [])
         if supplied and supplied != set(entitlement.squad_uuids):
@@ -385,6 +391,8 @@ async def _revive_paid_subscription(
     commit: bool,
     entitlement=None,
     tariff_id: int | None = None,
+    access_point_term_source_reference: str | None = None,
+    access_point_term_provenance: str = 'paid_issuance',
 ) -> Subscription:
     """Revive/extend an existing (possibly expired) tariff subscription in place.
 
@@ -394,10 +402,12 @@ async def _revive_paid_subscription(
     alive, otherwise start a fresh period from now and reset used traffic.
     """
     await _assert_user_not_in_financial_closure(db, subscription.user_id)
-    if entitlement is not None:
+    if entitlement is not None and entitlement.provenance != 'access_point_policy':
         from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
 
         await persist_subscription_entitlement_snapshot(db, subscription.id, tariff_id, entitlement)
+    if entitlement is not None and entitlement.provenance == 'access_point_policy' and not access_point_term_source_reference:
+        raise ValueError('access-point paid revive requires a pre-captured idempotency source reference')
     now = datetime.now(UTC)
     was_alive = subscription.end_date is not None and subscription.end_date > now
 
@@ -422,6 +432,23 @@ async def _revive_paid_subscription(
     _grace_period = grace_period_for_term(duration_days)
     if _grace_period is not None:
         subscription.grace_eligible_period_days = _grace_period
+
+    if entitlement is not None and entitlement.provenance == 'access_point_policy':
+        tariff = await db.get(Tariff, tariff_id)
+        if tariff is None:
+            raise ValueError('access-point tariff disappeared before paid revive term capture')
+        from app.services.public_access_point_service import capture_access_point_entitlement_term
+
+        await capture_access_point_entitlement_term(
+            db,
+            subscription_id=subscription.id,
+            tariff=tariff,
+            starts_at=base_date,
+            ends_at=subscription.end_date,
+            source_reference=str(access_point_term_source_reference),
+            provenance=access_point_term_provenance,
+            resolved_entitlement=entitlement,
+        )
 
     if commit:
         await db.commit()
@@ -478,13 +505,14 @@ async def create_paid_subscription(
     tariff_id: int | None = None,
     commit: bool = True,
     _resolved_entitlement=None,
+    _access_point_term_source_reference: str | None = None,
+    _access_point_term_provenance: str = 'paid_issuance',
 ) -> Subscription:
     # This central gate runs before any subscription row or later panel sync
     # can be created. The DB trigger is retained as a final independent rail.
     await _assert_user_not_in_financial_closure(db, user_id)
     entitlement = None
     if tariff_id is not None:
-        from app.database.models import Tariff
         from app.services.public_location_entitlement_service import resolve_tariff_entitlement
 
         if _resolved_entitlement is not None:
@@ -498,6 +526,8 @@ async def create_paid_subscription(
         if supplied and supplied != set(entitlement.squad_uuids):
             raise ValueError('tariff entitlement mismatch: caller supplied technical squads')
         connected_squads = list(entitlement.squad_uuids)
+        if entitlement.provenance == 'access_point_policy' and not _access_point_term_source_reference:
+            raise ValueError('access-point paid issuance requires a pre-captured idempotency source reference')
     # Multi-tariff invariant: at most ONE subscription per (user, tariff). If a
     # subscription for this tariff has EXPIRED, revive it in place instead of
     # inserting a duplicate — the partial unique index only guards the alive
@@ -523,6 +553,8 @@ async def create_paid_subscription(
                 commit=commit,
                 entitlement=entitlement,
                 tariff_id=tariff_id,
+                access_point_term_source_reference=_access_point_term_source_reference,
+                access_point_term_provenance=_access_point_term_provenance,
             )
 
     end_date = datetime.now(UTC) + timedelta(days=duration_days)
@@ -566,6 +598,22 @@ async def create_paid_subscription(
         from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
 
         await persist_subscription_entitlement_snapshot(db, subscription.id, tariff_id, entitlement)
+        if entitlement.provenance == 'access_point_policy':
+            from app.services.public_access_point_service import capture_access_point_entitlement_term
+
+            tariff = await db.get(Tariff, tariff_id)
+            if tariff is None:
+                raise ValueError('access-point tariff disappeared before paid term capture')
+            await capture_access_point_entitlement_term(
+                db,
+                subscription_id=subscription.id,
+                tariff=tariff,
+                starts_at=subscription.start_date,
+                ends_at=subscription.end_date,
+                source_reference=str(_access_point_term_source_reference),
+                provenance=_access_point_term_provenance,
+                resolved_entitlement=entitlement,
+            )
     if commit:
         await db.commit()
         await db.refresh(subscription)
@@ -663,6 +711,8 @@ async def replace_subscription(
             if tariff is None:
                 raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
             entitlement = await resolve_tariff_entitlement(db, tariff)
+        if entitlement.provenance == 'access_point_policy':
+            raise ValueError('access-point replacement requires a dedicated future-term workflow')
         supplied = set(connected_squads or [])
         if supplied and supplied != set(entitlement.squad_uuids):
             raise ValueError('tariff entitlement mismatch: caller supplied technical squads')
@@ -997,6 +1047,8 @@ async def extend_subscription(
     convert_trial: bool = True,
     commit: bool = True,
     _resolved_entitlement=None,
+    _access_point_term_source_reference: str | None = None,
+    _access_point_term_provenance: str = 'paid_renewal',
 ) -> Subscription:
     """Продлевает подписку на указанное количество дней.
 
@@ -1016,33 +1068,41 @@ async def extend_subscription(
     """
     await _assert_user_not_in_financial_closure(db, subscription.user_id)
     entitlement = None
+    effective_tariff = None
     effective_tariff_id = tariff_id if tariff_id is not None else subscription.tariff_id
     if effective_tariff_id is not None:
         from app.services.public_location_entitlement_service import (
-            get_subscription_resolved_entitlement,
+            get_effective_subscription_resolved_entitlement,
             resolve_tariff_entitlement,
         )
 
+        effective_tariff = await db.get(Tariff, effective_tariff_id)
+        if effective_tariff is None:
+            raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
+
         if _resolved_entitlement is not None:
             entitlement = _resolved_entitlement
+        elif effective_tariff.entitlement_mode == 'access_point_managed':
+            # A current policy must never be silently resolved from a legacy
+            # renewal/auto-purchase callback.  AP renewals enter only with the
+            # immutable quote captured before their financial transition.
+            raise ValueError('access-point renewal requires a captured immutable entitlement quote')
         elif tariff_id is None or tariff_id == subscription.tariff_id:
             # Renewal/restoration preserves the first issued entitlement.
             # Policy changes apply only to a future, distinct issuance.
-            entitlement = await get_subscription_resolved_entitlement(db, subscription.id)
+            entitlement = await get_effective_subscription_resolved_entitlement(db, subscription.id)
         else:
-            from app.database.models import Tariff
-
-            tariff = await db.get(Tariff, effective_tariff_id)
-            if tariff is None:
-                raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
-            entitlement = await resolve_tariff_entitlement(db, tariff)
+            entitlement = await resolve_tariff_entitlement(db, effective_tariff)
         supplied = set(connected_squads or [])
         if supplied and supplied != set(entitlement.squad_uuids):
             raise ValueError('tariff entitlement mismatch: caller supplied technical squads')
         connected_squads = list(entitlement.squad_uuids)
         from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
 
-        await persist_subscription_entitlement_snapshot(db, subscription.id, effective_tariff_id, entitlement)
+        if entitlement.provenance != 'access_point_policy':
+            await persist_subscription_entitlement_snapshot(db, subscription.id, effective_tariff_id, entitlement)
+        elif not _access_point_term_source_reference:
+            raise ValueError('access-point paid renewal requires a pre-captured idempotency source reference')
     current_time = datetime.now(UTC)
 
     # Lock + refresh traffic-полей ДО любых чтений и расчёта base_limit для веток.
@@ -1080,6 +1140,21 @@ async def extend_subscription(
     # новая подписка начинается после фактически доступного времени. Проверка
     # через is_in_grace не даёт старому флагу/прошедшей дате перенести лишние дни.
     active_grace_until = subscription.grace_until if days > 0 and is_in_grace(subscription, current_time) else None
+
+    access_point_term_start: datetime | None = None
+    if entitlement is not None and entitlement.provenance == 'access_point_policy':
+        if days <= 0:
+            raise ValueError('access-point paid term must have a positive duration')
+        if is_tariff_change:
+            # The legacy tariff-change algorithm rewrites connected squads and
+            # carries time immediately.  It cannot model the required future
+            # AP boundary, so it is fenced until its own quote/plan workflow
+            # is introduced.
+            raise ValueError('access-point tariff switch requires a dedicated future-term workflow')
+        if active_grace_until is not None:
+            raise ValueError('access-point paid renewal during grace requires a dedicated term workflow')
+        prior_end = subscription.end_date
+        access_point_term_start = prior_end if prior_end and prior_end > current_time else current_time
 
     if is_tariff_change:
         logger.info('🔄 Обнаружена СМЕНА тарифа', tariff_id=subscription.tariff_id, tariff_id_2=tariff_id)
@@ -1274,8 +1349,17 @@ async def extend_subscription(
         logger.info('📱 Обновлен лимит устройств', old_devices=old_devices, device_limit=device_limit)
 
     if connected_squads is not None:
+        if access_point_term_start is not None and access_point_term_start > current_time:
+            # The immutable future term is captured below and has a durable
+            # boundary projection outbox.  Keep the currently-effective
+            # technical access untouched until that exact start time.
+            logger.info(
+                '🌍 Отложена смена AP-сквадов до начала оплаченного срока',
+                subscription_id=subscription.id,
+                effective_at=access_point_term_start,
+            )
         # Не перезаписываем существующие сквады пустым списком
-        if connected_squads or not subscription.connected_squads:
+        elif connected_squads or not subscription.connected_squads:
             old_squads = subscription.connected_squads
             subscription.connected_squads = connected_squads
             logger.info('🌍 Обновлены сквады', old_squads=old_squads, connected_squads=connected_squads)
@@ -1343,6 +1427,25 @@ async def extend_subscription(
     if days > 0 and not _housekeeping_done:
         await _housekeep_expired_purchases(db, subscription, now=current_time)
 
+    if access_point_term_start is not None:
+        expected_term_end = access_point_term_start + timedelta(days=days)
+        if subscription.end_date != expected_term_end:
+            raise ValueError('access-point renewal window diverged from its captured paid term')
+        if effective_tariff is None:
+            raise ValueError('access-point tariff disappeared before term capture')
+        from app.services.public_access_point_service import capture_access_point_entitlement_term
+
+        await capture_access_point_entitlement_term(
+            db,
+            subscription_id=subscription.id,
+            tariff=effective_tariff,
+            starts_at=access_point_term_start,
+            ends_at=expected_term_end,
+            source_reference=str(_access_point_term_source_reference),
+            provenance=_access_point_term_provenance,
+            resolved_entitlement=entitlement,
+        )
+
     subscription.updated_at = current_time
 
     if commit:
@@ -1389,6 +1492,12 @@ async def extend_subscription(
 
 
 async def add_subscription_traffic(db: AsyncSession, subscription: Subscription, gb: int) -> Subscription:
+    # Defence in depth for callers outside the supported checkout workflow.
+    # The public routes reject before charging; this keeps a new/forgotten
+    # caller from silently changing local AP state without a term projection.
+    from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+    await assert_no_manual_access_point_grant(db, subscription, action='traffic top-up')
     # Lock subscription row — защита от lost-update гонки с housekeeping в extend_subscription
     # (см. _apply_base_limit_preserving_active_purchases / _housekeep_expired_purchases).
     # Без lock'а одновременный renewal + topup могут затереть друг друга.
@@ -1440,6 +1549,9 @@ async def add_subscription_traffic(db: AsyncSession, subscription: Subscription,
 
 
 async def add_subscription_devices(db: AsyncSession, subscription: Subscription, devices: int) -> Subscription:
+    from app.services.public_access_point_service import assert_no_manual_access_point_grant
+
+    await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
     # Lock subscription to prevent concurrent modifications
     locked_result = await db.execute(
         select(Subscription)
@@ -2385,6 +2497,11 @@ async def create_pending_subscription(
         tariff = await db.get(Tariff, tariff_id)
         if tariff is None:
             raise ValueError('tariff entitlement cannot be resolved: tariff does not exist')
+        if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+            # Pending rows are a legacy payment ownership model. They cannot
+            # carry the immutable AP quote/term evidence required before an
+            # invoice is created, so fail before any DB write.
+            raise ValueError('access_point_pending_issuance_unsupported')
         entitlement = await resolve_tariff_entitlement(db, tariff)
         supplied = set(connected_squads or [])
         if supplied and supplied != set(entitlement.squad_uuids):

@@ -117,6 +117,16 @@ def _resolve_subscription(user: User, override: Subscription | None = None) -> S
     return next((s for s in subs if s.is_active), subs[0] if subs else None)
 
 
+async def _manual_access_point_grant_error(db: AsyncSession, sub: Subscription, *, action: str) -> str | None:
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, sub, action=action)
+    except AccessPointPolicyError as error:
+        return str(error)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Per-user action handlers
 # ---------------------------------------------------------------------------
@@ -133,6 +143,9 @@ async def _do_extend_subscription(
     sub = _resolve_subscription(user, sub_override)
     if not sub:
         return BulkUserResult(user_id=user.id, success=False, message='No subscription found', username=user.username)
+
+    if error := await _manual_access_point_grant_error(db, sub, action='extend'):
+        return BulkUserResult(user_id=user.id, success=False, message=error, username=user.username)
 
     if dry_run:
         return BulkUserResult(
@@ -201,6 +214,9 @@ async def _do_activate_subscription(
     if not sub:
         return BulkUserResult(user_id=user.id, success=False, message='No subscription found', username=user.username)
 
+    if error := await _manual_access_point_grant_error(db, sub, action='activate'):
+        return BulkUserResult(user_id=user.id, success=False, message=error, username=user.username)
+
     # Проверка дубликата в мультитарифном режиме
     if settings.is_multi_tariff_enabled() and sub.tariff_id:
         from app.database.crud.subscription import get_subscription_by_user_and_tariff
@@ -249,6 +265,9 @@ async def _do_change_tariff(
     sub = _resolve_subscription(user, sub_override)
     if not sub:
         return BulkUserResult(user_id=user.id, success=False, message='No subscription found', username=user.username)
+
+    if error := await _manual_access_point_grant_error(db, sub, action='change_tariff'):
+        return BulkUserResult(user_id=user.id, success=False, message=error, username=user.username)
 
     # Проверка дубликата в мультитарифном режиме
     if settings.is_multi_tariff_enabled() and tariff.id != sub.tariff_id:
@@ -358,6 +377,9 @@ async def _do_add_traffic(
     sub = _resolve_subscription(user, sub_override)
     if not sub:
         return BulkUserResult(user_id=user.id, success=False, message='No subscription found', username=user.username)
+
+    if error := await _manual_access_point_grant_error(db, sub, action='add_traffic'):
+        return BulkUserResult(user_id=user.id, success=False, message=error, username=user.username)
 
     if dry_run:
         return BulkUserResult(
@@ -478,6 +500,9 @@ async def _do_set_devices(
     sub = _resolve_subscription(user, sub_override)
     if not sub:
         return BulkUserResult(user_id=user.id, success=False, message='No subscription found', username=user.username)
+
+    if error := await _manual_access_point_grant_error(db, sub, action='set_devices'):
+        return BulkUserResult(user_id=user.id, success=False, message=error, username=user.username)
 
     if dry_run:
         return BulkUserResult(
@@ -628,6 +653,15 @@ async def _do_grant_subscription(
     days = params.days  # already validated
     is_multi_tariff = settings.is_multi_tariff_enabled()
     subs = getattr(user, 'subscriptions', None) or []
+
+    if tariff.entitlement_mode == 'access_point_managed':
+        return BulkUserResult(
+            user_id=user.id,
+            success=False,
+            message='access-point subscriptions require the tariff checkout flow',
+            username=user.username,
+            subscriptions=_build_subscription_info(subs),
+        )
 
     # Check for existing active subscription
     if is_multi_tariff:

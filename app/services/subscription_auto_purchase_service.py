@@ -17,7 +17,7 @@ from app.config import settings
 from app.database.crud.subscription import extend_subscription
 from app.database.crud.transaction import create_transaction
 from app.database.crud.user import subtract_user_balance
-from app.database.models import Subscription, SubscriptionStatus, TransactionType, User
+from app.database.models import Subscription, SubscriptionStatus, Tariff, TransactionType, User
 from app.localization.texts import get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.pricing_engine import PricingEngine, pricing_engine
@@ -532,6 +532,17 @@ async def _auto_extend_subscription(
     if prepared is None:
         return False
 
+    prepared_tariff = (
+        await db.get(Tariff, prepared.subscription.tariff_id) if prepared.subscription.tariff_id is not None else None
+    )
+    if prepared_tariff is not None and prepared_tariff.entitlement_mode == 'access_point_managed':
+        logger.info(
+            'Автопродление AP-тарифа пропущено: требуется tariff checkout с immutable term',
+            subscription_id=prepared.subscription.id,
+            tariff_id=prepared_tariff.id,
+        )
+        return False
+
     if prepared.price_kopeks > 0 and user.balance_kopeks < prepared.price_kopeks:
         logger.info(
             '🔁 Автопокупка: у пользователя недостаточно средств для продления (<)',
@@ -868,6 +879,9 @@ async def _auto_purchase_tariff(
             tariff_id=tariff_id,
             format_user_id=_format_user_id(user),
         )
+        return False
+    if tariff.entitlement_mode == 'access_point_managed':
+        logger.info('Автопокупка AP-тарифа пропущена: требуется tariff checkout с immutable term', tariff_id=tariff_id)
         return False
 
     # Validate period_days against tariff's configured periods (prevent arbitrary periods from saved cart)
@@ -1647,6 +1661,18 @@ async def _auto_add_devices(
         await _delete_cart_for_subscription(user.id, cart_data)
         return False
 
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
+    except AccessPointPolicyError:
+        logger.info(
+            '🔁 Автопокупка устройств: access-point тариф не поддерживает add-on',
+            format_user_id=_format_user_id(user),
+        )
+        await _delete_cart_for_subscription(user.id, cart_data)
+        return False
+
     # Load tariff for device price and max limit
     tariff = None
     if subscription.tariff_id:
@@ -2017,6 +2043,18 @@ async def _auto_add_traffic(
         await _delete_cart_for_subscription(user.id, cart_data)
         return False
 
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='traffic top-up')
+    except AccessPointPolicyError:
+        logger.info(
+            '🔁 Автопокупка трафика: access-point тариф не поддерживает add-on',
+            format_user_id=_format_user_id(user),
+        )
+        await _delete_cart_for_subscription(user.id, cart_data)
+        return False
+
     # Lock user BEFORE price computation to prevent TOCTOU on promo-offer/group discount
     user = await lock_user_for_pricing(db, user.id)
 
@@ -2379,6 +2417,13 @@ async def try_auto_extend_expired_after_topup(
             format_user_id=_format_user_id(user),
             tariff_id=getattr(tariff, 'id', None),
             tariff_name=tariff_name_for_label,
+        )
+        return False
+    if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+        logger.info(
+            'Автопродление expired AP-тарифа пропущено: требуется tariff checkout с immutable term',
+            subscription_id=subscription.id,
+            tariff_id=tariff.id,
         )
         return False
     if tariff:
@@ -2784,6 +2829,13 @@ async def try_resume_disabled_daily_after_topup(
 
     tariff = getattr(subscription, 'tariff', None)
     if not tariff:
+        return False
+    if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
+        logger.warning(
+            'Daily AP auto-resume stopped before balance debit: Device-First term workflow required',
+            subscription_id=subscription.id,
+            manual_reconcile_required=True,
+        )
         return False
 
     raw_daily_price = getattr(tariff, 'daily_price_kopeks', 0)

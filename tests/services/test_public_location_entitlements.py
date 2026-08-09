@@ -1,4 +1,6 @@
+import json
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -23,6 +25,8 @@ from app.services.device_first_checkout_service import _direct_sale_snapshot
 from app.services.public_location_entitlement_service import (
     EntitlementResolutionError,
     ResolvedEntitlement,
+    get_effective_subscription_resolved_entitlement,
+    get_subscription_resolved_entitlement,
     resolve_tariff_entitlement,
 )
 from app.webapi.routes.miniapp import switch_tariff_endpoint, update_subscription_servers_endpoint
@@ -100,6 +104,136 @@ async def test_one_location_can_resolve_to_multiple_verified_dedicated_squads():
 
     assert result.location_ids == ('pl',)
     assert result.squad_uuids == ('customer-pl-a', 'customer-pl-b')
+
+
+@pytest.mark.asyncio
+async def test_access_point_snapshot_rebuilds_its_inventory_fingerprint() -> None:
+    original = ResolvedEntitlement(
+        ('public-point-pl',),
+        ('internal-only-pl',),
+        2,
+        'access_point_policy',
+        'point-policy-fingerprint',
+    )
+    snapshot = SimpleNamespace(
+        location_ids=list(original.location_ids),
+        technical_squad_uuids=list(original.squad_uuids),
+        policy_revision=original.policy_revision,
+        provenance=original.provenance,
+        inventory_fingerprint=original.inventory_fingerprint,
+        snapshot_hash=original.snapshot_hash,
+    )
+    db = SimpleNamespace(scalar=AsyncMock(return_value=snapshot))
+
+    rebuilt = await get_subscription_resolved_entitlement(db, 12, allow_access_point_baseline=True)
+
+    assert rebuilt == original
+
+
+@pytest.mark.asyncio
+async def test_access_point_policy_cannot_be_resolved_from_a_legacy_purchase_path() -> None:
+    """The shared resolver is the before-money fence for every old writer."""
+
+    db = SimpleNamespace(execute=AsyncMock())
+    tariff = SimpleNamespace(id=77, entitlement_mode='access_point_managed')
+
+    with pytest.raises(EntitlementResolutionError, match='Device-First immutable checkout quote'):
+        await resolve_tariff_entitlement(db, tariff)
+
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_access_point_daily_tariff_is_fenced_before_any_policy_or_money_work() -> None:
+    db = SimpleNamespace(execute=AsyncMock())
+    tariff = SimpleNamespace(id=77, entitlement_mode='access_point_managed', is_daily=True)
+
+    with pytest.raises(EntitlementResolutionError, match='cannot use daily billing'):
+        await resolve_tariff_entitlement(db, tariff, access_point_quote_context=True)
+
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_effective_reader_ignores_a_future_access_point_term_until_its_boundary() -> None:
+    starts_at = datetime.now(UTC) + timedelta(days=5)
+    ends_at = starts_at + timedelta(days=30)
+    term = SimpleNamespace(
+        subscription_id=12,
+        term_version=2,
+        tariff_id=7,
+        starts_at=starts_at,
+        ends_at=ends_at,
+        access_point_ids=['point-new'],
+        technical_squad_keys=['squad-new'],
+        policy_revision=9,
+        inventory_fingerprint='fp-new',
+        source_reference='checkout:future',
+        provenance='device_first_checkout',
+    )
+    term.grant_hash = sha256(
+        json.dumps(
+            {
+                'subscription_id': term.subscription_id,
+                'term_version': term.term_version,
+                'tariff_id': term.tariff_id,
+                'starts_at': term.starts_at.isoformat(),
+                'ends_at': term.ends_at.isoformat(),
+                'access_point_ids': term.access_point_ids,
+                'technical_squad_keys': term.technical_squad_keys,
+                'policy_revision': term.policy_revision,
+                'inventory_fingerprint': term.inventory_fingerprint,
+                'source_reference': term.source_reference,
+                'provenance': term.provenance,
+            },
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode()
+    ).hexdigest()
+    baseline = ResolvedEntitlement(('point-old',), ('squad-old',), 8, 'access_point_policy', 'fp-old')
+    snapshot = SimpleNamespace(
+        location_ids=list(baseline.location_ids),
+        technical_squad_uuids=list(baseline.squad_uuids),
+        policy_revision=baseline.policy_revision,
+        provenance=baseline.provenance,
+        inventory_fingerprint=baseline.inventory_fingerprint,
+        snapshot_hash=baseline.snapshot_hash,
+    )
+    # Before boundary: no effective term then 0100 baseline. At boundary: the
+    # exact captured future grant replaces it without consulting tariff policy.
+    db = SimpleNamespace(scalar=AsyncMock(side_effect=[None, snapshot, term]))
+
+    before_boundary = await get_effective_subscription_resolved_entitlement(
+        db,
+        12,
+        at=starts_at - timedelta(seconds=1),
+        # Explicit migration-only compatibility read.  Runtime paid paths
+        # cannot use an AP one-row baseline outside a captured active term.
+        allow_access_point_baseline=True,
+    )
+
+    effective = await get_effective_subscription_resolved_entitlement(db, 12, at=starts_at + timedelta(seconds=1))
+
+    assert before_boundary.location_ids == ('point-old',)
+    assert effective.location_ids == ('point-new',)
+    assert effective.squad_uuids == ('squad-new',)
+
+
+@pytest.mark.asyncio
+async def test_access_point_baseline_is_not_a_runtime_fallback_outside_a_paid_term() -> None:
+    baseline = ResolvedEntitlement(('point-old',), ('squad-old',), 8, 'access_point_policy', 'fp-old')
+    snapshot = SimpleNamespace(
+        location_ids=list(baseline.location_ids),
+        technical_squad_uuids=list(baseline.squad_uuids),
+        policy_revision=baseline.policy_revision,
+        provenance=baseline.provenance,
+        inventory_fingerprint=baseline.inventory_fingerprint,
+        snapshot_hash=baseline.snapshot_hash,
+    )
+    db = SimpleNamespace(scalar=AsyncMock(side_effect=[None, snapshot]))
+
+    with pytest.raises(EntitlementResolutionError, match='direct immutable checkout quote'):
+        await get_effective_subscription_resolved_entitlement(db, 12)
 
 
 @pytest.mark.asyncio
@@ -198,6 +332,40 @@ def test_device_first_sale_snapshot_captures_immutable_entitlement_not_tariff_uu
     assert snapshot['entitlement']['location_ids'] == ['pl']
     assert snapshot['entitlement_hash'] == entitlement.snapshot_hash
     assert 'allowed_squads' not in snapshot
+
+
+def test_device_first_access_point_snapshot_round_trips_the_inventory_fingerprint() -> None:
+    checkout = SimpleNamespace(
+        tariff_id=3,
+        period_days=30,
+        selected_device_limit=2,
+        tariff_total_kopeks=90000,
+        price_breakdown={},
+        pricing_revision=7,
+        target_snapshot=None,
+        quote_expires_at=SimpleNamespace(isoformat=lambda: '2026-08-08T00:00:00+00:00'),
+    )
+    tariff = SimpleNamespace(name='Premium', traffic_limit_gb=100, allowed_squads=['must-not-leak'])
+    entitlement = ResolvedEntitlement(
+        ('public-point-pl',),
+        ('internal-only-pl',),
+        4,
+        'access_point_policy',
+        'point-policy-fingerprint',
+    )
+
+    snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='wallet', entitlement=entitlement)
+    raw = snapshot['entitlement']
+    rebuilt = ResolvedEntitlement(
+        tuple(raw['location_ids']),
+        tuple(raw['technical_squad_uuids']),
+        int(raw['policy_revision']),
+        str(raw['provenance']),
+        str(raw['inventory_fingerprint']),
+    )
+
+    assert rebuilt.snapshot_hash == snapshot['entitlement_hash']
+    assert raw['inventory_fingerprint'] == 'point-policy-fingerprint'
 
 
 @pytest.mark.asyncio
@@ -375,10 +543,11 @@ async def test_central_renewal_stops_before_balance_when_snapshot_is_missing(mon
 
     pricing = SimpleNamespace(final_total=1_000, period_days=30, promo_offer_discount=0)
     subscription = SimpleNamespace(id=81, tariff_id=4)
+    db = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(entitlement_mode='legacy_snapshot')))
 
     with pytest.raises(subscription_renewal_service.SubscriptionRenewalEntitlementError):
         await subscription_renewal_service.SubscriptionRenewalService().finalize(
-            SimpleNamespace(), SimpleNamespace(), subscription, pricing
+            db, SimpleNamespace(), subscription, pricing
         )
 
     deducted.assert_not_awaited()

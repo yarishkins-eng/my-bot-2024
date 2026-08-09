@@ -14,6 +14,13 @@ class ServerInfo(BaseModel):
     country_code: str | None = None
 
 
+class PublicAccessPointInfo(BaseModel):
+    """User-safe presentation of a Host entitlement without technical UUIDs."""
+
+    id: str
+    title: str
+
+
 class TrafficPurchaseInfo(BaseModel):
     """Purchased traffic package info."""
 
@@ -43,6 +50,7 @@ class SubscriptionData(BaseModel):
     device_limit: int
     connected_squads: list[str] = []
     servers: list[ServerInfo] = []  # Server display info
+    access_points: list[PublicAccessPointInfo] = []
     autopay_enabled: bool
     autopay_days_before: int
     subscription_url: str | None = None

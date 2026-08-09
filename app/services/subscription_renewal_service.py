@@ -21,7 +21,7 @@ from app.database.crud.subscription import (
 )
 from app.database.crud.transaction import create_transaction
 from app.database.crud.user import subtract_user_balance
-from app.database.models import PaymentMethod, Subscription, Transaction, TransactionType, User
+from app.database.models import PaymentMethod, Subscription, Tariff, Transaction, TransactionType, User
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.pricing_engine import RenewalPricing
 from app.services.remnawave_service import RemnaWaveConfigurationError
@@ -397,6 +397,11 @@ class SubscriptionRenewalService:
         # policy or a raw cart when their issued snapshot is absent.
         resolved_entitlement = None
         if subscription.tariff_id is not None:
+            tariff = await db.get(Tariff, subscription.tariff_id)
+            if tariff is not None and tariff.entitlement_mode == 'access_point_managed':
+                raise SubscriptionRenewalEntitlementError(
+                    'Access-point renewals require the tariff checkout workflow'
+                )
             try:
                 from app.services.public_location_entitlement_service import get_subscription_resolved_entitlement
 

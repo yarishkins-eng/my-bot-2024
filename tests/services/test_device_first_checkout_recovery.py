@@ -379,14 +379,20 @@ async def test_direct_provisioning_finalization_uses_checkout_then_outbox_lock_o
                 Result(None),
             ]
         ),
-        get=AsyncMock(side_effect=[claimed, subscription]),
+        get=AsyncMock(side_effect=[claimed, subscription, checkout]),
         commit=AsyncMock(),
         add=MagicMock(),
     )
 
-    with patch(
-        'app.services.subscription_service.SubscriptionService.ensure_subscription_synced',
-        AsyncMock(return_value=(True, None)),
+    with (
+        patch(
+            'app.services.device_first_checkout_service._access_point_checkout_projection_delivered',
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            'app.services.subscription_service.SubscriptionService.ensure_subscription_synced',
+            AsyncMock(return_value=(True, None)),
+        ),
     ):
         processed = await process_direct_provisioning_outbox(db, checkout_id=checkout.id, limit=1)
 
