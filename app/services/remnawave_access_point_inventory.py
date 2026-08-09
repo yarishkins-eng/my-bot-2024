@@ -208,11 +208,29 @@ class RemnaWaveAccessPointInventoryClient:
             # beyond the one visible Host title, so it is never "dedicated".
             return host_inbound is not None and inbound_keys == {host_inbound}
 
+        # A legacy, shared Squad may legitimately retain the same inbound for
+        # historical subscriptions.  It must remain visible in the source
+        # snapshot (so drift still fences discovery), but it must not make a
+        # separately proven dedicated Squad unsafe for a *new* access-point
+        # tariff.  Exactly one structural dedicated mapping is required: zero
+        # or more than one stays fail-closed as a missing mapping below.
+        dedicated_squad_keys_by_host: dict[str, set[str]] = defaultdict(set)
+        for squad in squads:
+            if not is_dedicated_to_one_host(squad):
+                continue
+            host_keys = host_keys_by_squad.get(squad.uuid, set())
+            # `is_dedicated_to_one_host` established this invariant above.
+            dedicated_squad_keys_by_host[next(iter(host_keys))].add(squad.uuid)
+
+        def selected_dedicated_squad_keys(host_key: str) -> tuple[str, ...]:
+            keys = tuple(sorted(dedicated_squad_keys_by_host.get(host_key, set())))
+            return keys if len(keys) == 1 else ()
+
         inventory_hosts = tuple(
             InventoryHost(
                 host_key=host.uuid,
                 title=host.remark,
-                squad_keys=tuple(sorted(squads_by_inbound.get(host_inbound_by_key.get(host.uuid), set()))),
+                squad_keys=selected_dedicated_squad_keys(host.uuid),
                 is_hidden=host.is_hidden,
                 is_disabled=host.is_disabled,
             )

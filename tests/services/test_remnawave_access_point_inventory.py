@@ -189,7 +189,53 @@ async def test_adapter_marks_shared_host_mapping_needs_verification() -> None:
 
     assert snapshot.squads[0].is_dedicated is False
     assert all(point.state == 'needs_verification' for point in assessment.points)
-    assert all('shared_squad_mapping' in (point.reason or '') for point in assessment.points)
+    assert all(point.reason == 'missing_squad_mapping' for point in assessment.points)
+
+
+@pytest.mark.asyncio
+async def test_adapter_selects_only_dedicated_mapping_when_legacy_squad_still_shares_inbound() -> None:
+    api = _ReadOnlyApi(
+        hosts=[_host('host-pl', 'Польша', 'inbound-pl')],
+        squads=[
+            _squad('legacy-shared', 'inbound-pl', 'inbound-legacy'),
+            _squad('dedicated-pl', 'inbound-pl'),
+        ],
+        accessible={
+            'legacy-shared': [_accessible_node('node-pl', active_inbounds=['tag-inbound-pl', 'tag-inbound-legacy'])],
+            'dedicated-pl': [_accessible_node('node-pl')],
+        },
+        nodes=[_node('node-pl')],
+    )
+
+    snapshot = await RemnaWaveAccessPointInventoryClient(_Service(api)).read_access_point_inventory()
+    assessment = assess_inventory(snapshot)
+
+    assert snapshot.hosts[0].squad_keys == ('dedicated-pl',)
+    assert {squad.key: squad.is_dedicated for squad in snapshot.squads} == {
+        'dedicated-pl': True,
+        'legacy-shared': False,
+    }
+    assert assessment.points[0].assignable is True
+
+
+@pytest.mark.asyncio
+async def test_adapter_rejects_ambiguous_multiple_dedicated_mappings_for_one_host() -> None:
+    api = _ReadOnlyApi(
+        hosts=[_host('host-pl', 'Польша', 'inbound-pl')],
+        squads=[_squad('dedicated-pl-one', 'inbound-pl'), _squad('dedicated-pl-two', 'inbound-pl')],
+        accessible={
+            'dedicated-pl-one': [_accessible_node('node-pl')],
+            'dedicated-pl-two': [_accessible_node('node-pl')],
+        },
+        nodes=[_node('node-pl')],
+    )
+
+    snapshot = await RemnaWaveAccessPointInventoryClient(_Service(api)).read_access_point_inventory()
+    assessment = assess_inventory(snapshot)
+
+    assert snapshot.hosts[0].squad_keys == ()
+    assert assessment.points[0].assignable is False
+    assert assessment.points[0].reason == 'missing_squad_mapping'
 
 
 @pytest.mark.asyncio
