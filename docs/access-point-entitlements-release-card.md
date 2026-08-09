@@ -83,6 +83,10 @@ operational checks below.
 - Broader AP/API/grace/plan profile: `78 passed`.
 - Final focused AP safety sweep: `23 passed`.
 - Final backend suite after adapter hardening: `2338 passed, 5 skipped`.
+- Fresh protected production backup `20260809T191417Z` has matching server and
+  local SHA-256 manifests. Its restore reached schema `0100` in a disposable
+  local PostgreSQL instance; the exact candidate then upgraded it successfully
+  to `0101` with all seven expected entitlement-domain tables present.
 - Full `ruff check app tests migrations` passes. New adapter/API tests prove
   the exact GET-only paths, opaque raw evidence, dedicated mapping and shared
   mapping fail-closed behaviour.
