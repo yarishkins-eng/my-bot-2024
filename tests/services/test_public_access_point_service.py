@@ -15,6 +15,7 @@ from app.cabinet.routes.admin_access_points import (
     router as access_point_router,
 )
 from app.cabinet.routes.subscription_modules import purchase as cabinet_purchase_routes
+from app.config import settings
 from app.services import public_access_point_service
 from app.services.public_access_point_inventory import InventoryHost, InventorySnapshot, InventorySquad
 from app.services.public_access_point_service import (
@@ -108,6 +109,25 @@ def test_access_point_admin_router_exposes_no_executor_route() -> None:
     assert any(path.endswith('/access-points/discovery') for path in paths)
     assert any(path.endswith('/access-points/catalog') for path in paths)
     assert not any('execute' in path or 'worker' in path for path in paths)
+
+
+def test_access_point_discovery_requires_live_owner_arm_even_if_client_is_injected(monkeypatch) -> None:
+    monkeypatch.setattr(settings, 'ACCESS_POINT_INVENTORY_DRY_RUN_ENABLED', False)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(access_point_inventory_client=object())))
+
+    with pytest.raises(HTTPException) as exc_info:
+        access_point_routes._get_read_only_inventory_client(request)
+
+    assert exc_info.value.status_code == 503
+
+
+def test_catalog_apply_arm_refuses_an_expired_or_disabled_window(monkeypatch) -> None:
+    monkeypatch.setattr(settings, 'ACCESS_POINT_INVENTORY_CATALOG_APPLY_ENABLED', False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        access_point_routes._require_catalog_apply_arm()
+
+    assert exc_info.value.status_code == 409
 
 
 @pytest.mark.asyncio

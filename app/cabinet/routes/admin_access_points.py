@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database.crud.rbac import AuditLogCRUD
 from app.database.models import (
     EntitlementChangePlan,
@@ -40,6 +41,7 @@ from app.services.public_access_point_service import (
     replace_tariff_access_point_policy,
 )
 from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+from app.services.remnawave_access_point_inventory import RemnaWaveAccessPointInventoryError
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -91,6 +93,11 @@ def _dto(point: PublicAccessPoint, *, selected: bool = False) -> dict[str, objec
 
 
 def _get_read_only_inventory_client(request: Request) -> ReadOnlyAccessPointInventoryClient:
+    if not settings.is_access_point_inventory_dry_run_armed():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Read-only access-point inventory is not currently owner-armed',
+        )
     client = getattr(request.app.state, 'access_point_inventory_client', None)
     if client is None or not hasattr(client, 'read_access_point_inventory'):
         raise HTTPException(
@@ -98,6 +105,16 @@ def _get_read_only_inventory_client(request: Request) -> ReadOnlyAccessPointInve
             detail='Read-only access-point inventory is not configured for this environment',
         )
     return client
+
+
+def _require_catalog_apply_arm() -> None:
+    """Fail before a local mutation unless the separate owner window is live."""
+
+    if not settings.is_access_point_inventory_catalog_apply_armed():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Access-point catalog apply requires a separate owner approval window',
+        )
 
 
 def _timestamp(value: object) -> str | None:
@@ -331,7 +348,22 @@ async def discover_access_points(
     create a subscription/grant, or touch a Panel object.
     """
 
-    assessment = await read_consistent_inventory(_get_read_only_inventory_client(request))
+    if apply:
+        _require_catalog_apply_arm()
+
+    try:
+        assessment = await read_consistent_inventory(_get_read_only_inventory_client(request))
+    except RemnaWaveAccessPointInventoryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Read-only access-point inventory is temporarily unavailable',
+        ) from exc
+    except AccessPointPolicyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if apply:
+        # A full double-read can consume most of a short dry-run window.  Check
+        # again immediately before the first local catalog mutation.
+        _require_catalog_apply_arm()
     result = await apply_catalog_assessment(db, assessment, dry_run=not apply)
     if apply:
         await AuditLogCRUD.create(
@@ -349,6 +381,13 @@ async def discover_access_points(
             },
             status='success',
         )
+        try:
+            # Do not make a just-expired owner arm durable.  Rolling back also
+            # removes any flushes from catalog assessment and the audit row.
+            _require_catalog_apply_arm()
+        except HTTPException:
+            await db.rollback()
+            raise
         await db.commit()
     return {
         'applied': apply,

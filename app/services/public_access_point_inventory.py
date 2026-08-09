@@ -159,6 +159,8 @@ def assess_inventory(snapshot: InventorySnapshot) -> InventoryAssessment:
     """
 
     squads = {squad.key: squad for squad in snapshot.squads if squad.key}
+    # Keep the Host title exactly as the panel supplied it for presentation,
+    # while treating whitespace-only variants as a duplicate safety conflict.
     title_counts = Counter(host.title.strip() for host in snapshot.hosts if host.title.strip())
     squad_hosts: dict[str, set[str]] = defaultdict(set)
     for host in snapshot.hosts:
@@ -168,13 +170,13 @@ def assess_inventory(snapshot: InventorySnapshot) -> InventoryAssessment:
 
     points: list[AccessPointCandidate] = []
     for host in sorted(snapshot.hosts, key=lambda item: item.host_key):
-        title = host.title.strip()
+        title = host.title
         reasons: list[str] = []
         if not host.host_key:
             reasons.append('missing_host_identity')
-        if not title:
+        if not title.strip():
             reasons.append('empty_title')
-        elif title_counts[title] != 1:
+        elif title_counts[title.strip()] != 1:
             reasons.append('duplicate_title')
         if host.is_hidden:
             reasons.append('hidden_host')

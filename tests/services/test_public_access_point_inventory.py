@@ -80,6 +80,13 @@ def test_host_rename_changes_only_presentation_revision_when_graph_is_unchanged(
     assert first.invalidate_unpaid_quote is False
 
 
+def test_host_title_preserves_the_exact_panel_presentation_value() -> None:
+    result = assess_inventory(_safe_snapshot(first_title=' Польша '))
+
+    assert result.points[0].title == ' Польша '
+    assert result.points[0].assignable is True
+
+
 def test_unrelated_catalog_addition_does_not_change_existing_point_entitlement_evidence() -> None:
     before = _safe_snapshot()
     after = InventorySnapshot(

@@ -56,11 +56,19 @@ operational checks below.
 
 ## Required owner go/no-go checks
 
-- Wire and independently verify a **GET-only**, source-verified RemnaWave
-  inventory adapter. The code intentionally ships no guessed Host endpoint;
-  discovery fails closed until this adapter is injected.
-- Perform an owner-observed, no-write inventory dry run with redacted output,
-  then a second matching read before any catalog/policy creation.
+- The owner-approved production read-only source probe is recorded in
+  [`remnawave-access-point-source-probe-20260809.md`](remnawave-access-point-source-probe-20260809.md).
+  It verified the Host-to-Internal-Squad contract using only GET requests.
+  The adapter keeps all technical values server-side, requires current node
+  status as well as accessibility evidence, and uses redacted error logging.
+- Ordinary RemnaWave credentials do not enable discovery. A production dry run
+  needs an explicit default-false owner arm plus a UTC expiry; local catalog
+  apply needs a separate explicit arm and is not covered by a read-only go.
+- After the candidate is deployed, perform an owner-observed no-write catalog
+  dry run through the application, then a second matching read before any
+  catalog/policy creation. The pre-release probe found only shared mappings,
+  so all currently observed Hosts remain non-selectable by design; no catalog
+  apply was performed.
 - Verify exact AP term-boundary behavior and recovery with a non-production
   Panel fixture. Do not use a live customer or modify production data for this
   check.
@@ -74,10 +82,14 @@ operational checks below.
 
 - Broader AP/API/grace/plan profile: `78 passed`.
 - Final focused AP safety sweep: `23 passed`.
-- Final backend suite: `2314 passed, 5 skipped`.
-- Two independent final re-reads found no P0/P1. The PostgreSQL writer-fence
-  unit asserts SQL emission; a live two-session blocking race remains a
-  non-blocking coverage improvement.
+- Final backend suite after adapter hardening: `2338 passed, 5 skipped`.
+- Full `ruff check app tests migrations` passes. New adapter/API tests prove
+  the exact GET-only paths, opaque raw evidence, dedicated mapping and shared
+  mapping fail-closed behaviour.
+- Two independent final re-reads gave code-review GO without P0/P1 after the
+  final adapter hardening. The PostgreSQL writer-fence unit asserts SQL
+  emission; a live two-session blocking race remains a non-blocking coverage
+  improvement.
 - Cabinet worktree (unchanged by this final backend safety pass): type-check,
   unit tests, and production build passed.
 - `ruff check` passes for the changed access-point files.
