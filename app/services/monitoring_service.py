@@ -347,16 +347,12 @@ class MonitoringService:
                 self._sla_task.cancel()
         except Exception:
             pass
+
     async def start_access_point_term_projection_worker(self) -> None:
         """Start the independent executor for paid AP authorization boundaries."""
         self._access_point_term_projection_running = True
-        if (
-            self._access_point_term_projection_task is None
-            or self._access_point_term_projection_task.done()
-        ):
-            self._access_point_term_projection_task = asyncio.create_task(
-                self._access_point_term_projection_loop()
-            )
+        if self._access_point_term_projection_task is None or self._access_point_term_projection_task.done():
+            self._access_point_term_projection_task = asyncio.create_task(self._access_point_term_projection_loop())
 
     def stop_access_point_term_projection_worker(self) -> None:
         self._access_point_term_projection_running = False
@@ -1413,10 +1409,13 @@ class MonitoringService:
                                 )
 
                                 subscription = await reactivate_subscription(batch_db, subscription, commit=False)
-                                if subscription.status == SubscriptionStatus.ACTIVE.value and await requeue_active_access_point_term_projection(
-                                    batch_db,
-                                    subscription,
-                                    reason='channel_resubscribe',
+                                if (
+                                    subscription.status == SubscriptionStatus.ACTIVE.value
+                                    and await requeue_active_access_point_term_projection(
+                                        batch_db,
+                                        subscription,
+                                        reason='channel_resubscribe',
+                                    )
                                 ):
                                     access_point_reprojection_armed = True
                                     restored_count += 1

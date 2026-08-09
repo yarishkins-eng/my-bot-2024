@@ -399,9 +399,7 @@ class SubscriptionRenewalService:
         if subscription.tariff_id is not None:
             tariff = await db.get(Tariff, subscription.tariff_id)
             if tariff is not None and tariff.entitlement_mode == 'access_point_managed':
-                raise SubscriptionRenewalEntitlementError(
-                    'Access-point renewals require the tariff checkout workflow'
-                )
+                raise SubscriptionRenewalEntitlementError('Access-point renewals require the tariff checkout workflow')
             try:
                 from app.services.public_location_entitlement_service import get_subscription_resolved_entitlement
 

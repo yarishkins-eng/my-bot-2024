@@ -507,7 +507,9 @@ async def test_legacy_tariff_public_presentation_and_cards_never_fall_back_to_sq
     assert [(point.id, point.title) for point in public_points or ()] == [('legacy-pl', 'Польша')]
     assert 'private-legacy-squad' not in str(public_points)
 
-    monkeypatch.setattr(cabinet_purchase_routes, 'get_tariff_public_access_points', AsyncMock(return_value=public_points))
+    monkeypatch.setattr(
+        cabinet_purchase_routes, 'get_tariff_public_access_points', AsyncMock(return_value=public_points)
+    )
     monkeypatch.setattr(miniapp_routes, 'get_tariff_public_access_points', AsyncMock(return_value=public_points))
     cabinet_card = await cabinet_purchase_routes._build_tariff_response(SimpleNamespace(), tariff)
     miniapp_card = await miniapp_routes._build_tariff_model(SimpleNamespace(), tariff)
@@ -539,7 +541,9 @@ async def test_miniapp_current_tariff_uses_captured_term_not_future_offer_policy
         return_value=(public_access_point_service.EffectivePublicAccessPoint(id='term-pl', title='Текущая Польша'),)
     )
     offer_lookup = AsyncMock(
-        return_value=(public_access_point_service.EffectivePublicAccessPoint(id='future-fi', title='Будущая Финляндия'),)
+        return_value=(
+            public_access_point_service.EffectivePublicAccessPoint(id='future-fi', title='Будущая Финляндия'),
+        )
     )
     monkeypatch.setattr(miniapp_routes, 'get_effective_public_access_points', effective_lookup)
     monkeypatch.setattr(miniapp_routes, 'get_tariff_public_access_points', offer_lookup)

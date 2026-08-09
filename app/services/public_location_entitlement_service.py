@@ -121,11 +121,9 @@ async def _access_point_policy(
     policy_revision = int(getattr(tariff, 'access_point_policy_revision', 0) or 0)
     if policy_revision <= 0:
         raise EntitlementResolutionError('access-point tariff has no active policy revision')
-    policy_query = (
-        select(TariffAccessPointPolicyRevision).where(
-            TariffAccessPointPolicyRevision.tariff_id == tariff.id,
-            TariffAccessPointPolicyRevision.revision == policy_revision,
-        )
+    policy_query = select(TariffAccessPointPolicyRevision).where(
+        TariffAccessPointPolicyRevision.tariff_id == tariff.id,
+        TariffAccessPointPolicyRevision.revision == policy_revision,
     )
     if lock_evidence:
         policy_query = policy_query.with_for_update()
@@ -242,9 +240,7 @@ async def resolve_tariff_entitlement(
             # resolver before its own debit.  Refusing here is the common
             # before-money fence until a path is migrated to Device-First's
             # durable entitlement quote and term transaction.
-            raise EntitlementResolutionError(
-                'access-point issuance requires a Device-First immutable checkout quote'
-            )
+            raise EntitlementResolutionError('access-point issuance requires a Device-First immutable checkout quote')
         return await _access_point_policy(
             db,
             tariff,

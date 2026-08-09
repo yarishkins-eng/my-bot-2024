@@ -1446,10 +1446,7 @@ async def _validate_direct_pre_commit(
         # acquire the same row locks on UPDATE, eliminating a quote→money
         # inventory or policy TOCTOU window.
         locked_tariff = await db.scalar(
-            select(Tariff)
-            .where(Tariff.id == tariff.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+            select(Tariff).where(Tariff.id == tariff.id).with_for_update().execution_options(populate_existing=True)
         )
         if locked_tariff is None:
             raise EntitlementResolutionError('tariff disappeared during final quote validation')

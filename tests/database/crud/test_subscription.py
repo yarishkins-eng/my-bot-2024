@@ -146,7 +146,9 @@ async def test_early_access_point_renewal_keeps_current_squads_until_projection_
     monkeypatch.setattr('app.database.crud.subscription._lock_subscription_row', AsyncMock())
     monkeypatch.setattr('app.database.crud.subscription._housekeep_expired_purchases', AsyncMock())
     monkeypatch.setattr('app.database.crud.subscription.clear_notifications', AsyncMock())
-    monkeypatch.setattr('app.database.crud.subscription.deactivate_user_trial_subscriptions', AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        'app.database.crud.subscription.deactivate_user_trial_subscriptions', AsyncMock(return_value=[])
+    )
     capture = AsyncMock()
     monkeypatch.setattr('app.services.public_access_point_service.capture_access_point_entitlement_term', capture)
 

@@ -325,9 +325,7 @@ async def _access_point_plan_target(
     if resolved.provenance != 'access_point_policy' or not resolved.location_ids:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Tariff has no verified access-point policy')
     points = list(
-        (
-            await db.execute(select(PublicAccessPoint).where(PublicAccessPoint.id.in_(resolved.location_ids)))
-        ).scalars()
+        (await db.execute(select(PublicAccessPoint).where(PublicAccessPoint.id.in_(resolved.location_ids)))).scalars()
     )
     point_by_id = {point.id: point for point in points}
     if set(resolved.location_ids) != set(point_by_id):
@@ -645,14 +643,14 @@ async def prepare_access_point_plan(
         old_ids = {
             point_id
             for subscription in related_selected
-            for point_id in (active_terms.get(subscription.id).access_point_ids if active_terms.get(subscription.id) else [])
+            for point_id in (
+                active_terms.get(subscription.id).access_point_ids if active_terms.get(subscription.id) else []
+            )
         }
         point_ids = target_ids.union(old_ids)
         if point_ids - set(point_by_id):
             extra_points = list(
-                (
-                    await db.execute(select(PublicAccessPoint).where(PublicAccessPoint.id.in_(point_ids)))
-                ).scalars()
+                (await db.execute(select(PublicAccessPoint).where(PublicAccessPoint.id.in_(point_ids)))).scalars()
             )
             point_by_id.update({point.id: point for point in extra_points})
         missing_term_ids = sorted(
@@ -721,15 +719,11 @@ async def prepare_access_point_plan(
         'affected_subscription_count': len(selected_ids),
         'affected_identity_count': len(identities),
         'excluded_subscription_count': len(excluded_ids),
-        'missing_active_term_subscription_count': len(
-            (scope or {}).get('missing_active_term_subscription_ids') or []
-        ),
+        'missing_active_term_subscription_count': len((scope or {}).get('missing_active_term_subscription_ids') or []),
         'execution_enabled': False,
         **public_diff,
     }
-    existing_plan = await db.scalar(
-        select(EntitlementChangePlan).where(EntitlementChangePlan.plan_hash == plan_hash)
-    )
+    existing_plan = await db.scalar(select(EntitlementChangePlan).where(EntitlementChangePlan.plan_hash == plan_hash))
     if existing_plan is not None:
         # ``plan_hash`` includes actor and reason, so this can only be the
         # exact same immutable request. Return it idempotently and release the
@@ -816,10 +810,9 @@ async def confirm_access_point_plan(
         active_terms=active_terms,
     )
     frozen_preimage = plan.preimage or {}
-    if (
-        frozen_preimage.get('subscriptions') != current_subscriptions
-        or frozen_preimage.get('panel_identity_scope') != list(current_identities.values())
-    ):
+    if frozen_preimage.get('subscriptions') != current_subscriptions or frozen_preimage.get(
+        'panel_identity_scope'
+    ) != list(current_identities.values()):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail='Subscription scope or active entitlement evidence changed; prepare a new plan',
@@ -833,10 +826,9 @@ async def confirm_access_point_plan(
                 detail='Tariff policy revision changed; prepare a new plan',
             )
         resolved, _point_by_id = await _access_point_plan_target(db, tariff, lock_evidence=True)
-        if (
-            resolved.inventory_fingerprint != (plan.scope or {}).get('inventory_fingerprint')
-            or sorted(resolved.location_ids) != list((plan.scope or {}).get('target_access_point_ids') or [])
-        ):
+        if resolved.inventory_fingerprint != (plan.scope or {}).get('inventory_fingerprint') or sorted(
+            resolved.location_ids
+        ) != list((plan.scope or {}).get('target_access_point_ids') or []):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail='Tariff point evidence changed; prepare a new plan',

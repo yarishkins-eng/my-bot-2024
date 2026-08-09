@@ -605,9 +605,7 @@ async def record_verified_legacy_access_point_conversion(
     if manifest is None or list(tariff.allowed_squads or []) != list(manifest.squad_uuids or []):
         raise AccessPointPolicyError('legacy manifest is absent or differs from the protected tariff baseline')
     existing = await db.scalar(
-        select(TariffAccessPointConversion)
-        .where(TariffAccessPointConversion.tariff_id == tariff.id)
-        .with_for_update()
+        select(TariffAccessPointConversion).where(TariffAccessPointConversion.tariff_id == tariff.id).with_for_update()
     )
     if existing is not None:
         raise AccessPointPolicyError('legacy tariff already has a dedicated-equivalence conversion')
@@ -623,11 +621,7 @@ async def record_verified_legacy_access_point_conversion(
         raise AccessPointPolicyError('protected dedicated-equivalence evidence is incomplete or stale')
     points = list(
         (
-            await db.execute(
-                select(PublicAccessPoint)
-                .where(PublicAccessPoint.id.in_(wanted))
-                .with_for_update()
-            )
+            await db.execute(select(PublicAccessPoint).where(PublicAccessPoint.id.in_(wanted)).with_for_update())
         ).scalars()
     )
     if len(points) != len(wanted) or any(
@@ -1023,8 +1017,7 @@ async def process_due_access_point_term_projections(
                 # operator instead of retrying it as if it were current.
                 retry.state = (
                     'manual_reconcile'
-                    if isinstance(exc, AccessPointPolicyError)
-                    and 'not effective at projection time' in str(exc)
+                    if isinstance(exc, AccessPointPolicyError) and 'not effective at projection time' in str(exc)
                     else 'pending'
                 )
                 retry.last_error = type(exc).__name__

@@ -116,9 +116,7 @@ class RemnaWaveAccessPointInventoryClient:
         node_by_key = {node.uuid: node for node in current_nodes}
         required_active_tags_by_squad = {
             squad.uuid: frozenset(
-                inbound.tag
-                for inbound in squad.inbounds
-                if isinstance(inbound.tag, str) and inbound.tag.strip()
+                inbound.tag for inbound in squad.inbounds if isinstance(inbound.tag, str) and inbound.tag.strip()
             )
             for squad in squads
         }
@@ -127,10 +125,7 @@ class RemnaWaveAccessPointInventoryClient:
             profile_ids = {inbound.profile_uuid for inbound in squad.inbounds if inbound.profile_uuid.strip()}
             return next(iter(profile_ids)) if len(profile_ids) == 1 else None
 
-        required_profile_by_squad = {
-            squad.uuid: required_profile(squad)
-            for squad in squads
-        }
+        required_profile_by_squad = {squad.uuid: required_profile(squad) for squad in squads}
 
         def is_currently_healthy(
             squad: RemnaWaveInternalSquad,
@@ -148,16 +143,21 @@ class RemnaWaveAccessPointInventoryClient:
 
             required_tags = required_active_tags_by_squad.get(squad.uuid, frozenset())
             required_profile = required_profile_by_squad.get(squad.uuid)
-            return bool(accessible_nodes) and bool(required_tags) and required_profile is not None and all(
-                (node := node_by_key.get(accessible.uuid)) is not None
-                and node.is_connected
-                and not node.is_disabled
-                and not node.is_connecting
-                and accessible.config_profile_uuid == required_profile
-                and isinstance(accessible.active_inbounds, list)
-                and all(isinstance(tag, str) and tag.strip() for tag in accessible.active_inbounds)
-                and frozenset(accessible.active_inbounds) == required_tags
-                for accessible in accessible_nodes
+            return (
+                bool(accessible_nodes)
+                and bool(required_tags)
+                and required_profile is not None
+                and all(
+                    (node := node_by_key.get(accessible.uuid)) is not None
+                    and node.is_connected
+                    and not node.is_disabled
+                    and not node.is_connecting
+                    and accessible.config_profile_uuid == required_profile
+                    and isinstance(accessible.active_inbounds, list)
+                    and all(isinstance(tag, str) and tag.strip() for tag in accessible.active_inbounds)
+                    and frozenset(accessible.active_inbounds) == required_tags
+                    for accessible in accessible_nodes
+                )
             )
 
         healthy_by_squad = {

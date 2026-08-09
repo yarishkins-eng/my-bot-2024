@@ -306,10 +306,7 @@ class SubscriptionService:
         access_point_term_ends_at: datetime | None = None,
     ) -> RemnaWaveUser | None:
         try:
-            if (
-                await self._is_access_point_subscription(db, subscription)
-                and not access_point_term_projection
-            ):
+            if await self._is_access_point_subscription(db, subscription) and not access_point_term_projection:
                 logger.warning(
                     'raw_panel_create_blocked_for_access_point_term',
                     subscription_id=subscription.id,
@@ -603,10 +600,7 @@ class SubscriptionService:
         access_point_term_ends_at: datetime | None = None,
     ) -> RemnaWaveUser | None:
         try:
-            if (
-                await self._is_access_point_subscription(db, subscription)
-                and not access_point_term_projection
-            ):
+            if await self._is_access_point_subscription(db, subscription) and not access_point_term_projection:
                 logger.warning(
                     'raw_panel_update_blocked_for_access_point_term',
                     subscription_id=subscription.id,

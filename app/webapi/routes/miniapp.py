@@ -5251,8 +5251,7 @@ async def _build_subscription_settings(
         current=MiniAppSubscriptionCurrentSettings(
             servers=current_servers,
             access_points=[
-                MiniAppPublicAccessPoint(id=point.id, title=point.title)
-                for point in (effective_access_points or ())
+                MiniAppPublicAccessPoint(id=point.id, title=point.title) for point in (effective_access_points or ())
             ],
             traffic_limit_gb=subscription.traffic_limit_gb,
             traffic_limit_label=None,

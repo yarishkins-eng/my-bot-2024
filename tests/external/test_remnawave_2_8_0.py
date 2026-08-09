@@ -150,9 +150,7 @@ async def test_sensitive_inventory_http_failure_never_logs_or_raises_raw_identif
     squad_uuid = 'private-squad-uuid'
     host_uuid = 'private-host-uuid'
     api = _api()
-    api.session = _ErrorSession(
-        response=_FakeResponse(status=500, body=f'{{"message":"{squad_uuid} {host_uuid}"}}')
-    )
+    api.session = _ErrorSession(response=_FakeResponse(status=500, body=f'{{"message":"{squad_uuid} {host_uuid}"}}'))
     captured = _LogCapture()
     monkeypatch.setattr(remnawave_api_module, 'logger', captured)
 

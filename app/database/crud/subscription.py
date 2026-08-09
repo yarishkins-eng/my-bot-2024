@@ -406,7 +406,11 @@ async def _revive_paid_subscription(
         from app.services.public_location_entitlement_service import persist_subscription_entitlement_snapshot
 
         await persist_subscription_entitlement_snapshot(db, subscription.id, tariff_id, entitlement)
-    if entitlement is not None and entitlement.provenance == 'access_point_policy' and not access_point_term_source_reference:
+    if (
+        entitlement is not None
+        and entitlement.provenance == 'access_point_policy'
+        and not access_point_term_source_reference
+    ):
         raise ValueError('access-point paid revive requires a pre-captured idempotency source reference')
     now = datetime.now(UTC)
     was_alive = subscription.end_date is not None and subscription.end_date > now
