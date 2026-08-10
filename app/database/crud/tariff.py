@@ -30,10 +30,24 @@ def _normalized_squad_selection(values: list[str] | None) -> tuple[str, ...]:
 async def _assert_tariff_squad_change_has_no_live_checkout(db: AsyncSession, tariff: Tariff) -> None:
     """Do not invalidate any live checkout's captured access entitlement."""
 
+    # A direct provider attempt deliberately stays ``paid_processing`` after
+    # a successful sale.  It is then an idempotency/reconciliation record,
+    # not an open invoice.  Once the checkout has reached its fully delivered
+    # ``ready`` state, retaining that historical attempt must not permanently
+    # prevent an administrator from changing a tariff's future squad choice.
+    # Do *not* relax this for ``fulfilling`` / ``retry``: those still have a
+    # live provision path and therefore must keep the tariff fence.
+    fully_delivered_checkout = (
+        (SubscriptionCheckout.lifecycle_state == 'ready')
+        & (SubscriptionCheckout.funding_state == 'funded')
+        & (SubscriptionCheckout.fulfillment_state == 'fulfilled')
+        & (SubscriptionCheckout.provisioning_state == 'ready')
+    )
     live_provider_attempt = exists(
         select(CheckoutPaymentAttempt.id).where(
             CheckoutPaymentAttempt.checkout_id == SubscriptionCheckout.id,
             CheckoutPaymentAttempt.status.in_(_DIRECT_PROVIDER_ATTEMPT_OPEN_STATES),
+            ~fully_delivered_checkout,
         )
     )
     live_checkout_id = await db.scalar(

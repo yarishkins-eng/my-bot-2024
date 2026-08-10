@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 from app.cabinet.routes import admin_users
 from app.database.crud import subscription as subscription_crud, tariff as tariff_crud
@@ -79,6 +81,53 @@ async def test_same_squad_payload_cannot_bypass_live_checkout_fence_during_nativ
     assert tariff.allowed_squads == ['de-squad']
     db.get.assert_awaited_once_with(tariff_crud.Tariff, 18, with_for_update=True, populate_existing=True)
     db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_only_fully_delivered_direct_checkout_is_not_treated_as_a_live_provider_invoice() -> None:
+    """A retained ``paid_processing`` record is harmless only after full delivery."""
+    engine = create_engine('sqlite:///:memory:')
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    'CREATE TABLE subscription_checkouts ('
+                    'id INTEGER PRIMARY KEY, tariff_id INTEGER, lifecycle_state TEXT, '
+                    'funding_state TEXT, fulfillment_state TEXT, provisioning_state TEXT)'
+                )
+            )
+            connection.execute(
+                text('CREATE TABLE checkout_payment_attempts (id INTEGER PRIMARY KEY, checkout_id INTEGER, status TEXT)')
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO subscription_checkouts VALUES "
+                    "(19, 19, 'ready', 'funded', 'fulfilled', 'ready'), "
+                    "(20, 20, 'ready', 'unfunded', 'fulfilled', 'ready'), "
+                    "(21, 21, 'ready', 'funded', 'fulfilled', 'retry')"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO checkout_payment_attempts VALUES "
+                    "(19, 19, 'paid_processing'), (20, 20, 'paid_processing'), (21, 21, 'paid_processing')"
+                )
+            )
+
+        session_factory = sessionmaker(engine)
+        with session_factory() as sync_db:
+            async def scalar(statement):
+                return sync_db.scalar(statement)
+
+            db = SimpleNamespace(scalar=scalar)
+            await tariff_crud._assert_tariff_squad_change_has_no_live_checkout(db, SimpleNamespace(id=19))
+            for tariff_id in (20, 21):
+                with pytest.raises(ValueError, match='live checkout or Platega invoice'):
+                    await tariff_crud._assert_tariff_squad_change_has_no_live_checkout(
+                        db, SimpleNamespace(id=tariff_id)
+                    )
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.asyncio
