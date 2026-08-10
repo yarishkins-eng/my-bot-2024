@@ -14,6 +14,31 @@ from app.services.public_location_entitlement_service import EntitlementResoluti
 from app.services.subscription_service import SubscriptionService
 
 
+def _create_tariff_checkout_fence_schema(connection) -> None:
+    """Minimal SQLite schema for the tariff-edit checkout fence."""
+    for statement in (
+        'CREATE TABLE users (id INTEGER PRIMARY KEY, account_erased_at TEXT, account_erasure_requested_at TEXT)',
+        'CREATE TABLE account_erasure_requests (id INTEGER PRIMARY KEY, user_id INTEGER, state TEXT)',
+        'CREATE TABLE subscription_checkouts ('
+        'id INTEGER PRIMARY KEY, tariff_id INTEGER, user_id INTEGER, lifecycle_state TEXT, terminal_reason TEXT, '
+        'quote_state TEXT, funding_state TEXT, fulfillment_state TEXT, provisioning_state TEXT, '
+        'settlement_mode TEXT, created_subscription_id INTEGER, debit_transaction_id INTEGER)',
+        'CREATE TABLE checkout_payment_attempts ('
+        'id INTEGER PRIMARY KEY, checkout_id INTEGER, status TEXT, provider TEXT, settlement_mode TEXT, '
+        'reconciliation_reason TEXT, credited_amount_kopeks INTEGER, platega_payment_id INTEGER, '
+        'provider_payment_id TEXT, requested_amount_kopeks INTEGER, currency TEXT, provider_method_code INTEGER)',
+        'CREATE TABLE platega_payments ('
+        'id INTEGER PRIMARY KEY, user_id INTEGER, platega_transaction_id TEXT, amount_kopeks INTEGER, currency TEXT, '
+        'payment_method_code INTEGER, status TEXT, is_paid BOOLEAN, paid_at TEXT, transaction_id INTEGER)',
+        'CREATE TABLE device_first_reconciliation_credits (id INTEGER PRIMARY KEY, checkout_id INTEGER)',
+        'CREATE TABLE transactions (id INTEGER PRIMARY KEY, device_first_checkout_id INTEGER)',
+        'CREATE TABLE device_first_outbox (id INTEGER PRIMARY KEY, checkout_id INTEGER)',
+        'CREATE TABLE device_first_deposit_outbox (id INTEGER PRIMARY KEY, checkout_id INTEGER)',
+        'CREATE TABLE device_first_notification_outbox (id INTEGER PRIMARY KEY, checkout_id INTEGER)',
+    ):
+        connection.execute(text(statement))
+
+
 @pytest.mark.asyncio
 async def test_new_tariff_uses_native_squads_without_an_access_point_policy(monkeypatch) -> None:
     db = SimpleNamespace(add=Mock(), execute=AsyncMock(), flush=AsyncMock(), commit=AsyncMock(), refresh=AsyncMock())
@@ -89,19 +114,12 @@ async def test_only_fully_delivered_direct_checkout_is_not_treated_as_a_live_pro
     engine = create_engine('sqlite:///:memory:')
     try:
         with engine.begin() as connection:
+            _create_tariff_checkout_fence_schema(connection)
             connection.execute(
                 text(
-                    'CREATE TABLE subscription_checkouts ('
-                    'id INTEGER PRIMARY KEY, tariff_id INTEGER, lifecycle_state TEXT, '
-                    'funding_state TEXT, fulfillment_state TEXT, provisioning_state TEXT)'
-                )
-            )
-            connection.execute(
-                text('CREATE TABLE checkout_payment_attempts (id INTEGER PRIMARY KEY, checkout_id INTEGER, status TEXT)')
-            )
-            connection.execute(
-                text(
-                    "INSERT INTO subscription_checkouts VALUES "
+                    'INSERT INTO subscription_checkouts ('
+                    'id, tariff_id, lifecycle_state, funding_state, fulfillment_state, provisioning_state'
+                    ') VALUES '
                     "(19, 19, 'ready', 'funded', 'fulfilled', 'ready'), "
                     "(20, 20, 'ready', 'unfunded', 'fulfilled', 'ready'), "
                     "(21, 21, 'ready', 'funded', 'fulfilled', 'retry')"
@@ -109,13 +127,14 @@ async def test_only_fully_delivered_direct_checkout_is_not_treated_as_a_live_pro
             )
             connection.execute(
                 text(
-                    "INSERT INTO checkout_payment_attempts VALUES "
+                    'INSERT INTO checkout_payment_attempts (id, checkout_id, status) VALUES '
                     "(19, 19, 'paid_processing'), (20, 20, 'paid_processing'), (21, 21, 'paid_processing')"
                 )
             )
 
         session_factory = sessionmaker(engine)
         with session_factory() as sync_db:
+
             async def scalar(statement):
                 return sync_db.scalar(statement)
 
