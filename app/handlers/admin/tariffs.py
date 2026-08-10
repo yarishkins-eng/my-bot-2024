@@ -2291,16 +2291,6 @@ async def start_edit_tariff_squads(
     state: FSMContext,
 ):
     """Показывает меню выбора серверов для тарифа."""
-    # This editor exposes and persists raw technical Squad UUIDs.  Tariff
-    # access is now a PublicLocation policy and active-user changes require a
-    # separately confirmed entitlement plan, so stale admin buttons must stop
-    # before reading or writing the legacy projection.
-    await callback.answer(
-        'Редактор технических серверов отключён. Используйте политику публичных локаций и план прав.',
-        show_alert=True,
-    )
-    return
-
     texts = get_texts(db_user.language)
     tariff_id = int(callback.data.split(':')[1])
     tariff = await get_tariff_by_id(db, tariff_id)
@@ -2309,13 +2299,15 @@ async def start_edit_tariff_squads(
         await callback.answer('Тариф не найден', show_alert=True)
         return
 
-    squads, _ = await get_all_server_squads(db, limit=10000)
+    squads, _ = await get_all_server_squads(db, available_only=True, limit=10000)
 
     if not squads:
         await callback.answer('Нет доступных серверов', show_alert=True)
         return
 
+    available_squad_uuids = {squad.squad_uuid for squad in squads if squad.squad_uuid}
     current_squads = set(tariff.allowed_squads or [])
+    stale_squads = current_squads - available_squad_uuids
 
     buttons = []
     for squad in squads:
@@ -2331,10 +2323,7 @@ async def start_edit_tariff_squads(
         )
 
     buttons.append(
-        [
-            InlineKeyboardButton(text='🔄 Очистить все', callback_data=f'admin_tariff_clear_squads:{tariff_id}'),
-            InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}'),
-        ]
+        [InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}')]
     )
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
 
@@ -2343,7 +2332,12 @@ async def start_edit_tariff_squads(
     await callback.message.edit_text(
         f'🌐 <b>Серверы для тарифа «{html.escape(tariff.name)}»</b>\n\n'
         f'Выбрано: {selected_count} из {len(squads)}\n\n'
-        'Если не выбран ни один сервер - доступны все.\n'
+        + (
+            '⚠️ В тарифе есть недоступный прежний сервер. Следующее сохранение заменит его выбранными здесь серверами.\n\n'
+            if stale_squads
+            else ''
+        )
+        + 'Выберите хотя бы один сервер. Пустой список заблокирован.\n'
         'Нажмите на сервер для выбора/отмены:',
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode='HTML',
@@ -2359,12 +2353,6 @@ async def toggle_tariff_squad(
     db: AsyncSession,
 ):
     """Переключает выбор сервера для тарифа."""
-    await callback.answer(
-        'Изменение технических серверов отключено; используйте публичные локации.',
-        show_alert=True,
-    )
-    return
-
     parts = callback.data.split(':')
     tariff_id = int(parts[1])
     squad_uuid = parts[2]
@@ -2373,10 +2361,25 @@ async def toggle_tariff_squad(
     if not tariff:
         await callback.answer('Тариф не найден', show_alert=True)
         return
+    if getattr(tariff, 'entitlement_mode', None) != 'native_squads':
+        await callback.answer(
+            'Этот тариф ещё не переведён на штатные серверы. Первый перенос выполните в веб-кабинете: там выбор сохраняется отдельно от применения к текущим подпискам.',
+            show_alert=True,
+        )
+        return
 
-    current_squads = set(tariff.allowed_squads or [])
+    squads, _ = await get_all_server_squads(db, available_only=True, limit=10000)
+    available_squad_uuids = {squad.squad_uuid for squad in squads if squad.squad_uuid}
+    if squad_uuid not in available_squad_uuids:
+        await callback.answer('Этот сервер больше недоступен. Откройте список заново.', show_alert=True)
+        return
+
+    current_squads = set(tariff.allowed_squads or []) & available_squad_uuids
 
     if squad_uuid in current_squads:
+        if len(current_squads) == 1:
+            await callback.answer('Нужно оставить хотя бы один сервер.', show_alert=True)
+            return
         current_squads.remove(squad_uuid)
     else:
         current_squads.add(squad_uuid)
@@ -2384,7 +2387,6 @@ async def toggle_tariff_squad(
     tariff = await update_tariff(db, tariff, allowed_squads=list(current_squads))
 
     # Перерисовываем меню
-    squads, _ = await get_all_server_squads(db, limit=10000)
     texts = get_texts(db_user.language)
 
     buttons = []
@@ -2401,10 +2403,7 @@ async def toggle_tariff_squad(
         )
 
     buttons.append(
-        [
-            InlineKeyboardButton(text='🔄 Очистить все', callback_data=f'admin_tariff_clear_squads:{tariff_id}'),
-            InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}'),
-        ]
+        [InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}')]
     )
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
 
@@ -2412,7 +2411,7 @@ async def toggle_tariff_squad(
         await callback.message.edit_text(
             f'🌐 <b>Серверы для тарифа «{html.escape(tariff.name)}»</b>\n\n'
             f'Выбрано: {len(current_squads)} из {len(squads)}\n\n'
-            'Если не выбран ни один сервер - доступны все.\n'
+            'Выберите хотя бы один сервер. Пустой список заблокирован.\n'
             'Нажмите на сервер для выбора/отмены:',
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             parse_mode='HTML',
@@ -2422,14 +2421,9 @@ async def toggle_tariff_squad(
 
     await callback.answer()
 
-    # Применяем изменения серверов к существующим подпискам
-    from app.services.subscription_service import SubscriptionService
-
-    propagate_result = await SubscriptionService().propagate_tariff_squads(db, tariff.id, list(current_squads))
-    if propagate_result.failed_ids:
-        await callback.message.answer(
-            f'⚠️ {len(propagate_result.failed_ids)} из {propagate_result.total} подписок не синхронизированы с RemnaWave',
-        )
+    await callback.message.answer(
+        '✅ Выбор серверов сохранён. Действующие подписки не менялись; примените выбор к ним отдельной кнопкой в веб-кабинете.',
+    )
 
 
 @admin_required
@@ -2440,65 +2434,23 @@ async def clear_tariff_squads(
     db: AsyncSession,
 ):
     """Очищает список серверов тарифа."""
-    await callback.answer(
-        'Изменение технических серверов отключено; используйте публичные локации.',
-        show_alert=True,
-    )
-    return
-
     tariff_id = int(callback.data.split(':')[1])
     tariff = await get_tariff_by_id(db, tariff_id)
 
     if not tariff:
         await callback.answer('Тариф не найден', show_alert=True)
         return
-
-    tariff = await update_tariff(db, tariff, allowed_squads=[])
-    await callback.answer('Все серверы очищены')
-
-    # Перерисовываем меню
-    squads, _ = await get_all_server_squads(db, limit=10000)
-    texts = get_texts(db_user.language)
-
-    buttons = []
-    for squad in squads:
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=f'⬜ {squad.display_name}',
-                    callback_data=f'trf_sq:{tariff_id}:{squad.squad_uuid}',
-                )
-            ]
+    if getattr(tariff, 'entitlement_mode', None) != 'native_squads':
+        await callback.answer(
+            'Первый перенос тарифа на штатные серверы выполните в веб-кабинете.',
+            show_alert=True,
         )
+        return
 
-    buttons.append(
-        [
-            InlineKeyboardButton(text='🔄 Очистить все', callback_data=f'admin_tariff_clear_squads:{tariff_id}'),
-            InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}'),
-        ]
+    await callback.answer(
+        'Пустой список означал бы доступ ко всем серверам, поэтому он заблокирован. Выберите серверы явно.',
+        show_alert=True,
     )
-    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
-
-    try:
-        await callback.message.edit_text(
-            f'🌐 <b>Серверы для тарифа «{html.escape(tariff.name)}»</b>\n\n'
-            f'Выбрано: 0 из {len(squads)}\n\n'
-            'Если не выбран ни один сервер - доступны все.\n'
-            'Нажмите на сервер для выбора/отмены:',
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            parse_mode='HTML',
-        )
-    except TelegramBadRequest:
-        pass
-
-    # Применяем изменения серверов к существующим подпискам (пустой список = все серверы)
-    from app.services.subscription_service import SubscriptionService
-
-    propagate_result = await SubscriptionService().propagate_tariff_squads(db, tariff.id, [])
-    if propagate_result.failed_ids:
-        await callback.message.answer(
-            f'⚠️ {len(propagate_result.failed_ids)} из {propagate_result.total} подписок не синхронизированы с RemnaWave',
-        )
 
 
 @admin_required
@@ -2509,20 +2461,20 @@ async def select_all_tariff_squads(
     db: AsyncSession,
 ):
     """Выбирает все серверы для тарифа."""
-    await callback.answer(
-        'Изменение технических серверов отключено; используйте публичные локации.',
-        show_alert=True,
-    )
-    return
-
     tariff_id = int(callback.data.split(':')[1])
     tariff = await get_tariff_by_id(db, tariff_id)
 
     if not tariff:
         await callback.answer('Тариф не найден', show_alert=True)
         return
+    if getattr(tariff, 'entitlement_mode', None) != 'native_squads':
+        await callback.answer(
+            'Первый перенос тарифа на штатные серверы выполните в веб-кабинете.',
+            show_alert=True,
+        )
+        return
 
-    squads, _ = await get_all_server_squads(db, limit=10000)
+    squads, _ = await get_all_server_squads(db, available_only=True, limit=10000)
     all_uuids = [s.squad_uuid for s in squads if s.squad_uuid]
 
     tariff = await update_tariff(db, tariff, allowed_squads=all_uuids)
@@ -2542,10 +2494,7 @@ async def select_all_tariff_squads(
         )
 
     buttons.append(
-        [
-            InlineKeyboardButton(text='🔄 Очистить все', callback_data=f'admin_tariff_clear_squads:{tariff_id}'),
-            InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}'),
-        ]
+        [InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}')]
     )
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
 
@@ -2553,7 +2502,7 @@ async def select_all_tariff_squads(
         await callback.message.edit_text(
             f'🌐 <b>Серверы для тарифа «{html.escape(tariff.name)}»</b>\n\n'
             f'Выбрано: {len(squads)} из {len(squads)}\n\n'
-            'Если не выбран ни один сервер - доступны все.\n'
+            'Выберите хотя бы один сервер. Пустой список заблокирован.\n'
             'Нажмите на сервер для выбора/отмены:',
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             parse_mode='HTML',
@@ -2561,14 +2510,9 @@ async def select_all_tariff_squads(
     except TelegramBadRequest:
         pass
 
-    # Применяем изменения серверов к существующим подпискам
-    from app.services.subscription_service import SubscriptionService
-
-    propagate_result = await SubscriptionService().propagate_tariff_squads(db, tariff.id, all_uuids)
-    if propagate_result.failed_ids:
-        await callback.message.answer(
-            f'⚠️ {len(propagate_result.failed_ids)} из {propagate_result.total} подписок не синхронизированы с RemnaWave',
-        )
+    await callback.message.answer(
+        '✅ Выбор серверов сохранён. Действующие подписки не менялись; примените выбор к ним отдельной кнопкой в веб-кабинете.',
+    )
 
 
 # ============ РЕДАКТИРОВАНИЕ ПРОМОГРУПП ============

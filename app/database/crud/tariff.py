@@ -1,13 +1,345 @@
-import structlog
-from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+import hashlib
+import json
+from types import SimpleNamespace
 
-from app.database.models import PromoGroup, Subscription, SubscriptionStatus, Tariff
+import structlog
+from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased, selectinload
+
+from app.database.models import (
+    AccountErasureRequest,
+    CheckoutPaymentAttempt,
+    DeviceFirstDepositOutbox,
+    DeviceFirstNotificationOutbox,
+    DeviceFirstOutbox,
+    DeviceFirstReconciliationCredit,
+    PlategaPayment,
+    PromoGroup,
+    Subscription,
+    SubscriptionCheckout,
+    SubscriptionStatus,
+    Tariff,
+    Transaction,
+    User,
+)
 from app.services.device_first_eligibility import normalize_device_purchase_options
 
 
 logger = structlog.get_logger(__name__)
+
+
+_CHECKOUT_TERMINAL_STATES = ('ready', 'cancelled', 'expired')
+_DIRECT_PROVIDER_ATTEMPT_OPEN_STATES = ('creating', 'pending', 'paid_processing')
+_HISTORICAL_ERASED_DIRECT_MISMATCH = 'direct_payment_binding_mismatch'
+_APPROVED_FINAL_ERASURE_ARCHIVE_TARIFF_ID = 3
+_APPROVED_FINAL_ERASURE_ARCHIVE_COUNT = 5
+# Owner-pinned from a read-only canonical-Platega CANCELED verification and a
+# matching local P/U/A/C snapshot. It is not a configurable policy: any drift
+# in this exact archived cohort must fail closed and keep the tariff edit
+# blocked for manual financial review.
+_APPROVED_FINAL_ERASURE_ARCHIVE_SHA256 = 'ee4478122f393ee2930424bcabae91afd22e30bcab0e7521b15d57cf77159e81'
+
+
+def _normalized_squad_selection(values: list[str] | None) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(value) for value in (values or []) if value))
+
+
+def _manifest_timestamp(value: object) -> str | None:
+    if value is None:
+        return None
+    isoformat = getattr(value, 'isoformat', None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
+def _archive_manifest_sha256(rows: list[dict[str, object]]) -> str | None:
+    """Return the exact, non-configurable fingerprint of the archived cohort."""
+
+    if len(rows) != _APPROVED_FINAL_ERASURE_ARCHIVE_COUNT:
+        return None
+    if any(int(row['tariff_id']) != _APPROVED_FINAL_ERASURE_ARCHIVE_TARIFF_ID for row in rows):
+        return None
+    if len({int(row['checkout_id']) for row in rows}) != _APPROVED_FINAL_ERASURE_ARCHIVE_COUNT:
+        return None
+    if len({int(row['attempt_id']) for row in rows}) != _APPROVED_FINAL_ERASURE_ARCHIVE_COUNT:
+        return None
+    if len({int(row['payment_id']) for row in rows}) != _APPROVED_FINAL_ERASURE_ARCHIVE_COUNT:
+        return None
+    if len({str(row['provider_payment_id']) for row in rows}) != _APPROVED_FINAL_ERASURE_ARCHIVE_COUNT:
+        return None
+    variants = [str(row['variant']) for row in rows]
+    if variants.count('direct_direct_missing_marker') != 4:
+        return None
+    if variants.count('direct_legacy_missing_marker') != 1:
+        return None
+
+    encoded = json.dumps(
+        {'version': 3, 'entries': sorted(rows, key=lambda row: str(row['provider_payment_id']))},
+        sort_keys=True,
+        separators=(',', ':'),
+        ensure_ascii=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _final_erasure_archive_candidate_query(tariff_id: int):
+    """Select only the documented no-money final-erasure archive cohort."""
+
+    other_attempt = aliased(CheckoutPaymentAttempt)
+    exactly_one_payment_attempt = (
+        select(func.count(other_attempt.id))
+        .where(other_attempt.checkout_id == SubscriptionCheckout.id)
+        .scalar_subquery()
+        == 1
+    )
+    no_money_or_provisioning = and_(
+        ~exists(
+            select(DeviceFirstReconciliationCredit.id).where(
+                DeviceFirstReconciliationCredit.checkout_id == SubscriptionCheckout.id
+            )
+        ),
+        ~exists(select(Transaction.id).where(Transaction.device_first_checkout_id == SubscriptionCheckout.id)),
+        ~exists(select(DeviceFirstOutbox.id).where(DeviceFirstOutbox.checkout_id == SubscriptionCheckout.id)),
+        ~exists(
+            select(DeviceFirstDepositOutbox.id).where(DeviceFirstDepositOutbox.checkout_id == SubscriptionCheckout.id)
+        ),
+        ~exists(
+            select(DeviceFirstNotificationOutbox.id).where(
+                DeviceFirstNotificationOutbox.checkout_id == SubscriptionCheckout.id
+            )
+        ),
+    )
+    return (
+        select(
+            SubscriptionCheckout.id.label('checkout_id'),
+            SubscriptionCheckout.tariff_id.label('tariff_id'),
+            SubscriptionCheckout.user_id.label('checkout_user_id'),
+            SubscriptionCheckout.lifecycle_state.label('checkout_lifecycle_state'),
+            SubscriptionCheckout.terminal_reason.label('checkout_terminal_reason'),
+            SubscriptionCheckout.quote_state.label('checkout_quote_state'),
+            SubscriptionCheckout.funding_state.label('checkout_funding_state'),
+            SubscriptionCheckout.fulfillment_state.label('checkout_fulfillment_state'),
+            SubscriptionCheckout.provisioning_state.label('checkout_provisioning_state'),
+            SubscriptionCheckout.settlement_mode.label('checkout_settlement_mode'),
+            SubscriptionCheckout.created_subscription_id.label('checkout_created_subscription_id'),
+            SubscriptionCheckout.debit_transaction_id.label('checkout_debit_transaction_id'),
+            CheckoutPaymentAttempt.id.label('attempt_id'),
+            CheckoutPaymentAttempt.status.label('attempt_status'),
+            CheckoutPaymentAttempt.reconciliation_reason.label('attempt_reconciliation_reason'),
+            CheckoutPaymentAttempt.settlement_mode.label('attempt_settlement_mode'),
+            CheckoutPaymentAttempt.provider_payment_id.label('provider_payment_id'),
+            CheckoutPaymentAttempt.requested_amount_kopeks.label('attempt_requested_amount_kopeks'),
+            CheckoutPaymentAttempt.currency.label('attempt_currency'),
+            CheckoutPaymentAttempt.provider_method_code.label('attempt_provider_method_code'),
+            CheckoutPaymentAttempt.credited_amount_kopeks.label('attempt_credited_amount_kopeks'),
+            PlategaPayment.id.label('payment_id'),
+            PlategaPayment.user_id.label('payment_user_id'),
+            PlategaPayment.platega_transaction_id.label('payment_transaction_id'),
+            PlategaPayment.amount_kopeks.label('payment_amount_kopeks'),
+            PlategaPayment.currency.label('payment_currency'),
+            PlategaPayment.payment_method_code.label('payment_method_code'),
+            PlategaPayment.status.label('payment_status'),
+            PlategaPayment.is_paid.label('payment_is_paid'),
+            PlategaPayment.paid_at.label('payment_paid_at'),
+            PlategaPayment.transaction_id.label('payment_local_transaction_id'),
+            AccountErasureRequest.id.label('erasure_request_id'),
+            AccountErasureRequest.state.label('erasure_state'),
+            AccountErasureRequest.panel_state.label('erasure_panel_state'),
+            AccountErasureRequest.panel_cleanup_uuids.label('erasure_panel_cleanup_uuids'),
+            AccountErasureRequest.finalized_at.label('erasure_finalized_at'),
+            User.account_erased_at.label('user_account_erased_at'),
+            User.account_erasure_requested_at.label('user_account_erasure_requested_at'),
+        )
+        .join(User, User.id == SubscriptionCheckout.user_id)
+        .join(AccountErasureRequest, AccountErasureRequest.user_id == User.id)
+        .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.checkout_id == SubscriptionCheckout.id)
+        .join(PlategaPayment, PlategaPayment.id == CheckoutPaymentAttempt.platega_payment_id)
+        .where(
+            SubscriptionCheckout.tariff_id == tariff_id,
+            SubscriptionCheckout.lifecycle_state == 'operator_review',
+            SubscriptionCheckout.terminal_reason == _HISTORICAL_ERASED_DIRECT_MISMATCH,
+            SubscriptionCheckout.quote_state == 'expired',
+            SubscriptionCheckout.funding_state == 'invoice_terminal',
+            SubscriptionCheckout.fulfillment_state == 'not_started',
+            SubscriptionCheckout.provisioning_state == 'not_started',
+            SubscriptionCheckout.settlement_mode.in_({'direct_purchase_v2', 'legacy_deposit'}),
+            SubscriptionCheckout.created_subscription_id.is_(None),
+            SubscriptionCheckout.debit_transaction_id.is_(None),
+            User.account_erased_at.is_not(None),
+            User.account_erasure_requested_at.is_not(None),
+            AccountErasureRequest.state == 'completed',
+            AccountErasureRequest.finalized_at.is_not(None),
+            AccountErasureRequest.panel_state == 'deactivated',
+            CheckoutPaymentAttempt.provider == 'platega',
+            CheckoutPaymentAttempt.settlement_mode == 'direct_purchase_v2',
+            CheckoutPaymentAttempt.status == 'operator_review',
+            CheckoutPaymentAttempt.reconciliation_reason == _HISTORICAL_ERASED_DIRECT_MISMATCH,
+            CheckoutPaymentAttempt.credited_amount_kopeks == 0,
+            PlategaPayment.user_id == SubscriptionCheckout.user_id,
+            PlategaPayment.status == 'OPERATOR_REVIEW',
+            PlategaPayment.is_paid.is_(False),
+            PlategaPayment.paid_at.is_(None),
+            PlategaPayment.transaction_id.is_(None),
+            PlategaPayment.platega_transaction_id.is_not(None),
+            PlategaPayment.platega_transaction_id == CheckoutPaymentAttempt.provider_payment_id,
+            PlategaPayment.amount_kopeks == CheckoutPaymentAttempt.requested_amount_kopeks,
+            func.upper(PlategaPayment.currency) == 'RUB',
+            func.upper(CheckoutPaymentAttempt.currency) == 'RUB',
+            PlategaPayment.payment_method_code == CheckoutPaymentAttempt.provider_method_code,
+            exactly_one_payment_attempt,
+            no_money_or_provisioning,
+        )
+        .order_by(PlategaPayment.platega_transaction_id)
+    )
+
+
+def _archive_manifest_row(row: dict[str, object]) -> dict[str, object] | None:
+    checkout_mode = str(row['checkout_settlement_mode'])
+    if checkout_mode == 'direct_purchase_v2':
+        variant = 'direct_direct_missing_marker'
+    elif checkout_mode == 'legacy_deposit':
+        variant = 'direct_legacy_missing_marker'
+    else:  # Defensive: the SQL query is deliberately duplicated by the hash.
+        return None
+    return {
+        'tariff_id': int(row['tariff_id']),
+        'checkout_id': int(row['checkout_id']),
+        'checkout_user_id': int(row['checkout_user_id']),
+        'checkout_lifecycle_state': str(row['checkout_lifecycle_state']),
+        'checkout_terminal_reason': str(row['checkout_terminal_reason']),
+        'checkout_quote_state': str(row['checkout_quote_state']),
+        'checkout_funding_state': str(row['checkout_funding_state']),
+        'checkout_fulfillment_state': str(row['checkout_fulfillment_state']),
+        'checkout_provisioning_state': str(row['checkout_provisioning_state']),
+        'checkout_settlement_mode': checkout_mode,
+        'checkout_created_subscription_id': row['checkout_created_subscription_id'],
+        'checkout_debit_transaction_id': row['checkout_debit_transaction_id'],
+        'attempt_id': int(row['attempt_id']),
+        'attempt_status': str(row['attempt_status']),
+        'attempt_reconciliation_reason': str(row['attempt_reconciliation_reason']),
+        'attempt_settlement_mode': str(row['attempt_settlement_mode']),
+        'provider_payment_id': str(row['provider_payment_id']),
+        'attempt_requested_amount_kopeks': int(row['attempt_requested_amount_kopeks']),
+        'attempt_currency': str(row['attempt_currency']).upper(),
+        'attempt_provider_method_code': int(row['attempt_provider_method_code']),
+        'attempt_credited_amount_kopeks': int(row['attempt_credited_amount_kopeks']),
+        'payment_id': int(row['payment_id']),
+        'payment_user_id': int(row['payment_user_id']),
+        'payment_transaction_id': str(row['payment_transaction_id']),
+        'payment_amount_kopeks': int(row['payment_amount_kopeks']),
+        'payment_currency': str(row['payment_currency']).upper(),
+        'payment_method_code': int(row['payment_method_code']),
+        'payment_status': str(row['payment_status']),
+        'payment_is_paid': bool(row['payment_is_paid']),
+        'payment_paid_at': _manifest_timestamp(row['payment_paid_at']),
+        'payment_local_transaction_id': row['payment_local_transaction_id'],
+        'erasure_request_id': int(row['erasure_request_id']),
+        'erasure_state': str(row['erasure_state']),
+        'erasure_panel_state': str(row['erasure_panel_state']),
+        'erasure_panel_cleanup_uuids': row['erasure_panel_cleanup_uuids'],
+        'erasure_finalized_at': _manifest_timestamp(row['erasure_finalized_at']),
+        'user_account_erased_at': _manifest_timestamp(row['user_account_erased_at']),
+        'user_account_erasure_requested_at': _manifest_timestamp(row['user_account_erasure_requested_at']),
+        'variant': variant,
+    }
+
+
+async def _archive_manifest_rows(db: AsyncSession, *, tariff_id: int) -> list[dict[str, object]]:
+    result = await db.execute(_final_erasure_archive_candidate_query(tariff_id))
+    rows = []
+    for row in result.mappings():
+        manifest_row = _archive_manifest_row(dict(row))
+        if manifest_row is None:
+            return []
+        rows.append(manifest_row)
+    return rows
+
+
+async def _lock_archive_manifest_rows(db: AsyncSession, rows: list[dict[str, object]]) -> bool:
+    """Lock the archive in the same Payment -> User -> Attempt -> Checkout order as reconciliation."""
+
+    lock_targets = (
+        (PlategaPayment, 'payment_id'),
+        (User, 'payment_user_id'),
+        (CheckoutPaymentAttempt, 'attempt_id'),
+        (SubscriptionCheckout, 'checkout_id'),
+        (AccountErasureRequest, 'erasure_request_id'),
+    )
+    for model, key in lock_targets:
+        expected_ids = sorted({int(row[key]) for row in rows})
+        locked_ids = (
+            (await db.execute(select(model.id).where(model.id.in_(expected_ids)).order_by(model.id).with_for_update()))
+            .scalars()
+            .all()
+        )
+        if locked_ids != expected_ids:
+            return False
+    return True
+
+
+async def _approved_final_erasure_archive_checkout_ids(
+    db: AsyncSession,
+    *,
+    tariff_id: int,
+) -> frozenset[int]:
+    """Return the five owner-pinned historical checkout IDs, or no exception."""
+
+    if tariff_id != _APPROVED_FINAL_ERASURE_ARCHIVE_TARIFF_ID:
+        return frozenset()
+    initial_rows = await _archive_manifest_rows(db, tariff_id=tariff_id)
+    if _archive_manifest_sha256(initial_rows) != _APPROVED_FINAL_ERASURE_ARCHIVE_SHA256:
+        return frozenset()
+    if not await _lock_archive_manifest_rows(db, initial_rows):
+        return frozenset()
+    locked_rows = await _archive_manifest_rows(db, tariff_id=tariff_id)
+    if _archive_manifest_sha256(locked_rows) != _APPROVED_FINAL_ERASURE_ARCHIVE_SHA256:
+        return frozenset()
+    return frozenset(int(row['checkout_id']) for row in locked_rows)
+
+
+async def _assert_tariff_squad_change_has_no_live_checkout(db: AsyncSession, tariff: Tariff) -> None:
+    """Do not invalidate any live checkout's captured access entitlement."""
+
+    # A direct provider attempt deliberately stays ``paid_processing`` after
+    # a successful sale.  It is then an idempotency/reconciliation record,
+    # not an open invoice.  Once the checkout has reached its fully delivered
+    # ``ready`` state, retaining that historical attempt must not permanently
+    # prevent an administrator from changing a tariff's future squad choice.
+    # Do *not* relax this for ``fulfilling`` / ``retry``: those still have a
+    # live provision path and therefore must keep the tariff fence.
+    fully_delivered_checkout = (
+        (SubscriptionCheckout.lifecycle_state == 'ready')
+        & (SubscriptionCheckout.funding_state == 'funded')
+        & (SubscriptionCheckout.fulfillment_state == 'fulfilled')
+        & (SubscriptionCheckout.provisioning_state == 'ready')
+    )
+    live_provider_attempt = exists(
+        select(CheckoutPaymentAttempt.id).where(
+            CheckoutPaymentAttempt.checkout_id == SubscriptionCheckout.id,
+            CheckoutPaymentAttempt.status.in_(_DIRECT_PROVIDER_ATTEMPT_OPEN_STATES),
+            ~fully_delivered_checkout,
+        )
+    )
+    approved_archive_checkout_ids = await _approved_final_erasure_archive_checkout_ids(db, tariff_id=tariff.id)
+    live_checkout_id = await db.scalar(
+        select(SubscriptionCheckout.id)
+        .where(
+            SubscriptionCheckout.tariff_id == tariff.id,
+            or_(
+                and_(
+                    SubscriptionCheckout.lifecycle_state.not_in(_CHECKOUT_TERMINAL_STATES),
+                    SubscriptionCheckout.id.not_in(approved_archive_checkout_ids),
+                ),
+                live_provider_attempt,
+            ),
+        )
+        .limit(1)
+    )
+    if live_checkout_id is not None:
+        raise ValueError(
+            'Cannot change Internal Squads while this tariff has a live checkout or Platega invoice. '
+            'Finish its safe reconciliation first.'
+        )
 
 
 def _normalize_period_prices(period_prices: dict[int, int] | None) -> dict[str, int]:
@@ -208,12 +540,26 @@ async def create_tariff(
     traffic_reset_mode: str | None = None,  # DAY, WEEK, MONTH, MONTH_ROLLING, NO_RESET, None = глобальная настройка
     # Внешний сквад RemnaWave
     external_squad_uuid: str | None = None,
+    # New tariffs use the upstream Internal Squad contract.  Legacy/AP modes
+    # remain readable compatibility states and are never created here.
+    entitlement_mode: str = 'native_squads',
 ) -> Tariff:
     """Создает новый тариф."""
+    if entitlement_mode != 'native_squads':
+        raise ValueError('new tariffs must use the native Internal Squad entitlement mode')
     if is_active or is_trial_available:
-        raise ValueError(
-            'A new tariff must remain an inactive non-trial draft until a validated entitlement policy exists'
+        from app.services.public_location_entitlement_service import (
+            EntitlementResolutionError,
+            assert_tariff_sellable,
         )
+
+        try:
+            await assert_tariff_sellable(
+                db,
+                SimpleNamespace(entitlement_mode='native_squads', allowed_squads=allowed_squads or []),
+            )
+        except EntitlementResolutionError as exc:
+            raise ValueError(f'tariff has no available Internal Squad selection: {exc}') from exc
     normalized_prices = _normalize_period_prices(period_prices)
     normalized_device_options = normalize_device_purchase_options(
         device_purchase_options,
@@ -233,6 +579,7 @@ async def create_tariff(
         max_device_limit=max_device_limit,
         device_purchase_options=normalized_device_options,
         allowed_squads=allowed_squads or [],
+        entitlement_mode=entitlement_mode,
         server_traffic_limits=server_traffic_limits or {},
         period_prices=normalized_prices,
         tier_level=max(1, tier_level),
@@ -332,15 +679,50 @@ async def update_tariff(
     external_squad_uuid: str | None = ...,  # ... = не передан, None = убрать внешний сквад
 ) -> Tariff:
     """Обновляет существующий тариф."""
+    # The direct checkout birth and provider-intent paths take this same
+    # tariff-row lock.  Keep it through the live-checkout query and the mode
+    # mutation so an AP invoice cannot be born between those two operations.
+    if allowed_squads is not None:
+        locked_tariff = await db.get(Tariff, tariff.id, with_for_update=True, populate_existing=True)
+        if locked_tariff is None:
+            raise ValueError('tariff no longer exists')
+        tariff = locked_tariff
+
+    selection_changed = allowed_squads is not None and _normalized_squad_selection(
+        allowed_squads
+    ) != _normalized_squad_selection(tariff.allowed_squads)
+    will_transition_to_native = allowed_squads is not None and tariff.entitlement_mode != 'native_squads'
+    if selection_changed or will_transition_to_native:
+        await _assert_tariff_squad_change_has_no_live_checkout(db, tariff)
+
     if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
         if is_daily is True:
             raise ValueError('access-point tariffs cannot be configured as daily')
         if is_trial_available is True:
             raise ValueError('access-point tariffs cannot be configured as trials')
-    if (is_active is True and not tariff.is_active) or (is_trial_available is True and not tariff.is_trial_available):
-        from app.services.public_location_entitlement_service import assert_tariff_sellable
+    activating_or_enabling_trial = (is_active is True and not tariff.is_active) or (
+        is_trial_available is True and not tariff.is_trial_available
+    )
+    if activating_or_enabling_trial or allowed_squads is not None:
+        from app.services.public_location_entitlement_service import (
+            EntitlementResolutionError,
+            assert_tariff_sellable,
+        )
 
-        await assert_tariff_sellable(db, tariff)
+        # When an administrator activates a historical tariff and selects
+        # native squads in the same request, evaluate that proposed state
+        # without mutating (or autoflushing) the persisted ORM object first.
+        candidate = (
+            SimpleNamespace(entitlement_mode='native_squads', allowed_squads=allowed_squads)
+            if allowed_squads is not None
+            else tariff
+        )
+        try:
+            await assert_tariff_sellable(db, candidate)
+        except EntitlementResolutionError as exc:
+            if allowed_squads is None:
+                raise
+            raise ValueError(f'tariff has no available Internal Squad selection: {exc}') from exc
     revision_before = (
         tariff.is_active,
         tariff.traffic_limit_gb,
@@ -381,6 +763,10 @@ async def update_tariff(
         )
     if allowed_squads is not None:
         tariff.allowed_squads = allowed_squads
+        # This is the explicit forward-only boundary from frozen historical
+        # manifests to the normal Bedolaga tariff editor.  Existing issued
+        # subscriptions retain their own connected_squads until propagation.
+        tariff.entitlement_mode = 'native_squads'
     if server_traffic_limits is not None:
         tariff.server_traffic_limits = server_traffic_limits
     if allow_traffic_topup is not None:

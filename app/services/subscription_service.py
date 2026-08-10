@@ -1264,6 +1264,8 @@ class SubscriptionService:
         if not squads_to_set:
             all_servers, _ = await get_all_server_squads(db, available_only=True, limit=10000)
             squads_to_set = [s.squad_uuid for s in all_servers if s.squad_uuid]
+        if not squads_to_set:
+            raise ValueError('tariff propagation requires at least one available Internal Squad')
 
         result = await db.execute(
             select(Subscription).where(
@@ -1276,9 +1278,9 @@ class SubscriptionService:
         if not subscriptions:
             return PropagateSquadsResult(total=0, synced=0)
 
+        previous_squads = {sub.id: list(sub.connected_squads or []) for sub in subscriptions}
         for sub in subscriptions:
             sub.connected_squads = squads_to_set
-        await db.commit()
 
         # Предзагружаем пользователей и тарифы — никаких DB-операций внутри gather
         user_ids = [sub.user_id for sub in subscriptions]
@@ -1383,7 +1385,11 @@ class SubscriptionService:
             if success:
                 synced += 1
             else:
-                failed_ids.append(subscriptions[i].id)
+                failed_subscription = subscriptions[i]
+                failed_ids.append(failed_subscription.id)
+                # Do not claim locally that a Panel change which failed was
+                # applied.  A later explicit retry reads this exact preimage.
+                failed_subscription.connected_squads = previous_squads[failed_subscription.id]
 
         # Один commit после всех API-вызовов
         try:

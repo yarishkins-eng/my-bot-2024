@@ -15,11 +15,13 @@ from hashlib import sha256
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.crud.server_squad import get_effective_tariff_squad_uuids
 from app.database.models import (
     PublicAccessPoint,
     PublicAccessPointSquadMapping,
     PublicLocation,
     PublicLocationSquadMapping,
+    Subscription,
     SubscriptionEntitlementSnapshot,
     SubscriptionEntitlementTerm,
     Tariff,
@@ -105,6 +107,23 @@ async def _legacy_snapshot(db: AsyncSession, tariff: Tariff) -> ResolvedEntitlem
     if not approved or current != approved:
         raise EntitlementResolutionError('legacy tariff UUIDs do not exactly match its approved manifest')
     return ResolvedEntitlement((), approved, int(tariff.location_policy_revision or 1), 'legacy_manifest')
+
+
+async def _native_squads(db: AsyncSession, tariff: Tariff) -> ResolvedEntitlement:
+    """Resolve the original Bedolaga tariff contract without AP evidence.
+
+    An empty list deliberately retains upstream semantics: all locally
+    available Internal Squads.  The caller must use an explicit list during a
+    country cutover; this fallback exists for old generic tariffs only.
+    """
+
+    try:
+        squads = await get_effective_tariff_squad_uuids(db, tariff.allowed_squads)
+    except ValueError as exc:
+        raise EntitlementResolutionError(str(exc)) from exc
+    if not squads:
+        raise EntitlementResolutionError('native tariff has no available Internal Squads')
+    return ResolvedEntitlement((), _dedupe(squads), 0, 'native_squads')
 
 
 async def _access_point_policy(
@@ -228,6 +247,8 @@ async def resolve_tariff_entitlement(
     # ``getattr`` keeps the error deterministic for malformed in-memory inputs
     # (including legacy test doubles) instead of leaking an AttributeError.
     mode = getattr(tariff, 'entitlement_mode', None) or 'legacy_snapshot'
+    if mode == 'native_squads':
+        return await _native_squads(db, tariff)
     if mode == 'no_locations':
         raise EntitlementResolutionError('this tariff has no sellable locations')
     if mode == 'legacy_snapshot':
@@ -314,8 +335,14 @@ async def persist_subscription_entitlement_snapshot(
     subscription_id: int,
     tariff_id: int | None,
     entitlement: ResolvedEntitlement,
-) -> SubscriptionEntitlementSnapshot:
+) -> SubscriptionEntitlementSnapshot | None:
     """Store first resolved evidence; updates deliberately fail closed."""
+
+    # Native tariff membership belongs to Subscription.connected_squads.  A
+    # second immutable snapshot would immediately conflict with the ordinary
+    # admin checkbox propagation that this mode intentionally restores.
+    if entitlement.provenance == 'native_squads':
+        return None
 
     existing = await db.scalar(
         select(SubscriptionEntitlementSnapshot).where(
@@ -432,6 +459,16 @@ async def get_subscription_resolved_entitlement(
     Read-only projection callers use ``get_effective...`` instead, which can
     safely fall back to this baseline for a pre-term historical subscription.
     """
+
+    subscription = await db.get(Subscription, subscription_id)
+    if subscription is None:
+        raise EntitlementResolutionError('subscription does not exist')
+    tariff = await db.get(Tariff, subscription.tariff_id) if subscription.tariff_id is not None else None
+    if getattr(tariff, 'entitlement_mode', None) == 'native_squads':
+        squads = _dedupe(subscription.connected_squads or [])
+        if not squads:
+            raise EntitlementResolutionError('native subscription has no assigned Internal Squads')
+        return ResolvedEntitlement((), squads, 0, 'native_squads')
 
     snapshot = await db.scalar(
         select(SubscriptionEntitlementSnapshot).where(

@@ -681,7 +681,11 @@ async def create_checkout(
     if period_days not in options['period_options'] or selected_device_limit not in options['device_options']:
         raise DeviceFirstError('invalid_selection', 'Unsupported period or device limit', status_code=422)
 
-    tariff = await db.get(Tariff, options['tariff']['id'])
+    # Share a tariff-row lock with the native-squad editor.  Thus either a
+    # checkout captures the pre-change AP entitlement first (and blocks the
+    # conversion), or the tariff conversion commits first and this checkout
+    # resolves the new native selection — never a mixed invoice.
+    tariff = await db.get(Tariff, options['tariff']['id'], with_for_update=True, populate_existing=True)
     if tariff is None:
         raise DeviceFirstError('tariff_missing', 'The selected tariff no longer exists', status_code=404)
     subscription = await _current_subscription(db, user.id)
@@ -694,10 +698,23 @@ async def create_checkout(
     )
     if int(selected['price_kopeks']) <= 0:
         raise DeviceFirstError('non_positive_quote', 'Free quotes use the legacy flow', status_code=422)
-    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+    from app.services.public_location_entitlement_service import (
+        EntitlementResolutionError,
+        get_subscription_resolved_entitlement,
+        resolve_tariff_entitlement,
+    )
 
     try:
-        quoted_entitlement = await resolve_tariff_entitlement(db, tariff, access_point_quote_context=True)
+        # A renewal keeps the currently issued squad set until an explicit
+        # admin propagation updates that subscription.  A brand-new sale (or
+        # a trial conversion) quotes the tariff's current native selection.
+        quoted_entitlement = (
+            await get_subscription_resolved_entitlement(db, subscription.id)
+            if subscription is not None
+            and not subscription.is_trial
+            and getattr(tariff, 'entitlement_mode', None) == 'native_squads'
+            else await resolve_tariff_entitlement(db, tariff, access_point_quote_context=True)
+        )
     except EntitlementResolutionError as error:
         # A point tariff with stale/unsafe evidence must fail before creating
         # even a disposable checkout.  This avoids an unpaid quote that could
@@ -1189,10 +1206,20 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         _event('conflict', checkout, reason=checkout.terminal_reason)
         return checkout
 
-    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+    from app.services.public_location_entitlement_service import (
+        EntitlementResolutionError,
+        get_subscription_resolved_entitlement,
+        resolve_tariff_entitlement,
+    )
 
     try:
-        entitlement = await resolve_tariff_entitlement(db, tariff)
+        entitlement = (
+            await get_subscription_resolved_entitlement(db, target.id)
+            if target is not None
+            and not target.is_trial
+            and getattr(tariff, 'entitlement_mode', None) == 'native_squads'
+            else await resolve_tariff_entitlement(db, tariff)
+        )
     except EntitlementResolutionError as error:
         checkout.lifecycle_state = 'conflict'
         checkout.terminal_reason = 'location_policy_not_sellable'
@@ -1438,7 +1465,11 @@ async def _validate_direct_pre_commit(
         checkout.terminal_reason = 'entitlement_quote_missing_or_invalid'
         await db.commit()
         return None
-    from app.services.public_location_entitlement_service import EntitlementResolutionError, resolve_tariff_entitlement
+    from app.services.public_location_entitlement_service import (
+        EntitlementResolutionError,
+        get_subscription_resolved_entitlement,
+        resolve_tariff_entitlement,
+    )
 
     try:
         # Quote finalisation locks the tariff and every selected AP evidence
@@ -1466,11 +1497,17 @@ async def _validate_direct_pre_commit(
             checkout.terminal_reason = 'price_changed'
             await db.commit()
             return None
-        current_entitlement = await resolve_tariff_entitlement(
-            db,
-            tariff,
-            access_point_quote_context=True,
-            lock_access_point_evidence=True,
+        current_entitlement = (
+            await get_subscription_resolved_entitlement(db, target.id)
+            if target is not None
+            and not target.is_trial
+            and getattr(tariff, 'entitlement_mode', None) == 'native_squads'
+            else await resolve_tariff_entitlement(
+                db,
+                tariff,
+                access_point_quote_context=True,
+                lock_access_point_evidence=True,
+            )
         )
     except EntitlementResolutionError:
         current_entitlement = None

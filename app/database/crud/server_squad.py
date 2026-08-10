@@ -1,6 +1,5 @@
 import random
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy import (
@@ -167,17 +166,19 @@ async def get_effective_tariff_squad_uuids(
     db: AsyncSession,
     allowed_squads: Sequence[str] | None,
 ) -> list[str]:
-    """Normalize an already-resolved technical squad set.
+    """Resolve a native tariff, treating an empty list as all available."""
 
-    This compatibility helper intentionally no longer interprets an empty
-    tariff list as "all available squads".  New tariff issuance must use the
-    PublicLocation resolver, which owns the business-to-technical mapping.
-    """
-
-    normalized = [str(squad_uuid) for squad_uuid in (allowed_squads or []) if squad_uuid]
+    available = await get_available_server_squads(db)
+    available_uuids = [str(squad.squad_uuid) for squad in available if squad.squad_uuid]
+    available_uuid_set = set(available_uuids)
+    normalized = list(dict.fromkeys(str(squad_uuid) for squad_uuid in (allowed_squads or []) if squad_uuid))
     if normalized:
-        return list(dict.fromkeys(normalized))
-    raise ValueError('empty tariff squad list is not an entitlement; use PublicLocation resolver')
+        unavailable = sorted(set(normalized) - available_uuid_set)
+        if unavailable:
+            raise ValueError('tariff references unavailable Internal Squads')
+        return normalized
+
+    return available_uuids
 
 
 async def get_active_server_squads(db: AsyncSession) -> list[ServerSquad]:
@@ -342,11 +343,47 @@ async def sync_with_remnawave(db: AsyncSession, remnawave_squads: list[dict]) ->
             )
             created += 1
 
-    # Protect external squads referenced by tariffs from being removed during sync
+    # A panel catalog refresh is informational: it must never silently rewrite
+    # an offer or an issued entitlement.  In particular, a native tariff with
+    # one vanished UUID must stay an explicit, fail-closed selection — deleting
+    # that UUID would turn it into [] ("all available squads").
+    #
+    # Keep every locally referenced squad as an unavailable tombstone until an
+    # administrator deliberately changes the tariff or migrates a subscriber.
+    # That also prevents database/Panel divergence from local-only cleanup.
     tariff_ext_uuids_result = await db.execute(
         select(Tariff.external_squad_uuid).where(Tariff.external_squad_uuid.isnot(None))
     )
     protected_uuids = {row[0] for row in tariff_ext_uuids_result.fetchall()}
+
+    tariff_squads_result = await db.execute(select(Tariff.allowed_squads))
+    for allowed_squads in tariff_squads_result.scalars().all():
+        protected_uuids.update(str(squad_uuid) for squad_uuid in (allowed_squads or []) if squad_uuid)
+
+    subscription_squads_result = await db.execute(select(Subscription.connected_squads))
+    for connected_squads in subscription_squads_result.scalars().all():
+        protected_uuids.update(str(squad_uuid) for squad_uuid in (connected_squads or []) if squad_uuid)
+
+    linked_server_ids_result = await db.execute(select(SubscriptionServer.server_squad_id))
+    linked_server_ids = {row[0] for row in linked_server_ids_result.fetchall()}
+    protected_uuids.update(
+        server.squad_uuid
+        for server in existing_servers.values()
+        if server.id in linked_server_ids and server.squad_uuid
+    )
+
+    retained_servers = [
+        server for uuid, server in existing_servers.items() if uuid not in remnawave_uuids and uuid in protected_uuids
+    ]
+    for server in retained_servers:
+        if server.is_available:
+            server.is_available = False
+            updated += 1
+        logger.warning(
+            'Panel squad disappeared but is retained as unavailable because it is still referenced',
+            squad_uuid=server.squad_uuid,
+            display_name=server.display_name,
+        )
 
     removed_servers = [
         server
@@ -356,78 +393,14 @@ async def sync_with_remnawave(db: AsyncSession, remnawave_squads: list[dict]) ->
 
     if removed_servers:
         removed_ids = [server.id for server in removed_servers]
-        removed_uuids = {server.squad_uuid for server in removed_servers}
-
-        subscription_ids_result = await db.execute(
-            select(SubscriptionServer.subscription_id).where(SubscriptionServer.server_squad_id.in_(removed_ids))
-        )
-        subscription_ids = {row[0] for row in subscription_ids_result.fetchall()}
 
         for server in removed_servers:
             logger.info('🗑️ Удаляется сервер', display_name=server.display_name, squad_uuid=server.squad_uuid)
 
         await db.execute(delete(SubscriptionServer).where(SubscriptionServer.server_squad_id.in_(removed_ids)))
 
-        subscriptions_to_update: dict[int, Subscription] = {}
-
-        if subscription_ids:
-            subscriptions_result = await db.execute(select(Subscription).where(Subscription.id.in_(subscription_ids)))
-            for subscription in subscriptions_result.scalars().unique().all():
-                subscriptions_to_update[subscription.id] = subscription
-
-        for squad_uuid in removed_uuids:
-            if not squad_uuid:
-                continue
-
-            extra_result = await db.execute(
-                select(Subscription).where(text('connected_squads::text LIKE :uuid_pattern')),
-                {'uuid_pattern': f'%"{squad_uuid}"%'},
-            )
-
-            for subscription in extra_result.scalars().unique().all():
-                subscriptions_to_update[subscription.id] = subscription
-
-        cleaned_subscriptions = 0
-
-        for subscription in subscriptions_to_update.values():
-            current_squads = list(subscription.connected_squads or [])
-            if not current_squads:
-                continue
-
-            filtered_squads = [squad_uuid for squad_uuid in current_squads if squad_uuid not in removed_uuids]
-
-            if len(filtered_squads) != len(current_squads):
-                subscription.connected_squads = filtered_squads
-                subscription.updated_at = datetime.now(UTC)
-                cleaned_subscriptions += 1
-
-        # Clean up stale UUIDs from tariff allowed_squads
-        cleaned_tariffs = 0
-        tariffs_result = await db.execute(select(Tariff))
-        for tariff in tariffs_result.scalars().all():
-            current = list(tariff.allowed_squads or [])
-            if not current:
-                continue
-            filtered = [u for u in current if u not in removed_uuids]
-            if len(filtered) != len(current):
-                tariff.allowed_squads = filtered
-                tariff.updated_at = datetime.now(UTC)
-                cleaned_tariffs += 1
-                logger.info(
-                    '🧹 Тариф "%s" (ID: %s): удалены несуществующие сквады %s',
-                    tariff.name,
-                    tariff.id,
-                    [u for u in current if u in removed_uuids],
-                )
-
         await db.execute(delete(ServerSquad).where(ServerSquad.id.in_(removed_ids)))
         removed = len(removed_servers)
-
-        if cleaned_subscriptions:
-            logger.info('🧹 Обновлены подписки после удаления серверов', cleaned_subscriptions=cleaned_subscriptions)
-
-        if cleaned_tariffs:
-            logger.info('🧹 Обновлены тарифы после удаления серверов', cleaned_tariffs=cleaned_tariffs)
 
     await db.commit()
 

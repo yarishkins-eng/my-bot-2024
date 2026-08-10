@@ -1667,6 +1667,13 @@ class Tariff(Base):
     """Тарифный план для режима продаж 'Тарифы'."""
 
     __tablename__ = 'tariffs'
+    __table_args__ = (
+        CheckConstraint(
+            "entitlement_mode IN ('legacy_snapshot', 'location_managed', 'no_locations', "
+            "'access_point_managed', 'native_squads')",
+            name='ck_tariffs_entitlement_mode',
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 
