@@ -2322,7 +2322,9 @@ async def start_edit_tariff_squads(
             ]
         )
 
-    buttons.append([InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}')])
+    buttons.append(
+        [InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}')]
+    )
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
 
     selected_count = len(current_squads)
@@ -2330,7 +2332,11 @@ async def start_edit_tariff_squads(
     await callback.message.edit_text(
         f'🌐 <b>Серверы для тарифа «{html.escape(tariff.name)}»</b>\n\n'
         f'Выбрано: {selected_count} из {len(squads)}\n\n'
-        + ('⚠️ В тарифе есть недоступный прежний сервер. Следующее сохранение заменит его выбранными здесь серверами.\n\n' if stale_squads else '')
+        + (
+            '⚠️ В тарифе есть недоступный прежний сервер. Следующее сохранение заменит его выбранными здесь серверами.\n\n'
+            if stale_squads
+            else ''
+        )
         + 'Выберите хотя бы один сервер. Пустой список заблокирован.\n'
         'Нажмите на сервер для выбора/отмены:',
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
@@ -2396,7 +2402,9 @@ async def toggle_tariff_squad(
             ]
         )
 
-    buttons.append([InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}')])
+    buttons.append(
+        [InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}')]
+    )
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
 
     try:
@@ -2485,7 +2493,9 @@ async def select_all_tariff_squads(
             ]
         )
 
-    buttons.append([InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}')])
+    buttons.append(
+        [InlineKeyboardButton(text='✅ Выбрать все', callback_data=f'admin_tariff_select_all_squads:{tariff_id}')]
+    )
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
 
     try:

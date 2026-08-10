@@ -367,13 +367,13 @@ async def sync_with_remnawave(db: AsyncSession, remnawave_squads: list[dict]) ->
     linked_server_ids_result = await db.execute(select(SubscriptionServer.server_squad_id))
     linked_server_ids = {row[0] for row in linked_server_ids_result.fetchall()}
     protected_uuids.update(
-        server.squad_uuid for server in existing_servers.values() if server.id in linked_server_ids and server.squad_uuid
+        server.squad_uuid
+        for server in existing_servers.values()
+        if server.id in linked_server_ids and server.squad_uuid
     )
 
     retained_servers = [
-        server
-        for uuid, server in existing_servers.items()
-        if uuid not in remnawave_uuids and uuid in protected_uuids
+        server for uuid, server in existing_servers.items() if uuid not in remnawave_uuids and uuid in protected_uuids
     ]
     for server in retained_servers:
         if server.is_available:
