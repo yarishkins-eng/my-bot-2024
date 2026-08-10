@@ -1,13 +1,57 @@
+from types import SimpleNamespace
+
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.database.models import PromoGroup, Subscription, SubscriptionStatus, Tariff
+from app.database.models import (
+    CheckoutPaymentAttempt,
+    PromoGroup,
+    Subscription,
+    SubscriptionCheckout,
+    SubscriptionStatus,
+    Tariff,
+)
 from app.services.device_first_eligibility import normalize_device_purchase_options
 
 
 logger = structlog.get_logger(__name__)
+
+
+_CHECKOUT_TERMINAL_STATES = ('ready', 'cancelled', 'expired')
+_DIRECT_PROVIDER_ATTEMPT_OPEN_STATES = ('creating', 'pending', 'paid_processing')
+
+
+def _normalized_squad_selection(values: list[str] | None) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(value) for value in (values or []) if value))
+
+
+async def _assert_tariff_squad_change_has_no_live_checkout(db: AsyncSession, tariff: Tariff) -> None:
+    """Do not invalidate any live checkout's captured access entitlement."""
+
+    live_provider_attempt = exists(
+        select(CheckoutPaymentAttempt.id).where(
+            CheckoutPaymentAttempt.checkout_id == SubscriptionCheckout.id,
+            CheckoutPaymentAttempt.status.in_(_DIRECT_PROVIDER_ATTEMPT_OPEN_STATES),
+        )
+    )
+    live_checkout_id = await db.scalar(
+        select(SubscriptionCheckout.id)
+        .where(
+            SubscriptionCheckout.tariff_id == tariff.id,
+            or_(
+                SubscriptionCheckout.lifecycle_state.not_in(_CHECKOUT_TERMINAL_STATES),
+                live_provider_attempt,
+            ),
+        )
+        .limit(1)
+    )
+    if live_checkout_id is not None:
+        raise ValueError(
+            'Cannot change Internal Squads while this tariff has a live checkout or Platega invoice. '
+            'Finish its safe reconciliation first.'
+        )
 
 
 def _normalize_period_prices(period_prices: dict[int, int] | None) -> dict[str, int]:
@@ -208,12 +252,26 @@ async def create_tariff(
     traffic_reset_mode: str | None = None,  # DAY, WEEK, MONTH, MONTH_ROLLING, NO_RESET, None = глобальная настройка
     # Внешний сквад RemnaWave
     external_squad_uuid: str | None = None,
+    # New tariffs use the upstream Internal Squad contract.  Legacy/AP modes
+    # remain readable compatibility states and are never created here.
+    entitlement_mode: str = 'native_squads',
 ) -> Tariff:
     """Создает новый тариф."""
+    if entitlement_mode != 'native_squads':
+        raise ValueError('new tariffs must use the native Internal Squad entitlement mode')
     if is_active or is_trial_available:
-        raise ValueError(
-            'A new tariff must remain an inactive non-trial draft until a validated entitlement policy exists'
+        from app.services.public_location_entitlement_service import (
+            EntitlementResolutionError,
+            assert_tariff_sellable,
         )
+
+        try:
+            await assert_tariff_sellable(
+                db,
+                SimpleNamespace(entitlement_mode='native_squads', allowed_squads=allowed_squads or []),
+            )
+        except EntitlementResolutionError as exc:
+            raise ValueError(f'tariff has no available Internal Squad selection: {exc}') from exc
     normalized_prices = _normalize_period_prices(period_prices)
     normalized_device_options = normalize_device_purchase_options(
         device_purchase_options,
@@ -233,6 +291,7 @@ async def create_tariff(
         max_device_limit=max_device_limit,
         device_purchase_options=normalized_device_options,
         allowed_squads=allowed_squads or [],
+        entitlement_mode=entitlement_mode,
         server_traffic_limits=server_traffic_limits or {},
         period_prices=normalized_prices,
         tier_level=max(1, tier_level),
@@ -332,15 +391,50 @@ async def update_tariff(
     external_squad_uuid: str | None = ...,  # ... = не передан, None = убрать внешний сквад
 ) -> Tariff:
     """Обновляет существующий тариф."""
+    # The direct checkout birth and provider-intent paths take this same
+    # tariff-row lock.  Keep it through the live-checkout query and the mode
+    # mutation so an AP invoice cannot be born between those two operations.
+    if allowed_squads is not None:
+        locked_tariff = await db.get(Tariff, tariff.id, with_for_update=True, populate_existing=True)
+        if locked_tariff is None:
+            raise ValueError('tariff no longer exists')
+        tariff = locked_tariff
+
+    selection_changed = allowed_squads is not None and _normalized_squad_selection(allowed_squads) != _normalized_squad_selection(
+        tariff.allowed_squads
+    )
+    will_transition_to_native = allowed_squads is not None and tariff.entitlement_mode != 'native_squads'
+    if selection_changed or will_transition_to_native:
+        await _assert_tariff_squad_change_has_no_live_checkout(db, tariff)
+
     if getattr(tariff, 'entitlement_mode', None) == 'access_point_managed':
         if is_daily is True:
             raise ValueError('access-point tariffs cannot be configured as daily')
         if is_trial_available is True:
             raise ValueError('access-point tariffs cannot be configured as trials')
-    if (is_active is True and not tariff.is_active) or (is_trial_available is True and not tariff.is_trial_available):
-        from app.services.public_location_entitlement_service import assert_tariff_sellable
+    activating_or_enabling_trial = (is_active is True and not tariff.is_active) or (
+        is_trial_available is True and not tariff.is_trial_available
+    )
+    if activating_or_enabling_trial or allowed_squads is not None:
+        from app.services.public_location_entitlement_service import (
+            EntitlementResolutionError,
+            assert_tariff_sellable,
+        )
 
-        await assert_tariff_sellable(db, tariff)
+        # When an administrator activates a historical tariff and selects
+        # native squads in the same request, evaluate that proposed state
+        # without mutating (or autoflushing) the persisted ORM object first.
+        candidate = (
+            SimpleNamespace(entitlement_mode='native_squads', allowed_squads=allowed_squads)
+            if allowed_squads is not None
+            else tariff
+        )
+        try:
+            await assert_tariff_sellable(db, candidate)
+        except EntitlementResolutionError as exc:
+            if allowed_squads is None:
+                raise
+            raise ValueError(f'tariff has no available Internal Squad selection: {exc}') from exc
     revision_before = (
         tariff.is_active,
         tariff.traffic_limit_gb,
@@ -381,6 +475,10 @@ async def update_tariff(
         )
     if allowed_squads is not None:
         tariff.allowed_squads = allowed_squads
+        # This is the explicit forward-only boundary from frozen historical
+        # manifests to the normal Bedolaga tariff editor.  Existing issued
+        # subscriptions retain their own connected_squads until propagation.
+        tariff.entitlement_mode = 'native_squads'
     if server_traffic_limits is not None:
         tariff.server_traffic_limits = server_traffic_limits
     if allow_traffic_topup is not None:

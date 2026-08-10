@@ -989,6 +989,7 @@ async def test_fused_birth_carries_a_thirty_minute_quote_expiry_and_confirmed_bi
     assert checkout.expires_at > checkout.quote_expires_at
     assert checkout.entitlement_quote_snapshot['entitlement']['location_ids'] == ['point-1']
     assert checkout.entitlement_quote_snapshot['entitlement_hash']
+    db.get.assert_awaited_once_with(service.Tariff, 7, with_for_update=True, populate_existing=True)
 
 
 @pytest.mark.asyncio

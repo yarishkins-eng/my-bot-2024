@@ -1,14 +1,10 @@
 """Admin routes for managing tariffs in cabinet."""
 
-import asyncio
-
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload
 
-from app.config import settings
 from app.database.crud.server_squad import get_all_server_squads
 from app.database.crud.tariff import (
     create_tariff,
@@ -21,16 +17,14 @@ from app.database.crud.tariff import (
     set_tariff_promo_groups,
     update_tariff,
 )
-from app.database.models import PromoGroup, Subscription, SubscriptionStatus, Tariff, Transaction, TransactionType, User
+from app.database.models import PromoGroup, Subscription, Tariff, Transaction, TransactionType, User
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.tariffs import (
-    ExternalSquadInfoResponse,
     PeriodPrice,
     PromoGroupInfo,
     ServerInfo,
     ServerTrafficLimit,
-    SyncSquadsResponse,
     TariffCreateRequest,
     TariffDetailResponse,
     TariffListItem,
@@ -66,7 +60,7 @@ async def _get_tariff_servers(
     db: AsyncSession, allowed_squads: list[str], server_traffic_limits: dict = None
 ) -> list[ServerInfo]:
     """Get server info for tariff."""
-    servers, _ = await get_all_server_squads(db, available_only=False)
+    servers, _ = await get_all_server_squads(db, available_only=True)
     limits = server_traffic_limits or {}
     result = []
     for server in servers:
@@ -165,21 +159,30 @@ async def get_available_servers(
     admin: User = Depends(require_permission('tariffs:read')),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Hard-close raw Internal Squad discovery for the tariff editor."""
-    raise HTTPException(
-        status_code=status.HTTP_410_GONE,
-        detail='Raw Squad catalog is retired; use the access-point catalog.',
-    )
+    """Get Internal Squads for the native tariff checkbox editor."""
+    # A tariff must never advertise an Internal Squad that the backend will
+    # reject during issuance or propagation.
+    servers, _ = await get_all_server_squads(db, available_only=True, limit=1000)
+    return [
+        ServerInfo(
+            id=server.id,
+            squad_uuid=server.squad_uuid,
+            display_name=server.display_name,
+            country_code=server.country_code,
+            is_selected=False,
+        )
+        for server in servers
+    ]
 
 
-@router.get('/available-external-squads', response_model=list[ExternalSquadInfoResponse])
+@router.get('/available-external-squads', status_code=status.HTTP_410_GONE)
 async def get_available_external_squads(
     admin: User = Depends(require_permission('tariffs:read')),
 ):
-    """Retire raw RemnaWave selection from the normal tariff editor."""
+    """External Squad management is intentionally outside the native-node rollout."""
     raise HTTPException(
         status_code=status.HTTP_410_GONE,
-        detail='Raw external Squad selection is retired; use the audited privileged control.',
+        detail='External Squad management is not available in the native tariff editor.',
     )
 
 
@@ -212,11 +215,9 @@ async def get_tariff(
             detail='Tariff not found',
         )
 
-    # Normal tariff-management responses are business-only.  Raw UUIDs stay
-    # server-side for legacy reconciliation and are never returned to React.
-    allowed_squads: list[str] = []
-    server_traffic_limits: dict = {}
-    servers: list[ServerInfo] = []
+    allowed_squads = tariff.allowed_squads or []
+    server_traffic_limits = tariff.server_traffic_limits or {}
+    servers = await _get_tariff_servers(db, allowed_squads, server_traffic_limits)
     promo_groups = await _get_tariff_promo_groups(db, tariff)
     subs_count = await get_tariff_subscriptions_count(db, tariff.id)
 
@@ -268,7 +269,7 @@ async def get_tariff(
         # Режим сброса трафика
         traffic_reset_mode=tariff.traffic_reset_mode,
         # Внешний сквад
-        external_squad_uuid=None,
+        external_squad_uuid=tariff.external_squad_uuid,
         # Показывать в подарках
         show_in_gift=tariff.show_in_gift,
         created_at=tariff.created_at,
@@ -283,15 +284,10 @@ async def create_new_tariff(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Create a new tariff."""
-    if request.allowed_squads is not None or request.external_squad_uuid is not None or request.server_traffic_limits:
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail='Raw Squad tariff mutation is retired; assign PublicLocations after creating an inactive tariff.',
-        )
-    if request.is_active:
+    if 'external_squad_uuid' in request.model_fields_set:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail='A tariff must be created inactive until a validated entitlement policy is attached.',
+            detail='External Squad changes are outside the native Internal Squad rollout.',
         )
     period_prices_dict = _period_prices_to_dict(request.period_prices)
 
@@ -307,7 +303,7 @@ async def create_new_tariff(
             db=db,
             name=request.name,
             description=request.description,
-            is_active=False,
+            is_active=request.is_active,
             allow_traffic_topup=request.allow_traffic_topup,
             traffic_topup_enabled=request.traffic_topup_enabled,
             traffic_topup_packages=request.traffic_topup_packages,
@@ -319,7 +315,7 @@ async def create_new_tariff(
             device_purchase_options=request.device_purchase_options,
             tier_level=request.tier_level,
             period_prices=period_prices_dict,
-            allowed_squads=[],
+            allowed_squads=request.allowed_squads,
             server_traffic_limits=server_limits_dict,
             promo_group_ids=request.promo_group_ids or None,
             # Произвольное количество дней
@@ -337,21 +333,13 @@ async def create_new_tariff(
             daily_price_kopeks=request.daily_price_kopeks,
             # Режим сброса трафика
             traffic_reset_mode=request.traffic_reset_mode,
-            # Внешний сквад
+            # External Squad mutation is deliberately not part of this rollout.
             external_squad_uuid=None,
             # Показывать в подарках
             show_in_gift=request.show_in_gift,
         )
     except ValueError as error:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
-
-    # New tariffs are explicit non-sellable drafts.  The access-point policy
-    # endpoint is the only path that may transition this to a future-issuance
-    # policy; ordinary create never inherits []/NULL = all semantics.
-    tariff.entitlement_mode = 'no_locations'
-    tariff.access_point_policy_revision = 0
-    await db.commit()
-    await db.refresh(tariff)
 
     logger.info('Admin created tariff', admin_id=admin.id, tariff_id=tariff.id, tariff_name=tariff.name)
 
@@ -370,14 +358,10 @@ async def update_existing_tariff(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Update an existing tariff."""
-    if (
-        'allowed_squads' in request.model_fields_set
-        or 'external_squad_uuid' in request.model_fields_set
-        or 'server_traffic_limits' in request.model_fields_set
-    ):
+    if 'external_squad_uuid' in request.model_fields_set:
         raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail='Raw Squad tariff mutation is retired; use the PublicLocation policy endpoint.',
+            status_code=status.HTTP_409_CONFLICT,
+            detail='External Squad changes are outside the native Internal Squad rollout.',
         )
     tariff = await get_tariff_by_id(db, tariff_id)
     if not tariff:
@@ -386,13 +370,8 @@ async def update_existing_tariff(
             detail='Tariff not found',
         )
 
-    if request.is_active is True and not tariff.is_active:
-        await _ensure_tariff_sellable(db, tariff)
-
     # Capture old values for change detection
     old_squads = list(tariff.allowed_squads) if tariff.allowed_squads else []
-    old_external_squad = tariff.external_squad_uuid
-
     # Build updates dict
     updates = {}
     if request.name is not None:
@@ -458,9 +437,6 @@ async def update_existing_tariff(
     # Режим сброса трафика (None допускается как значение для сброса к глобальной настройке)
     if 'traffic_reset_mode' in request.model_fields_set:
         updates['traffic_reset_mode'] = request.traffic_reset_mode
-    # Внешний сквад (None допускается для сброса)
-    if 'external_squad_uuid' in request.model_fields_set:
-        updates['external_squad_uuid'] = request.external_squad_uuid
     # Показывать в подарках
     if request.show_in_gift is not None:
         updates['show_in_gift'] = request.show_in_gift
@@ -480,16 +456,16 @@ async def update_existing_tariff(
     # Перезагружаем периоды из БД для синхронизации с ботом
     await load_period_prices_from_db(db)
 
-    # Auto-sync squads to active subscriptions in Remnawave when squads changed
+    # Native membership is propagated only by the explicit, auditable endpoint
+    # below.  A fire-and-forget task could leave a tariff changed locally while
+    # silently failing to change a paying user's Panel access.
     new_squads = tariff.allowed_squads or []
     squads_changed = request.allowed_squads is not None and sorted(old_squads) != sorted(new_squads)
-    ext_squad_changed = (
-        'external_squad_uuid' in request.model_fields_set and tariff.external_squad_uuid != old_external_squad
-    )
-    if squads_changed or ext_squad_changed:
-        asyncio.create_task(
-            _background_sync_squads(tariff_id, admin.id),
-            name=f'sync-squads-tariff-{tariff_id}',
+    if squads_changed:
+        logger.info(
+            'Native tariff squads saved; explicit sync is required before existing subscriptions change',
+            admin_id=admin.id,
+            tariff_id=tariff_id,
         )
 
     return await get_tariff(tariff_id, admin, db)
@@ -656,243 +632,4 @@ async def get_tariff_stats(
         trial_subscriptions=trial_count,
         revenue_kopeks=revenue_kopeks,
         revenue_rubles=revenue_kopeks / 100,
-    )
-
-
-async def _background_sync_squads(tariff_id: int, admin_id: int) -> None:
-    """Run squad sync in background with its own DB session (fire-and-forget)."""
-    raise RuntimeError('Tariff save must never execute a Panel squad sync; use a separately released plan executor.')
-
-    # Kept unreachable only for short-term source-history audit.  A production
-    # route/worker has no reference to this body and cannot turn it on by flag.
-    from app.database.database import AsyncSessionLocal
-    from app.services.remnawave_service import RemnaWaveService
-
-    try:
-        async with AsyncSessionLocal() as db:
-            tariff = await get_tariff_by_id(db, tariff_id)
-            if not tariff:
-                return
-
-            result = await db.execute(
-                select(Subscription)
-                .join(User, Subscription.user_id == User.id)
-                .options(joinedload(Subscription.user))
-                .where(
-                    and_(
-                        Subscription.tariff_id == tariff_id,
-                        Subscription.status.in_([SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value]),
-                        User.remnawave_uuid.isnot(None),
-                    )
-                )
-            )
-            subscriptions = list(result.unique().scalars().all())
-
-            if not subscriptions:
-                return
-
-            new_squads = tariff.allowed_squads or []
-            ext_squad_uuid = tariff.external_squad_uuid
-
-            service = RemnaWaveService()
-            updated = 0
-            failed = 0
-
-            async with service.get_api_client() as api:
-                semaphore = asyncio.Semaphore(5)
-
-                async def _sync_one(sub: Subscription) -> None:
-                    nonlocal updated, failed
-                    remnawave_uuid = (
-                        getattr(sub, 'remnawave_uuid', None)
-                        if settings.is_multi_tariff_enabled()
-                        else (sub.user.remnawave_uuid if sub.user else None)
-                    )
-                    if not remnawave_uuid:
-                        return
-                    async with semaphore:
-                        try:
-                            await api.update_user(
-                                uuid=remnawave_uuid,
-                                active_internal_squads=new_squads,
-                                external_squad_uuid=ext_squad_uuid,
-                            )
-                            sub.connected_squads = new_squads
-                            updated += 1
-                        except Exception as e:
-                            failed += 1
-                            logger.warning(
-                                'Background sync: failed to sync squads for user',
-                                user_id=sub.user_id,
-                                error=str(e),
-                            )
-
-                await asyncio.gather(*[_sync_one(sub) for sub in subscriptions])
-
-            await db.commit()
-            logger.info(
-                'Background squad sync completed after tariff update',
-                admin_id=admin_id,
-                tariff_id=tariff_id,
-                tariff_name=tariff.name,
-                total=len(subscriptions),
-                updated=updated,
-                failed=failed,
-            )
-    except Exception:
-        logger.exception('Background squad sync failed', tariff_id=tariff_id)
-
-
-_SYNC_SQUADS_CONCURRENCY = 5
-_SYNC_SQUADS_MAX_CONSECUTIVE_FAILURES = 10
-
-
-@router.post('/{tariff_id}/sync-squads', response_model=SyncSquadsResponse)
-async def sync_tariff_squads(
-    tariff_id: int,
-    admin: User = Depends(require_permission('tariffs:edit')),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Retired fire-and-forget sync; execution needs a confirmed entitlement plan.
-
-    Updates connected_squads and external_squad_uuid for every active or trial
-    subscription linked to this tariff.  Only users that have a remnawave_uuid
-    (i.e. already exist in the panel) are touched.
-    """
-    raise HTTPException(
-        status_code=status.HTTP_410_GONE,
-        detail='Mass squad sync is retired; prepare and confirm an entitlement plan instead.',
-    )
-
-
-async def _retired_sync_tariff_squads(
-    tariff_id: int,
-    admin: User,
-    db: AsyncSession,
-) -> SyncSquadsResponse:
-    raise RuntimeError('Tariff mass squad execution is retired and cannot be invoked from this release.')
-
-    tariff = await get_tariff_by_id(db, tariff_id)
-    if not tariff:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail='Tariff not found',
-        )
-
-    # Fetch active + trial subscriptions for this tariff whose users exist in Remnawave
-    result = await db.execute(
-        select(Subscription)
-        .join(User, Subscription.user_id == User.id)
-        .options(joinedload(Subscription.user))
-        .where(
-            and_(
-                Subscription.tariff_id == tariff_id,
-                Subscription.status.in_([SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value]),
-                User.remnawave_uuid.isnot(None),
-            )
-        )
-    )
-    subscriptions = list(result.unique().scalars().all())
-
-    if not subscriptions:
-        return SyncSquadsResponse(
-            tariff_id=tariff_id,
-            tariff_name=tariff.name,
-            total_subscriptions=0,
-            updated_count=0,
-            failed_count=0,
-            skipped_count=0,
-        )
-
-    new_squads = tariff.allowed_squads or []
-    # None means "clear external squad" — intentional when tariff has none
-    ext_squad_uuid = tariff.external_squad_uuid
-
-    # Sync to Remnawave panel with concurrency limit and circuit breaker
-    from app.services.remnawave_service import RemnaWaveService
-
-    service = RemnaWaveService()
-    updated_count = 0
-    failed_count = 0
-    skipped_count = 0
-    consecutive_failures = 0
-    errors: list[str] = []
-    aborted = False
-
-    async with service.get_api_client() as api:
-        semaphore = asyncio.Semaphore(_SYNC_SQUADS_CONCURRENCY)
-
-        async def _sync_one(sub: Subscription) -> str:
-            # Counter mutations are safe: no `await` between read-modify-write
-            # and the check within each branch (single-threaded asyncio event loop).
-            nonlocal updated_count, failed_count, skipped_count, consecutive_failures, aborted
-
-            if aborted:
-                skipped_count += 1
-                return 'skipped'
-
-            remnawave_uuid = (
-                getattr(sub, 'remnawave_uuid', None)
-                if settings.is_multi_tariff_enabled()
-                else (sub.user.remnawave_uuid if sub.user else None)
-            )
-            if not remnawave_uuid:
-                skipped_count += 1
-                return 'skipped'
-
-            async with semaphore:
-                if aborted:
-                    skipped_count += 1
-                    return 'skipped'
-
-                try:
-                    await api.update_user(
-                        uuid=remnawave_uuid,
-                        active_internal_squads=new_squads,
-                        external_squad_uuid=ext_squad_uuid,
-                    )
-                    # Update local DB only on successful API call
-                    sub.connected_squads = new_squads
-                    updated_count += 1
-                    consecutive_failures = 0
-                    return 'ok'
-                except Exception as e:
-                    failed_count += 1
-                    consecutive_failures += 1
-                    errors.append(f'user_id={sub.user_id}: sync failed')
-                    logger.warning(
-                        'Failed to sync squads for user in Remnawave',
-                        user_id=sub.user_id,
-                        remnawave_uuid=remnawave_uuid,
-                        error=str(e),
-                    )
-                    if consecutive_failures >= _SYNC_SQUADS_MAX_CONSECUTIVE_FAILURES:
-                        aborted = True
-                        errors.append(f'Aborted after {_SYNC_SQUADS_MAX_CONSECUTIVE_FAILURES} consecutive failures')
-                    return 'error'
-
-        await asyncio.gather(*[_sync_one(sub) for sub in subscriptions])
-
-    # Commit local DB changes only for successfully synced subscriptions
-    await db.commit()
-
-    logger.info(
-        'Admin synced squads for tariff',
-        admin_id=admin.id,
-        tariff_id=tariff_id,
-        tariff_name=tariff.name,
-        total=len(subscriptions),
-        updated=updated_count,
-        failed=failed_count,
-        skipped=skipped_count,
-    )
-
-    return SyncSquadsResponse(
-        tariff_id=tariff_id,
-        tariff_name=tariff.name,
-        total_subscriptions=len(subscriptions),
-        updated_count=updated_count,
-        failed_count=failed_count,
-        skipped_count=skipped_count,
-        errors=errors[:20],
     )

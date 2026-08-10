@@ -123,7 +123,10 @@ async def test_access_point_snapshot_rebuilds_its_inventory_fingerprint() -> Non
         inventory_fingerprint=original.inventory_fingerprint,
         snapshot_hash=original.snapshot_hash,
     )
-    db = SimpleNamespace(scalar=AsyncMock(return_value=snapshot))
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(tariff_id=None)),
+        scalar=AsyncMock(return_value=snapshot),
+    )
 
     rebuilt = await get_subscription_resolved_entitlement(db, 12, allow_access_point_baseline=True)
 
@@ -201,7 +204,10 @@ async def test_effective_reader_ignores_a_future_access_point_term_until_its_bou
     )
     # Before boundary: no effective term then 0100 baseline. At boundary: the
     # exact captured future grant replaces it without consulting tariff policy.
-    db = SimpleNamespace(scalar=AsyncMock(side_effect=[None, snapshot, term]))
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(tariff_id=None)),
+        scalar=AsyncMock(side_effect=[None, snapshot, term]),
+    )
 
     before_boundary = await get_effective_subscription_resolved_entitlement(
         db,
@@ -230,7 +236,10 @@ async def test_access_point_baseline_is_not_a_runtime_fallback_outside_a_paid_te
         inventory_fingerprint=baseline.inventory_fingerprint,
         snapshot_hash=baseline.snapshot_hash,
     )
-    db = SimpleNamespace(scalar=AsyncMock(side_effect=[None, snapshot]))
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(tariff_id=None)),
+        scalar=AsyncMock(side_effect=[None, snapshot]),
+    )
 
     with pytest.raises(EntitlementResolutionError, match='direct immutable checkout quote'):
         await get_effective_subscription_resolved_entitlement(db, 12)
@@ -631,13 +640,12 @@ async def test_unversioned_legacy_cart_is_fenced_before_database_or_money():
 
 
 @pytest.mark.asyncio
-async def test_telegram_admin_raw_squad_callbacks_are_fenced_before_database_effect():
+async def test_telegram_admin_legacy_callbacks_remain_fenced_before_database_effect():
     callback = SimpleNamespace(answer=AsyncMock())
     db = SimpleNamespace(commit=AsyncMock(), execute=AsyncMock())
     db_user = SimpleNamespace()
 
     # Unwrap auth/error decorators to exercise the first line of each handler.
-    raw_tariff_toggle = telegram_admin_tariffs.toggle_tariff_squad.__wrapped__.__wrapped__
     raw_user_toggle = telegram_admin_users.toggle_user_server.__wrapped__.__wrapped__
     raw_tariff_confirm = telegram_admin_users.confirm_admin_tariff_change.__wrapped__.__wrapped__
     legacy_buy = telegram_admin_users.admin_buy_subscription.__wrapped__.__wrapped__
@@ -647,7 +655,6 @@ async def test_telegram_admin_raw_squad_callbacks_are_fenced_before_database_eff
     tariff_buy_confirm = telegram_admin_users.admin_buy_tariff_confirm.__wrapped__.__wrapped__
     tariff_buy_execute = telegram_admin_users.admin_buy_tariff_execute.__wrapped__.__wrapped__
 
-    await raw_tariff_toggle(callback, db_user, db)
     await raw_user_toggle(callback, db_user, db)
     await raw_tariff_confirm(callback, db_user, db)
     await legacy_buy(callback, db_user, db)
@@ -657,9 +664,38 @@ async def test_telegram_admin_raw_squad_callbacks_are_fenced_before_database_eff
     await tariff_buy_confirm(callback, db_user, db)
     await tariff_buy_execute(callback, db_user, db)
 
-    assert callback.answer.await_count == 9
+    assert callback.answer.await_count == 8
     db.commit.assert_not_awaited()
     db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_telegram_admin_tariff_picker_displays_native_internal_squad_checkboxes(monkeypatch):
+    callback = SimpleNamespace(
+        data='admin_tariff_edit_squads:3',
+        message=SimpleNamespace(edit_text=AsyncMock()),
+        answer=AsyncMock(),
+    )
+    tariff = SimpleNamespace(id=3, name='Basic', allowed_squads=['de-squad'])
+    monkeypatch.setattr(telegram_admin_tariffs, 'get_tariff_by_id', AsyncMock(return_value=tariff))
+    monkeypatch.setattr(
+        telegram_admin_tariffs,
+        'get_all_server_squads',
+        AsyncMock(
+            return_value=(
+                [SimpleNamespace(squad_uuid='de-squad', display_name='Germany')],
+                1,
+            )
+        ),
+    )
+
+    raw_tariff_picker = telegram_admin_tariffs.start_edit_tariff_squads.__wrapped__.__wrapped__
+    await raw_tariff_picker(callback, SimpleNamespace(language='ru'), SimpleNamespace(), SimpleNamespace())
+
+    callback.message.edit_text.assert_awaited_once()
+    rendered_text = callback.message.edit_text.await_args.args[0]
+    assert 'Выбрано: 1 из 1' in rendered_text
+    callback.answer.assert_awaited_once()
 
 
 @pytest.mark.asyncio

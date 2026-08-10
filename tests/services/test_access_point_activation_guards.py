@@ -13,14 +13,71 @@ from app.services.subscription_service import SubscriptionService
 
 
 @pytest.mark.asyncio
-async def test_new_tariff_cannot_be_created_active_before_any_database_write() -> None:
-    db = SimpleNamespace(add=Mock(), execute=AsyncMock(), commit=AsyncMock(), refresh=AsyncMock())
+async def test_new_tariff_uses_native_squads_without_an_access_point_policy(monkeypatch) -> None:
+    db = SimpleNamespace(add=Mock(), execute=AsyncMock(), flush=AsyncMock(), commit=AsyncMock(), refresh=AsyncMock())
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.get_effective_tariff_squad_uuids',
+        AsyncMock(return_value=['de-squad']),
+    )
 
-    with pytest.raises(ValueError, match='inactive non-trial draft'):
-        await tariff_crud.create_tariff(db, 'Unsafe draft', is_active=True)
+    tariff = await tariff_crud.create_tariff(db, 'Native draft', is_active=True, allowed_squads=['de-squad'])
+
+    assert tariff.entitlement_mode == 'native_squads'
+    assert tariff.allowed_squads == ['de-squad']
+    db.add.assert_called_once_with(tariff)
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_active_native_tariff_rejects_an_unavailable_internal_squad(monkeypatch) -> None:
+    db = SimpleNamespace(add=Mock(), execute=AsyncMock(), flush=AsyncMock(), commit=AsyncMock(), refresh=AsyncMock())
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.get_effective_tariff_squad_uuids',
+        AsyncMock(side_effect=ValueError('tariff references unavailable Internal Squads')),
+    )
+
+    with pytest.raises(ValueError, match='no available Internal Squad selection'):
+        await tariff_crud.create_tariff(db, 'Unsafe tariff', is_active=True, allowed_squads=['disabled-squad'])
 
     db.add.assert_not_called()
-    db.execute.assert_not_awaited()
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_internal_squad_change_is_blocked_while_a_live_checkout_can_still_be_paid() -> None:
+    tariff = SimpleNamespace(id=17, entitlement_mode='legacy_snapshot', allowed_squads=['old-squad'])
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=tariff),
+        scalar=AsyncMock(return_value=999),
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+
+    with pytest.raises(ValueError, match='live checkout or Platega invoice'):
+        await tariff_crud.update_tariff(db, tariff, allowed_squads=['de-squad'])
+
+    assert tariff.entitlement_mode == 'legacy_snapshot'
+    assert tariff.allowed_squads == ['old-squad']
+    db.get.assert_awaited_once_with(tariff_crud.Tariff, 17, with_for_update=True, populate_existing=True)
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_same_squad_payload_cannot_bypass_live_checkout_fence_during_native_transition() -> None:
+    tariff = SimpleNamespace(id=18, entitlement_mode='access_point_managed', allowed_squads=['de-squad'])
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=tariff),
+        scalar=AsyncMock(return_value=1000),
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+
+    with pytest.raises(ValueError, match='live checkout or Platega invoice'):
+        await tariff_crud.update_tariff(db, tariff, allowed_squads=['de-squad'])
+
+    assert tariff.entitlement_mode == 'access_point_managed'
+    assert tariff.allowed_squads == ['de-squad']
+    db.get.assert_awaited_once_with(tariff_crud.Tariff, 18, with_for_update=True, populate_existing=True)
     db.commit.assert_not_awaited()
 
 
