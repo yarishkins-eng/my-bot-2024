@@ -116,6 +116,46 @@ async def test_period_labels_are_compact_and_do_not_promise_a_price_before_devic
 
 
 @pytest.mark.asyncio
+async def test_period_and_device_pages_render_only_the_escaped_tariff_description() -> None:
+    state = AsyncMock()
+    callback = SimpleNamespace()
+    description = 'В каждый тариф входит:\n<b>✔️ Безлимитный трафик</b>'
+    options = {
+        'tariff': {'name': 'Базовый', 'description': description},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 24_900}]}],
+    }
+
+    with patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render:
+        await _period_page(
+            callback,
+            _user(),
+            state,
+            options,
+            view_id='view1234',
+            origin_callback='funnel_tariffs',
+        )
+        period_caption = render.await_args.kwargs['caption']
+
+        await _device_page(
+            callback,
+            _user(),
+            state,
+            options,
+            view_id='view1234',
+            days=30,
+            origin_callback='funnel_tariffs',
+        )
+        device_caption = render.await_args.kwargs['caption']
+
+    for caption in (period_caption, device_caption):
+        assert 'В каждый тариф входит:\n&lt;b&gt;✔️ Безлимитный трафик&lt;/b&gt;' in caption
+        assert '<b>✔️ Безлимитный трафик</b>' not in caption
+        assert 'traffic_limit_gb' not in caption
+
+
+@pytest.mark.asyncio
 async def test_device_page_shows_all_ten_choices_on_one_screen_without_pagination() -> None:
     state = AsyncMock()
     callback = SimpleNamespace()
