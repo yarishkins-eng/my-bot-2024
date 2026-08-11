@@ -541,6 +541,7 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
         'tariff': {
             'id': tariff.id,
             'name': tariff.name,
+            'description': tariff.description,
             'traffic_limit_gb': tariff.traffic_limit_gb,
             'base_device_limit': tariff.device_limit,
             'pricing_revision': tariff.pricing_revision,

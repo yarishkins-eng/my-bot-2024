@@ -134,7 +134,14 @@ def test_closed_public_rollout_keeps_the_existing_canary_fence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_purchase_options_quote_the_exact_kopeks_total_that_will_be_charged(monkeypatch):
-    tariff = SimpleNamespace(id=7, name='Premium', traffic_limit_gb=100, device_limit=2, pricing_revision=1)
+    tariff = SimpleNamespace(
+        id=7,
+        name='Premium',
+        description='Unlimited traffic\nWorks with Russian apps',
+        traffic_limit_gb=100,
+        device_limit=2,
+        pricing_revision=1,
+    )
     user = SimpleNamespace(id=9, balance_kopeks=0)
     eligibility = SimpleNamespace(
         eligible=True,
@@ -166,6 +173,7 @@ async def test_purchase_options_quote_the_exact_kopeks_total_that_will_be_charge
     options = await service.build_purchase_options(db, user)
     price = options['price_matrix'][0]['prices'][0]
 
+    assert options['tariff']['description'] == 'Unlimited traffic\nWorks with Russian apps'
     assert price['price_kopeks'] == 30_050
     assert 'raw_total_kopeks' not in price['breakdown']
     assert 'rounding_adjustment_kopeks' not in price['breakdown']

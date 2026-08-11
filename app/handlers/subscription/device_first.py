@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from html import escape
 from itertools import islice
 from urllib.parse import urlencode
 
@@ -135,6 +136,12 @@ def _price_for(options: dict, *, days: int, devices: int) -> int | None:
             if item.get('device_limit') == devices:
                 return item.get('price_kopeks')
     return None
+
+
+def _tariff_description_block(options: dict) -> str:
+    """Return the admin-provided tariff description safely for an HTML caption."""
+    description = options.get('tariff', {}).get('description')
+    return f'{escape(description)}\n\n' if isinstance(description, str) and description else ''
 
 
 def _chunks(values: list[int], size: int):
@@ -305,6 +312,7 @@ async def _device_page(
         callback=callback,
         caption=(
             f'📱 <b>{options["tariff"]["name"]}</b>\n\n'
+            + _tariff_description_block(options)
             + _text(
                 user,
                 f'Срок: <b>{_period_summary_label(user, days)}</b>\n\nСколько устройств подключить?',
@@ -341,7 +349,9 @@ async def _period_page(
     await edit_or_answer_photo(
         callback=callback,
         caption=(
-            f'📱 <b>{options["tariff"]["name"]}</b>\n\n' + _text(user, '📅 Выберите срок.', '📅 Choose a period.')
+            f'📱 <b>{options["tariff"]["name"]}</b>\n\n'
+            + _tariff_description_block(options)
+            + _text(user, '📅 Выберите срок.', '📅 Choose a period.')
         ),
         keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
         parse_mode='HTML',
