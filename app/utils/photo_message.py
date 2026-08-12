@@ -9,7 +9,6 @@ from aiogram.types import InaccessibleMessage, InputMediaPhoto
 from app.config import settings
 
 from .message_patch import (
-    LOGO_PATH,
     _cache_logo_file_id,
     append_privacy_hint,
     caption_exceeds_telegram_limit,
@@ -18,6 +17,7 @@ from .message_patch import (
     is_qr_message,
     prepare_privacy_safe_kwargs,
 )
+from .scenario_media import cache_scenario_media_file_id, get_scenario_media
 
 
 logger = structlog.get_logger(__name__)
@@ -26,7 +26,14 @@ MAX_RETRIES = 3
 RETRY_DELAY = 0.5
 
 
-def _resolve_media(message: types.Message):
+def _resolve_media(
+    message: types.Message,
+    *,
+    scenario_media_key: str | None = None,
+    scenario_media_language: str | None = None,
+):
+    if scenario_media_key:
+        return get_scenario_media(scenario_media_key, scenario_media_language)
     if isinstance(message, InaccessibleMessage):
         return get_logo_media()
     if settings.ENABLE_LOGO_MODE and not is_qr_message(message):
@@ -113,23 +120,35 @@ async def edit_or_answer_photo(
     parse_mode: str | None = 'HTML',
     *,
     force_text: bool = False,
+    scenario_media_key: str | None = None,
+    scenario_media_language: str | None = None,
 ) -> types.Message | None:
     """Возвращает фактически показанное сообщение (отправленное/отредактированное)
     или None, если показать не удалось. Возврат нужен, чтобы вызывающий код мог
     запомнить message_id реального меню (см. funnel-удаление старого меню)."""
     resolved_parse_mode = parse_mode or 'HTML'
 
+    media_language = scenario_media_language or _get_language(callback)
+
     # Если сообщение недоступно, отправляем новое сообщение
     if isinstance(callback.message, InaccessibleMessage):
         try:
-            if settings.ENABLE_LOGO_MODE and LOGO_PATH.exists():
+            media = _resolve_media(
+                callback.message,
+                scenario_media_key=scenario_media_key,
+                scenario_media_language=media_language,
+            )
+            if settings.ENABLE_LOGO_MODE and media is not None:
                 result = await callback.message.answer_photo(
-                    photo=get_logo_media(),
+                    photo=media,
                     caption=caption,
                     reply_markup=keyboard,
                     parse_mode=resolved_parse_mode,
                 )
-                _cache_logo_file_id(result)
+                if scenario_media_key:
+                    cache_scenario_media_file_id(scenario_media_key, media_language, result)
+                else:
+                    _cache_logo_file_id(result)
                 return result
             return await callback.message.answer(
                 caption,
@@ -183,7 +202,11 @@ async def edit_or_answer_photo(
         except TelegramBadRequest as error:
             return await _answer_text(callback, caption, keyboard, resolved_parse_mode, error)
 
-    media = _resolve_media(callback.message)
+    media = _resolve_media(
+        callback.message,
+        scenario_media_key=scenario_media_key,
+        scenario_media_language=media_language,
+    )
 
     # Logo file unavailable (missing / directory bind-mount) — fall back to text.
     # See #586617: this used to surface as IsADirectoryError on every callback.
@@ -197,10 +220,14 @@ async def edit_or_answer_photo(
     # Retry logic для сетевых ошибок
     for attempt in range(MAX_RETRIES):
         try:
-            await callback.message.edit_media(
+            result = await callback.message.edit_media(
                 InputMediaPhoto(media=media, caption=caption, parse_mode=(parse_mode or 'HTML')),
                 reply_markup=keyboard,
             )
+            if scenario_media_key:
+                cache_scenario_media_file_id(scenario_media_key, media_language, result)
+            else:
+                _cache_logo_file_id(result)
             return callback.message  # Успешно — отредактировано на месте, id не изменился
         except TelegramNetworkError as net_error:
             if attempt < MAX_RETRIES - 1:
@@ -250,18 +277,25 @@ async def edit_or_answer_photo(
                 await callback.message.delete()
             except Exception:
                 pass
-            logo_media = get_logo_media()
-            if logo_media is None:
+            fallback_media = _resolve_media(
+                callback.message,
+                scenario_media_key=scenario_media_key,
+                scenario_media_language=media_language,
+            )
+            if fallback_media is None:
                 return await _answer_text(callback, caption, keyboard, resolved_parse_mode)
             try:
-                # Отправим как фото с логотипом
+                # Отправим как фото с тематической картинкой или нейтральным fallback.
                 result = await callback.message.answer_photo(
-                    photo=logo_media,
+                    photo=fallback_media,
                     caption=caption,
                     reply_markup=keyboard,
                     parse_mode=resolved_parse_mode,
                 )
-                _cache_logo_file_id(result)
+                if scenario_media_key:
+                    cache_scenario_media_file_id(scenario_media_key, media_language, result)
+                else:
+                    _cache_logo_file_id(result)
                 return result
             except (TelegramBadRequest, TelegramForbiddenError) as photo_error:
                 return await _answer_text(callback, caption, keyboard, resolved_parse_mode, photo_error)

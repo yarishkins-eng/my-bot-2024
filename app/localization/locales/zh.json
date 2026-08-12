@@ -1462,6 +1462,7 @@
   "SUB_STATUS_EXPIRED": "🔴已过期\n📅{end_date}",
   "SUB_STATUS_GRACE": "🎁 奖励天数\n⏳ VPN 有效至 {date}",
   "SUB_STATUS_TRIAL_EXPIRED": "⛔ 您的试用期已结束\n请购买订阅以恢复访问。",
+  "TRIAL_EXPIRED_NOTIFICATION": "🎁 <b>试用期已结束</b>\n\n您的免费访问已结束。请选择套餐以继续使用 VPN。",
   "TRIAL_EXPIRED_DISCOUNT": "🎁 <b>专属 {percent}% 折扣</b>\n\n您的试用期已结束。以折扣价购买首个订阅 — 优惠有效期至 {expires_at}。",
   "SUB_STATUS_DISABLED": "⚫已禁用",
   "SUB_STATUS_PENDING": "⏳等待激活",

@@ -18,6 +18,7 @@ import redis.asyncio as aioredis
 import structlog
 
 from app.config import settings
+from app.utils.scenario_media import cache_scenario_media_file_id, get_scenario_media
 
 
 logger = structlog.get_logger(__name__)
@@ -184,12 +185,23 @@ async def send_funnel_trial_menu(user) -> None:
         text = texts.t('FUNNEL_TRIAL_ACTIVATED', '🎉 Готово! Пробный период активирован.')
         bot = create_bot()
         try:
-            sent = await bot.send_message(
-                chat_id=user.telegram_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode='HTML',
-            )
+            media = get_scenario_media('trial_active', language) if settings.ENABLE_LOGO_MODE else None
+            if media is None:
+                sent = await bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode='HTML',
+                )
+            else:
+                sent = await bot.send_photo(
+                    chat_id=user.telegram_id,
+                    photo=media,
+                    caption=text,
+                    reply_markup=keyboard,
+                    parse_mode='HTML',
+                )
+                cache_scenario_media_file_id('trial_active', language, sent)
             # Старое меню новичка теперь мусор — удаляем; новое запоминаем.
             await _delete_remembered_menu(bot, user.telegram_id)
             if sent is not None:
