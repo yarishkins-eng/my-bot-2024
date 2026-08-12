@@ -332,6 +332,7 @@ async def _period_page(
     *,
     view_id: str,
     origin_callback: str,
+    scenario_media_key: str | None = None,
 ) -> None:
     rows = []
     for chunk in _chunks(list(options['period_options']), 2):
@@ -355,6 +356,8 @@ async def _period_page(
         ),
         keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
         parse_mode='HTML',
+        scenario_media_key=scenario_media_key,
+        scenario_media_language=user.language,
     )
 
 
@@ -366,6 +369,7 @@ async def show_device_first_entry(
     *,
     options: dict | None = None,
     origin_callback: str | None = None,
+    scenario_media_key: str | None = None,
 ) -> bool:
     # A direct provider invoice is resumable until the customer explicitly
     # changes the completed configuration or confirms an abandon action.
@@ -430,6 +434,7 @@ async def show_device_first_entry(
         options,
         view_id=view_id,
         origin_callback=origin,
+        scenario_media_key=scenario_media_key,
     )
     return True
 

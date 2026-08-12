@@ -35,11 +35,15 @@ def _wire(monkeypatch: pytest.MonkeyPatch, *, funnel_enabled: bool = True) -> _B
     async def _fake_send_message(*args, **kwargs):
         return SimpleNamespace(message_id=7)
 
+    async def _fake_send_photo(*args, **kwargs):
+        return SimpleNamespace(message_id=7, photo=[])
+
     async def _fake_close():
         return None
 
     fake_bot = SimpleNamespace(
         send_message=_fake_send_message,
+        send_photo=_fake_send_photo,
         session=SimpleNamespace(close=_fake_close),
     )
     recorder = _BotRecorder(fake_bot)
@@ -68,6 +72,32 @@ async def test_sends_trial_menu_after_activation(monkeypatch: pytest.MonkeyPatch
     await funnel_notify.send_funnel_trial_menu(user)
 
     assert recorder.calls == 1  # меню активного триала отправлено, старое заменено
+
+
+@pytest.mark.asyncio
+async def test_trial_menu_uses_language_safe_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RU получает тематическую карточку, EN — нейтральное изображение без русского текста."""
+    recorder = _wire(monkeypatch)
+    sent_photos = []
+    ru_media = object()
+    neutral_media = object()
+
+    async def _record_photo(*args, **kwargs):
+        sent_photos.append(kwargs['photo'])
+        return SimpleNamespace(message_id=7, photo=[])
+
+    monkeypatch.setattr(recorder._bot, 'send_photo', _record_photo)
+    monkeypatch.setattr(funnel_notify.settings, 'ENABLE_LOGO_MODE', True)
+    monkeypatch.setattr(
+        funnel_notify,
+        'get_scenario_media',
+        lambda _key, language: ru_media if language == 'ru' else neutral_media,
+    )
+
+    await funnel_notify.send_funnel_trial_menu(SimpleNamespace(telegram_id=123, language='ru'))
+    await funnel_notify.send_funnel_trial_menu(SimpleNamespace(telegram_id=456, language='en'))
+
+    assert sent_photos == [ru_media, neutral_media]
 
 
 @pytest.mark.asyncio

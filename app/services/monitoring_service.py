@@ -2245,6 +2245,9 @@ class MonitoringService:
         self, user: User, subscription: Subscription, *, tariff_name: str | None = None
     ) -> bool:
         try:
+            if getattr(subscription, 'is_trial', False):
+                return await self._send_trial_expired_notification(user)
+
             tariff_label = ''
             if settings.is_multi_tariff_enabled():
                 if tariff_name:
@@ -2290,6 +2293,78 @@ class MonitoringService:
         except Exception as e:
             logger.error(
                 'Ошибка отправки уведомления об истечении подписки пользователю', telegram_id=user.telegram_id, e=e
+            )
+            return False
+
+    async def _send_trial_expired_notification(self, user: User) -> bool:
+        """Notify once when a trial ends without making it look like an outage.
+
+        This deliberately uses ``send_message`` rather than the global logo
+        helper: a finished trial is a commercial state, not a VPN fault, and
+        the agreed scenario has no image here.
+        """
+        if not getattr(user, 'telegram_id', None):
+            return True
+
+        try:
+            texts = get_texts(user.language)
+            message = texts.t(
+                'TRIAL_EXPIRED_NOTIFICATION',
+                (
+                    '🎁 <b>Пробный период завершён</b>\n\n'
+                    'Бесплатный доступ закончился. Выберите тариф, чтобы продолжить пользоваться VPN.'
+                ),
+            )
+            from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        build_miniapp_or_callback_button(
+                            text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
+                            callback_data='menu_buy',
+                            cabinet_path='/subscription/purchase',
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text=texts.t('FUNNEL_TARIFFS', '💳 Тарифы'),
+                            callback_data='funnel_tariffs',
+                        )
+                    ],
+                ]
+            )
+            await asyncio.wait_for(
+                self.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=message,
+                    parse_mode='HTML',
+                    reply_markup=keyboard,
+                ),
+                timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
+            )
+            return True
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            if await self._handle_unreachable_user(user, exc, 'уведомление о завершении пробного периода'):
+                return True
+            logger.error(
+                'Ошибка Telegram API при отправке уведомления о завершении пробного периода',
+                telegram_id=user.telegram_id,
+                exc=exc,
+            )
+            return False
+        except (TelegramNetworkError, TimeoutError) as exc:
+            logger.warning(
+                'Таймаут отправки уведомления о завершении пробного периода',
+                telegram_id=user.telegram_id,
+                exc=exc,
+            )
+            return False
+        except Exception as exc:
+            logger.error(
+                'Ошибка отправки уведомления о завершении пробного периода',
+                telegram_id=user.telegram_id,
+                exc=exc,
             )
             return False
 
@@ -2773,11 +2848,14 @@ class MonitoringService:
                 ]
             )
 
-            await self._send_message_with_logo(
-                chat_id=user.telegram_id,
-                text=message,
-                parse_mode='HTML',
-                reply_markup=keyboard,
+            await asyncio.wait_for(
+                self.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=message,
+                    parse_mode='HTML',
+                    reply_markup=keyboard,
+                ),
+                timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
             )
             return True
 

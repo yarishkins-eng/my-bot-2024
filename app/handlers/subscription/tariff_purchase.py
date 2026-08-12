@@ -713,6 +713,8 @@ async def show_tariffs_list(
     db_user: User,
     db: AsyncSession,
     state: FSMContext,
+    *,
+    scenario_media_key: str | None = None,
 ):
     """Показывает список тарифов для покупки."""
     texts = get_texts(db_user.language)
@@ -724,7 +726,14 @@ async def show_tariffs_list(
     # Existing v2 orders remain reachable even after new orders are disabled.
     from app.handlers.subscription.device_first import show_device_first_entry
 
-    if await show_device_first_entry(callback, db_user, db, state, origin_callback='back_to_menu'):
+    if await show_device_first_entry(
+        callback,
+        db_user,
+        db,
+        state,
+        origin_callback='back_to_menu',
+        scenario_media_key=scenario_media_key,
+    ):
         return
 
     # Получаем доступные тарифы
@@ -732,12 +741,22 @@ async def show_tariffs_list(
     tariffs = await get_tariffs_for_user(db, promo_group_id)
 
     if not tariffs:
-        await callback.message.edit_text(
-            '😔 <b>Нет доступных тарифов</b>\n\nК сожалению, сейчас нет тарифов для покупки.',
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')]]
-            ),
+        caption = '😔 <b>Нет доступных тарифов</b>\n\nК сожалению, сейчас нет тарифов для покупки.'
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')]]
         )
+        if scenario_media_key:
+            from app.utils.photo_message import edit_or_answer_photo
+
+            await edit_or_answer_photo(
+                callback=callback,
+                caption=caption,
+                keyboard=keyboard,
+                scenario_media_key=scenario_media_key,
+                scenario_media_language=db_user.language,
+            )
+        else:
+            await callback.message.edit_text(caption, reply_markup=keyboard)
         await callback.answer()
         return
 
@@ -762,10 +781,19 @@ async def show_tariffs_list(
     # Формируем текст со списком тарифов и их характеристиками
     tariffs_text = format_tariffs_list_text(tariffs, db_user, has_period_discounts, purchased_tariff_ids)
 
-    await callback.message.edit_text(
-        tariffs_text,
-        reply_markup=get_tariffs_keyboard(tariffs, db_user.language, purchased_tariff_ids),
-    )
+    keyboard = get_tariffs_keyboard(tariffs, db_user.language, purchased_tariff_ids)
+    if scenario_media_key:
+        from app.utils.photo_message import edit_or_answer_photo
+
+        await edit_or_answer_photo(
+            callback=callback,
+            caption=tariffs_text,
+            keyboard=keyboard,
+            scenario_media_key=scenario_media_key,
+            scenario_media_language=db_user.language,
+        )
+    else:
+        await callback.message.edit_text(tariffs_text, reply_markup=keyboard)
 
     await callback.answer()
 
@@ -797,7 +825,14 @@ async def show_funnel_tariffs(
     # device-first orders have just been turned off.
     from app.handlers.subscription.device_first import show_device_first_entry
 
-    if await show_device_first_entry(callback, db_user, db, state, origin_callback='back_to_menu'):
+    if await show_device_first_entry(
+        callback,
+        db_user,
+        db,
+        state,
+        origin_callback='back_to_menu',
+        scenario_media_key='tariffs',
+    ):
         return
 
     if not tariffs:
@@ -808,18 +843,20 @@ async def show_funnel_tariffs(
                 inline_keyboard=[[InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')]]
             ),
             parse_mode='HTML',
+            scenario_media_key='tariffs',
+            scenario_media_language=db_user.language,
         )
         await callback.answer()
         return
 
     if len(tariffs) > 1:
-        await show_tariffs_list(callback, db_user, db, state)
+        await show_tariffs_list(callback, db_user, db, state, scenario_media_key='tariffs')
         return
 
     tariff = tariffs[0]
 
     if getattr(tariff, 'is_daily', False) or tariff.can_purchase_custom_days() or tariff.can_purchase_custom_traffic():
-        await show_tariffs_list(callback, db_user, db, state)
+        await show_tariffs_list(callback, db_user, db, state, scenario_media_key='tariffs')
         return
 
     await state.update_data(selected_tariff_id=tariff.id)
@@ -834,6 +871,8 @@ async def show_funnel_tariffs(
             subscription_device_limit=await _get_matching_subscription_device_limit(db, db_user, tariff),
         ),
         parse_mode='HTML',
+        scenario_media_key='tariffs',
+        scenario_media_language=db_user.language,
     )
     await callback.answer()
 

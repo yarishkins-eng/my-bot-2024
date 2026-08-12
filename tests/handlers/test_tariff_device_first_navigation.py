@@ -33,6 +33,7 @@ async def test_funnel_tariffs_returns_device_first_period_screen_to_main_menu(mo
 
     show_entry.assert_awaited_once()
     assert show_entry.await_args.kwargs['origin_callback'] == 'back_to_menu'
+    assert show_entry.await_args.kwargs['scenario_media_key'] == 'tariffs'
 
 
 @pytest.mark.asyncio
@@ -54,7 +55,14 @@ async def test_funnel_tariffs_reopens_an_existing_native_order_when_new_orders_a
     ):
         await show_funnel_tariffs(callback, user, AsyncMock(), state)
 
-    show_entry.assert_awaited_once_with(callback, user, ANY, state, origin_callback='back_to_menu')
+    show_entry.assert_awaited_once_with(
+        callback,
+        user,
+        ANY,
+        state,
+        origin_callback='back_to_menu',
+        scenario_media_key='tariffs',
+    )
 
 
 @pytest.mark.asyncio
@@ -69,4 +77,11 @@ async def test_legacy_tariff_entrypoints_redirect_to_device_first_when_eligible(
     ) as show_entry:
         await show_tariffs_list(callback, user, AsyncMock(), state)
 
-    show_entry.assert_awaited_once_with(callback, user, ANY, state, origin_callback='back_to_menu')
+    show_entry.assert_awaited_once_with(
+        callback,
+        user,
+        ANY,
+        state,
+        origin_callback='back_to_menu',
+        scenario_media_key=None,
+    )
