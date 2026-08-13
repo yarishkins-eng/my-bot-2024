@@ -1023,6 +1023,79 @@ def test_disable_helper_never_audits_transient_inspect_as_absent(tmp_path: Path)
     assert not latest.exists()
 
 
+def test_watchdog_never_audits_transient_inspect_as_absent(tmp_path: Path) -> None:
+    run_id, run_attempt = '731', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    container_id = '5' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(run_id, run_attempt, 'prepared', 1))
+    secret = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
+    secret.write_text('SECRET=redacted\n')
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    fail_once = tmp_path / 'fail-inspect-once'
+    fail_once.touch()
+    audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
+        'FAIL_INSPECT_ONCE_FILE': str(fail_once),
+    }
+
+    first = subprocess.run(  # noqa: S603 - fixed repository watchdog under test
+        [
+            str(WATCHDOG),
+            'BOOTSTRAP',
+            str(lease),
+            'teplo_entitlement_shadow',
+            run_id,
+            run_attempt,
+            str(audit),
+            str(secret),
+            'pending',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert first.returncode != 0
+    assert container_present.exists()
+    assert not list(state.glob('*AUTO_DISABLE_BOOTSTRAP.audit'))
+
+    retry = subprocess.run(  # noqa: S603 - fixed repository watchdog under test
+        [
+            str(WATCHDOG),
+            'BOOTSTRAP',
+            str(lease),
+            'teplo_entitlement_shadow',
+            run_id,
+            run_attempt,
+            str(audit),
+            str(secret),
+            'pending',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert retry.returncode == 0, retry.stderr
+    assert not container_present.exists()
+    assert list(state.glob('*AUTO_DISABLE_BOOTSTRAP.audit'))
+
+
 def _docker_path() -> str | None:
     return shutil.which('docker')
 
@@ -1100,6 +1173,12 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
                 f'teplo.workflow_run_attempt={run_attempt}',
                 image,
             ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(  # noqa: S603 - fixed Docker path and isolated test container
+            [docker, 'pause', 'teplo_entitlement_shadow'],
             check=True,
             capture_output=True,
             text=True,

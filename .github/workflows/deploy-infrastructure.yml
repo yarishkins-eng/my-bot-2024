@@ -154,6 +154,7 @@ jobs:
             git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
             readonly PREVIOUS_SHA="$(git rev-parse HEAD)"
             readonly REMOTE_MAIN_SHA="$(git rev-parse origin/main)"
+            DEPLOY_BASE_SHA="$PREVIOUS_SHA"
 
             if [ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]; then
               echo "Refusing controlled deploy: workflow=$TARGET_SHA, origin/main=$REMOTE_MAIN_SHA." >&2
@@ -161,22 +162,37 @@ jobs:
             fi
 
             if [ "$PREVIOUS_SHA" = "$TARGET_SHA" ]; then
-              echo "Source already at $TARGET_SHA; requiring the container health gate again."
-              verify_deployed_state
-              compose up -d --no-build --wait --wait-timeout 240 "$SERVICE"
-              compose ps "$SERVICE"
-              exit 0
+              stored_sha="$(sed -n 's/^sha=//p' "$STATE_FILE")"
+              stored_image="$(sed -n 's/^image=//p' "$STATE_FILE")"
+              current_image="$(docker inspect --format '{{.Image}}' remnawave_bot)"
+              if [ "$stored_sha" = "$TARGET_SHA" ]; then
+                echo "Source already at $TARGET_SHA; requiring the container health gate again."
+                verify_deployed_state
+                test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" = 'healthy'
+                compose ps "$SERVICE"
+                exit 0
+              fi
+              test "$stored_image" = "$current_image" || {
+                echo 'Refusing controlled deploy recovery: the recorded image changed.' >&2
+                exit 38
+              }
+              git merge-base --is-ancestor "$stored_sha" "$TARGET_SHA" || {
+                echo 'Refusing controlled deploy recovery: the recorded source is not an ancestor.' >&2
+                exit 38
+              }
+              DEPLOY_BASE_SHA="$stored_sha"
+              echo "Recovering an interrupted source-only transition from $stored_sha to $TARGET_SHA."
             fi
 
-            if ! git merge-base --is-ancestor "$PREVIOUS_SHA" "$TARGET_SHA"; then
-              echo "Refusing controlled deploy: server commit $PREVIOUS_SHA is not an ancestor of $TARGET_SHA." >&2
+            if ! git merge-base --is-ancestor "$DEPLOY_BASE_SHA" "$TARGET_SHA"; then
+              echo "Refusing controlled deploy: server commit $DEPLOY_BASE_SHA is not an ancestor of $TARGET_SHA." >&2
               exit 34
             fi
 
             infrastructure_paths_changed=0
             control_plane_paths_changed=0
-            git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- Dockerfile .dockerignore docker-compose.yml || infrastructure_paths_changed=1
-            git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- \
+            git diff --quiet "$DEPLOY_BASE_SHA" "$TARGET_SHA" -- Dockerfile .dockerignore docker-compose.yml || infrastructure_paths_changed=1
+            git diff --quiet "$DEPLOY_BASE_SHA" "$TARGET_SHA" -- \
               .github/scripts/control-entitlement-shadow.sh \
               .github/scripts/disable-entitlement-shadow.sh \
               .github/scripts/run-entitlement-shadow-sidecar.py \
@@ -193,17 +209,38 @@ jobs:
               exit 35
             fi
 
-            unexpected_control_plane_paths="$(
-              git diff --name-only "$PREVIOUS_SHA" "$TARGET_SHA" -- .github | grep -Ev '^\.github/(scripts/(control-entitlement-shadow\.sh|disable-entitlement-shadow\.sh|run-entitlement-shadow-sidecar\.py|verify-entitlement-shadow-baseline\.py|watchdog-entitlement-shadow-bootstrap\.sh)|workflows/(control-entitlement-shadow\.yml|deploy-infrastructure\.yml|deploy-migration\.yml|deploy\.yml|lint\.yml|recover-after-migration\.yml))$' || true
-            )"
-            if [ -n "$unexpected_control_plane_paths" ]; then
-              echo 'Refusing controlled deploy: the .github diff contains paths outside the reviewed allowlist.' >&2
-              exit 37
+            if [ "$infrastructure_paths_changed" = '0' ]; then
+              unexpected_control_plane_paths="$(
+                git diff --name-only "$DEPLOY_BASE_SHA" "$TARGET_SHA" | grep -Ev '^(\.github/(scripts/(control-entitlement-shadow\.sh|disable-entitlement-shadow\.sh|run-entitlement-shadow-sidecar\.py|verify-entitlement-shadow-baseline\.py|watchdog-entitlement-shadow-bootstrap\.sh)|workflows/(control-entitlement-shadow\.yml|deploy-infrastructure\.yml|deploy-migration\.yml|deploy\.yml|lint\.yml|recover-after-migration\.yml))|docs/entitlement_authority/gate2-shadow(-control-prerequisite)?-release-card\.md|tests/workflows/test_(entitlement_shadow_control|migration_recovery)_workflow\.py)$' || true
+              )"
+              if [ -n "$unexpected_control_plane_paths" ]; then
+                echo 'Refusing controlled deploy: control-plane-only mode contains paths outside the reviewed allowlist.' >&2
+                exit 37
+              fi
             fi
 
-            if ! git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- migrations alembic.ini app/database main.py app/config.py; then
+            if ! git diff --quiet "$DEPLOY_BASE_SHA" "$TARGET_SHA" -- migrations alembic.ini app/database main.py app/config.py; then
               echo 'Refusing controlled deploy: database or migration-risk changes require the migration workflow.' >&2
               exit 36
+            fi
+
+            if [ "$infrastructure_paths_changed" = '0' ]; then
+              readonly PREVIOUS_CONTAINER_ID="$(docker inspect --format '{{.Id}}' remnawave_bot)"
+              readonly PREVIOUS_IMAGE_ID="$(docker inspect --format '{{.Image}}' remnawave_bot)"
+              readonly PREVIOUS_STARTED_AT="$(docker inspect --format '{{.State.StartedAt}}' remnawave_bot)"
+              test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" = 'healthy'
+              test "$(sed -n 's/^sha=//p' "$STATE_FILE")" = "$DEPLOY_BASE_SHA"
+              test "$(sed -n 's/^image=//p' "$STATE_FILE")" = "$PREVIOUS_IMAGE_ID"
+
+              git checkout --detach "$TARGET_SHA"
+
+              test "$(docker inspect --format '{{.Id}}' remnawave_bot)" = "$PREVIOUS_CONTAINER_ID"
+              test "$(docker inspect --format '{{.Image}}' remnawave_bot)" = "$PREVIOUS_IMAGE_ID"
+              test "$(docker inspect --format '{{.State.StartedAt}}' remnawave_bot)" = "$PREVIOUS_STARTED_AT"
+              test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" = 'healthy'
+              write_deployed_state
+              echo "Protected control-plane source activated without rebuilding or restarting the bot at $(date --iso-8601=seconds)"
+              exit 0
             fi
 
             git checkout --detach "$TARGET_SHA"

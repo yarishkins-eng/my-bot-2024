@@ -616,6 +616,8 @@ def _infrastructure_control_plane_integration(
     *,
     unexpected_github_path: bool = False,
     migration_risk_changed: bool = False,
+    unexpected_business_path: bool = False,
+    source_already_at_target: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
     repo = tmp_path / 'repo'
     state = tmp_path / 'state'
@@ -624,7 +626,9 @@ def _infrastructure_control_plane_integration(
     for directory in (repo, state, fake_bin, fake):
         directory.mkdir()
     (state / 'bot-production.state').write_text(f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n')
-    (fake / 'source').write_text(ROLLBACK_SHA)
+    (fake / 'source').write_text(PRIOR_TARGET_SHA if source_already_at_target else ROLLBACK_SHA)
+    (fake / 'container').write_text('f' * 64)
+    (fake / 'started').write_text('2026-08-13T00:00:00Z')
 
     _write_executable(
         fake_bin / 'git',
@@ -646,7 +650,11 @@ case "$1" in
       esac
     fi
     if [ "$2" = --name-only ] || [ "$4" = --name-only ]; then
-      if [ "$UNEXPECTED_GITHUB_PATH" = 1 ]; then
+      if [ "$UNEXPECTED_BUSINESS_PATH" = 1 ]; then
+        printf '.github/scripts/control-entitlement-shadow.sh\n'
+        printf 'app/services/payment_service.py\n'
+        printf 'pyproject.toml\n'
+      elif [ "$UNEXPECTED_GITHUB_PATH" = 1 ]; then
         printf '.github/workflows/unreviewed.yml\n'
       else
         printf '.github/scripts/control-entitlement-shadow.sh\n'
@@ -673,8 +681,11 @@ elif [ "$1" = inspect ] && [ "${@: -1}" = teplo_entitlement_shadow ]; then
   exit 1
 elif [ "$1" = inspect ]; then
   case "$3" in
+    *'.Id'*) cat "$FAKE_STATE/container" ;;
     *'.Image'*) cat "$FAKE_STATE/image" ;;
     *'.Config.Image'*) printf 'teplo-bot:production\n' ;;
+    *'.State.StartedAt'*) cat "$FAKE_STATE/started" ;;
+    *'.State.Health.Status'*) printf 'healthy\n' ;;
     *) exit 96 ;;
   esac
 elif [ "$1" = compose ]; then
@@ -703,6 +714,7 @@ fi
         'INFRA_TARGET_SHA': PRIOR_TARGET_SHA,
         'MIGRATION_IMAGE': MIGRATION_IMAGE,
         'UNEXPECTED_GITHUB_PATH': '1' if unexpected_github_path else '0',
+        'UNEXPECTED_BUSINESS_PATH': '1' if unexpected_business_path else '0',
         'MIGRATION_RISK_CHANGED': '1' if migration_risk_changed else '0',
     }
     result = subprocess.run(  # noqa: S603 - extracted exact production workflow shell
@@ -1169,8 +1181,30 @@ def test_protected_infrastructure_deploy_accepts_allowlisted_control_plane_only(
     result, paths = _infrastructure_control_plane_integration(tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert paths['fake'].joinpath('mutations').read_text() == 'build\nup\n'
+    assert not paths['fake'].joinpath('mutations').exists()
+    assert paths['fake'].joinpath('container').read_text() == 'f' * 64
+    assert paths['fake'].joinpath('image').read_text() == ROLLBACK_IMAGE
+    assert paths['fake'].joinpath('started').read_text() == '2026-08-13T00:00:00Z'
     assert f'sha={PRIOR_TARGET_SHA}\n' in paths['state'].joinpath('bot-production.state').read_text()
+    assert f'image={ROLLBACK_IMAGE}\n' in paths['state'].joinpath('bot-production.state').read_text()
+
+
+def test_protected_control_plane_release_recovers_kill_after_source_checkout(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(
+        tmp_path,
+        source_already_at_target=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert 'Recovering an interrupted source-only transition' in result.stdout
+    assert not paths['fake'].joinpath('mutations').exists()
+    assert paths['fake'].joinpath('container').read_text() == 'f' * 64
+    assert paths['fake'].joinpath('image').read_text() == ROLLBACK_IMAGE
+    assert paths['fake'].joinpath('started').read_text() == '2026-08-13T00:00:00Z'
+    assert f'sha={PRIOR_TARGET_SHA}\n' in paths['state'].joinpath('bot-production.state').read_text()
+    assert f'image={ROLLBACK_IMAGE}\n' in paths['state'].joinpath('bot-production.state').read_text()
 
 
 def test_protected_infrastructure_deploy_rejects_unreviewed_github_path(
@@ -1180,6 +1214,16 @@ def test_protected_infrastructure_deploy_rejects_unreviewed_github_path(
 
     assert result.returncode == 37
     assert 'paths outside the reviewed allowlist' in result.stderr
+    assert not paths['fake'].joinpath('mutations').exists()
+
+
+def test_protected_control_plane_route_rejects_mixed_business_or_dependency_paths(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(tmp_path, unexpected_business_path=True)
+
+    assert result.returncode == 37
+    assert 'control-plane-only mode contains paths outside the reviewed allowlist' in result.stderr
     assert not paths['fake'].joinpath('mutations').exists()
 
 

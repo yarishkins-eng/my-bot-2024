@@ -82,6 +82,40 @@ container_value() {
   docker inspect --format "$format" "$(container_target)" 2>/dev/null || true
 }
 
+container_id_for_removal() {
+  inspect_tmp="$(mktemp "$STATE_DIR/entitlement-shadow-inspect.XXXXXX")"
+  if docker inspect --format '{{.Id}}' "$(container_target)" > "$inspect_tmp" 2>/dev/null; then
+    inspect_rc=0
+  else
+    inspect_rc=$?
+  fi
+  inspected_id="$(cat "$inspect_tmp")"
+  rm -f -- "$inspect_tmp"
+
+  case "$inspect_rc" in
+    0)
+      [[ "$inspected_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+      printf '%s\n' "$inspected_id"
+      ;;
+    1)
+      # Docker uses rc=1 for a container that is provably absent.
+      printf '\n'
+      ;;
+    *)
+      # A daemon/transport/client failure is never evidence of absence.
+      return 1
+      ;;
+  esac
+}
+
+fixed_sidecar_is_absent() {
+  remaining="$({
+    docker container ls -a --no-trunc \
+      --filter "name=^/${SIDECAR}$" --format '{{.ID}}'
+  } 2>/dev/null)" || return 1
+  [ -z "$remaining" ]
+}
+
 container_label() {
   key="$1"
   container_value "{{index .Config.Labels \"${key}\"}}"
@@ -160,7 +194,7 @@ remove_own_generation() {
   fi
   docker info >/dev/null 2>&1 || return 1
 
-  actual_id="$(container_value '{{.Id}}')"
+  actual_id="$(container_id_for_removal)" || return 1
   if [ -n "$actual_id" ]; then
     container_is_exact_generation || {
       [ "$generation" = 'different' ] || return 1
@@ -168,10 +202,13 @@ remove_own_generation() {
     }
     docker rm --force "$actual_id" >/dev/null 2>&1 || return 1
   fi
-  docker info >/dev/null 2>&1 || return 1
-  [ -z "$(container_value '{{.Id}}')" ] || return 1
-  [ "$generation" != 'invalid' ] || return 1
+  # An exact target from an older run may already be absent while the fixed
+  # sidecar name legitimately belongs to the newer lease. Never inspect or
+  # remove that newer generation.
   [ "$generation" != 'different' ] || return 10
+  docker info >/dev/null 2>&1 || return 1
+  fixed_sidecar_is_absent || return 1
+  [ "$generation" != 'invalid' ] || return 1
   return 0
 }
 
