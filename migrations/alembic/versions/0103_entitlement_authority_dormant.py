@@ -326,6 +326,9 @@ _TABLES = (
 
 def downgrade() -> None:
     connection = op.get_bind()
+    # Close the check/drop race: once emptiness is observed, no concurrent
+    # writer may insert a Gate-1 row before the additive tables are removed.
+    connection.execute(sa.text(f'LOCK TABLE {", ".join(_TABLES)} IN ACCESS EXCLUSIVE MODE'))
     for table in _TABLES:
         if connection.execute(sa.text(f'SELECT EXISTS (SELECT 1 FROM {table} LIMIT 1)')).scalar():
             raise RuntimeError(f'0103 downgrade refused: {table} contains rows')

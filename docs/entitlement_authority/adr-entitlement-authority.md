@@ -8,6 +8,11 @@ Status: **owner decisions approved; Gate 1 implementation only**.
   multi-tariff requires a new ADR/migration.
 - Immutable payment/sale evidence, AP terms and explicit authorized commands
   own desired access. Mutable `Subscription` is a legacy projection.
+- The coordinator loads the exact desired snapshot from the immutable source
+  referenced by the command. A caller-supplied snapshot is only a matching
+  assertion; it cannot authorize PATCH/CREATE or rewrite the durable hash.
+  Source hash/provenance/generation and owner/Panel identity binding are
+  revalidated at claim, mutation send-fence, UUID bind and finalization.
 - Panel GET/webhook data is observation only. Conflicting provenance is
   `unknown/quarantined`; last-write-wins is forbidden.
 
@@ -66,7 +71,9 @@ HMAC fingerprints. If no Panel binding exists and there is no unknown remote
 outcome, the same transaction records `cleanup_terminal` with no ciphertext.
 A preceding unknown mutation quarantines cleanup and blocks terminal state.
 Verified DELETE/canonical 404 clears ciphertext immediately; terminal evidence
-expires after 90 days, unresolved evidence does not.
+expires after 90 days, unresolved evidence does not. Once erasure begins, a
+stale source appender is rejected under the identity lock, late webhooks remain
+unlinked, and terminal/final states cannot regress or reintroduce snapshots.
 
 ## Consequences
 

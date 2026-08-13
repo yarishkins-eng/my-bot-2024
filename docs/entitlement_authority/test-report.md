@@ -8,14 +8,14 @@ controllable fake; no production adapter exists in Gate 1.
 
 - Phase 0 defect evidence: `12 passed` (the unsafe legacy behaviour remains
   reproducible and was not weakened).
-- Gate 1 entitlement suite: `98 passed`, no skipped.
-- APP-URL-only real-PostgreSQL harness: `67 passed`, proving that the test
+- Gate 1 entitlement suite: `110 passed`, no skipped.
+- APP-URL-only real-PostgreSQL harness: `79 passed`, proving that the test
   bootstrap does not replace `asyncpg` when only the application database URL
   is configured.
-- Exact 37-file affected manifest: `653 passed`, no skipped.
+- Exact 37-file affected manifest: `665 passed`, no skipped.
 - Real-PostgreSQL concurrency/fault subset: five consecutive runs of
-  `61 passed`, no skipped.
-- Full repository suite: `2529 passed, 5 skipped`; all five are existing
+  `73 passed`, no skipped.
+- Full repository suite: `2541 passed, 5 skipped`; all five skips are existing
   `tests/integration/test_device_first_postgres_constraints.py` cases skipped
   because their separate optional `DEVICE_FIRST_TEST_DATABASE_URL` was not
   configured. They are outside `tests/entitlement_authority` and outside every
@@ -40,6 +40,9 @@ controllable fake; no production adapter exists in Gate 1.
 - ✅ CREATE applied/lost/no-apply/kill: at most one DISABLED candidate and one POST.
 - ✅ kill after intent/send fence/POST/UUID bind/ACTIVE PATCH/canonical GET/final commit.
 - ✅ stale generation cannot finalize; generation is rechecked at send-fence.
+- ✅ caller-supplied bound/unbound snapshots cannot override the immutable
+  source or cause PATCH/CREATE; corrupt source/hash/binding stops before HTTP,
+  and a lost finalize fence can never write READY.
 - ✅ delayed server-side N after N+1: no N+1 mutation, late N never READY, quarantine persists.
 - ✅ a reclaimed stale command already marked sent remains a permanent
   mutation-possible fence; generation N+1 cannot mutate behind it.
@@ -66,6 +69,9 @@ controllable fake; no production adapter exists in Gate 1.
   evidence expires only after 90 days.
 - ✅ erasure with no Panel binding becomes terminal without a remote cleanup
   command or encrypted target, unless a prior remote outcome is unknown.
+- ✅ stale appenders waiting on the identity lock stop after erasure commit;
+  no owner/Panel PII or pending command can revive. Late webhooks stay unlinked
+  and repeated terminal marking cannot regress `final_erasure`.
 - ✅ schema JSON constraints reject extra PII keys and shadow has no DB/remote
   mutation boundary.
 - ✅ every startup writer registration is explicitly classified; unknown

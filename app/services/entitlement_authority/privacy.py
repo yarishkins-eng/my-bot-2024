@@ -223,8 +223,14 @@ async def mark_cleanup_terminal(
         (
             await session.execute(
                 text(
-                    'SELECT identity_id, remote_outcome_unknown FROM entitlement_cleanup_commands '
-                    'WHERE operation_id=:operation_id FOR UPDATE'
+                    """
+                    SELECT c.identity_id, c.remote_outcome_unknown, c.state,
+                           i.lifecycle_state
+                      FROM entitlement_cleanup_commands c
+                      JOIN entitlement_identities i ON i.id=c.identity_id
+                     WHERE c.operation_id=:operation_id
+                     FOR UPDATE OF c, i
+                    """
                 ),
                 {'operation_id': operation_id},
             )
@@ -232,6 +238,12 @@ async def mark_cleanup_terminal(
         .mappings()
         .one()
     )
+    if cleanup['state'] == 'cleanup_terminal':
+        if cleanup['lifecycle_state'] not in {'cleanup_terminal', 'final_erasure'}:
+            raise ValueError('cleanup terminal durable state mismatch')
+        return
+    if cleanup['lifecycle_state'] == 'final_erasure':
+        raise ValueError('final erasure cannot regress to cleanup terminal')
     if cleanup['remote_outcome_unknown']:
         raise ValueError('cleanup terminal requires contract-safe resolution of prior remote outcome')
     retention_until = now + timedelta(days=90)

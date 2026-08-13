@@ -4895,9 +4895,9 @@
     },
     {
       "access_relevant": false,
-      "entry_id": "cd59c3c4821b73749bd4aa70c8dfb20eed0a9c3b6fa58945036eeb2d9948c6d7",
+      "entry_id": "a9d816d726fcc1580e0558ceb7ea55017ac34bdf03a9c6e2d73dd4b4b27a27cc",
       "evidence": "exact desired/observed schema declaration, not a writer",
-      "line": 30,
+      "line": 31,
       "path": "app/services/entitlement_authority/coordinator.py",
       "primitive": "metadata_only",
       "section": "field_literals",
@@ -4906,29 +4906,7 @@
     },
     {
       "access_relevant": false,
-      "entry_id": "2a6905cb02649aa72680ee911c159fd9c350a8c6bc3e6e0586a578278cc5aa00",
-      "evidence": "exact desired/observed schema declaration, not a writer",
-      "line": 42,
-      "path": "app/services/entitlement_authority/coordinator.py",
-      "primitive": "metadata_only",
-      "section": "field_literals",
-      "surface": "desired_schema_literal",
-      "symbol": "normalize_panel_observation"
-    },
-    {
-      "access_relevant": false,
-      "entry_id": "50e102107e77636de46ca625e384c5122bbb7ae32e4cce39735a03e0042cd27e",
-      "evidence": "exact desired/observed schema declaration, not a writer",
-      "line": 42,
-      "path": "app/services/entitlement_authority/coordinator.py",
-      "primitive": "metadata_only",
-      "section": "field_literals",
-      "surface": "desired_schema_literal",
-      "symbol": "normalize_panel_observation"
-    },
-    {
-      "access_relevant": false,
-      "entry_id": "0535956e1119445c6dfdd569298008c26c96baa1cc6eed79572494b71088de6e",
+      "entry_id": "e417c99d15ba536b66039869aaf4b60a105c1fe3741d60f7a5372d8aadcd146d",
       "evidence": "exact desired/observed schema declaration, not a writer",
       "line": 43,
       "path": "app/services/entitlement_authority/coordinator.py",
@@ -4939,7 +4917,18 @@
     },
     {
       "access_relevant": false,
-      "entry_id": "6d00fd40bdef2cfea10abdeec0382d3934ccbbf7214c65824d6a31a48e470c02",
+      "entry_id": "fc33d5fe1ab2dafcbf5453451a7c1ed9075fc270e3e3ff4ac0c062aff1850da5",
+      "evidence": "exact desired/observed schema declaration, not a writer",
+      "line": 43,
+      "path": "app/services/entitlement_authority/coordinator.py",
+      "primitive": "metadata_only",
+      "section": "field_literals",
+      "surface": "desired_schema_literal",
+      "symbol": "normalize_panel_observation"
+    },
+    {
+      "access_relevant": false,
+      "entry_id": "6c6d9a9c6453534183f44e887b1867cc3249fee7e7c0163a4b51e555a77245ca",
       "evidence": "exact desired/observed schema declaration, not a writer",
       "line": 44,
       "path": "app/services/entitlement_authority/coordinator.py",
@@ -4950,7 +4939,7 @@
     },
     {
       "access_relevant": false,
-      "entry_id": "51a2cc24fc8ffdb0a999078977d5cebf69f49016af1974c9bfc7c95bd9c5da78",
+      "entry_id": "f0b0f5b2c16e388f4a30cacc41807749d28b615013b1ea07a59728bccffbd3ce",
       "evidence": "exact desired/observed schema declaration, not a writer",
       "line": 45,
       "path": "app/services/entitlement_authority/coordinator.py",
@@ -4961,7 +4950,7 @@
     },
     {
       "access_relevant": false,
-      "entry_id": "48ab5a3d0ed10f525b5a8e2ed97c2fdc8de5f032a2b305f38e72fe90fdc63da4",
+      "entry_id": "a3fd1957ec587995cd0c7bcd5c5f36da7262b850d807f2ff3a17c24c816d6c99",
       "evidence": "exact desired/observed schema declaration, not a writer",
       "line": 46,
       "path": "app/services/entitlement_authority/coordinator.py",
@@ -4972,9 +4961,20 @@
     },
     {
       "access_relevant": false,
-      "entry_id": "d113d818e7c31eddacccafab55aa8d75e4ba3ce2986c2a472274004852b47815",
+      "entry_id": "4982259504d83286bad54f6a8caf3652f74e74264ff743f2463687bbdef51d34",
       "evidence": "exact desired/observed schema declaration, not a writer",
-      "line": 48,
+      "line": 47,
+      "path": "app/services/entitlement_authority/coordinator.py",
+      "primitive": "metadata_only",
+      "section": "field_literals",
+      "surface": "desired_schema_literal",
+      "symbol": "normalize_panel_observation"
+    },
+    {
+      "access_relevant": false,
+      "entry_id": "d5e7a0db8fc60fb30d4f42afcb64bc9a74ad3b6a6b29bb7f0e2f15e2b311529e",
+      "evidence": "exact desired/observed schema declaration, not a writer",
+      "line": 49,
       "path": "app/services/entitlement_authority/coordinator.py",
       "primitive": "metadata_only",
       "section": "field_literals",
@@ -5093,9 +5093,9 @@
     },
     {
       "access_relevant": false,
-      "entry_id": "c997bb0897930fa7c8a1258c807f1b90e10cde314453bea3ca19d53ca1b0b6e5",
+      "entry_id": "b4053b55db9832a605aaeb9af8d70b63c23ad58f10aa345b7e1a89a114bfee17",
       "evidence": "exact desired/observed schema declaration, not a writer",
-      "line": 116,
+      "line": 119,
       "path": "app/services/entitlement_authority/types.py",
       "primitive": "metadata_only",
       "section": "field_literals",
@@ -23331,6 +23331,6 @@
     }
   ],
   "format": 1,
-  "inventory_sha256": "8f20df95a7cd084c6e3d841c7058627fa9c744c2c180bc0794d39f2c71878bde",
-  "sha256": "32920941a3f1787edc1775722c25dea4c6e3e930177c73df0196dbb53be8917f"
+  "inventory_sha256": "a8f44ac848e44205adef9dce9a15359b26f4fd40a746850cf038dd30381414c0",
+  "sha256": "ee4b7399b0964fb89adedbe45b5877ffd0d830cebd40d7cfc6470862da59db71"
 }

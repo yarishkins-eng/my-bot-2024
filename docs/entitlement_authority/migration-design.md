@@ -35,7 +35,9 @@
 - ✅ old-image model read/write on `0103` with startup migration deliberately
   skipped in the isolated probe; the application ignores additive tables.
 - ✅ downgrade guard rejects `0103 → 0102` as soon as any Gate 1 table has a
-  row. The guarded downgrade is an isolated compatibility proof, not the
+  row. It first takes one `ACCESS EXCLUSIVE` lock across all nine tables, so a
+  concurrent insert cannot race the emptiness check/drop transaction. The
+  guarded downgrade is an isolated compatibility proof, not the
   production recovery route. The protected `recover-after-migration.yml`
   instead pins the captured old image, sets `SKIP_MIGRATION=true`, verifies
   health/startup and permits it on the unchanged additive `0103` schema; this

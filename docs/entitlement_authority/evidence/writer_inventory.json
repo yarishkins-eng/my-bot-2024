@@ -2228,7 +2228,7 @@
     {
       "field": "activeInternalSquads",
       "function": "normalize_panel_observation",
-      "line": 30,
+      "line": 31,
       "path": "app/services/entitlement_authority/coordinator.py"
     },
     {
@@ -2348,7 +2348,7 @@
     {
       "field": "expireAt",
       "function": "normalize_panel_observation",
-      "line": 43,
+      "line": 44,
       "path": "app/services/entitlement_authority/coordinator.py"
     },
     {
@@ -2396,7 +2396,7 @@
     {
       "field": "externalSquadUuid",
       "function": "normalize_panel_observation",
-      "line": 48,
+      "line": 49,
       "path": "app/services/entitlement_authority/coordinator.py"
     },
     {
@@ -2492,7 +2492,7 @@
     {
       "field": "hwidDeviceLimit",
       "function": "normalize_panel_observation",
-      "line": 46,
+      "line": 47,
       "path": "app/services/entitlement_authority/coordinator.py"
     },
     {
@@ -3812,7 +3812,7 @@
     {
       "field": "status",
       "function": "from_mapping",
-      "line": 116,
+      "line": 119,
       "path": "app/services/entitlement_authority/types.py"
     },
     {
@@ -4436,13 +4436,13 @@
     {
       "field": "status",
       "function": "normalize_panel_observation",
-      "line": 42,
+      "line": 43,
       "path": "app/services/entitlement_authority/coordinator.py"
     },
     {
       "field": "status",
       "function": "normalize_panel_observation",
-      "line": 42,
+      "line": 43,
       "path": "app/services/entitlement_authority/coordinator.py"
     },
     {
@@ -5438,7 +5438,7 @@
     {
       "field": "trafficLimitBytes",
       "function": "normalize_panel_observation",
-      "line": 44,
+      "line": 45,
       "path": "app/services/entitlement_authority/coordinator.py"
     },
     {
@@ -5474,7 +5474,7 @@
     {
       "field": "trafficLimitStrategy",
       "function": "normalize_panel_observation",
-      "line": 45,
+      "line": 46,
       "path": "app/services/entitlement_authority/coordinator.py"
     },
     {
@@ -14445,7 +14445,7 @@
     "app/**/*.py",
     "main.py"
   ],
-  "sha256": "8f20df95a7cd084c6e3d841c7058627fa9c744c2c180bc0794d39f2c71878bde",
+  "sha256": "a8f44ac848e44205adef9dce9a15359b26f4fd40a746850cf038dd30381414c0",
   "startup_registrations": [
     {
       "call": "asyncio.create_task(                                     _refresh_remnawave_description(                                         remnawave_uuid=sub.remnawave_uuid,                                         description=description,                                         telegram_id=db_user.telegram_id",

@@ -106,6 +106,9 @@ class EntitlementSnapshot:
             'external_squad_uuid',
             'provenance',
             'generation',
+            'reset_epoch',
+            'revoke_epoch',
+            'deny_overlays',
         }
         missing = required - value.keys()
         if missing:
@@ -124,9 +127,9 @@ class EntitlementSnapshot:
             ),
             provenance=str(value['provenance']),
             generation=int(value['generation']),
-            reset_epoch=int(value.get('reset_epoch', 0)),
-            revoke_epoch=int(value.get('revoke_epoch', 0)),
-            deny_overlays=tuple(str(item) for item in value.get('deny_overlays', ())),
+            reset_epoch=int(value['reset_epoch']),
+            revoke_epoch=int(value['revoke_epoch']),
+            deny_overlays=tuple(str(item) for item in value['deny_overlays']),
         )
 
 

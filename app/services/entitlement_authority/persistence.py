@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -22,6 +23,49 @@ class CommandClaim:
     panel_uuid: str | None
     deterministic_create_key: str | None
     reason: str | None = None
+    desired_snapshot: EntitlementSnapshot | None = None
+
+
+def _durable_desired_snapshot(
+    *,
+    identity: Mapping[str, object],
+    command: Mapping[str, object],
+    source: Mapping[str, object] | None,
+) -> EntitlementSnapshot:
+    """Validate and return the immutable source bound to current identity state."""
+
+    if source is None:
+        raise ValueError('durable_source_missing')
+    if (
+        source['identity_id'] != identity['id']
+        or source['generation'] != command['generation']
+        or source['authority_state'] != 'authorized'
+    ):
+        raise ValueError('durable_source_fence_mismatch')
+    raw_snapshot = source['desired_snapshot']
+    if not isinstance(raw_snapshot, Mapping):
+        raise ValueError('durable_source_snapshot_invalid')
+    snapshot = EntitlementSnapshot.from_mapping(raw_snapshot)
+    if (
+        snapshot.generation != source['generation']
+        or snapshot.provenance != source['provenance']
+        or snapshot.desired_hash != source['desired_hash']
+        or snapshot.owner_key != identity['deterministic_owner_key']
+    ):
+        raise ValueError('durable_source_hash_mismatch')
+    panel_uuid = identity['panel_uuid']
+    if panel_uuid is None:
+        if snapshot.panel_uuid is not None:
+            raise ValueError('durable_source_identity_binding_mismatch')
+        expected = snapshot
+    else:
+        panel_uuid = str(panel_uuid)
+        if snapshot.panel_uuid not in {None, panel_uuid}:
+            raise ValueError('durable_source_identity_binding_mismatch')
+        expected = snapshot if snapshot.panel_uuid == panel_uuid else snapshot.bind(panel_uuid)
+    if command['desired_hash'] != expected.desired_hash:
+        raise ValueError('durable_command_hash_mismatch')
+    return expected
 
 
 class PostgresEntitlementStore:
@@ -69,6 +113,57 @@ class PostgresEntitlementStore:
                 .mappings()
                 .one()
             )
+            source = (
+                (
+                    await session.execute(
+                        text('SELECT * FROM entitlement_source_revisions WHERE id=:id'),
+                        {'id': command['source_revision_id']},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            try:
+                desired_snapshot = _durable_desired_snapshot(
+                    identity=identity,
+                    command=command,
+                    source=source,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                reason = str(exc) or 'durable_source_invalid'
+                await session.execute(
+                    text(
+                        """
+                        UPDATE entitlement_identities
+                           SET lifecycle_state='quarantined', quarantine_code=:reason, updated_at=:now
+                         WHERE id=:identity_id
+                           AND lifecycle_state NOT IN
+                               ('erasure_requested', 'cleanup_terminal', 'final_erasure')
+                        """
+                    ),
+                    {'identity_id': identity_id, 'reason': reason, 'now': now},
+                )
+                await session.execute(
+                    text(
+                        """
+                        UPDATE entitlement_projection_commands
+                           SET stage='quarantined', last_error_code=:reason,
+                               lease_owner=NULL, lease_expires_at=NULL, updated_at=:now
+                         WHERE id=:id
+                        """
+                    ),
+                    {'id': command_id, 'reason': reason, 'now': now},
+                )
+                return CommandClaim(
+                    command_id=command_id,
+                    identity_id=identity_id,
+                    generation=command['generation'],
+                    lease_epoch=command['lease_epoch'],
+                    mode='invalid',
+                    panel_uuid=identity['panel_uuid'],
+                    deterministic_create_key=command['deterministic_create_key'],
+                    reason=reason,
+                )
             if (
                 command['lease_owner']
                 and command['lease_owner'] != worker
@@ -84,6 +179,7 @@ class PostgresEntitlementStore:
                     panel_uuid=identity['panel_uuid'],
                     deterministic_create_key=command['deterministic_create_key'],
                     reason='lease_active',
+                    desired_snapshot=desired_snapshot,
                 )
             competing = (
                 await session.execute(
@@ -173,6 +269,7 @@ class PostgresEntitlementStore:
                 panel_uuid=identity['panel_uuid'],
                 deterministic_create_key=command['deterministic_create_key'],
                 reason=transition.reason,
+                desired_snapshot=desired_snapshot,
             )
 
     async def mark_mutation_sent(self, claim: CommandClaim, *, stage: Stage, now: datetime) -> None:
@@ -182,7 +279,10 @@ class PostgresEntitlementStore:
             identity = (
                 (
                     await session.execute(
-                        text('SELECT generation, lifecycle_state FROM entitlement_identities WHERE id=:id FOR UPDATE'),
+                        text(
+                            'SELECT id, generation, lifecycle_state, panel_uuid, deterministic_owner_key '
+                            'FROM entitlement_identities WHERE id=:id FOR UPDATE'
+                        ),
                         {'id': claim.identity_id},
                     )
                 )
@@ -193,7 +293,7 @@ class PostgresEntitlementStore:
                 (
                     await session.execute(
                         text(
-                            'SELECT generation, lease_epoch, remote_outcome_unknown '
+                            'SELECT generation, lease_epoch, remote_outcome_unknown, desired_hash, source_revision_id '
                             'FROM entitlement_projection_commands WHERE id=:id FOR UPDATE'
                         ),
                         {'id': claim.command_id},
@@ -202,6 +302,28 @@ class PostgresEntitlementStore:
                 .mappings()
                 .one()
             )
+            source = (
+                (
+                    await session.execute(
+                        text('SELECT * FROM entitlement_source_revisions WHERE id=:id'),
+                        {'id': command['source_revision_id']},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            try:
+                durable_desired = _durable_desired_snapshot(
+                    identity=identity,
+                    command=command,
+                    source=source,
+                )
+                desired_fence_lost = (
+                    claim.desired_snapshot is None
+                    or claim.desired_snapshot.desired_hash != durable_desired.desired_hash
+                )
+            except (KeyError, TypeError, ValueError):
+                desired_fence_lost = True
             if (
                 identity['generation'] != claim.generation
                 or identity['lifecycle_state']
@@ -209,6 +331,7 @@ class PostgresEntitlementStore:
                 or command['generation'] != claim.generation
                 or command['lease_epoch'] != claim.lease_epoch
                 or command['remote_outcome_unknown']
+                or desired_fence_lost
             ):
                 raise RuntimeError('mutation_fence_lost')
             await session.execute(
@@ -254,7 +377,7 @@ class PostgresEntitlementStore:
                 (
                     await session.execute(
                         text(
-                            'SELECT id, generation, lifecycle_state, panel_uuid '
+                            'SELECT id, generation, lifecycle_state, panel_uuid, deterministic_owner_key '
                             'FROM entitlement_identities WHERE id = ANY(:identity_ids) ORDER BY id FOR UPDATE'
                         ),
                         {'identity_ids': identity_ids},
@@ -269,13 +392,24 @@ class PostgresEntitlementStore:
                 (
                     await session.execute(
                         text(
-                            'SELECT generation, lease_epoch, stage FROM entitlement_projection_commands WHERE id=:id FOR UPDATE'
+                            'SELECT generation, lease_epoch, stage, desired_hash, source_revision_id '
+                            'FROM entitlement_projection_commands WHERE id=:id FOR UPDATE'
                         ),
                         {'id': claim.command_id},
                     )
                 )
                 .mappings()
                 .one()
+            )
+            source = (
+                (
+                    await session.execute(
+                        text('SELECT * FROM entitlement_source_revisions WHERE id=:id'),
+                        {'id': command['source_revision_id']},
+                    )
+                )
+                .mappings()
+                .one_or_none()
             )
             if conflict_id is not None:
                 await session.execute(
@@ -308,7 +442,8 @@ class PostgresEntitlementStore:
                 return False
             if (
                 identity['generation'] != claim.generation
-                or identity['lifecycle_state'] in {'quarantined', 'remote_outcome_unknown'}
+                or identity['lifecycle_state']
+                in {'quarantined', 'remote_outcome_unknown', 'erasure_requested', 'cleanup_terminal', 'final_erasure'}
                 or command['generation'] != claim.generation
                 or command['lease_epoch'] != claim.lease_epoch
                 or command['stage'] != Stage.CREATING_DISABLED.value
@@ -316,6 +451,21 @@ class PostgresEntitlementStore:
                 raise RuntimeError('uuid_bind_fence_lost')
             if identity['panel_uuid'] not in {None, panel_uuid}:
                 raise RuntimeError('cross_identity_uuid_bind')
+            try:
+                durable_desired = _durable_desired_snapshot(
+                    identity=identity,
+                    command=command,
+                    source=source,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError('uuid_bind_desired_fence_lost') from exc
+            if (
+                claim.desired_snapshot is None
+                or claim.desired_snapshot.desired_hash != durable_desired.desired_hash
+                or durable_desired.panel_uuid is not None
+                or bound_desired_hash != durable_desired.bind(panel_uuid).desired_hash
+            ):
+                raise RuntimeError('uuid_bind_desired_fence_lost')
             await session.execute(
                 text(
                     """
@@ -463,7 +613,10 @@ class PostgresEntitlementStore:
             identity = (
                 (
                     await session.execute(
-                        text('SELECT generation, lifecycle_state FROM entitlement_identities WHERE id=:id FOR UPDATE'),
+                        text(
+                            'SELECT id, generation, lifecycle_state, panel_uuid, deterministic_owner_key '
+                            'FROM entitlement_identities WHERE id=:id FOR UPDATE'
+                        ),
                         {'id': claim.identity_id},
                     )
                 )
@@ -474,7 +627,9 @@ class PostgresEntitlementStore:
                 (
                     await session.execute(
                         text(
-                            'SELECT generation, lease_epoch, stage, remote_outcome_unknown, desired_hash FROM entitlement_projection_commands WHERE id=:id FOR UPDATE'
+                            'SELECT generation, lease_epoch, stage, remote_outcome_unknown, '
+                            'desired_hash, source_revision_id '
+                            'FROM entitlement_projection_commands WHERE id=:id FOR UPDATE'
                         ),
                         {'id': claim.command_id},
                     )
@@ -482,6 +637,29 @@ class PostgresEntitlementStore:
                 .mappings()
                 .one()
             )
+            source = (
+                (
+                    await session.execute(
+                        text('SELECT * FROM entitlement_source_revisions WHERE id=:id'),
+                        {'id': command['source_revision_id']},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            try:
+                durable_desired = _durable_desired_snapshot(
+                    identity=identity,
+                    command=command,
+                    source=source,
+                )
+                desired_fence_lost = (
+                    claim.desired_snapshot is None
+                    or claim.desired_snapshot.desired_hash != durable_desired.desired_hash
+                    or comparison.desired_hash != durable_desired.desired_hash
+                )
+            except (KeyError, TypeError, ValueError):
+                desired_fence_lost = True
             transition = finalize_transition(
                 command_generation=command['generation'],
                 current_generation=identity['generation'],
@@ -494,19 +672,42 @@ class PostgresEntitlementStore:
                 or command['stage'] != Stage.VERIFYING.value
                 or command['desired_hash'] != comparison.desired_hash
                 or identity['lifecycle_state'] == 'quarantined'
+                or desired_fence_lost
             ):
+                fence_failure = transition.may_finalize
+                reason = 'finalize_fence_lost' if fence_failure else (transition.reason or 'finalize_rejected')
+                failed_stage = Stage.QUARANTINED.value if fence_failure else transition.stage.value
+                if fence_failure:
+                    await session.execute(
+                        text(
+                            """
+                            UPDATE entitlement_identities
+                               SET lifecycle_state='quarantined', quarantine_code=:reason, updated_at=:now
+                             WHERE id=:identity_id AND generation=:generation
+                               AND lifecycle_state NOT IN
+                                   ('erasure_requested', 'cleanup_terminal', 'final_erasure')
+                            """
+                        ),
+                        {
+                            'identity_id': claim.identity_id,
+                            'generation': claim.generation,
+                            'reason': reason,
+                            'now': now,
+                        },
+                    )
                 await session.execute(
                     text(
                         """
                         UPDATE entitlement_projection_commands
-                           SET stage=:stage, last_error_code=:reason, updated_at=:now
+                           SET stage=:stage, last_error_code=:reason,
+                               lease_owner=NULL, lease_expires_at=NULL, updated_at=:now
                          WHERE id=:id
                         """
                     ),
                     {
                         'id': claim.command_id,
-                        'stage': transition.stage.value,
-                        'reason': transition.reason or 'finalize_fence_lost',
+                        'stage': failed_stage,
+                        'reason': reason,
                         'now': now,
                     },
                 )
@@ -581,13 +782,34 @@ async def append_source_and_command(
     identity = (
         (
             await session.execute(
-                text('SELECT generation FROM entitlement_identities WHERE id=:id FOR UPDATE'),
+                text(
+                    """
+                    SELECT i.generation, i.lifecycle_state, i.erasure_requested_at,
+                           i.cleanup_terminal_at, i.deterministic_owner_key, i.panel_uuid,
+                           EXISTS (
+                               SELECT 1 FROM entitlement_cleanup_commands c
+                                WHERE c.identity_id=i.id
+                           ) AS has_cleanup_command
+                      FROM entitlement_identities i
+                     WHERE i.id=:id
+                     FOR UPDATE
+                    """
+                ),
                 {'id': identity_id},
             )
         )
         .mappings()
         .one()
     )
+    if (
+        identity['lifecycle_state'] in {'erasure_requested', 'cleanup_terminal', 'final_erasure'}
+        or identity['erasure_requested_at'] is not None
+        or identity['cleanup_terminal_at'] is not None
+        or identity['has_cleanup_command']
+    ):
+        raise ValueError('identity_erasure_in_progress_or_complete')
+    if snapshot.owner_key != identity['deterministic_owner_key'] or snapshot.panel_uuid != identity['panel_uuid']:
+        raise ValueError('snapshot_identity_binding_mismatch')
     existing = (
         (
             await session.execute(
@@ -738,7 +960,24 @@ async def ingest_webhook_observation(
             INSERT INTO entitlement_webhook_inbox
                    (identity_id, event_id_hash, event_type, normalized_hash,
                     event_timestamp, received_at, retention_until)
-            VALUES (:identity_id, :event_id_hash, :event_type, :normalized_hash,
+            VALUES (
+                    CASE
+                        WHEN CAST(:identity_id AS bigint) IS NULL THEN NULL
+                        WHEN EXISTS (
+                            SELECT 1 FROM entitlement_identities i
+                             WHERE i.id=CAST(:identity_id AS bigint)
+                               AND i.lifecycle_state NOT IN
+                                   ('erasure_requested', 'cleanup_terminal', 'final_erasure')
+                               AND i.erasure_requested_at IS NULL
+                               AND i.cleanup_terminal_at IS NULL
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM entitlement_cleanup_commands c
+                                    WHERE c.identity_id=i.id
+                               )
+                        ) THEN CAST(:identity_id AS bigint)
+                        ELSE NULL
+                    END,
+                    :event_id_hash, :event_type, :normalized_hash,
                     :event_timestamp, :now, :retention)
             ON CONFLICT (event_id_hash) DO NOTHING
             RETURNING id

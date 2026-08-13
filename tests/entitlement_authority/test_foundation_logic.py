@@ -50,7 +50,15 @@ def test_exact_comparator_preserves_zero_empty_and_explicit_null() -> None:
 
 def test_normalizer_rejects_missing_empty_null_fields_and_naive_expiry() -> None:
     value = snapshot().canonical()
-    for key in ('internal_squads', 'external_squad_uuid', 'hwid_device_limit', 'traffic_limit_bytes'):
+    for key in (
+        'internal_squads',
+        'external_squad_uuid',
+        'hwid_device_limit',
+        'traffic_limit_bytes',
+        'reset_epoch',
+        'revoke_epoch',
+        'deny_overlays',
+    ):
         incomplete = dict(value)
         incomplete.pop(key)
         with pytest.raises(ValueError, match='missing exact'):

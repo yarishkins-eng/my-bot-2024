@@ -276,6 +276,30 @@ async def test_erasure_two_stage_encryption_terminal_clear_and_ninety_day_retent
             )
         ).scalar_one()
         assert state == 'final_erasure'
+        original_retention = cleanup.retention_until
+    async with sessions() as session, session.begin():
+        await mark_cleanup_terminal(
+            session,
+            operation_id=operation_id,
+            verified_absent=True,
+            now=NOW + timedelta(days=30),
+        )
+    async with sessions() as session:
+        repeated = (
+            await session.execute(
+                text(
+                    """
+                    SELECT c.retention_until, i.lifecycle_state
+                      FROM entitlement_cleanup_commands c
+                      JOIN entitlement_identities i ON i.id=c.identity_id
+                     WHERE c.operation_id=:operation_id
+                    """
+                ),
+                {'operation_id': operation_id},
+            )
+        ).one()
+        assert repeated.retention_until == original_retention
+        assert repeated.lifecycle_state == 'final_erasure'
     async with sessions() as session, session.begin():
         before = await housekeep_terminal_evidence(session, now=NOW + timedelta(days=90))
         assert before['cleanup_commands'] == 0 and before['tombstones'] == 0

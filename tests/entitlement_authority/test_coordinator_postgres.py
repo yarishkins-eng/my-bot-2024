@@ -21,7 +21,7 @@ from app.services.entitlement_authority.persistence import (
     ingest_webhook_observation,
     lock_entitlement_context,
 )
-from app.services.entitlement_authority.privacy import request_erasure_cleanup
+from app.services.entitlement_authority.privacy import mark_final_erasure, request_erasure_cleanup
 from app.services.entitlement_authority.state_machine import Stage
 from app.services.entitlement_authority.strict_panel import StrictPanelClient, panel_owner_username
 from app.services.entitlement_authority.types import EntitlementSnapshot, compare_snapshots
@@ -254,6 +254,155 @@ async def test_existing_binding_stale_fields_never_ready_before_exact(
     assert state['stage'] == 'quarantined'
     assert state['verified_generation'] is None
     assert fake.count('POST') == 0 and fake.count('PATCH') == 1
+
+
+@pytest.mark.asyncio
+async def test_caller_snapshot_cannot_override_bound_durable_source(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    authorized = desired()
+    forged = replace(authorized, status='DISABLED')
+    _identity, command_id, store = await make_command(sessions, authorized, source_key='forged-bound')
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(authorized)
+
+    result = await coordinator(store, fake).project_command(command_id, forged, worker='worker-one', now=NOW)
+
+    state = await command_state(sessions, command_id)
+    assert result == 'quarantined'
+    assert state['stage'] == 'quarantined' and state['last_error_code'] == 'caller_desired_mismatch'
+    assert fake.states['panel-existing']['status'] == 'ACTIVE'
+    assert fake.count('POST') == 0 and fake.count('PATCH') == 0
+
+
+@pytest.mark.asyncio
+async def test_caller_snapshot_cannot_override_unbound_durable_source_or_create(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    authorized = desired(panel_uuid=None)
+    forged = replace(authorized, status='LIMITED', traffic_limit_bytes=123456)
+    _identity, command_id, store = await make_command(sessions, authorized, source_key='forged-unbound')
+    fake = FakePanelTransport()
+
+    result = await coordinator(store, fake).project_command(command_id, forged, worker='worker-one', now=NOW)
+
+    state = await command_state(sessions, command_id)
+    async with sessions() as session:
+        hashes = (
+            await session.execute(
+                text(
+                    """
+                    SELECT c.desired_hash, s.desired_hash
+                      FROM entitlement_projection_commands c
+                      JOIN entitlement_source_revisions s ON s.id=c.source_revision_id
+                     WHERE c.id=:id
+                    """
+                ),
+                {'id': command_id},
+            )
+        ).one()
+    assert result == 'quarantined'
+    assert state['stage'] == 'quarantined' and state['panel_uuid'] is None
+    assert hashes[0] == hashes[1] == authorized.desired_hash
+    assert fake.count('POST') == 0 and fake.count('PATCH') == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_hash_fence_never_writes_false_ready(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    authorized = desired()
+    forged = replace(authorized, status='DISABLED')
+    _identity, command_id, store = await make_command(sessions, authorized, source_key='forged-finalize')
+    claim = await store.claim_entitlement_command(command_id, worker='worker-one', now=NOW)
+    await store.mark_mutation_sent(claim, stage=Stage.MUTATING, now=NOW)
+    await store.mark_verifying(claim, now=NOW)
+
+    assert not await store.finalize_entitlement_command(
+        claim,
+        compare_snapshots(forged, forged),
+        now=NOW,
+    )
+    state = await command_state(sessions, command_id)
+    assert state['stage'] == 'quarantined'
+    assert state['lifecycle_state'] == 'quarantined'
+    assert state['verified_generation'] is None
+    assert state['last_error_code'] == 'finalize_fence_lost'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bound', [True, False])
+async def test_corrupt_durable_source_stops_before_any_panel_mutation(
+    sessions: async_sessionmaker[AsyncSession],
+    bound: bool,
+) -> None:
+    authorized = desired(panel_uuid='panel-existing' if bound else None)
+    _identity, command_id, store = await make_command(
+        sessions,
+        authorized,
+        source_key=f'corrupt-source-{bound}',
+    )
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text(
+                """
+                UPDATE entitlement_source_revisions
+                   SET desired_snapshot=jsonb_set(desired_snapshot, '{status}', '"DISABLED"'::jsonb)
+                 WHERE identity_id=:identity_id
+                """
+            ),
+            {'identity_id': _identity},
+        )
+    fake = FakePanelTransport()
+    if bound:
+        fake.states['panel-existing'] = raw(authorized)
+
+    result = await coordinator(store, fake).project_command(command_id, authorized, worker='worker-one', now=NOW)
+
+    state = await command_state(sessions, command_id)
+    assert result == 'quarantined'
+    assert state['stage'] == 'quarantined' and state['last_error_code'] == 'durable_source_hash_mismatch'
+    assert fake.count('POST') == 0 and fake.count('PATCH') == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'mismatch',
+    [
+        {'owner_key': 'different-owner'},
+        {'panel_uuid': 'different-panel'},
+    ],
+)
+async def test_append_snapshot_must_match_locked_identity_binding(
+    sessions: async_sessionmaker[AsyncSession],
+    mismatch: dict[str, object],
+) -> None:
+    first = desired()
+    identity_id, _command_id, _store = await make_command(sessions, first, source_key='binding-first')
+    second = replace(first, generation=2, **mismatch)
+    with pytest.raises(ValueError, match='snapshot_identity_binding_mismatch'):
+        async with sessions() as session, session.begin():
+            await append_source_and_command(
+                session,
+                identity_id=identity_id,
+                source_type='financial',
+                source_key=f'binding-{next(iter(mismatch))}',
+                source_fingerprint='a' * 64,
+                snapshot=second,
+            )
+    async with sessions() as session:
+        assert (
+            await session.execute(
+                text('SELECT count(*) FROM entitlement_source_revisions WHERE identity_id=:id'),
+                {'id': identity_id},
+            )
+        ).scalar_one() == 1
+        assert (
+            await session.execute(
+                text('SELECT generation FROM entitlement_identities WHERE id=:id'),
+                {'id': identity_id},
+            )
+        ).scalar_one() == 1
 
 
 @pytest.mark.asyncio
@@ -715,6 +864,117 @@ async def test_erasure_at_every_remote_barrier_severs_pii_and_never_allows_stale
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_state', ['erasure_requested', 'cleanup_terminal', 'final_erasure'])
+async def test_append_after_erasure_fails_closed_without_reintroducing_pii(
+    sessions: async_sessionmaker[AsyncSession],
+    terminal_state: str,
+) -> None:
+    panel_uuid = 'panel-existing' if terminal_state == 'erasure_requested' else None
+    first = desired(panel_uuid=panel_uuid)
+    identity_id, _command_id, _store = await make_command(
+        sessions,
+        first,
+        source_key=f'erasure-append-{terminal_state}',
+    )
+    async with sessions() as session, session.begin():
+        await request_erasure_cleanup(session, identity_id=identity_id, secret=SECRET, now=NOW)
+        if terminal_state == 'final_erasure':
+            await mark_final_erasure(session, identity_id=identity_id, now=NOW + timedelta(seconds=1))
+
+    stale_snapshot = replace(first, generation=3)
+    with pytest.raises(ValueError, match='identity_erasure_in_progress_or_complete'):
+        async with sessions() as session, session.begin():
+            await append_source_and_command(
+                session,
+                identity_id=identity_id,
+                source_type='financial',
+                source_key=f'post-erasure-{terminal_state}',
+                source_fingerprint=hashlib.sha256(terminal_state.encode()).hexdigest(),
+                snapshot=stale_snapshot,
+            )
+
+    async with sessions() as session:
+        identity = (
+            await session.execute(
+                text(
+                    'SELECT generation, lifecycle_state, user_id, panel_uuid FROM entitlement_identities WHERE id=:id'
+                ),
+                {'id': identity_id},
+            )
+        ).one()
+        snapshots = list(
+            (
+                await session.execute(
+                    text('SELECT desired_snapshot::text FROM entitlement_source_revisions WHERE identity_id=:id'),
+                    {'id': identity_id},
+                )
+            ).scalars()
+        )
+        pending = (
+            await session.execute(
+                text("SELECT count(*) FROM entitlement_projection_commands WHERE identity_id=:id AND stage='pending'"),
+                {'id': identity_id},
+            )
+        ).scalar_one()
+        assert identity == (2, terminal_state, None, None)
+        assert snapshots == [] and pending == 0
+
+
+@pytest.mark.asyncio
+async def test_append_waiting_on_identity_lock_stops_after_erasure_commit(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    first = desired()
+    identity_id, _command_id, _store = await make_command(sessions, first, source_key='stale-erasure-waiter')
+    stale_snapshot = replace(first, generation=3)
+
+    async with sessions() as eraser:
+        erasure_transaction = await eraser.begin()
+        await request_erasure_cleanup(eraser, identity_id=identity_id, secret=SECRET, now=NOW)
+
+        async def stale_append() -> tuple[int, int]:
+            async with sessions() as session, session.begin():
+                return await append_source_and_command(
+                    session,
+                    identity_id=identity_id,
+                    source_type='financial',
+                    source_key='stale-waiter-after-erasure',
+                    source_fingerprint='f' * 64,
+                    snapshot=stale_snapshot,
+                )
+
+        waiter = asyncio.create_task(stale_append())
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        await erasure_transaction.commit()
+        with pytest.raises(ValueError, match='identity_erasure_in_progress_or_complete'):
+            await waiter
+
+    async with sessions() as session:
+        identity = (
+            await session.execute(
+                text(
+                    'SELECT generation, lifecycle_state, user_id, panel_uuid FROM entitlement_identities WHERE id=:id'
+                ),
+                {'id': identity_id},
+            )
+        ).one()
+        assert identity == (2, 'erasure_requested', None, None)
+        assert (
+            await session.execute(
+                text('SELECT count(*) FROM entitlement_source_revisions WHERE identity_id=:id'),
+                {'id': identity_id},
+            )
+        ).scalar_one() == 0
+        assert (
+            await session.execute(
+                text("SELECT count(*) FROM entitlement_projection_commands WHERE identity_id=:id AND stage='pending'"),
+                {'id': identity_id},
+            )
+        ).scalar_one() == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('candidates', ['multiple', 'foreign'])
 async def test_shared_or_cross_owner_deterministic_candidate_quarantines(
     sessions: async_sessionmaker[AsyncSession],
@@ -805,6 +1065,33 @@ async def test_duplicate_reordered_webhooks_do_not_change_desired_source(
 
 
 @pytest.mark.asyncio
+async def test_webhook_after_erasure_cannot_relink_identity(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired()
+    identity_id, _command_id, _store = await make_command(sessions, target, source_key='webhook-erasure')
+    async with sessions() as session, session.begin():
+        await request_erasure_cleanup(session, identity_id=identity_id, secret=SECRET, now=NOW)
+        assert await ingest_webhook_observation(
+            session,
+            identity_id=identity_id,
+            event_id_hash='e' * 64,
+            event_type='user.modified',
+            normalized_hash='f' * 64,
+            event_timestamp=NOW,
+            now=NOW + timedelta(seconds=1),
+        )
+    async with sessions() as session:
+        linked_identity = (
+            await session.execute(
+                text('SELECT identity_id FROM entitlement_webhook_inbox WHERE event_id_hash=:event_id_hash'),
+                {'event_id_hash': 'e' * 64},
+            )
+        ).scalar_one_or_none()
+        assert linked_identity is None
+
+
+@pytest.mark.asyncio
 async def test_duplicate_provider_callback_is_one_source_and_stale_notification_is_cancelled(
     sessions: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -876,9 +1163,13 @@ async def test_financial_transaction_rollback_leaves_zero_source_and_command(
         identity_id = (
             await session.execute(
                 text(
-                    'INSERT INTO entitlement_identities(operation_id, deterministic_owner_key) VALUES (:op, :owner) RETURNING id'
+                    """
+                    INSERT INTO entitlement_identities(operation_id, deterministic_owner_key, panel_uuid)
+                    VALUES (:op, :owner, :panel_uuid)
+                    RETURNING id
+                    """
                 ),
-                {'op': str(uuid.uuid4()), 'owner': target.owner_key},
+                {'op': str(uuid.uuid4()), 'owner': target.owner_key, 'panel_uuid': target.panel_uuid},
             )
         ).scalar_one()
     async with sessions() as session:

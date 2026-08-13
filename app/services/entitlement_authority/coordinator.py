@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -125,8 +126,13 @@ class ProjectionCoordinator:
         claim = await self._store.claim_entitlement_command(command_id, worker=worker, now=clock)
         if claim.mode == 'busy':
             return 'busy'
-        if claim.generation != desired.generation:
-            return 'cancelled'
+        if claim.mode == 'invalid' or claim.desired_snapshot is None:
+            return 'quarantined'
+        provided = desired.bind(claim.panel_uuid) if claim.panel_uuid else desired
+        if provided.desired_hash != claim.desired_snapshot.desired_hash:
+            await self._store.quarantine(claim, code='caller_desired_mismatch', unknown=False, now=clock)
+            return 'quarantined'
+        desired = claim.desired_snapshot
         if claim.mode == 'observe':
             return await self._observe_only(claim, desired, now=clock)
         await self._hit('after_intent')
@@ -172,6 +178,7 @@ class ProjectionCoordinator:
                 return 'quarantined'
             await self._hit('after_uuid_bind')
             bound = desired.bind(receipt.panel_uuid)
+            claim = replace(claim, panel_uuid=receipt.panel_uuid, desired_snapshot=bound)
 
         try:
             await self._store.mark_mutation_sent(claim, stage=Stage.MUTATING, now=clock)
