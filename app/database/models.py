@@ -22,6 +22,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Table,
     Text,
@@ -2158,6 +2159,274 @@ class AccountErasureRequest(Base):
     user = relationship('User', foreign_keys=[user_id])
     requested_by = relationship('User', foreign_keys=[requested_by_user_id])
     financial_resolved_by = relationship('User', foreign_keys=[financial_resolved_by_user_id])
+
+
+class EntitlementIdentity(Base):
+    """User-scoped operational binding for the dormant entitlement authority.
+
+    The table deliberately contains no Telegram/email/name/link/provider
+    payload.  ``user_id`` and the raw Panel UUID are cleared at the first
+    erasure stage; an unresolved encrypted cleanup target lives only in the
+    restricted cleanup command below.
+    """
+
+    __tablename__ = 'entitlement_identities'
+    __table_args__ = (
+        UniqueConstraint('user_id', name='uq_entitlement_identities_user'),
+        UniqueConstraint('operation_id', name='uq_entitlement_identities_operation'),
+        UniqueConstraint('panel_uuid', name='uq_entitlement_identities_panel_uuid'),
+        CheckConstraint('generation >= 0', name='ck_entitlement_identities_generation'),
+        CheckConstraint(
+            'verified_generation IS NULL OR verified_generation <= generation',
+            name='ck_entitlement_identities_verified_generation',
+        ),
+        CheckConstraint('reset_epoch >= 0 AND revoke_epoch >= 0', name='ck_entitlement_identities_epochs'),
+        Index('ix_entitlement_identities_lifecycle_updated', 'lifecycle_state', 'updated_at'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    operation_id = Column(String(36), nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    deterministic_owner_key = Column(String(64), nullable=False, unique=True)
+    panel_uuid = Column(String(36), nullable=True)
+    panel_uuid_hmac = Column(String(64), nullable=True)
+    generation = Column(BigInteger, nullable=False, default=0, server_default='0')
+    verified_generation = Column(BigInteger, nullable=True)
+    lifecycle_state = Column(String(40), nullable=False, default='dormant', server_default='dormant')
+    quarantine_code = Column(String(64), nullable=True)
+    remote_outcome_unknown_generation = Column(BigInteger, nullable=True)
+    reset_epoch = Column(BigInteger, nullable=False, default=0, server_default='0')
+    revoke_epoch = Column(BigInteger, nullable=False, default=0, server_default='0')
+    erasure_requested_at = Column(AwareDateTime(), nullable=True)
+    cleanup_terminal_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    updated_at = Column(
+        AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now(), server_default=func.now()
+    )
+
+
+class EntitlementSourceRevision(Base):
+    """Immutable authorized source plus the exact normalized desired snapshot."""
+
+    __tablename__ = 'entitlement_source_revisions'
+    __table_args__ = (
+        UniqueConstraint('source_type', 'source_key', name='uq_entitlement_source_type_key'),
+        UniqueConstraint('identity_id', 'generation', name='uq_entitlement_source_identity_generation'),
+        CheckConstraint('generation > 0', name='ck_entitlement_source_generation'),
+        CheckConstraint(
+            "jsonb_typeof(desired_snapshot) = 'object' AND "
+            "desired_snapshot ?& ARRAY['owner_key','panel_uuid','status','expire_at','traffic_limit_bytes','traffic_limit_strategy','hwid_device_limit','internal_squads','external_squad_uuid','provenance','generation','reset_epoch','revoke_epoch','deny_overlays'] AND "
+            "(desired_snapshot - ARRAY['owner_key','panel_uuid','status','expire_at','traffic_limit_bytes','traffic_limit_strategy','hwid_device_limit','internal_squads','external_squad_uuid','provenance','generation','reset_epoch','revoke_epoch','deny_overlays']) = '{}'::jsonb",
+            name='ck_entitlement_source_snapshot_keys',
+        ),
+        Index('ix_entitlement_source_identity_created', 'identity_id', 'created_at'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    identity_id = Column(BigInteger, ForeignKey('entitlement_identities.id', ondelete='CASCADE'), nullable=False)
+    generation = Column(BigInteger, nullable=False)
+    source_type = Column(String(40), nullable=False)
+    source_key = Column(String(128), nullable=False)
+    source_fingerprint = Column(String(64), nullable=False)
+    provenance = Column(String(40), nullable=False)
+    desired_snapshot = Column(JSONB, nullable=False)
+    desired_hash = Column(String(64), nullable=False)
+    authority_state = Column(String(32), nullable=False, default='authorized', server_default='authorized')
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+
+
+class EntitlementOverlay(Base):
+    """Durable deny/grace/traffic/financial overlays with explicit epochs."""
+
+    __tablename__ = 'entitlement_overlays'
+    __table_args__ = (
+        UniqueConstraint('identity_id', 'overlay_type', 'epoch', name='uq_entitlement_overlay_epoch'),
+        UniqueConstraint('source_key', name='uq_entitlement_overlay_source_key'),
+        CheckConstraint('generation > 0 AND epoch >= 0', name='ck_entitlement_overlay_generation_epoch'),
+        Index('ix_entitlement_overlays_identity_active', 'identity_id', 'is_active'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    identity_id = Column(BigInteger, ForeignKey('entitlement_identities.id', ondelete='CASCADE'), nullable=False)
+    source_revision_id = Column(
+        BigInteger, ForeignKey('entitlement_source_revisions.id', ondelete='SET NULL'), nullable=True
+    )
+    generation = Column(BigInteger, nullable=False)
+    overlay_type = Column(String(40), nullable=False)
+    epoch = Column(BigInteger, nullable=False, default=0, server_default='0')
+    source_key = Column(String(128), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True, server_default=text('true'))
+    effective_at = Column(AwareDateTime(), nullable=False)
+    expires_at = Column(AwareDateTime(), nullable=True)
+    resolved_at = Column(AwareDateTime(), nullable=True)
+    resolution_code = Column(String(64), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+
+
+class EntitlementProjectionCommand(Base):
+    """Durable one-operation command and remote-outcome fence."""
+
+    __tablename__ = 'entitlement_projection_commands'
+    __table_args__ = (
+        UniqueConstraint('idempotency_key', name='uq_entitlement_projection_idempotency'),
+        UniqueConstraint('identity_id', 'generation', name='uq_entitlement_projection_identity_generation'),
+        CheckConstraint('generation > 0 AND lease_epoch >= 0', name='ck_entitlement_projection_generation_lease'),
+        Index('ix_entitlement_projection_claim', 'stage', 'lease_expires_at'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    operation_id = Column(String(36), nullable=False, unique=True)
+    identity_id = Column(BigInteger, ForeignKey('entitlement_identities.id', ondelete='CASCADE'), nullable=False)
+    # Null only after account erasure removes the PII-bearing source snapshot;
+    # the command remains as a redacted fencing record.
+    source_revision_id = Column(
+        BigInteger, ForeignKey('entitlement_source_revisions.id', ondelete='SET NULL'), nullable=True
+    )
+    generation = Column(BigInteger, nullable=False)
+    command_type = Column(String(32), nullable=False)
+    idempotency_key = Column(String(128), nullable=False)
+    deterministic_create_key = Column(String(64), nullable=True)
+    desired_hash = Column(String(64), nullable=False)
+    stage = Column(String(40), nullable=False, default='pending', server_default='pending')
+    lease_owner = Column(String(64), nullable=True)
+    lease_epoch = Column(BigInteger, nullable=False, default=0, server_default='0')
+    lease_expires_at = Column(AwareDateTime(), nullable=True)
+    mutation_sent_at = Column(AwareDateTime(), nullable=True)
+    remote_outcome_unknown = Column(Boolean, nullable=False, default=False, server_default=text('false'))
+    last_error_code = Column(String(64), nullable=True)
+    canonical_observation_hash = Column(String(64), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    updated_at = Column(
+        AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now(), server_default=func.now()
+    )
+    completed_at = Column(AwareDateTime(), nullable=True)
+
+
+class EntitlementObservation(Base):
+    """Normalized canonical GET or webhook observation; raw bodies are forbidden."""
+
+    __tablename__ = 'entitlement_observations'
+    __table_args__ = (
+        UniqueConstraint('identity_id', 'source_kind', 'event_id_hash', name='uq_entitlement_observation_event'),
+        CheckConstraint(
+            "jsonb_typeof(observed_snapshot) = 'object' AND "
+            "observed_snapshot ?& ARRAY['owner_key','panel_uuid','status','expire_at','traffic_limit_bytes','traffic_limit_strategy','hwid_device_limit','internal_squads','external_squad_uuid','provenance','generation','reset_epoch','revoke_epoch','deny_overlays'] AND "
+            "(observed_snapshot - ARRAY['owner_key','panel_uuid','status','expire_at','traffic_limit_bytes','traffic_limit_strategy','hwid_device_limit','internal_squads','external_squad_uuid','provenance','generation','reset_epoch','revoke_epoch','deny_overlays']) = '{}'::jsonb",
+            name='ck_entitlement_observation_snapshot_keys',
+        ),
+        CheckConstraint("jsonb_typeof(mismatch_fields) = 'array'", name='ck_entitlement_observation_mismatch_array'),
+        Index('ix_entitlement_observations_retention', 'retention_until'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    identity_id = Column(BigInteger, ForeignKey('entitlement_identities.id', ondelete='CASCADE'), nullable=False)
+    generation = Column(BigInteger, nullable=False)
+    source_kind = Column(String(24), nullable=False)
+    event_type = Column(String(48), nullable=False)
+    event_id_hash = Column(String(64), nullable=False)
+    observed_snapshot = Column(JSONB, nullable=False)
+    observed_hash = Column(String(64), nullable=False)
+    comparison_result = Column(String(32), nullable=False)
+    mismatch_fields = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    observed_at = Column(AwareDateTime(), nullable=False)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    retention_until = Column(AwareDateTime(), nullable=True)
+
+
+class EntitlementWebhookInbox(Base):
+    """Dedupe fence for normalized webhook metadata; never stores a raw body."""
+
+    __tablename__ = 'entitlement_webhook_inbox'
+    __table_args__ = (
+        UniqueConstraint('event_id_hash', name='uq_entitlement_webhook_event_hash'),
+        Index('ix_entitlement_webhook_retention', 'retention_until'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    identity_id = Column(BigInteger, ForeignKey('entitlement_identities.id', ondelete='SET NULL'), nullable=True)
+    event_id_hash = Column(String(64), nullable=False)
+    event_type = Column(String(48), nullable=False)
+    normalized_hash = Column(String(64), nullable=False)
+    event_timestamp = Column(AwareDateTime(), nullable=False)
+    received_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    retention_until = Column(AwareDateTime(), nullable=True)
+
+
+class EntitlementNotificationIntent(Base):
+    """Generation-bound ready notification, independent from access evidence."""
+
+    __tablename__ = 'entitlement_notification_intents'
+    __table_args__ = (
+        UniqueConstraint(
+            'identity_id', 'generation', 'notification_type', name='uq_entitlement_notification_generation'
+        ),
+        Index('ix_entitlement_notifications_state_created', 'state', 'created_at'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    operation_id = Column(String(36), nullable=False, unique=True)
+    identity_id = Column(BigInteger, ForeignKey('entitlement_identities.id', ondelete='CASCADE'), nullable=False)
+    generation = Column(BigInteger, nullable=False)
+    notification_type = Column(String(32), nullable=False)
+    state = Column(String(24), nullable=False, default='pending', server_default='pending')
+    cancellation_code = Column(String(64), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    sent_at = Column(AwareDateTime(), nullable=True)
+    cancelled_at = Column(AwareDateTime(), nullable=True)
+
+
+class EntitlementCleanupCommand(Base):
+    """Restricted erasure cleanup target encrypted with an existing app secret."""
+
+    __tablename__ = 'entitlement_cleanup_commands'
+    __table_args__ = (
+        UniqueConstraint('operation_id', name='uq_entitlement_cleanup_operation'),
+        UniqueConstraint('identity_id', 'generation', name='uq_entitlement_cleanup_identity_generation'),
+        Index('ix_entitlement_cleanup_alert', 'state', 'alert_after'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    operation_id = Column(String(36), nullable=False)
+    identity_id = Column(BigInteger, ForeignKey('entitlement_identities.id', ondelete='CASCADE'), nullable=False)
+    generation = Column(BigInteger, nullable=False)
+    state = Column(String(32), nullable=False, default='erasure_requested', server_default='erasure_requested')
+    encrypted_panel_uuid = Column(LargeBinary, nullable=True)
+    encrypted_create_locator = Column(LargeBinary, nullable=True)
+    panel_uuid_hmac = Column(String(64), nullable=False)
+    identity_hmac = Column(String(64), nullable=False)
+    lease_epoch = Column(BigInteger, nullable=False, default=0, server_default='0')
+    remote_outcome_unknown = Column(Boolean, nullable=False, default=False, server_default=text('false'))
+    last_error_code = Column(String(64), nullable=True)
+    requested_at = Column(AwareDateTime(), nullable=False)
+    alert_after = Column(AwareDateTime(), nullable=False)
+    operator_alerted_at = Column(AwareDateTime(), nullable=True)
+    terminal_at = Column(AwareDateTime(), nullable=True)
+    retention_until = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    updated_at = Column(
+        AwareDateTime(), nullable=False, default=func.now(), onupdate=func.now(), server_default=func.now()
+    )
+
+
+class EntitlementCleanupTombstone(Base):
+    """Non-PII terminal/quarantine audit record with a 90-day terminal TTL."""
+
+    __tablename__ = 'entitlement_cleanup_tombstones'
+    __table_args__ = (
+        UniqueConstraint('operation_id', name='uq_entitlement_tombstone_operation'),
+        Index('ix_entitlement_tombstones_retention', 'state', 'retention_until'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    operation_id = Column(String(36), nullable=False)
+    identity_hmac = Column(String(64), nullable=False)
+    panel_uuid_hmac = Column(String(64), nullable=False)
+    state = Column(String(32), nullable=False)
+    last_error_code = Column(String(64), nullable=True)
+    requested_at = Column(AwareDateTime(), nullable=False)
+    terminal_at = Column(AwareDateTime(), nullable=True)
+    retention_until = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
 
 
 class Subscription(Base):

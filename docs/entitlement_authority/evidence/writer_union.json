@@ -1,0 +1,230 @@
+{
+  "baseline_sha256": "724d620dd11f0b878d5d802bf8a8330c8d73cd8a75b09abf31bfd374190634c9",
+  "current_sha256": "a7ad53de0565ee3f0c6be9f48b19ae3c3baa6107386717b2a3ac0d957fe82269",
+  "format": 1,
+  "interpretation": "Every current entry is classified in writer_closure.json. Removed/renamed entries require an explicit mapping; this candidate has none for raw endpoints or startup registrations.",
+  "sections": {
+    "calls": {
+      "baseline_count": 235,
+      "current_count": 235,
+      "new": [],
+      "removed_or_renamed": [],
+      "unchanged_count": 235
+    },
+    "definitions": {
+      "baseline_count": 47,
+      "current_count": 47,
+      "new": [],
+      "removed_or_renamed": [],
+      "unchanged_count": 47
+    },
+    "field_literals": {
+      "baseline_count": 532,
+      "current_count": 551,
+      "new": [
+        {
+          "count": 1,
+          "signature": {
+            "field": "activeInternalSquads",
+            "function": "_payload",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "activeInternalSquads",
+            "function": "normalize_panel_observation",
+            "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "expireAt",
+            "function": "_payload",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "expireAt",
+            "function": "normalize_panel_observation",
+            "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "externalSquadUuid",
+            "function": "_payload",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "externalSquadUuid",
+            "function": "normalize_panel_observation",
+            "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "hwidDeviceLimit",
+            "function": "_payload",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "hwidDeviceLimit",
+            "function": "normalize_panel_observation",
+            "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "status",
+            "function": "__post_init__",
+            "path": "app/services/entitlement_authority/types.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "status",
+            "function": "_payload",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "status",
+            "function": "canonical",
+            "path": "app/services/entitlement_authority/types.py"
+          }
+        },
+        {
+          "count": 2,
+          "signature": {
+            "field": "status",
+            "function": "from_mapping",
+            "path": "app/services/entitlement_authority/types.py"
+          }
+        },
+        {
+          "count": 2,
+          "signature": {
+            "field": "status",
+            "function": "normalize_panel_observation",
+            "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "trafficLimitBytes",
+            "function": "_payload",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "trafficLimitBytes",
+            "function": "normalize_panel_observation",
+            "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "trafficLimitStrategy",
+            "function": "_payload",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "trafficLimitStrategy",
+            "function": "normalize_panel_observation",
+            "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        }
+      ],
+      "removed_or_renamed": [],
+      "unchanged_count": 532
+    },
+    "imports": {
+      "baseline_count": 147,
+      "current_count": 147,
+      "new": [],
+      "removed_or_renamed": [],
+      "unchanged_count": 147
+    },
+    "raw_endpoints": {
+      "baseline_count": 44,
+      "current_count": 47,
+      "new": [
+        {
+          "count": 1,
+          "signature": {
+            "endpoint": "'/api/users'",
+            "function": "create_disabled",
+            "method": "POST",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "endpoint": "'/api/users'",
+            "function": "patch_exact",
+            "method": "PATCH",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "endpoint": "f'/api/users/{panel_uuid}'",
+            "function": "delete_once",
+            "method": "DELETE",
+            "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        }
+      ],
+      "removed_or_renamed": [],
+      "unchanged_count": 44
+    },
+    "reachable_writer_entrypoints": {
+      "baseline_count": 391,
+      "current_count": 391,
+      "new": [],
+      "removed_or_renamed": [],
+      "unchanged_count": 391
+    },
+    "reachable_writer_functions": {
+      "baseline_count": 640,
+      "current_count": 640,
+      "new": [],
+      "removed_or_renamed": [],
+      "unchanged_count": 640
+    },
+    "startup_registrations": {
+      "baseline_count": 61,
+      "current_count": 61,
+      "new": [],
+      "removed_or_renamed": [],
+      "unchanged_count": 61
+    }
+  },
+  "sha256": "beaf151264afbf68b060a91e6cbbefbf805e2f0247072ff2672375ea118c8d4c"
+}

@@ -172,6 +172,12 @@ class Settings(BaseSettings):
     REMNAWAVE_WEBHOOK_ENABLED: bool = False
     REMNAWAVE_WEBHOOK_PATH: str = '/remnawave-webhook'
     REMNAWAVE_WEBHOOK_SECRET: str | None = None  # HMAC-SHA256 shared secret (min 32 chars)
+    # Dormant entitlement-authority gates.  Gate 1 ships all switches off;
+    # enabling any of them is a separate protected owner decision.
+    ENTITLEMENT_AUTHORITY_CHECKOUT_ADMISSION_ENABLED: bool = False
+    ENTITLEMENT_AUTHORITY_PROJECTOR_ENABLED: bool = False
+    ENTITLEMENT_AUTHORITY_READY_NOTIFICATIONS_ENABLED: bool = False
+    ENTITLEMENT_AUTHORITY_SHADOW_ENABLED: bool = False
     REMNAWAVE_WEBHOOK_NOTIFY_NODE_CONNECTION_STATUS: bool = True
     # Coalescing knobs для burst'ов node.connection_lost / node.connection_restored.
     # Окно — сколько секунд буферим события одного типа перед отправкой одной
