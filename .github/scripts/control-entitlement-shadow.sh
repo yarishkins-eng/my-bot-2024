@@ -33,11 +33,16 @@ readonly BOT_CONTAINER='remnawave_bot'
 readonly DEPLOY_STATE_FILE="$STATE_DIR/bot-production.state"
 readonly MIGRATION_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
 readonly LEASE_FILE="$RUNTIME_DIR/lease.state"
+readonly DISABLE_TOMBSTONE_FILE="$RUNTIME_DIR/disable.state"
 readonly AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.state"
 readonly RUN_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.audit"
 readonly WATCHDOG_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-watchdog.${RUN_ID}.${RUN_ATTEMPT}.audit"
 readonly LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"
-readonly WATCHDOG_UNIT="teplo-entitlement-shadow-watchdog-${RUN_ID}-${RUN_ATTEMPT}"
+readonly WATCHDOG_PENDING_UNIT="teplo-entitlement-shadow-watchdog-pending-${RUN_ID}-${RUN_ATTEMPT}"
+readonly WATCHDOG_EXACT_UNIT="teplo-entitlement-shadow-watchdog-exact-${RUN_ID}-${RUN_ATTEMPT}"
+readonly SIDECAR_INSTALLED="$STATE_DIR/entitlement-shadow-sidecar-${WORKFLOW_SHA}.py"
+readonly WATCHDOG_INSTALLED="$STATE_DIR/entitlement-shadow-watchdog-${WORKFLOW_SHA}.sh"
+readonly POLICY_VERSION='gate2-readonly-v1'
 readonly BOOTSTRAP_SECONDS=300
 readonly OBSERVATION_SECONDS=604800
 readonly MIN_FREE_KB=1048576
@@ -75,8 +80,8 @@ write_lease() {
   expires="$2"
   completed_at="$3"
   lease_tmp="$(mktemp "$RUNTIME_DIR/lease.XXXXXX")"
-  printf 'format_version=2\nphase=%s\naction=ENABLE_SHADOW\nruntime_mode=enabled\nworkflow_sha=%s\ndeployed_sha=%s\nimage=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\napproval_actor=%s\nrelease_card_reference=%s\nexpires_epoch=%s\ncompleted_at=%s\n' \
-    "$phase" "$WORKFLOW_SHA" "$deployed_sha" "$CURRENT_IMAGE_ID" "$RUN_ID" "$RUN_ATTEMPT" \
+  printf 'format_version=2\nphase=%s\naction=ENABLE_SHADOW\nruntime_mode=enabled\npolicy_version=%s\nworkflow_sha=%s\ndeployed_sha=%s\nimage=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\napproval_actor=%s\nrelease_card_reference=%s\nexpires_epoch=%s\ncompleted_at=%s\n' \
+    "$phase" "$POLICY_VERSION" "$WORKFLOW_SHA" "$deployed_sha" "$CURRENT_IMAGE_ID" "$RUN_ID" "$RUN_ATTEMPT" \
     "$ACTOR" "$RELEASE_CARD" "$expires" "$completed_at" > "$lease_tmp"
   chmod 444 "$lease_tmp"
   mv "$lease_tmp" "$LEASE_FILE"
@@ -99,6 +104,8 @@ verify_fixed_environment() {
     exact_env DATABASE_POOL_TIMEOUT 5 &&
     exact_env REMNAWAVE_API_CONNECT_TIMEOUT 4 &&
     exact_env REMNAWAVE_API_TOTAL_TIMEOUT 4 &&
+    exact_env REMNAWAVE_AUTH_TYPE api_key &&
+    exact_env TZ Europe/Moscow &&
     exact_env BOT_TOKEN 123456789:shadow-sidecar-does-not-use-telegram &&
     exact_env ADMIN_NOTIFICATIONS_ENABLED false &&
     exact_env REMNAWAVE_WEBHOOK_ENABLED false &&
@@ -136,8 +143,14 @@ cleanup_runtime() {
   set +e
   [ -z "$SIDECAR_ENV_FILE" ] || rm -f -- "$SIDECAR_ENV_FILE"
   rm -f -- "$LEASE_FILE"
-  docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
-  if [ -n "${RUN_AUDIT_FILE:-}" ]; then
+  cleanup_verified=0
+  if docker info >/dev/null 2>&1; then
+    docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
+    if docker info >/dev/null 2>&1 && ! docker inspect "$SIDECAR" >/dev/null 2>&1; then
+      cleanup_verified=1
+    fi
+  fi
+  if [ "$cleanup_verified" = '1' ] && [ -n "${RUN_AUDIT_FILE:-}" ]; then
     audit_tmp="$(mktemp "$STATE_DIR/bot-production.entitlement-shadow-control.XXXXXX" 2>/dev/null || true)"
     if [ -n "$audit_tmp" ]; then
       printf 'format_version=2\nphase=completed\naction=AUTO_DISABLE_FAILED_ENABLE\nruntime_mode=disabled\nworkflow_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\napproval_actor=%s\nrelease_card_reference=%s\ncompleted_at=%s\n' \
@@ -148,6 +161,11 @@ cleanup_runtime() {
       chmod 600 "$RUN_AUDIT_FILE"
       mv "$audit_tmp" "$AUDIT_FILE"
     fi
+  elif [ -n "${RUN_AUDIT_FILE:-}" ]; then
+    failure_audit="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.cleanup-unverified"
+    printf 'format_version=2\nphase=cleanup_unverified\naction=AUTO_DISABLE_FAILED_ENABLE\nruntime_mode=unknown\nworkflow_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\ncompleted_at=%s\n' \
+      "$WORKFLOW_SHA" "$RUN_ID" "$RUN_ATTEMPT" "$(date --iso-8601=seconds)" > "$failure_audit"
+    chmod 600 "$failure_audit"
   fi
   set -e
 }
@@ -166,7 +184,7 @@ build_sidecar_env_file() {
   : > "$SIDECAR_ENV_FILE"
   chmod 600 "$SIDECAR_ENV_FILE"
   docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$BOT_CONTAINER" | awk '
-    /^(POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD|REMNAWAVE_API_URL|REMNAWAVE_API_KEY|REMNAWAVE_SECRET_KEY|REMNAWAVE_USERNAME|REMNAWAVE_PASSWORD|REMNAWAVE_CADDY_TOKEN|REMNAWAVE_AUTH_TYPE|TZ)=/ { print }
+    /^(POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD|REMNAWAVE_API_URL|REMNAWAVE_API_KEY)=/ { print }
   ' > "$SIDECAR_ENV_FILE"
   for required_key in POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD REMNAWAVE_API_URL REMNAWAVE_API_KEY; do
     [ "$(grep -Ec "^${required_key}=.+$" "$SIDECAR_ENV_FILE" || true)" = '1' ] || fail "missing_or_duplicate_${required_key}"
@@ -207,63 +225,99 @@ install -d -m 700 "$STATE_DIR"
 install -d -m 755 "$RUNTIME_DIR"
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail 'control_busy'
-
-if [ -r "$RUN_AUDIT_FILE" ]; then
-  [ "$(audit_value phase "$RUN_AUDIT_FILE" || true)" = 'completed' ] || fail 'run_audit_conflict'
-  [ "$(audit_value action "$RUN_AUDIT_FILE" || true)" = 'ENABLE_SHADOW' ] || fail 'run_audit_conflict'
-  [ "$(audit_value runtime_mode "$RUN_AUDIT_FILE" || true)" = 'enabled' ] || fail 'run_audit_conflict'
-  [ "$(audit_value workflow_sha "$RUN_AUDIT_FILE" || true)" = "$WORKFLOW_SHA" ] || fail 'run_audit_conflict'
-  [ "$(audit_value approval_actor "$RUN_AUDIT_FILE" || true)" = "$ACTOR" ] || fail 'run_audit_conflict'
-  [ "$(audit_value release_card_reference "$RUN_AUDIT_FILE" || true)" = "$RELEASE_CARD" ] || fail 'run_audit_conflict'
-  [ -r "$LEASE_FILE" ] && cmp -s "$RUN_AUDIT_FILE" "$LEASE_FILE" || fail 'completed_lease_missing'
-  [ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR" 2>/dev/null || true)" = 'true' ] || fail 'completed_sidecar_not_running'
-  cp "$RUN_AUDIT_FILE" "$AUDIT_FILE"
-  chmod 600 "$AUDIT_FILE"
-  printf 'Gate 2 isolated read-only shadow was already enabled by this approved run.\n'
-  exit 0
-fi
+[ ! -e "$DISABLE_TOMBSTONE_FILE" ] || fail 'disable_in_progress'
 
 if [ -r "$LEASE_FILE" ]; then
-  [ "$(state_value workflow_run_id "$LEASE_FILE")" = "$RUN_ID" ] || fail 'another_shadow_control_run_active'
-  [ "$(state_value workflow_run_attempt "$LEASE_FILE")" = "$RUN_ATTEMPT" ] || fail 'another_shadow_control_run_active'
+  existing_run_id="$(state_value workflow_run_id "$LEASE_FILE")"
+  existing_run_attempt="$(state_value workflow_run_attempt "$LEASE_FILE")"
+  [[ "$existing_run_attempt" =~ ^[0-9]+$ ]] || fail 'invalid_existing_run_attempt'
+  [ "$existing_run_id" = "$RUN_ID" ] || fail 'another_shadow_control_run_active'
   lease_phase="$(state_value phase "$LEASE_FILE")"
   if [ "$lease_phase" = 'completed' ]; then
     [ "$(state_value action "$LEASE_FILE")" = 'ENABLE_SHADOW' ] || fail 'completed_lease_conflict'
     [ "$(state_value workflow_sha "$LEASE_FILE")" = "$WORKFLOW_SHA" ] || fail 'completed_lease_conflict'
     [ "$(state_value approval_actor "$LEASE_FILE")" = "$ACTOR" ] || fail 'completed_lease_conflict'
     [ "$(state_value release_card_reference "$LEASE_FILE")" = "$RELEASE_CARD" ] || fail 'completed_lease_conflict'
-    [ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR" 2>/dev/null || true)" = 'true' ] || fail 'completed_sidecar_not_running'
-    cp "$LEASE_FILE" "$RUN_AUDIT_FILE"
-    chmod 600 "$RUN_AUDIT_FILE"
-    cp "$RUN_AUDIT_FILE" "$AUDIT_FILE"
+    [ "$(state_value policy_version "$LEASE_FILE")" = "$POLICY_VERSION" ] || fail 'completed_lease_conflict'
+    existing_container_id="$(docker inspect --format '{{.Id}}' "$SIDECAR" 2>/dev/null || true)"
+    [[ "$existing_container_id" =~ ^[0-9a-f]{64}$ ]] || fail 'completed_sidecar_missing'
+    existing_audit="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${existing_run_attempt}.audit"
+    existing_watchdog_audit="$STATE_DIR/bot-production.entitlement-shadow-watchdog.${RUN_ID}.${existing_run_attempt}.audit"
+    existing_secret="$STATE_DIR/entitlement-shadow-secrets-${RUN_ID}-${existing_run_attempt}.env"
+    [ -x "$WATCHDOG_INSTALLED" ] || fail 'persistent_watchdog_missing'
+    cmp -s "$WATCHDOG" "$WATCHDOG_INSTALLED" || fail 'persistent_watchdog_sha_mismatch'
+    TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG_INSTALLED" BOOTSTRAP \
+      "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$existing_run_attempt" \
+      "$existing_watchdog_audit" "$existing_secret" "$existing_container_id"
+    [ -r "$existing_audit" ] && cmp -s "$existing_audit" "$LEASE_FILE" || fail 'completed_audit_recovery_failed'
+    cp "$existing_audit" "$AUDIT_FILE"
     chmod 600 "$AUDIT_FILE"
     printf 'Gate 2 isolated read-only shadow completion was recovered from its durable lease.\n'
     exit 0
   fi
   [ "$lease_phase" = 'prepared' ] || fail 'lease_phase_conflict'
+  [ -x "$WATCHDOG_INSTALLED" ] || fail 'persistent_watchdog_missing'
+  cmp -s "$WATCHDOG" "$WATCHDOG_INSTALLED" || fail 'persistent_watchdog_sha_mismatch'
+
+  # A retry may inherit a prepared lease, a staged container, and armed
+  # watchdogs.  Clean that exact generation while its original watchdogs are
+  # still live. Reusing the same run generation is forbidden: a delayed old
+  # timer could otherwise mistake the replacement for its own container.
+  existing_watchdog_audit="$STATE_DIR/bot-production.entitlement-shadow-watchdog.${RUN_ID}.${existing_run_attempt}.audit"
+  existing_secret="$STATE_DIR/entitlement-shadow-secrets-${RUN_ID}-${existing_run_attempt}.env"
+  MUTATION_STARTED=1
+  trap cleanup_failed_enable ERR
+  TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG_INSTALLED" BOOTSTRAP \
+    "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$existing_run_attempt" \
+    "$existing_watchdog_audit" "$existing_secret" \
+    pending
+  [ ! -e "$LEASE_FILE" ] || fail 'prepared_lease_cleanup_unverified'
+  docker info >/dev/null 2>&1 || fail 'prepared_docker_unavailable'
+  ! docker inspect "$SIDECAR" >/dev/null 2>&1 || fail 'prepared_sidecar_cleanup_unverified'
+  [ ! -e "$existing_secret" ] || fail 'prepared_secret_cleanup_unverified'
+  systemctl stop \
+    "teplo-entitlement-shadow-watchdog-pending-${RUN_ID}-${existing_run_attempt}.timer" \
+    "teplo-entitlement-shadow-watchdog-pending-${RUN_ID}-${existing_run_attempt}.service" \
+    "teplo-entitlement-shadow-watchdog-exact-${RUN_ID}-${existing_run_attempt}.timer" \
+    "teplo-entitlement-shadow-watchdog-exact-${RUN_ID}-${existing_run_attempt}.service" \
+    >/dev/null 2>&1 || true
+  for old_unit in \
+    "teplo-entitlement-shadow-watchdog-pending-${RUN_ID}-${existing_run_attempt}.timer" \
+    "teplo-entitlement-shadow-watchdog-pending-${RUN_ID}-${existing_run_attempt}.service" \
+    "teplo-entitlement-shadow-watchdog-exact-${RUN_ID}-${existing_run_attempt}.timer" \
+    "teplo-entitlement-shadow-watchdog-exact-${RUN_ID}-${existing_run_attempt}.service"; do
+    ! systemctl is-active --quiet "$old_unit" || fail 'prepared_watchdog_stop_unverified'
+  done
+  MUTATION_STARTED=0
+  trap - ERR
+  printf 'STOP:prepared_generation_cleaned_start_new_workflow_run\n' >&2
+  exit 64
 elif docker inspect "$SIDECAR" >/dev/null 2>&1; then
   fail 'sidecar_without_control_lease'
 fi
 
-systemctl stop "${WATCHDOG_UNIT}.timer" "${WATCHDOG_UNIT}.service" >/dev/null 2>&1 || true
+[ "$RUN_ATTEMPT" = '1' ] || fail 'rerun_without_completed_lease'
+systemctl stop "${WATCHDOG_PENDING_UNIT}.timer" "${WATCHDOG_PENDING_UNIT}.service" \
+  "${WATCHDOG_EXACT_UNIT}.timer" "${WATCHDOG_EXACT_UNIT}.service" >/dev/null 2>&1 || true
 MUTATION_STARTED=1
 trap cleanup_failed_enable ERR
 rm -f -- "$LEASE_FILE"
 docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
-SIDECAR_INSTALLED="$STATE_DIR/entitlement-shadow-sidecar-${WORKFLOW_SHA}.py"
-WATCHDOG_INSTALLED="$STATE_DIR/entitlement-shadow-watchdog-${WORKFLOW_SHA}.sh"
 install -m 555 "$SIDECAR_ENTRYPOINT" "$SIDECAR_INSTALLED"
 install -m 700 "$WATCHDOG" "$WATCHDOG_INSTALLED"
 prepared_expires="$(( $(date +%s) + BOOTSTRAP_SECONDS ))"
 write_lease prepared "$prepared_expires" pending
 
-systemd-run --quiet --unit="$WATCHDOG_UNIT" --on-active="${BOOTSTRAP_SECONDS}s" --property=Type=oneshot \
-  "$WATCHDOG_INSTALLED" "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$RUN_ATTEMPT" "$WATCHDOG_AUDIT_FILE" \
-  "$STATE_DIR/entitlement-shadow-secrets-${RUN_ID}-${RUN_ATTEMPT}.env"
+systemd-run --quiet --unit="$WATCHDOG_PENDING_UNIT" --on-active="${BOOTSTRAP_SECONDS}s" --property=Type=oneshot \
+  --property=Restart=on-failure --property=RestartSec=30s \
+  "$WATCHDOG_INSTALLED" BOOTSTRAP "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$RUN_ATTEMPT" \
+  "$WATCHDOG_AUDIT_FILE" "$STATE_DIR/entitlement-shadow-secrets-${RUN_ID}-${RUN_ATTEMPT}.env" \
+  pending
 build_sidecar_env_file
 docker create \
   --name "$SIDECAR" \
   --restart=no \
+  --no-healthcheck \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=32m \
   --network remnawave-bedolaga-telegram-bot_bot_network \
@@ -277,6 +331,8 @@ docker create \
   --env DATABASE_POOL_TIMEOUT=5 \
   --env REMNAWAVE_API_CONNECT_TIMEOUT=4 \
   --env REMNAWAVE_API_TOTAL_TIMEOUT=4 \
+  --env REMNAWAVE_AUTH_TYPE=api_key \
+  --env TZ=Europe/Moscow \
   --env BOT_TOKEN=123456789:shadow-sidecar-does-not-use-telegram \
   --env ADMIN_NOTIFICATIONS_ENABLED=false \
   --env REMNAWAVE_WEBHOOK_ENABLED=false \
@@ -328,7 +384,16 @@ docker create \
   --label "teplo.deployed_sha=$deployed_sha" \
   --label "teplo.workflow_run_id=$RUN_ID" \
   --label "teplo.workflow_run_attempt=$RUN_ATTEMPT" \
+  --label "teplo.policy_version=$POLICY_VERSION" \
   "$CURRENT_IMAGE_ID" python /app/shadow-sidecar-entrypoint.py >/dev/null
+SIDECAR_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$SIDECAR")"
+[[ "$SIDECAR_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid_sidecar_container_id'
+systemd-run --quiet --unit="$WATCHDOG_EXACT_UNIT" --on-active="${BOOTSTRAP_SECONDS}s" --property=Type=oneshot \
+  --property=Restart=on-failure --property=RestartSec=30s \
+  "$WATCHDOG_INSTALLED" BOOTSTRAP "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$RUN_ATTEMPT" \
+  "$WATCHDOG_AUDIT_FILE" "$STATE_DIR/entitlement-shadow-secrets-${RUN_ID}-${RUN_ATTEMPT}.env" \
+  "$SIDECAR_CONTAINER_ID"
+systemctl stop "${WATCHDOG_PENDING_UNIT}.timer" "${WATCHDOG_PENDING_UNIT}.service" >/dev/null 2>&1 || true
 rm -f -- "$SIDECAR_ENV_FILE"
 SIDECAR_ENV_FILE=''
 docker network connect remnawave-network "$SIDECAR"
@@ -362,18 +427,12 @@ completed_expires="$(( $(date +%s) + OBSERVATION_SECONDS ))"
 write_lease completed "$completed_expires" "$(date --iso-8601=seconds)"
 sleep 3
 [ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR")" = 'true' ] || fail 'sidecar_not_running_after_commit'
-
-audit_tmp="$(mktemp "$STATE_DIR/bot-production.entitlement-shadow-control.XXXXXX")"
-cp "$LEASE_FILE" "$audit_tmp"
-chmod 600 "$audit_tmp"
-if [ -e "$RUN_AUDIT_FILE" ]; then
-  cmp -s "$audit_tmp" "$RUN_AUDIT_FILE" || fail 'run_audit_conflict'
-  rm -f -- "$audit_tmp"
-else
-  cp "$audit_tmp" "$RUN_AUDIT_FILE"
-  chmod 600 "$RUN_AUDIT_FILE"
-  mv "$audit_tmp" "$AUDIT_FILE"
-fi
+TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG_INSTALLED" BOOTSTRAP \
+  "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$RUN_ATTEMPT" "$WATCHDOG_AUDIT_FILE" \
+  "$STATE_DIR/entitlement-shadow-secrets-${RUN_ID}-${RUN_ATTEMPT}.env" "$SIDECAR_CONTAINER_ID"
+[ -r "$RUN_AUDIT_FILE" ] && cmp -s "$RUN_AUDIT_FILE" "$LEASE_FILE" || fail 'run_audit_not_durable'
+[ -r "$AUDIT_FILE" ] && cmp -s "$AUDIT_FILE" "$LEASE_FILE" || fail 'latest_audit_not_durable'
+systemctl stop "${WATCHDOG_EXACT_UNIT}.timer" "${WATCHDOG_EXACT_UNIT}.service" >/dev/null 2>&1 || true
 MUTATION_STARTED=0
 trap - ERR
 printf 'Gate 2 isolated read-only shadow enabled after first successful cycle.\n'

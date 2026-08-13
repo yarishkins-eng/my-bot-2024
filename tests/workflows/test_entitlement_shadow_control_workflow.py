@@ -18,6 +18,12 @@ DISABLE = SCRIPTS / 'disable-entitlement-shadow.sh'
 SIDECAR = SCRIPTS / 'run-entitlement-shadow-sidecar.py'
 WATCHDOG = SCRIPTS / 'watchdog-entitlement-shadow-bootstrap.sh'
 WORKFLOW = ROOT / '.github/workflows/control-entitlement-shadow.yml'
+DEPLOY_WORKFLOWS = (
+    ROOT / '.github/workflows/deploy.yml',
+    ROOT / '.github/workflows/deploy-migration.yml',
+    ROOT / '.github/workflows/deploy-infrastructure.yml',
+    ROOT / '.github/workflows/recover-after-migration.yml',
+)
 
 
 def _run_baseline(tmp_path: Path, content: str, mode: int = 0o600) -> subprocess.CompletedProcess[str]:
@@ -102,6 +108,7 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
 
     assert '--name "$SIDECAR"' in source
     assert '--restart=no' in source
+    assert '--no-healthcheck' in source
     assert '--read-only' in source
     assert '--security-opt no-new-privileges:true' in source
     assert '--cap-drop ALL' in source
@@ -126,6 +133,46 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     assert 'docker compose up' not in source
     assert 'docker restart' not in source
     assert 'docker rm -f "$BOT_CONTAINER"' not in source
+    assert 'WATCHDOG_PENDING_UNIT' in source
+    assert 'WATCHDOG_EXACT_UNIT' in source
+    assert source.index('--unit="$WATCHDOG_EXACT_UNIT"') < source.rindex(
+        'systemctl stop "${WATCHDOG_PENDING_UNIT}.timer"'
+    )
+    assert 'pending\n' in source
+
+
+def test_prepared_enable_retry_only_cleans_and_requires_new_workflow_run() -> None:
+    source = ENABLE.read_text()
+    prepared = source.split('[ "$lease_phase" = \'prepared\' ]', 1)[1].split('elif docker inspect "$SIDECAR"', 1)[0]
+
+    assert prepared.index('trap cleanup_failed_enable ERR') < prepared.index('"$WATCHDOG_INSTALLED" BOOTSTRAP')
+    assert prepared.index('"$WATCHDOG_INSTALLED" BOOTSTRAP') < source.index(
+        'systemctl stop "${WATCHDOG_PENDING_UNIT}.timer"'
+    )
+    assert 'prepared_sidecar_cleanup_unverified' in prepared
+    assert 'prepared_secret_cleanup_unverified' in prepared
+    assert 'prepared_watchdog_stop_unverified' in prepared
+    assert 'prepared_generation_cleaned_start_new_workflow_run' in prepared
+    assert 'exit 64' in prepared
+
+
+def test_enable_rerun_without_completed_lease_is_rejected() -> None:
+    source = ENABLE.read_text()
+    rerun_gate = "[ \"$RUN_ATTEMPT\" = '1' ] || fail 'rerun_without_completed_lease'"
+
+    assert rerun_gate in source
+    assert source.index(rerun_gate) < source.index('write_lease prepared')
+    assert source.index(rerun_gate) < source.index('docker create')
+
+
+def test_every_production_switch_refuses_an_active_shadow() -> None:
+    for workflow in DEPLOY_WORKFLOWS:
+        source = workflow.read_text()
+        assert "readonly SHADOW_RUNTIME_DIR='/var/lib/teplo-vpn/entitlement-shadow-runtime'" in source
+        assert 'test ! -e "$SHADOW_RUNTIME_DIR/lease.state"' in source
+        assert 'test ! -e "$SHADOW_RUNTIME_DIR/disable.state"' in source
+        assert 'docker info >/dev/null 2>&1' in source
+        assert '! docker inspect teplo_entitlement_shadow' in source
 
 
 def test_sidecar_receives_only_minimal_secret_names() -> None:
@@ -142,6 +189,12 @@ def test_sidecar_receives_only_minimal_secret_names() -> None:
         'STRIPE',
         'SMTP',
         'REDIS',
+        'REMNAWAVE_SECRET_KEY',
+        'REMNAWAVE_USERNAME',
+        'REMNAWAVE_PASSWORD',
+        'REMNAWAVE_CADDY_TOKEN',
+        'REMNAWAVE_AUTH_TYPE',
+        'TZ',
     ):
         assert forbidden not in extractor
 
@@ -152,10 +205,11 @@ def test_disable_is_independent_of_bot_and_business_systems() -> None:
 
     assert "readonly SIDECAR='teplo_entitlement_shadow'" in source
     assert 'rm -f -- "$LEASE_FILE"' in source
-    assert 'docker rm -f "$SIDECAR"' in source
+    assert 'docker rm --force "$actual"' in source
     assert 'docker info' in source
     assert 'systemd-run' in source
     assert 'on-active=60s' in source
+    assert '--property=Restart=on-failure' in source
     for forbidden in (
         'remnawave_bot',
         'docker compose',
@@ -178,24 +232,82 @@ def _write_fake_flock(fake_bin: Path) -> None:
     _write_executable(fake_bin / 'flock', '#!/usr/bin/env bash\nexit 0\n')
 
 
-def _write_fake_watchdog_docker(fake_bin: Path) -> None:
+def _write_fake_watchdog_docker(fake_bin: Path, container_id: str) -> None:
     _write_executable(
         fake_bin / 'docker',
         r"""#!/usr/bin/env bash
+if [ "$1" = info ]; then exit 0; fi
 if [ "$1" = inspect ]; then
+  [ -e "$CONTAINER_PRESENT" ] || exit 1
+  target="${@: -1}"
+  if [ "$target" != teplo_entitlement_shadow ] && [ "$target" != "$FAKE_CONTAINER_ID" ]; then exit 1; fi
   case "$*" in
+    *'{{.Id}}'*) if [ -e "$CONTAINER_PRESENT" ]; then printf '%s\n' "$FAKE_CONTAINER_ID"; fi ;;
     *State.Running*) printf 'true\n' ;;
+    *'{{.Image}}'*) printf 'sha256:%064d\n' 0 | tr 0 b ;;
     *teplo.role*) printf 'entitlement-shadow-readonly\n' ;;
     *teplo.workflow_sha*) printf '%040d\n' 0 | tr 0 a ;;
-    *teplo.workflow_run_id*) printf '%s\n' "$EXPECTED_RUN_ID" ;;
-    *teplo.workflow_run_attempt*) printf '%s\n' "$EXPECTED_RUN_ATTEMPT" ;;
+    *teplo.deployed_sha*) printf '%040d\n' 0 | tr 0 a ;;
+    *teplo.policy_version*) printf 'gate2-readonly-v1\n' ;;
+    *teplo.workflow_run_id*) printf '%s\n' "${FAKE_LABEL_RUN_ID:-$EXPECTED_RUN_ID}" ;;
+    *teplo.workflow_run_attempt*) printf '%s\n' "${FAKE_LABEL_RUN_ATTEMPT:-$EXPECTED_RUN_ATTEMPT}" ;;
+    *Config.Env*)
+      if [ -n "${EXPECTED_ENV_FILE:-}" ] && [ -r "$EXPECTED_ENV_FILE" ]; then cat "$EXPECTED_ENV_FILE"; fi ;;
+    *) : ;;
   esac
   exit 0
 fi
+if [ "$1" = rm ]; then rm -f "$CONTAINER_PRESENT"; printf '%s\n' "$*" >> "$DOCKER_CALLS"; exit 0; fi
 printf '%s\n' "$*" >> "$DOCKER_CALLS"
 exit 0
 """,
     )
+    _write_executable(fake_bin / 'systemctl', '#!/usr/bin/env bash\nexit 1\n')
+    _write_executable(fake_bin / 'systemd-run', '#!/usr/bin/env bash\nexit 0\n')
+
+
+def _fixed_policy_env() -> str:
+    values = {
+        'ENTITLEMENT_AUTHORITY_CHECKOUT_ADMISSION_ENABLED': 'false',
+        'ENTITLEMENT_AUTHORITY_PROJECTOR_ENABLED': 'false',
+        'ENTITLEMENT_AUTHORITY_READY_NOTIFICATIONS_ENABLED': 'false',
+        'ENTITLEMENT_AUTHORITY_SHADOW_ENABLED': 'true',
+        'ENTITLEMENT_AUTHORITY_SHADOW_KILL_SWITCH': 'false',
+        'DATABASE_POOL_SIZE': '2',
+        'DATABASE_MAX_OVERFLOW': '0',
+        'DATABASE_POOL_TIMEOUT': '5',
+        'REMNAWAVE_API_CONNECT_TIMEOUT': '4',
+        'REMNAWAVE_API_TOTAL_TIMEOUT': '4',
+        'REMNAWAVE_AUTH_TYPE': 'api_key',
+        'TZ': 'Europe/Moscow',
+        'BOT_TOKEN': '123456789:shadow-sidecar-does-not-use-telegram',
+        'ADMIN_NOTIFICATIONS_ENABLED': 'false',
+        'REMNAWAVE_WEBHOOK_ENABLED': 'false',
+        'REMNAWAVE_AUTO_SYNC_ENABLED': 'false',
+        'ACCESS_POINT_INVENTORY_DRY_RUN_ENABLED': 'false',
+        'ACCESS_POINT_INVENTORY_CATALOG_APPLY_ENABLED': 'false',
+        'MULTI_TARIFF_ENABLED': 'false',
+        'DEFAULT_TRAFFIC_RESET_STRATEGY': 'MONTH',
+        'DEVICES_SELECTION_ENABLED': 'true',
+        'DEVICES_SELECTION_DISABLED_AMOUNT': '',
+        'ENTITLEMENT_AUTHORITY_SHADOW_COHORT_BASIS_POINTS': '1000',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_IDENTITIES_PER_CYCLE': '18',
+        'ENTITLEMENT_AUTHORITY_SHADOW_SCHEDULE_SECONDS': '900',
+        'ENTITLEMENT_AUTHORITY_SHADOW_PANEL_READS_PER_MINUTE': '12',
+        'ENTITLEMENT_AUTHORITY_SHADOW_PANEL_TIMEOUT_SECONDS': '4',
+        'ENTITLEMENT_AUTHORITY_SHADOW_DB_STATEMENT_TIMEOUT_MS': '5000',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_CYCLE_SECONDS': '180',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MIN_RATIO_SAMPLE': '10',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_PANEL_READ_ERRORS': '2',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_PANEL_READ_ERROR_BASIS_POINTS': '1000',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_MISSING_COUNT': '2',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_MISSING_BASIS_POINTS': '1000',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_CRITICAL_DRIFT_COUNT': '2',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_CRITICAL_DRIFT_BASIS_POINTS': '1000',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_TOTAL_DRIFT_COUNT': '4',
+        'ENTITLEMENT_AUTHORITY_SHADOW_MAX_TOTAL_DRIFT_BASIS_POINTS': '2000',
+    }
+    return ''.join(f'{key}={value}\n' for key, value in values.items())
 
 
 def _lease(run_id: str, run_attempt: str, phase: str, expires: int) -> str:
@@ -205,6 +317,7 @@ def _lease(run_id: str, run_attempt: str, phase: str, expires: int) -> str:
         f'phase={phase}\n'
         'action=ENABLE_SHADOW\n'
         'runtime_mode=enabled\n'
+        'policy_version=gate2-readonly-v1\n'
         f'workflow_sha={"a" * 40}\n'
         f'deployed_sha={"a" * 40}\n'
         f'image=sha256:{"b" * 64}\n'
@@ -227,27 +340,34 @@ def test_watchdog_removes_uncommitted_sidecar_after_controller_kill(tmp_path: Pa
     lease = runtime / 'lease.state'
     lease.write_text(_lease(run_id, run_attempt, 'prepared', 1))
     docker_calls = tmp_path / 'docker-calls'
-    _write_fake_watchdog_docker(fake_bin)
+    container_id = 'c' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
     _write_fake_flock(fake_bin)
     audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
     secret_env = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
     secret_env.write_text('SECRET=redacted\n')
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
     environment = os.environ | {
         'PATH': f'{fake_bin}:{os.environ["PATH"]}',
         'DOCKER_CALLS': str(docker_calls),
         'EXPECTED_RUN_ID': run_id,
         'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
     }
 
     result = subprocess.run(  # noqa: S603 - fixed repository watchdog
         [
             str(WATCHDOG),
+            'BOOTSTRAP',
             str(lease),
             'teplo_entitlement_shadow',
             run_id,
             run_attempt,
             str(audit),
             str(secret_env),
+            'pending',
         ],
         check=False,
         capture_output=True,
@@ -258,9 +378,13 @@ def test_watchdog_removes_uncommitted_sidecar_after_controller_kill(tmp_path: Pa
     assert result.returncode == 0, result.stderr
     assert not lease.exists()
     assert not secret_env.exists()
-    assert docker_calls.read_text().strip() == 'rm -f teplo_entitlement_shadow'
-    assert 'action=AUTO_DISABLE_BOOTSTRAP\n' in audit.read_text()
-    assert stat.S_IMODE(audit.stat().st_mode) == 0o600
+    assert not container_present.exists()
+    assert docker_calls.read_text().strip() == f'rm --force {container_id}'
+    disabled_audit = (
+        state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_BOOTSTRAP.audit'
+    )
+    assert 'action=AUTO_DISABLE_BOOTSTRAP\n' in disabled_audit.read_text()
+    assert stat.S_IMODE(disabled_audit.stat().st_mode) == 0o600
 
 
 def test_watchdog_materializes_completed_audit_without_removing_sidecar(tmp_path: Path) -> None:
@@ -273,27 +397,37 @@ def test_watchdog_materializes_completed_audit_without_removing_sidecar(tmp_path
     lease = runtime / 'lease.state'
     lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
     docker_calls = tmp_path / 'docker-calls'
-    _write_fake_watchdog_docker(fake_bin)
+    container_id = 'd' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
     _write_fake_flock(fake_bin)
     audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
     secret_env = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
     secret_env.write_text('SECRET=redacted\n')
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    expected_env = tmp_path / 'expected-env'
+    expected_env.write_text(_fixed_policy_env())
     environment = os.environ | {
         'PATH': f'{fake_bin}:{os.environ["PATH"]}',
         'DOCKER_CALLS': str(docker_calls),
         'EXPECTED_RUN_ID': run_id,
         'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
+        'EXPECTED_ENV_FILE': str(expected_env),
     }
 
     result = subprocess.run(  # noqa: S603 - fixed repository watchdog
         [
             str(WATCHDOG),
+            'BOOTSTRAP',
             str(lease),
             'teplo_entitlement_shadow',
             run_id,
             run_attempt,
             str(audit),
             str(secret_env),
+            container_id,
         ],
         check=False,
         capture_output=True,
@@ -308,7 +442,251 @@ def test_watchdog_materializes_completed_audit_without_removing_sidecar(tmp_path
     assert not secret_env.exists()
     assert keyed.read_text() == lease.read_text()
     assert latest.read_text() == lease.read_text()
-    assert not docker_calls.exists()
+    assert container_present.exists()
+
+
+def test_watchdog_recovers_missing_latest_from_existing_durable_audits(tmp_path: Path) -> None:
+    run_id, run_attempt = '457', '3'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    container_id = 'e' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
+    watchdog_audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
+    keyed_audit = state / f'bot-production.entitlement-shadow-control.{run_id}.{run_attempt}.audit'
+    watchdog_audit.write_text(lease.read_text())
+    keyed_audit.write_text(lease.read_text())
+    secret_env = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    expected_env = tmp_path / 'expected-env'
+    expected_env.write_text(_fixed_policy_env())
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
+        'EXPECTED_ENV_FILE': str(expected_env),
+    }
+
+    result = subprocess.run(  # noqa: S603 - fixed repository watchdog
+        [
+            str(WATCHDOG),
+            'BOOTSTRAP',
+            str(lease),
+            'teplo_entitlement_shadow',
+            run_id,
+            run_attempt,
+            str(watchdog_audit),
+            str(secret_env),
+            container_id,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    latest = state / 'bot-production.entitlement-shadow-control.state'
+    assert result.returncode == 0, result.stderr
+    assert latest.read_text() == lease.read_text()
+    assert container_present.exists()
+
+
+@pytest.mark.parametrize(
+    ('mode', 'expected_container'),
+    [('BOOTSTRAP', 'pending'), ('BOOTSTRAP', 'exact'), ('EXPIRY', 'exact')],
+)
+def test_stale_watchdog_never_removes_newer_generation(
+    tmp_path: Path,
+    mode: str,
+    expected_container: str,
+) -> None:
+    old_run_id, old_attempt = '600', '1'
+    new_run_id, new_attempt = '601', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(new_run_id, new_attempt, 'completed', 4102444800))
+    new_container_id = 'f' * 64
+    old_container_id = 'a' * 64
+    _write_fake_watchdog_docker(fake_bin, new_container_id)
+    _write_fake_flock(fake_bin)
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    audit = state / f'bot-production.entitlement-shadow-watchdog.{old_run_id}.{old_attempt}.audit'
+    secret_env = state / f'entitlement-shadow-secrets-{old_run_id}-{old_attempt}.env'
+    docker_calls = tmp_path / 'docker-calls'
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(docker_calls),
+        'EXPECTED_RUN_ID': old_run_id,
+        'EXPECTED_RUN_ATTEMPT': old_attempt,
+        'FAKE_LABEL_RUN_ID': new_run_id,
+        'FAKE_LABEL_RUN_ATTEMPT': new_attempt,
+        'FAKE_CONTAINER_ID': new_container_id,
+        'CONTAINER_PRESENT': str(container_present),
+    }
+    target = 'pending' if expected_container == 'pending' else old_container_id
+
+    result = subprocess.run(  # noqa: S603 - fixed repository watchdog
+        [
+            str(WATCHDOG),
+            mode,
+            str(lease),
+            'teplo_entitlement_shadow',
+            old_run_id,
+            old_attempt,
+            str(audit),
+            str(secret_env),
+            target,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert lease.read_text() == _lease(new_run_id, new_attempt, 'completed', 4102444800)
+    assert container_present.exists()
+    assert not docker_calls.exists() or 'rm --force' not in docker_calls.read_text()
+
+
+def test_stale_disable_helper_never_removes_newer_generation(tmp_path: Path) -> None:
+    old_run_id, old_attempt = '700', '1'
+    new_run_id, new_attempt = '701', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    patched_disable = tmp_path / 'disable.sh'
+    patched_disable.write_text(
+        DISABLE.read_text()
+        .replace('/var/lib/teplo-vpn/deploy-state', str(state))
+        .replace('/var/lib/teplo-vpn/entitlement-shadow-runtime', str(runtime))
+    )
+    patched_disable.chmod(0o755)
+    _write_fake_watchdog_docker(fake_bin, '1' * 64)
+    _write_fake_flock(fake_bin)
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(old_run_id, old_attempt, 'completed', 4102444800))
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    docker_calls = tmp_path / 'docker-calls'
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(docker_calls),
+        'EXPECTED_RUN_ID': old_run_id,
+        'EXPECTED_RUN_ATTEMPT': old_attempt,
+        'FAKE_CONTAINER_ID': '1' * 64,
+        'CONTAINER_PRESENT': str(container_present),
+    }
+
+    result = subprocess.run(  # noqa: S603 - isolated patched production primitive
+        [
+            str(patched_disable),
+            'a' * 40,
+            old_run_id,
+            old_attempt,
+            'owner',
+            'gate2-test',
+            str(state),
+            str(runtime),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not container_present.exists()
+    keyed = state / f'bot-production.entitlement-shadow-control.{old_run_id}.{old_attempt}.audit'
+    latest = state / 'bot-production.entitlement-shadow-control.state'
+    assert 'action=DISABLE_SHADOW\n' in keyed.read_text()
+    assert latest.read_text() == keyed.read_text()
+
+    # A lost response after the keyed write is repaired by the durable helper.
+    latest.unlink()
+    tombstone = runtime / 'disable.state'
+    tombstone.write_text(
+        'format_version=1\n'
+        f'workflow_sha={"a" * 40}\n'
+        f'workflow_run_id={old_run_id}\n'
+        f'workflow_run_attempt={old_attempt}\n'
+        'approval_actor=owner\n'
+        'release_card_reference=gate2-test\n'
+    )
+    helper = state / f'entitlement-shadow-disable-{"a" * 40}-{old_run_id}-{old_attempt}.sh'
+    recovery = subprocess.run(  # noqa: S603 - generated immutable helper under test
+        [
+            str(helper),
+            str(lease),
+            str(tombstone),
+            'teplo_entitlement_shadow',
+            'pending',
+            old_run_id,
+            old_attempt,
+            old_run_id,
+            old_attempt,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert recovery.returncode == 0, recovery.stderr
+    assert latest.read_text() == keyed.read_text()
+
+    # Recreate a newer generation, then fire the old run's immutable helper.
+    new_container_id = '2' * 64
+    container_present.touch()
+    lease.write_text(_lease(new_run_id, new_attempt, 'completed', 4102444800))
+    tombstone.write_text(
+        'format_version=1\n'
+        f'workflow_sha={"a" * 40}\n'
+        f'workflow_run_id={old_run_id}\n'
+        f'workflow_run_attempt={old_attempt}\n'
+        'approval_actor=owner\n'
+        'release_card_reference=gate2-test\n'
+    )
+    environment |= {
+        'FAKE_CONTAINER_ID': new_container_id,
+        'FAKE_LABEL_RUN_ID': new_run_id,
+        'FAKE_LABEL_RUN_ATTEMPT': new_attempt,
+    }
+    stale_result = subprocess.run(  # noqa: S603 - generated immutable helper under test
+        [
+            str(helper),
+            str(lease),
+            str(tombstone),
+            'teplo_entitlement_shadow',
+            'pending',
+            old_run_id,
+            old_attempt,
+            old_run_id,
+            old_attempt,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert stale_result.returncode == 0, stale_result.stderr
+    assert container_present.exists()
+    assert lease.read_text() == _lease(new_run_id, new_attempt, 'completed', 4102444800)
 
 
 def _docker_path() -> str | None:
@@ -396,12 +774,14 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
         result = subprocess.run(  # noqa: S603 - fixed repository watchdog
             [
                 str(WATCHDOG),
+                'BOOTSTRAP',
                 str(lease),
                 'teplo_entitlement_shadow',
                 run_id,
                 run_attempt,
                 str(audit),
                 str(secret_env),
+                'pending',
             ],
             check=False,
             capture_output=True,
@@ -418,7 +798,10 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
         assert inspect.returncode != 0
         assert not lease.exists()
         assert not secret_env.exists()
-        assert 'action=AUTO_DISABLE_BOOTSTRAP\n' in audit.read_text()
+        disabled_audit = (
+            state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_BOOTSTRAP.audit'
+        )
+        assert 'action=AUTO_DISABLE_BOOTSTRAP\n' in disabled_audit.read_text()
     finally:
         subprocess.run(  # noqa: S603 - resolved fixed Docker executable
             [docker, 'rm', '--force', 'teplo_entitlement_shadow'],

@@ -62,10 +62,27 @@ jobs:
             readonly MIN_FREE_KB=2097152
             readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'
             readonly STATE_FILE="$STATE_DIR/bot-production.state"
+            readonly SHADOW_RUNTIME_DIR='/var/lib/teplo-vpn/entitlement-shadow-runtime'
             BUILD_DIR=''
             BUILD_OVERRIDE=''
 
             cd "$REPO_DIR"
+            test ! -e "$SHADOW_RUNTIME_DIR/lease.state" || {
+              echo 'Refusing controlled deploy: disable the active shadow lease first.' >&2
+              exit 64
+            }
+            test ! -e "$SHADOW_RUNTIME_DIR/disable.state" || {
+              echo 'Refusing controlled deploy: a shadow disable is still in progress.' >&2
+              exit 64
+            }
+            docker info >/dev/null 2>&1 || {
+              echo 'Refusing controlled deploy: Docker state cannot be verified.' >&2
+              exit 64
+            }
+            ! docker inspect teplo_entitlement_shadow >/dev/null 2>&1 || {
+              echo 'Refusing controlled deploy: disable the shadow sidecar first.' >&2
+              exit 64
+            }
 
             compose() {
               if [ -n "$BUILD_OVERRIDE" ]; then

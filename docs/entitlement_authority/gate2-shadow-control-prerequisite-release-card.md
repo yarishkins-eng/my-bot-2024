@@ -19,8 +19,10 @@ There is no arbitrary key, value, command, path or image input. Both actions
 require `main`, the exact owner phrase, a strictly validated non-secret
 release-card reference and a recorded approval actor. Enable additionally
 requires the owner-supplied exact production deploy-state SHA. A stale workflow
-re-run is rejected because both jobs require their checked-out SHA to equal
-current `origin/main`.
+re-run is rejected if its checked-out SHA is no longer current `origin/main`.
+An approved GitHub re-run of the same current-main workflow (which receives a
+new run-attempt number) may only recover the already completed lease of the
+same workflow run; it cannot perform a second enable transition.
 
 ## Isolation boundary
 
@@ -36,7 +38,7 @@ The sidecar is created directly from the immutable running bot image ID with:
 - no Docker socket, bot data/log volume, Telegram token, payment credentials,
   SMTP, Redis or cabinet secrets;
 - only the DB and RemnaWave credentials needed for read-only observation,
-  copied to a mode-`0600` temporary env file and deleted immediately after
+copied to a mode-`0600` temporary env file and deleted immediately after
   container creation;
 - a fixed dummy `BOT_TOKEN`, because Settings requires the field although the
   sidecar never constructs a Telegram bot.
@@ -72,23 +74,36 @@ addressed by any mutating Docker command.
 ## Durable bootstrap and hard-kill policy
 
 Before creating the sidecar, Enable writes a five-minute prepared lease and
-arms an independent root-owned transient systemd watchdog. The shell ERR trap
+arms an independent root-owned transient systemd watchdog. The first watchdog
+is bound to the fixed name plus exact run labels; after Docker returns a
+container ID, a second distinct watchdog is armed against that immutable ID
+before the first one is stopped. The shell ERR trap
 removes the lease and sidecar on ordinary failure. If the runner, SSH process
 or control shell is killed and the trap cannot run, the watchdog independently
-removes every sidecar whose lease did not reach a valid completed state.
+removes only its own exact sidecar generation whose lease did not reach a valid
+completed state. A stale bootstrap or disable timer cannot remove a later run.
+If an Enable retry finds a prepared lease from the same workflow run, it may
+only invoke that exact generation's installed watchdog while the existing
+timers remain armed, prove lease, secret file and sidecar absence, stop and
+verify the old timers, then terminate with `STOP`. It never reuses the same
+generation: the owner must start a new protected workflow run with a new run
+ID before another Enable attempt.
 
 Enable waits for a real `entitlement_shadow_cycle`, refuses circuit/stopped/
 lease-loss markers, rechecks the unchanged bot, dotenv fingerprint and nine
 empty authority tables, then atomically changes the lease to `completed` with
 a seven-day expiry. The watchdog treats only that exact completed lease as the
-commit point and idempotently materializes the keyed/root-only audit if the
-workflow response is lost. A re-run recovers the same completed lease/audit;
-it never performs a second enable transition. Conflicting or orphan state is
-fail-closed.
+commit point, arms a separate host-owned hard-expiry timer, and idempotently
+materializes both keyed and latest root-only audits if the workflow response is
+lost. A re-run (including a later run-attempt of the same GitHub run) recovers
+the same completed lease/audit; it never performs a second enable transition.
+Conflicting or orphan state is fail-closed.
 
-The sidecar checks the lease every two seconds. At seven days it exits and does
-not restart. Automatic circuit STOP also exits and does not restart. A new
-observation therefore always needs a new protected owner-approved Enable run.
+The sidecar checks the lease every two seconds. Independently, the host expiry
+timer removes that exact container generation at seven days, even if the
+sidecar process is paused. Automatic circuit STOP exits and does not restart.
+A new observation therefore always needs a new protected owner-approved Enable
+run.
 
 ## Emergency disable
 
@@ -97,13 +112,26 @@ workflow code and protected Environment approval, but the production-side
 primitive does not depend on Git state, bot health, deploy-state, migration
 journal, PostgreSQL, Redis, RemnaWave or `.env`.
 
-It acquires the dedicated control lock, stops the exact pending watchdog when
-identifiable, removes the lease first (causing self-termination), then removes
-only `teplo_entitlement_shadow`. It never addresses `remnawave_bot`. If Docker
-is unavailable after lease removal, it reports failure rather than falsely
-claiming success; restart policy `no` still prevents an old sidecar from
-returning when Docker restarts. The disable audit is keyed by workflow
-run/attempt and is idempotent under lost response/re-run.
+It acquires the dedicated control lock and first arms an independent
+generation/label-fenced disable helper. Creating the immutable disable
+tombstone is the durable commit point: a kill before that point leaves the
+running observation unchanged and reports no success; after it, the armed
+helper keeps retrying independently and both future Enable and deploy paths
+remain blocked. Disable then removes the lease (causing
+self-termination), removes only `teplo_entitlement_shadow`, and cancels the
+old generation's bootstrap/expiry timers. It never addresses
+`remnawave_bot`. If Docker is unavailable after lease removal, it reports
+failure rather than falsely claiming success; the helper retries, while
+restart policy `no` prevents an old sidecar from returning after a daemon
+restart. The disable audit is keyed by workflow run/attempt and is idempotent
+under lost response/re-run.
+
+All four production image/schema switch workflows share the same concurrency
+group and contain an inline fail-closed guard. Ordinary, migration,
+infrastructure and migration-recovery deploys refuse to run while a shadow
+lease or sidecar exists. Operators must complete `DISABLE_SHADOW` first, so an
+observation can never silently continue against a newer source, image or
+schema.
 
 ## Prerequisite release and verification
 
@@ -114,7 +142,8 @@ deploy of the exact reviewed merge SHA. Shadow remains absent. Required checks:
    `P0=0`, `P1=0`;
    CI must run the dedicated real-Docker hard-kill/watchdog proof without skip;
 2. schema still `0103`; no migration, Compose, Dockerfile, app writer or
-   business-flow file changed;
+   business-flow file changed; production deploy/recovery workflows changed
+   only to add the active-shadow interlock;
 3. production bot/PostgreSQL/Redis/HTTP/Telegram healthy; bot ID/start time
    stable during the separate disable rehearsal;
 4. all four production entitlement flags `false`, kill switch `true`;
