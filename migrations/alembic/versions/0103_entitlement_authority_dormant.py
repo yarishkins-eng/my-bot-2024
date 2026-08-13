@@ -274,6 +274,7 @@ def upgrade() -> None:
         sa.Column('generation', sa.BigInteger(), nullable=False),
         sa.Column('state', sa.String(32), nullable=False, server_default='erasure_requested'),
         sa.Column('encrypted_panel_uuid', sa.LargeBinary(), nullable=True),
+        sa.Column('encrypted_create_locator', sa.LargeBinary(), nullable=True),
         sa.Column('panel_uuid_hmac', sa.String(64), nullable=False),
         sa.Column('identity_hmac', sa.String(64), nullable=False),
         sa.Column('lease_epoch', sa.BigInteger(), nullable=False, server_default='0'),

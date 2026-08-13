@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
-from app.utils.security import hmac_fingerprint
+from app.utils.security import encrypt_restricted_identifier, hmac_fingerprint
 
 from .persistence import CommandClaim, PostgresEntitlementStore
 from .state_machine import Stage
@@ -170,6 +170,11 @@ class ProjectionCoordinator:
                     receipt.panel_uuid,
                     secret=self._secret,
                     purpose='entitlement-panel-uuid',
+                ),
+                encrypted_cleanup_panel_uuid=encrypt_restricted_identifier(
+                    receipt.panel_uuid,
+                    secret=self._secret,
+                    purpose='entitlement-panel-cleanup-v1',
                 ),
                 bound_desired_hash=desired.bind(receipt.panel_uuid).desired_hash,
                 now=clock,

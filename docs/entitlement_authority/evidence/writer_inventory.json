@@ -2510,13 +2510,7 @@
     {
       "field": "status",
       "function": "<module>",
-      "line": 2434,
-      "path": "app/database/models.py"
-    },
-    {
-      "field": "status",
-      "function": "<module>",
-      "line": 2437,
+      "line": 2435,
       "path": "app/database/models.py"
     },
     {
@@ -2528,61 +2522,67 @@
     {
       "field": "status",
       "function": "<module>",
-      "line": 2947,
+      "line": 2439,
       "path": "app/database/models.py"
     },
     {
       "field": "status",
       "function": "<module>",
-      "line": 2970,
+      "line": 2948,
       "path": "app/database/models.py"
     },
     {
       "field": "status",
       "function": "<module>",
-      "line": 3007,
+      "line": 2971,
       "path": "app/database/models.py"
     },
     {
       "field": "status",
       "function": "<module>",
-      "line": 3036,
+      "line": 3008,
       "path": "app/database/models.py"
     },
     {
       "field": "status",
       "function": "<module>",
-      "line": 3352,
+      "line": 3037,
       "path": "app/database/models.py"
     },
     {
       "field": "status",
       "function": "<module>",
-      "line": 4534,
+      "line": 3353,
       "path": "app/database/models.py"
     },
     {
       "field": "status",
       "function": "<module>",
-      "line": 5049,
+      "line": 4535,
       "path": "app/database/models.py"
     },
     {
       "field": "status",
       "function": "<module>",
-      "line": 5051,
+      "line": 5050,
       "path": "app/database/models.py"
     },
     {
       "field": "status",
       "function": "<module>",
-      "line": 5053,
+      "line": 5052,
       "path": "app/database/models.py"
     },
     {
       "field": "status",
       "function": "<module>",
       "line": 5054,
+      "path": "app/database/models.py"
+    },
+    {
+      "field": "status",
+      "function": "<module>",
+      "line": 5055,
       "path": "app/database/models.py"
     },
     {
@@ -13091,7 +13091,7 @@
     },
     {
       "decorators": [],
-      "line": 2653,
+      "line": 2654,
       "name": "add_traffic",
       "path": "app/database/models.py"
     },
@@ -14445,7 +14445,7 @@
     "app/**/*.py",
     "main.py"
   ],
-  "sha256": "a8f44ac848e44205adef9dce9a15359b26f4fd40a746850cf038dd30381414c0",
+  "sha256": "a7ad53de0565ee3f0c6be9f48b19ae3c3baa6107386717b2a3ac0d957fe82269",
   "startup_registrations": [
     {
       "call": "asyncio.create_task(                                     _refresh_remnawave_description(                                         remnawave_uuid=sub.remnawave_uuid,                                         description=description,                                         telegram_id=db_user.telegram_id",

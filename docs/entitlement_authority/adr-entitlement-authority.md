@@ -66,9 +66,16 @@ exists, the identity may retain `user_id` and operational Panel UUID.
 Erasure is `erasure_requested → cleanup_terminal → final_erasure`. The first
 stage increments generation, clears `user_id`/raw binding, rotates the owner
 key, removes snapshots/observations/overlays/notification intents, unlinks
-webhook evidence, and retains the cleanup UUID only AES-GCM encrypted plus
-HMAC fingerprints. If no Panel binding exists and there is no unknown remote
-outcome, the same transaction records `cleanup_terminal` with no ciphertext.
+webhook evidence, and retains cleanup locators only AES-GCM encrypted plus
+HMAC fingerprints. Webhook and canonical-observation writers first take the
+same identity row lock, so either their evidence commits before erasure and is
+deleted by it, or it observes terminal markers and remains unlinked/absent.
+For an unbound CREATE with a possible remote outcome, erasure retains the
+encrypted deterministic Panel username; a late successful POST receipt is
+handed directly to the locked cleanup command as an encrypted UUID without
+relinking the identity. If no Panel binding or possible CREATE exists and
+there is no unknown remote outcome, the same transaction records
+`cleanup_terminal` with no ciphertext.
 A preceding unknown mutation quarantines cleanup and blocks terminal state.
 Verified DELETE/canonical 404 clears ciphertext immediately; terminal evidence
 expires after 90 days, unresolved evidence does not. Once erasure begins, a

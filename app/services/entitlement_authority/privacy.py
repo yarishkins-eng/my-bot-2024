@@ -6,10 +6,12 @@ from datetime import datetime, timedelta
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.entitlement_authority.strict_panel import panel_owner_username
 from app.utils.security import encrypt_restricted_identifier, hmac_fingerprint
 
 
 _PURPOSE = 'entitlement-panel-cleanup-v1'
+_CREATE_LOCATOR_PURPOSE = 'entitlement-panel-create-locator-v1'
 
 
 async def request_erasure_cleanup(
@@ -25,7 +27,7 @@ async def request_erasure_cleanup(
         (
             await session.execute(
                 text(
-                    'SELECT panel_uuid, generation, lifecycle_state, '
+                    'SELECT panel_uuid, generation, lifecycle_state, deterministic_owner_key, '
                     'erasure_requested_at, cleanup_terminal_at '
                     'FROM entitlement_identities WHERE id=:identity_id FOR UPDATE'
                 ),
@@ -83,6 +85,34 @@ async def request_erasure_cleanup(
                 {'identity_id': identity_id},
             )
         ).scalar_one()
+    )
+    unbound_create_possible = bool(
+        panel_uuid is None
+        and (
+            await session.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM entitlement_projection_commands
+                         WHERE identity_id=:identity_id
+                           AND deterministic_create_key IS NOT NULL
+                           AND (remote_outcome_unknown OR mutation_sent_at IS NOT NULL)
+                           AND stage NOT IN ('ready', 'cancelled')
+                    )
+                    """
+                ),
+                {'identity_id': identity_id},
+            )
+        ).scalar_one()
+    )
+    encrypted_create_locator = (
+        encrypt_restricted_identifier(
+            panel_owner_username(str(identity['deterministic_owner_key'])),
+            secret=secret,
+            purpose=_CREATE_LOCATOR_PURPOSE,
+        )
+        if unbound_create_possible
+        else None
     )
     generation = int(identity['generation']) + 1
     no_remote_cleanup = panel_uuid is None and not prior_remote_unknown
@@ -169,10 +199,12 @@ async def request_erasure_cleanup(
             """
             INSERT INTO entitlement_cleanup_commands
                    (operation_id, identity_id, generation, state, encrypted_panel_uuid,
+                    encrypted_create_locator,
                     panel_uuid_hmac, identity_hmac, remote_outcome_unknown, last_error_code,
                     requested_at, alert_after, operator_alerted_at, terminal_at,
                     retention_until, created_at, updated_at)
             VALUES (:operation_id, :identity_id, :generation, :state, :encrypted,
+                    :encrypted_create_locator,
                     :panel_hmac, :identity_hmac, :prior_remote_unknown, :error_code,
                     :now, :alert_after, NULL, :terminal_at, :retention_until, :now, :now)
             """
@@ -182,6 +214,7 @@ async def request_erasure_cleanup(
             'identity_id': identity_id,
             'generation': generation,
             'encrypted': encrypted,
+            'encrypted_create_locator': encrypted_create_locator,
             'panel_hmac': panel_hmac,
             'identity_hmac': identity_hmac,
             'state': cleanup_state,
@@ -259,6 +292,7 @@ async def mark_cleanup_terminal(
             """
             UPDATE entitlement_cleanup_commands
                SET state = 'cleanup_terminal', encrypted_panel_uuid = NULL,
+                   encrypted_create_locator = NULL,
                    terminal_at = :now, retention_until = :retention, updated_at = :now
              WHERE operation_id = :operation_id
             """
@@ -355,6 +389,7 @@ async def housekeep_terminal_evidence(session: AsyncSession, *, now: datetime) -
             DELETE FROM entitlement_cleanup_commands
              WHERE state = 'cleanup_terminal'
                AND encrypted_panel_uuid IS NULL
+               AND encrypted_create_locator IS NULL
                AND retention_until < :now
          RETURNING id
             """

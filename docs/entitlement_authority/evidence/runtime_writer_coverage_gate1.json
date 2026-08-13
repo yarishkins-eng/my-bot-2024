@@ -2,11 +2,11 @@
   "coverage_tool": "7.13.1",
   "format": 1,
   "interpretation": "Executed lines prove exercised paths only. Uncovered locations remain a cutover NO-GO; coverage never proves absence of Python dynamic dispatch.",
-  "inventory_sha256": "8f20df95a7cd084c6e3d841c7058627fa9c744c2c180bc0794d39f2c71878bde",
+  "inventory_sha256": "a7ad53de0565ee3f0c6be9f48b19ae3c3baa6107386717b2a3ac0d957fe82269",
   "overall_app_lines": {
-    "covered_lines": 31537,
-    "num_statements": 128733,
-    "percent_covered": 24.497991967871485
+    "covered_lines": 31629,
+    "num_statements": 128834,
+    "percent_covered": 24.55019637673285
   },
   "sections": {
     "calls": {
@@ -5717,7 +5717,7 @@
         },
         {
           "covered": true,
-          "line": 2653,
+          "line": 2654,
           "path": "app/database/models.py"
         },
         {

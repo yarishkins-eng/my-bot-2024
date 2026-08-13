@@ -22,11 +22,15 @@ the strict gateway and no shadow/production deployment is part of this work.
 - Pure read-only shadow evaluator. It accepts no DB session or Panel client and
   exposes only hash prefixes and mismatch field names.
 - Two-stage erasure removes new authority links/snapshots immediately, keeps
-  only an encrypted restricted cleanup UUID until verified terminal cleanup,
+  only encrypted restricted cleanup locators until verified terminal cleanup,
   raises a durable 30-day operator alert, and deletes terminal evidence after
-  90 days. An identity with no Panel binding and no unknown remote outcome is
-  terminal immediately; unknown prior remote outcomes cannot become terminal
-  automatically.
+  90 days. Evidence linking is serialized on the identity row, so an in-flight
+  webhook or canonical observation cannot relink PII after erasure commits.
+  If an unbound CREATE may have reached Panel, cleanup retains the encrypted
+  deterministic username and atomically accepts a late exact UUID receipt
+  without restoring the identity binding. An identity with no Panel binding
+  and no unknown remote outcome is terminal immediately; unknown prior remote
+  outcomes cannot become terminal automatically.
 
 ## Evidence index
 

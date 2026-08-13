@@ -13,6 +13,46 @@ from .state_machine import Stage, claim_transition, finalize_transition
 from .types import EntitlementSnapshot, SnapshotComparison
 
 
+async def _lock_identity_for_evidence(
+    session: AsyncSession,
+    *,
+    identity_id: int,
+    generation: int | None = None,
+) -> bool:
+    """Serialize evidence linking with erasure and reject terminal identities."""
+
+    identity = (
+        (
+            await session.execute(
+                text(
+                    """
+                    SELECT i.generation, i.lifecycle_state, i.erasure_requested_at,
+                           i.cleanup_terminal_at,
+                           EXISTS (
+                               SELECT 1 FROM entitlement_cleanup_commands c
+                                WHERE c.identity_id=i.id
+                           ) AS has_cleanup_command
+                      FROM entitlement_identities i
+                     WHERE i.id=:identity_id
+                     FOR UPDATE
+                    """
+                ),
+                {'identity_id': identity_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return bool(
+        identity is not None
+        and (generation is None or identity['generation'] == generation)
+        and identity['lifecycle_state'] not in {'erasure_requested', 'cleanup_terminal', 'final_erasure'}
+        and identity['erasure_requested_at'] is None
+        and identity['cleanup_terminal_at'] is None
+        and not identity['has_cleanup_command']
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CommandClaim:
     command_id: int
@@ -355,6 +395,7 @@ class PostgresEntitlementStore:
         panel_uuid: str,
         *,
         panel_uuid_hmac: str,
+        encrypted_cleanup_panel_uuid: bytes,
         bound_desired_hash: str,
         now: datetime,
     ) -> bool:
@@ -392,7 +433,8 @@ class PostgresEntitlementStore:
                 (
                     await session.execute(
                         text(
-                            'SELECT generation, lease_epoch, stage, desired_hash, source_revision_id '
+                            'SELECT generation, lease_epoch, stage, desired_hash, source_revision_id, '
+                            'deterministic_create_key, mutation_sent_at, remote_outcome_unknown '
                             'FROM entitlement_projection_commands WHERE id=:id FOR UPDATE'
                         ),
                         {'id': claim.command_id},
@@ -411,6 +453,93 @@ class PostgresEntitlementStore:
                 .mappings()
                 .one_or_none()
             )
+            terminal_lifecycle = identity['lifecycle_state'] in {
+                'erasure_requested',
+                'cleanup_terminal',
+                'final_erasure',
+            }
+            if terminal_lifecycle:
+                cleanup = (
+                    (
+                        await session.execute(
+                            text(
+                                """
+                                SELECT operation_id, generation, state, remote_outcome_unknown,
+                                       encrypted_create_locator
+                                  FROM entitlement_cleanup_commands
+                                 WHERE identity_id=:identity_id
+                                 ORDER BY id DESC LIMIT 1
+                                 FOR UPDATE
+                                """
+                            ),
+                            {'identity_id': claim.identity_id},
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                safe_erasure_handoff = bool(
+                    identity['lifecycle_state'] == 'erasure_requested'
+                    and identity['generation'] == claim.generation + 1
+                    and command['generation'] == claim.generation
+                    and command['lease_epoch'] == claim.lease_epoch
+                    and command['stage'] == Stage.REMOTE_OUTCOME_UNKNOWN.value
+                    and command['remote_outcome_unknown']
+                    and command['mutation_sent_at'] is not None
+                    and command['deterministic_create_key'] == claim.deterministic_create_key
+                    and cleanup is not None
+                    and cleanup['generation'] == identity['generation']
+                    and cleanup['state'] == 'quarantined'
+                    and cleanup['remote_outcome_unknown']
+                    and cleanup['encrypted_create_locator'] is not None
+                )
+                if not safe_erasure_handoff:
+                    raise RuntimeError('uuid_bind_fence_lost')
+                if conflict_id is not None:
+                    await session.execute(
+                        text(
+                            """
+                            UPDATE entitlement_cleanup_commands
+                               SET last_error_code='create_receipt_uuid_conflict', updated_at=:now
+                             WHERE operation_id=:operation_id
+                            """
+                        ),
+                        {'operation_id': cleanup['operation_id'], 'now': now},
+                    )
+                    return False
+                await session.execute(
+                    text(
+                        """
+                        UPDATE entitlement_cleanup_commands
+                           SET encrypted_panel_uuid=:encrypted_panel_uuid,
+                               panel_uuid_hmac=:panel_uuid_hmac,
+                               last_error_code='create_receipt_handed_to_cleanup',
+                               updated_at=:now
+                         WHERE operation_id=:operation_id
+                        """
+                    ),
+                    {
+                        'operation_id': cleanup['operation_id'],
+                        'encrypted_panel_uuid': encrypted_cleanup_panel_uuid,
+                        'panel_uuid_hmac': panel_uuid_hmac,
+                        'now': now,
+                    },
+                )
+                await session.execute(
+                    text(
+                        """
+                        UPDATE entitlement_cleanup_tombstones
+                           SET panel_uuid_hmac=:panel_uuid_hmac,
+                               last_error_code='create_receipt_handed_to_cleanup'
+                         WHERE operation_id=:operation_id
+                        """
+                    ),
+                    {
+                        'operation_id': cleanup['operation_id'],
+                        'panel_uuid_hmac': panel_uuid_hmac,
+                    },
+                )
+                return False
             if conflict_id is not None:
                 await session.execute(
                     text(
@@ -569,6 +698,12 @@ class PostgresEntitlementStore:
     ) -> None:
         event_key = hashlib.sha256(f'{claim.command_id}:{event_type}:{comparison.observed_hash}'.encode()).hexdigest()
         async with self._sessions() as session, session.begin():
+            if not await _lock_identity_for_evidence(
+                session,
+                identity_id=claim.identity_id,
+                generation=claim.generation,
+            ):
+                return
             await session.execute(
                 text(
                     """
@@ -576,15 +711,9 @@ class PostgresEntitlementStore:
                            (identity_id, generation, source_kind, event_type, event_id_hash,
                             observed_snapshot, observed_hash, comparison_result, mismatch_fields,
                             observed_at, created_at, retention_until)
-                    SELECT :identity_id, :generation, 'canonical_get', :event_type, :event_key,
+                    VALUES (:identity_id, :generation, 'canonical_get', :event_type, :event_key,
                            CAST(:snapshot AS jsonb), :observed_hash, :result, CAST(:mismatch AS jsonb),
-                           :now, :now, :retention
-                     WHERE EXISTS (
-                           SELECT 1 FROM entitlement_identities
-                            WHERE id=:identity_id AND generation=:generation
-                              AND lifecycle_state NOT IN
-                                  ('erasure_requested', 'cleanup_terminal', 'final_erasure')
-                     )
+                           :now, :now, :retention)
                     ON CONFLICT (identity_id, source_kind, event_id_hash) DO NOTHING
                     """
                 ),
@@ -954,37 +1083,23 @@ async def ingest_webhook_observation(
 ) -> bool:
     """Append normalized webhook metadata only; commercial desired state is untouched."""
 
+    linked_identity_id = None
+    if identity_id is not None and await _lock_identity_for_evidence(session, identity_id=identity_id):
+        linked_identity_id = identity_id
     inserted = await session.execute(
         text(
             """
             INSERT INTO entitlement_webhook_inbox
                    (identity_id, event_id_hash, event_type, normalized_hash,
                     event_timestamp, received_at, retention_until)
-            VALUES (
-                    CASE
-                        WHEN CAST(:identity_id AS bigint) IS NULL THEN NULL
-                        WHEN EXISTS (
-                            SELECT 1 FROM entitlement_identities i
-                             WHERE i.id=CAST(:identity_id AS bigint)
-                               AND i.lifecycle_state NOT IN
-                                   ('erasure_requested', 'cleanup_terminal', 'final_erasure')
-                               AND i.erasure_requested_at IS NULL
-                               AND i.cleanup_terminal_at IS NULL
-                               AND NOT EXISTS (
-                                   SELECT 1 FROM entitlement_cleanup_commands c
-                                    WHERE c.identity_id=i.id
-                               )
-                        ) THEN CAST(:identity_id AS bigint)
-                        ELSE NULL
-                    END,
-                    :event_id_hash, :event_type, :normalized_hash,
+            VALUES (:linked_identity_id, :event_id_hash, :event_type, :normalized_hash,
                     :event_timestamp, :now, :retention)
             ON CONFLICT (event_id_hash) DO NOTHING
             RETURNING id
             """
         ),
         {
-            'identity_id': identity_id,
+            'linked_identity_id': linked_identity_id,
             'event_id_hash': event_id_hash,
             'event_type': event_type,
             'normalized_hash': normalized_hash,

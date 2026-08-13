@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -11,6 +12,11 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.services.entitlement_authority.persistence import (
+    CommandClaim,
+    PostgresEntitlementStore,
+    ingest_webhook_observation,
+)
 from app.services.entitlement_authority.privacy import (
     housekeep_terminal_evidence,
     mark_cleanup_terminal,
@@ -18,7 +24,7 @@ from app.services.entitlement_authority.privacy import (
     mark_overdue_cleanup_alerts,
     request_erasure_cleanup,
 )
-from app.services.entitlement_authority.types import EntitlementSnapshot
+from app.services.entitlement_authority.types import EntitlementSnapshot, compare_snapshots
 from app.utils.security import decrypt_restricted_identifier
 
 
@@ -146,6 +152,147 @@ async def create_identity(
             },
         )
     return user_id, identity_id
+
+
+def identity_snapshot(user_id: int, *, panel_uuid: str | None = RAW_UUID) -> EntitlementSnapshot:
+    return EntitlementSnapshot(
+        owner_key=f'owner-{user_id}',
+        panel_uuid=panel_uuid,
+        status='ACTIVE',
+        expire_at=NOW + timedelta(days=30),
+        traffic_limit_bytes=0,
+        traffic_limit_strategy='NO_RESET',
+        hwid_device_limit=None,
+        internal_squads=(),
+        external_squad_uuid=None,
+        provenance='test',
+        generation=1,
+    )
+
+
+async def write_identity_evidence(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    kind: str,
+    user_id: int,
+    identity_id: int,
+) -> None:
+    if kind == 'webhook':
+        async with sessions() as session, session.begin():
+            assert await ingest_webhook_observation(
+                session,
+                identity_id=identity_id,
+                event_id_hash='a' * 64,
+                event_type='user.updated',
+                normalized_hash='b' * 64,
+                event_timestamp=NOW,
+                now=NOW,
+            )
+        return
+    snapshot = identity_snapshot(user_id)
+    async with sessions() as session:
+        command_id = (
+            await session.execute(
+                text('SELECT id FROM entitlement_projection_commands WHERE identity_id=:identity_id AND generation=1'),
+                {'identity_id': identity_id},
+            )
+        ).scalar_one()
+    claim = CommandClaim(
+        command_id=command_id,
+        identity_id=identity_id,
+        generation=1,
+        lease_epoch=0,
+        mode='work',
+        panel_uuid=RAW_UUID,
+        deterministic_create_key=None,
+        desired_snapshot=snapshot,
+    )
+    await PostgresEntitlementStore(sessions).record_observation(
+        claim,
+        snapshot,
+        compare_snapshots(snapshot, snapshot),
+        event_type='concurrent_erasure_probe',
+        now=NOW,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['webhook', 'observation'])
+@pytest.mark.parametrize('erasure_locks_first', [False, True])
+async def test_evidence_linking_serializes_with_erasure_in_both_lock_orders(
+    sessions: async_sessionmaker[AsyncSession],
+    kind: str,
+    erasure_locks_first: bool,
+) -> None:
+    user_id, identity_id = await create_identity(sessions)
+
+    async def erase() -> None:
+        async with sessions() as session, session.begin():
+            await request_erasure_cleanup(
+                session,
+                identity_id=identity_id,
+                secret=SECRET,
+                now=NOW + timedelta(seconds=1),
+            )
+
+    if erasure_locks_first:
+        eraser = sessions()
+        transaction = await eraser.begin()
+        await request_erasure_cleanup(
+            eraser,
+            identity_id=identity_id,
+            secret=SECRET,
+            now=NOW + timedelta(seconds=1),
+        )
+        evidence_task = asyncio.create_task(
+            write_identity_evidence(sessions, kind=kind, user_id=user_id, identity_id=identity_id)
+        )
+        await asyncio.sleep(0.05)
+        assert not evidence_task.done()
+        await transaction.commit()
+        await eraser.close()
+        await asyncio.wait_for(evidence_task, timeout=2)
+    else:
+        blocked_table = 'entitlement_webhook_inbox' if kind == 'webhook' else 'entitlement_observations'
+        blocker = sessions()
+        blocker_transaction = await blocker.begin()
+        await blocker.execute(text(f'LOCK TABLE {blocked_table} IN ACCESS EXCLUSIVE MODE'))
+        evidence_task = asyncio.create_task(
+            write_identity_evidence(sessions, kind=kind, user_id=user_id, identity_id=identity_id)
+        )
+        await asyncio.sleep(0.05)
+        assert not evidence_task.done()
+        erasure_task = asyncio.create_task(erase())
+        await asyncio.sleep(0.05)
+        assert not erasure_task.done()
+        await blocker_transaction.commit()
+        await blocker.close()
+        await asyncio.wait_for(evidence_task, timeout=2)
+        await asyncio.wait_for(erasure_task, timeout=2)
+
+    async with sessions() as session:
+        identity = (
+            await session.execute(
+                text('SELECT lifecycle_state, erasure_requested_at FROM entitlement_identities WHERE id=:identity_id'),
+                {'identity_id': identity_id},
+            )
+        ).one()
+        assert identity.lifecycle_state == 'erasure_requested'
+        assert identity.erasure_requested_at is not None
+        assert (
+            await session.execute(
+                text('SELECT count(*) FROM entitlement_observations WHERE identity_id=:identity_id'),
+                {'identity_id': identity_id},
+            )
+        ).scalar_one() == 0
+        assert (
+            await session.execute(
+                text('SELECT count(*) FROM entitlement_webhook_inbox WHERE identity_id=:identity_id'),
+                {'identity_id': identity_id},
+            )
+        ).scalar_one() == 0
+    async with sessions() as session, session.begin():
+        await session.execute(text('DELETE FROM users WHERE id=:id'), {'id': user_id})
 
 
 @pytest.mark.asyncio

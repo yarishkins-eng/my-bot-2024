@@ -25,6 +25,7 @@ from app.services.entitlement_authority.privacy import mark_final_erasure, reque
 from app.services.entitlement_authority.state_machine import Stage
 from app.services.entitlement_authority.strict_panel import StrictPanelClient, panel_owner_username
 from app.services.entitlement_authority.types import EntitlementSnapshot, compare_snapshots
+from app.utils.security import decrypt_restricted_identifier
 
 
 DATABASE_URL = os.environ.get('ENTITLEMENT_AUTHORITY_APP_DATABASE_URL')
@@ -472,6 +473,123 @@ async def test_create_unknown_has_at_most_one_disabled_candidate_and_no_blind_se
     assert fake.count('POST') == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('create_mode', ['apply_lost', 'lost_without_apply'])
+async def test_erasure_after_unknown_create_retains_encrypted_deterministic_locator(
+    sessions: async_sessionmaker[AsyncSession],
+    create_mode: str,
+) -> None:
+    target = desired(panel_uuid=None)
+    identity_id, command_id, store = await make_command(sessions, target)
+    fake = FakePanelTransport()
+    fake.create_mode = create_mode
+    assert (
+        await coordinator(store, fake).project_command(command_id, target, worker='worker-one', now=NOW)
+        == 'quarantined'
+    )
+    async with sessions() as session, session.begin():
+        operation_id = await request_erasure_cleanup(
+            session,
+            identity_id=identity_id,
+            secret=SECRET,
+            now=NOW + timedelta(seconds=1),
+        )
+    async with sessions() as session:
+        cleanup = (
+            await session.execute(
+                text(
+                    'SELECT encrypted_panel_uuid, encrypted_create_locator, remote_outcome_unknown '
+                    'FROM entitlement_cleanup_commands WHERE operation_id=:operation_id'
+                ),
+                {'operation_id': operation_id},
+            )
+        ).one()
+        identity = (
+            await session.execute(
+                text(
+                    'SELECT panel_uuid, lifecycle_state, deterministic_owner_key '
+                    'FROM entitlement_identities WHERE id=:identity_id'
+                ),
+                {'identity_id': identity_id},
+            )
+        ).one()
+    assert cleanup.remote_outcome_unknown
+    assert cleanup.encrypted_panel_uuid is None
+    assert cleanup.encrypted_create_locator is not None
+    assert decrypt_restricted_identifier(
+        cleanup.encrypted_create_locator,
+        secret=SECRET,
+        purpose='entitlement-panel-create-locator-v1',
+    ) == panel_owner_username(target.owner_key)
+    assert target.owner_key not in identity.deterministic_owner_key
+    assert identity.panel_uuid is None and identity.lifecycle_state == 'erasure_requested'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('barrier', ['after_create_send_fence', 'after_create_post'])
+async def test_erasure_during_create_hands_receipt_to_restricted_cleanup(
+    sessions: async_sessionmaker[AsyncSession],
+    barrier: str,
+) -> None:
+    target = desired(panel_uuid=None)
+    identity_id, command_id, store = await make_command(sessions, target, source_key=f'erasure-create-{barrier}')
+    fake = FakePanelTransport()
+    operation_id: str | None = None
+
+    async def erase(name: str) -> None:
+        nonlocal operation_id
+        if name != barrier or operation_id is not None:
+            return
+        async with sessions() as session, session.begin():
+            operation_id = await request_erasure_cleanup(
+                session,
+                identity_id=identity_id,
+                secret=SECRET,
+                now=NOW + timedelta(seconds=1),
+            )
+
+    result = await coordinator(store, fake, erase).project_command(
+        command_id,
+        target,
+        worker='worker-one',
+        now=NOW,
+    )
+    assert result == 'quarantined'
+    assert operation_id is not None and len(fake.states) == 1
+    remote_uuid = next(iter(fake.states))
+    async with sessions() as session:
+        cleanup = (
+            await session.execute(
+                text(
+                    'SELECT encrypted_panel_uuid, encrypted_create_locator, panel_uuid_hmac, '
+                    'remote_outcome_unknown, last_error_code '
+                    'FROM entitlement_cleanup_commands WHERE operation_id=:operation_id'
+                ),
+                {'operation_id': operation_id},
+            )
+        ).one()
+        identity = (
+            await session.execute(
+                text('SELECT panel_uuid, lifecycle_state FROM entitlement_identities WHERE id=:identity_id'),
+                {'identity_id': identity_id},
+            )
+        ).one()
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_source_revisions'))).scalar_one() == 0
+    assert cleanup.remote_outcome_unknown
+    assert cleanup.encrypted_create_locator is not None
+    assert cleanup.encrypted_panel_uuid is not None
+    assert cleanup.last_error_code == 'create_receipt_handed_to_cleanup'
+    assert (
+        decrypt_restricted_identifier(
+            cleanup.encrypted_panel_uuid,
+            secret=SECRET,
+            purpose='entitlement-panel-cleanup-v1',
+        )
+        == remote_uuid
+    )
+    assert identity.panel_uuid is None and identity.lifecycle_state == 'erasure_requested'
+
+
 class SimulatedProcessKill(BaseException):
     pass
 
@@ -631,6 +749,7 @@ async def test_concurrent_cross_identity_uuid_bind_quarantines_both(
             claim_one,
             'shared-panel-uuid',
             panel_uuid_hmac='1' * 64,
+            encrypted_cleanup_panel_uuid=b'encrypted-one',
             bound_desired_hash=first.bind('shared-panel-uuid').desired_hash,
             now=NOW,
         ),
@@ -638,6 +757,7 @@ async def test_concurrent_cross_identity_uuid_bind_quarantines_both(
             claim_two,
             'shared-panel-uuid',
             panel_uuid_hmac='1' * 64,
+            encrypted_cleanup_panel_uuid=b'encrypted-two',
             bound_desired_hash=second.bind('shared-panel-uuid').desired_hash,
             now=NOW,
         ),

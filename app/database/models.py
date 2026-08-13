@@ -2391,6 +2391,7 @@ class EntitlementCleanupCommand(Base):
     generation = Column(BigInteger, nullable=False)
     state = Column(String(32), nullable=False, default='erasure_requested', server_default='erasure_requested')
     encrypted_panel_uuid = Column(LargeBinary, nullable=True)
+    encrypted_create_locator = Column(LargeBinary, nullable=True)
     panel_uuid_hmac = Column(String(64), nullable=False)
     identity_hmac = Column(String(64), nullable=False)
     lease_epoch = Column(BigInteger, nullable=False, default=0, server_default='0')
