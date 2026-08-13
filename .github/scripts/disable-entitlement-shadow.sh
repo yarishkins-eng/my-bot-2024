@@ -64,8 +64,11 @@ install_helper() {
     '#!/usr/bin/env bash' \
     'set -Eeuo pipefail' \
     'lease="$1"; tombstone="$2"; sidecar="$3"; expected_id="$4"; expected_run="$5"; expected_attempt="$6"; disable_run="$7"; disable_attempt="$8"' \
+    'state="$(dirname "$0")"' \
+    'if [ "${TEPLO_SHADOW_CONTROL_LOCK_HELD:-0}" != 1 ]; then exec 9>"$state/bot-production.entitlement-shadow-control.lock"; flock -w 30 9 || exit 1; fi' \
     'tombstone_run="$(sed -n "s/^workflow_run_id=//p" "$tombstone" 2>/dev/null || true)"' \
     'tombstone_attempt="$(sed -n "s/^workflow_run_attempt=//p" "$tombstone" 2>/dev/null || true)"' \
+    '[[ "$tombstone_run" =~ ^[0-9]+$ ]] && [[ "$tombstone_attempt" =~ ^[0-9]+$ ]] || exit 1' \
     '[ "$tombstone_run" = "$disable_run" ] && [ "$tombstone_attempt" = "$disable_attempt" ] || exit 0' \
     'workflow_sha="$(sed -n "s/^workflow_sha=//p" "$tombstone" 2>/dev/null || true)"' \
     'actor="$(sed -n "s/^approval_actor=//p" "$tombstone" 2>/dev/null || true)"' \
@@ -87,7 +90,6 @@ install_helper() {
     'fi' \
     'docker info >/dev/null 2>&1 || exit 1' \
     '! docker inspect "$actual" >/dev/null 2>&1 || exit 1' \
-    'state="$(dirname "$0")"' \
     'keyed="$state/bot-production.entitlement-shadow-control.${disable_run}.${disable_attempt}.audit"' \
     'latest="$state/bot-production.entitlement-shadow-control.state"' \
     'if [ -e "$keyed" ]; then' \
@@ -145,7 +147,7 @@ if [ "$old_run_id" != 'none' ]; then
   rm -f -- "$STATE_DIR/entitlement-shadow-secrets-${old_run_id}-${old_run_attempt}.env"
 fi
 
-"$HELPER" "$LEASE_FILE" "$DISABLE_TOMBSTONE_FILE" "$SIDECAR" pending \
+TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$HELPER" "$LEASE_FILE" "$DISABLE_TOMBSTONE_FILE" "$SIDECAR" pending \
   "$old_run_id" "$old_run_attempt" "$RUN_ID" "$RUN_ATTEMPT" || fail 'sidecar_removal_unverified'
 docker info >/dev/null 2>&1 || fail 'docker_unavailable_after_lease_removal'
 ! docker inspect "$SIDECAR" >/dev/null 2>&1 || fail 'sidecar_still_present'

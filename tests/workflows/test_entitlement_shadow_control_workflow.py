@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -106,6 +108,9 @@ def test_workflow_has_only_allowlisted_protected_actions() -> None:
 def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     source = ENABLE.read_text()
 
+    assert source.index('flock -n 9') < source.index('git fetch --no-tags origin')
+    assert source.index('flock -n 9') < source.index('CURRENT_IMAGE_ID=')
+    assert source.index('flock -n 9') < source.index('actual_schema=')
     assert '--name "$SIDECAR"' in source
     assert '--restart=no' in source
     assert '--no-healthcheck' in source
@@ -139,6 +144,8 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
         'systemctl stop "${WATCHDOG_PENDING_UNIT}.timer"'
     )
     assert 'pending\n' in source
+    assert 'sampled[^0-9]*[1-9][0-9]*.*entitlement_shadow_cycle' in source
+    assert 'entitlement_shadow_cycle.*sampled[^0-9]*[1-9][0-9]*' in source
 
 
 def test_prepared_enable_retry_only_cleans_and_requires_new_workflow_run() -> None:
@@ -169,10 +176,21 @@ def test_every_production_switch_refuses_an_active_shadow() -> None:
     for workflow in DEPLOY_WORKFLOWS:
         source = workflow.read_text()
         assert "readonly SHADOW_RUNTIME_DIR='/var/lib/teplo-vpn/entitlement-shadow-runtime'" in source
+        assert 'readonly SHADOW_CONTROL_LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"' in source
+        assert 'exec 8>"$SHADOW_CONTROL_LOCK_FILE"' in source
+        assert 'flock -w 30 8' in source
+        assert source.index('flock -w 30 8') < source.index('test ! -e "$SHADOW_RUNTIME_DIR/lease.state"')
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/lease.state"' in source
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/disable.state"' in source
         assert 'docker info >/dev/null 2>&1' in source
         assert '! docker inspect teplo_entitlement_shadow' in source
+
+
+def test_ordinary_deploy_routes_control_plane_changes_to_protected_infrastructure() -> None:
+    source = (ROOT / '.github/workflows/deploy.yml').read_text()
+    assert 'git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- .github' in source
+    assert 'a production control-plane change is present' in source
+    assert 'Deploy bot infrastructure to production' in source
 
 
 def test_sidecar_receives_only_minimal_secret_names() -> None:
@@ -230,6 +248,18 @@ def _write_executable(path: Path, content: str) -> None:
 
 def _write_fake_flock(fake_bin: Path) -> None:
     _write_executable(fake_bin / 'flock', '#!/usr/bin/env bash\nexit 0\n')
+
+
+def _write_real_flock(fake_bin: Path) -> None:
+    _write_executable(
+        fake_bin / 'flock',
+        """#!/usr/bin/env python3
+import fcntl
+import sys
+
+fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX)
+""",
+    )
 
 
 def _write_fake_watchdog_docker(fake_bin: Path, container_id: str) -> None:
@@ -565,7 +595,6 @@ def test_stale_watchdog_never_removes_newer_generation(
 
 def test_stale_disable_helper_never_removes_newer_generation(tmp_path: Path) -> None:
     old_run_id, old_attempt = '700', '1'
-    new_run_id, new_attempt = '701', '1'
     state = tmp_path / 'state'
     runtime = tmp_path / 'runtime'
     fake_bin = tmp_path / 'bin'
@@ -649,44 +678,229 @@ def test_stale_disable_helper_never_removes_newer_generation(tmp_path: Path) -> 
     assert recovery.returncode == 0, recovery.stderr
     assert latest.read_text() == keyed.read_text()
 
-    # Recreate a newer generation, then fire the old run's immutable helper.
-    new_container_id = '2' * 64
-    container_present.touch()
-    lease.write_text(_lease(new_run_id, new_attempt, 'completed', 4102444800))
-    tombstone.write_text(
-        'format_version=1\n'
-        f'workflow_sha={"a" * 40}\n'
-        f'workflow_run_id={old_run_id}\n'
-        f'workflow_run_attempt={old_attempt}\n'
-        'approval_actor=owner\n'
-        'release_card_reference=gate2-test\n'
+
+def test_async_disable_helper_serializes_before_reading_generation(tmp_path: Path) -> None:
+    old_run_id, old_attempt = '710', '1'
+    new_run_id, new_attempt = '711', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    patched_disable = tmp_path / 'disable.sh'
+    patched_disable.write_text(
+        DISABLE.read_text()
+        .replace('/var/lib/teplo-vpn/deploy-state', str(state))
+        .replace('/var/lib/teplo-vpn/entitlement-shadow-runtime', str(runtime))
     )
-    environment |= {
-        'FAKE_CONTAINER_ID': new_container_id,
-        'FAKE_LABEL_RUN_ID': new_run_id,
-        'FAKE_LABEL_RUN_ATTEMPT': new_attempt,
+    patched_disable.chmod(0o755)
+    old_container_id = '2' * 64
+    _write_fake_watchdog_docker(fake_bin, old_container_id)
+    _write_fake_flock(fake_bin)
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(old_run_id, old_attempt, 'completed', 4102444800))
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+        'EXPECTED_RUN_ID': old_run_id,
+        'EXPECTED_RUN_ATTEMPT': old_attempt,
+        'FAKE_CONTAINER_ID': old_container_id,
+        'CONTAINER_PRESENT': str(container_present),
     }
-    stale_result = subprocess.run(  # noqa: S603 - generated immutable helper under test
+
+    initial = subprocess.run(  # noqa: S603 - isolated patched production primitive
         [
-            str(helper),
-            str(lease),
-            str(tombstone),
-            'teplo_entitlement_shadow',
-            'pending',
+            str(patched_disable),
+            'b' * 40,
             old_run_id,
             old_attempt,
-            old_run_id,
-            old_attempt,
+            'owner',
+            'gate2-test',
+            str(state),
+            str(runtime),
         ],
         check=False,
         capture_output=True,
         text=True,
         env=environment,
     )
+    assert initial.returncode == 0, initial.stderr
 
-    assert stale_result.returncode == 0, stale_result.stderr
-    assert container_present.exists()
+    helper = state / f'entitlement-shadow-disable-{"b" * 40}-{old_run_id}-{old_attempt}.sh'
+    tombstone = runtime / 'disable.state'
+    tombstone.write_text(
+        'format_version=1\n'
+        f'workflow_sha={"b" * 40}\n'
+        f'workflow_run_id={old_run_id}\n'
+        f'workflow_run_attempt={old_attempt}\n'
+        'approval_actor=owner\n'
+        'release_card_reference=gate2-test\n'
+    )
+    lease.write_text(_lease(old_run_id, old_attempt, 'completed', 4102444800))
+    container_present.touch()
+
+    # The generated async helper must acquire the same host lock as ENABLE and
+    # DISABLE before it reads either tombstone or lease generation.
+    _write_real_flock(fake_bin)
+    lock_file = state / 'bot-production.entitlement-shadow-control.lock'
+    with lock_file.open('a+') as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        stale = subprocess.Popen(  # noqa: S603 - generated immutable helper under test
+            [
+                str(helper),
+                str(lease),
+                str(tombstone),
+                'teplo_entitlement_shadow',
+                'pending',
+                old_run_id,
+                old_attempt,
+                old_run_id,
+                old_attempt,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        time.sleep(0.2)
+        assert stale.poll() is None
+
+        # Model a newer serialized control generation completing while the old
+        # helper is fenced out. Once admitted, the stale helper must observe
+        # the mismatch and leave both the lease and sidecar intact.
+        lease.write_text(_lease(new_run_id, new_attempt, 'completed', 4102444800))
+        tombstone.write_text(
+            'format_version=1\n'
+            f'workflow_sha={"c" * 40}\n'
+            f'workflow_run_id={new_run_id}\n'
+            f'workflow_run_attempt={new_attempt}\n'
+            'approval_actor=owner\n'
+            'release_card_reference=gate2-new\n'
+        )
+        fcntl.flock(lock_handle, fcntl.LOCK_UN)
+
+    stdout, stderr = stale.communicate(timeout=5)
+    assert stale.returncode == 0, f'{stdout}\n{stderr}'
     assert lease.read_text() == _lease(new_run_id, new_attempt, 'completed', 4102444800)
+    assert container_present.exists()
+
+
+def test_disable_helper_retries_when_timer_fires_before_tombstone_commit(tmp_path: Path) -> None:
+    run_id, run_attempt = '720', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    patched_disable = tmp_path / 'disable.sh'
+    patched_disable.write_text(
+        DISABLE.read_text()
+        .replace('/var/lib/teplo-vpn/deploy-state', str(state))
+        .replace('/var/lib/teplo-vpn/entitlement-shadow-runtime', str(runtime))
+    )
+    patched_disable.chmod(0o755)
+    container_id = '3' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
+    }
+
+    initial = subprocess.run(  # noqa: S603 - installs the generated helper
+        [
+            str(patched_disable),
+            'd' * 40,
+            run_id,
+            run_attempt,
+            'owner',
+            'gate2-test',
+            str(state),
+            str(runtime),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert initial.returncode == 0, initial.stderr
+
+    helper = state / f'entitlement-shadow-disable-{"d" * 40}-{run_id}-{run_attempt}.sh'
+    tombstone = runtime / 'disable.state'
+    keyed = state / f'bot-production.entitlement-shadow-control.{run_id}.{run_attempt}.audit'
+    latest = state / 'bot-production.entitlement-shadow-control.state'
+    keyed.unlink()
+    latest.unlink()
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    container_present.touch()
+
+    # Model the independent timer firing before the controller's first durable
+    # state mutation. It must fail so systemd Restart=on-failure keeps recovery
+    # armed instead of treating the missing tombstone as successful cleanup.
+    early = subprocess.run(  # noqa: S603 - generated immutable helper under test
+        [
+            str(helper),
+            str(lease),
+            str(tombstone),
+            'teplo_entitlement_shadow',
+            'pending',
+            run_id,
+            run_attempt,
+            run_id,
+            run_attempt,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert early.returncode != 0
+    assert lease.exists()
+    assert container_present.exists()
+
+    # The controller commits the tombstone and then dies. The already armed
+    # helper retry must finish removal and durable audit recovery by itself.
+    tombstone.write_text(
+        'format_version=1\n'
+        f'workflow_sha={"d" * 40}\n'
+        f'workflow_run_id={run_id}\n'
+        f'workflow_run_attempt={run_attempt}\n'
+        'approval_actor=owner\n'
+        'release_card_reference=gate2-test\n'
+    )
+    recovered = subprocess.run(  # noqa: S603 - generated immutable helper under test
+        [
+            str(helper),
+            str(lease),
+            str(tombstone),
+            'teplo_entitlement_shadow',
+            'pending',
+            run_id,
+            run_attempt,
+            run_id,
+            run_attempt,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not lease.exists()
+    assert not tombstone.exists()
+    assert not container_present.exists()
+    assert 'action=DISABLE_SHADOW\n' in keyed.read_text()
+    assert latest.read_text() == keyed.read_text()
 
 
 def _docker_path() -> str | None:

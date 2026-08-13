@@ -42,6 +42,7 @@ jobs:
             readonly STATE_FILE="$STATE_DIR/bot-production.state"
             readonly RECOVERY_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
             readonly SHADOW_RUNTIME_DIR='/var/lib/teplo-vpn/entitlement-shadow-runtime'
+            readonly SHADOW_CONTROL_LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"
             BUILD_DIR=''
             BUILD_OVERRIDE=''
             VERIFIED_DEPLOY_MODE=''
@@ -50,6 +51,12 @@ jobs:
             VERIFIED_RECOVERY_FROM_SHA=''
 
             cd "$REPO_DIR"
+            install -d -m 700 "$STATE_DIR"
+            exec 8>"$SHADOW_CONTROL_LOCK_FILE"
+            flock -w 30 8 || {
+              echo 'Refusing deploy: shadow control is busy.' >&2
+              exit 64
+            }
             test ! -e "$SHADOW_RUNTIME_DIR/lease.state" || {
               echo 'Refusing deploy: disable the active shadow lease first.' >&2
               exit 64
@@ -339,6 +346,15 @@ jobs:
               echo 'Refusing automatic deploy: a Docker or Compose change is present.' >&2
               echo 'Use "Deploy bot infrastructure to production" after the controlled-change gates.' >&2
               exit 15
+            fi
+
+            # Workflow and release-control changes alter the production control
+            # plane even when the application image itself is unchanged. They
+            # require the protected infrastructure workflow and owner approval.
+            if ! git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- .github; then
+              echo 'Refusing automatic deploy: a production control-plane change is present.' >&2
+              echo 'Use "Deploy bot infrastructure to production" after the controlled-change gates.' >&2
+              exit 16
             fi
 
             readonly PREVIOUS_IMAGE_ID="$(docker inspect --format '{{.Image}}' remnawave_bot)"

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 import textwrap
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -118,6 +120,22 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
+def _write_fake_flock(path: Path, *, barrier: bool = False) -> None:
+    if not barrier:
+        _write_executable(path, '#!/usr/bin/env bash\nexit 0\n')
+        return
+    _write_executable(
+        path,
+        r"""#!/usr/bin/env bash
+set -eu
+touch "$FAKE_STATE/flock_entered"
+while [ ! -e "$FAKE_STATE/flock_release" ]; do sleep 0.02; done
+[ ! -e "$FAKE_STATE/mutations" ] || touch "$FAKE_STATE/mutation_before_flock_release"
+exit 0
+""",
+    )
+
+
 def _extract_recovery_shell(repo_dir: Path, state_dir: Path) -> str:
     workflow = RECOVERY_WORKFLOW.read_text()
     step = workflow.index('- name: Recover only the captured pre-migration bot image')
@@ -226,6 +244,7 @@ case "$1" in
 esac
 """,
     )
+    _write_fake_flock(fake_bin / 'flock')
     _write_executable(
         fake_bin / 'docker',
         r"""#!/usr/bin/env bash
@@ -395,6 +414,7 @@ case "$1" in
 esac
 """,
     )
+    _write_fake_flock(fake_bin / 'flock')
     _write_executable(
         fake_bin / 'docker',
         r"""#!/usr/bin/env bash
@@ -468,6 +488,8 @@ def _ordinary_deploy_interlock_integration(
     deploy_state: str,
     recovery_journal: str | None,
     recovery_audit: str | None = None,
+    shadow_lock_barrier: bool = False,
+    control_plane_changed: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
     repo = tmp_path / 'repo'
     state = tmp_path / 'state'
@@ -491,11 +513,18 @@ case "$1" in
   rev-parse)
     if [ "$2" = 'HEAD' ]; then cat "$FAKE_STATE/source"; else printf '%s\n' "$ORDINARY_TARGET_SHA"; fi
     ;;
-  merge-base|diff) exit 0 ;;
+  merge-base) exit 0 ;;
+  diff)
+    case " $* " in
+      *' -- .github '*) [ "${CONTROL_PLANE_CHANGED:-0}" != 1 ] ;;
+      *) exit 0 ;;
+    esac
+    ;;
   *) printf 'unexpected fake ordinary git call: %s\n' "$*" >&2; exit 98 ;;
 esac
 """,
     )
+    _write_fake_flock(fake_bin / 'flock', barrier=shadow_lock_barrier)
     _write_executable(
         fake_bin / 'docker',
         r"""#!/usr/bin/env bash
@@ -533,7 +562,23 @@ fi
         'ORDINARY_TARGET_SHA': PRIOR_TARGET_SHA,
         'ROLLBACK_IMAGE': ROLLBACK_IMAGE,
         'PREVIOUS_SCHEMA': PREVIOUS_SCHEMA,
+        'CONTROL_PLANE_CHANGED': '1' if control_plane_changed else '0',
     }
+    release_thread: threading.Thread | None = None
+    if shadow_lock_barrier:
+
+        def release_shadow_lock() -> None:
+            deadline = time.monotonic() + 5
+            while not (fake / 'flock_entered').exists():
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.02)
+            time.sleep(0.2)
+            (fake / 'flock_release').touch()
+
+        release_thread = threading.Thread(target=release_shadow_lock, daemon=True)
+        release_thread.start()
+
     result = subprocess.run(  # noqa: S603 - executes extracted ordinary deployment shell
         ['/bin/bash', str(shell)],
         cwd=repo,
@@ -542,6 +587,8 @@ fi
         capture_output=True,
         text=True,
     )
+    if release_thread is not None:
+        release_thread.join(timeout=5)
     return result, {'state': state, 'fake': fake}
 
 
@@ -955,6 +1002,41 @@ def test_extracted_ordinary_deploy_reaches_first_mutation_from_consistent_state(
     )
     assert result.returncode == 66, result.stderr
     assert paths['fake'].joinpath('mutations').read_text() == 'tag\n'
+
+
+def test_ordinary_deploy_waits_for_shadow_control_lock_before_first_mutation(
+    tmp_path: Path,
+) -> None:
+    normal_state = f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n'
+    result, paths = _ordinary_deploy_interlock_integration(
+        tmp_path,
+        current_source=ROLLBACK_SHA,
+        deploy_state=normal_state,
+        recovery_journal=_completed_v1_recovery_journal(),
+        shadow_lock_barrier=True,
+    )
+
+    assert result.returncode == 66, result.stderr
+    assert paths['fake'].joinpath('flock_entered').exists()
+    assert not paths['fake'].joinpath('mutation_before_flock_release').exists()
+    assert paths['fake'].joinpath('mutations').read_text() == 'tag\n'
+
+
+def test_ordinary_deploy_stops_control_plane_change_before_first_mutation(
+    tmp_path: Path,
+) -> None:
+    normal_state = f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n'
+    result, paths = _ordinary_deploy_interlock_integration(
+        tmp_path,
+        current_source=ROLLBACK_SHA,
+        deploy_state=normal_state,
+        recovery_journal=_completed_v1_recovery_journal(),
+        control_plane_changed=True,
+    )
+
+    assert result.returncode == 16
+    assert 'production control-plane change is present' in result.stderr
+    assert not paths['fake'].joinpath('mutations').exists()
 
 
 def test_extracted_ordinary_deploy_accepts_verified_recovery_state(

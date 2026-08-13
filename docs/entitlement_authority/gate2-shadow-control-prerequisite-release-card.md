@@ -89,7 +89,7 @@ verify the old timers, then terminate with `STOP`. It never reuses the same
 generation: the owner must start a new protected workflow run with a new run
 ID before another Enable attempt.
 
-Enable waits for a real `entitlement_shadow_cycle`, refuses circuit/stopped/
+Enable waits for a real `entitlement_shadow_cycle` with `sampled > 0`, refuses circuit/stopped/
 lease-loss markers, rechecks the unchanged bot, dotenv fingerprint and nine
 empty authority tables, then atomically changes the lease to `completed` with
 a seven-day expiry. The watchdog treats only that exact completed lease as the
@@ -135,8 +135,10 @@ schema.
 
 ## Prerequisite release and verification
 
-The prerequisite is released by protected PR merge and ordinary production
-deploy of the exact reviewed merge SHA. Shadow remains absent. Required checks:
+The prerequisite is released by protected PR merge and the manual protected
+`deploy-infrastructure.yml` workflow for the exact reviewed merge SHA. The
+ordinary deploy must stop before checkout/build/container switch because the
+candidate changes `.github/**`. Shadow remains absent. Required checks:
 
 1. exact merge SHA/tree, exact-SHA CI and fresh reviewer/skeptic GO with
    `P0=0`, `P1=0`;

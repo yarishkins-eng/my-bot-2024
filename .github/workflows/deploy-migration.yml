@@ -86,6 +86,7 @@ jobs:
             readonly STATE_FILE="$STATE_DIR/bot-production.state"
             readonly RECOVERY_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
             readonly SHADOW_RUNTIME_DIR='/var/lib/teplo-vpn/entitlement-shadow-runtime'
+            readonly SHADOW_CONTROL_LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"
             readonly RECOVERY_IMAGE_TAG="teplo-vpn-rollback/bot:pre-migration-${TARGET_SHA}"
             readonly RELEASE_CARD_REFERENCE="${RELEASE_CARD_REFERENCE:?missing release-card reference}"
             readonly APPROVAL_ACTOR="${APPROVAL_ACTOR:?missing protected-deployment actor}"
@@ -97,6 +98,12 @@ jobs:
             RECOVERY_JOURNAL_PREPARED=0
 
             cd "$REPO_DIR"
+            install -d -m 700 "$STATE_DIR"
+            exec 8>"$SHADOW_CONTROL_LOCK_FILE"
+            flock -w 30 8 || {
+              echo 'Refusing migration deploy: shadow control is busy.' >&2
+              exit 64
+            }
             test ! -e "$SHADOW_RUNTIME_DIR/lease.state" || {
               echo 'Refusing migration deploy: disable the active shadow lease first.' >&2
               exit 64

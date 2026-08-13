@@ -77,6 +77,7 @@ jobs:
             readonly RECOVERY_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
             readonly RECOVERY_AUDIT_FILE="$STATE_DIR/bot-production.migration-recovery.${TARGET_SHA}.audit"
             readonly SHADOW_RUNTIME_DIR='/var/lib/teplo-vpn/entitlement-shadow-runtime'
+            readonly SHADOW_CONTROL_LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"
             RECOVERY_DIR=''
             RECOVERY_OVERRIDE=''
             CURRENT_SOURCE_SHA=''
@@ -87,6 +88,12 @@ jobs:
             RECOVERY_OLD_IMAGE_VERIFIED=0
 
             cd "$REPO_DIR"
+            install -d -m 700 "$STATE_DIR"
+            exec 8>"$SHADOW_CONTROL_LOCK_FILE"
+            flock -w 30 8 || {
+              echo 'Refusing recovery: shadow control is busy.' >&2
+              exit 64
+            }
             test ! -e "$SHADOW_RUNTIME_DIR/lease.state" || {
               echo 'Refusing recovery: disable the active shadow lease first.' >&2
               exit 64

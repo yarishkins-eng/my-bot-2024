@@ -191,6 +191,11 @@ build_sidecar_env_file() {
   done
 }
 
+install -d -m 700 "$STATE_DIR"
+install -d -m 755 "$RUNTIME_DIR"
+exec 9>"$LOCK_FILE"
+flock -n 9 || fail 'control_busy'
+
 cd "$REPO_DIR"
 [ -z "$(git status --porcelain)" ] || fail 'server_worktree_not_exact'
 [ "$(df -Pk "$REPO_DIR" | awk 'NR == 2 { print $4 }')" -ge "$MIN_FREE_KB" ] || fail 'insufficient_disk'
@@ -221,10 +226,6 @@ ENV_FINGERPRINT_BEFORE="$(sha256sum "$REPO_DIR/.env" | awk '{ print $1 }')"
 AUTHORITY_COUNTS_BEFORE="$(authority_counts)"
 [ "$AUTHORITY_COUNTS_BEFORE" = '0,0,0,0,0,0,0,0,0' ] || fail 'authority_tables_not_empty'
 
-install -d -m 700 "$STATE_DIR"
-install -d -m 755 "$RUNTIME_DIR"
-exec 9>"$LOCK_FILE"
-flock -n 9 || fail 'control_busy'
 [ ! -e "$DISABLE_TOMBSTONE_FILE" ] || fail 'disable_in_progress'
 
 if [ -r "$LEASE_FILE" ]; then
@@ -410,7 +411,7 @@ for _ in $(seq 1 115); do
   if printf '%s\n' "$sidecar_logs" | grep -Eq 'entitlement_shadow_circuit_open|entitlement_shadow_sidecar_(stopped|refused)|entitlement_shadow_lease_lost'; then
     fail 'sidecar_failed_before_first_cycle'
   fi
-  if printf '%s\n' "$sidecar_logs" | grep -F 'entitlement_shadow_cycle' >/dev/null; then
+  if printf '%s\n' "$sidecar_logs" | grep -E 'sampled[^0-9]*[1-9][0-9]*.*entitlement_shadow_cycle|entitlement_shadow_cycle.*sampled[^0-9]*[1-9][0-9]*' >/dev/null; then
     cycle_seen=1
     break
   fi
