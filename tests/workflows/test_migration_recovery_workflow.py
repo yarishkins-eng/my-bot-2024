@@ -243,6 +243,10 @@ if [ "$1" = 'compose' ]; then
     *' ps bot '*) printf 'bot healthy\n' ;;
     *) printf 'unexpected fake compose call: %s\n' "$*" >&2; exit 97 ;;
   esac
+elif [ "$1" = 'info' ]; then
+  exit 0
+elif [ "$1" = 'inspect' ] && [ "${@: -1}" = 'teplo_entitlement_shadow' ]; then
+  exit 1
 elif [ "$1" = 'inspect' ]; then
   case "$3" in
     *'.Image'*) cat "$FAKE_STATE/image" ;;
@@ -395,7 +399,11 @@ esac
         fake_bin / 'docker',
         r"""#!/usr/bin/env bash
 set -eu
-if [ "$1" = 'inspect' ]; then
+if [ "$1" = 'info' ]; then
+  exit 0
+elif [ "$1" = 'inspect' ] && [ "${@: -1}" = 'teplo_entitlement_shadow' ]; then
+  exit 1
+elif [ "$1" = 'inspect' ]; then
   case "$3" in
     *'.Image'*) printf '%s\n' "$ROLLBACK_IMAGE" ;;
     *'.Config.Image'*) printf 'teplo-bot:production\n' ;;
@@ -492,7 +500,11 @@ esac
         fake_bin / 'docker',
         r"""#!/usr/bin/env bash
 set -eu
-if [ "$1" = 'inspect' ]; then
+if [ "$1" = 'info' ]; then
+  exit 0
+elif [ "$1" = 'inspect' ] && [ "${@: -1}" = 'teplo_entitlement_shadow' ]; then
+  exit 1
+elif [ "$1" = 'inspect' ]; then
   case "$3" in
     *'.Image'*) printf '%s\n' "$ROLLBACK_IMAGE" ;;
     *'.State.Health.Status'*) printf 'healthy\n' ;;
