@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import re
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
 from app.config import settings
-from app.external.remnawave_api import RemnaWaveAPI
+from app.external import remnawave_api as remnawave_api_module
+from app.external.remnawave_api import RemnaWaveAPI, RemnaWaveAPIError
 from app.services.entitlement_authority import shadow_runtime
 from app.services.entitlement_authority.shadow import (
     ReadOnlyShadowEvaluator,
@@ -97,6 +99,20 @@ class _FailingSource:
 
     async def load_candidates(self, policy: ShadowPolicy, *, now: datetime) -> Sequence[ShadowCandidate]:
         raise ShadowSourceInvariantError(self.code)
+
+
+class _BlockingSource:
+    def __init__(self) -> None:
+        self.started = False
+        self.cancelled = False
+
+    async def load_candidates(self, policy: ShadowPolicy, *, now: datetime) -> Sequence[ShadowCandidate]:
+        self.started = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 class _PanelCycle:
@@ -341,6 +357,35 @@ async def test_source_invariant_and_panel_open_fail_without_reads_or_raw_error()
 
 
 @pytest.mark.asyncio
+async def test_whole_cycle_deadline_cancels_blocked_source_before_panel_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _BlockingSource()
+    provider = _PanelProvider(_PanelCycle([]))
+    timeouts: list[float | None] = []
+    real_wait_for = asyncio.wait_for
+
+    async def force_timeout(awaitable: Any, timeout: float | None = None) -> Any:
+        timeouts.append(timeout)
+        task = asyncio.create_task(awaitable)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        raise TimeoutError
+
+    monkeypatch.setattr(shadow_runtime.asyncio, 'wait_for', force_timeout)
+    counters, _ = await ReadOnlyShadowRunner(source, provider, policy()).run_once(now=NOW)
+    monkeypatch.setattr(shadow_runtime.asyncio, 'wait_for', real_wait_for)
+
+    assert source.started is True
+    assert source.cancelled is True
+    assert provider.opens == 0
+    assert timeouts == [180.0]
+    assert counters.stop_reason == 'cycle_deadline_exceeded'
+
+
+@pytest.mark.asyncio
 async def test_service_never_restarts_after_automatic_circuit_stop() -> None:
     runner = _CircuitRunner()
     service = EntitlementShadowService(runner, policy())  # type: ignore[arg-type]
@@ -419,10 +464,63 @@ async def test_shadow_api_is_one_redacted_get_without_enrichment(
             {
                 'log_endpoint': '/api/users/{redacted-shadow-uuid}',
                 'redact_error_details': True,
+                'log_http_errors_as_warning': True,
                 'max_retries': 0,
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [400, 401, 403, 429, 500])
+async def test_shadow_http_failure_is_redacted_warning_without_error_log(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    class Response:
+        headers: dict[str, str] = {}
+
+        def __init__(self, response_status: int) -> None:
+            self.status = response_status
+
+        async def text(self) -> str:
+            return '{"message":"secret-panel-detail"}'
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class Session:
+        def request(self, method: str, **kwargs: object) -> Response:
+            return Response(status)
+
+    class CapturingLogger:
+        def __init__(self) -> None:
+            self.warnings: list[tuple[object, ...]] = []
+            self.errors: list[tuple[object, ...]] = []
+
+        def warning(self, *args: object, **kwargs: object) -> None:
+            self.warnings.append((*args, kwargs))
+
+        def error(self, *args: object, **kwargs: object) -> None:
+            self.errors.append((*args, kwargs))
+
+    api = RemnaWaveAPI('https://panel.invalid', 'test-key')
+    api.session = Session()  # type: ignore[assignment]
+    logger = CapturingLogger()
+    monkeypatch.setattr(remnawave_api_module, 'logger', logger)
+
+    with pytest.raises(RemnaWaveAPIError, match='Protected inventory request failed'):
+        await api.get_user_by_uuid_shadow_once('panel-uuid-never-log')
+
+    rendered = repr(logger.warnings)
+    assert logger.errors == []
+    assert len(logger.warnings) == 1
+    assert 'panel-uuid-never-log' not in rendered
+    assert 'secret-panel-detail' not in rendered
+    assert 'Protected inventory request failed' in rendered
 
 
 @pytest.mark.parametrize(

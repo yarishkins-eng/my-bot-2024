@@ -7,8 +7,11 @@ shadow enablement are forbidden until a new explicit owner decision.
 
 ## Deploy shape for the next owner decision
 
-If separately approved, the first Gate 2 deploy is code-only and must keep this
-exact environment matrix:
+If separately approved, the first Gate 2 deploy is code-only but must use the
+protected `deploy-migration.yml` path because the repository's migration-risk
+guard covers `main.py` and `app/config.py`. Both previous and target schema are
+`0103`, so Alembic performs no DDL/DML. The deploy must keep this exact
+environment matrix:
 
 | Setting | Required value |
 |---|---:|
@@ -57,9 +60,12 @@ can become desired state or feed a legacy writer.
   cycle.
 - One cycle every 900 seconds; sequential Panel reads only; at most 12 GETs per
   minute; no concurrent Panel request.
-- Per-GET timeout 4 seconds, database statement timeout 5 seconds, cycle
-  deadline 180 seconds. At the hard cap, the scheduled waits plus all request
-  timeouts fit within 157 seconds, leaving 23 seconds of circuit margin.
+- Per-GET timeout 4 seconds, database statement timeout 5 seconds, hard
+  whole-cycle deadline 180 seconds. The deadline wraps database/pool
+  acquisition, source reads, Panel-client open, every rate-limit wait and
+  every GET. At the hard cap, the database timeout plus scheduled waits and
+  all request timeouts fit within 162 seconds, leaving 18 seconds of circuit
+  margin.
 
 The initial observation window, if later authorized, is at least seven full
 days and must cover renewal, expiry, grace entry/exit, daily processing,
@@ -105,7 +111,8 @@ minimum ratio sample.
 ## Kill switch and recovery
 
 - Automatic: any threshold above ends the shadow task; `main.py` records the
-  fixed fail-closed state and never restarts it.
+  fixed fail-closed state and never restarts it. A whole-cycle timeout cancels
+  the in-flight read path before recording `cycle_deadline_exceeded`.
 - Operator: keep/set `ENTITLEMENT_AUTHORITY_SHADOW_KILL_SWITCH=true` (or
   `SHADOW=false`) through the protected environment and restart the existing
   bot deployment. The double interlock prevents SHADOW alone from starting.

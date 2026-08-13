@@ -447,6 +447,7 @@ class RemnaWaveAPI:
         *,
         log_endpoint: str | None = None,
         redact_error_details: bool = False,
+        log_http_errors_as_warning: bool = False,
         max_retries: int = 3,
     ) -> dict:
         if not self.session:
@@ -509,7 +510,12 @@ class RemnaWaveAPI:
                         is_not_found = response.status == 404
                         log = (
                             logger.warning
-                            if response.status in (502, 503, 504) or is_harmless or is_not_found
+                            if (
+                                log_http_errors_as_warning
+                                or response.status in (502, 503, 504)
+                                or is_harmless
+                                or is_not_found
+                            )
                             else logger.error
                         )
                         log('API Error %s: %s', response.status, error_message)
@@ -658,6 +664,7 @@ class RemnaWaveAPI:
                 f'/api/users/{uuid}',
                 log_endpoint='/api/users/{redacted-shadow-uuid}',
                 redact_error_details=True,
+                log_http_errors_as_warning=True,
                 max_retries=0,
             )
             if not isinstance(response, Mapping):

@@ -1,6 +1,6 @@
 {
   "baseline_sha256": "724d620dd11f0b878d5d802bf8a8330c8d73cd8a75b09abf31bfd374190634c9",
-  "current_sha256": "8c3771b2852fddc6550a3937e747db0658532869efc51d92c00e0c534fa883d4",
+  "current_sha256": "e455090e4d38db6903114a59fb318cfa1556cc0c2b1ea0a38d0be0024479a227",
   "format": 1,
   "interpretation": "Every current entry is classified in writer_closure.json. Removed/renamed entries require an explicit mapping; this candidate has none for raw endpoints or startup registrations.",
   "sections": {
@@ -417,5 +417,5 @@
       "unchanged_count": 61
     }
   },
-  "sha256": "449d664af540244ec96117ef679de3b6d4ab9f13b88d2fc50021d174e5a54fdb"
+  "sha256": "50ac770135d797e2035eb7e59dd791481145147f166521559b46bdd7e3e128a6"
 }

@@ -406,14 +406,35 @@ class ReadOnlyShadowRunner:
     async def run_once(self, *, now: datetime | None = None) -> tuple[ShadowCycleCounters, float]:
         started = self._monotonic()
         counters = ShadowCycleCounters()
+        timed_out = False
         try:
-            candidates = await self._source.load_candidates(self._policy, now=now or datetime.now(UTC))
+            await asyncio.wait_for(
+                self._run_cycle(counters, now=now or datetime.now(UTC), started=started),
+                timeout=self._policy.max_cycle_seconds,
+            )
+        except TimeoutError:
+            timed_out = True
+        elapsed = self._monotonic() - started
+        counters.apply_thresholds(self._policy, elapsed_seconds=elapsed)
+        if timed_out:
+            counters.stop_reason = 'cycle_deadline_exceeded'
+        return counters, elapsed
+
+    async def _run_cycle(
+        self,
+        counters: ShadowCycleCounters,
+        *,
+        now: datetime,
+        started: float,
+    ) -> None:
+        try:
+            candidates = await self._source.load_candidates(self._policy, now=now)
         except ShadowSourceInvariantError as error:
             counters.stop_reason = error.code
-            return counters, self._monotonic() - started
+            return
         if len(candidates) > self._policy.max_identities_per_cycle:
             counters.stop_reason = 'legacy_shadow_row_invalid'
-            return counters, self._monotonic() - started
+            return
 
         try:
             async with self._panel.open_cycle() as panel:
@@ -465,9 +486,6 @@ class ReadOnlyShadowRunner:
         except Exception:
             counters.panel_read_errors += 1
             counters.stop_reason = 'panel_cycle_open_failed'
-        elapsed = self._monotonic() - started
-        counters.apply_thresholds(self._policy, elapsed_seconds=elapsed)
-        return counters, elapsed
 
 
 class EntitlementShadowService:
