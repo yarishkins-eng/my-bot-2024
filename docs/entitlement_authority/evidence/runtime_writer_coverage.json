@@ -1,0 +1,7147 @@
+{
+  "coverage_tool": "7.13.1",
+  "format": 1,
+  "interpretation": "Executed lines prove exercised paths only. Uncovered locations remain a cutover NO-GO; coverage never proves absence of Python dynamic dispatch.",
+  "inventory_sha256": "724d620dd11f0b878d5d802bf8a8330c8d73cd8a75b09abf31bfd374190634c9",
+  "overall_app_lines": {
+    "covered_lines": 30775,
+    "num_statements": 127986,
+    "percent_covered": 24.0455987373619
+  },
+  "sections": {
+    "calls": {
+      "covered": 3,
+      "locations": [
+        {
+          "covered": false,
+          "line": 199,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 4706,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 4628,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 4639,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 493,
+          "path": "app/services/wheel_service.py"
+        },
+        {
+          "covered": false,
+          "line": 538,
+          "path": "app/services/wheel_service.py"
+        },
+        {
+          "covered": false,
+          "line": 379,
+          "path": "app/services/promocode_service.py"
+        },
+        {
+          "covered": false,
+          "line": 484,
+          "path": "app/services/promocode_service.py"
+        },
+        {
+          "covered": false,
+          "line": 509,
+          "path": "app/services/promocode_service.py"
+        },
+        {
+          "covered": false,
+          "line": 213,
+          "path": "app/services/campaign_service.py"
+        },
+        {
+          "covered": false,
+          "line": 239,
+          "path": "app/services/campaign_service.py"
+        },
+        {
+          "covered": false,
+          "line": 357,
+          "path": "app/services/campaign_service.py"
+        },
+        {
+          "covered": false,
+          "line": 388,
+          "path": "app/services/campaign_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1492,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1830,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1838,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2198,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2206,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 700,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1477,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1103,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 5792,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 1368,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1479,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1487,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 289,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": false,
+          "line": 462,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 466,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 497,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 567,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 572,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 585,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 499,
+          "path": "app/middlewares/channel_checker.py"
+        },
+        {
+          "covered": false,
+          "line": 4672,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 210,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2097,
+          "path": "app/database/crud/subscription.py"
+        },
+        {
+          "covered": false,
+          "line": 212,
+          "path": "app/services/account_merge_service.py"
+        },
+        {
+          "covered": false,
+          "line": 223,
+          "path": "app/services/account_merge_service.py"
+        },
+        {
+          "covered": false,
+          "line": 236,
+          "path": "app/services/account_merge_service.py"
+        },
+        {
+          "covered": false,
+          "line": 406,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": false,
+          "line": 566,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": false,
+          "line": 4926,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 4584,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 421,
+          "path": "app/services/payment/stars.py"
+        },
+        {
+          "covered": false,
+          "line": 4796,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 4742,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 313,
+          "path": "app/handlers/stars_payments.py"
+        },
+        {
+          "covered": false,
+          "line": 385,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": false,
+          "line": 2113,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 375,
+          "path": "app/services/wheel_service.py"
+        },
+        {
+          "covered": true,
+          "line": 2273,
+          "path": "app/services/device_first_checkout_service.py"
+        },
+        {
+          "covered": false,
+          "line": 268,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 276,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 291,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 681,
+          "path": "app/services/payment/yookassa.py"
+        },
+        {
+          "covered": false,
+          "line": 992,
+          "path": "app/services/payment/yookassa.py"
+        },
+        {
+          "covered": false,
+          "line": 587,
+          "path": "app/middlewares/channel_checker.py"
+        },
+        {
+          "covered": false,
+          "line": 29,
+          "path": "app/middlewares/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 478,
+          "path": "app/services/account_erasure_service.py"
+        },
+        {
+          "covered": false,
+          "line": 604,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 625,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 830,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 251,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 516,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": false,
+          "line": 518,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": false,
+          "line": 325,
+          "path": "app/cabinet/routes/subscription_modules/servers.py"
+        },
+        {
+          "covered": false,
+          "line": 327,
+          "path": "app/cabinet/routes/subscription_modules/servers.py"
+        },
+        {
+          "covered": false,
+          "line": 268,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 1366,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 432,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 475,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 494,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 427,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 471,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 291,
+          "path": "app/services/account_merge_service.py"
+        },
+        {
+          "covered": false,
+          "line": 4412,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 4407,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 4477,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 4472,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 1363,
+          "path": "app/services/guest_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 3883,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 4088,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 1193,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 1855,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 374,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 383,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 338,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 347,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 667,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 676,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 5233,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 5659,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 423,
+          "path": "app/handlers/subscription/countries.py"
+        },
+        {
+          "covered": false,
+          "line": 818,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": false,
+          "line": 832,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": false,
+          "line": 112,
+          "path": "app/services/phantom_service.py"
+        },
+        {
+          "covered": false,
+          "line": 621,
+          "path": "app/services/broadcast_service.py"
+        },
+        {
+          "covered": false,
+          "line": 623,
+          "path": "app/services/broadcast_service.py"
+        },
+        {
+          "covered": false,
+          "line": 948,
+          "path": "app/handlers/subscription/countries.py"
+        },
+        {
+          "covered": false,
+          "line": 1689,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 1694,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 6072,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 2330,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 2337,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 3970,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 3929,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 3936,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 4771,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 4730,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 4737,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 2827,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 2834,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 2845,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 382,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 2292,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": false,
+          "line": 3483,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 2929,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 2936,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 2015,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 2022,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 3694,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 3653,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 3660,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 381,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1085,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 860,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1115,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 146,
+          "path": "app/cabinet/routes/subscription_modules/multi_tariff.py"
+        },
+        {
+          "covered": false,
+          "line": 434,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 1050,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1067,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1096,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2472,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 283,
+          "path": "app/services/blocked_users_service.py"
+        },
+        {
+          "covered": false,
+          "line": 596,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": false,
+          "line": 843,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2932,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 2937,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 907,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1081,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1101,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1111,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 701,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 706,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 974,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 983,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 289,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 291,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 586,
+          "path": "app/services/subscription_renewal_service.py"
+        },
+        {
+          "covered": false,
+          "line": 544,
+          "path": "app/services/subscription_renewal_service.py"
+        },
+        {
+          "covered": false,
+          "line": 551,
+          "path": "app/services/subscription_renewal_service.py"
+        },
+        {
+          "covered": false,
+          "line": 3097,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 480,
+          "path": "app/services/guest_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1811,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": false,
+          "line": 1378,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 1385,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 540,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": false,
+          "line": 457,
+          "path": "app/handlers/subscription/my_subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 3398,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 3406,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 3416,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 3597,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 1241,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 105,
+          "path": "app/handlers/channel_member.py"
+        },
+        {
+          "covered": false,
+          "line": 189,
+          "path": "app/handlers/channel_member.py"
+        },
+        {
+          "covered": true,
+          "line": 976,
+          "path": "app/services/public_access_point_service.py"
+        },
+        {
+          "covered": false,
+          "line": 113,
+          "path": "app/services/remnawave_retry_queue.py"
+        },
+        {
+          "covered": false,
+          "line": 115,
+          "path": "app/services/remnawave_retry_queue.py"
+        },
+        {
+          "covered": false,
+          "line": 2125,
+          "path": "app/services/device_first_checkout_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2638,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2662,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2675,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2633,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2658,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2671,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 581,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 583,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 296,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 298,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 1414,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 1431,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 1439,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 6985,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 369,
+          "path": "app/cabinet/routes/subscription_modules/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 371,
+          "path": "app/cabinet/routes/subscription_modules/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 379,
+          "path": "app/cabinet/routes/subscription_modules/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 7642,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 7650,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 794,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1384,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 4556,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 2614,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": false,
+          "line": 2616,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": false,
+          "line": 1444,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2575,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 4351,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 2849,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 2854,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 91,
+          "path": "app/services/remnawave_resync_service.py"
+        },
+        {
+          "covered": false,
+          "line": 97,
+          "path": "app/services/remnawave_resync_service.py"
+        },
+        {
+          "covered": false,
+          "line": 961,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 261,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 401,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 1184,
+          "path": "app/services/subscription_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1199,
+          "path": "app/services/subscription_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1206,
+          "path": "app/services/subscription_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 575,
+          "path": "app/cabinet/routes/subscription_modules/tariff_switch.py"
+        },
+        {
+          "covered": false,
+          "line": 540,
+          "path": "app/cabinet/routes/subscription_modules/tariff_switch.py"
+        },
+        {
+          "covered": false,
+          "line": 548,
+          "path": "app/cabinet/routes/subscription_modules/tariff_switch.py"
+        },
+        {
+          "covered": false,
+          "line": 7436,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 684,
+          "path": "app/cabinet/routes/subscription_modules/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 686,
+          "path": "app/cabinet/routes/subscription_modules/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 209,
+          "path": "app/services/phantom_service.py"
+        },
+        {
+          "covered": false,
+          "line": 3734,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 3778,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 3729,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 3774,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 7900,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 7908,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 7919,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 163,
+          "path": "app/cabinet/routes/subscription_modules/daily.py"
+        },
+        {
+          "covered": false,
+          "line": 3900,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 3895,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 2640,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 3021,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 3029,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 3039,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 898,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1002,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 717,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1100,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 6463,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 6072,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 6239,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 1663,
+          "path": "app/cabinet/routes/admin_users.py"
+        }
+      ],
+      "total": 235,
+      "uncovered": 232
+    },
+    "definitions": {
+      "covered": 47,
+      "locations": [
+        {
+          "covered": true,
+          "line": 1012,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1017,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1019,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1021,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1050,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1055,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1060,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1060,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1065,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1108,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1126,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1149,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1170,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1284,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1288,
+          "path": "app/database/crud/user.py"
+        },
+        {
+          "covered": true,
+          "line": 1424,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1465,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1490,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1517,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1554,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 193,
+          "path": "app/external/ban_system_api.py"
+        },
+        {
+          "covered": true,
+          "line": 230,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 2533,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2592,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2885,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 297,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 373,
+          "path": "app/database/crud/user.py"
+        },
+        {
+          "covered": true,
+          "line": 4318,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 498,
+          "path": "app/database/crud/user.py"
+        },
+        {
+          "covered": true,
+          "line": 567,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 590,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 709,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 773,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 777,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 782,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 787,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 792,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 840,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 856,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 872,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 902,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 939,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 944,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 956,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 975,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 980,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 985,
+          "path": "app/external/remnawave_api.py"
+        }
+      ],
+      "total": 47,
+      "uncovered": 0
+    },
+    "raw_endpoints": {
+      "covered": 3,
+      "locations": [
+        {
+          "covered": false,
+          "line": 1014,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1047,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1067,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1165,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 1098,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 741,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 1389,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 1270,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 1367,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 1504,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1479,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 941,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 2984,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 953,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1049,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 992,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1130,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1362,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1373,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1388,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1382,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1576,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 612,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 623,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 750,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 761,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 81,
+          "path": "app/external/cryptobot.py"
+        },
+        {
+          "covered": false,
+          "line": 1052,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1057,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1062,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 2937,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2951,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 957,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 977,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 982,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1118,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1114,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1125,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 1377,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 774,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 783,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 778,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 788,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 809,
+          "path": "app/external/remnawave_api.py"
+        }
+      ],
+      "total": 44,
+      "uncovered": 41
+    },
+    "reachable_writer_entrypoints": {
+      "covered": 328,
+      "locations": [
+        {
+          "covered": true,
+          "line": 114,
+          "path": "app/handlers/admin/overpay_certificate.py"
+        },
+        {
+          "covered": true,
+          "line": 163,
+          "path": "app/handlers/admin/overpay_certificate.py"
+        },
+        {
+          "covered": true,
+          "line": 109,
+          "path": "app/handlers/admin/maintenance.py"
+        },
+        {
+          "covered": true,
+          "line": 1145,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 1177,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 1209,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 1265,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 1316,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 134,
+          "path": "app/handlers/admin/maintenance.py"
+        },
+        {
+          "covered": true,
+          "line": 140,
+          "path": "app/handlers/admin/rules.py"
+        },
+        {
+          "covered": true,
+          "line": 1518,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 169,
+          "path": "app/handlers/admin/maintenance.py"
+        },
+        {
+          "covered": true,
+          "line": 1757,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2086,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 212,
+          "path": "app/handlers/admin/rules.py"
+        },
+        {
+          "covered": true,
+          "line": 2267,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2357,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2413,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 246,
+          "path": "app/handlers/admin/privacy_policy.py"
+        },
+        {
+          "covered": true,
+          "line": 246,
+          "path": "app/handlers/admin/public_offer.py"
+        },
+        {
+          "covered": true,
+          "line": 2484,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 2487,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2509,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2561,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2576,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2613,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2660,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 270,
+          "path": "app/handlers/admin/welcome_text.py"
+        },
+        {
+          "covered": true,
+          "line": 2709,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 272,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 2723,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2770,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2795,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 2835,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2863,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2867,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 3071,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3119,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3169,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3219,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3258,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3326,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3357,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3383,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3444,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3464,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3514,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 353,
+          "path": "app/handlers/admin/user_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 3553,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 357,
+          "path": "app/handlers/admin/privacy_policy.py"
+        },
+        {
+          "covered": true,
+          "line": 362,
+          "path": "app/handlers/admin/public_offer.py"
+        },
+        {
+          "covered": true,
+          "line": 3630,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3677,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3836,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 384,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 4057,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 406,
+          "path": "app/handlers/admin/messages.py"
+        },
+        {
+          "covered": true,
+          "line": 4099,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 420,
+          "path": "app/handlers/admin/public_offer.py"
+        },
+        {
+          "covered": true,
+          "line": 4204,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4243,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4318,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4834,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 50,
+          "path": "app/handlers/admin/trials.py"
+        },
+        {
+          "covered": true,
+          "line": 51,
+          "path": "app/handlers/admin/bulk_ban.py"
+        },
+        {
+          "covered": true,
+          "line": 5106,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 5523,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 554,
+          "path": "app/handlers/admin/blocked_users.py"
+        },
+        {
+          "covered": true,
+          "line": 5729,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 575,
+          "path": "app/handlers/admin/polls.py"
+        },
+        {
+          "covered": true,
+          "line": 5974,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 60,
+          "path": "app/handlers/admin/rules.py"
+        },
+        {
+          "covered": true,
+          "line": 607,
+          "path": "app/handlers/admin/payments.py"
+        },
+        {
+          "covered": true,
+          "line": 672,
+          "path": "app/handlers/admin/payments.py"
+        },
+        {
+          "covered": true,
+          "line": 676,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 687,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 70,
+          "path": "app/handlers/admin/rules.py"
+        },
+        {
+          "covered": true,
+          "line": 709,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 803,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 805,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 883,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 99,
+          "path": "app/handlers/admin/user_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 751,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": true,
+          "line": 711,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": true,
+          "line": 1959,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": true,
+          "line": 1933,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": false,
+          "line": 110,
+          "path": "app/handlers/promocode.py"
+        },
+        {
+          "covered": true,
+          "line": 1178,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 153,
+          "path": "app/handlers/subscription/revoke.py"
+        },
+        {
+          "covered": true,
+          "line": 1673,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 1704,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 1838,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 2071,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 2118,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 2134,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": false,
+          "line": 256,
+          "path": "app/handlers/balance/wata.py"
+        },
+        {
+          "covered": false,
+          "line": 266,
+          "path": "app/handlers/balance/heleket.py"
+        },
+        {
+          "covered": false,
+          "line": 273,
+          "path": "app/handlers/balance/mulenpay.py"
+        },
+        {
+          "covered": true,
+          "line": 2792,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 3472,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 3519,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 370,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 3778,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 433,
+          "path": "app/handlers/balance/platega.py"
+        },
+        {
+          "covered": true,
+          "line": 4524,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 472,
+          "path": "app/handlers/balance/pal24.py"
+        },
+        {
+          "covered": true,
+          "line": 878,
+          "path": "app/cabinet/routes/account_linking.py"
+        },
+        {
+          "covered": false,
+          "line": 127,
+          "path": "app/handlers/channel_member.py"
+        },
+        {
+          "covered": false,
+          "line": 42,
+          "path": "app/handlers/channel_member.py"
+        },
+        {
+          "covered": true,
+          "line": 85,
+          "path": "app/cabinet/routes/admin_overpay_certificate.py"
+        },
+        {
+          "covered": true,
+          "line": 701,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 190,
+          "path": "app/webapi/routes/config.py"
+        },
+        {
+          "covered": true,
+          "line": 302,
+          "path": "app/cabinet/routes/admin_settings.py"
+        },
+        {
+          "covered": true,
+          "line": 112,
+          "path": "app/cabinet/routes/subscription_modules/multi_tariff.py"
+        },
+        {
+          "covered": true,
+          "line": 410,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 2592,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2533,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2441,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2637,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 553,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": true,
+          "line": 211,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 138,
+          "path": "app/cabinet/routes/info.py"
+        },
+        {
+          "covered": true,
+          "line": 314,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 2060,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": true,
+          "line": 198,
+          "path": "app/webapi/routes/partners.py"
+        },
+        {
+          "covered": true,
+          "line": 328,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 614,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 160,
+          "path": "app/webapi/routes/pinned_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 196,
+          "path": "app/cabinet/routes/admin_pinned_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 88,
+          "path": "app/webapi/routes/user_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 246,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": true,
+          "line": 71,
+          "path": "app/cabinet/routes/admin_info_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 111,
+          "path": "app/webapi/routes/pinned_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 143,
+          "path": "app/cabinet/routes/admin_pinned_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 67,
+          "path": "app/webapi/routes/user_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 214,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": true,
+          "line": 47,
+          "path": "app/cabinet/routes/promocode.py"
+        },
+        {
+          "covered": true,
+          "line": 499,
+          "path": "app/cabinet/routes/landing.py"
+        },
+        {
+          "covered": true,
+          "line": 146,
+          "path": "app/cabinet/apple_iap.py"
+        },
+        {
+          "covered": true,
+          "line": 46,
+          "path": "app/cabinet/routes/admin_overpay_certificate.py"
+        },
+        {
+          "covered": true,
+          "line": 568,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 587,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 935,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 748,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 701,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 2352,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 70,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 348,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 1261,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 4499,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 1624,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 1311,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 1491,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 962,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 293,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 392,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 375,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 507,
+          "path": "app/cabinet/routes/account_linking.py"
+        },
+        {
+          "covered": true,
+          "line": 718,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 30,
+          "path": "app/cabinet/routes/subscription_modules/daily.py"
+        },
+        {
+          "covered": true,
+          "line": 1483,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 1470,
+          "path": "app/cabinet/routes/balance.py"
+        },
+        {
+          "covered": true,
+          "line": 4222,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 772,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 935,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 100,
+          "path": "app/cabinet/routes/subscription_modules/renewal.py"
+        },
+        {
+          "covered": true,
+          "line": 28,
+          "path": "app/cabinet/routes/subscription_modules/revoke.py"
+        },
+        {
+          "covered": true,
+          "line": 830,
+          "path": "app/cabinet/routes/admin_ban_system.py"
+        },
+        {
+          "covered": true,
+          "line": 134,
+          "path": "app/cabinet/routes/wheel.py"
+        },
+        {
+          "covered": true,
+          "line": 306,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 588,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 754,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 531,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 650,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 356,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 7684,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 6260,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 5731,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 5388,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 5848,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 6782,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 7181,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 6093,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 7477,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 3824,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 914,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 877,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 447,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 941,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 492,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 1047,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 466,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 966,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 213,
+          "path": "app/cabinet/routes/subscription_modules/tariff_switch.py"
+        },
+        {
+          "covered": true,
+          "line": 531,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 879,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 727,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 149,
+          "path": "app/cabinet/routes/subscription_modules/traffic.py"
+        },
+        {
+          "covered": true,
+          "line": 1689,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 513,
+          "path": "app/cabinet/routes/admin_payments.py"
+        },
+        {
+          "covered": true,
+          "line": 129,
+          "path": "app/cabinet/routes/oauth.py"
+        },
+        {
+          "covered": true,
+          "line": 354,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 276,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 318,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 2696,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 1918,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2885,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2804,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2729,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 1205,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 3545,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 1946,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 36,
+          "path": "app/webserver/apple_iap.py"
+        },
+        {
+          "covered": false,
+          "line": 975,
+          "path": "app/webserver/payments.py"
+        },
+        {
+          "covered": false,
+          "line": 1056,
+          "path": "app/webserver/payments.py"
+        },
+        {
+          "covered": false,
+          "line": 1131,
+          "path": "app/webserver/payments.py"
+        },
+        {
+          "covered": false,
+          "line": 183,
+          "path": "app/webserver/payments.py"
+        },
+        {
+          "covered": true,
+          "line": 369,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 410,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 337,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 279,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 310,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 68,
+          "path": "app/cabinet/routes/admin_apps.py"
+        },
+        {
+          "covered": true,
+          "line": 341,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 567,
+          "path": "app/cabinet/routes/subscription_modules/traffic.py"
+        },
+        {
+          "covered": true,
+          "line": 163,
+          "path": "app/webapi/routes/config.py"
+        },
+        {
+          "covered": true,
+          "line": 266,
+          "path": "app/cabinet/routes/admin_settings.py"
+        },
+        {
+          "covered": true,
+          "line": 109,
+          "path": "app/cabinet/routes/admin_info_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 1008,
+          "path": "app/services/traffic_monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1010,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": true,
+          "line": 1019,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1060,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1068,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 1099,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 1108,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1126,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1149,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1160,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 1170,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1195,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1224,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": true,
+          "line": 125,
+          "path": "app/services/payment/cryptobot.py"
+        },
+        {
+          "covered": false,
+          "line": 1264,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 127,
+          "path": "app/services/payment/cloudpayments.py"
+        },
+        {
+          "covered": true,
+          "line": 1284,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 129,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 129,
+          "path": "app/external/webhook_server.py"
+        },
+        {
+          "covered": true,
+          "line": 135,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": false,
+          "line": 1357,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 1364,
+          "path": "app/services/payment/yookassa.py"
+        },
+        {
+          "covered": false,
+          "line": 1415,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 1417,
+          "path": "app/handlers/subscription/device_first.py"
+        },
+        {
+          "covered": false,
+          "line": 142,
+          "path": "app/external/wata_webhook.py"
+        },
+        {
+          "covered": true,
+          "line": 1445,
+          "path": "app/services/guest_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1456,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 1466,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 1467,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 150,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 1509,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 1511,
+          "path": "app/services/guest_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1513,
+          "path": "app/handlers/subscription/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 1517,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1528,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 153,
+          "path": "app/services/payment/freekassa.py"
+        },
+        {
+          "covered": false,
+          "line": 155,
+          "path": "app/services/remnawave_retry_queue.py"
+        },
+        {
+          "covered": true,
+          "line": 1554,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1618,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 162,
+          "path": "app/services/payment/riopay.py"
+        },
+        {
+          "covered": false,
+          "line": 1634,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": false,
+          "line": 1639,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 165,
+          "path": "app/services/payment/kassa_ai.py"
+        },
+        {
+          "covered": false,
+          "line": 168,
+          "path": "app/services/remnawave_retry_queue.py"
+        },
+        {
+          "covered": true,
+          "line": 1691,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 170,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 170,
+          "path": "app/external/cryptobot.py"
+        },
+        {
+          "covered": false,
+          "line": 1708,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": false,
+          "line": 1731,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 174,
+          "path": "app/services/payment/rollypay.py"
+        },
+        {
+          "covered": false,
+          "line": 177,
+          "path": "app/external/webhook_server.py"
+        },
+        {
+          "covered": true,
+          "line": 177,
+          "path": "app/services/payment/paypear.py"
+        },
+        {
+          "covered": true,
+          "line": 177,
+          "path": "app/services/payment/severpay.py"
+        },
+        {
+          "covered": true,
+          "line": 178,
+          "path": "app/cabinet/routes/subscription_modules/servers.py"
+        },
+        {
+          "covered": true,
+          "line": 179,
+          "path": "app/services/payment/aurapay.py"
+        },
+        {
+          "covered": true,
+          "line": 1795,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 1814,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1824,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 1844,
+          "path": "app/handlers/subscription/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 185,
+          "path": "app/services/payment/wata.py"
+        },
+        {
+          "covered": true,
+          "line": 1891,
+          "path": "app/handlers/subscription/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 1895,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 20,
+          "path": "app/handlers/stars_payments.py"
+        },
+        {
+          "covered": true,
+          "line": 203,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": false,
+          "line": 2059,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 206,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 2060,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 207,
+          "path": "app/external/yookassa_webhook.py"
+        },
+        {
+          "covered": false,
+          "line": 21,
+          "path": "app/handlers/gift_activation.py"
+        },
+        {
+          "covered": true,
+          "line": 217,
+          "path": "app/services/maintenance_service.py"
+        },
+        {
+          "covered": false,
+          "line": 22,
+          "path": "app/external/heleket_webhook.py"
+        },
+        {
+          "covered": false,
+          "line": 222,
+          "path": "app/external/wata_webhook.py"
+        },
+        {
+          "covered": false,
+          "line": 226,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 2317,
+          "path": "app/handlers/admin/promo_offers.py"
+        },
+        {
+          "covered": false,
+          "line": 232,
+          "path": "app/handlers/stars_payments.py"
+        },
+        {
+          "covered": true,
+          "line": 236,
+          "path": "app/services/payment/overpay.py"
+        },
+        {
+          "covered": false,
+          "line": 237,
+          "path": "app/handlers/promocode.py"
+        },
+        {
+          "covered": true,
+          "line": 24,
+          "path": "app/handlers/admin/welcome_text.py"
+        },
+        {
+          "covered": true,
+          "line": 240,
+          "path": "app/handlers/subscription/countries.py"
+        },
+        {
+          "covered": true,
+          "line": 2402,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 243,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 245,
+          "path": "app/external/webhook_server.py"
+        },
+        {
+          "covered": false,
+          "line": 2483,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 25,
+          "path": "app/handlers/admin/maintenance.py"
+        },
+        {
+          "covered": false,
+          "line": 25,
+          "path": "app/handlers/webhooks.py"
+        },
+        {
+          "covered": true,
+          "line": 257,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 257,
+          "path": "app/services/payment/platega.py"
+        },
+        {
+          "covered": false,
+          "line": 271,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": true,
+          "line": 276,
+          "path": "app/handlers/subscription/my_subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 294,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2975,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 299,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": false,
+          "line": 309,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 309,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": true,
+          "line": 320,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 3239,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 3257,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 326,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 3414,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3481,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 351,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 358,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 369,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": false,
+          "line": 370,
+          "path": "app/handlers/stars_payments.py"
+        },
+        {
+          "covered": false,
+          "line": 372,
+          "path": "app/external/yookassa_webhook.py"
+        },
+        {
+          "covered": true,
+          "line": 38,
+          "path": "app/cabinet/routes/oauth.py"
+        },
+        {
+          "covered": true,
+          "line": 400,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": true,
+          "line": 409,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 426,
+          "path": "app/handlers/subscription/my_subscriptions.py"
+        },
+        {
+          "covered": false,
+          "line": 430,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 4378,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 438,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 4441,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4565,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4586,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 4599,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4650,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4682,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4716,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4739,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 4752,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 476,
+          "path": "app/services/payment/heleket.py"
+        },
+        {
+          "covered": true,
+          "line": 492,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 493,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 512,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": false,
+          "line": 523,
+          "path": "app/handlers/stars_payments.py"
+        },
+        {
+          "covered": true,
+          "line": 528,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 529,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": false,
+          "line": 530,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": false,
+          "line": 55,
+          "path": "app/handlers/promocode.py"
+        },
+        {
+          "covered": true,
+          "line": 57,
+          "path": "app/external/tribute.py"
+        },
+        {
+          "covered": true,
+          "line": 5762,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 585,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 611,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": false,
+          "line": 618,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": false,
+          "line": 62,
+          "path": "main.py"
+        },
+        {
+          "covered": true,
+          "line": 646,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 659,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 669,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": false,
+          "line": 685,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 69,
+          "path": "app/services/tribute_service.py"
+        },
+        {
+          "covered": false,
+          "line": 70,
+          "path": "app/services/remnawave_retry_queue.py"
+        },
+        {
+          "covered": false,
+          "line": 71,
+          "path": "app/external/webhook_server.py"
+        },
+        {
+          "covered": true,
+          "line": 73,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": false,
+          "line": 732,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 733,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 762,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": true,
+          "line": 786,
+          "path": "app/services/traffic_monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 800,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 813,
+          "path": "app/handlers/subscription/countries.py"
+        },
+        {
+          "covered": false,
+          "line": 82,
+          "path": "app/external/heleket_webhook.py"
+        },
+        {
+          "covered": true,
+          "line": 839,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": false,
+          "line": 842,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 85,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": false,
+          "line": 886,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": false,
+          "line": 887,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 9,
+          "path": "app/handlers/admin/display_mode_button.py"
+        },
+        {
+          "covered": true,
+          "line": 901,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 901,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": true,
+          "line": 902,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 934,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 97,
+          "path": "app/handlers/webhooks.py"
+        },
+        {
+          "covered": true,
+          "line": 972,
+          "path": "app/handlers/admin/bot_configuration.py"
+        }
+      ],
+      "total": 391,
+      "uncovered": 63
+    },
+    "reachable_writer_functions": {
+      "covered": 529,
+      "locations": [
+        {
+          "covered": true,
+          "line": 114,
+          "path": "app/handlers/admin/overpay_certificate.py"
+        },
+        {
+          "covered": true,
+          "line": 163,
+          "path": "app/handlers/admin/overpay_certificate.py"
+        },
+        {
+          "covered": true,
+          "line": 109,
+          "path": "app/handlers/admin/maintenance.py"
+        },
+        {
+          "covered": true,
+          "line": 1145,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 1177,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 1209,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 1265,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 1316,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 134,
+          "path": "app/handlers/admin/maintenance.py"
+        },
+        {
+          "covered": true,
+          "line": 140,
+          "path": "app/handlers/admin/rules.py"
+        },
+        {
+          "covered": true,
+          "line": 1518,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 169,
+          "path": "app/handlers/admin/maintenance.py"
+        },
+        {
+          "covered": true,
+          "line": 1757,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2086,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 212,
+          "path": "app/handlers/admin/rules.py"
+        },
+        {
+          "covered": true,
+          "line": 2267,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2357,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2413,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 246,
+          "path": "app/handlers/admin/privacy_policy.py"
+        },
+        {
+          "covered": true,
+          "line": 246,
+          "path": "app/handlers/admin/public_offer.py"
+        },
+        {
+          "covered": true,
+          "line": 2484,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 2487,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2509,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2561,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2576,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2613,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2660,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 270,
+          "path": "app/handlers/admin/welcome_text.py"
+        },
+        {
+          "covered": true,
+          "line": 2709,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 272,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 2723,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2770,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2795,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 2835,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 2863,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 2867,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 3071,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3119,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3169,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3219,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3258,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3326,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3357,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3383,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3444,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3464,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3514,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 353,
+          "path": "app/handlers/admin/user_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 3553,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 357,
+          "path": "app/handlers/admin/privacy_policy.py"
+        },
+        {
+          "covered": true,
+          "line": 362,
+          "path": "app/handlers/admin/public_offer.py"
+        },
+        {
+          "covered": true,
+          "line": 3630,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3677,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3836,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 384,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 4057,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 406,
+          "path": "app/handlers/admin/messages.py"
+        },
+        {
+          "covered": true,
+          "line": 4099,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 420,
+          "path": "app/handlers/admin/public_offer.py"
+        },
+        {
+          "covered": true,
+          "line": 4204,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4243,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4318,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4834,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 50,
+          "path": "app/handlers/admin/trials.py"
+        },
+        {
+          "covered": true,
+          "line": 51,
+          "path": "app/handlers/admin/bulk_ban.py"
+        },
+        {
+          "covered": true,
+          "line": 5106,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 5523,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 554,
+          "path": "app/handlers/admin/blocked_users.py"
+        },
+        {
+          "covered": true,
+          "line": 5729,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 575,
+          "path": "app/handlers/admin/polls.py"
+        },
+        {
+          "covered": true,
+          "line": 5974,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 60,
+          "path": "app/handlers/admin/rules.py"
+        },
+        {
+          "covered": true,
+          "line": 607,
+          "path": "app/handlers/admin/payments.py"
+        },
+        {
+          "covered": true,
+          "line": 672,
+          "path": "app/handlers/admin/payments.py"
+        },
+        {
+          "covered": true,
+          "line": 676,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 687,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 70,
+          "path": "app/handlers/admin/rules.py"
+        },
+        {
+          "covered": true,
+          "line": 709,
+          "path": "app/handlers/admin/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 803,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 805,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 883,
+          "path": "app/handlers/admin/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 99,
+          "path": "app/handlers/admin/user_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 751,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": true,
+          "line": 711,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": true,
+          "line": 1959,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": true,
+          "line": 1933,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": true,
+          "line": 150,
+          "path": "app/services/faq_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1668,
+          "path": "app/services/system_settings_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1702,
+          "path": "app/services/system_settings_service.py"
+        },
+        {
+          "covered": true,
+          "line": 178,
+          "path": "app/services/faq_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1790,
+          "path": "app/services/system_settings_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1819,
+          "path": "app/services/system_settings_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1846,
+          "path": "app/services/system_settings_service.py"
+        },
+        {
+          "covered": true,
+          "line": 294,
+          "path": "app/services/public_offer_service.py"
+        },
+        {
+          "covered": true,
+          "line": 305,
+          "path": "app/services/public_offer_service.py"
+        },
+        {
+          "covered": false,
+          "line": 110,
+          "path": "app/handlers/promocode.py"
+        },
+        {
+          "covered": true,
+          "line": 1178,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 153,
+          "path": "app/handlers/subscription/revoke.py"
+        },
+        {
+          "covered": true,
+          "line": 1673,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 1704,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 1838,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 2071,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 2118,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 2134,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": false,
+          "line": 256,
+          "path": "app/handlers/balance/wata.py"
+        },
+        {
+          "covered": false,
+          "line": 266,
+          "path": "app/handlers/balance/heleket.py"
+        },
+        {
+          "covered": false,
+          "line": 273,
+          "path": "app/handlers/balance/mulenpay.py"
+        },
+        {
+          "covered": true,
+          "line": 2792,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 3472,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 3519,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 370,
+          "path": "app/handlers/simple_subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 3778,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 433,
+          "path": "app/handlers/balance/platega.py"
+        },
+        {
+          "covered": true,
+          "line": 4524,
+          "path": "app/handlers/subscription/tariff_purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 472,
+          "path": "app/handlers/balance/pal24.py"
+        },
+        {
+          "covered": true,
+          "line": 878,
+          "path": "app/cabinet/routes/account_linking.py"
+        },
+        {
+          "covered": false,
+          "line": 127,
+          "path": "app/handlers/channel_member.py"
+        },
+        {
+          "covered": false,
+          "line": 42,
+          "path": "app/handlers/channel_member.py"
+        },
+        {
+          "covered": true,
+          "line": 85,
+          "path": "app/cabinet/routes/admin_overpay_certificate.py"
+        },
+        {
+          "covered": true,
+          "line": 701,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 190,
+          "path": "app/webapi/routes/config.py"
+        },
+        {
+          "covered": true,
+          "line": 302,
+          "path": "app/cabinet/routes/admin_settings.py"
+        },
+        {
+          "covered": true,
+          "line": 112,
+          "path": "app/cabinet/routes/subscription_modules/multi_tariff.py"
+        },
+        {
+          "covered": true,
+          "line": 410,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 2592,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2533,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2441,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2637,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 553,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": true,
+          "line": 211,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 138,
+          "path": "app/cabinet/routes/info.py"
+        },
+        {
+          "covered": true,
+          "line": 314,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 2060,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": true,
+          "line": 198,
+          "path": "app/webapi/routes/partners.py"
+        },
+        {
+          "covered": true,
+          "line": 328,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 614,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 160,
+          "path": "app/webapi/routes/pinned_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 196,
+          "path": "app/cabinet/routes/admin_pinned_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 88,
+          "path": "app/webapi/routes/user_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 246,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": true,
+          "line": 71,
+          "path": "app/cabinet/routes/admin_info_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 111,
+          "path": "app/webapi/routes/pinned_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 143,
+          "path": "app/cabinet/routes/admin_pinned_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 67,
+          "path": "app/webapi/routes/user_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 214,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": true,
+          "line": 47,
+          "path": "app/cabinet/routes/promocode.py"
+        },
+        {
+          "covered": true,
+          "line": 499,
+          "path": "app/cabinet/routes/landing.py"
+        },
+        {
+          "covered": true,
+          "line": 146,
+          "path": "app/cabinet/apple_iap.py"
+        },
+        {
+          "covered": true,
+          "line": 46,
+          "path": "app/cabinet/routes/admin_overpay_certificate.py"
+        },
+        {
+          "covered": true,
+          "line": 568,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 587,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 935,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 748,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 701,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 2352,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 70,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 348,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 1261,
+          "path": "app/cabinet/routes/subscription_modules/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 4499,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 1624,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 1311,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 1491,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 962,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 293,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 392,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 375,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 507,
+          "path": "app/cabinet/routes/account_linking.py"
+        },
+        {
+          "covered": true,
+          "line": 718,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 30,
+          "path": "app/cabinet/routes/subscription_modules/daily.py"
+        },
+        {
+          "covered": true,
+          "line": 1483,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 1470,
+          "path": "app/cabinet/routes/balance.py"
+        },
+        {
+          "covered": true,
+          "line": 4222,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 772,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 935,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 100,
+          "path": "app/cabinet/routes/subscription_modules/renewal.py"
+        },
+        {
+          "covered": true,
+          "line": 28,
+          "path": "app/cabinet/routes/subscription_modules/revoke.py"
+        },
+        {
+          "covered": true,
+          "line": 830,
+          "path": "app/cabinet/routes/admin_ban_system.py"
+        },
+        {
+          "covered": true,
+          "line": 134,
+          "path": "app/cabinet/routes/wheel.py"
+        },
+        {
+          "covered": true,
+          "line": 306,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 588,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 754,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 531,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 650,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 356,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 7684,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 6260,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 5731,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 5388,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 5848,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 6782,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 7181,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 6093,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 7477,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 3824,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 914,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 877,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 447,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 941,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 492,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 1047,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 466,
+          "path": "app/webapi/routes/remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 966,
+          "path": "app/cabinet/routes/admin_remnawave.py"
+        },
+        {
+          "covered": true,
+          "line": 213,
+          "path": "app/cabinet/routes/subscription_modules/tariff_switch.py"
+        },
+        {
+          "covered": true,
+          "line": 531,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 879,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 727,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 149,
+          "path": "app/cabinet/routes/subscription_modules/traffic.py"
+        },
+        {
+          "covered": true,
+          "line": 1689,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 513,
+          "path": "app/cabinet/routes/admin_payments.py"
+        },
+        {
+          "covered": true,
+          "line": 129,
+          "path": "app/cabinet/routes/oauth.py"
+        },
+        {
+          "covered": true,
+          "line": 354,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 276,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 318,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 2696,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 1918,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2885,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2804,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 2729,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 1205,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 3545,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 1946,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": false,
+          "line": 36,
+          "path": "app/webserver/apple_iap.py"
+        },
+        {
+          "covered": false,
+          "line": 975,
+          "path": "app/webserver/payments.py"
+        },
+        {
+          "covered": false,
+          "line": 1056,
+          "path": "app/webserver/payments.py"
+        },
+        {
+          "covered": false,
+          "line": 1131,
+          "path": "app/webserver/payments.py"
+        },
+        {
+          "covered": false,
+          "line": 183,
+          "path": "app/webserver/payments.py"
+        },
+        {
+          "covered": true,
+          "line": 369,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 410,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 337,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 279,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 310,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 68,
+          "path": "app/cabinet/routes/admin_apps.py"
+        },
+        {
+          "covered": true,
+          "line": 341,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 567,
+          "path": "app/cabinet/routes/subscription_modules/traffic.py"
+        },
+        {
+          "covered": true,
+          "line": 163,
+          "path": "app/webapi/routes/config.py"
+        },
+        {
+          "covered": true,
+          "line": 266,
+          "path": "app/cabinet/routes/admin_settings.py"
+        },
+        {
+          "covered": true,
+          "line": 109,
+          "path": "app/cabinet/routes/admin_info_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 120,
+          "path": "app/services/privacy_policy_service.py"
+        },
+        {
+          "covered": true,
+          "line": 214,
+          "path": "app/services/faq_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1008,
+          "path": "app/services/traffic_monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1010,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": true,
+          "line": 1012,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1017,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1019,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 102,
+          "path": "app/database/crud/faq.py"
+        },
+        {
+          "covered": true,
+          "line": 1021,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 105,
+          "path": "app/services/remnawave_sync_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1050,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1055,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 106,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1060,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1060,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1065,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1068,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 1082,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1094,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1096,
+          "path": "app/services/device_first_payment_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1099,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 1108,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1109,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1126,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1126,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1149,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1160,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 1170,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1195,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1205,
+          "path": "app/services/guest_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1224,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": true,
+          "line": 123,
+          "path": "app/services/apple_iap.py"
+        },
+        {
+          "covered": true,
+          "line": 1238,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 125,
+          "path": "app/services/payment/cryptobot.py"
+        },
+        {
+          "covered": true,
+          "line": 1254,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 126,
+          "path": "app/services/payment/mulenpay.py"
+        },
+        {
+          "covered": true,
+          "line": 126,
+          "path": "app/services/remnawave_sync_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1264,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 127,
+          "path": "app/services/payment/cloudpayments.py"
+        },
+        {
+          "covered": true,
+          "line": 1270,
+          "path": "app/services/device_first_payment_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1284,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1288,
+          "path": "app/database/crud/user.py"
+        },
+        {
+          "covered": true,
+          "line": 129,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 129,
+          "path": "app/external/webhook_server.py"
+        },
+        {
+          "covered": false,
+          "line": 13,
+          "path": "app/utils/long_messages.py"
+        },
+        {
+          "covered": false,
+          "line": 1307,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 132,
+          "path": "app/services/phantom_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1345,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": true,
+          "line": 135,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": false,
+          "line": 1357,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 1364,
+          "path": "app/services/payment/yookassa.py"
+        },
+        {
+          "covered": false,
+          "line": 139,
+          "path": "app/middlewares/display_name_restriction.py"
+        },
+        {
+          "covered": false,
+          "line": 14,
+          "path": "app/middlewares/context_binding.py"
+        },
+        {
+          "covered": false,
+          "line": 14,
+          "path": "app/middlewares/logging.py"
+        },
+        {
+          "covered": false,
+          "line": 141,
+          "path": "app/logging_handler.py"
+        },
+        {
+          "covered": false,
+          "line": 1415,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 1417,
+          "path": "app/handlers/subscription/device_first.py"
+        },
+        {
+          "covered": false,
+          "line": 142,
+          "path": "app/external/wata_webhook.py"
+        },
+        {
+          "covered": true,
+          "line": 142,
+          "path": "app/services/contest_rotation_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1424,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1445,
+          "path": "app/services/guest_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1456,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 1465,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1466,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 1467,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1489,
+          "path": "app/services/payment_verification_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1490,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1498,
+          "path": "app/database/crud/subscription.py"
+        },
+        {
+          "covered": false,
+          "line": 15,
+          "path": "app/middlewares/blacklist.py"
+        },
+        {
+          "covered": true,
+          "line": 15,
+          "path": "app/database/crud/user_message.py"
+        },
+        {
+          "covered": true,
+          "line": 150,
+          "path": "app/webapi/routes/subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 1502,
+          "path": "app/services/device_first_payment_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1509,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 1511,
+          "path": "app/services/guest_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1513,
+          "path": "app/handlers/subscription/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 1517,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1528,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 153,
+          "path": "app/services/payment/freekassa.py"
+        },
+        {
+          "covered": true,
+          "line": 155,
+          "path": "app/services/campaign_service.py"
+        },
+        {
+          "covered": false,
+          "line": 155,
+          "path": "app/services/remnawave_retry_queue.py"
+        },
+        {
+          "covered": true,
+          "line": 1554,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": false,
+          "line": 16,
+          "path": "app/middlewares/maintenance.py"
+        },
+        {
+          "covered": true,
+          "line": 1605,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1618,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 1619,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": true,
+          "line": 162,
+          "path": "app/services/payment/riopay.py"
+        },
+        {
+          "covered": false,
+          "line": 1634,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": false,
+          "line": 1639,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 165,
+          "path": "app/services/payment/kassa_ai.py"
+        },
+        {
+          "covered": false,
+          "line": 168,
+          "path": "app/services/remnawave_retry_queue.py"
+        },
+        {
+          "covered": true,
+          "line": 1691,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 17,
+          "path": "app/services/remnawave_resync_service.py"
+        },
+        {
+          "covered": false,
+          "line": 170,
+          "path": "app/middlewares/global_error.py"
+        },
+        {
+          "covered": true,
+          "line": 170,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 170,
+          "path": "app/external/cryptobot.py"
+        },
+        {
+          "covered": false,
+          "line": 1708,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 171,
+          "path": "app/services/payment/heleket.py"
+        },
+        {
+          "covered": false,
+          "line": 1731,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 174,
+          "path": "app/services/payment/rollypay.py"
+        },
+        {
+          "covered": true,
+          "line": 175,
+          "path": "app/services/apple_iap.py"
+        },
+        {
+          "covered": true,
+          "line": 175,
+          "path": "app/services/payment/jupiter.py"
+        },
+        {
+          "covered": false,
+          "line": 177,
+          "path": "app/external/webhook_server.py"
+        },
+        {
+          "covered": true,
+          "line": 177,
+          "path": "app/services/payment/etoplatezhi.py"
+        },
+        {
+          "covered": true,
+          "line": 177,
+          "path": "app/services/payment/paypear.py"
+        },
+        {
+          "covered": true,
+          "line": 177,
+          "path": "app/services/payment/severpay.py"
+        },
+        {
+          "covered": true,
+          "line": 178,
+          "path": "app/cabinet/routes/subscription_modules/servers.py"
+        },
+        {
+          "covered": true,
+          "line": 178,
+          "path": "app/services/payment/antilopay.py"
+        },
+        {
+          "covered": true,
+          "line": 179,
+          "path": "app/services/payment/aurapay.py"
+        },
+        {
+          "covered": true,
+          "line": 1795,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": false,
+          "line": 18,
+          "path": "app/utils/long_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 1814,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 182,
+          "path": "app/services/payment/donut.py"
+        },
+        {
+          "covered": true,
+          "line": 1824,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 1844,
+          "path": "app/handlers/subscription/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 185,
+          "path": "app/services/payment/wata.py"
+        },
+        {
+          "covered": true,
+          "line": 1859,
+          "path": "app/services/device_first_payment_service.py"
+        },
+        {
+          "covered": true,
+          "line": 1872,
+          "path": "app/services/device_first_checkout_service.py"
+        },
+        {
+          "covered": false,
+          "line": 189,
+          "path": "app/utils/telegram_html.py"
+        },
+        {
+          "covered": true,
+          "line": 1891,
+          "path": "app/handlers/subscription/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 1895,
+          "path": "app/webapi/routes/miniapp.py"
+        },
+        {
+          "covered": true,
+          "line": 1904,
+          "path": "app/services/device_first_checkout_service.py"
+        },
+        {
+          "covered": true,
+          "line": 192,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 193,
+          "path": "app/external/ban_system_api.py"
+        },
+        {
+          "covered": true,
+          "line": 1944,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 195,
+          "path": "app/services/payment/pal24.py"
+        },
+        {
+          "covered": false,
+          "line": 197,
+          "path": "app/services/phantom_service.py"
+        },
+        {
+          "covered": false,
+          "line": 20,
+          "path": "app/handlers/stars_payments.py"
+        },
+        {
+          "covered": false,
+          "line": 200,
+          "path": "app/utils/telegram_html.py"
+        },
+        {
+          "covered": true,
+          "line": 2007,
+          "path": "app/services/device_first_checkout_service.py"
+        },
+        {
+          "covered": true,
+          "line": 202,
+          "path": "app/services/remnawave_sync_service.py"
+        },
+        {
+          "covered": true,
+          "line": 203,
+          "path": "app/cabinet/routes/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 2057,
+          "path": "app/database/crud/subscription.py"
+        },
+        {
+          "covered": false,
+          "line": 2059,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 206,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 2060,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": false,
+          "line": 207,
+          "path": "app/external/yookassa_webhook.py"
+        },
+        {
+          "covered": true,
+          "line": 208,
+          "path": "app/services/account_merge_service.py"
+        },
+        {
+          "covered": true,
+          "line": 2080,
+          "path": "app/services/device_first_checkout_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2087,
+          "path": "app/database/crud/subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 2098,
+          "path": "app/services/device_first_payment_service.py"
+        },
+        {
+          "covered": false,
+          "line": 21,
+          "path": "app/database/crud/squad.py"
+        },
+        {
+          "covered": false,
+          "line": 21,
+          "path": "app/handlers/gift_activation.py"
+        },
+        {
+          "covered": true,
+          "line": 2151,
+          "path": "app/database/crud/subscription.py"
+        },
+        {
+          "covered": true,
+          "line": 2158,
+          "path": "app/services/device_first_checkout_service.py"
+        },
+        {
+          "covered": true,
+          "line": 217,
+          "path": "app/services/maintenance_service.py"
+        },
+        {
+          "covered": true,
+          "line": 2199,
+          "path": "app/services/device_first_checkout_service.py"
+        },
+        {
+          "covered": false,
+          "line": 22,
+          "path": "app/external/heleket_webhook.py"
+        },
+        {
+          "covered": true,
+          "line": 222,
+          "path": "app/services/remnawave_sync_service.py"
+        },
+        {
+          "covered": false,
+          "line": 222,
+          "path": "app/external/wata_webhook.py"
+        },
+        {
+          "covered": false,
+          "line": 226,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 230,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 2312,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 2317,
+          "path": "app/handlers/admin/promo_offers.py"
+        },
+        {
+          "covered": false,
+          "line": 232,
+          "path": "app/handlers/stars_payments.py"
+        },
+        {
+          "covered": true,
+          "line": 232,
+          "path": "app/services/payment_verification_service.py"
+        },
+        {
+          "covered": true,
+          "line": 232,
+          "path": "app/utils/validators.py"
+        },
+        {
+          "covered": true,
+          "line": 233,
+          "path": "app/services/payment/lava.py"
+        },
+        {
+          "covered": true,
+          "line": 236,
+          "path": "app/services/payment/overpay.py"
+        },
+        {
+          "covered": false,
+          "line": 237,
+          "path": "app/handlers/promocode.py"
+        },
+        {
+          "covered": true,
+          "line": 2385,
+          "path": "app/database/models.py"
+        },
+        {
+          "covered": true,
+          "line": 24,
+          "path": "app/handlers/admin/welcome_text.py"
+        },
+        {
+          "covered": true,
+          "line": 240,
+          "path": "app/handlers/subscription/countries.py"
+        },
+        {
+          "covered": true,
+          "line": 2402,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 242,
+          "path": "app/services/promocode_service.py"
+        },
+        {
+          "covered": true,
+          "line": 243,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 2443,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 245,
+          "path": "app/external/webhook_server.py"
+        },
+        {
+          "covered": true,
+          "line": 248,
+          "path": "app/services/payment/freekassa.py"
+        },
+        {
+          "covered": false,
+          "line": 2483,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2483,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 249,
+          "path": "app/services/account_merge_service.py"
+        },
+        {
+          "covered": true,
+          "line": 25,
+          "path": "app/handlers/admin/maintenance.py"
+        },
+        {
+          "covered": false,
+          "line": 25,
+          "path": "app/middlewares/auth.py"
+        },
+        {
+          "covered": false,
+          "line": 25,
+          "path": "app/handlers/webhooks.py"
+        },
+        {
+          "covered": true,
+          "line": 253,
+          "path": "app/services/payment/kassa_ai.py"
+        },
+        {
+          "covered": true,
+          "line": 257,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 257,
+          "path": "app/services/payment/platega.py"
+        },
+        {
+          "covered": true,
+          "line": 26,
+          "path": "app/services/bulk_ban_service.py"
+        },
+        {
+          "covered": true,
+          "line": 261,
+          "path": "app/services/account_merge_service.py"
+        },
+        {
+          "covered": true,
+          "line": 267,
+          "path": "app/services/payment_verification_service.py"
+        },
+        {
+          "covered": false,
+          "line": 27,
+          "path": "app/middlewares/chat_type_filter.py"
+        },
+        {
+          "covered": false,
+          "line": 271,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": true,
+          "line": 272,
+          "path": "app/services/blocked_users_service.py"
+        },
+        {
+          "covered": true,
+          "line": 275,
+          "path": "app/services/account_erasure_service.py"
+        },
+        {
+          "covered": true,
+          "line": 276,
+          "path": "app/handlers/subscription/my_subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 2768,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 278,
+          "path": "app/services/payment/jupiter.py"
+        },
+        {
+          "covered": false,
+          "line": 28,
+          "path": "app/middlewares/subscription_checker.py"
+        },
+        {
+          "covered": true,
+          "line": 284,
+          "path": "app/services/payment/donut.py"
+        },
+        {
+          "covered": true,
+          "line": 284,
+          "path": "app/services/payment/wata.py"
+        },
+        {
+          "covered": true,
+          "line": 285,
+          "path": "app/services/payment/riopay.py"
+        },
+        {
+          "covered": true,
+          "line": 289,
+          "path": "app/services/public_offer_service.py"
+        },
+        {
+          "covered": false,
+          "line": 29,
+          "path": "app/services/phantom_service.py"
+        },
+        {
+          "covered": true,
+          "line": 290,
+          "path": "app/services/payment_verification_service.py"
+        },
+        {
+          "covered": true,
+          "line": 294,
+          "path": "app/services/campaign_service.py"
+        },
+        {
+          "covered": true,
+          "line": 294,
+          "path": "app/cabinet/routes/admin_users.py"
+        },
+        {
+          "covered": true,
+          "line": 294,
+          "path": "app/services/blocked_users_service.py"
+        },
+        {
+          "covered": true,
+          "line": 295,
+          "path": "app/services/payment/yookassa.py"
+        },
+        {
+          "covered": true,
+          "line": 297,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 2975,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 298,
+          "path": "app/services/payment/severpay.py"
+        },
+        {
+          "covered": true,
+          "line": 299,
+          "path": "app/handlers/admin/pricing.py"
+        },
+        {
+          "covered": true,
+          "line": 300,
+          "path": "app/services/tribute_service.py"
+        },
+        {
+          "covered": true,
+          "line": 302,
+          "path": "app/services/payment/rollypay.py"
+        },
+        {
+          "covered": true,
+          "line": 303,
+          "path": "app/services/payment/etoplatezhi.py"
+        },
+        {
+          "covered": true,
+          "line": 3057,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": true,
+          "line": 306,
+          "path": "app/services/payment/antilopay.py"
+        },
+        {
+          "covered": true,
+          "line": 307,
+          "path": "app/services/payment/aurapay.py"
+        },
+        {
+          "covered": false,
+          "line": 309,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 309,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": true,
+          "line": 313,
+          "path": "app/services/payment/paypear.py"
+        },
+        {
+          "covered": true,
+          "line": 317,
+          "path": "app/services/guest_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 3173,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": true,
+          "line": 318,
+          "path": "app/services/payment/stars.py"
+        },
+        {
+          "covered": false,
+          "line": 32,
+          "path": "app/utils/long_messages.py"
+        },
+        {
+          "covered": true,
+          "line": 320,
+          "path": "app/services/account_merge_service.py"
+        },
+        {
+          "covered": true,
+          "line": 320,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 3200,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 322,
+          "path": "app/utils/validators.py"
+        },
+        {
+          "covered": true,
+          "line": 3239,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 3257,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 326,
+          "path": "app/cabinet/routes/subscription_modules/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 3287,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 33,
+          "path": "app/services/pinned_message_service.py"
+        },
+        {
+          "covered": true,
+          "line": 33,
+          "path": "app/services/disposable_email_service.py"
+        },
+        {
+          "covered": true,
+          "line": 336,
+          "path": "app/services/wheel_service.py"
+        },
+        {
+          "covered": true,
+          "line": 3380,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": false,
+          "line": 34,
+          "path": "app/database/crud/squad.py"
+        },
+        {
+          "covered": true,
+          "line": 340,
+          "path": "app/services/payment/pal24.py"
+        },
+        {
+          "covered": true,
+          "line": 3414,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 3481,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 351,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 351,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 358,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 360,
+          "path": "app/services/payment/overpay.py"
+        },
+        {
+          "covered": true,
+          "line": 363,
+          "path": "app/services/payment/common.py"
+        },
+        {
+          "covered": true,
+          "line": 365,
+          "path": "app/services/subscription_renewal_service.py"
+        },
+        {
+          "covered": false,
+          "line": 365,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 367,
+          "path": "app/external/ban_system_api.py"
+        },
+        {
+          "covered": true,
+          "line": 369,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 37,
+          "path": "app/services/device_first_recovery_service.py"
+        },
+        {
+          "covered": true,
+          "line": 370,
+          "path": "app/services/payment/lava.py"
+        },
+        {
+          "covered": false,
+          "line": 370,
+          "path": "app/handlers/stars_payments.py"
+        },
+        {
+          "covered": false,
+          "line": 372,
+          "path": "app/external/yookassa_webhook.py"
+        },
+        {
+          "covered": true,
+          "line": 373,
+          "path": "app/database/crud/user.py"
+        },
+        {
+          "covered": true,
+          "line": 38,
+          "path": "app/cabinet/routes/oauth.py"
+        },
+        {
+          "covered": true,
+          "line": 385,
+          "path": "app/services/wheel_service.py"
+        },
+        {
+          "covered": true,
+          "line": 386,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": true,
+          "line": 388,
+          "path": "app/services/payment/yookassa.py"
+        },
+        {
+          "covered": true,
+          "line": 396,
+          "path": "app/services/tribute_service.py"
+        },
+        {
+          "covered": false,
+          "line": 40,
+          "path": "app/middlewares/auth.py"
+        },
+        {
+          "covered": true,
+          "line": 400,
+          "path": "app/webapi/routes/users.py"
+        },
+        {
+          "covered": true,
+          "line": 409,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 410,
+          "path": "app/services/payment/cryptobot.py"
+        },
+        {
+          "covered": true,
+          "line": 413,
+          "path": "app/services/payment/wata.py"
+        },
+        {
+          "covered": false,
+          "line": 414,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 416,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 425,
+          "path": "app/services/blocked_users_service.py"
+        },
+        {
+          "covered": true,
+          "line": 426,
+          "path": "app/handlers/subscription/my_subscriptions.py"
+        },
+        {
+          "covered": true,
+          "line": 428,
+          "path": "app/services/account_erasure_service.py"
+        },
+        {
+          "covered": false,
+          "line": 430,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 433,
+          "path": "app/services/apple_iap.py"
+        },
+        {
+          "covered": true,
+          "line": 434,
+          "path": "app/services/payment/platega.py"
+        },
+        {
+          "covered": true,
+          "line": 4378,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 438,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 44,
+          "path": "app/services/referral_contest_service.py"
+        },
+        {
+          "covered": true,
+          "line": 4441,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 445,
+          "path": "app/services/payment/kassa_ai.py"
+        },
+        {
+          "covered": true,
+          "line": 45,
+          "path": "app/services/device_first_recovery_service.py"
+        },
+        {
+          "covered": true,
+          "line": 450,
+          "path": "app/services/payment/mulenpay.py"
+        },
+        {
+          "covered": false,
+          "line": 451,
+          "path": "app/middlewares/channel_checker.py"
+        },
+        {
+          "covered": true,
+          "line": 454,
+          "path": "app/services/payment/freekassa.py"
+        },
+        {
+          "covered": true,
+          "line": 456,
+          "path": "app/services/payment/riopay.py"
+        },
+        {
+          "covered": true,
+          "line": 4565,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4586,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 4599,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4650,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": false,
+          "line": 468,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 4682,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 4716,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 473,
+          "path": "app/services/payment/common.py"
+        },
+        {
+          "covered": true,
+          "line": 4739,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 4752,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 476,
+          "path": "app/services/payment/heleket.py"
+        },
+        {
+          "covered": true,
+          "line": 477,
+          "path": "app/services/remnawave_service.py"
+        },
+        {
+          "covered": true,
+          "line": 489,
+          "path": "app/services/payment/heleket.py"
+        },
+        {
+          "covered": true,
+          "line": 49,
+          "path": "app/services/promocode_service.py"
+        },
+        {
+          "covered": true,
+          "line": 492,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": false,
+          "line": 492,
+          "path": "app/services/legacy_entitlement_manifest_seed.py"
+        },
+        {
+          "covered": true,
+          "line": 493,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": true,
+          "line": 498,
+          "path": "app/database/crud/user.py"
+        },
+        {
+          "covered": true,
+          "line": 502,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 511,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 512,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": true,
+          "line": 513,
+          "path": "app/services/payment/severpay.py"
+        },
+        {
+          "covered": true,
+          "line": 515,
+          "path": "app/services/payment/platega.py"
+        },
+        {
+          "covered": true,
+          "line": 515,
+          "path": "app/services/apple_iap.py"
+        },
+        {
+          "covered": true,
+          "line": 517,
+          "path": "app/services/payment/rollypay.py"
+        },
+        {
+          "covered": true,
+          "line": 522,
+          "path": "app/services/payment/aurapay.py"
+        },
+        {
+          "covered": true,
+          "line": 523,
+          "path": "app/services/payment/pal24.py"
+        },
+        {
+          "covered": false,
+          "line": 523,
+          "path": "app/handlers/stars_payments.py"
+        },
+        {
+          "covered": true,
+          "line": 528,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 528,
+          "path": "app/services/payment/paypear.py"
+        },
+        {
+          "covered": true,
+          "line": 529,
+          "path": "app/handlers/subscription/devices.py"
+        },
+        {
+          "covered": true,
+          "line": 53,
+          "path": "app/services/campaign_service.py"
+        },
+        {
+          "covered": true,
+          "line": 530,
+          "path": "app/services/payment/cloudpayments.py"
+        },
+        {
+          "covered": false,
+          "line": 530,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 532,
+          "path": "app/services/account_merge_service.py"
+        },
+        {
+          "covered": false,
+          "line": 54,
+          "path": "app/utils/long_messages.py"
+        },
+        {
+          "covered": false,
+          "line": 543,
+          "path": "app/middlewares/channel_checker.py"
+        },
+        {
+          "covered": false,
+          "line": 55,
+          "path": "app/middlewares/throttling.py"
+        },
+        {
+          "covered": false,
+          "line": 55,
+          "path": "app/handlers/promocode.py"
+        },
+        {
+          "covered": true,
+          "line": 554,
+          "path": "app/services/account_erasure_service.py"
+        },
+        {
+          "covered": true,
+          "line": 558,
+          "path": "app/services/broadcast_service.py"
+        },
+        {
+          "covered": true,
+          "line": 560,
+          "path": "app/services/payment/stars.py"
+        },
+        {
+          "covered": true,
+          "line": 567,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 57,
+          "path": "app/external/tribute.py"
+        },
+        {
+          "covered": true,
+          "line": 575,
+          "path": "app/services/payment/overpay.py"
+        },
+        {
+          "covered": true,
+          "line": 5762,
+          "path": "app/handlers/admin/users.py"
+        },
+        {
+          "covered": true,
+          "line": 585,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": false,
+          "line": 59,
+          "path": "app/webserver/telegram.py"
+        },
+        {
+          "covered": true,
+          "line": 590,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 591,
+          "path": "app/services/wheel_service.py"
+        },
+        {
+          "covered": false,
+          "line": 60,
+          "path": "app/middlewares/global_error.py"
+        },
+        {
+          "covered": false,
+          "line": 60,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 61,
+          "path": "app/services/nalogo_queue_service.py"
+        },
+        {
+          "covered": true,
+          "line": 611,
+          "path": "app/cabinet/routes/device_first.py"
+        },
+        {
+          "covered": false,
+          "line": 618,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": false,
+          "line": 62,
+          "path": "main.py"
+        },
+        {
+          "covered": true,
+          "line": 629,
+          "path": "app/services/apple_iap.py"
+        },
+        {
+          "covered": true,
+          "line": 63,
+          "path": "app/services/remnawave_sync_service.py"
+        },
+        {
+          "covered": true,
+          "line": 646,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 65,
+          "path": "app/services/reporting_service.py"
+        },
+        {
+          "covered": true,
+          "line": 659,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 664,
+          "path": "app/services/payment/cryptobot.py"
+        },
+        {
+          "covered": false,
+          "line": 669,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": false,
+          "line": 67,
+          "path": "app/services/referral_contest_service.py"
+        },
+        {
+          "covered": false,
+          "line": 685,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 69,
+          "path": "app/services/tribute_service.py"
+        },
+        {
+          "covered": false,
+          "line": 70,
+          "path": "app/services/remnawave_retry_queue.py"
+        },
+        {
+          "covered": false,
+          "line": 70,
+          "path": "app/webapi/server.py"
+        },
+        {
+          "covered": true,
+          "line": 709,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 71,
+          "path": "app/database/crud/faq.py"
+        },
+        {
+          "covered": false,
+          "line": 71,
+          "path": "app/external/webhook_server.py"
+        },
+        {
+          "covered": true,
+          "line": 73,
+          "path": "app/webapi/routes/pages.py"
+        },
+        {
+          "covered": true,
+          "line": 73,
+          "path": "app/services/overpay_certificate_service.py"
+        },
+        {
+          "covered": false,
+          "line": 732,
+          "path": "app/handlers/start.py"
+        },
+        {
+          "covered": true,
+          "line": 733,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 74,
+          "path": "app/middlewares/display_name_restriction.py"
+        },
+        {
+          "covered": true,
+          "line": 753,
+          "path": "app/services/account_erasure_service.py"
+        },
+        {
+          "covered": true,
+          "line": 754,
+          "path": "app/services/apple_iap.py"
+        },
+        {
+          "covered": false,
+          "line": 759,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 762,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 762,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": true,
+          "line": 773,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 777,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 782,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 786,
+          "path": "app/services/traffic_monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 787,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 788,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": false,
+          "line": 79,
+          "path": "app/services/log_rotation_service.py"
+        },
+        {
+          "covered": true,
+          "line": 79,
+          "path": "app/services/remnawave_sync_service.py"
+        },
+        {
+          "covered": true,
+          "line": 792,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 800,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": true,
+          "line": 813,
+          "path": "app/handlers/subscription/countries.py"
+        },
+        {
+          "covered": true,
+          "line": 819,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 82,
+          "path": "app/services/payment/stars.py"
+        },
+        {
+          "covered": false,
+          "line": 82,
+          "path": "app/external/heleket_webhook.py"
+        },
+        {
+          "covered": true,
+          "line": 836,
+          "path": "app/services/subscription_auto_purchase_service.py"
+        },
+        {
+          "covered": true,
+          "line": 837,
+          "path": "app/services/account_erasure_service.py"
+        },
+        {
+          "covered": true,
+          "line": 839,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": false,
+          "line": 84,
+          "path": "app/middlewares/channel_checker.py"
+        },
+        {
+          "covered": false,
+          "line": 84,
+          "path": "app/services/log_rotation_service.py"
+        },
+        {
+          "covered": true,
+          "line": 840,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 842,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 85,
+          "path": "app/cabinet/routes/admin_legal_pages.py"
+        },
+        {
+          "covered": true,
+          "line": 853,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": true,
+          "line": 856,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 872,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": false,
+          "line": 886,
+          "path": "app/handlers/menu.py"
+        },
+        {
+          "covered": false,
+          "line": 887,
+          "path": "app/services/daily_subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 9,
+          "path": "app/handlers/admin/display_mode_button.py"
+        },
+        {
+          "covered": true,
+          "line": 90,
+          "path": "app/database/crud/user_message.py"
+        },
+        {
+          "covered": true,
+          "line": 901,
+          "path": "app/cabinet/routes/admin_bulk_actions.py"
+        },
+        {
+          "covered": true,
+          "line": 901,
+          "path": "app/handlers/subscription/traffic.py"
+        },
+        {
+          "covered": true,
+          "line": 902,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 91,
+          "path": "app/middlewares/button_stats.py"
+        },
+        {
+          "covered": true,
+          "line": 918,
+          "path": "app/services/public_access_point_service.py"
+        },
+        {
+          "covered": true,
+          "line": 933,
+          "path": "app/services/user_service.py"
+        },
+        {
+          "covered": true,
+          "line": 934,
+          "path": "app/handlers/subscription/purchase.py"
+        },
+        {
+          "covered": true,
+          "line": 939,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 94,
+          "path": "app/services/tribute_service.py"
+        },
+        {
+          "covered": true,
+          "line": 941,
+          "path": "app/services/subscription_service.py"
+        },
+        {
+          "covered": true,
+          "line": 944,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 956,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": false,
+          "line": 97,
+          "path": "app/handlers/webhooks.py"
+        },
+        {
+          "covered": false,
+          "line": 97,
+          "path": "app/bot.py"
+        },
+        {
+          "covered": true,
+          "line": 972,
+          "path": "app/handlers/admin/bot_configuration.py"
+        },
+        {
+          "covered": true,
+          "line": 975,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 98,
+          "path": "app/services/overpay_certificate_service.py"
+        },
+        {
+          "covered": true,
+          "line": 980,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 985,
+          "path": "app/external/remnawave_api.py"
+        },
+        {
+          "covered": true,
+          "line": 986,
+          "path": "app/services/subscription_purchase_service.py"
+        }
+      ],
+      "total": 640,
+      "uncovered": 111
+    },
+    "startup_registrations": {
+      "covered": 0,
+      "locations": [
+        {
+          "covered": false,
+          "line": 226,
+          "path": "app/middlewares/auth.py"
+        },
+        {
+          "covered": false,
+          "line": 830,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 815,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 209,
+          "path": "app/middlewares/auth.py"
+        },
+        {
+          "covered": false,
+          "line": 680,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 69,
+          "path": "app/webserver/telegram.py"
+        },
+        {
+          "covered": false,
+          "line": 126,
+          "path": "app/middlewares/button_stats.py"
+        },
+        {
+          "covered": false,
+          "line": 126,
+          "path": "app/services/broadcast_service.py"
+        },
+        {
+          "covered": false,
+          "line": 679,
+          "path": "app/services/broadcast_service.py"
+        },
+        {
+          "covered": false,
+          "line": 237,
+          "path": "app/handlers/polls.py"
+        },
+        {
+          "covered": false,
+          "line": 376,
+          "path": "app/services/contest_rotation_service.py"
+        },
+        {
+          "covered": false,
+          "line": 87,
+          "path": "app/webapi/server.py"
+        },
+        {
+          "covered": false,
+          "line": 158,
+          "path": "app/handlers/tickets.py"
+        },
+        {
+          "covered": false,
+          "line": 166,
+          "path": "app/handlers/tickets.py"
+        },
+        {
+          "covered": false,
+          "line": 178,
+          "path": "app/handlers/tickets.py"
+        },
+        {
+          "covered": false,
+          "line": 226,
+          "path": "app/handlers/tickets.py"
+        },
+        {
+          "covered": false,
+          "line": 764,
+          "path": "app/handlers/tickets.py"
+        },
+        {
+          "covered": false,
+          "line": 776,
+          "path": "app/handlers/tickets.py"
+        },
+        {
+          "covered": false,
+          "line": 103,
+          "path": "app/handlers/tickets.py"
+        },
+        {
+          "covered": false,
+          "line": 95,
+          "path": "app/handlers/tickets.py"
+        },
+        {
+          "covered": false,
+          "line": 1905,
+          "path": "app/services/system_settings_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1907,
+          "path": "app/services/system_settings_service.py"
+        },
+        {
+          "covered": false,
+          "line": 53,
+          "path": "app/cabinet/routes/admin_promo_offers.py"
+        },
+        {
+          "covered": false,
+          "line": 220,
+          "path": "app/services/yandex_offline_conv_service.py"
+        },
+        {
+          "covered": false,
+          "line": 673,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 825,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 460,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 634,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 793,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 703,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 646,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 799,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 626,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 787,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 720,
+          "path": "app/handlers/admin/monitoring.py"
+        },
+        {
+          "covered": false,
+          "line": 355,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 2005,
+          "path": "app/services/backup_service.py"
+        },
+        {
+          "covered": false,
+          "line": 251,
+          "path": "app/services/payment_verification_service.py"
+        },
+        {
+          "covered": false,
+          "line": 86,
+          "path": "app/services/reporting_service.py"
+        },
+        {
+          "covered": false,
+          "line": 546,
+          "path": "app/services/remnawave_webhook_service.py"
+        },
+        {
+          "covered": false,
+          "line": 151,
+          "path": "app/services/contest_rotation_service.py"
+        },
+        {
+          "covered": false,
+          "line": 225,
+          "path": "app/services/maintenance_service.py"
+        },
+        {
+          "covered": false,
+          "line": 36,
+          "path": "app/services/disposable_email_service.py"
+        },
+        {
+          "covered": false,
+          "line": 72,
+          "path": "app/services/nalogo_queue_service.py"
+        },
+        {
+          "covered": false,
+          "line": 90,
+          "path": "app/services/log_rotation_service.py"
+        },
+        {
+          "covered": false,
+          "line": 815,
+          "path": "app/services/traffic_monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 806,
+          "path": "app/services/traffic_monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 158,
+          "path": "app/services/remnawave_retry_queue.py"
+        },
+        {
+          "covered": false,
+          "line": 55,
+          "path": "app/services/referral_contest_service.py"
+        },
+        {
+          "covered": false,
+          "line": 100,
+          "path": "app/services/remnawave_sync_service.py"
+        },
+        {
+          "covered": false,
+          "line": 34,
+          "path": "app/webapi/background/backup_tasks.py"
+        },
+        {
+          "covered": false,
+          "line": 330,
+          "path": "app/services/monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 1012,
+          "path": "app/services/traffic_monitoring_service.py"
+        },
+        {
+          "covered": false,
+          "line": 40,
+          "path": "app/services/maintenance_service.py"
+        },
+        {
+          "covered": false,
+          "line": 103,
+          "path": "app/services/remnawave_sync_service.py"
+        },
+        {
+          "covered": false,
+          "line": 659,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 691,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 807,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 634,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 793,
+          "path": "main.py"
+        },
+        {
+          "covered": false,
+          "line": 317,
+          "path": "app/bot.py"
+        }
+      ],
+      "total": 61,
+      "uncovered": 61
+    }
+  },
+  "test_manifest": "docs/entitlement_authority/evidence/affected_test_manifest.txt",
+  "test_manifest_sha256": "d2f95ed5d28319d24b6f0baa18003a9bfb1dc5d138ce1b3488f6cb7a406a29c4"
+}
