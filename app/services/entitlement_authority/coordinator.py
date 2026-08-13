@@ -53,7 +53,7 @@ def normalize_panel_observation(
             'generation': expected.generation,
             'reset_epoch': expected.reset_epoch,
             'revoke_epoch': expected.revoke_epoch,
-            'deny_overlays': expected.deny_overlays,
+            'deny_overlays': list(expected.deny_overlays),
         }
     )
 
