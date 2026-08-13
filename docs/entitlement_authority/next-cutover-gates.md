@@ -22,8 +22,10 @@ candidate SHA:
 Stop immediately on any shadow mutation, provenance last-write-wins, schema
 ambiguity, PII/raw response, comparator instability or unexpected legacy
 behaviour. Rollback is shadow-flag disable; schema stays additive. If the old
-container itself must be restored while Gate 1 rows are unused, downgrade to
-`0102` before starting it.
+container itself must be restored, use only the captured protected migration
+recovery record: the pinned old image starts with `SKIP_MIGRATION=true` on the
+unchanged additive schema and must pass its exact health/startup/schema gates.
+Do not perform an ad-hoc production downgrade.
 
 ## Later gates, still forbidden
 

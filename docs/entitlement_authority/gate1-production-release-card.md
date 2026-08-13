@@ -51,7 +51,9 @@ unexpected worker/table row, Panel mutation, unhealthy dependency, new critical
 log, or legacy-flow regression.
 
 The migration is additive and its guarded downgrade is allowed only while all
-nine new tables are empty. If the candidate cannot run, use the protected
-migration recovery record; an old image may start only after the unused schema
-is returned to `0102`. Never infer authority to restore user data or mutate
-RemnaWave from this card.
+nine new tables are empty, but it is not the production recovery procedure. If
+the candidate cannot run, use only `recover-after-migration.yml` and its exact
+captured recovery record: it pins the previous image, starts it with
+`SKIP_MIGRATION=true` on the unchanged additive `0103` schema, and verifies
+health, startup and revision. Never infer authority to downgrade ad hoc,
+restore user data or mutate RemnaWave from this card.

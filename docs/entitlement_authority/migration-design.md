@@ -34,8 +34,11 @@
 - ✅ old-image model read/write on `0103` with startup migration deliberately
   skipped in the isolated probe; the application ignores additive tables.
 - ✅ downgrade guard rejects `0103 → 0102` as soon as any Gate 1 table has a
-  row. A real rollback to the old container must downgrade while unused before
-  starting it; the old Alembic graph cannot interpret a future revision ID.
+  row. The guarded downgrade is an isolated compatibility proof, not the
+  production recovery route. The protected `recover-after-migration.yml`
+  instead pins the captured old image, sets `SKIP_MIGRATION=true`, verifies
+  health/startup and permits it on the unchanged additive `0103` schema; this
+  is the old-image compatibility scenario proved above.
 
 The complete empty migration cycle was repeated on both the schema-only test
 database and the protected production restore after the final migration
