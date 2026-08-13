@@ -265,11 +265,18 @@ async def mark_cleanup_terminal(
                 text(
                     """
                     SELECT c.identity_id, c.remote_outcome_unknown, c.state,
-                           i.lifecycle_state
+                           c.encrypted_panel_uuid, c.encrypted_create_locator,
+                           c.terminal_at, c.retention_until,
+                           i.lifecycle_state,
+                           t.state AS tombstone_state,
+                           t.terminal_at AS tombstone_terminal_at,
+                           t.retention_until AS tombstone_retention_until
                       FROM entitlement_cleanup_commands c
                       JOIN entitlement_identities i ON i.id=c.identity_id
-                     WHERE c.operation_id=:operation_id
-                     FOR UPDATE OF c, i
+                      JOIN entitlement_cleanup_tombstones t
+                        ON t.operation_id=c.operation_id
+                      WHERE c.operation_id=:operation_id
+                     FOR UPDATE OF c, i, t
                     """
                 ),
                 {'operation_id': operation_id},
@@ -279,7 +286,16 @@ async def mark_cleanup_terminal(
         .one()
     )
     if cleanup['state'] == 'cleanup_terminal':
-        if cleanup['lifecycle_state'] not in {'cleanup_terminal', 'final_erasure'}:
+        if (
+            cleanup['lifecycle_state'] not in {'cleanup_terminal', 'final_erasure'}
+            or cleanup['encrypted_panel_uuid'] is not None
+            or cleanup['encrypted_create_locator'] is not None
+            or cleanup['terminal_at'] is None
+            or cleanup['retention_until'] is None
+            or cleanup['tombstone_state'] != 'cleanup_terminal'
+            or cleanup['tombstone_terminal_at'] != cleanup['terminal_at']
+            or cleanup['tombstone_retention_until'] != cleanup['retention_until']
+        ):
             raise ValueError('cleanup terminal durable state mismatch')
         return
     if cleanup['lifecycle_state'] == 'final_erasure':

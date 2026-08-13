@@ -590,6 +590,61 @@ async def test_erasure_during_create_hands_receipt_to_restricted_cleanup(
     assert identity.panel_uuid is None and identity.lifecycle_state == 'erasure_requested'
 
 
+@pytest.mark.asyncio
+async def test_terminal_receipt_handoff_rejects_cross_wired_identity_claim(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target_a = desired(panel_uuid=None, owner_key='owner-a')
+    target_b = desired(panel_uuid=None, owner_key='owner-b')
+    identity_a, command_a, store = await make_command(sessions, target_a, source_key='cross-wire-a')
+    identity_b, command_b, _ = await make_command(sessions, target_b, source_key='cross-wire-b')
+    claim_a = await store.claim_entitlement_command(command_a, worker='worker-a', now=NOW)
+    claim_b = await store.claim_entitlement_command(command_b, worker='worker-b', now=NOW)
+    await store.mark_mutation_sent(claim_a, stage=Stage.CREATING_DISABLED, now=NOW)
+    await store.mark_mutation_sent(claim_b, stage=Stage.CREATING_DISABLED, now=NOW)
+    async with sessions() as session, session.begin():
+        operation_a = await request_erasure_cleanup(
+            session,
+            identity_id=identity_a,
+            secret=SECRET,
+            now=NOW + timedelta(seconds=1),
+        )
+    before_hmac = await _cleanup_row(sessions, operation_a)
+    cross_wired = replace(
+        claim_b,
+        identity_id=identity_a,
+        deterministic_create_key=claim_a.deterministic_create_key,
+    )
+    with pytest.raises(RuntimeError, match='uuid_bind_fence_lost'):
+        await store.bind_uuid(
+            cross_wired,
+            'panel-for-b',
+            panel_uuid_hmac='c' * 64,
+            encrypted_cleanup_panel_uuid=b'wrong-cross-wired-ciphertext',
+            bound_desired_hash=target_b.bind('panel-for-b').desired_hash,
+            now=NOW + timedelta(seconds=2),
+        )
+    after_hmac = await _cleanup_row(sessions, operation_a)
+    assert identity_a != identity_b
+    assert before_hmac == after_hmac
+
+
+async def _cleanup_row(
+    sessions: async_sessionmaker[AsyncSession],
+    operation_id: str,
+) -> tuple[bytes | None, str, str | None]:
+    async with sessions() as session:
+        return (
+            await session.execute(
+                text(
+                    'SELECT encrypted_panel_uuid, panel_uuid_hmac, last_error_code '
+                    'FROM entitlement_cleanup_commands WHERE operation_id=:operation_id'
+                ),
+                {'operation_id': operation_id},
+            )
+        ).one()
+
+
 class SimulatedProcessKill(BaseException):
     pass
 

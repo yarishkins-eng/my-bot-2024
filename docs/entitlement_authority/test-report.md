@@ -8,15 +8,15 @@ controllable fake; no production adapter exists in Gate 1.
 
 - Phase 0 defect evidence: `12 passed` (the unsafe legacy behaviour remains
   reproducible and was not weakened).
-- Gate 1 entitlement suite: `120 passed`, no skipped.
-- APP-URL-only real-PostgreSQL harness: `89 passed`, proving that the test
+- Gate 1 entitlement suite: `124 passed`, no skipped.
+- APP-URL-only real-PostgreSQL harness: `93 passed`, proving that the test
   bootstrap does not replace `asyncpg` when only the application database URL
   is configured.
-- Exact 37-file affected manifest: `675 passed`, no skipped.
+- Exact 37-file affected manifest: `679 passed`, no skipped.
 - Real-PostgreSQL concurrency/fault subset: five consecutive runs of
-  `83 passed`, no skipped; the eight new erasure/evidence/CREATE race cases
+  `87 passed`, no skipped; the eight new erasure/evidence/CREATE race cases
   also passed five isolated consecutive repetitions.
-- Full repository suite: `2551 passed, 5 skipped`; all five skips are existing
+- Full repository suite: `2555 passed, 5 skipped`; all five skips are existing
   `tests/integration/test_device_first_postgres_constraints.py` cases skipped
   because their separate optional `DEVICE_FIRST_TEST_DATABASE_URL` was not
   configured. They are outside `tests/entitlement_authority` and outside every
@@ -78,6 +78,11 @@ controllable fake; no production adapter exists in Gate 1.
 - ✅ unbound CREATE outcome-unknown preserves an encrypted deterministic
   cleanup locator; erasure at send/post barriers atomically hands a late UUID
   receipt to restricted cleanup without restoring source, owner or Panel links.
+  A cross-wired claim whose command belongs to another identity is rejected
+  before any cleanup ciphertext, HMAC or error marker changes.
+- ✅ repeated terminal cleanup verifies that both restricted ciphertexts are
+  clear and the command/tombstone terminal timestamps and retention agree;
+  corrupted durable state stops instead of being accepted as idempotent.
 - ✅ schema JSON constraints reject extra PII keys and shadow has no DB/remote
   mutation boundary.
 - ✅ every startup writer registration is explicitly classified; unknown

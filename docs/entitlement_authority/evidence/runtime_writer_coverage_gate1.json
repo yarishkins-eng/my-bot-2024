@@ -4,9 +4,9 @@
   "interpretation": "Executed lines prove exercised paths only. Uncovered locations remain a cutover NO-GO; coverage never proves absence of Python dynamic dispatch.",
   "inventory_sha256": "a7ad53de0565ee3f0c6be9f48b19ae3c3baa6107386717b2a3ac0d957fe82269",
   "overall_app_lines": {
-    "covered_lines": 31629,
+    "covered_lines": 31631,
     "num_statements": 128834,
-    "percent_covered": 24.55019637673285
+    "percent_covered": 24.55174876197277
   },
   "sections": {
     "calls": {

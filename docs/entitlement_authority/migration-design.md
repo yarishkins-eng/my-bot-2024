@@ -6,7 +6,8 @@
 - Creates nine tables and their indexes/constraints only.
 - The restricted cleanup command has separate AES-GCM ciphertext fields for
   an exact Panel UUID and an unbound-CREATE deterministic lookup username;
-  both are cleared at verified terminal cleanup and neither is user PII.
+  both are restricted pseudonymous identifiers and are cleared at verified
+  terminal cleanup.
 - No seed/backfill/repair, no `users`/`subscriptions` mutation and no Panel
   network code. No unique constraint is added to historical subscription UUIDs.
 - `entitlement_identities.panel_uuid` is unique inside the new authority only;

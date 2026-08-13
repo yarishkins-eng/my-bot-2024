@@ -433,7 +433,7 @@ class PostgresEntitlementStore:
                 (
                     await session.execute(
                         text(
-                            'SELECT generation, lease_epoch, stage, desired_hash, source_revision_id, '
+                            'SELECT identity_id, generation, lease_epoch, stage, desired_hash, source_revision_id, '
                             'deterministic_create_key, mutation_sent_at, remote_outcome_unknown '
                             'FROM entitlement_projection_commands WHERE id=:id FOR UPDATE'
                         ),
@@ -480,6 +480,7 @@ class PostgresEntitlementStore:
                 )
                 safe_erasure_handoff = bool(
                     identity['lifecycle_state'] == 'erasure_requested'
+                    and command['identity_id'] == claim.identity_id
                     and identity['generation'] == claim.generation + 1
                     and command['generation'] == claim.generation
                     and command['lease_epoch'] == claim.lease_epoch

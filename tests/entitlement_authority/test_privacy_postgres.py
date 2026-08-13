@@ -458,6 +458,53 @@ async def test_erasure_two_stage_encryption_terminal_clear_and_ninety_day_retent
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('corruption', ['panel_ciphertext', 'create_locator', 'tombstone_state'])
+async def test_repeated_terminal_cleanup_rejects_corrupt_durable_state(
+    sessions: async_sessionmaker[AsyncSession],
+    corruption: str,
+) -> None:
+    user_id, identity_id = await create_identity(sessions, panel_uuid=None)
+    async with sessions() as session, session.begin():
+        operation_id = await request_erasure_cleanup(
+            session,
+            identity_id=identity_id,
+            secret=SECRET,
+            now=NOW,
+        )
+        if corruption == 'panel_ciphertext':
+            await session.execute(
+                text(
+                    'UPDATE entitlement_cleanup_commands SET encrypted_panel_uuid=:value '
+                    'WHERE operation_id=:operation_id'
+                ),
+                {'operation_id': operation_id, 'value': b'corrupt-panel'},
+            )
+        elif corruption == 'create_locator':
+            await session.execute(
+                text(
+                    'UPDATE entitlement_cleanup_commands SET encrypted_create_locator=:value '
+                    'WHERE operation_id=:operation_id'
+                ),
+                {'operation_id': operation_id, 'value': b'corrupt-locator'},
+            )
+        else:
+            await session.execute(
+                text("UPDATE entitlement_cleanup_tombstones SET state='quarantined' WHERE operation_id=:operation_id"),
+                {'operation_id': operation_id},
+            )
+    async with sessions() as session, session.begin():
+        with pytest.raises(ValueError, match='cleanup terminal durable state mismatch'):
+            await mark_cleanup_terminal(
+                session,
+                operation_id=operation_id,
+                verified_absent=True,
+                now=NOW + timedelta(seconds=1),
+            )
+    async with sessions() as session, session.begin():
+        await session.execute(text('DELETE FROM users WHERE id=:id'), {'id': user_id})
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('finalize', [False, True])
 async def test_erasure_cannot_restart_after_terminal_evidence_retention(
     sessions: async_sessionmaker[AsyncSession],
