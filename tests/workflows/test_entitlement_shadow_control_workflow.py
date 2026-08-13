@@ -315,24 +315,26 @@ def _docker_path() -> str | None:
     return shutil.which('docker')
 
 
-def _docker_is_available() -> bool:
-    docker = _docker_path()
-    if docker is None or shutil.which('cc') is None:
-        return False
-    return (
-        subprocess.run(  # noqa: S603 - resolved fixed Docker executable
-            [docker, 'info'],
-            check=False,
-            capture_output=True,
-            timeout=10,
-        ).returncode
-        == 0
-    )
-
-
-@pytest.mark.skipif(not _docker_is_available(), reason='real Docker daemon and C compiler are required')
 def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path) -> None:
     """Adversarial proof uses a local scratch image and no network pull."""
+    require_real_docker = os.environ.get('TEPLO_REQUIRE_REAL_DOCKER_SHADOW_TEST') == '1'
+    docker = _docker_path()
+    compiler = shutil.which('cc')
+    if docker is None or compiler is None:
+        if require_real_docker:
+            pytest.fail('real Docker and a C compiler are required by CI')
+        pytest.skip('real Docker daemon and C compiler are unavailable')
+    docker_info = subprocess.run(  # noqa: S603 - resolved fixed Docker executable
+        [docker, 'info'],
+        check=False,
+        capture_output=True,
+        timeout=10,
+    )
+    if docker_info.returncode != 0:
+        if require_real_docker:
+            pytest.fail('a working real Docker daemon is required by CI')
+        pytest.skip('real Docker daemon is unavailable')
+
     run_id, run_attempt = '987654321', '1'
     state = tmp_path / 'state'
     runtime = tmp_path / 'runtime'
@@ -340,10 +342,6 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
     runtime.mkdir()
     source = tmp_path / 'sleeper.c'
     binary = tmp_path / 'sleeper'
-    docker = _docker_path()
-    compiler = shutil.which('cc')
-    require_real_docker = os.environ.get('TEPLO_REQUIRE_REAL_DOCKER_SHADOW_TEST') == '1'
-    assert docker is not None and compiler is not None
     source.write_text('#include <unistd.h>\nint main(void) { sleep(300); return 0; }\n')
     compile_result = subprocess.run(  # noqa: S603 - fixed compiler and generated source
         [compiler, '-static', '-Os', '-o', str(binary), str(source)],
