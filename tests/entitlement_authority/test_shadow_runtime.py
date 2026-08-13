@@ -371,7 +371,11 @@ def test_legacy_row_conversion_is_strict_and_grace_aware(monkeypatch: pytest.Mon
     assert item.expected.status == 'ACTIVE'
     assert item.expected.expire_at == NOW + timedelta(days=1)
     assert item.cohorts == ('grace',)
-    assert '42' not in repr(item)
+    rendered = repr(item)
+    assert 'owner_id' not in rendered
+    assert '100001' not in rendered
+    assert 'panel-uuid-never-log' not in rendered
+    assert item.expected.owner_key not in rendered
     with pytest.raises(ShadowSourceInvariantError, match='legacy_shadow_row_invalid'):
         LegacyPostgresShadowSource._candidate_from_row({**row, 'connected_squads': 'not-an-array'}, now=NOW)
 
