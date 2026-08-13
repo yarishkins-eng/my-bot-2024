@@ -111,6 +111,9 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     docker_create = source.split('docker create', 1)[1].split('>/dev/null', 1)[0]
     assert '--env-file "$REPO_DIR/.env"' not in docker_create
     assert 'BOT_TOKEN=123456789:shadow-sidecar-does-not-use-telegram' in source
+    assert 'ADMIN_NOTIFICATIONS_ENABLED=false' in source
+    assert 'REMNAWAVE_WEBHOOK_ENABLED=false' in source
+    assert 'REMNAWAVE_AUTO_SYNC_ENABLED=false' in source
     assert 'TELEGRAM' not in source
     assert 'systemd-run' in source
     assert 'write_lease prepared' in source
@@ -151,6 +154,8 @@ def test_disable_is_independent_of_bot_and_business_systems() -> None:
     assert 'rm -f -- "$LEASE_FILE"' in source
     assert 'docker rm -f "$SIDECAR"' in source
     assert 'docker info' in source
+    assert 'systemd-run' in source
+    assert 'on-active=60s' in source
     for forbidden in (
         'remnawave_bot',
         'docker compose',
@@ -171,6 +176,26 @@ def _write_executable(path: Path, content: str) -> None:
 
 def _write_fake_flock(fake_bin: Path) -> None:
     _write_executable(fake_bin / 'flock', '#!/usr/bin/env bash\nexit 0\n')
+
+
+def _write_fake_watchdog_docker(fake_bin: Path) -> None:
+    _write_executable(
+        fake_bin / 'docker',
+        r"""#!/usr/bin/env bash
+if [ "$1" = inspect ]; then
+  case "$*" in
+    *State.Running*) printf 'true\n' ;;
+    *teplo.role*) printf 'entitlement-shadow-readonly\n' ;;
+    *teplo.workflow_sha*) printf '%040d\n' 0 | tr 0 a ;;
+    *teplo.workflow_run_id*) printf '%s\n' "$EXPECTED_RUN_ID" ;;
+    *teplo.workflow_run_attempt*) printf '%s\n' "$EXPECTED_RUN_ATTEMPT" ;;
+  esac
+  exit 0
+fi
+printf '%s\n' "$*" >> "$DOCKER_CALLS"
+exit 0
+""",
+    )
 
 
 def _lease(run_id: str, run_attempt: str, phase: str, expires: int) -> str:
@@ -202,10 +227,7 @@ def test_watchdog_removes_uncommitted_sidecar_after_controller_kill(tmp_path: Pa
     lease = runtime / 'lease.state'
     lease.write_text(_lease(run_id, run_attempt, 'prepared', 1))
     docker_calls = tmp_path / 'docker-calls'
-    _write_executable(
-        fake_bin / 'docker',
-        '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "$DOCKER_CALLS"\nexit 0\n',
-    )
+    _write_fake_watchdog_docker(fake_bin)
     _write_fake_flock(fake_bin)
     audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
     secret_env = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
@@ -213,6 +235,8 @@ def test_watchdog_removes_uncommitted_sidecar_after_controller_kill(tmp_path: Pa
     environment = os.environ | {
         'PATH': f'{fake_bin}:{os.environ["PATH"]}',
         'DOCKER_CALLS': str(docker_calls),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
     }
 
     result = subprocess.run(  # noqa: S603 - fixed repository watchdog
@@ -249,10 +273,7 @@ def test_watchdog_materializes_completed_audit_without_removing_sidecar(tmp_path
     lease = runtime / 'lease.state'
     lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
     docker_calls = tmp_path / 'docker-calls'
-    _write_executable(
-        fake_bin / 'docker',
-        '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "$DOCKER_CALLS"\nexit 0\n',
-    )
+    _write_fake_watchdog_docker(fake_bin)
     _write_fake_flock(fake_bin)
     audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
     secret_env = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
@@ -260,6 +281,8 @@ def test_watchdog_materializes_completed_audit_without_removing_sidecar(tmp_path
     environment = os.environ | {
         'PATH': f'{fake_bin}:{os.environ["PATH"]}',
         'DOCKER_CALLS': str(docker_calls),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
     }
 
     result = subprocess.run(  # noqa: S603 - fixed repository watchdog
@@ -354,6 +377,14 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
                 '--name',
                 'teplo_entitlement_shadow',
                 '--restart=no',
+                '--label',
+                'teplo.role=entitlement-shadow-readonly',
+                '--label',
+                f'teplo.workflow_sha={"a" * 40}',
+                '--label',
+                f'teplo.workflow_run_id={run_id}',
+                '--label',
+                f'teplo.workflow_run_attempt={run_attempt}',
                 image,
             ],
             check=True,

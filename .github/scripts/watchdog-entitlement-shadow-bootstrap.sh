@@ -37,6 +37,11 @@ lease_value() {
   sed -n "s/^${key}=//p" "$LEASE_FILE"
 }
 
+sidecar_label() {
+  key="$1"
+  docker inspect --format "{{index .Config.Labels \"${key}\"}}" "$SIDECAR" 2>/dev/null || true
+}
+
 if [ -r "$LEASE_FILE" ] && \
   [ "$(lease_value format_version || true)" = '2' ] && \
   [ "$(lease_value phase || true)" = 'completed' ] && \
@@ -44,7 +49,12 @@ if [ -r "$LEASE_FILE" ] && \
   [ "$(lease_value workflow_run_id || true)" = "$RUN_ID" ] && \
   [ "$(lease_value workflow_run_attempt || true)" = "$RUN_ATTEMPT" ] && \
   [[ "$(lease_value expires_epoch || true)" =~ ^[0-9]+$ ]] && \
-  [ "$(lease_value expires_epoch)" -gt "$(date +%s)" ]; then
+  [ "$(lease_value expires_epoch)" -gt "$(date +%s)" ] && \
+  [ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR" 2>/dev/null || true)" = 'true' ] && \
+  [ "$(sidecar_label teplo.role)" = 'entitlement-shadow-readonly' ] && \
+  [ "$(sidecar_label teplo.workflow_sha)" = "$(lease_value workflow_sha)" ] && \
+  [ "$(sidecar_label teplo.workflow_run_id)" = "$RUN_ID" ] && \
+  [ "$(sidecar_label teplo.workflow_run_attempt)" = "$RUN_ATTEMPT" ]; then
   rm -f -- "$SECRET_ENV_FILE"
   audit_tmp="$(mktemp "$STATE_DIR/bot-production.entitlement-shadow-watchdog.XXXXXX")"
   cp "$LEASE_FILE" "$audit_tmp"

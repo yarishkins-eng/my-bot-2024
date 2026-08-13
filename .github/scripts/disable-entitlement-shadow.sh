@@ -23,6 +23,7 @@ readonly LEASE_FILE="$RUNTIME_DIR/lease.state"
 readonly AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.state"
 readonly RUN_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.audit"
 readonly LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"
+readonly DISABLE_UNIT="teplo-entitlement-shadow-disable-${RUN_ID}-${RUN_ATTEMPT}"
 
 [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'invalid_workflow_sha'
 [[ "$RUN_ID" =~ ^[0-9]+$ ]] || fail 'invalid_run_id'
@@ -54,12 +55,19 @@ flock -w 30 9 || fail 'control_busy'
 
 old_run_id="$(lease_value workflow_run_id || true)"
 old_run_attempt="$(lease_value workflow_run_attempt || true)"
+docker_path="$(command -v docker || true)"
+case "$docker_path" in
+  /usr/bin/docker|/usr/local/bin/docker) ;;
+  *) fail 'docker_path_not_allowlisted' ;;
+esac
+systemctl stop "${DISABLE_UNIT}.timer" "${DISABLE_UNIT}.service" >/dev/null 2>&1 || true
+systemd-run --quiet --unit="$DISABLE_UNIT" --on-active=60s --property=Type=oneshot \
+  "$docker_path" rm --force "$SIDECAR"
 # Removing the lease is deliberately the first state change. A hard-killed
 # disable therefore still makes the sidecar terminate itself.
 rm -f -- "$LEASE_FILE"
 if [[ "$old_run_id" =~ ^[0-9]+$ ]] && [[ "$old_run_attempt" =~ ^[0-9]+$ ]]; then
   old_unit="teplo-entitlement-shadow-watchdog-${old_run_id}-${old_run_attempt}"
-  systemctl stop "${old_unit}.timer" "${old_unit}.service" >/dev/null 2>&1 || true
   rm -f -- "$STATE_DIR/entitlement-shadow-secrets-${old_run_id}-${old_run_attempt}.env"
 fi
 
@@ -69,6 +77,10 @@ if docker inspect "$SIDECAR" >/dev/null 2>&1; then
 fi
 if docker inspect "$SIDECAR" >/dev/null 2>&1; then
   fail 'sidecar_still_present'
+fi
+systemctl stop "${DISABLE_UNIT}.timer" "${DISABLE_UNIT}.service" >/dev/null 2>&1 || true
+if [[ "$old_run_id" =~ ^[0-9]+$ ]] && [[ "$old_run_attempt" =~ ^[0-9]+$ ]]; then
+  systemctl stop "${old_unit}.timer" "${old_unit}.service" >/dev/null 2>&1 || true
 fi
 
 if [ -r "$RUN_AUDIT_FILE" ]; then

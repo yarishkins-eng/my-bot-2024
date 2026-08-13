@@ -100,6 +100,11 @@ verify_fixed_environment() {
     exact_env REMNAWAVE_API_CONNECT_TIMEOUT 4 &&
     exact_env REMNAWAVE_API_TOTAL_TIMEOUT 4 &&
     exact_env BOT_TOKEN 123456789:shadow-sidecar-does-not-use-telegram &&
+    exact_env ADMIN_NOTIFICATIONS_ENABLED false &&
+    exact_env REMNAWAVE_WEBHOOK_ENABLED false &&
+    exact_env REMNAWAVE_AUTO_SYNC_ENABLED false &&
+    exact_env ACCESS_POINT_INVENTORY_DRY_RUN_ENABLED false &&
+    exact_env ACCESS_POINT_INVENTORY_CATALOG_APPLY_ENABLED false &&
     exact_env ENTITLEMENT_AUTHORITY_SHADOW_COHORT_BASIS_POINTS 1000 &&
     exact_env ENTITLEMENT_AUTHORITY_SHADOW_MAX_IDENTITIES_PER_CYCLE 18 &&
     exact_env ENTITLEMENT_AUTHORITY_SHADOW_SCHEDULE_SECONDS 900 &&
@@ -273,6 +278,11 @@ docker create \
   --env REMNAWAVE_API_CONNECT_TIMEOUT=4 \
   --env REMNAWAVE_API_TOTAL_TIMEOUT=4 \
   --env BOT_TOKEN=123456789:shadow-sidecar-does-not-use-telegram \
+  --env ADMIN_NOTIFICATIONS_ENABLED=false \
+  --env REMNAWAVE_WEBHOOK_ENABLED=false \
+  --env REMNAWAVE_AUTO_SYNC_ENABLED=false \
+  --env ACCESS_POINT_INVENTORY_DRY_RUN_ENABLED=false \
+  --env ACCESS_POINT_INVENTORY_CATALOG_APPLY_ENABLED=false \
   --env ENTITLEMENT_AUTHORITY_CHECKOUT_ADMISSION_ENABLED=false \
   --env ENTITLEMENT_AUTHORITY_PROJECTOR_ENABLED=false \
   --env ENTITLEMENT_AUTHORITY_READY_NOTIFICATIONS_ENABLED=false \
@@ -316,6 +326,8 @@ docker create \
   --label teplo.role=entitlement-shadow-readonly \
   --label "teplo.workflow_sha=$WORKFLOW_SHA" \
   --label "teplo.deployed_sha=$deployed_sha" \
+  --label "teplo.workflow_run_id=$RUN_ID" \
+  --label "teplo.workflow_run_attempt=$RUN_ATTEMPT" \
   "$CURRENT_IMAGE_ID" python /app/shadow-sidecar-entrypoint.py >/dev/null
 rm -f -- "$SIDECAR_ENV_FILE"
 SIDECAR_ENV_FILE=''
