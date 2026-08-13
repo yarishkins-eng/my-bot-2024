@@ -1,0 +1,1002 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import os
+import uuid
+from collections.abc import Mapping
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from app.services.entitlement_authority.coordinator import ProjectionCoordinator
+from app.services.entitlement_authority.persistence import (
+    PostgresEntitlementStore,
+    append_source_and_command,
+    ingest_webhook_observation,
+    lock_entitlement_context,
+)
+from app.services.entitlement_authority.privacy import request_erasure_cleanup
+from app.services.entitlement_authority.state_machine import Stage
+from app.services.entitlement_authority.strict_panel import StrictPanelClient, panel_owner_username
+from app.services.entitlement_authority.types import EntitlementSnapshot, compare_snapshots
+
+
+DATABASE_URL = os.environ.get('ENTITLEMENT_AUTHORITY_APP_DATABASE_URL')
+if DATABASE_URL is None:
+    pytest.skip('isolated entitlement authority PostgreSQL is not configured', allow_module_level=True)
+NOW = datetime(2026, 8, 13, 0, 0, tzinfo=UTC)
+SECRET = 'test-only-existing-application-secret'
+
+
+def desired(
+    *, generation: int = 1, panel_uuid: str | None = 'panel-existing', **changes: object
+) -> EntitlementSnapshot:
+    values: dict[str, object] = {
+        'owner_key': 'owner-fingerprint',
+        'panel_uuid': panel_uuid,
+        'status': 'ACTIVE',
+        'expire_at': NOW + timedelta(days=30),
+        'traffic_limit_bytes': 0,
+        'traffic_limit_strategy': 'NO_RESET',
+        'hwid_device_limit': None,
+        'internal_squads': (),
+        'external_squad_uuid': None,
+        'provenance': 'paid_sale',
+        'generation': generation,
+    }
+    values.update(changes)
+    return EntitlementSnapshot(**values)  # type: ignore[arg-type]
+
+
+def raw(snapshot: EntitlementSnapshot) -> dict[str, Any]:
+    return {
+        'username': panel_owner_username(snapshot.owner_key),
+        'uuid': snapshot.panel_uuid,
+        'status': snapshot.status,
+        'expireAt': snapshot.expire_at.isoformat().replace('+00:00', 'Z'),
+        'trafficLimitBytes': snapshot.traffic_limit_bytes,
+        'trafficLimitStrategy': snapshot.traffic_limit_strategy,
+        'hwidDeviceLimit': snapshot.hwid_device_limit,
+        'activeInternalSquads': list(snapshot.internal_squads),
+        'externalSquadUuid': snapshot.external_squad_uuid,
+    }
+
+
+class FakePanelTransport:
+    def __init__(self) -> None:
+        self.states: dict[str, dict[str, Any]] = {}
+        self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.patch_mode = 'apply'
+        self.create_mode = 'apply'
+        self.get_timeout = False
+        self.lookup_override: list[dict[str, Any]] | None = None
+        self.patch_received = asyncio.Event()
+        self.patch_release = asyncio.Event()
+        self.patch_release.set()
+        self._created = 0
+
+    def _apply_patch(self, payload: Mapping[str, Any]) -> None:
+        panel_uuid = str(payload['uuid'])
+        state = self.states[panel_uuid]
+        state.update(
+            {
+                'uuid': panel_uuid,
+                'status': payload['status'],
+                'expireAt': payload['expireAt'],
+                'trafficLimitBytes': payload['trafficLimitBytes'],
+                'trafficLimitStrategy': payload['trafficLimitStrategy'],
+                'hwidDeviceLimit': payload['hwidDeviceLimit'],
+                'activeInternalSquads': list(payload['activeInternalSquads']),
+                'externalSquadUuid': payload['externalSquadUuid'],
+            }
+        )
+
+    async def request_once(
+        self,
+        method: str,
+        endpoint: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        copied = dict(payload) if payload is not None else None
+        self.calls.append((method, endpoint, copied))
+        if method == 'GET' and '/by-username/' in endpoint:
+            if self.get_timeout:
+                raise TimeoutError('fake read timeout')
+            candidates = self.lookup_override
+            if candidates is None:
+                username = endpoint.rsplit('/', 1)[-1]
+                candidates = [state for state in self.states.values() if state.get('username') == username]
+            return {'response': candidates}
+        if method == 'GET':
+            if self.get_timeout:
+                raise TimeoutError('fake read timeout')
+            return {'response': self.states.get(endpoint.rsplit('/', 1)[-1])}
+        if method == 'POST':
+            assert endpoint == '/api/users'
+            assert payload is not None and payload['status'] == 'DISABLED'
+            self._created += 1
+            panel_uuid = f'panel-created-{self._created}'
+            state = {
+                'uuid': panel_uuid,
+                'username': payload['username'],
+                **{key: value for key, value in payload.items() if key != 'username'},
+            }
+            if self.create_mode in {'apply', 'apply_lost'}:
+                self.states[panel_uuid] = state
+            if self.create_mode == 'apply_lost':
+                raise ConnectionError('response lost after apply')
+            if self.create_mode == 'lost_without_apply':
+                raise ConnectionError('request outcome unknown')
+            return {'response': {'uuid': panel_uuid}}
+        if method == 'PATCH':
+            assert payload is not None
+            self.patch_received.set()
+            await self.patch_release.wait()
+            if self.patch_mode in {'apply', 'apply_lost'}:
+                self._apply_patch(payload)
+            if self.patch_mode == 'apply_lost':
+                raise ConnectionError('response lost after apply')
+            return {'response': self.states[str(payload['uuid'])]}
+        raise AssertionError((method, endpoint))
+
+    def count(self, method: str) -> int:
+        return sum(call_method == method for call_method, _endpoint, _payload in self.calls)
+
+
+@pytest_asyncio.fixture
+async def sessions() -> async_sessionmaker[AsyncSession]:
+    engine = create_async_engine(DATABASE_URL, pool_size=10, max_overflow=0)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    yield factory
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_foundation(sessions: async_sessionmaker[AsyncSession]):
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text(
+                """
+                TRUNCATE entitlement_cleanup_tombstones, entitlement_cleanup_commands,
+                         entitlement_notification_intents, entitlement_webhook_inbox,
+                         entitlement_observations, entitlement_projection_commands,
+                         entitlement_overlays, entitlement_source_revisions,
+                         entitlement_identities RESTART IDENTITY CASCADE
+                """
+            )
+        )
+
+
+async def make_command(
+    sessions: async_sessionmaker[AsyncSession],
+    snapshot: EntitlementSnapshot,
+    *,
+    source_key: str = 'source-one',
+) -> tuple[int, int, PostgresEntitlementStore]:
+    async with sessions() as session, session.begin():
+        identity_id = (
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO entitlement_identities
+                           (operation_id, deterministic_owner_key, panel_uuid, generation, lifecycle_state)
+                    VALUES (:operation_id, :owner_key, :panel_uuid, 0, 'dormant')
+                    RETURNING id
+                    """
+                ),
+                {
+                    'operation_id': str(uuid.uuid4()),
+                    'owner_key': snapshot.owner_key,
+                    'panel_uuid': snapshot.panel_uuid,
+                },
+            )
+        ).scalar_one()
+        _source_id, command_id = await append_source_and_command(
+            session,
+            identity_id=identity_id,
+            source_type='test',
+            source_key=source_key,
+            source_fingerprint=hashlib.sha256(source_key.encode()).hexdigest(),
+            snapshot=snapshot,
+        )
+    return identity_id, command_id, PostgresEntitlementStore(sessions)
+
+
+async def command_state(sessions: async_sessionmaker[AsyncSession], command_id: int) -> dict[str, Any]:
+    async with sessions() as session:
+        return dict(
+            (
+                await session.execute(
+                    text(
+                        """
+                        SELECT c.*, i.lifecycle_state, i.generation AS identity_generation,
+                               i.verified_generation, i.panel_uuid
+                          FROM entitlement_projection_commands c
+                          JOIN entitlement_identities i ON i.id=c.identity_id
+                         WHERE c.id=:id
+                        """
+                    ),
+                    {'id': command_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+
+def coordinator(store: PostgresEntitlementStore, fake: FakePanelTransport, failpoint=None) -> ProjectionCoordinator:
+    return ProjectionCoordinator(
+        store,
+        StrictPanelClient(fake),
+        fingerprint_secret=SECRET,
+        failpoint=failpoint,
+    )
+
+
+@pytest.mark.asyncio
+async def test_existing_binding_stale_fields_never_ready_before_exact(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired()
+    _identity, command_id, store = await make_command(sessions, target)
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(replace(target, status='DISABLED', traffic_limit_bytes=99))
+    fake.patch_mode = 'ack_without_apply'
+    result = await coordinator(store, fake).project_command(command_id, target, worker='worker-one', now=NOW)
+    state = await command_state(sessions, command_id)
+    assert result == 'quarantined'
+    assert state['stage'] == 'quarantined'
+    assert state['verified_generation'] is None
+    assert fake.count('POST') == 0 and fake.count('PATCH') == 1
+
+
+@pytest.mark.asyncio
+async def test_get_timeout_is_fail_closed_and_never_creates(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired()
+    _identity, command_id, store = await make_command(sessions, target)
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(target)
+    fake.get_timeout = True
+    assert (
+        await coordinator(store, fake).project_command(command_id, target, worker='worker-one', now=NOW)
+        == 'quarantined'
+    )
+    state = await command_state(sessions, command_id)
+    assert state['verified_generation'] is None
+    assert fake.count('POST') == 0
+
+
+@pytest.mark.asyncio
+async def test_patch_applied_lost_then_takeover_observes_only_never_creates(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired()
+    _identity, command_id, store = await make_command(sessions, target)
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(replace(target, status='DISABLED'))
+    fake.patch_mode = 'apply_lost'
+    assert (
+        await coordinator(store, fake).project_command(command_id, target, worker='worker-one', now=NOW)
+        == 'quarantined'
+    )
+    first_patch_count = fake.count('PATCH')
+    fake.patch_mode = 'apply'
+    assert (
+        await coordinator(store, fake).project_command(
+            command_id, target, worker='worker-two', now=NOW + timedelta(seconds=31)
+        )
+        == 'quarantined'
+    )
+    assert fake.count('PATCH') == first_patch_count == 1
+    assert fake.count('POST') == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('create_mode', ['apply_lost', 'lost_without_apply'])
+async def test_create_unknown_has_at_most_one_disabled_candidate_and_no_blind_second_post(
+    sessions: async_sessionmaker[AsyncSession],
+    create_mode: str,
+) -> None:
+    target = desired(panel_uuid=None)
+    _identity, command_id, store = await make_command(sessions, target)
+    fake = FakePanelTransport()
+    fake.create_mode = create_mode
+    assert (
+        await coordinator(store, fake).project_command(command_id, target, worker='worker-one', now=NOW)
+        == 'quarantined'
+    )
+    assert fake.count('POST') == 1
+    assert len(fake.states) <= 1
+    if fake.states:
+        assert next(iter(fake.states.values()))['status'] == 'DISABLED'
+    await coordinator(store, fake).project_command(
+        command_id, target, worker='worker-two', now=NOW + timedelta(seconds=31)
+    )
+    assert fake.count('POST') == 1
+
+
+class SimulatedProcessKill(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'barrier',
+    [
+        'after_intent',
+        'after_create_send_fence',
+        'after_create_post',
+        'after_uuid_bind',
+        'after_active_patch',
+        'after_canonical_get',
+        'before_final_commit',
+    ],
+)
+async def test_create_kill_barriers_never_duplicate_or_false_ready(
+    sessions: async_sessionmaker[AsyncSession],
+    barrier: str,
+) -> None:
+    target = desired(panel_uuid=None)
+    _identity, command_id, store = await make_command(sessions, target)
+    fake = FakePanelTransport()
+    fired = False
+
+    async def failpoint(name: str) -> None:
+        nonlocal fired
+        if name == barrier and not fired:
+            fired = True
+            raise SimulatedProcessKill(name)
+
+    with pytest.raises(SimulatedProcessKill):
+        await coordinator(store, fake, failpoint).project_command(command_id, target, worker='worker-one', now=NOW)
+    before = fake.count('POST')
+    result = await coordinator(store, fake).project_command(
+        command_id,
+        target,
+        worker='worker-two',
+        now=NOW + timedelta(seconds=31),
+    )
+    state = await command_state(sessions, command_id)
+    assert fake.count('POST') <= 1
+    if barrier == 'after_intent':
+        assert before == 0 and result == 'ready'
+        assert state['verified_generation'] == 1
+    else:
+        assert result == 'quarantined'
+        assert state['verified_generation'] is None
+
+
+@pytest.mark.asyncio
+async def test_late_generation_n_blocks_n_plus_one_and_never_becomes_ready(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    first = desired()
+    identity_id, command_one, store = await make_command(sessions, first, source_key='generation-one')
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(replace(first, status='DISABLED'))
+    fake.patch_release.clear()
+    task = asyncio.create_task(
+        coordinator(store, fake).project_command(command_one, first, worker='worker-one', now=NOW)
+    )
+    await asyncio.wait_for(fake.patch_received.wait(), timeout=2)
+    second = replace(first, generation=2, expire_at=first.expire_at + timedelta(days=30))
+    async with sessions() as session, session.begin():
+        _source_two, command_two = await append_source_and_command(
+            session,
+            identity_id=identity_id,
+            source_type='test',
+            source_key='generation-two',
+            source_fingerprint='2' * 64,
+            snapshot=second,
+        )
+    assert (
+        await coordinator(store, fake).project_command(command_two, second, worker='worker-two', now=NOW)
+        == 'quarantined'
+    )
+    assert fake.count('PATCH') == 1
+    fake.patch_release.set()
+    assert await task == 'quarantined'
+    one = await command_state(sessions, command_one)
+    two = await command_state(sessions, command_two)
+    assert one['stage'] == 'cancelled'
+    assert two['verified_generation'] is None
+    assert fake.count('PATCH') == 1
+
+
+@pytest.mark.asyncio
+async def test_reclaiming_stale_sent_n_keeps_fence_and_blocks_n_plus_one(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    first = desired()
+    identity_id, command_one, store = await make_command(sessions, first, source_key='stale-sent-one')
+    claim = await store.claim_entitlement_command(command_one, worker='worker-one', now=NOW)
+    await store.mark_mutation_sent(claim, stage=Stage.MUTATING, now=NOW)
+    second = replace(first, generation=2, expire_at=first.expire_at + timedelta(days=30))
+    async with sessions() as session, session.begin():
+        _source_two, command_two = await append_source_and_command(
+            session,
+            identity_id=identity_id,
+            source_type='test',
+            source_key='stale-sent-two',
+            source_fingerprint='7' * 64,
+            snapshot=second,
+        )
+
+    reclaimed = await store.claim_entitlement_command(
+        command_one,
+        worker='worker-reclaim',
+        now=NOW + timedelta(seconds=31),
+    )
+    assert reclaimed.mode == 'observe'
+    assert (await command_state(sessions, command_one))['stage'] != 'cancelled'
+
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(replace(first, status='DISABLED'))
+    assert (
+        await coordinator(store, fake).project_command(
+            command_two,
+            second,
+            worker='worker-two',
+            now=NOW + timedelta(seconds=32),
+        )
+        == 'quarantined'
+    )
+    assert fake.count('PATCH') == 0
+    fake.states['panel-existing'] = raw(first)  # late server-side N applies
+    assert (
+        await coordinator(store, fake).project_command(
+            command_two,
+            second,
+            worker='worker-three',
+            now=NOW + timedelta(seconds=64),
+        )
+        == 'quarantined'
+    )
+    assert fake.count('PATCH') == 0
+    assert (await command_state(sessions, command_two))['verified_generation'] is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cross_identity_uuid_bind_quarantines_both(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    first = desired(panel_uuid=None, owner_key='owner-one')
+    second = desired(panel_uuid=None, owner_key='owner-two')
+    identity_one, command_one, store = await make_command(sessions, first, source_key='bind-one')
+    identity_two, command_two, _ = await make_command(sessions, second, source_key='bind-two')
+    claim_one = await store.claim_entitlement_command(command_one, worker='one', now=NOW)
+    claim_two = await store.claim_entitlement_command(command_two, worker='two', now=NOW)
+    await store.mark_mutation_sent(claim_one, stage=Stage.CREATING_DISABLED, now=NOW)
+    await store.mark_mutation_sent(claim_two, stage=Stage.CREATING_DISABLED, now=NOW)
+
+    outcomes = await asyncio.gather(
+        store.bind_uuid(
+            claim_one,
+            'shared-panel-uuid',
+            panel_uuid_hmac='1' * 64,
+            bound_desired_hash=first.bind('shared-panel-uuid').desired_hash,
+            now=NOW,
+        ),
+        store.bind_uuid(
+            claim_two,
+            'shared-panel-uuid',
+            panel_uuid_hmac='1' * 64,
+            bound_desired_hash=second.bind('shared-panel-uuid').desired_hash,
+            now=NOW,
+        ),
+    )
+    assert sorted(outcomes) == [False, True]
+    async with sessions() as session:
+        rows = (
+            await session.execute(
+                text(
+                    'SELECT id, panel_uuid, lifecycle_state FROM entitlement_identities '
+                    'WHERE id IN (:one, :two) ORDER BY id'
+                ),
+                {'one': identity_one, 'two': identity_two},
+            )
+        ).all()
+    assert sum(row.panel_uuid == 'shared-panel-uuid' for row in rows) == 1
+    assert {row.lifecycle_state for row in rows} == {'quarantined'}
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_while_old_worker_alive_allows_observation_only(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired()
+    _identity, command_id, store = await make_command(sessions, target)
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(replace(target, status='DISABLED'))
+    fake.patch_release.clear()
+    old = asyncio.create_task(coordinator(store, fake).project_command(command_id, target, worker='old', now=NOW))
+    await asyncio.wait_for(fake.patch_received.wait(), timeout=2)
+    assert (
+        await coordinator(store, fake).project_command(
+            command_id,
+            target,
+            worker='takeover',
+            now=NOW + timedelta(seconds=31),
+        )
+        == 'quarantined'
+    )
+    assert fake.count('PATCH') == 1
+    fake.patch_release.set()
+    with pytest.raises(RuntimeError, match='verify_fence_lost'):
+        await old
+    assert (await command_state(sessions, command_id))['verified_generation'] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('barrier_source', 'status'),
+    [
+        ('reset', 'DISABLED'),
+        ('delete', 'DISABLED'),
+        ('channel_deny', 'DISABLED'),
+        ('limited', 'LIMITED'),
+        ('erasure', 'DISABLED'),
+        ('traffic_addon', 'ACTIVE'),
+        ('device_addon', 'ACTIVE'),
+        ('expiry', 'EXPIRED'),
+    ],
+)
+async def test_new_generation_barriers_cancel_stale_finalize(
+    sessions: async_sessionmaker[AsyncSession],
+    barrier_source: str,
+    status: str,
+) -> None:
+    first = desired()
+    identity_id, command_one, store = await make_command(sessions, first, source_key='first')
+    claim = await store.claim_entitlement_command(command_one, worker='old', now=NOW)
+    await store.mark_mutation_sent(claim, stage=Stage.MUTATING, now=NOW)
+    await store.mark_verifying(claim, now=NOW)
+    second = replace(first, generation=2, status=status, expire_at=first.expire_at + timedelta(days=1))
+    async with sessions() as session, session.begin():
+        await append_source_and_command(
+            session,
+            identity_id=identity_id,
+            source_type=barrier_source,
+            source_key=f'{barrier_source}-two',
+            source_fingerprint='b' * 64,
+            snapshot=second,
+        )
+    assert not await store.finalize_entitlement_command(claim, compare_snapshots(first, first), now=NOW)
+    assert (await command_state(sessions, command_one))['stage'] == 'cancelled'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('barrier_source', 'status'),
+    [
+        ('reset', 'DISABLED'),
+        ('delete', 'DISABLED'),
+        ('channel_deny', 'DISABLED'),
+        ('limited', 'LIMITED'),
+    ],
+)
+@pytest.mark.parametrize(
+    'barrier',
+    ['after_intent', 'after_patch_send_fence', 'after_active_patch', 'after_canonical_get', 'before_final_commit'],
+)
+async def test_deny_generation_at_every_remote_barrier_never_allows_stale_ready(
+    sessions: async_sessionmaker[AsyncSession],
+    barrier_source: str,
+    status: str,
+    barrier: str,
+) -> None:
+    first = desired()
+    identity_id, command_one, store = await make_command(sessions, first, source_key='barrier-first')
+    second = replace(first, generation=2, status=status, expire_at=first.expire_at + timedelta(days=1))
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(replace(first, status='DISABLED'))
+    injected = False
+
+    async def inject(name: str) -> None:
+        nonlocal injected
+        if name != barrier or injected:
+            return
+        injected = True
+        async with sessions() as session, session.begin():
+            await append_source_and_command(
+                session,
+                identity_id=identity_id,
+                source_type=barrier_source,
+                source_key=f'{barrier_source}-{barrier}',
+                source_fingerprint=hashlib.sha256(f'{barrier_source}:{barrier}'.encode()).hexdigest(),
+                snapshot=second,
+            )
+
+    first_result = await coordinator(store, fake, inject).project_command(
+        command_one,
+        first,
+        worker='generation-one',
+        now=NOW,
+    )
+    first_state = await command_state(sessions, command_one)
+    assert first_result in {'cancelled', 'quarantined'}
+    assert first_state['verified_generation'] is None
+    if barrier == 'after_intent':
+        assert fake.count('PATCH') == 0
+    async with sessions() as session:
+        command_two = (
+            await session.execute(
+                text('SELECT id FROM entitlement_projection_commands WHERE identity_id=:identity_id AND generation=2'),
+                {'identity_id': identity_id},
+            )
+        ).scalar_one()
+    assert (
+        await coordinator(store, fake).project_command(
+            command_two,
+            second,
+            worker='generation-two',
+            now=NOW + timedelta(seconds=31),
+        )
+        == 'ready'
+    )
+    assert (await command_state(sessions, command_two))['verified_generation'] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'barrier',
+    ['after_intent', 'after_patch_send_fence', 'after_active_patch', 'after_canonical_get', 'before_final_commit'],
+)
+async def test_erasure_at_every_remote_barrier_severs_pii_and_never_allows_stale_ready(
+    sessions: async_sessionmaker[AsyncSession],
+    barrier: str,
+) -> None:
+    first = desired()
+    identity_id, command_id, store = await make_command(sessions, first, source_key='erasure-barrier-first')
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(replace(first, status='DISABLED'))
+    operation_id: str | None = None
+
+    async def erase(name: str) -> None:
+        nonlocal operation_id
+        if name != barrier or operation_id is not None:
+            return
+        async with sessions() as session, session.begin():
+            operation_id = await request_erasure_cleanup(
+                session,
+                identity_id=identity_id,
+                secret=SECRET,
+                now=NOW + timedelta(seconds=1),
+            )
+
+    try:
+        result = await coordinator(store, fake, erase).project_command(
+            command_id,
+            first,
+            worker='generation-one',
+            now=NOW,
+        )
+        assert result in {'cancelled', 'quarantined'}
+    except RuntimeError as exc:
+        assert str(exc) == 'verify_fence_lost'
+    assert operation_id is not None
+    async with sessions() as session:
+        identity = (
+            await session.execute(
+                text(
+                    'SELECT user_id, panel_uuid, generation, verified_generation, lifecycle_state '
+                    'FROM entitlement_identities WHERE id=:identity_id'
+                ),
+                {'identity_id': identity_id},
+            )
+        ).one()
+        cleanup = (
+            await session.execute(
+                text(
+                    'SELECT remote_outcome_unknown, encrypted_panel_uuid '
+                    'FROM entitlement_cleanup_commands WHERE operation_id=:operation_id'
+                ),
+                {'operation_id': operation_id},
+            )
+        ).one()
+        assert identity.user_id is None and identity.panel_uuid is None
+        assert identity.generation == 2 and identity.verified_generation is None
+        assert identity.lifecycle_state == 'erasure_requested'
+        assert cleanup.encrypted_panel_uuid is not None
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_source_revisions'))).scalar_one() == 0
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_observations'))).scalar_one() == 0
+    if barrier in {'after_patch_send_fence', 'after_active_patch'}:
+        assert cleanup.remote_outcome_unknown
+    else:
+        assert not cleanup.remote_outcome_unknown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('candidates', ['multiple', 'foreign'])
+async def test_shared_or_cross_owner_deterministic_candidate_quarantines(
+    sessions: async_sessionmaker[AsyncSession],
+    candidates: str,
+) -> None:
+    target = desired(panel_uuid=None)
+    _identity, command_id, store = await make_command(sessions, target)
+    fake = FakePanelTransport()
+    fake.create_mode = 'lost_without_apply'
+    await coordinator(store, fake).project_command(command_id, target, worker='one', now=NOW)
+    candidate = raw(target.bind('foreign'))
+    if candidates == 'foreign':
+        candidate['username'] = 'different-owner'
+        fake.lookup_override = [candidate]
+    else:
+        fake.lookup_override = [candidate, {**candidate, 'uuid': 'foreign-two'}]
+    await coordinator(store, fake).project_command(
+        command_id,
+        target,
+        worker='two',
+        now=NOW + timedelta(seconds=31),
+    )
+    assert fake.count('POST') == 1 and fake.count('PATCH') == 0
+    assert (await command_state(sessions, command_id))['verified_generation'] is None
+
+
+@pytest.mark.asyncio
+async def test_owner_mismatch_sentinel_collision_cannot_become_ready(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired(owner_key='owner-mismatch')
+    _identity_id, command_id, store = await make_command(
+        sessions,
+        target,
+        source_key='owner-sentinel-collision',
+    )
+    fake = FakePanelTransport()
+    fake.states['panel-existing'] = raw(replace(target, status='DISABLED'))
+    fake.patch_mode = 'ack_without_apply'
+    fake.states['panel-existing']['username'] = panel_owner_username('different-owner')
+    assert await coordinator(store, fake).project_command(command_id, target, worker='worker', now=NOW) == 'quarantined'
+    state = await command_state(sessions, command_id)
+    assert state['verified_generation'] is None
+    assert state['last_error_code'] == 'canonical_contract_invalid'
+
+
+@pytest.mark.asyncio
+async def test_duplicate_reordered_webhooks_do_not_change_desired_source(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired()
+    identity_id, _command_id, _store = await make_command(sessions, target)
+    async with sessions() as session, session.begin():
+        assert await ingest_webhook_observation(
+            session,
+            identity_id=identity_id,
+            event_id_hash='a' * 64,
+            event_type='user.modified',
+            normalized_hash='b' * 64,
+            event_timestamp=NOW + timedelta(minutes=2),
+            now=NOW + timedelta(minutes=3),
+        )
+        assert not await ingest_webhook_observation(
+            session,
+            identity_id=identity_id,
+            event_id_hash='a' * 64,
+            event_type='user.modified',
+            normalized_hash='b' * 64,
+            event_timestamp=NOW + timedelta(minutes=2),
+            now=NOW + timedelta(minutes=4),
+        )
+        assert await ingest_webhook_observation(
+            session,
+            identity_id=identity_id,
+            event_id_hash='c' * 64,
+            event_type='user.modified',
+            normalized_hash='d' * 64,
+            event_timestamp=NOW,
+            now=NOW + timedelta(minutes=5),
+        )
+    async with sessions() as session:
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_webhook_inbox'))).scalar_one() == 2
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_source_revisions'))).scalar_one() == 1
+        stored_hash = (
+            await session.execute(text('SELECT desired_hash FROM entitlement_source_revisions'))
+        ).scalar_one()
+        assert stored_hash == target.desired_hash
+
+
+@pytest.mark.asyncio
+async def test_duplicate_provider_callback_is_one_source_and_stale_notification_is_cancelled(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    first = desired()
+    identity_id, command_one, store = await make_command(sessions, first, source_key='provider-one')
+    claim = await store.claim_entitlement_command(command_one, worker='one', now=NOW)
+    await store.mark_mutation_sent(claim, stage=Stage.MUTATING, now=NOW)
+    await store.mark_verifying(claim, now=NOW)
+    assert await store.finalize_entitlement_command(claim, compare_snapshots(first, first), now=NOW)
+    second = replace(first, generation=2, expire_at=first.expire_at + timedelta(days=30))
+    async with sessions() as session, session.begin():
+        first_ids = await append_source_and_command(
+            session,
+            identity_id=identity_id,
+            source_type='provider_callback',
+            source_key='provider-two',
+            source_fingerprint='e' * 64,
+            snapshot=second,
+        )
+    async with sessions() as session, session.begin():
+        duplicate_ids = await append_source_and_command(
+            session,
+            identity_id=identity_id,
+            source_type='provider_callback',
+            source_key='provider-two',
+            source_fingerprint='e' * 64,
+            snapshot=second,
+        )
+    assert first_ids == duplicate_ids
+    async with sessions() as session:
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_source_revisions'))).scalar_one() == 2
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_projection_commands'))).scalar_one() == 2
+        old_state = (
+            await session.execute(
+                text('SELECT state FROM entitlement_notification_intents WHERE identity_id=:id AND generation=1'),
+                {'id': identity_id},
+            )
+        ).scalar_one()
+        assert old_state == 'cancelled'
+
+
+@pytest.mark.asyncio
+async def test_duplicate_source_key_with_changed_evidence_fails_closed(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired()
+    identity_id, _command_id, _store = await make_command(sessions, target, source_key='provider-conflict')
+    with pytest.raises(ValueError, match='source_provenance_conflict'):
+        async with sessions() as session, session.begin():
+            await append_source_and_command(
+                session,
+                identity_id=identity_id,
+                source_type='test',
+                source_key='provider-conflict',
+                source_fingerprint='changed-fingerprint',
+                snapshot=target,
+            )
+    async with sessions() as session:
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_source_revisions'))).scalar_one() == 1
+        assert (await session.execute(text('SELECT generation FROM entitlement_identities'))).scalar_one() == 1
+
+
+@pytest.mark.asyncio
+async def test_financial_transaction_rollback_leaves_zero_source_and_command(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired()
+    async with sessions() as session, session.begin():
+        identity_id = (
+            await session.execute(
+                text(
+                    'INSERT INTO entitlement_identities(operation_id, deterministic_owner_key) VALUES (:op, :owner) RETURNING id'
+                ),
+                {'op': str(uuid.uuid4()), 'owner': target.owner_key},
+            )
+        ).scalar_one()
+    async with sessions() as session:
+        transaction = await session.begin()
+        await append_source_and_command(
+            session,
+            identity_id=identity_id,
+            source_type='financial',
+            source_key='rolled-back',
+            source_fingerprint='f' * 64,
+            snapshot=target,
+        )
+        await transaction.rollback()
+    async with sessions() as session:
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_source_revisions'))).scalar_one() == 0
+        assert (await session.execute(text('SELECT count(*) FROM entitlement_projection_commands'))).scalar_one() == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_lock_order_has_no_deadlock_and_preserves_ap_term(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    grant_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    inventory_fingerprint = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    async with sessions() as session, session.begin():
+        user_id = (
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO users
+                           (auth_type, has_had_paid_subscription, email_verified,
+                            auto_promo_group_assigned, auto_promo_group_threshold_kopeks,
+                            promo_offer_discount_percent, has_made_first_topup,
+                            restriction_topup, restriction_subscription, partner_status)
+                    VALUES ('test', false, false, false, 0, 0, false, false, false, 'none')
+                    RETURNING id
+                    """
+                )
+            )
+        ).scalar_one()
+        subscription_id = (
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO subscriptions(user_id, end_date, is_daily_paused, remnawave_short_id)
+                    VALUES (:user_id, :end_date, false, :short_id) RETURNING id
+                    """
+                ),
+                {
+                    'user_id': user_id,
+                    'end_date': NOW + timedelta(days=30),
+                    'short_id': uuid.uuid4().hex[:16],
+                },
+            )
+        ).scalar_one()
+        identity_id = (
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO entitlement_identities(operation_id, user_id, deterministic_owner_key)
+                    VALUES (:op, :user_id, :owner) RETURNING id
+                    """
+                ),
+                {'op': str(uuid.uuid4()), 'user_id': user_id, 'owner': f'owner-{user_id}'},
+            )
+        ).scalar_one()
+        term_id = (
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO subscription_entitlement_terms
+                           (subscription_id, term_version, starts_at, ends_at, access_point_ids,
+                            technical_squad_keys, policy_revision, inventory_fingerprint,
+                            provenance, grant_hash)
+                    VALUES (:subscription_id, 1, :starts_at, :ends_at, '[]', '[]', 1,
+                            :fingerprint, 'synthetic_ap', :grant_hash)
+                    RETURNING id
+                    """
+                ),
+                {
+                    'subscription_id': subscription_id,
+                    'starts_at': NOW,
+                    'ends_at': NOW + timedelta(days=30),
+                    'fingerprint': inventory_fingerprint,
+                    'grant_hash': grant_hash,
+                },
+            )
+        ).scalar_one()
+
+    first_locked = asyncio.Event()
+
+    async def workflow(delay: float) -> None:
+        async with sessions() as session, session.begin():
+            await lock_entitlement_context(
+                session,
+                payment_attempt_id=None,
+                user_id=user_id,
+                subscription_id=subscription_id,
+                identity_id=identity_id,
+            )
+            first_locked.set()
+            await asyncio.sleep(delay)
+
+    one = asyncio.create_task(workflow(0.15))
+    await asyncio.wait_for(first_locked.wait(), timeout=2)
+    two = asyncio.create_task(workflow(0))
+    await asyncio.wait_for(asyncio.gather(one, two), timeout=3)
+    async with sessions() as session:
+        term = (
+            await session.execute(
+                text('SELECT provenance, grant_hash FROM subscription_entitlement_terms WHERE id=:id'),
+                {'id': term_id},
+            )
+        ).one()
+        assert term == ('synthetic_ap', grant_hash)
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text('DELETE FROM subscription_entitlement_terms WHERE id=:id'),
+            {'id': term_id},
+        )
+        await session.execute(text('DELETE FROM users WHERE id=:id'), {'id': user_id})
