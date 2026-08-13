@@ -193,6 +193,26 @@ def test_ordinary_deploy_routes_control_plane_changes_to_protected_infrastructur
     assert 'Deploy bot infrastructure to production' in source
 
 
+def test_protected_infrastructure_allowlists_only_reviewed_shadow_control_plane() -> None:
+    source = (ROOT / '.github/workflows/deploy-infrastructure.yml').read_text()
+    for path in (
+        '.github/scripts/control-entitlement-shadow.sh',
+        '.github/scripts/disable-entitlement-shadow.sh',
+        '.github/scripts/run-entitlement-shadow-sidecar.py',
+        '.github/scripts/verify-entitlement-shadow-baseline.py',
+        '.github/scripts/watchdog-entitlement-shadow-bootstrap.sh',
+        '.github/workflows/control-entitlement-shadow.yml',
+        '.github/workflows/deploy-infrastructure.yml',
+        '.github/workflows/deploy-migration.yml',
+        '.github/workflows/deploy.yml',
+        '.github/workflows/lint.yml',
+        '.github/workflows/recover-after-migration.yml',
+    ):
+        assert path in source
+    assert 'paths outside the reviewed allowlist' in source
+    assert 'database or migration-risk changes require the migration workflow' in source
+
+
 def test_sidecar_receives_only_minimal_secret_names() -> None:
     source = ENABLE.read_text()
     extractor = source.split('build_sidecar_env_file() {', 1)[1].split('\n}', 1)[0]
@@ -268,6 +288,10 @@ def _write_fake_watchdog_docker(fake_bin: Path, container_id: str) -> None:
         r"""#!/usr/bin/env bash
 if [ "$1" = info ]; then exit 0; fi
 if [ "$1" = inspect ]; then
+  if [ -e "${FAIL_INSPECT_ONCE_FILE:-/nonexistent}" ]; then
+    rm -f "$FAIL_INSPECT_ONCE_FILE"
+    exit 125
+  fi
   [ -e "$CONTAINER_PRESENT" ] || exit 1
   target="${@: -1}"
   if [ "$target" != teplo_entitlement_shadow ] && [ "$target" != "$FAKE_CONTAINER_ID" ]; then exit 1; fi
@@ -285,6 +309,10 @@ if [ "$1" = inspect ]; then
       if [ -n "${EXPECTED_ENV_FILE:-}" ] && [ -r "$EXPECTED_ENV_FILE" ]; then cat "$EXPECTED_ENV_FILE"; fi ;;
     *) : ;;
   esac
+  exit 0
+fi
+if [ "$1" = container ] && [ "$2" = ls ]; then
+  [ -e "$CONTAINER_PRESENT" ] && printf '%s\n' "$FAKE_CONTAINER_ID"
   exit 0
 fi
 if [ "$1" = rm ]; then rm -f "$CONTAINER_PRESENT"; printf '%s\n' "$*" >> "$DOCKER_CALLS"; exit 0; fi
@@ -901,6 +929,98 @@ def test_disable_helper_retries_when_timer_fires_before_tombstone_commit(tmp_pat
     assert not container_present.exists()
     assert 'action=DISABLE_SHADOW\n' in keyed.read_text()
     assert latest.read_text() == keyed.read_text()
+
+
+def test_disable_helper_never_audits_transient_inspect_as_absent(tmp_path: Path) -> None:
+    run_id, run_attempt = '730', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    patched_disable = tmp_path / 'disable.sh'
+    patched_disable.write_text(
+        DISABLE.read_text()
+        .replace('/var/lib/teplo-vpn/deploy-state', str(state))
+        .replace('/var/lib/teplo-vpn/entitlement-shadow-runtime', str(runtime))
+    )
+    patched_disable.chmod(0o755)
+    container_id = '4' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
+    }
+
+    installed = subprocess.run(  # noqa: S603 - installs generated helper under test
+        [
+            str(patched_disable),
+            'e' * 40,
+            run_id,
+            run_attempt,
+            'owner',
+            'gate2-test',
+            str(state),
+            str(runtime),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    helper = state / f'entitlement-shadow-disable-{"e" * 40}-{run_id}-{run_attempt}.sh'
+    tombstone = runtime / 'disable.state'
+    keyed = state / f'bot-production.entitlement-shadow-control.{run_id}.{run_attempt}.audit'
+    latest = state / 'bot-production.entitlement-shadow-control.state'
+    keyed.unlink()
+    latest.unlink()
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    container_present.touch()
+    tombstone.write_text(
+        'format_version=1\n'
+        f'workflow_sha={"e" * 40}\n'
+        f'workflow_run_id={run_id}\n'
+        f'workflow_run_attempt={run_attempt}\n'
+        'approval_actor=owner\n'
+        'release_card_reference=gate2-test\n'
+    )
+    fail_once = tmp_path / 'fail-inspect-once'
+    fail_once.touch()
+    environment['FAIL_INSPECT_ONCE_FILE'] = str(fail_once)
+
+    transient = subprocess.run(  # noqa: S603 - generated immutable helper under test
+        [
+            str(helper),
+            str(lease),
+            str(tombstone),
+            'teplo_entitlement_shadow',
+            'pending',
+            run_id,
+            run_attempt,
+            run_id,
+            run_attempt,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert transient.returncode != 0
+    assert container_present.exists()
+    assert tombstone.exists()
+    assert not keyed.exists()
+    assert not latest.exists()
 
 
 def _docker_path() -> str | None:

@@ -15,6 +15,7 @@ CLASSIFIER = ROOT / '.github/scripts/classify-migration-recovery.sh'
 DEPLOY_WORKFLOW = ROOT / '.github/workflows/deploy-migration.yml'
 RECOVERY_WORKFLOW = ROOT / '.github/workflows/recover-after-migration.yml'
 ORDINARY_DEPLOY_WORKFLOW = ROOT / '.github/workflows/deploy.yml'
+INFRASTRUCTURE_DEPLOY_WORKFLOW = ROOT / '.github/workflows/deploy-infrastructure.yml'
 
 TARGET_SHA = 'a' * 40
 ROLLBACK_SHA = 'b' * 40
@@ -171,6 +172,24 @@ def _extract_deploy_shell(repo_dir: Path, state_dir: Path) -> str:
 def _extract_ordinary_deploy_shell(repo_dir: Path, state_dir: Path) -> str:
     workflow = ORDINARY_DEPLOY_WORKFLOW.read_text()
     step = workflow.index('- name: Deploy the exact non-migration revision and wait for health')
+    marker = workflow.index('          script: |\n', step)
+    script = textwrap.dedent(workflow[marker + len('          script: |\n') :])
+    return (
+        script.replace(
+            "readonly REPO_DIR='/opt/remnawave-bedolaga-telegram-bot'",
+            f"readonly REPO_DIR='{repo_dir}'",
+        )
+        .replace(
+            "readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'",
+            f"readonly STATE_DIR='{state_dir}'",
+        )
+        .replace("readonly TARGET_SHA='${{ github.sha }}'", f"readonly TARGET_SHA='{PRIOR_TARGET_SHA}'")
+    )
+
+
+def _extract_infrastructure_deploy_shell(repo_dir: Path, state_dir: Path) -> str:
+    workflow = INFRASTRUCTURE_DEPLOY_WORKFLOW.read_text()
+    step = workflow.index('- name: Deploy the exact controlled infrastructure revision and wait for health')
     marker = workflow.index('          script: |\n', step)
     script = textwrap.dedent(workflow[marker + len('          script: |\n') :])
     return (
@@ -589,6 +608,111 @@ fi
     )
     if release_thread is not None:
         release_thread.join(timeout=5)
+    return result, {'state': state, 'fake': fake}
+
+
+def _infrastructure_control_plane_integration(
+    tmp_path: Path,
+    *,
+    unexpected_github_path: bool = False,
+    migration_risk_changed: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
+    repo = tmp_path / 'repo'
+    state = tmp_path / 'state'
+    fake_bin = tmp_path / 'bin'
+    fake = tmp_path / 'fake'
+    for directory in (repo, state, fake_bin, fake):
+        directory.mkdir()
+    (state / 'bot-production.state').write_text(f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n')
+    (fake / 'source').write_text(ROLLBACK_SHA)
+
+    _write_executable(
+        fake_bin / 'git',
+        r"""#!/usr/bin/env bash
+set -eu
+case "$1" in
+  status|fetch) exit 0 ;;
+  rev-parse)
+    if [ "$2" = HEAD ]; then cat "$FAKE_STATE/source"; else printf '%s\n' "$INFRA_TARGET_SHA"; fi
+    ;;
+  merge-base) exit 0 ;;
+  diff)
+    if [ "$2" = --quiet ] || [ "$4" = --quiet ]; then
+      case " $* " in
+        *' Dockerfile .dockerignore docker-compose.yml '*) exit 0 ;;
+        *' migrations alembic.ini app/database main.py app/config.py '*) [ "$MIGRATION_RISK_CHANGED" != 1 ]; exit ;;
+        *'.github/scripts/control-entitlement-shadow.sh'*) exit 1 ;;
+        *) exit 0 ;;
+      esac
+    fi
+    if [ "$2" = --name-only ] || [ "$4" = --name-only ]; then
+      if [ "$UNEXPECTED_GITHUB_PATH" = 1 ]; then
+        printf '.github/workflows/unreviewed.yml\n'
+      else
+        printf '.github/scripts/control-entitlement-shadow.sh\n'
+        printf '.github/workflows/deploy-infrastructure.yml\n'
+      fi
+      exit 0
+    fi
+    exit 98
+    ;;
+  checkout) printf '%s\n' "$3" > "$FAKE_STATE/source" ;;
+  archive) /usr/bin/tar -cf - -T /dev/null ;;
+  *) printf 'unexpected fake infrastructure git call: %s\n' "$*" >&2; exit 98 ;;
+esac
+""",
+    )
+    _write_fake_flock(fake_bin / 'flock')
+    _write_executable(
+        fake_bin / 'docker',
+        r"""#!/usr/bin/env bash
+set -eu
+if [ "$1" = info ]; then
+  exit 0
+elif [ "$1" = inspect ] && [ "${@: -1}" = teplo_entitlement_shadow ]; then
+  exit 1
+elif [ "$1" = inspect ]; then
+  case "$3" in
+    *'.Image'*) cat "$FAKE_STATE/image" ;;
+    *'.Config.Image'*) printf 'teplo-bot:production\n' ;;
+    *) exit 96 ;;
+  esac
+elif [ "$1" = compose ]; then
+  case " $* " in
+    *' build bot '*) printf 'build\n' >> "$FAKE_STATE/mutations" ;;
+    *' up -d --wait '* ) printf 'up\n' >> "$FAKE_STATE/mutations"; printf '%s\n' "$MIGRATION_IMAGE" > "$FAKE_STATE/image" ;;
+    *' ps bot '*) printf 'bot healthy\n' ;;
+    *) exit 97 ;;
+  esac
+else
+  exit 95
+fi
+""",
+    )
+    _write_executable(
+        fake_bin / 'df',
+        "#!/usr/bin/env bash\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted\\n/dev/fake 9999999 1 9999998 1%% /\\n'\n",
+    )
+    _write_executable(fake_bin / 'find', '#!/usr/bin/env bash\nexit 0\n')
+    (fake / 'image').write_text(ROLLBACK_IMAGE)
+    shell = tmp_path / 'deploy-infrastructure.sh'
+    _write_executable(shell, _extract_infrastructure_deploy_shell(repo, state))
+    env = {
+        'PATH': f'{fake_bin}:/usr/bin:/bin',
+        'FAKE_STATE': str(fake),
+        'INFRA_TARGET_SHA': PRIOR_TARGET_SHA,
+        'MIGRATION_IMAGE': MIGRATION_IMAGE,
+        'UNEXPECTED_GITHUB_PATH': '1' if unexpected_github_path else '0',
+        'MIGRATION_RISK_CHANGED': '1' if migration_risk_changed else '0',
+    }
+    result = subprocess.run(  # noqa: S603 - extracted exact production workflow shell
+        ['/bin/bash', str(shell)],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     return result, {'state': state, 'fake': fake}
 
 
@@ -1036,6 +1160,36 @@ def test_ordinary_deploy_stops_control_plane_change_before_first_mutation(
 
     assert result.returncode == 16
     assert 'production control-plane change is present' in result.stderr
+    assert not paths['fake'].joinpath('mutations').exists()
+
+
+def test_protected_infrastructure_deploy_accepts_allowlisted_control_plane_only(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert paths['fake'].joinpath('mutations').read_text() == 'build\nup\n'
+    assert f'sha={PRIOR_TARGET_SHA}\n' in paths['state'].joinpath('bot-production.state').read_text()
+
+
+def test_protected_infrastructure_deploy_rejects_unreviewed_github_path(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(tmp_path, unexpected_github_path=True)
+
+    assert result.returncode == 37
+    assert 'paths outside the reviewed allowlist' in result.stderr
+    assert not paths['fake'].joinpath('mutations').exists()
+
+
+def test_protected_infrastructure_deploy_rejects_mixed_migration_risk(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(tmp_path, migration_risk_changed=True)
+
+    assert result.returncode == 36
+    assert 'database or migration-risk changes require the migration workflow' in result.stderr
     assert not paths['fake'].joinpath('mutations').exists()
 
 

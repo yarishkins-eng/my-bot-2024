@@ -80,7 +80,8 @@ install_helper() {
     'rm -f -- "$lease"' \
     'docker info >/dev/null 2>&1 || exit 1' \
     'target="$sidecar"; [ "$expected_id" = pending ] || target="$expected_id"' \
-    'actual="$(docker inspect --format "{{.Id}}" "$target" 2>/dev/null || true)"' \
+    'inspect_tmp="$(mktemp)"; if docker inspect --format "{{.Id}}" "$target" >"$inspect_tmp" 2>/dev/null; then actual="$(cat "$inspect_tmp")"; inspect_rc=0; else inspect_rc=$?; actual=""; fi; rm -f -- "$inspect_tmp"' \
+    '[ "$inspect_rc" = 0 ] || [ "$inspect_rc" = 1 ] || exit 1' \
     'if [ -n "$actual" ]; then' \
     '  [ "$expected_id" = pending ] || [ "$actual" = "$expected_id" ] || exit 0' \
     '  role="$(docker inspect --format "{{index .Config.Labels \"teplo.role\"}}" "$actual" 2>/dev/null || true)"' \
@@ -89,7 +90,8 @@ install_helper() {
     '  docker rm --force "$actual" >/dev/null 2>&1 || exit 1' \
     'fi' \
     'docker info >/dev/null 2>&1 || exit 1' \
-    '! docker inspect "$actual" >/dev/null 2>&1 || exit 1' \
+    'remaining="$(docker container ls -a --no-trunc --filter "name=^/${sidecar}$" --format "{{.ID}}")" || exit 1' \
+    '[ -z "$remaining" ] || exit 1' \
     'keyed="$state/bot-production.entitlement-shadow-control.${disable_run}.${disable_attempt}.audit"' \
     'latest="$state/bot-production.entitlement-shadow-control.state"' \
     'if [ -e "$keyed" ]; then' \

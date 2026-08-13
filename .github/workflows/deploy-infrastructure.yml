@@ -173,9 +173,32 @@ jobs:
               exit 34
             fi
 
-            if git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- Dockerfile .dockerignore docker-compose.yml; then
-              echo 'Refusing controlled deploy: no Docker or Compose change was found.' >&2
+            infrastructure_paths_changed=0
+            control_plane_paths_changed=0
+            git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- Dockerfile .dockerignore docker-compose.yml || infrastructure_paths_changed=1
+            git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- \
+              .github/scripts/control-entitlement-shadow.sh \
+              .github/scripts/disable-entitlement-shadow.sh \
+              .github/scripts/run-entitlement-shadow-sidecar.py \
+              .github/scripts/verify-entitlement-shadow-baseline.py \
+              .github/scripts/watchdog-entitlement-shadow-bootstrap.sh \
+              .github/workflows/control-entitlement-shadow.yml \
+              .github/workflows/deploy-infrastructure.yml \
+              .github/workflows/deploy-migration.yml \
+              .github/workflows/deploy.yml \
+              .github/workflows/lint.yml \
+              .github/workflows/recover-after-migration.yml || control_plane_paths_changed=1
+            if [ "$infrastructure_paths_changed" = '0' ] && [ "$control_plane_paths_changed" = '0' ]; then
+              echo 'Refusing controlled deploy: no allowlisted infrastructure or control-plane change was found.' >&2
               exit 35
+            fi
+
+            unexpected_control_plane_paths="$(
+              git diff --name-only "$PREVIOUS_SHA" "$TARGET_SHA" -- .github | grep -Ev '^\.github/(scripts/(control-entitlement-shadow\.sh|disable-entitlement-shadow\.sh|run-entitlement-shadow-sidecar\.py|verify-entitlement-shadow-baseline\.py|watchdog-entitlement-shadow-bootstrap\.sh)|workflows/(control-entitlement-shadow\.yml|deploy-infrastructure\.yml|deploy-migration\.yml|deploy\.yml|lint\.yml|recover-after-migration\.yml))$' || true
+            )"
+            if [ -n "$unexpected_control_plane_paths" ]; then
+              echo 'Refusing controlled deploy: the .github diff contains paths outside the reviewed allowlist.' >&2
+              exit 37
             fi
 
             if ! git diff --quiet "$PREVIOUS_SHA" "$TARGET_SHA" -- migrations alembic.ini app/database main.py app/config.py; then
