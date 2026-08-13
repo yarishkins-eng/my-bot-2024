@@ -40,8 +40,13 @@ jobs:
             readonly MIN_FREE_KB=2097152
             readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'
             readonly STATE_FILE="$STATE_DIR/bot-production.state"
+            readonly RECOVERY_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
             BUILD_DIR=''
             BUILD_OVERRIDE=''
+            VERIFIED_DEPLOY_MODE=''
+            VERIFIED_DEPLOY_IMAGE=''
+            VERIFIED_DEPLOY_SCHEMA=''
+            VERIFIED_RECOVERY_FROM_SHA=''
 
             cd "$REPO_DIR"
 
@@ -71,13 +76,178 @@ jobs:
                 '      dockerfile: Dockerfile' > "$BUILD_OVERRIDE"
             }
 
+            state_value() {
+              key="$1"
+              file="$2"
+              count="$(grep -Ec "^${key}=[^[:space:]]+$" "$file" || true)"
+              if [ "$count" != '1' ]; then
+                echo "Refusing deploy: missing or duplicate state key ${key}." >&2
+                return 1
+              fi
+              sed -n "s/^${key}=//p" "$file"
+            }
+
+            read_schema_revisions() {
+              docker compose -f docker-compose.yml exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT version_num FROM alembic_version ORDER BY version_num"' | sort | paste -sd, -
+            }
+
             verify_deployed_state() {
-              test -r "$STATE_FILE"
-              stored_sha="$(sed -n 's/^sha=//p' "$STATE_FILE")"
-              stored_image="$(sed -n 's/^image=//p' "$STATE_FILE")"
-              current_image="$(docker inspect --format '{{.Image}}' remnawave_bot)"
-              test "$stored_sha" = "$TARGET_SHA"
-              test "$stored_image" = "$current_image"
+              expected_sha="$1"
+              test -r "$STATE_FILE" || return 1
+              mode_count="$(grep -Ec '^mode=[^[:space:]]+$' "$STATE_FILE" || true)"
+              if [ "$mode_count" = '0' ]; then
+                if grep -Ev '^(sha|image)=[^[:space:]]+$' "$STATE_FILE" >/dev/null; then
+                  echo 'Refusing deploy: malformed normal deploy state.' >&2
+                  return 1
+                fi
+                VERIFIED_DEPLOY_MODE='normal'
+                VERIFIED_DEPLOY_SCHEMA="$(read_schema_revisions)" || return 1
+                [[ "$VERIFIED_DEPLOY_SCHEMA" =~ ^[0-9a-z]+(,[0-9a-z]+)*$ ]] || return 1
+              elif [ "$mode_count" = '1' ]; then
+                if grep -Ev '^(sha|image|mode|schema_revisions|recovery_from_sha)=[^[:space:]]+$' "$STATE_FILE" >/dev/null; then
+                  echo 'Refusing deploy: malformed recovery deploy state.' >&2
+                  return 1
+                fi
+                if [ "$(state_value mode "$STATE_FILE")" != 'recovery' ]; then
+                  echo 'Refusing deploy: unknown deploy-state mode.' >&2
+                  return 1
+                fi
+                stored_schema="$(state_value schema_revisions "$STATE_FILE")" || return 1
+                recovery_from_sha="$(state_value recovery_from_sha "$STATE_FILE")" || return 1
+                if ! [[ "$stored_schema" =~ ^[0-9a-z]+(,[0-9a-z]+)*$ ]]; then
+                  echo 'Refusing deploy: invalid recovered schema revision.' >&2
+                  return 1
+                fi
+                if ! [[ "$recovery_from_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo 'Refusing deploy: invalid recovery source SHA.' >&2
+                  return 1
+                fi
+                if [ "$stored_schema" != "$(read_schema_revisions)" ]; then
+                  echo 'Refusing deploy: recovered state disagrees with live schema.' >&2
+                  return 1
+                fi
+                git cat-file -e "${recovery_from_sha}^{commit}" || return 1
+                git merge-base --is-ancestor "$expected_sha" "$recovery_from_sha" || return 1
+                git merge-base --is-ancestor "$recovery_from_sha" "$TARGET_SHA" || return 1
+                VERIFIED_DEPLOY_MODE='recovery'
+                VERIFIED_DEPLOY_SCHEMA="$stored_schema"
+                VERIFIED_RECOVERY_FROM_SHA="$recovery_from_sha"
+              else
+                echo 'Refusing deploy: duplicate deploy-state mode.' >&2
+                return 1
+              fi
+              stored_sha="$(state_value sha "$STATE_FILE")" || return 1
+              stored_image="$(state_value image "$STATE_FILE")" || return 1
+              current_image="$(docker inspect --format '{{.Image}}' remnawave_bot)" || return 1
+              test "$stored_sha" = "$expected_sha" || return 1
+              [[ "$stored_image" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+              test "$stored_image" = "$current_image" || return 1
+              test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" = 'healthy' || return 1
+              VERIFIED_DEPLOY_IMAGE="$stored_image"
+            }
+
+            verify_no_unresolved_migration() {
+              if [ ! -e "$RECOVERY_STATE_FILE" ]; then
+                if [ "$VERIFIED_DEPLOY_MODE" = 'recovery' ]; then
+                  echo 'Refusing deploy: recovered deploy state has no migration journal.' >&2
+                  return 1
+                fi
+                return
+              fi
+              test -r "$RECOVERY_STATE_FILE" || return 1
+              format_version="$(state_value format_version "$RECOVERY_STATE_FILE")" || return 1
+              case "$format_version" in
+                1)
+                  allowed_recovery_keys='^(format_version|phase|deployed_sha|rollback_source_sha|rollback_image_tag|rollback_image_id|migration_image_id|previous_schema_revisions|target_schema_revisions)=[^[:space:]]+$'
+                  ;;
+                2)
+                  allowed_recovery_keys='^(format_version|phase|deployed_sha|rollback_source_sha|rollback_image_tag|rollback_image_id|migration_image_id|previous_schema_revisions|target_schema_revisions|old_image_target_schema_compatible)=[^[:space:]]+$'
+                  ;;
+                *)
+                  echo 'Refusing deploy: unsupported migration journal version.' >&2
+                  return 1
+                  ;;
+              esac
+              if grep -Ev "$allowed_recovery_keys" "$RECOVERY_STATE_FILE" >/dev/null; then
+                echo 'Refusing deploy: malformed migration journal.' >&2
+                return 1
+              fi
+              recovery_phase="$(state_value phase "$RECOVERY_STATE_FILE")" || return 1
+              recovery_deployed_sha="$(state_value deployed_sha "$RECOVERY_STATE_FILE")" || return 1
+              recovery_source_sha="$(state_value rollback_source_sha "$RECOVERY_STATE_FILE")" || return 1
+              recovery_image_tag="$(state_value rollback_image_tag "$RECOVERY_STATE_FILE")" || return 1
+              recovery_image_id="$(state_value rollback_image_id "$RECOVERY_STATE_FILE")" || return 1
+              migration_image_id="$(state_value migration_image_id "$RECOVERY_STATE_FILE")" || return 1
+              previous_revisions="$(state_value previous_schema_revisions "$RECOVERY_STATE_FILE")" || return 1
+              target_revisions="$(state_value target_schema_revisions "$RECOVERY_STATE_FILE")" || return 1
+              [[ "$recovery_deployed_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+              [[ "$recovery_source_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+              [[ "$recovery_image_tag" =~ ^teplo-vpn-rollback/bot:pre-migration-[0-9a-f]{40}$ ]] || return 1
+              test "$recovery_image_tag" = "teplo-vpn-rollback/bot:pre-migration-${recovery_deployed_sha}" || return 1
+              [[ "$recovery_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+              [[ "$migration_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+              [[ "$previous_revisions" =~ ^[0-9a-z]+(,[0-9a-z]+)*$ ]] || return 1
+              [[ "$target_revisions" =~ ^[0-9a-z]+(,[0-9a-z]+)*$ ]] || return 1
+              if [ "$format_version" = '2' ]; then
+                old_image_compatible="$(state_value old_image_target_schema_compatible "$RECOVERY_STATE_FILE")" || return 1
+                [ "$old_image_compatible" = '0' ] || [ "$old_image_compatible" = '1' ] || return 1
+              fi
+              [ "$recovery_phase" = 'prepared' ] || [ "$recovery_phase" = 'completed' ] || [ "$recovery_phase" = 'recovered' ] || return 1
+              if [ "$recovery_phase" = 'recovered' ] && [ "$format_version" != '2' ]; then
+                return 1
+              fi
+              git cat-file -e "${recovery_source_sha}^{commit}" || return 1
+              git cat-file -e "${recovery_deployed_sha}^{commit}" || return 1
+              git merge-base --is-ancestor "$recovery_source_sha" "$recovery_deployed_sha" || return 1
+
+              if [ "$recovery_phase" = 'prepared' ]; then
+                echo 'Refusing deploy: a prepared migration journal requires protected recovery or completion.' >&2
+                return 1
+              fi
+
+              if [ "$recovery_phase" = 'recovered' ]; then
+                recovery_audit_file="$STATE_DIR/bot-production.migration-recovery.${recovery_deployed_sha}.audit"
+                test -r "$recovery_audit_file" || return 1
+                if grep -Ev '^(recovered_at|source_sha|image|schema_revisions|from_migration_sha)=[^[:space:]]+$' "$recovery_audit_file" >/dev/null; then
+                  echo 'Refusing deploy: malformed recovery audit.' >&2
+                  return 1
+                fi
+                recovered_at="$(state_value recovered_at "$recovery_audit_file")" || return 1
+                audit_source_sha="$(state_value source_sha "$recovery_audit_file")" || return 1
+                audit_image="$(state_value image "$recovery_audit_file")" || return 1
+                audit_schema="$(state_value schema_revisions "$recovery_audit_file")" || return 1
+                audit_from_sha="$(state_value from_migration_sha "$recovery_audit_file")" || return 1
+                test -n "$recovered_at" || return 1
+                test "$audit_source_sha" = "$recovery_source_sha" || return 1
+                test "$audit_image" = "$recovery_image_id" || return 1
+                test "$audit_schema" = "$VERIFIED_DEPLOY_SCHEMA" || return 1
+                test "$audit_from_sha" = "$recovery_deployed_sha" || return 1
+                test "$audit_schema" = "$previous_revisions" -o "$audit_schema" = "$target_revisions" || return 1
+                if [ "$audit_schema" = "$target_revisions" ] && [ "$old_image_compatible" != '1' ]; then
+                  echo 'Refusing deploy: recovered old image lacks target-schema compatibility approval.' >&2
+                  return 1
+                fi
+                test "$VERIFIED_DEPLOY_MODE" = 'recovery' || return 1
+                test "$recovery_deployed_sha" = "$VERIFIED_RECOVERY_FROM_SHA" || return 1
+                test "$recovery_source_sha" = "$PREVIOUS_SHA" || return 1
+                test "$recovery_image_id" = "$VERIFIED_DEPLOY_IMAGE" || return 1
+                git merge-base --is-ancestor "$PREVIOUS_SHA" "$TARGET_SHA" || return 1
+                return
+              fi
+
+              # A normal live state can follow a completed migration.
+              # The journal target must be in the current source ancestry and
+              # its target schema must still be the live schema. This accepts
+              # the valid historical v1 production journal after later
+              # application-only deploys, while rejecting a contradictory
+              # synthetic `completed` marker.
+              test "$VERIFIED_DEPLOY_MODE" = 'normal' || return 1
+              test "$VERIFIED_DEPLOY_SCHEMA" = "$target_revisions" || return 1
+              git merge-base --is-ancestor "$recovery_deployed_sha" "$PREVIOUS_SHA" || return 1
+              git merge-base --is-ancestor "$PREVIOUS_SHA" "$TARGET_SHA" || return 1
+              if [ "$PREVIOUS_SHA" = "$recovery_deployed_sha" ]; then
+                test "$VERIFIED_DEPLOY_IMAGE" = "$migration_image_id" || return 1
+              fi
             }
 
             write_deployed_state() {
@@ -119,9 +289,15 @@ jobs:
 
             git cat-file -e "${TARGET_SHA}^{commit}"
 
+            # A normal deploy may begin only from the source/image recorded as
+            # the stable production state and with no unresolved migration.
+            # This closes the cross-workflow hard-kill window after a protected
+            # migration wrote `prepared` and checked out its target.
+            verify_deployed_state "$PREVIOUS_SHA"
+            verify_no_unresolved_migration
+
             if [ "$PREVIOUS_SHA" = "$TARGET_SHA" ]; then
               echo "Source already at $TARGET_SHA; requiring the container health gate again."
-              verify_deployed_state
               compose up -d --no-build --wait --wait-timeout 240 "$SERVICE"
               compose ps "$SERVICE"
               exit 0

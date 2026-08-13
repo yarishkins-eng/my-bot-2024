@@ -1,8 +1,8 @@
 name: Recover bot code after forward-only migration
 
-# This is an immediate-only, protected recovery path.  It is intentionally
-# unavailable after another main/source deployment: returning to the image that
-# preceded 0095 could otherwise erase a later code release.
+# This is an immediate-only, protected recovery path. It uses the durable
+# migration journal plus live schema/source/image evidence and remains
+# idempotent across interruption at every recovery step.
 on:
   workflow_dispatch:
     inputs:
@@ -75,7 +75,7 @@ jobs:
             readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'
             readonly STATE_FILE="$STATE_DIR/bot-production.state"
             readonly RECOVERY_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
-            readonly RECOVERY_AUDIT_FILE="$STATE_DIR/bot-production.migration-recovery.audit"
+            readonly RECOVERY_AUDIT_FILE="$STATE_DIR/bot-production.migration-recovery.${TARGET_SHA}.audit"
             RECOVERY_DIR=''
             RECOVERY_OVERRIDE=''
             CURRENT_SOURCE_SHA=''
@@ -83,6 +83,7 @@ jobs:
             CURRENT_SERVICE_IMAGE=''
             CURRENT_SCHEMA_REVISIONS=''
             RECOVERY_SWITCH_ATTEMPTED=0
+            RECOVERY_OLD_IMAGE_VERIFIED=0
 
             cd "$REPO_DIR"
 
@@ -97,30 +98,12 @@ jobs:
             state_value() {
               key="$1"
               file="$2"
-              test "$(grep -Ec "^${key}=[^[:space:]]+$" "$file")" = '1'
-              sed -n "s/^${key}=//p" "$file"
-            }
-
-            validate_recovery_state() {
-              file="$1"
-              test -r "$file"
-              if grep -Ev '^(format_version|phase|deployed_sha|rollback_source_sha|rollback_image_tag|rollback_image_id|migration_image_id|previous_schema_revisions|target_schema_revisions)=[^[:space:]]+$' "$file" >/dev/null; then
-                echo 'Refusing recovery: malformed or unknown recovery-state key.' >&2
+              count="$(grep -Ec "^${key}=[^[:space:]]+$" "$file" || true)"
+              if [ "$count" != '1' ]; then
+                echo "Refusing recovery: missing or duplicate state key ${key}." >&2
                 return 1
               fi
-              for key in format_version phase deployed_sha rollback_source_sha rollback_image_tag rollback_image_id migration_image_id previous_schema_revisions target_schema_revisions; do
-                state_value "$key" "$file" >/dev/null
-              done
-              test "$(state_value format_version "$file")" = '1'
-              phase="$(state_value phase "$file")"
-              test "$phase" = 'prepared' -o "$phase" = 'completed'
-              [[ "$(state_value deployed_sha "$file")" =~ ^[0-9a-f]{40}$ ]]
-              [[ "$(state_value rollback_source_sha "$file")" =~ ^[0-9a-f]{40}$ ]]
-              [[ "$(state_value rollback_image_tag "$file")" =~ ^teplo-vpn-rollback/bot:pre-migration-[0-9a-f]{40}$ ]]
-              [[ "$(state_value rollback_image_id "$file")" =~ ^sha256:[0-9a-f]{64}$ ]]
-              [[ "$(state_value migration_image_id "$file")" =~ ^sha256:[0-9a-f]{64}$ ]]
-              [[ "$(state_value previous_schema_revisions "$file")" =~ ^[0-9a-z]+(,[0-9a-z]+)*$ ]]
-              [[ "$(state_value target_schema_revisions "$file")" =~ ^[0-9a-z]+(,[0-9a-z]+)*$ ]]
+              sed -n "s/^${key}=//p" "$file"
             }
 
             read_schema_revisions() {
@@ -133,20 +116,34 @@ jobs:
               fi
             }
 
-            restore_current_service() {
+            handle_recovery_failure() {
               original_rc=$?
               trap - ERR
               set +e
+              if [ "$RECOVERY_OLD_IMAGE_VERIFIED" = '1' ]; then
+                echo 'Recovery was interrupted after the compatible old image became healthy; leaving the safe partial state for an idempotent retry.' >&2
+                cleanup_recovery_context
+                exit "$original_rc"
+              fi
               restored=1
               if [ "$RECOVERY_SWITCH_ATTEMPTED" = '1' ] && [ -n "$CURRENT_IMAGE_ID" ]; then
                 echo 'Recovery switch failed; restoring the captured current bot image.' >&2
                 docker image tag "$CURRENT_IMAGE_ID" "$CURRENT_SERVICE_IMAGE" || restored=0
-                RECOVERY_OVERRIDE=''
+                # A retry can begin while the captured current image is
+                # already the rollback image. Preserve SKIP_MIGRATION in that
+                # case; only the migration image may be restored without the
+                # recovery override.
+                if [ "$CURRENT_IMAGE_ID" != "$RECOVERY_IMAGE_ID" ]; then
+                  RECOVERY_OVERRIDE=''
+                fi
                 compose up -d --no-build --wait --wait-timeout 240 "$SERVICE" || restored=0
                 test "$(docker inspect --format '{{.Image}}' remnawave_bot 2>/dev/null)" = "$CURRENT_IMAGE_ID" || restored=0
                 test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot 2>/dev/null)" = 'healthy' || restored=0
                 restored_started_at="$(docker inspect --format '{{.State.StartedAt}}' remnawave_bot 2>/dev/null)" || restored=0
                 docker logs --since "$restored_started_at" remnawave_bot 2>&1 | grep -F 'Aiogram polling запущен' >/dev/null || restored=0
+                if [ "$CURRENT_IMAGE_ID" = "$RECOVERY_IMAGE_ID" ]; then
+                  docker logs --since "$restored_started_at" remnawave_bot 2>&1 | grep -F 'SKIP_MIGRATION=true' >/dev/null || restored=0
+                fi
                 test "$(read_schema_revisions)" = "$CURRENT_SCHEMA_REVISIONS" || restored=0
               fi
               git checkout --detach "$CURRENT_SOURCE_SHA" || restored=0
@@ -158,6 +155,49 @@ jobs:
               fi
               echo 'Recovery failed before completion; the previous service image was restored and verified.' >&2
               exit "$original_rc"
+            }
+
+            write_recovery_state() {
+              state_tmp="$(mktemp "$STATE_DIR/bot-production.XXXXXX")"
+              printf 'sha=%s\nimage=%s\nmode=recovery\nschema_revisions=%s\nrecovery_from_sha=%s\n' \
+                "$REQUESTED_ROLLBACK_SHA" "$RECOVERY_IMAGE_ID" "$CURRENT_SCHEMA_REVISIONS" "$TARGET_SHA" > "$state_tmp"
+              chmod 600 "$state_tmp"
+              mv "$state_tmp" "$STATE_FILE"
+            }
+
+            ensure_recovery_audit() {
+              if [ -e "$RECOVERY_AUDIT_FILE" ]; then
+                test -r "$RECOVERY_AUDIT_FILE"
+                if grep -Ev '^(recovered_at|source_sha|image|schema_revisions|from_migration_sha)=[^[:space:]]+$' "$RECOVERY_AUDIT_FILE" >/dev/null; then
+                  echo 'Refusing recovery: malformed recovery audit.' >&2
+                  return 1
+                fi
+                test "$(state_value source_sha "$RECOVERY_AUDIT_FILE")" = "$REQUESTED_ROLLBACK_SHA"
+                test "$(state_value image "$RECOVERY_AUDIT_FILE")" = "$RECOVERY_IMAGE_ID"
+                test "$(state_value schema_revisions "$RECOVERY_AUDIT_FILE")" = "$CURRENT_SCHEMA_REVISIONS"
+                test "$(state_value from_migration_sha "$RECOVERY_AUDIT_FILE")" = "$TARGET_SHA"
+                state_value recovered_at "$RECOVERY_AUDIT_FILE" >/dev/null
+                return
+              fi
+              audit_tmp="$(mktemp "$STATE_DIR/bot-production.migration-recovery.audit.XXXXXX")"
+              printf 'recovered_at=%s\nsource_sha=%s\nimage=%s\nschema_revisions=%s\nfrom_migration_sha=%s\n' \
+                "$(date --iso-8601=seconds)" "$REQUESTED_ROLLBACK_SHA" "$RECOVERY_IMAGE_ID" \
+                "$CURRENT_SCHEMA_REVISIONS" "$TARGET_SHA" > "$audit_tmp"
+              chmod 600 "$audit_tmp"
+              mv "$audit_tmp" "$RECOVERY_AUDIT_FILE"
+            }
+
+            mark_recovery_journal_recovered() {
+              current_phase="$(state_value phase "$RECOVERY_STATE_FILE")"
+              if [ "$current_phase" = 'recovered' ]; then
+                return
+              fi
+              [ "$current_phase" = 'prepared' ] || [ "$current_phase" = 'completed' ]
+              journal_tmp="$(mktemp "$STATE_DIR/bot-production.migration-recovery.XXXXXX")"
+              awk 'BEGIN { replaced = 0 } /^phase=/ { print "phase=recovered"; replaced += 1; next } { print } END { if (replaced != 1) exit 1 }' \
+                "$RECOVERY_STATE_FILE" > "$journal_tmp"
+              chmod 600 "$journal_tmp"
+              mv "$journal_tmp" "$RECOVERY_STATE_FILE"
             }
 
             trap 'cleanup_recovery_context' EXIT
@@ -175,26 +215,25 @@ jobs:
               exit 12
             fi
             [[ "$REQUESTED_ROLLBACK_SHA" =~ ^[0-9a-f]{40}$ ]]
-            validate_recovery_state "$RECOVERY_STATE_FILE"
 
             git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
             CURRENT_SOURCE_SHA="$(git rev-parse HEAD)"
             REMOTE_MAIN_SHA="$(git rev-parse origin/main)"
-            RECOVERY_PHASE="$(state_value phase "$RECOVERY_STATE_FILE")"
-            RECOVERY_DEPLOYED_SHA="$(state_value deployed_sha "$RECOVERY_STATE_FILE")"
-            RECOVERY_SOURCE_SHA="$(state_value rollback_source_sha "$RECOVERY_STATE_FILE")"
+            CURRENT_IMAGE_ID="$(docker inspect --format '{{.Image}}' remnawave_bot)"
+            CURRENT_SERVICE_IMAGE="$(docker inspect --format '{{.Config.Image}}' remnawave_bot)"
+            CURRENT_SCHEMA_REVISIONS="$(read_schema_revisions)"
+            test -n "$CURRENT_SCHEMA_REVISIONS"
+
+            RECOVERY_DECISION="$(.github/scripts/classify-migration-recovery.sh \
+              "$RECOVERY_STATE_FILE" "$STATE_FILE" "$TARGET_SHA" "$REQUESTED_ROLLBACK_SHA" \
+              "$REMOTE_MAIN_SHA" "$CURRENT_SOURCE_SHA" "$CURRENT_IMAGE_ID" "$CURRENT_SCHEMA_REVISIONS")"
+
             RECOVERY_IMAGE_TAG="$(state_value rollback_image_tag "$RECOVERY_STATE_FILE")"
             RECOVERY_IMAGE_ID="$(state_value rollback_image_id "$RECOVERY_STATE_FILE")"
             MIGRATION_IMAGE_ID="$(state_value migration_image_id "$RECOVERY_STATE_FILE")"
-            PREVIOUS_REVISIONS="$(state_value previous_schema_revisions "$RECOVERY_STATE_FILE")"
-            TARGET_REVISIONS="$(state_value target_schema_revisions "$RECOVERY_STATE_FILE")"
 
-            # Immediate-only: source, current main and the journal must all still
-            # point to this migration target.  Any later deploy fails closed.
-            test "$TARGET_SHA" = "$REMOTE_MAIN_SHA"
-            test "$TARGET_SHA" = "$CURRENT_SOURCE_SHA"
-            test "$TARGET_SHA" = "$RECOVERY_DEPLOYED_SHA"
-            test "$RECOVERY_SOURCE_SHA" = "$REQUESTED_ROLLBACK_SHA"
+            # The classifier has already bound current main, source, image,
+            # schema, deploy state and the v2 journal to one safe decision.
             git cat-file -e "${REQUESTED_ROLLBACK_SHA}^{commit}"
             git merge-base --is-ancestor "$REQUESTED_ROLLBACK_SHA" "$TARGET_SHA"
             if ! git diff --quiet "$REQUESTED_ROLLBACK_SHA" "$TARGET_SHA" -- Dockerfile .dockerignore docker-compose.yml; then
@@ -204,31 +243,25 @@ jobs:
             test "$(docker image inspect --format '{{.Id}}' "$RECOVERY_IMAGE_TAG")" = "$RECOVERY_IMAGE_ID"
             docker image inspect "$MIGRATION_IMAGE_ID" >/dev/null
 
-            CURRENT_IMAGE_ID="$(docker inspect --format '{{.Image}}' remnawave_bot)"
-            CURRENT_SERVICE_IMAGE="$(docker inspect --format '{{.Config.Image}}' remnawave_bot)"
-            CURRENT_SCHEMA_REVISIONS="$(read_schema_revisions)"
-            if [ "$RECOVERY_PHASE" = 'completed' ]; then
-              test -r "$STATE_FILE"
-              test "$(state_value sha "$STATE_FILE")" = "$TARGET_SHA"
-              test "$(state_value image "$STATE_FILE")" = "$MIGRATION_IMAGE_ID"
-              test "$CURRENT_IMAGE_ID" = "$MIGRATION_IMAGE_ID"
-              test "$(read_schema_revisions)" = "$TARGET_REVISIONS"
-            else
-              actual_revisions="$(read_schema_revisions)"
-              # Before `compose up` the captured old image may be stopped on
-              # the old schema.  Once 0100 commits, that image cannot issue
-              # immutable entitlement snapshots, so it must stay stopped: an
-              # additive schema never makes an old entitlement writer safe.
-              if [ "$actual_revisions" = "$TARGET_REVISIONS" ]; then
-                echo 'Refusing recovery: target schema is committed; old entitlement writer must remain stopped.' >&2
-                exit 14
+            if [ "$RECOVERY_DECISION" = 'already_recovered' ]; then
+              test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" = 'healthy'
+              started_at="$(docker inspect --format '{{.State.StartedAt}}' remnawave_bot)"
+              docker logs --since "$started_at" remnawave_bot 2>&1 | grep -F 'SKIP_MIGRATION=true' >/dev/null
+              docker logs --since "$started_at" remnawave_bot 2>&1 | grep -F 'Aiogram polling запущен' >/dev/null
+              test "$(read_schema_revisions)" = "$CURRENT_SCHEMA_REVISIONS"
+              if [ "$(state_value phase "$RECOVERY_STATE_FILE")" = 'recovered' ]; then
+                # `recovered` is written only after the keyed audit. Its
+                # absence therefore signals lost or contradictory durable
+                # state and must never be silently reconstructed.
+                test -r "$RECOVERY_AUDIT_FILE"
               fi
-              test "$actual_revisions" = "$PREVIOUS_REVISIONS"
-              if [ "$CURRENT_IMAGE_ID" != "$RECOVERY_IMAGE_ID" ] && [ "$CURRENT_IMAGE_ID" != "$MIGRATION_IMAGE_ID" ]; then
-                echo 'Refusing recovery: prepared state has an unknown running image.' >&2
-                exit 14
-              fi
+              ensure_recovery_audit
+              mark_recovery_journal_recovered
+              echo "Recovery already complete for source=$REQUESTED_ROLLBACK_SHA schema=$CURRENT_SCHEMA_REVISIONS"
+              exit 0
             fi
+
+            test "$RECOVERY_DECISION" = 'start_recovery' -o "$RECOVERY_DECISION" = 'continue_recovery'
 
             RECOVERY_DIR="$(mktemp -d /tmp/teplo-vpn-bot-recovery.XXXXXX)"
             RECOVERY_OVERRIDE="$RECOVERY_DIR/compose-recovery.yml"
@@ -238,9 +271,10 @@ jobs:
               '    environment:' \
               "      SKIP_MIGRATION: 'true'" > "$RECOVERY_OVERRIDE"
 
-            trap restore_current_service ERR
+            trap handle_recovery_failure ERR
             docker image tag "$RECOVERY_IMAGE_TAG" "$CURRENT_SERVICE_IMAGE"
             RECOVERY_SWITCH_ATTEMPTED=1
+            test "$(read_schema_revisions)" = "$CURRENT_SCHEMA_REVISIONS"
             compose up -d --no-build --wait --wait-timeout 240 "$SERVICE"
             compose ps "$SERVICE"
             running_image="$(docker inspect --format '{{.Image}}' remnawave_bot)"
@@ -250,19 +284,13 @@ jobs:
             docker logs --since "$started_at" remnawave_bot 2>&1 | grep -F 'SKIP_MIGRATION=true' >/dev/null
             docker logs --since "$started_at" remnawave_bot 2>&1 | grep -F 'Aiogram polling запущен' >/dev/null
             actual_revisions="$(read_schema_revisions)"
-            test "$actual_revisions" = "$PREVIOUS_REVISIONS" -o "$actual_revisions" = "$TARGET_REVISIONS"
+            test "$actual_revisions" = "$CURRENT_SCHEMA_REVISIONS"
+            RECOVERY_OLD_IMAGE_VERIFIED=1
 
             git checkout --detach "$REQUESTED_ROLLBACK_SHA"
-            state_tmp="$(mktemp "$STATE_DIR/bot-production.XXXXXX")"
-            printf 'sha=%s\nimage=%s\nmode=recovery\nschema_revisions=%s\nrecovery_from_sha=%s\n' \
-              "$REQUESTED_ROLLBACK_SHA" "$running_image" "$actual_revisions" "$TARGET_SHA" > "$state_tmp"
-            chmod 600 "$state_tmp"
-            mv "$state_tmp" "$STATE_FILE"
-            audit_tmp="$(mktemp "$STATE_DIR/bot-production.migration-recovery.audit.XXXXXX")"
-            printf 'recovered_at=%s\nsource_sha=%s\nimage=%s\nschema_revisions=%s\nfrom_migration_sha=%s\n' \
-              "$(date --iso-8601=seconds)" "$REQUESTED_ROLLBACK_SHA" "$running_image" "$actual_revisions" "$TARGET_SHA" > "$audit_tmp"
-            chmod 600 "$audit_tmp"
-            mv "$audit_tmp" "$RECOVERY_AUDIT_FILE"
+            write_recovery_state
+            ensure_recovery_audit
+            mark_recovery_journal_recovered
             RECOVERY_SWITCH_ATTEMPTED=0
             trap - ERR
             echo "Recovered source=$REQUESTED_ROLLBACK_SHA against schema=$actual_revisions at $(date --iso-8601=seconds)"

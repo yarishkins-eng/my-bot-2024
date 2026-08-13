@@ -12,6 +12,10 @@ on:
         description: 'Exact phrase: OWNER_APPROVED'
         required: true
         type: string
+      old_image_target_schema_compatibility:
+        description: 'Exact phrase: OLD_IMAGE_TARGET_SCHEMA_COMPATIBLE or OLD_IMAGE_TARGET_SCHEMA_INCOMPATIBLE'
+        required: true
+        type: string
       release_card_reference:
         description: 'Private release-card / change record reference (no secrets)'
         required: true
@@ -38,11 +42,19 @@ jobs:
         env:
           BACKUP_AND_RESTORE_EVIDENCE: ${{ inputs.backup_and_restore_evidence }}
           OWNER_GO_NO_GO: ${{ inputs.owner_go_no_go }}
+          OLD_IMAGE_TARGET_SCHEMA_COMPATIBILITY: ${{ inputs.old_image_target_schema_compatibility }}
           RELEASE_CARD_REFERENCE: ${{ inputs.release_card_reference }}
         run: |
           set -Eeuo pipefail
           test "$BACKUP_AND_RESTORE_EVIDENCE" = 'BACKUP_RESTORE_VERIFIED'
           test "$OWNER_GO_NO_GO" = 'OWNER_APPROVED'
+          case "$OLD_IMAGE_TARGET_SCHEMA_COMPATIBILITY" in
+            OLD_IMAGE_TARGET_SCHEMA_COMPATIBLE|OLD_IMAGE_TARGET_SCHEMA_INCOMPATIBLE) ;;
+            *)
+              echo 'Old-image target-schema compatibility decision is invalid.' >&2
+              exit 1
+              ;;
+          esac
           test -n "$RELEASE_CARD_REFERENCE"
           case "$RELEASE_CARD_REFERENCE" in
             *[!A-Za-z0-9._:/@-]*)
@@ -56,11 +68,12 @@ jobs:
         env:
           RELEASE_CARD_REFERENCE: ${{ inputs.release_card_reference }}
           APPROVAL_ACTOR: ${{ github.actor }}
+          OLD_IMAGE_TARGET_SCHEMA_COMPATIBILITY: ${{ inputs.old_image_target_schema_compatibility }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: RELEASE_CARD_REFERENCE,APPROVAL_ACTOR
+          envs: RELEASE_CARD_REFERENCE,APPROVAL_ACTOR,OLD_IMAGE_TARGET_SCHEMA_COMPATIBILITY
           command_timeout: 15m
           script: |
             set -Eeuo pipefail
@@ -75,6 +88,7 @@ jobs:
             readonly RECOVERY_IMAGE_TAG="teplo-vpn-rollback/bot:pre-migration-${TARGET_SHA}"
             readonly RELEASE_CARD_REFERENCE="${RELEASE_CARD_REFERENCE:?missing release-card reference}"
             readonly APPROVAL_ACTOR="${APPROVAL_ACTOR:?missing protected-deployment actor}"
+            readonly OLD_IMAGE_TARGET_SCHEMA_COMPATIBILITY="${OLD_IMAGE_TARGET_SCHEMA_COMPATIBILITY:?missing old-image compatibility decision}"
             BUILD_DIR=''
             BUILD_OVERRIDE=''
             TARGET_SCHEMA_REVISIONS=''
@@ -112,7 +126,11 @@ jobs:
             state_value() {
               key="$1"
               file="$2"
-              test "$(grep -Ec "^${key}=[^[:space:]]+$" "$file")" = '1'
+              count="$(grep -Ec "^${key}=[^[:space:]]+$" "$file" || true)"
+              if [ "$count" != '1' ]; then
+                echo "Refusing migration deploy: missing or duplicate state key ${key}." >&2
+                return 1
+              fi
               sed -n "s/^${key}=//p" "$file"
             }
 
@@ -122,14 +140,50 @@ jobs:
 
             verify_deployed_state() {
               expected_sha="$1"
-              test -r "$STATE_FILE"
-              stored_sha="$(state_value sha "$STATE_FILE")"
-              stored_image="$(state_value image "$STATE_FILE")"
-              current_image="$(docker inspect --format '{{.Image}}' remnawave_bot)"
-              test "$stored_sha" = "$expected_sha"
-              [[ "$stored_image" =~ ^sha256:[0-9a-f]{64}$ ]]
-              test "$stored_image" = "$current_image"
-              test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" = 'healthy'
+              test -r "$STATE_FILE" || return 1
+              mode_count="$(grep -Ec '^mode=[^[:space:]]+$' "$STATE_FILE" || true)"
+              if [ "$mode_count" = '0' ]; then
+                if grep -Ev '^(sha|image)=[^[:space:]]+$' "$STATE_FILE" >/dev/null; then
+                  echo 'Refusing migration deploy: malformed normal deploy state.' >&2
+                  return 1
+                fi
+              elif [ "$mode_count" = '1' ]; then
+                if grep -Ev '^(sha|image|mode|schema_revisions|recovery_from_sha)=[^[:space:]]+$' "$STATE_FILE" >/dev/null; then
+                  echo 'Refusing migration deploy: malformed recovery deploy state.' >&2
+                  return 1
+                fi
+                if [ "$(state_value mode "$STATE_FILE")" != 'recovery' ]; then
+                  echo 'Refusing migration deploy: unknown deploy-state mode.' >&2
+                  return 1
+                fi
+                stored_schema="$(state_value schema_revisions "$STATE_FILE")" || return 1
+                recovery_from_sha="$(state_value recovery_from_sha "$STATE_FILE")" || return 1
+                if ! [[ "$stored_schema" =~ ^[0-9a-z]+(,[0-9a-z]+)*$ ]]; then
+                  echo 'Refusing migration deploy: invalid recovered schema revision.' >&2
+                  return 1
+                fi
+                if ! [[ "$recovery_from_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo 'Refusing migration deploy: invalid recovery source SHA.' >&2
+                  return 1
+                fi
+                if [ "$stored_schema" != "$(read_schema_revisions)" ]; then
+                  echo 'Refusing migration deploy: recovered state disagrees with live schema.' >&2
+                  return 1
+                fi
+                git cat-file -e "${recovery_from_sha}^{commit}" || return 1
+                git merge-base --is-ancestor "$expected_sha" "$recovery_from_sha" || return 1
+                git merge-base --is-ancestor "$recovery_from_sha" "$TARGET_SHA" || return 1
+              else
+                echo 'Refusing migration deploy: duplicate deploy-state mode.' >&2
+                return 1
+              fi
+              stored_sha="$(state_value sha "$STATE_FILE")" || return 1
+              stored_image="$(state_value image "$STATE_FILE")" || return 1
+              current_image="$(docker inspect --format '{{.Image}}' remnawave_bot)" || return 1
+              test "$stored_sha" = "$expected_sha" || return 1
+              [[ "$stored_image" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+              test "$stored_image" = "$current_image" || return 1
+              test "$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" = 'healthy' || return 1
             }
 
             write_deployed_state() {
@@ -140,16 +194,33 @@ jobs:
               mv "$state_tmp" "$STATE_FILE"
             }
 
+            write_previous_deployed_state() {
+              install -d -m 700 "$STATE_DIR"
+              state_tmp="$(mktemp "$STATE_DIR/bot-production.XXXXXX")"
+              printf 'sha=%s\nimage=%s\n' "$PREVIOUS_SHA" "$PREVIOUS_IMAGE_ID" > "$state_tmp"
+              chmod 600 "$state_tmp"
+              mv "$state_tmp" "$STATE_FILE"
+            }
+
             # Write the journal before the service switch.  The recovery workflow
             # accepts only its captured SHA and image identity, so it remains
             # usable if Alembic commits but candidate startup fails.
             write_migration_recovery_state() {
               phase="$1"
+              case "$OLD_IMAGE_TARGET_SCHEMA_COMPATIBILITY" in
+                OLD_IMAGE_TARGET_SCHEMA_COMPATIBLE) old_image_compatible=1 ;;
+                OLD_IMAGE_TARGET_SCHEMA_INCOMPATIBLE) old_image_compatible=0 ;;
+                *)
+                  echo 'Refusing migration deploy: invalid old-image compatibility decision.' >&2
+                  return 1
+                  ;;
+              esac
               install -d -m 700 "$STATE_DIR"
               state_tmp="$(mktemp "$STATE_DIR/bot-production.migration-recovery.XXXXXX")"
-              printf 'format_version=1\nphase=%s\ndeployed_sha=%s\nrollback_source_sha=%s\nrollback_image_tag=%s\nrollback_image_id=%s\nmigration_image_id=%s\nprevious_schema_revisions=%s\ntarget_schema_revisions=%s\n' \
+              printf 'format_version=2\nphase=%s\ndeployed_sha=%s\nrollback_source_sha=%s\nrollback_image_tag=%s\nrollback_image_id=%s\nmigration_image_id=%s\nprevious_schema_revisions=%s\ntarget_schema_revisions=%s\nold_image_target_schema_compatible=%s\n' \
                 "$phase" "$TARGET_SHA" "$PREVIOUS_SHA" "$RECOVERY_IMAGE_TAG" "$PREVIOUS_IMAGE_ID" \
-                "$TARGET_IMAGE_ID" "$PREVIOUS_SCHEMA_REVISIONS" "$TARGET_SCHEMA_REVISIONS" > "$state_tmp"
+                "$TARGET_IMAGE_ID" "$PREVIOUS_SCHEMA_REVISIONS" "$TARGET_SCHEMA_REVISIONS" \
+                "$old_image_compatible" > "$state_tmp"
               chmod 600 "$state_tmp"
               mv "$state_tmp" "$RECOVERY_STATE_FILE"
             }
@@ -310,11 +381,19 @@ jobs:
             readonly PREVIOUS_SCHEMA_REVISIONS="$(read_schema_revisions)"
             test -n "$PREVIOUS_SCHEMA_REVISIONS"
             readonly PREVIOUS_IMAGE_ID="$RUNNING_IMAGE_ID"
+            # A successful earlier recovery stores mode=recovery metadata.
+            # This new migration attempt starts from the now-verified live
+            # source/image as its ordinary baseline, so atomically normalize
+            # deploy state before binding the new journal to it.
+            write_previous_deployed_state
             docker image tag "$PREVIOUS_IMAGE_ID" "$RECOVERY_IMAGE_TAG"
 
             PREPARE_IN_PROGRESS=1
             trap restore_after_preparation_failure ERR
-            git checkout --detach "$TARGET_SHA"
+            # Build and inspect the exact target from its clean git archive
+            # while the server source remains on the previous SHA. A hard kill
+            # before the durable journal therefore leaves source/image/state
+            # mutually consistent for an ordinary retry.
             verify_migration_flags
             create_clean_build_context
             compose build "$SERVICE"
@@ -326,18 +405,20 @@ jobs:
             test -n "$TARGET_SCHEMA_REVISIONS"
             write_migration_recovery_state prepared
             RECOVERY_JOURNAL_PREPARED=1
+            # From this point the protected recovery workflow has every SHA,
+            # image and schema identity needed for an idempotent retry.
+            git checkout --detach "$TARGET_SHA"
             PREPARE_IN_PROGRESS=0
             trap - ERR
 
             quiesce_writer_before_legacy_entitlement_baseline
             prepare_legacy_entitlement_baseline_if_required
 
-            # No automatic code rollback after quiescing the writer: the old
-            # image cannot issue immutable entitlement snapshots and therefore
-            # must never run on schema 0100.  If a forward migration commits
-            # but this candidate cannot start, the bot deliberately remains
-            # stopped for protected manual reconciliation; no old writer is
-            # permitted to create unsupported subscriptions in the meantime.
+            # No automatic code rollback after migration begins. The protected
+            # recovery workflow must re-read the durable journal and live
+            # schema/source/image evidence. It may start the captured old image
+            # on the target schema only when this dispatch recorded the exact
+            # reviewed compatibility decision; otherwise it stops fail-closed.
             compose up -d --wait --wait-timeout 240 "$SERVICE"
             compose ps "$SERVICE"
             verify_migration_revision
