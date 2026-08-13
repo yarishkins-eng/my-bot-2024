@@ -25,7 +25,8 @@ async def request_erasure_cleanup(
         (
             await session.execute(
                 text(
-                    'SELECT panel_uuid, generation, lifecycle_state '
+                    'SELECT panel_uuid, generation, lifecycle_state, '
+                    'erasure_requested_at, cleanup_terminal_at '
                     'FROM entitlement_identities WHERE id=:identity_id FOR UPDATE'
                 ),
                 {'identity_id': identity_id},
@@ -48,6 +49,12 @@ async def request_erasure_cleanup(
     ).scalar_one_or_none()
     if existing:
         return str(existing)
+    if (
+        identity['lifecycle_state'] in {'erasure_requested', 'cleanup_terminal', 'final_erasure'}
+        or identity['erasure_requested_at'] is not None
+        or identity['cleanup_terminal_at'] is not None
+    ):
+        raise ValueError('erasure marker exists without retained cleanup record')
     operation_id = str(uuid.uuid4())
     panel_uuid = str(identity['panel_uuid']) if identity['panel_uuid'] else None
     panel_hmac = hmac_fingerprint(

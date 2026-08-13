@@ -8,14 +8,14 @@ controllable fake; no production adapter exists in Gate 1.
 
 - Phase 0 defect evidence: `12 passed` (the unsafe legacy behaviour remains
   reproducible and was not weakened).
-- Gate 1 entitlement suite: `110 passed`, no skipped.
-- APP-URL-only real-PostgreSQL harness: `79 passed`, proving that the test
+- Gate 1 entitlement suite: `112 passed`, no skipped.
+- APP-URL-only real-PostgreSQL harness: `81 passed`, proving that the test
   bootstrap does not replace `asyncpg` when only the application database URL
   is configured.
-- Exact 37-file affected manifest: `665 passed`, no skipped.
+- Exact 37-file affected manifest: `667 passed`, no skipped.
 - Real-PostgreSQL concurrency/fault subset: five consecutive runs of
-  `73 passed`, no skipped.
-- Full repository suite: `2541 passed, 5 skipped`; all five skips are existing
+  `75 passed`, no skipped.
+- Full repository suite: `2543 passed, 5 skipped`; all five skips are existing
   `tests/integration/test_device_first_postgres_constraints.py` cases skipped
   because their separate optional `DEVICE_FIRST_TEST_DATABASE_URL` was not
   configured. They are outside `tests/entitlement_authority` and outside every
@@ -71,7 +71,8 @@ controllable fake; no production adapter exists in Gate 1.
   command or encrypted target, unless a prior remote outcome is unknown.
 - ✅ stale appenders waiting on the identity lock stop after erasure commit;
   no owner/Panel PII or pending command can revive. Late webhooks stay unlinked
-  and repeated terminal marking cannot regress `final_erasure`.
+  and repeated terminal marking cannot regress `final_erasure`; retained
+  identity markers also block cleanup restart after terminal evidence expires.
 - ✅ schema JSON constraints reject extra PII keys and shadow has no DB/remote
   mutation boundary.
 - ✅ every startup writer registration is explicitly classified; unknown

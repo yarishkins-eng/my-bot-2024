@@ -74,6 +74,8 @@ Verified DELETE/canonical 404 clears ciphertext immediately; terminal evidence
 expires after 90 days, unresolved evidence does not. Once erasure begins, a
 stale source appender is rejected under the identity lock, late webhooks remain
 unlinked, and terminal/final states cannot regress or reintroduce snapshots.
+After terminal evidence reaches its 90-day retention limit, the identity's
+durable erasure markers still prevent a second cleanup lifecycle from starting.
 
 ## Consequences
 

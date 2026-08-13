@@ -311,6 +311,51 @@ async def test_erasure_two_stage_encryption_terminal_clear_and_ninety_day_retent
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('finalize', [False, True])
+async def test_erasure_cannot_restart_after_terminal_evidence_retention(
+    sessions: async_sessionmaker[AsyncSession],
+    finalize: bool,
+) -> None:
+    user_id, identity_id = await create_identity(sessions, panel_uuid=None)
+    async with sessions() as session, session.begin():
+        operation_id = await request_erasure_cleanup(
+            session,
+            identity_id=identity_id,
+            secret=SECRET,
+            now=NOW,
+        )
+        if finalize:
+            await mark_final_erasure(session, identity_id=identity_id, now=NOW + timedelta(seconds=1))
+    async with sessions() as session, session.begin():
+        counts = await housekeep_terminal_evidence(session, now=NOW + timedelta(days=91))
+        assert counts['cleanup_commands'] == 1 and counts['tombstones'] == 1
+    async with sessions() as session, session.begin():
+        with pytest.raises(ValueError, match='marker exists without retained cleanup'):
+            await request_erasure_cleanup(
+                session,
+                identity_id=identity_id,
+                secret=SECRET,
+                now=NOW + timedelta(days=92),
+            )
+    async with sessions() as session:
+        identity = (
+            await session.execute(
+                text('SELECT generation, lifecycle_state FROM entitlement_identities WHERE id=:identity_id'),
+                {'identity_id': identity_id},
+            )
+        ).one()
+        assert identity == (2, 'final_erasure' if finalize else 'cleanup_terminal')
+        assert (
+            await session.execute(
+                text('SELECT count(*) FROM entitlement_cleanup_commands WHERE operation_id=:operation_id'),
+                {'operation_id': operation_id},
+            )
+        ).scalar_one() == 0
+    async with sessions() as session, session.begin():
+        await session.execute(text('DELETE FROM users WHERE id=:id'), {'id': user_id})
+
+
+@pytest.mark.asyncio
 async def test_cleanup_terminal_requires_verified_delete_or_canonical_404(
     sessions: async_sessionmaker[AsyncSession],
 ) -> None:
