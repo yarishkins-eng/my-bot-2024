@@ -114,8 +114,11 @@ minimum ratio sample.
   fixed fail-closed state and never restarts it. A whole-cycle timeout cancels
   the in-flight read path before recording `cycle_deadline_exceeded`.
 - Operator: keep/set `ENTITLEMENT_AUTHORITY_SHADOW_KILL_SWITCH=true` (or
-  `SHADOW=false`) through the protected environment and restart the existing
-  bot deployment. The double interlock prevents SHADOW alone from starting.
+  `SHADOW=false`) only through the reviewed allowlisted
+  `control-entitlement-shadow.yml` workflow. The production `.env` remains a
+  permanent `SHADOW=false`/`KILL_SWITCH=true` baseline; the protected runtime
+  override is ephemeral. The double interlock prevents SHADOW alone from
+  starting. See `gate2-shadow-control-prerequisite-release-card.md`.
 - Code rollback, if required, is a protected revert commit followed by
   `deploy-migration.yml`, because the revert still changes `main.py` and
   `app/config.py` and the ordinary deploy guard must stop it. Previous and

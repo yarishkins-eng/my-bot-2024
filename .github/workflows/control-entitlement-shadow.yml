@@ -1,0 +1,110 @@
+name: Control Gate 2 entitlement shadow
+
+# The production .env remains the permanent disabled baseline. This workflow
+# creates only a temporary, fixed Compose override for the existing bot image.
+# It never writes .env, the database, RemnaWave or user/business data.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Allowlisted runtime transition'
+        required: true
+        type: choice
+        options:
+          - DISABLE_SHADOW
+          - ENABLE_SHADOW
+      expected_deployed_sha:
+        description: 'Exact 40-char production deploy-state SHA'
+        required: true
+        type: string
+      owner_go_no_go:
+        description: 'Exact phrase: OWNER_APPROVED'
+        required: true
+        type: string
+      release_card_reference:
+        description: 'Approved Gate 2 observation/stop record (no secrets)'
+        required: true
+        type: string
+
+concurrency:
+  group: teplo-bot-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/lint.yml
+
+  control:
+    needs: [verify]
+    runs-on: ubuntu-latest
+    environment: teplo-vpn-production-controlled-change
+    timeout-minutes: 12
+    steps:
+      - name: Validate protected shadow-control gate
+        env:
+          CONTROL_ACTION: ${{ inputs.action }}
+          EXPECTED_DEPLOYED_SHA: ${{ inputs.expected_deployed_sha }}
+          OWNER_GO_NO_GO: ${{ inputs.owner_go_no_go }}
+          RELEASE_CARD_REFERENCE: ${{ inputs.release_card_reference }}
+          TARGET_REF: ${{ github.ref }}
+        run: |
+          set -Eeuo pipefail
+          case "$CONTROL_ACTION" in
+            ENABLE_SHADOW|DISABLE_SHADOW) ;;
+            *) exit 64 ;;
+          esac
+          [[ "$EXPECTED_DEPLOYED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$OWNER_GO_NO_GO" = 'OWNER_APPROVED'
+          test -n "$RELEASE_CARD_REFERENCE"
+          test "$TARGET_REF" = 'refs/heads/main'
+
+      - name: Apply only the reviewed runtime transition
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        env:
+          CONTROL_ACTION: ${{ inputs.action }}
+          TARGET_SHA: ${{ github.sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CONTROL_SCRIPT_SHA256: ${{ hashFiles('.github/scripts/control-entitlement-shadow.sh') }}
+          CLASSIFIER_SHA256: ${{ hashFiles('.github/scripts/classify-entitlement-shadow-control.sh') }}
+          BASELINE_VERIFIER_SHA256: ${{ hashFiles('.github/scripts/verify-entitlement-shadow-baseline.py') }}
+          EXPECTED_DEPLOYED_SHA: ${{ inputs.expected_deployed_sha }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 10m
+          envs: CONTROL_ACTION,TARGET_SHA,WORKFLOW_RUN_ID,WORKFLOW_RUN_ATTEMPT,CONTROL_SCRIPT_SHA256,CLASSIFIER_SHA256,BASELINE_VERIFIER_SHA256,EXPECTED_DEPLOYED_SHA
+          script: |
+            set -Eeuo pipefail
+            readonly REPO_DIR='/opt/remnawave-bedolaga-telegram-bot'
+            readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'
+            readonly RUNTIME_DIR='/tmp/teplo-entitlement-shadow-control'
+            readonly CONTROL_SCRIPT="$RUNTIME_DIR/control-entitlement-shadow.sh"
+            readonly CLASSIFIER="$RUNTIME_DIR/classify-entitlement-shadow-control.sh"
+            readonly BASELINE_VERIFIER="$RUNTIME_DIR/verify-entitlement-shadow-baseline.py"
+            readonly RAW_BASE="https://raw.githubusercontent.com/${{ github.repository }}/${TARGET_SHA}/.github/scripts"
+            cleanup() {
+              rm -f -- "$CONTROL_SCRIPT" "$CLASSIFIER" "$BASELINE_VERIFIER"
+              rmdir -- "$RUNTIME_DIR" 2>/dev/null || true
+            }
+            trap cleanup EXIT
+            umask 077
+            mkdir "$RUNTIME_DIR"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              "$RAW_BASE/control-entitlement-shadow.sh" --output "$CONTROL_SCRIPT"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              "$RAW_BASE/classify-entitlement-shadow-control.sh" --output "$CLASSIFIER"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              "$RAW_BASE/verify-entitlement-shadow-baseline.py" --output "$BASELINE_VERIFIER"
+            test "$(sha256sum "$CONTROL_SCRIPT" | awk '{ print $1 }')" = "$CONTROL_SCRIPT_SHA256"
+            test "$(sha256sum "$CLASSIFIER" | awk '{ print $1 }')" = "$CLASSIFIER_SHA256"
+            test "$(sha256sum "$BASELINE_VERIFIER" | awk '{ print $1 }')" = "$BASELINE_VERIFIER_SHA256"
+            chmod 700 "$CONTROL_SCRIPT" "$CLASSIFIER" "$BASELINE_VERIFIER"
+            "$CONTROL_SCRIPT" \
+              "$CONTROL_ACTION" "$TARGET_SHA" "$WORKFLOW_RUN_ID" "$WORKFLOW_RUN_ATTEMPT" \
+              "$REPO_DIR" "$STATE_DIR" "$EXPECTED_DEPLOYED_SHA" "$CLASSIFIER" "$BASELINE_VERIFIER"
