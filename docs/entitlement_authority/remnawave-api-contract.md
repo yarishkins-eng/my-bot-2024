@@ -32,6 +32,10 @@ SHA. No production identity was mutated.
   an in-band sentinel value.
   It still cannot prove that a late first POST will not apply after a second
   generation; therefore no blind second POST is permitted.
+- A successful CREATE response UUID is not ownership evidence. Before local
+  binding or PATCH, GET that UUID and require the exact deterministic username
+  plus the complete expected DISABLED snapshot. A foreign/stale UUID, missing
+  canonical row, read failure or field mismatch remains unbound and unknown.
 - PATCH/action success must mean `mutation → fresh canonical GET → exact
   current-generation comparison`; an HTTP acknowledgement alone is not proof.
 - Without remote CAS, an unknown/late mutating request requires identity-level
@@ -43,9 +47,10 @@ SHA. No production identity was mutated.
 
 `StrictPanelClient` is deliberately backed only by the controllable fake/test
 transport. Its transport exposes `request_once`; CREATE is forced DISABLED,
-PATCH sends the full exact payload, DELETE is one-shot, and every mutation
-exception becomes `remote_outcome_unknown`. It has no A039 field removal and
-no mutating retry.
+the receipt is canonically owner/snapshot-verified before UUID binding, PATCH
+sends the full exact payload, DELETE is one-shot, and every mutation exception
+becomes `remote_outcome_unknown`. It has no A039 field removal and no mutating
+retry.
 
 There is no production `RemnaWaveAPI` adapter or callsite switch. A future
 shadow deploy is read-only and therefore does not need a mutating adapter. A

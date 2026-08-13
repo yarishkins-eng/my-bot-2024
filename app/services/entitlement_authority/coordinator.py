@@ -163,6 +163,56 @@ class ProjectionCoordinator:
                 )
                 raise
             await self._hit('after_create_post')
+            create_bound = desired.bind(receipt.panel_uuid)
+            expected_disabled = replace(create_bound, status='DISABLED')
+            try:
+                raw_receipt = await self._panel.get_canonical(receipt.panel_uuid)
+            except PanelReadError:
+                await self._store.quarantine(
+                    claim,
+                    code='create_receipt_get_failed',
+                    unknown=True,
+                    now=clock,
+                )
+                return 'quarantined'
+            if raw_receipt is None:
+                await self._store.quarantine(
+                    claim,
+                    code='create_receipt_missing',
+                    unknown=True,
+                    now=clock,
+                )
+                return 'quarantined'
+            try:
+                observed_receipt = normalize_panel_observation(
+                    raw_receipt,
+                    expected=expected_disabled,
+                )
+            except (TypeError, ValueError):
+                await self._store.quarantine(
+                    claim,
+                    code='create_receipt_contract_invalid',
+                    unknown=True,
+                    now=clock,
+                )
+                return 'quarantined'
+            receipt_comparison = compare_snapshots(expected_disabled, observed_receipt)
+            await self._store.record_observation(
+                claim,
+                observed_receipt,
+                receipt_comparison,
+                event_type='post_create_receipt_verify',
+                now=clock,
+            )
+            await self._hit('after_create_canonical_get')
+            if not receipt_comparison.exact:
+                await self._store.quarantine(
+                    claim,
+                    code='create_receipt_mismatch',
+                    unknown=True,
+                    now=clock,
+                )
+                return 'quarantined'
             bound_uuid = await self._store.bind_uuid(
                 claim,
                 receipt.panel_uuid,
@@ -176,13 +226,13 @@ class ProjectionCoordinator:
                     secret=self._secret,
                     purpose='entitlement-panel-cleanup-v1',
                 ),
-                bound_desired_hash=desired.bind(receipt.panel_uuid).desired_hash,
+                bound_desired_hash=create_bound.desired_hash,
                 now=clock,
             )
             if not bound_uuid:
                 return 'quarantined'
             await self._hit('after_uuid_bind')
-            bound = desired.bind(receipt.panel_uuid)
+            bound = create_bound
             claim = replace(claim, panel_uuid=receipt.panel_uuid, desired_snapshot=bound)
 
         try:

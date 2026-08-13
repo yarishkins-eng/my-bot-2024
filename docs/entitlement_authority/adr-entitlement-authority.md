@@ -45,10 +45,14 @@ any uncertain send → REMOTE_OUTCOME_UNKNOWN → QUARANTINED
 
 Only one identity mutation may be active. A generation/lease send-fence is
 committed immediately before HTTP; no PostgreSQL row lock spans HTTP. CREATE
-has a durable deterministic intent, is always DISABLED, and its UUID must be
-bound before ACTIVE PATCH. Lost CREATE/PATCH never causes a blind retry. A
-takeover performs deterministic lookup/canonical GET only; without remote CAS
-it cannot clear unknown outcome automatically.
+has a durable deterministic intent and is always DISABLED. Its response UUID
+is only a claim: a fresh canonical GET by that UUID must prove both the exact
+deterministic owner username and the complete expected DISABLED snapshot
+before the UUID may be bound and before ACTIVE PATCH. A malformed/stale claim,
+read failure or mismatch leaves the identity unbound and remote-outcome-unknown.
+Lost CREATE/PATCH never causes a blind retry. A takeover performs deterministic
+lookup/canonical GET only; without remote CAS it cannot clear unknown outcome
+automatically.
 
 The recovery/ownership key is the Panel-legal unique username
 `te-<sha256(owner_key)[:32]>`. The exact value is used for CREATE, lookup and

@@ -12,8 +12,10 @@ the strict gateway and no shadow/production deployment is part of this work.
   intents, restricted cleanup command and tombstone.
 - Exact normalized snapshot/comparator, provenance/deny reducer and pure
   command state transitions.
-- Test/fake-only strict Panel interface: one-shot mutation, DISABLED CREATE,
-  durable UUID binding, fresh canonical GET and current-generation finalize.
+- Test/fake-only strict Panel interface: one-shot mutation and DISABLED CREATE.
+  A returned CREATE UUID is not trusted: a fresh canonical GET must prove the
+  deterministic owner and exact DISABLED snapshot before durable UUID binding
+  or any ACTIVE PATCH. Finalize also requires a fresh current-generation GET.
 - Deterministic Panel owner proof uses the valid unique username
   `te-<sha256(owner_key)[:32]>`; CREATE, recovery lookup and canonical reads
   require that exact value, and mismatch is quarantined without a sentinel.

@@ -75,6 +75,8 @@ class FakePanelTransport:
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.patch_mode = 'apply'
         self.create_mode = 'apply'
+        self.create_receipt_override: str | None = None
+        self.create_state_changes: dict[str, Any] = {}
         self.get_timeout = False
         self.lookup_override: list[dict[str, Any]] | None = None
         self.patch_received = asyncio.Event()
@@ -128,13 +130,14 @@ class FakePanelTransport:
                 'username': payload['username'],
                 **{key: value for key, value in payload.items() if key != 'username'},
             }
+            state.update(self.create_state_changes)
             if self.create_mode in {'apply', 'apply_lost'}:
                 self.states[panel_uuid] = state
             if self.create_mode == 'apply_lost':
                 raise ConnectionError('response lost after apply')
             if self.create_mode == 'lost_without_apply':
                 raise ConnectionError('request outcome unknown')
-            return {'response': {'uuid': panel_uuid}}
+            return {'response': {'uuid': self.create_receipt_override or panel_uuid}}
         if method == 'PATCH':
             assert payload is not None
             self.patch_received.set()
@@ -526,7 +529,10 @@ async def test_erasure_after_unknown_create_retains_encrypted_deterministic_loca
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('barrier', ['after_create_send_fence', 'after_create_post'])
+@pytest.mark.parametrize(
+    'barrier',
+    ['after_create_send_fence', 'after_create_post', 'after_create_canonical_get'],
+)
 async def test_erasure_during_create_hands_receipt_to_restricted_cleanup(
     sessions: async_sessionmaker[AsyncSession],
     barrier: str,
@@ -650,12 +656,146 @@ class SimulatedProcessKill(BaseException):
 
 
 @pytest.mark.asyncio
+async def test_unbound_create_rejects_foreign_receipt_before_bind_or_patch(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired(panel_uuid=None)
+    identity_id, command_id, store = await make_command(sessions, target, source_key='foreign-create-receipt')
+    fake = FakePanelTransport()
+    foreign_uuid = 'foreign-stale'
+    foreign = raw(
+        desired(
+            panel_uuid=foreign_uuid,
+            owner_key='foreign-owner',
+            status='ACTIVE',
+            traffic_limit_bytes=777,
+        )
+    )
+    fake.states[foreign_uuid] = foreign
+    fake.create_receipt_override = foreign_uuid
+
+    assert (
+        await coordinator(store, fake).project_command(command_id, target, worker='worker-one', now=NOW)
+        == 'quarantined'
+    )
+    state = await command_state(sessions, command_id)
+    async with sessions() as session:
+        identity = (
+            await session.execute(
+                text(
+                    'SELECT panel_uuid, lifecycle_state, remote_outcome_unknown_generation '
+                    'FROM entitlement_identities WHERE id=:identity_id'
+                ),
+                {'identity_id': identity_id},
+            )
+        ).one()
+    assert fake.count('POST') == 1
+    assert fake.count('GET') == 1
+    assert fake.count('PATCH') == 0
+    assert fake.states[foreign_uuid]['trafficLimitBytes'] == 777
+    assert identity.panel_uuid is None
+    assert identity.lifecycle_state == 'quarantined'
+    assert identity.remote_outcome_unknown_generation == 1
+    assert state['stage'] == 'remote_outcome_unknown'
+    assert state['last_error_code'] == 'create_receipt_contract_invalid'
+    assert state['verified_generation'] is None
+
+
+@pytest.mark.asyncio
+async def test_unbound_create_requires_exact_disabled_receipt_before_bind_or_patch(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    target = desired(panel_uuid=None)
+    identity_id, command_id, store = await make_command(sessions, target, source_key='inexact-create-receipt')
+    fake = FakePanelTransport()
+    fake.create_state_changes = {'status': 'ACTIVE', 'trafficLimitBytes': 777}
+
+    assert (
+        await coordinator(store, fake).project_command(command_id, target, worker='worker-one', now=NOW)
+        == 'quarantined'
+    )
+    state = await command_state(sessions, command_id)
+    remote = next(iter(fake.states.values()))
+    async with sessions() as session:
+        identity = (
+            await session.execute(
+                text(
+                    'SELECT panel_uuid, lifecycle_state, remote_outcome_unknown_generation '
+                    'FROM entitlement_identities WHERE id=:identity_id'
+                ),
+                {'identity_id': identity_id},
+            )
+        ).one()
+    assert fake.count('POST') == 1
+    assert fake.count('GET') == 1
+    assert fake.count('PATCH') == 0
+    assert remote['status'] == 'ACTIVE' and remote['trafficLimitBytes'] == 777
+    assert identity.panel_uuid is None
+    assert identity.lifecycle_state == 'quarantined'
+    assert identity.remote_outcome_unknown_generation == 1
+    assert state['stage'] == 'remote_outcome_unknown'
+    assert state['last_error_code'] == 'create_receipt_mismatch'
+    assert state['verified_generation'] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('create_mode', 'get_timeout', 'expected_error'),
+    [
+        ('ack_without_apply', False, 'create_receipt_missing'),
+        ('apply', True, 'create_receipt_get_failed'),
+    ],
+)
+async def test_unbound_create_receipt_read_failure_never_binds_or_patches(
+    sessions: async_sessionmaker[AsyncSession],
+    create_mode: str,
+    get_timeout: bool,
+    expected_error: str,
+) -> None:
+    target = desired(panel_uuid=None)
+    identity_id, command_id, store = await make_command(
+        sessions,
+        target,
+        source_key=f'create-receipt-read-{create_mode}',
+    )
+    fake = FakePanelTransport()
+    fake.create_mode = create_mode
+    fake.get_timeout = get_timeout
+
+    assert (
+        await coordinator(store, fake).project_command(command_id, target, worker='worker-one', now=NOW)
+        == 'quarantined'
+    )
+    state = await command_state(sessions, command_id)
+    async with sessions() as session:
+        identity = (
+            await session.execute(
+                text(
+                    'SELECT panel_uuid, lifecycle_state, remote_outcome_unknown_generation '
+                    'FROM entitlement_identities WHERE id=:identity_id'
+                ),
+                {'identity_id': identity_id},
+            )
+        ).one()
+    assert fake.count('POST') == 1
+    assert fake.count('GET') == 1
+    assert fake.count('PATCH') == 0
+    assert identity.panel_uuid is None
+    assert identity.lifecycle_state == 'quarantined'
+    assert identity.remote_outcome_unknown_generation == 1
+    assert state['stage'] == 'remote_outcome_unknown'
+    assert state['last_error_code'] == expected_error
+    assert state['verified_generation'] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     'barrier',
     [
         'after_intent',
         'after_create_send_fence',
         'after_create_post',
+        'after_create_canonical_get',
         'after_uuid_bind',
         'after_active_patch',
         'after_canonical_get',

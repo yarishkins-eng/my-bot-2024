@@ -1,7 +1,8 @@
-# Gate 1 independent reviewer and skeptic record
+# Gate 1 historical reviewer and skeptic record
 
-Two independent agents reviewed only the sanitized prompt, detached worktree,
-diff, tests and evidence in this directory. They did not receive owner-only
+Two independent agents reviewed an earlier foundation SHA using only the
+sanitized prompt, detached worktree, diff, tests and evidence in this
+directory. They did not receive owner-only
 Phase 0 data, the protected backup, production secrets, raw responses or WIP
 refs. Reviewer: `gate1_reviewer` (Nietzsche); skeptic: `gate1_skeptic`
 (Copernicus).
@@ -54,8 +55,10 @@ quarantines `canonical_contract_invalid`; a regression proves the former
 collision cannot become READY. Final reviewer verdict: **PASS, 0 P0/P1**.
 Final skeptic KEEP/DROP audit: **KEEP CLOSED, 0 P0/P1, PASS**.
 
-## Review conclusion
+## Historical review conclusion
 
-Independent double review is closed for the dormant Gate 1 boundary. It does
-not approve a production adapter, shadow deployment, flag change or cutover;
-those remain separate owner gates.
+Those findings were closed for the SHA reviewed in that pass. This record is
+not release authority for later commits: the production release card requires
+fresh independent reviewer and skeptic GO on the exact immutable candidate
+SHA. No review approves a production adapter, shadow deployment, flag change
+or cutover; those remain separate owner gates.

@@ -8,15 +8,15 @@ controllable fake; no production adapter exists in Gate 1.
 
 - Phase 0 defect evidence: `12 passed` (the unsafe legacy behaviour remains
   reproducible and was not weakened).
-- Gate 1 entitlement suite: `124 passed`, no skipped.
-- APP-URL-only real-PostgreSQL harness: `93 passed`, proving that the test
+- Gate 1 entitlement suite: `130 passed`, no skipped.
+- APP-URL-only real-PostgreSQL harness: `99 passed`, proving that the test
   bootstrap does not replace `asyncpg` when only the application database URL
   is configured.
-- Exact 37-file affected manifest: `679 passed`, no skipped.
+- Exact 37-file affected manifest: `685 passed`, no skipped.
 - Real-PostgreSQL concurrency/fault subset: five consecutive runs of
-  `87 passed`, no skipped; the eight new erasure/evidence/CREATE race cases
+  `93 passed`, no skipped; the fourteen new erasure/evidence/CREATE race cases
   also passed five isolated consecutive repetitions.
-- Full repository suite: `2555 passed, 5 skipped`; all five skips are existing
+- Full repository suite: `2561 passed, 5 skipped`; all five skips are existing
   `tests/integration/test_device_first_postgres_constraints.py` cases skipped
   because their separate optional `DEVICE_FIRST_TEST_DATABASE_URL` was not
   configured. They are outside `tests/entitlement_authority` and outside every
@@ -39,7 +39,12 @@ controllable fake; no production adapter exists in Gate 1.
 - ✅ GET timeout produces no READY and no CREATE.
 - ✅ PATCH applied/lost response: one PATCH, observation-only takeover, no CREATE.
 - ✅ CREATE applied/lost/no-apply/kill: at most one DISABLED candidate and one POST.
-- ✅ kill after intent/send fence/POST/UUID bind/ACTIVE PATCH/canonical GET/final commit.
+- ✅ a returned CREATE UUID is canonically verified for exact owner and the
+  complete DISABLED snapshot before local bind/PATCH; a foreign/stale receipt
+  or mismatching state remains unbound/unknown and cannot mutate that UUID.
+  Receipt GET timeout and acknowledged-but-missing UUID do the same.
+- ✅ kill after intent/send fence/POST/CREATE receipt GET/UUID bind/ACTIVE
+  PATCH/canonical GET/final commit.
 - ✅ stale generation cannot finalize; generation is rechecked at send-fence.
 - ✅ caller-supplied bound/unbound snapshots cannot override the immutable
   source or cause PATCH/CREATE; corrupt source/hash/binding stops before HTTP,
@@ -76,8 +81,9 @@ controllable fake; no production adapter exists in Gate 1.
   orders. Repeated terminal marking cannot regress `final_erasure`; retained
   identity markers also block cleanup restart after terminal evidence expires.
 - ✅ unbound CREATE outcome-unknown preserves an encrypted deterministic
-  cleanup locator; erasure at send/post barriers atomically hands a late UUID
-  receipt to restricted cleanup without restoring source, owner or Panel links.
+  cleanup locator; erasure at send/post/receipt-GET barriers atomically hands a
+  late UUID receipt, only after its canonical owner/DISABLED proof, to
+  restricted cleanup without restoring source, owner or Panel links.
   A cross-wired claim whose command belongs to another identity is rejected
   before any cleanup ciphertext, HMAC or error marker changes.
 - ✅ repeated terminal cleanup verifies that both restricted ciphertexts are
