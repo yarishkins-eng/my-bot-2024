@@ -167,7 +167,10 @@ class Visitor(ast.NodeVisitor):
             if name in {'create_task', 'add_job', 'start'}:
                 rendered = ast.get_source_segment(self.source, node) or ast.unparse(node)
                 lowered = rendered.lower()
-                if any(token in lowered for token in ('worker', 'monitor', 'sync', 'remnawave', 'recovery', 'outbox')):
+                if any(
+                    token in lowered
+                    for token in ('worker', 'monitor', 'sync', 'remnawave', 'recovery', 'outbox', 'shadow')
+                ):
                     self.startups.append(
                         {
                             'path': self.path.as_posix(),

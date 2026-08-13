@@ -40,7 +40,10 @@ def test_fresh_inventory_matches_frozen_current_architecture(tmp_path: Path) -> 
     baseline_startups = {(item['path'], item['function'], item['call']) for item in baseline['startup_registrations']}
     current_startups = {(item['path'], item['function'], item['call']) for item in actual['startup_registrations']}
     assert baseline_raw <= current_raw
-    assert baseline_startups == current_startups
+    assert baseline_startups <= current_startups
+    assert current_startups - baseline_startups == {
+        ('main.py', 'main', 'asyncio.create_task(entitlement_shadow_service.run())')
+    }
     assert current_raw - baseline_raw == {
         ('app/services/entitlement_authority/strict_panel.py', 'create_disabled', 'POST', "'/api/users'"),
         ('app/services/entitlement_authority/strict_panel.py', 'patch_exact', 'PATCH', "'/api/users'"),
@@ -93,7 +96,7 @@ def test_raw_access_writers_are_never_hidden_as_metadata_only() -> None:
 def test_startup_classification_has_no_blanket_exclusion_and_keeps_known_writers() -> None:
     closure = json.loads(CLOSURE.read_text(encoding='utf-8'))
     startups = [entry for entry in closure['entries'] if entry['section'] == 'startup_registrations']
-    assert len(startups) == 61
+    assert len(startups) == 62
     assert all(entry['surface'] != 'scanner_false_positive' for entry in startups)
     by_path = {}
     for entry in startups:
@@ -106,6 +109,12 @@ def test_startup_classification_has_no_blanket_exclusion_and_keeps_known_writers
     ]
     assert len(payment) == 1 and payment[0]['primitive'] == 'source_mutation'
     assert len(dedupe) == 1 and dedupe[0]['primitive'] == 'cleanup'
+    shadow = [
+        entry
+        for entry in by_path['main.py']
+        if entry['symbol'] == 'main' and entry['surface'] == 'entitlement_readonly_shadow'
+    ]
+    assert len(shadow) == 1 and shadow[0]['primitive'] == 'observation'
 
 
 def test_writer_closure_artifact_is_reproducible() -> None:
@@ -143,4 +152,5 @@ def test_baseline_current_union_has_no_unmapped_legacy_raw_or_startup_removal() 
     assert union['current_sha256'] == json.loads(INVENTORY.read_text(encoding='utf-8'))['sha256']
     assert union['sections']['raw_endpoints']['removed_or_renamed'] == []
     assert union['sections']['startup_registrations']['removed_or_renamed'] == []
-    assert union['sections']['startup_registrations']['new'] == []
+    assert len(union['sections']['startup_registrations']['new']) == 1
+    assert 'entitlement_shadow_service.run' in union['sections']['startup_registrations']['new'][0]['signature']['call']

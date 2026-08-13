@@ -1,35 +1,30 @@
-# Next owner gate — do not execute from Gate 1
+# Next owner gate — Gate 2 dormant code deploy only
 
-Gate 1 ends with an evidence-backed decision only about a **future separate
-shadow deploy**. It does not authorize migration, deploy or any flag change.
+Gate 1 is deployed at exact `80bf7e7262e174ef8fa6ada0dcce503571c6395e`
+and schema `0103`. Gate 2 candidate preparation does not authorize PR merge,
+deploy or any flag change.
 
-## Exact next gate: owner-approved shadow release preparation
+## Exact next gate: owner-approved dormant Gate 2 code deploy
 
-The owner has authorized preparation and review, not migration or deploy. After
-the exact committed candidate SHA and both independent verdicts are reported,
-the owner must separately approve all of the following:
+After the exact candidate SHA, exact-SHA CI and both independent verdicts are
+reported, the owner may separately approve only:
 
-1. a release card and fresh comparison against then-current `origin/main`;
-2. protected migration workflow approval for additive `0103`, including a new
-   backup/restore check if the SHA/schema/environment changed;
-3. deployment with all checkout/projector/ready-notification switches still
-   false;
-4. only then, a separate explicit approval to enable the read-only shadow flag;
-5. redacted metrics/retention/stop thresholds and an observation window that
-   covers renewal, grace, daily jobs and reordered webhooks;
-6. proof that shadow emitted zero POST/PATCH/DELETE, changed no checkout,
-   finance, AP, legacy projection or notification behaviour, and leaked no PII.
+1. a protected PR merge and code-only deploy with all four entitlement flags
+   false and the shadow kill switch true;
+2. no migration: live schema must remain exactly `0103` and all dormant tables
+   empty;
+3. post-deploy health, logs, one legacy worker, no shadow/projector task, no
+   Panel mutation and unchanged checkout/AP/payment/webhook/notification flows.
 
-Stop immediately on any shadow mutation, provenance last-write-wins, schema
-ambiguity, PII/raw response, comparator instability or unexpected legacy
-behaviour. Rollback is shadow-flag disable; schema stays additive. If the old
-container itself must be restored, use only the captured protected migration
-recovery record: the pinned old image starts with `SKIP_MIGRATION=true` on the
-unchanged additive schema and must pass its exact health/startup/schema gates.
-The protected workflow records `OLD_IMAGE_TARGET_SCHEMA_COMPATIBLE` and writes
-the truthful v2 phase `recovered` only after exact state and keyed audit are
-durable; ordinary deploy remains blocked on `prepared` or contradictory state.
-Do not perform an ad-hoc production downgrade.
+Only after that evidence may the owner consider another explicit decision to
+set `SHADOW=true` and `KILL_SWITCH=false` for the bounded observation window in
+[the Gate 2 release card](gate2-shadow-release-card.md). That enablement is not
+part of the dormant deploy request.
+
+Stop immediately on any mutation, schema/flag/SHA ambiguity, PII/raw response,
+unexpected worker or legacy regression. A dormant code rollback is an ordinary
+protected revert; schema remains `0103`. Do not downgrade or run the migration
+workflow for Gate 2.
 
 ## Later gates, still forbidden
 

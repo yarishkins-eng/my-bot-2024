@@ -67,6 +67,41 @@ def test_normalizer_rejects_missing_empty_null_fields_and_naive_expiry() -> None
         snapshot(expire_at=datetime(2026, 8, 13))
 
 
+@pytest.mark.parametrize(
+    ('field', 'invalid'),
+    [
+        ('traffic_limit_bytes', False),
+        ('generation', True),
+        ('reset_epoch', '0'),
+        ('hwid_device_limit', '2'),
+        ('internal_squads', 'squad-one'),
+        ('internal_squads', [1]),
+        ('deny_overlays', 'limited'),
+        ('panel_uuid', 123),
+        ('external_squad_uuid', False),
+        ('status', ['ACTIVE']),
+        ('expire_at', NOW),
+    ],
+)
+def test_exact_json_decoder_rejects_coercion_and_non_json_types(field: str, invalid: object) -> None:
+    value = snapshot().canonical()
+    value[field] = invalid
+    with pytest.raises(ValueError):
+        EntitlementSnapshot.from_mapping(value)
+
+
+def test_exact_json_decoder_rejects_unknown_keys_and_noncanonical_enums() -> None:
+    extra = snapshot().canonical()
+    extra['email'] = 'forbidden@example.test'
+    with pytest.raises(ValueError, match='unexpected exact'):
+        EntitlementSnapshot.from_mapping(extra)
+    for field, invalid in (('status', 'active'), ('traffic_limit_strategy', 'month')):
+        value = snapshot().canonical()
+        value[field] = invalid
+        with pytest.raises(ValueError, match='exact uppercase'):
+            EntitlementSnapshot.from_mapping(value)
+
+
 @pytest.mark.parametrize('kind', ['erasure', 'delete', 'reset', 'admin_block', 'channel_deny'])
 def test_hard_deny_precedence_over_limited_grace_and_paid(kind: str) -> None:
     result = reduce_authority(
@@ -188,5 +223,6 @@ def test_shadow_evaluator_is_pure_redacted_and_exact() -> None:
     drift = ReadOnlyShadowEvaluator.evaluate(desired, replace(snapshot(), status='DISABLED'))
     assert exact.state == 'exact' and exact.mismatch_fields == ()
     assert drift.state == 'drift' and drift.mismatch_fields == ('status',)
-    assert exact.desired_hash_prefix == desired.desired_hash[:12]
+    assert not hasattr(exact, 'desired_hash_prefix')
+    assert not hasattr(exact, 'observed_hash_prefix')
     assert 'owner-fingerprint' not in repr(exact)

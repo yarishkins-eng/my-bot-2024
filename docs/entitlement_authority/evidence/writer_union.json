@@ -1,6 +1,6 @@
 {
   "baseline_sha256": "724d620dd11f0b878d5d802bf8a8330c8d73cd8a75b09abf31bfd374190634c9",
-  "current_sha256": "a7ad53de0565ee3f0c6be9f48b19ae3c3baa6107386717b2a3ac0d957fe82269",
+  "current_sha256": "8c3771b2852fddc6550a3937e747db0658532869efc51d92c00e0c534fa883d4",
   "format": 1,
   "interpretation": "Every current entry is classified in writer_closure.json. Removed/renamed entries require an explicit mapping; this candidate has none for raw endpoints or startup registrations.",
   "sections": {
@@ -20,9 +20,17 @@
     },
     "field_literals": {
       "baseline_count": 532,
-      "current_count": 551,
+      "current_count": 576,
       "new": [
         {
+          "count": 2,
+          "signature": {
+            "field": "activeInternalSquads",
+            "function": "_convert",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
+          }
+        },
+        {
           "count": 1,
           "signature": {
             "field": "activeInternalSquads",
@@ -34,8 +42,24 @@
           "count": 1,
           "signature": {
             "field": "activeInternalSquads",
+            "function": "get_user_by_uuid_shadow_once",
+            "path": "app/external/remnawave_api.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "activeInternalSquads",
             "function": "normalize_panel_observation",
             "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 2,
+          "signature": {
+            "field": "expireAt",
+            "function": "_convert",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
           }
         },
         {
@@ -50,8 +74,24 @@
           "count": 1,
           "signature": {
             "field": "expireAt",
+            "function": "get_user_by_uuid_shadow_once",
+            "path": "app/external/remnawave_api.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "expireAt",
             "function": "normalize_panel_observation",
             "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 2,
+          "signature": {
+            "field": "externalSquadUuid",
+            "function": "_convert",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
           }
         },
         {
@@ -66,8 +106,24 @@
           "count": 1,
           "signature": {
             "field": "externalSquadUuid",
+            "function": "get_user_by_uuid_shadow_once",
+            "path": "app/external/remnawave_api.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "externalSquadUuid",
             "function": "normalize_panel_observation",
             "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 2,
+          "signature": {
+            "field": "hwidDeviceLimit",
+            "function": "_convert",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
           }
         },
         {
@@ -76,6 +132,14 @@
             "field": "hwidDeviceLimit",
             "function": "_payload",
             "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "hwidDeviceLimit",
+            "function": "get_user_by_uuid_shadow_once",
+            "path": "app/external/remnawave_api.py"
           }
         },
         {
@@ -90,8 +154,32 @@
           "count": 1,
           "signature": {
             "field": "status",
+            "function": "<module>",
+            "path": "app/services/entitlement_authority/shadow.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "status",
             "function": "__post_init__",
             "path": "app/services/entitlement_authority/types.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "status",
+            "function": "_candidate_from_row",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
+          }
+        },
+        {
+          "count": 2,
+          "signature": {
+            "field": "status",
+            "function": "_convert",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
           }
         },
         {
@@ -111,11 +199,19 @@
           }
         },
         {
-          "count": 2,
+          "count": 3,
           "signature": {
             "field": "status",
             "function": "from_mapping",
             "path": "app/services/entitlement_authority/types.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "status",
+            "function": "get_user_by_uuid_shadow_once",
+            "path": "app/external/remnawave_api.py"
           }
         },
         {
@@ -124,6 +220,22 @@
             "field": "status",
             "function": "normalize_panel_observation",
             "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "status",
+            "function": "normalize_shadow_observation",
+            "path": "app/services/entitlement_authority/shadow.py"
+          }
+        },
+        {
+          "count": 2,
+          "signature": {
+            "field": "trafficLimitBytes",
+            "function": "_convert",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
           }
         },
         {
@@ -138,8 +250,24 @@
           "count": 1,
           "signature": {
             "field": "trafficLimitBytes",
+            "function": "get_user_by_uuid_shadow_once",
+            "path": "app/external/remnawave_api.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "trafficLimitBytes",
             "function": "normalize_panel_observation",
             "path": "app/services/entitlement_authority/coordinator.py"
+          }
+        },
+        {
+          "count": 2,
+          "signature": {
+            "field": "trafficLimitStrategy",
+            "function": "_convert",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
           }
         },
         {
@@ -148,6 +276,14 @@
             "field": "trafficLimitStrategy",
             "function": "_payload",
             "path": "app/services/entitlement_authority/strict_panel.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "field": "trafficLimitStrategy",
+            "function": "get_user_by_uuid_shadow_once",
+            "path": "app/external/remnawave_api.py"
           }
         },
         {
@@ -164,8 +300,29 @@
     },
     "imports": {
       "baseline_count": 147,
-      "current_count": 147,
-      "new": [],
+      "current_count": 149,
+      "new": [
+        {
+          "count": 1,
+          "signature": {
+            "module": "app.external.remnawave_api",
+            "names": [
+              "RemnaWaveAPI"
+            ],
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "module": "app.services.remnawave_service",
+            "names": [
+              "RemnaWaveService"
+            ],
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
+          }
+        }
+      ],
       "removed_or_renamed": [],
       "unchanged_count": 147
     },
@@ -213,18 +370,52 @@
     },
     "reachable_writer_functions": {
       "baseline_count": 640,
-      "current_count": 640,
-      "new": [],
+      "current_count": 643,
+      "new": [
+        {
+          "count": 1,
+          "signature": {
+            "decorators": [],
+            "name": "get_rules_sync",
+            "path": "app/localization/texts.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "decorators": [],
+            "name": "run",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
+          }
+        },
+        {
+          "count": 1,
+          "signature": {
+            "decorators": [],
+            "name": "run_once",
+            "path": "app/services/entitlement_authority/shadow_runtime.py"
+          }
+        }
+      ],
       "removed_or_renamed": [],
       "unchanged_count": 640
     },
     "startup_registrations": {
       "baseline_count": 61,
-      "current_count": 61,
-      "new": [],
+      "current_count": 62,
+      "new": [
+        {
+          "count": 1,
+          "signature": {
+            "call": "asyncio.create_task(entitlement_shadow_service.run())",
+            "function": "main",
+            "path": "main.py"
+          }
+        }
+      ],
       "removed_or_renamed": [],
       "unchanged_count": 61
     }
   },
-  "sha256": "beaf151264afbf68b060a91e6cbbefbf805e2f0247072ff2672375ea118c8d4c"
+  "sha256": "449d664af540244ec96117ef679de3b6d4ab9f13b88d2fc50021d174e5a54fdb"
 }

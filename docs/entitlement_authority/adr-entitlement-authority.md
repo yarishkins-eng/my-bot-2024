@@ -1,6 +1,6 @@
 # ADR: dormant single entitlement authority
 
-Status: **owner decisions approved; Gate 1 implementation only**.
+Status: **Gate 1 deployed; Gate 2 read-only shadow candidate preparation**.
 
 ## Identity and authority
 
@@ -90,6 +90,12 @@ durable erasure markers still prevent a second cleanup lifecycle from starting.
 
 ## Consequences
 
-Gate 1 is intentionally not wired to production writers, checkout,
-notifications or account-erasure routes. Those integrations and any runtime
-enablement require the next separately approved shadow/cutover gates.
+Gate 2 may wire only a double-interlocked read-only task: forced read-only SQL,
+one redacted rate-limited canonical GET, in-memory comparison and anonymized
+aggregate metrics. It cannot persist an observation or invoke the coordinator.
+Checkout, projector and ready-notification integrations remain absent.
+
+The exact JSON decoder is strict before shadow comparison. The low-level UUID
+bind proof boundary and missing Panel CAS/ETag remain explicit writer-cutover
+blockers; a GET-only shadow does not relax them. Any runtime enablement or
+writer integration requires a later separate owner gate.
