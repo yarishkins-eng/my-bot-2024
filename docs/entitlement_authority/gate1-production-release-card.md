@@ -1,8 +1,14 @@
 # Gate 1 dormant foundation production release card
 
-Owner authorization: 2026-08-13. The protected workflow's `github.sha` is the
-exact release candidate and must match the independently reviewed final SHA and
-the then-current `origin/main`.
+Current authorization: candidate preparation and independent review only.
+Migration `0102 → 0103` and production deploy require a new explicit owner
+permission after the exact final SHA is reported. The protected workflow's
+`github.sha` must match that independently reviewed SHA and the then-current
+`origin/main`.
+
+The required recovery prerequisite is already deployed at exact SHA
+`5d972ef9d5dd0031d47c185ea23188287dc854c6`. This candidate must be its direct
+reviewable descendant; it must not replace or weaken the prerequisite.
 
 ## Allowed change
 
@@ -36,8 +42,9 @@ the then-current `origin/main`.
    admin bypass disabled.
 3. Fresh protected database backup with server/local size and SHA-256 equality;
    isolated restore must be revision `0102` and upgrade to `0103` successfully.
-4. Migration workflow inputs `BACKUP_RESTORE_VERIFIED`, `OWNER_APPROVED`, and
-   this release-card path.
+4. Fresh explicit owner permission after both exact-SHA reviews. Migration
+   workflow inputs `BACKUP_RESTORE_VERIFIED`, `OWNER_APPROVED`,
+   `OLD_IMAGE_TARGET_SCHEMA_COMPATIBLE`, and this release-card path.
 5. Post-deploy proof: deploy/source exact SHA, schema `0103`, healthy bot,
    PostgreSQL and Redis, clean startup/runtime logs, all four flags false, one
    existing `python main.py` worker only, no new entitlement-table rows, no new
@@ -55,5 +62,9 @@ nine new tables are empty, but it is not the production recovery procedure. If
 the candidate cannot run, use only `recover-after-migration.yml` and its exact
 captured recovery record: it pins the previous image, starts it with
 `SKIP_MIGRATION=true` on the unchanged additive `0103` schema, and verifies
-health, startup and revision. Never infer authority to downgrade ad hoc,
+health, startup and revision. A successful protected recovery writes exact
+deploy state and keyed audit before atomically changing the v2 journal from
+`prepared`/`completed` to the truthful phase `recovered`; a retry re-reads live
+source/image/schema and all durable markers. Ordinary deploy must stop on
+`prepared` or any contradiction. Never infer authority to downgrade ad hoc,
 restore user data or mutate RemnaWave from this card.

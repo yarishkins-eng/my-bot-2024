@@ -31,7 +31,10 @@ import tempfile as _tempfile
 os.environ.setdefault('BACKUP_LOCATION', _tempfile.mkdtemp(prefix='bedolaga_test_backups_'))
 
 # Создаём заглушки для драйверов, которых может не быть в окружении тестов.
-if not os.environ.get('ENTITLEMENT_AUTHORITY_TEST_DATABASE_URL'):
+if not (
+    os.environ.get('ENTITLEMENT_AUTHORITY_TEST_DATABASE_URL')
+    or os.environ.get('ENTITLEMENT_AUTHORITY_APP_DATABASE_URL')
+):
     sys.modules.setdefault('asyncpg', types.ModuleType('asyncpg'))
 sys.modules.setdefault('aiosqlite', types.ModuleType('aiosqlite'))
 

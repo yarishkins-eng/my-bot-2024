@@ -1,23 +1,26 @@
 # Gate 1 test and fault-injection report
 
-Environment: Python 3.13.14, PostgreSQL 17.10, Unix socket only on port 55441,
-separate schema-only test DB and full protected-restore DB. Panel is an
-in-process controllable fake; no production adapter exists in Gate 1.
+Environment: Python 3.13.14, PostgreSQL 17.10, Unix socket only on port 55449,
+full protected-restore DB at production revision `0102`. Panel is an in-process
+controllable fake; no production adapter exists in Gate 1.
 
 ## Results
 
 - Phase 0 defect evidence: `12 passed` (the unsafe legacy behaviour remains
   reproducible and was not weakened).
 - Gate 1 entitlement suite: `98 passed`, no skipped.
+- APP-URL-only real-PostgreSQL harness: `67 passed`, proving that the test
+  bootstrap does not replace `asyncpg` when only the application database URL
+  is configured.
 - Exact 37-file affected manifest: `653 passed`, no skipped.
 - Real-PostgreSQL concurrency/fault subset: five consecutive runs of
   `61 passed`, no skipped.
-- Full repository suite: `2474 passed, 5 skipped`; all five are existing
+- Full repository suite: `2529 passed, 5 skipped`; all five are existing
   `tests/integration/test_device_first_postgres_constraints.py` cases skipped
   because their separate optional `DEVICE_FIRST_TEST_DATABASE_URL` was not
   configured. They are outside `tests/entitlement_authority` and outside every
   mandatory Gate 1 scenario.
-- Standard no-database GitHub lint path: `2395 passed, 9 skipped`. Four
+- Standard no-database GitHub lint path: `2450 passed, 9 skipped`. Four
   entitlement PostgreSQL modules now explicitly skip at module collection when
   their isolated database URLs are absent; with the protected test URLs set,
   the same modules execute the mandatory Gate 1 matrix above with no skips.
@@ -25,6 +28,9 @@ in-process controllable fake; no production adapter exists in Gate 1.
 - Mypy 1.18.2 on 13 changed foundation/security/evidence modules: pass.
 - Old-image entitlement-related baseline: `42 passed` plus isolated ORM
   read/write probe against upgraded `0103` with startup migration disabled.
+  The deployed prerequisite `5d972ef9…` changes no application/runtime file
+  relative to the previously proved old base, so the same image compatibility
+  boundary applies.
 
 ## Mandatory scenarios
 

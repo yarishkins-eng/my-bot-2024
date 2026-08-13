@@ -1,7 +1,7 @@
 # Entitlement Authority — Gate 1 dormant foundation
 
-Scope: local, dormant implementation on clean base
-`bcfe945863e64d5922c4998cd4b047e7ea7516d4`, migration `0102 → 0103`.
+Scope: local, dormant implementation on the deployed recovery-prerequisite base
+`5d972ef9d5dd0031d47c185ea23188287dc854c6`, migration `0102 → 0103`.
 All four new flags default to `false`; no production callsite is switched to
 the strict gateway and no shadow/production deployment is part of this work.
 

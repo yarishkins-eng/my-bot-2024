@@ -5,8 +5,9 @@ shadow deploy**. It does not authorize migration, deploy or any flag change.
 
 ## Exact next gate: owner-approved shadow release preparation
 
-The owner must separately approve all of the following on an exact committed
-candidate SHA:
+The owner has authorized preparation and review, not migration or deploy. After
+the exact committed candidate SHA and both independent verdicts are reported,
+the owner must separately approve all of the following:
 
 1. a release card and fresh comparison against then-current `origin/main`;
 2. protected migration workflow approval for additive `0103`, including a new
@@ -25,6 +26,9 @@ behaviour. Rollback is shadow-flag disable; schema stays additive. If the old
 container itself must be restored, use only the captured protected migration
 recovery record: the pinned old image starts with `SKIP_MIGRATION=true` on the
 unchanged additive schema and must pass its exact health/startup/schema gates.
+The protected workflow records `OLD_IMAGE_TARGET_SCHEMA_COMPATIBLE` and writes
+the truthful v2 phase `recovered` only after exact state and keyed audit are
+durable; ordinary deploy remains blocked on `prepared` or contradictory state.
 Do not perform an ad-hoc production downgrade.
 
 ## Later gates, still forbidden

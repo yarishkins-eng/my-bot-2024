@@ -13,13 +13,13 @@
 ## Protected restore route
 
 - Fresh production backup artifact:
-  `/root/teplo-vpn-pre-release-backups/entitlement-gate1-20260812T212612Z.dump`
+  `entitlement-gate1-release-20260813T055154Z.dump`
 - Protected local copy outside Git:
-  `/Users/stanis/Тепло ВПН/.private-backups/entitlement-gate1-20260812T212612Z.dump`
-- Size: `928055` bytes; both SHA-256:
-  `c69f862c6810b5a6fdd5666fd5d259ee2e52ec5454b6d2db21a50086da6e3579`.
+  `/Users/stanis/Тепло ВПН/.private-backups/entitlement-gate1-release-20260813T055154Z.dump`
+- Size: `928196` bytes; server/local SHA-256:
+  `c6a0e82fcf5479426006b2a434001224e6304ade361e13d1305dae558ef4ad86`.
 - Server/local modes were `0600`; no table rows or PII were inspected.
-- Full custom-format restore succeeded into `entitlement_gate1_restore` on
+- Full custom-format restore succeeded into `gate1_v2_restore` on
   PostgreSQL 17.10, Unix socket only, `listen_addresses=''`.
 - Restored revision was exactly `0102`; archive metadata had 1,447 entries.
 
@@ -28,8 +28,9 @@
 - ✅ restore `0102 → 0103`.
 - ✅ all Gate 1 tests on upgraded schema.
 - ✅ empty `0103 → 0102`; all nine Gate 1 tables absent.
-- ✅ old base image (`bcfe945…`) entitlement-related baseline: `42 passed`,
-  plus synthetic ORM read/write on `0102`.
+- ✅ deployed prerequisite (`5d972ef…`) has no application/runtime diff from
+  the previously proved old base (`bcfe945…`); its entitlement-related baseline
+  remains `42 passed`, plus synthetic ORM read/write on `0102`.
 - ✅ repeat `0102 → 0103`; all nine tables present.
 - ✅ old-image model read/write on `0103` with startup migration deliberately
   skipped in the isolated probe; the application ignores additive tables.
@@ -38,7 +39,9 @@
   production recovery route. The protected `recover-after-migration.yml`
   instead pins the captured old image, sets `SKIP_MIGRATION=true`, verifies
   health/startup and permits it on the unchanged additive `0103` schema; this
-  is the old-image compatibility scenario proved above.
+  is the old-image compatibility scenario proved above. It writes exact
+  recovery deploy-state and target-keyed audit before atomically marking the
+  v2 journal `recovered`; partial `prepared` state is retried fail-closed.
 
 The complete empty migration cycle was repeated on both the schema-only test
 database and the protected production restore after the final migration
