@@ -112,6 +112,7 @@ deploy of the exact reviewed merge SHA. Shadow remains absent. Required checks:
 
 1. exact merge SHA/tree, exact-SHA CI and fresh reviewer/skeptic GO with
    `P0=0`, `P1=0`;
+   CI must run the dedicated real-Docker hard-kill/watchdog proof without skip;
 2. schema still `0103`; no migration, Compose, Dockerfile, app writer or
    business-flow file changed;
 3. production bot/PostgreSQL/Redis/HTTP/Telegram healthy; bot ID/start time

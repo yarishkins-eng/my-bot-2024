@@ -342,6 +342,7 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
     binary = tmp_path / 'sleeper'
     docker = _docker_path()
     compiler = shutil.which('cc')
+    require_real_docker = os.environ.get('TEPLO_REQUIRE_REAL_DOCKER_SHADOW_TEST') == '1'
     assert docker is not None and compiler is not None
     source.write_text('#include <unistd.h>\nint main(void) { sleep(300); return 0; }\n')
     compile_result = subprocess.run(  # noqa: S603 - fixed compiler and generated source
@@ -351,6 +352,8 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
         text=True,
     )
     if compile_result.returncode != 0:
+        if require_real_docker:
+            pytest.fail(f'static C runtime is required in CI: {compile_result.stderr}')
         pytest.skip('static C runtime is unavailable')
     dockerfile = tmp_path / 'Dockerfile'
     dockerfile.write_text('FROM scratch\nCOPY sleeper /sleeper\nENTRYPOINT ["/sleeper"]\n')

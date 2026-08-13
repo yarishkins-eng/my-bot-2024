@@ -29,3 +29,10 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -q
+
+      - name: Prove entitlement shadow hard-kill recovery with real Docker
+        if: >-
+          hashFiles('.github/scripts/watchdog-entitlement-shadow-bootstrap.sh') != ''
+        env:
+          TEPLO_REQUIRE_REAL_DOCKER_SHADOW_TEST: '1'
+        run: uv run pytest -q tests/workflows/test_entitlement_shadow_control_workflow.py -k real_docker_watchdog
