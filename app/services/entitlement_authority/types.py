@@ -12,6 +12,30 @@ _STATUSES = {'ACTIVE', 'DISABLED', 'LIMITED', 'EXPIRED'}
 _STRATEGIES = {'NO_RESET', 'DAY', 'WEEK', 'MONTH', 'MONTH_ROLLING'}
 
 
+def _json_string(value: object, field: str, *, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if type(value) is not str or not value:
+        raise ValueError(f'{field} must be a non-empty JSON string')
+    return value
+
+
+def _json_integer(value: object, field: str, *, nullable: bool = False) -> int | None:
+    if value is None and nullable:
+        return None
+    if type(value) is not int:
+        raise ValueError(f'{field} must be a JSON integer')
+    return value
+
+
+def _json_string_array(value: object, field: str) -> tuple[str, ...]:
+    if type(value) is not list:
+        raise ValueError(f'{field} must be a JSON array')
+    if any(type(item) is not str or not item for item in value):
+        raise ValueError(f'{field} must contain only non-empty JSON strings')
+    return tuple(value)
+
+
 def normalize_utc(value: datetime | str) -> datetime:
     parsed = datetime.fromisoformat(value.replace('Z', '+00:00')) if isinstance(value, str) else value
     if parsed.tzinfo is None:
@@ -113,23 +137,55 @@ class EntitlementSnapshot:
         missing = required - value.keys()
         if missing:
             raise ValueError(f'missing exact entitlement fields: {sorted(missing)}')
+        extra = value.keys() - required
+        if extra:
+            raise ValueError(f'unexpected exact entitlement fields: {sorted(extra)}')
+
+        owner_key = _json_string(value['owner_key'], 'owner_key')
+        panel_uuid = _json_string(value['panel_uuid'], 'panel_uuid', nullable=True)
+        status = _json_string(value['status'], 'status')
+        expire_at = _json_string(value['expire_at'], 'expire_at')
+        traffic_limit_bytes = _json_integer(value['traffic_limit_bytes'], 'traffic_limit_bytes')
+        traffic_limit_strategy = _json_string(value['traffic_limit_strategy'], 'traffic_limit_strategy')
+        hwid_device_limit = _json_integer(value['hwid_device_limit'], 'hwid_device_limit', nullable=True)
+        internal_squads = _json_string_array(value['internal_squads'], 'internal_squads')
+        external_squad_uuid = _json_string(
+            value['external_squad_uuid'],
+            'external_squad_uuid',
+            nullable=True,
+        )
+        provenance = _json_string(value['provenance'], 'provenance')
+        generation = _json_integer(value['generation'], 'generation')
+        reset_epoch = _json_integer(value['reset_epoch'], 'reset_epoch')
+        revoke_epoch = _json_integer(value['revoke_epoch'], 'revoke_epoch')
+        deny_overlays = _json_string_array(value['deny_overlays'], 'deny_overlays')
+
+        assert owner_key is not None
+        assert status is not None
+        assert expire_at is not None
+        assert traffic_limit_bytes is not None
+        assert traffic_limit_strategy is not None
+        assert provenance is not None
+        assert generation is not None
+        assert reset_epoch is not None
+        assert revoke_epoch is not None
+        if status != status.upper() or traffic_limit_strategy != traffic_limit_strategy.upper():
+            raise ValueError('status and traffic strategy must use their exact uppercase JSON values')
         return cls(
-            owner_key=str(value['owner_key']),
-            panel_uuid=str(value['panel_uuid']) if value['panel_uuid'] is not None else None,
-            status=str(value['status']),
-            expire_at=normalize_utc(value['expire_at']),
-            traffic_limit_bytes=int(value['traffic_limit_bytes']),
-            traffic_limit_strategy=str(value['traffic_limit_strategy']),
-            hwid_device_limit=(int(value['hwid_device_limit']) if value['hwid_device_limit'] is not None else None),
-            internal_squads=_uuid_set(value['internal_squads']),
-            external_squad_uuid=(
-                str(value['external_squad_uuid']) if value['external_squad_uuid'] is not None else None
-            ),
-            provenance=str(value['provenance']),
-            generation=int(value['generation']),
-            reset_epoch=int(value['reset_epoch']),
-            revoke_epoch=int(value['revoke_epoch']),
-            deny_overlays=tuple(str(item) for item in value['deny_overlays']),
+            owner_key=owner_key,
+            panel_uuid=panel_uuid,
+            status=status,
+            expire_at=normalize_utc(expire_at),
+            traffic_limit_bytes=traffic_limit_bytes,
+            traffic_limit_strategy=traffic_limit_strategy,
+            hwid_device_limit=hwid_device_limit,
+            internal_squads=internal_squads,
+            external_squad_uuid=external_squad_uuid,
+            provenance=provenance,
+            generation=generation,
+            reset_epoch=reset_epoch,
+            revoke_epoch=revoke_epoch,
+            deny_overlays=deny_overlays,
         )
 
 

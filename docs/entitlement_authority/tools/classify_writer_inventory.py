@@ -173,6 +173,12 @@ def _startup_binding(item: dict) -> tuple[str, str, str]:
         return ('metadata_only', 'version_check', 'release metadata polling only')
     if path == 'main.py' and 'maintenance_service.start_monitoring' in call:
         return ('metadata_only', 'bot_maintenance', 'bot availability monitor does not mutate VPN entitlement')
+    if path == 'main.py' and 'entitlement_shadow_service.run' in call:
+        return (
+            'observation',
+            'entitlement_readonly_shadow',
+            'double-interlocked task uses read-only SQL and redacted rate-limited Panel GET only',
+        )
     if 'device_first_recovery' in value or 'access_point_term_projection' in value:
         return ('project', 'legacy_projection_worker', 'durable projection worker can mutate access')
     if 'remnawave_retry_queue' in value:
@@ -196,6 +202,16 @@ def _startup_binding(item: dict) -> tuple[str, str, str]:
 
 def _general_binding(section: str, item: dict) -> tuple[str, str, str]:
     value = ' '.join(str(item.get(key, '')) for key in ('path', 'name', 'method', 'function', 'module')).lower()
+    if item['path'] == 'app/services/entitlement_authority/shadow_runtime.py' and section in {
+        'imports',
+        'reachable_writer_functions',
+        'reachable_writer_entrypoints',
+    }:
+        return (
+            'observation',
+            'entitlement_readonly_shadow',
+            'over-approximated call name is confined to read-only SQL and redacted GET adapter',
+        )
     if section == 'field_literals':
         if '/entitlement_authority/' in f'/{item["path"]}':
             return (

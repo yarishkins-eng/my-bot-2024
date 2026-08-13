@@ -171,6 +171,8 @@ async def main():
 
     web_app = None
     monitoring_task = None
+    entitlement_shadow_service = None
+    entitlement_shadow_task = None
     device_first_recovery_task = None
     maintenance_task = None
     version_check_task = None
@@ -635,6 +637,33 @@ async def main():
             stage.log(f'Интервал direct-sale recovery: {settings.get_device_first_recovery_worker_interval_seconds()}с')
 
         async with timeline.stage(
+            'Entitlement read-only shadow',
+            '🔎',
+            success_message='Read-only shadow запущен',
+        ) as stage:
+            if not settings.ENTITLEMENT_AUTHORITY_SHADOW_ENABLED:
+                stage.skip('SHADOW=false')
+            elif settings.ENTITLEMENT_AUTHORITY_SHADOW_KILL_SWITCH:
+                stage.skip('Kill switch активен')
+            else:
+                try:
+                    from app.services.entitlement_authority.shadow_runtime import (
+                        build_production_shadow_service,
+                    )
+
+                    entitlement_shadow_service = build_production_shadow_service()
+                    if entitlement_shadow_service is None:
+                        stage.skip('Read-only shadow не армирован')
+                    else:
+                        entitlement_shadow_task = asyncio.create_task(entitlement_shadow_service.run())
+                        stage.log('Only legacy DB reads + rate-limited RemnaWave GET; aggregate metrics only')
+                except Exception:
+                    entitlement_shadow_service = None
+                    entitlement_shadow_task = None
+                    logger.warning('entitlement_shadow_start_refused')
+                    stage.warning('Read-only shadow fail-closed; legacy runtime не затронут')
+
+        async with timeline.stage(
             'Служба техработ',
             '🛡️',
             success_message='Служба техработ запущена',
@@ -752,6 +781,7 @@ async def main():
 
         services_lines = [
             f'Мониторинг: {"Включен" if monitoring_task else "Отключен"}',
+            f'Read-only shadow: {"Включен" if entitlement_shadow_task else "Отключен"}',
             f'Техработы: {"Включен" if maintenance_task else "Отключен"}',
             f'Мониторинг трафика: {"Включен" if traffic_monitoring_task else "Отключен"}',
             f'Суточные подписки: {"Включен" if daily_subscription_task else "Отключен"}',
@@ -785,6 +815,14 @@ async def main():
                     if exception:
                         logger.error('Служба мониторинга завершилась с ошибкой', error=exception)
                         monitoring_task = asyncio.create_task(monitoring_service.start_monitoring())
+
+                if entitlement_shadow_task and entitlement_shadow_task.done():
+                    if entitlement_shadow_task.cancelled() or entitlement_shadow_task.exception():
+                        logger.warning('entitlement_shadow_stopped_fail_closed')
+                    else:
+                        logger.warning('entitlement_shadow_stopped_by_circuit')
+                    entitlement_shadow_task = None
+                    entitlement_shadow_service = None
 
                 if device_first_recovery_task and device_first_recovery_task.done():
                     exception = device_first_recovery_task.exception()
@@ -867,6 +905,16 @@ async def main():
             monitoring_task.cancel()
             try:
                 await monitoring_task
+            except asyncio.CancelledError:
+                pass
+
+        if entitlement_shadow_task and not entitlement_shadow_task.done():
+            logger.info('ℹ️ Остановка entitlement read-only shadow...')
+            if entitlement_shadow_service is not None:
+                entitlement_shadow_service.stop()
+            entitlement_shadow_task.cancel()
+            try:
+                await entitlement_shadow_task
             except asyncio.CancelledError:
                 pass
 

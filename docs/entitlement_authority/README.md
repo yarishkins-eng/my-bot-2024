@@ -1,9 +1,10 @@
 # Entitlement Authority — Gate 1 dormant foundation
 
-Scope: local, dormant implementation on the deployed recovery-prerequisite base
-`5d972ef9d5dd0031d47c185ea23188287dc854c6`, migration `0102 → 0103`.
-All four new flags default to `false`; no production callsite is switched to
-the strict gateway and no shadow/production deployment is part of this work.
+Gate 1 is deployed at `80bf7e7262e174ef8fa6ada0dcce503571c6395e`
+with schema `0103`. Gate 2 preparation adds a separately armed, read-only
+shadow candidate. All four entitlement flags still default to `false`, its
+independent kill switch defaults to `true`, and no production deployment or
+flag change is part of candidate preparation.
 
 ## Implemented boundary
 
@@ -21,8 +22,10 @@ the strict gateway and no shadow/production deployment is part of this work.
   require that exact value, and mismatch is quarantined without a sentinel.
 - Unknown remote outcomes and lease takeovers are observation-only and remain
   quarantined because RemnaWave 2.8.1 has no CAS/ETag.
-- Pure read-only shadow evaluator. It accepts no DB session or Panel client and
-  exposes only hash prefixes and mismatch field names.
+- Read-only shadow evaluator/runtime with a forced PostgreSQL read-only
+  transaction, a sequential rate-limited redacted Panel GET and aggregate-only
+  metrics. It emits no ID, UUID, owner proof, raw snapshot/response or stable
+  hash prefix and has no mutation interface.
 - Two-stage erasure removes new authority links/snapshots immediately, keeps
   only encrypted restricted cleanup locators until verified terminal cleanup,
   raises a durable 30-day operator alert, and deletes terminal evidence after
@@ -44,6 +47,7 @@ the strict gateway and no shadow/production deployment is part of this work.
 - [Production/backup audit](production-audit.md)
 - [Independent reviews](reviews.md)
 - [Next owner gate](next-cutover-gates.md)
+- [Gate 2 shadow release card](gate2-shadow-release-card.md)
 - `evidence/phase0_writer_inventory.json` — frozen Phase 0 baseline
 - `evidence/writer_inventory.json` / `writer_closure.json` / `writer_union.json`
 - `evidence/gate1_affected_test_manifest.txt`

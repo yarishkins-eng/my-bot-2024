@@ -3,6 +3,7 @@ import base64
 import json
 import ssl
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -446,6 +447,8 @@ class RemnaWaveAPI:
         *,
         log_endpoint: str | None = None,
         redact_error_details: bool = False,
+        log_http_errors_as_warning: bool = False,
+        max_retries: int = 3,
     ) -> dict:
         if not self.session:
             raise RemnaWaveAPIError('Session not initialized. Use async context manager.')
@@ -456,7 +459,8 @@ class RemnaWaveAPI:
         # retain or publish it.  Callers opt in explicitly; normal API calls
         # preserve their established diagnostics.
         safe_endpoint = log_endpoint or endpoint
-        max_retries = 3
+        if not 0 <= max_retries <= 3:
+            raise ValueError('max_retries must be between zero and three')
         base_delay = 1.0
 
         for attempt in range(max_retries + 1):
@@ -506,7 +510,12 @@ class RemnaWaveAPI:
                         is_not_found = response.status == 404
                         log = (
                             logger.warning
-                            if response.status in (502, 503, 504) or is_harmless or is_not_found
+                            if (
+                                log_http_errors_as_warning
+                                or response.status in (502, 503, 504)
+                                or is_harmless
+                                or is_not_found
+                            )
                             else logger.error
                         )
                         log('API Error %s: %s', response.status, error_message)
@@ -639,6 +648,47 @@ class RemnaWaveAPI:
             return await self.enrich_user_with_happ_link(user)
         except RemnaWaveAPIError as e:
             if e.status_code == 404:
+                return None
+            raise
+
+    async def get_user_by_uuid_shadow_once(self, uuid: str) -> dict[str, object] | None:
+        """One redacted GET for the rate-limited entitlement shadow.
+
+        Unlike the legacy helper, this method performs no retry and no
+        subscription-link enrichment.  It cannot issue a mutating verb.
+        """
+
+        try:
+            response = await self._make_request(
+                'GET',
+                f'/api/users/{uuid}',
+                log_endpoint='/api/users/{redacted-shadow-uuid}',
+                redact_error_details=True,
+                log_http_errors_as_warning=True,
+                max_retries=0,
+            )
+            if not isinstance(response, Mapping):
+                return {}
+            raw = response.get('response')
+            if not isinstance(raw, Mapping):
+                return {}
+            # Return only comparison fields.  Names, e-mail, subscription URLs,
+            # credentials, traffic history and raw payload keys are discarded
+            # at the transport boundary and cannot reach metrics or exceptions.
+            allowed = (
+                'uuid',
+                'telegramId',
+                'status',
+                'expireAt',
+                'trafficLimitBytes',
+                'trafficLimitStrategy',
+                'hwidDeviceLimit',
+                'activeInternalSquads',
+                'externalSquadUuid',
+            )
+            return {key: raw[key] for key in allowed if key in raw}
+        except RemnaWaveAPIError as error:
+            if error.status_code == 404:
                 return None
             raise
 

@@ -1884,25 +1884,19 @@
   "counts": {
     "calls": 235,
     "definitions": 47,
-    "field_literals": 551,
-    "imports": 147,
+    "field_literals": 576,
+    "imports": 149,
     "raw_endpoints": 47,
     "reachable_writer_entrypoints": 391,
-    "reachable_writer_functions": 640,
-    "startup_registrations": 61,
+    "reachable_writer_functions": 643,
+    "startup_registrations": 62,
     "unknown_raw_requests": 0
   },
   "definitions": [
     {
       "async": true,
-      "line": 1012,
-      "name": "create_external_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "async": true,
-      "line": 1017,
-      "name": "update_external_squad",
+      "line": 1006,
+      "name": "delete_internal_squad",
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -1919,14 +1913,20 @@
     },
     {
       "async": true,
-      "line": 1050,
-      "name": "delete_external_squad",
+      "line": 1025,
+      "name": "add_users_to_internal_squad",
       "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
-      "line": 1055,
-      "name": "add_users_to_external_squad",
+      "line": 1030,
+      "name": "remove_users_from_internal_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "async": true,
+      "line": 1035,
+      "name": "reorder_internal_squads",
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -1937,14 +1937,26 @@
     },
     {
       "async": true,
-      "line": 1060,
-      "name": "remove_users_from_external_squad",
+      "line": 1062,
+      "name": "create_external_squad",
       "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
-      "line": 1065,
-      "name": "reorder_external_squads",
+      "line": 1067,
+      "name": "update_external_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "async": true,
+      "line": 1100,
+      "name": "delete_external_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "async": true,
+      "line": 1105,
+      "name": "add_users_to_external_squad",
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -1952,6 +1964,18 @@
       "line": 1108,
       "name": "_handle_user_enabled",
       "path": "app/services/remnawave_webhook_service.py"
+    },
+    {
+      "async": true,
+      "line": 1110,
+      "name": "remove_users_from_external_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "async": true,
+      "line": 1115,
+      "name": "reorder_external_squads",
+      "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
@@ -1991,14 +2015,8 @@
     },
     {
       "async": true,
-      "line": 1465,
+      "line": 1515,
       "name": "reset_user_devices",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "async": true,
-      "line": 1490,
-      "name": "remove_device",
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2006,6 +2024,12 @@
       "line": 1517,
       "name": "_handle_user_revoked",
       "path": "app/services/remnawave_webhook_service.py"
+    },
+    {
+      "async": true,
+      "line": 1540,
+      "name": "remove_device",
+      "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
@@ -2069,7 +2093,7 @@
     },
     {
       "async": true,
-      "line": 567,
+      "line": 576,
       "name": "create_user",
       "path": "app/external/remnawave_api.py"
     },
@@ -2081,38 +2105,32 @@
     },
     {
       "async": true,
-      "line": 709,
+      "line": 759,
       "name": "update_user",
       "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
-      "line": 773,
+      "line": 823,
       "name": "delete_user",
       "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
-      "line": 777,
+      "line": 827,
       "name": "enable_user",
       "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
-      "line": 782,
+      "line": 832,
       "name": "disable_user",
       "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
-      "line": 787,
+      "line": 837,
       "name": "reset_user_traffic",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "async": true,
-      "line": 792,
-      "name": "revoke_user_subscription",
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2120,6 +2138,12 @@
       "line": 840,
       "name": "disable_remnawave_user",
       "path": "app/services/subscription_service.py"
+    },
+    {
+      "async": true,
+      "line": 842,
+      "name": "revoke_user_subscription",
+      "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
@@ -2141,42 +2165,30 @@
     },
     {
       "async": true,
-      "line": 939,
+      "line": 989,
       "name": "create_internal_squad",
       "path": "app/external/remnawave_api.py"
     },
     {
       "async": true,
-      "line": 944,
+      "line": 994,
       "name": "update_internal_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "async": true,
-      "line": 956,
-      "name": "delete_internal_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "async": true,
-      "line": 975,
-      "name": "add_users_to_internal_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "async": true,
-      "line": 980,
-      "name": "remove_users_from_internal_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "async": true,
-      "line": 985,
-      "name": "reorder_internal_squads",
       "path": "app/external/remnawave_api.py"
     }
   ],
   "field_literals": [
+    {
+      "field": "activeInternalSquads",
+      "function": "_convert",
+      "line": 318,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "activeInternalSquads",
+      "function": "_convert",
+      "line": 330,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
     {
       "field": "activeInternalSquads",
       "function": "_create_subscription_from_panel_data",
@@ -2186,7 +2198,7 @@
     {
       "field": "activeInternalSquads",
       "function": "_parse_user",
-      "line": 1741,
+      "line": 1791,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2222,7 +2234,13 @@
     {
       "field": "activeInternalSquads",
       "function": "create_user",
-      "line": 601,
+      "line": 610,
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "field": "activeInternalSquads",
+      "function": "get_user_by_uuid_shadow_once",
+      "line": 686,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2288,8 +2306,20 @@
     {
       "field": "activeInternalSquads",
       "function": "update_user",
-      "line": 745,
+      "line": 795,
       "path": "app/external/remnawave_api.py"
+    },
+    {
+      "field": "expireAt",
+      "function": "_convert",
+      "line": 314,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "expireAt",
+      "function": "_convert",
+      "line": 326,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
     },
     {
       "field": "expireAt",
@@ -2306,7 +2336,7 @@
     {
       "field": "expireAt",
       "function": "_parse_user",
-      "line": 1734,
+      "line": 1784,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2342,7 +2372,13 @@
     {
       "field": "expireAt",
       "function": "create_user",
-      "line": 585,
+      "line": 594,
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "field": "expireAt",
+      "function": "get_user_by_uuid_shadow_once",
+      "line": 682,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2360,13 +2396,25 @@
     {
       "field": "expireAt",
       "function": "update_user",
-      "line": 733,
+      "line": 783,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "externalSquadUuid",
+      "function": "_convert",
+      "line": 319,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "externalSquadUuid",
+      "function": "_convert",
+      "line": 331,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "externalSquadUuid",
       "function": "_parse_user",
-      "line": 1753,
+      "line": 1803,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2378,19 +2426,25 @@
     {
       "field": "externalSquadUuid",
       "function": "create_user",
-      "line": 603,
+      "line": 612,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "externalSquadUuid",
       "function": "create_user",
-      "line": 616,
+      "line": 625,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "externalSquadUuid",
       "function": "create_user",
-      "line": 617,
+      "line": 626,
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "field": "externalSquadUuid",
+      "function": "get_user_by_uuid_shadow_once",
+      "line": 687,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2432,20 +2486,32 @@
     {
       "field": "externalSquadUuid",
       "function": "update_user",
-      "line": 747,
+      "line": 797,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "externalSquadUuid",
       "function": "update_user",
-      "line": 754,
+      "line": 804,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "externalSquadUuid",
       "function": "update_user",
-      "line": 755,
+      "line": 805,
       "path": "app/external/remnawave_api.py"
+    },
+    {
+      "field": "hwidDeviceLimit",
+      "function": "_convert",
+      "line": 317,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "hwidDeviceLimit",
+      "function": "_convert",
+      "line": 329,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
     },
     {
       "field": "hwidDeviceLimit",
@@ -2456,7 +2522,7 @@
     {
       "field": "hwidDeviceLimit",
       "function": "_parse_user",
-      "line": 1737,
+      "line": 1787,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2480,13 +2546,19 @@
     {
       "field": "hwidDeviceLimit",
       "function": "create_user",
-      "line": 595,
+      "line": 604,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "hwidDeviceLimit",
       "function": "create_user",
-      "line": 608,
+      "line": 617,
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "field": "hwidDeviceLimit",
+      "function": "get_user_by_uuid_shadow_once",
+      "line": 685,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -2504,8 +2576,14 @@
     {
       "field": "hwidDeviceLimit",
       "function": "update_user",
-      "line": 739,
+      "line": 789,
       "path": "app/external/remnawave_api.py"
+    },
+    {
+      "field": "status",
+      "function": "<module>",
+      "line": 12,
+      "path": "app/services/entitlement_authority/shadow.py"
     },
     {
       "field": "status",
@@ -2594,7 +2672,7 @@
     {
       "field": "status",
       "function": "__post_init__",
-      "line": 49,
+      "line": 73,
       "path": "app/services/entitlement_authority/types.py"
     },
     {
@@ -2650,6 +2728,24 @@
       "function": "_calculate_servers_price",
       "line": 473,
       "path": "app/services/pricing_engine.py"
+    },
+    {
+      "field": "status",
+      "function": "_candidate_from_row",
+      "line": 221,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "status",
+      "function": "_convert",
+      "line": 313,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "status",
+      "function": "_convert",
+      "line": 325,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
     },
     {
       "field": "status",
@@ -2780,7 +2876,7 @@
     {
       "field": "status",
       "function": "_parse_user",
-      "line": 1710,
+      "line": 1760,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -3218,7 +3314,7 @@
     {
       "field": "status",
       "function": "canonical",
-      "line": 80,
+      "line": 104,
       "path": "app/services/entitlement_authority/types.py"
     },
     {
@@ -3626,13 +3722,13 @@
     {
       "field": "status",
       "function": "create_user",
-      "line": 584,
+      "line": 593,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "status",
       "function": "create_user",
-      "line": 609,
+      "line": 618,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -3806,13 +3902,19 @@
     {
       "field": "status",
       "function": "from_mapping",
-      "line": 100,
+      "line": 124,
       "path": "app/services/entitlement_authority/types.py"
     },
     {
       "field": "status",
       "function": "from_mapping",
-      "line": 119,
+      "line": 146,
+      "path": "app/services/entitlement_authority/types.py"
+    },
+    {
+      "field": "status",
+      "function": "from_mapping",
+      "line": 146,
       "path": "app/services/entitlement_authority/types.py"
     },
     {
@@ -4072,6 +4174,12 @@
       "function": "get_user_activity_summary",
       "line": 1683,
       "path": "app/services/user_service.py"
+    },
+    {
+      "field": "status",
+      "function": "get_user_by_uuid_shadow_once",
+      "line": 681,
+      "path": "app/external/remnawave_api.py"
     },
     {
       "field": "status",
@@ -4444,6 +4552,12 @@
       "function": "normalize_panel_observation",
       "line": 43,
       "path": "app/services/entitlement_authority/coordinator.py"
+    },
+    {
+      "field": "status",
+      "function": "normalize_shadow_observation",
+      "line": 149,
+      "path": "app/services/entitlement_authority/shadow.py"
     },
     {
       "field": "status",
@@ -5222,7 +5336,7 @@
     {
       "field": "status",
       "function": "update_user",
-      "line": 727,
+      "line": 777,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -5383,6 +5497,18 @@
     },
     {
       "field": "trafficLimitBytes",
+      "function": "_convert",
+      "line": 315,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "trafficLimitBytes",
+      "function": "_convert",
+      "line": 327,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "trafficLimitBytes",
       "function": "_create_subscription_from_panel_data",
       "line": 2222,
       "path": "app/services/remnawave_service.py"
@@ -5396,19 +5522,19 @@
     {
       "field": "trafficLimitBytes",
       "function": "_parse_node",
-      "line": 1856,
+      "line": 1906,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "trafficLimitBytes",
       "function": "_parse_node",
-      "line": 1857,
+      "line": 1907,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "trafficLimitBytes",
       "function": "_parse_user",
-      "line": 1732,
+      "line": 1782,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -5432,7 +5558,13 @@
     {
       "field": "trafficLimitBytes",
       "function": "create_user",
-      "line": 586,
+      "line": 595,
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "field": "trafficLimitBytes",
+      "function": "get_user_by_uuid_shadow_once",
+      "line": 683,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -5450,13 +5582,25 @@
     {
       "field": "trafficLimitBytes",
       "function": "update_user",
-      "line": 729,
+      "line": 779,
       "path": "app/external/remnawave_api.py"
     },
     {
       "field": "trafficLimitStrategy",
+      "function": "_convert",
+      "line": 316,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "trafficLimitStrategy",
+      "function": "_convert",
+      "line": 328,
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "field": "trafficLimitStrategy",
       "function": "_parse_user",
-      "line": 1718,
+      "line": 1768,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -5468,7 +5612,13 @@
     {
       "field": "trafficLimitStrategy",
       "function": "create_user",
-      "line": 587,
+      "line": 596,
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "field": "trafficLimitStrategy",
+      "function": "get_user_by_uuid_shadow_once",
+      "line": 684,
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -5480,7 +5630,7 @@
     {
       "field": "trafficLimitStrategy",
       "function": "update_user",
-      "line": 731,
+      "line": 781,
       "path": "app/external/remnawave_api.py"
     }
   ],
@@ -5725,6 +5875,14 @@
       "line": 17,
       "module": "app.external.remnawave_api",
       "names": [
+        "RemnaWaveAPI"
+      ],
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "line": 17,
+      "module": "app.external.remnawave_api",
+      "names": [
         "RemnaWaveUser",
         "UserStatus"
       ],
@@ -5754,6 +5912,14 @@
         "RemnaWaveService"
       ],
       "path": "app/cabinet/routes/admin_traffic.py"
+    },
+    {
+      "line": 18,
+      "module": "app.services.remnawave_service",
+      "names": [
+        "RemnaWaveService"
+      ],
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
     },
     {
       "line": 18,
@@ -6766,7 +6932,7 @@
     {
       "endpoint": "'/api/external-squads'",
       "function": "create_external_squad",
-      "line": 1014,
+      "line": 1064,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6774,7 +6940,7 @@
     {
       "endpoint": "'/api/external-squads'",
       "function": "update_external_squad",
-      "line": 1047,
+      "line": 1097,
       "method": "PATCH",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6782,7 +6948,7 @@
     {
       "endpoint": "'/api/external-squads/actions/reorder'",
       "function": "reorder_external_squads",
-      "line": 1067,
+      "line": 1117,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6838,7 +7004,7 @@
     {
       "endpoint": "'/api/hwid/devices/delete'",
       "function": "remove_device",
-      "line": 1504,
+      "line": 1554,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6846,7 +7012,7 @@
     {
       "endpoint": "'/api/hwid/devices/delete'",
       "function": "reset_user_devices",
-      "line": 1479,
+      "line": 1529,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6854,7 +7020,7 @@
     {
       "endpoint": "'/api/internal-squads'",
       "function": "create_internal_squad",
-      "line": 941,
+      "line": 991,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6870,7 +7036,7 @@
     {
       "endpoint": "'/api/internal-squads'",
       "function": "update_internal_squad",
-      "line": 953,
+      "line": 1003,
       "method": "PATCH",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6886,7 +7052,7 @@
     {
       "endpoint": "'/api/internal-squads/actions/reorder'",
       "function": "reorder_internal_squads",
-      "line": 992,
+      "line": 1042,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6894,7 +7060,7 @@
     {
       "endpoint": "'/api/nodes/actions/restart-all'",
       "function": "restart_all_nodes",
-      "line": 1130,
+      "line": 1180,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6902,7 +7068,7 @@
     {
       "endpoint": "'/api/subscription-page-configs'",
       "function": "create_subscription_page_config",
-      "line": 1362,
+      "line": 1412,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6910,7 +7076,7 @@
     {
       "endpoint": "'/api/subscription-page-configs'",
       "function": "update_subscription_page_config",
-      "line": 1373,
+      "line": 1423,
       "method": "PATCH",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6918,7 +7084,7 @@
     {
       "endpoint": "'/api/subscription-page-configs/actions/clone'",
       "function": "clone_subscription_page_config",
-      "line": 1388,
+      "line": 1438,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6926,7 +7092,7 @@
     {
       "endpoint": "'/api/subscription-page-configs/actions/reorder'",
       "function": "reorder_subscription_page_configs",
-      "line": 1382,
+      "line": 1432,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6934,7 +7100,7 @@
     {
       "endpoint": "'/api/system/tools/happ/encrypt'",
       "function": "_encrypt_via_panel",
-      "line": 1576,
+      "line": 1626,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6950,7 +7116,7 @@
     {
       "endpoint": "'/api/users'",
       "function": "create_user",
-      "line": 612,
+      "line": 621,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6958,7 +7124,7 @@
     {
       "endpoint": "'/api/users'",
       "function": "create_user",
-      "line": 623,
+      "line": 632,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6974,7 +7140,7 @@
     {
       "endpoint": "'/api/users'",
       "function": "update_user",
-      "line": 750,
+      "line": 800,
       "method": "PATCH",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6982,7 +7148,7 @@
     {
       "endpoint": "'/api/users'",
       "function": "update_user",
-      "line": 761,
+      "line": 811,
       "method": "PATCH",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -6998,7 +7164,7 @@
     {
       "endpoint": "f'/api/external-squads/{uuid}'",
       "function": "delete_external_squad",
-      "line": 1052,
+      "line": 1102,
       "method": "DELETE",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7006,7 +7172,7 @@
     {
       "endpoint": "f'/api/external-squads/{uuid}/bulk-actions/add-users'",
       "function": "add_users_to_external_squad",
-      "line": 1057,
+      "line": 1107,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7014,7 +7180,7 @@
     {
       "endpoint": "f'/api/external-squads/{uuid}/bulk-actions/remove-users'",
       "function": "remove_users_from_external_squad",
-      "line": 1062,
+      "line": 1112,
       "method": "DELETE",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7038,7 +7204,7 @@
     {
       "endpoint": "f'/api/internal-squads/{uuid}'",
       "function": "delete_internal_squad",
-      "line": 957,
+      "line": 1007,
       "method": "DELETE",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7046,7 +7212,7 @@
     {
       "endpoint": "f'/api/internal-squads/{uuid}/bulk-actions/add-users'",
       "function": "add_users_to_internal_squad",
-      "line": 977,
+      "line": 1027,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7054,7 +7220,7 @@
     {
       "endpoint": "f'/api/internal-squads/{uuid}/bulk-actions/remove-users'",
       "function": "remove_users_from_internal_squad",
-      "line": 982,
+      "line": 1032,
       "method": "DELETE",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7062,7 +7228,7 @@
     {
       "endpoint": "f'/api/nodes/{uuid}/actions/disable'",
       "function": "disable_node",
-      "line": 1118,
+      "line": 1168,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7070,7 +7236,7 @@
     {
       "endpoint": "f'/api/nodes/{uuid}/actions/enable'",
       "function": "enable_node",
-      "line": 1114,
+      "line": 1164,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7078,7 +7244,7 @@
     {
       "endpoint": "f'/api/nodes/{uuid}/actions/restart'",
       "function": "restart_node",
-      "line": 1125,
+      "line": 1175,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7086,7 +7252,7 @@
     {
       "endpoint": "f'/api/subscription-page-configs/{uuid}'",
       "function": "delete_subscription_page_config",
-      "line": 1377,
+      "line": 1427,
       "method": "DELETE",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7102,7 +7268,7 @@
     {
       "endpoint": "f'/api/users/{uuid}'",
       "function": "delete_user",
-      "line": 774,
+      "line": 824,
       "method": "DELETE",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7110,7 +7276,7 @@
     {
       "endpoint": "f'/api/users/{uuid}/actions/disable'",
       "function": "disable_user",
-      "line": 783,
+      "line": 833,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7118,7 +7284,7 @@
     {
       "endpoint": "f'/api/users/{uuid}/actions/enable'",
       "function": "enable_user",
-      "line": 778,
+      "line": 828,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7126,7 +7292,7 @@
     {
       "endpoint": "f'/api/users/{uuid}/actions/reset-traffic'",
       "function": "reset_user_traffic",
-      "line": 788,
+      "line": 838,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -7134,7 +7300,7 @@
     {
       "endpoint": "f'/api/users/{uuid}/actions/revoke'",
       "function": "revoke_user_subscription",
-      "line": 809,
+      "line": 859,
       "method": "POST",
       "path": "app/external/remnawave_api.py",
       "transport": "_make_request"
@@ -12035,6 +12201,12 @@
     },
     {
       "decorators": [],
+      "line": 1006,
+      "name": "delete_internal_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
       "line": 1008,
       "name": "start_monitoring",
       "path": "app/services/traffic_monitoring_service.py"
@@ -12044,18 +12216,6 @@
       "line": 1010,
       "name": "show_info_page",
       "path": "app/handlers/menu.py"
-    },
-    {
-      "decorators": [],
-      "line": 1012,
-      "name": "create_external_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
-      "line": 1017,
-      "name": "update_external_squad",
-      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -12077,21 +12237,27 @@
     },
     {
       "decorators": [],
+      "line": 1025,
+      "name": "add_users_to_internal_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
+      "line": 1030,
+      "name": "remove_users_from_internal_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
+      "line": 1035,
+      "name": "reorder_internal_squads",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
       "line": 105,
       "name": "schedule_refresh",
       "path": "app/services/remnawave_sync_service.py"
-    },
-    {
-      "decorators": [],
-      "line": 1050,
-      "name": "delete_external_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
-      "line": 1055,
-      "name": "add_users_to_external_squad",
-      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -12107,14 +12273,14 @@
     },
     {
       "decorators": [],
-      "line": 1060,
-      "name": "remove_users_from_external_squad",
+      "line": 1062,
+      "name": "create_external_squad",
       "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
-      "line": 1065,
-      "name": "reorder_external_squads",
+      "line": 1067,
+      "name": "update_external_squad",
       "path": "app/external/remnawave_api.py"
     },
     {
@@ -12149,6 +12315,18 @@
     },
     {
       "decorators": [],
+      "line": 1100,
+      "name": "delete_external_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
+      "line": 1105,
+      "name": "add_users_to_external_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
       "line": 1108,
       "name": "_handle_user_enabled",
       "path": "app/services/remnawave_webhook_service.py"
@@ -12158,6 +12336,18 @@
       "line": 1109,
       "name": "delete_squad",
       "path": "app/services/remnawave_service.py"
+    },
+    {
+      "decorators": [],
+      "line": 1110,
+      "name": "remove_users_from_external_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
+      "line": 1115,
+      "name": "reorder_external_squads",
+      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -12395,12 +12585,6 @@
     },
     {
       "decorators": [],
-      "line": 1465,
-      "name": "reset_user_devices",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
       "line": 1466,
       "name": "confirm_add_devices",
       "path": "app/handlers/subscription/devices.py"
@@ -12416,12 +12600,6 @@
       "line": 1489,
       "name": "run_manual_check",
       "path": "app/services/payment_verification_service.py"
-    },
-    {
-      "decorators": [],
-      "line": 1490,
-      "name": "remove_device",
-      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -12473,6 +12651,12 @@
     },
     {
       "decorators": [],
+      "line": 1515,
+      "name": "reset_user_devices",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
       "line": 1517,
       "name": "_handle_user_revoked",
       "path": "app/services/remnawave_webhook_service.py"
@@ -12488,6 +12672,12 @@
       "line": 153,
       "name": "process_freekassa_webhook",
       "path": "app/services/payment/freekassa.py"
+    },
+    {
+      "decorators": [],
+      "line": 1540,
+      "name": "remove_device",
+      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -13103,6 +13293,12 @@
     },
     {
       "decorators": [],
+      "line": 267,
+      "name": "get_rules_sync",
+      "path": "app/localization/texts.py"
+    },
+    {
+      "decorators": [],
       "line": 27,
       "name": "__call__",
       "path": "app/middlewares/chat_type_filter.py"
@@ -13535,6 +13731,12 @@
     },
     {
       "decorators": [],
+      "line": 406,
+      "name": "run_once",
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "decorators": [],
       "line": 409,
       "name": "_access_point_term_projection_loop",
       "path": "app/services/monitoring_service.py"
@@ -13763,6 +13965,12 @@
     },
     {
       "decorators": [],
+      "line": 497,
+      "name": "run",
+      "path": "app/services/entitlement_authority/shadow_runtime.py"
+    },
+    {
+      "decorators": [],
       "line": 498,
       "name": "update_user",
       "path": "app/database/crud/user.py"
@@ -13913,12 +14121,6 @@
     },
     {
       "decorators": [],
-      "line": 567,
-      "name": "create_user",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
       "line": 57,
       "name": "process_webhook",
       "path": "app/external/tribute.py"
@@ -13928,6 +14130,12 @@
       "line": 575,
       "name": "check_overpay_payment_status",
       "path": "app/services/payment/overpay.py"
+    },
+    {
+      "decorators": [],
+      "line": 576,
+      "name": "create_user",
+      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -14069,12 +14277,6 @@
     },
     {
       "decorators": [],
-      "line": 709,
-      "name": "update_user",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
       "line": 71,
       "name": "create_faq_page",
       "path": "app/database/crud/faq.py"
@@ -14135,6 +14337,12 @@
     },
     {
       "decorators": [],
+      "line": 759,
+      "name": "update_user",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
       "line": 762,
       "name": "push_panel_state",
       "path": "app/services/subscription_service.py"
@@ -14147,33 +14355,9 @@
     },
     {
       "decorators": [],
-      "line": 773,
-      "name": "delete_user",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
-      "line": 777,
-      "name": "enable_user",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
-      "line": 782,
-      "name": "disable_user",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
       "line": 786,
       "name": "start",
       "path": "app/services/traffic_monitoring_service.py"
-    },
-    {
-      "decorators": [],
-      "line": 787,
-      "name": "reset_user_traffic",
-      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -14192,12 +14376,6 @@
       "line": 79,
       "name": "refresh_schedule",
       "path": "app/services/remnawave_sync_service.py"
-    },
-    {
-      "decorators": [],
-      "line": 792,
-      "name": "revoke_user_subscription",
-      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -14231,6 +14409,24 @@
     },
     {
       "decorators": [],
+      "line": 823,
+      "name": "delete_user",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
+      "line": 827,
+      "name": "enable_user",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
+      "line": 832,
+      "name": "disable_user",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
       "line": 836,
       "name": "_auto_purchase_tariff",
       "path": "app/services/subscription_auto_purchase_service.py"
@@ -14240,6 +14436,12 @@
       "line": 837,
       "name": "process_pending_financial_account_erasures",
       "path": "app/services/account_erasure_service.py"
+    },
+    {
+      "decorators": [],
+      "line": 837,
+      "name": "reset_user_traffic",
+      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -14264,6 +14466,12 @@
       "line": 840,
       "name": "disable_remnawave_user",
       "path": "app/services/subscription_service.py"
+    },
+    {
+      "decorators": [],
+      "line": 842,
+      "name": "revoke_user_subscription",
+      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -14363,12 +14571,6 @@
     },
     {
       "decorators": [],
-      "line": 939,
-      "name": "create_internal_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
       "line": 94,
       "name": "_handle_successful_payment",
       "path": "app/services/tribute_service.py"
@@ -14378,18 +14580,6 @@
       "line": 941,
       "name": "revoke_subscription",
       "path": "app/services/subscription_service.py"
-    },
-    {
-      "decorators": [],
-      "line": 944,
-      "name": "update_internal_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
-      "line": 956,
-      "name": "delete_internal_squad",
-      "path": "app/external/remnawave_api.py"
     },
     {
       "decorators": [],
@@ -14411,33 +14601,27 @@
     },
     {
       "decorators": [],
-      "line": 975,
-      "name": "add_users_to_internal_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
       "line": 98,
       "name": "delete_certificate",
       "path": "app/services/overpay_certificate_service.py"
     },
     {
       "decorators": [],
-      "line": 980,
-      "name": "remove_users_from_internal_squad",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
-      "line": 985,
-      "name": "reorder_internal_squads",
-      "path": "app/external/remnawave_api.py"
-    },
-    {
-      "decorators": [],
       "line": 986,
       "name": "submit_purchase",
       "path": "app/services/subscription_purchase_service.py"
+    },
+    {
+      "decorators": [],
+      "line": 989,
+      "name": "create_internal_squad",
+      "path": "app/external/remnawave_api.py"
+    },
+    {
+      "decorators": [],
+      "line": 994,
+      "name": "update_internal_squad",
+      "path": "app/external/remnawave_api.py"
     }
   ],
   "scope": "app/**/*.py",
@@ -14445,7 +14629,7 @@
     "app/**/*.py",
     "main.py"
   ],
-  "sha256": "a7ad53de0565ee3f0c6be9f48b19ae3c3baa6107386717b2a3ac0d957fe82269",
+  "sha256": "e455090e4d38db6903114a59fb318cfa1556cc0c2b1ea0a38d0be0024479a227",
   "startup_registrations": [
     {
       "call": "asyncio.create_task(                                     _refresh_remnawave_description(                                         remnawave_uuid=sub.remnawave_uuid,                                         description=description,                                         telegram_id=db_user.telegram_id",
@@ -14456,13 +14640,13 @@
     {
       "call": "asyncio.create_task(                                 daily_subscription_service.start_traffic_reset_monitoring()                             )",
       "function": "main",
-      "line": 830,
+      "line": 868,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(                                 traffic_monitoring_scheduler.start_monitoring()                             )",
       "function": "main",
-      "line": 815,
+      "line": 853,
       "path": "main.py"
     },
     {
@@ -14474,7 +14658,7 @@
     {
       "call": "asyncio.create_task(                     daily_subscription_service.start_traffic_reset_monitoring()                 )",
       "function": "main",
-      "line": 680,
+      "line": 709,
       "path": "main.py"
     },
     {
@@ -14594,61 +14778,67 @@
     {
       "call": "asyncio.create_task(daily_subscription_service.start_monitoring())",
       "function": "main",
-      "line": 673,
+      "line": 702,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(daily_subscription_service.start_monitoring())",
       "function": "main",
-      "line": 825,
+      "line": 863,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(dedupe_expired_tariff_subscriptions())",
       "function": "main",
-      "line": 460,
+      "line": 462,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(device_first_recovery_service.start(bot=bot))",
       "function": "main",
-      "line": 634,
+      "line": 636,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(device_first_recovery_service.start(bot=bot))",
       "function": "main",
-      "line": 793,
+      "line": 831,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(dp.start_polling(bot, skip_updates=False))",
       "function": "main",
-      "line": 703,
+      "line": 732,
+      "path": "main.py"
+    },
+    {
+      "call": "asyncio.create_task(entitlement_shadow_service.run())",
+      "function": "main",
+      "line": 658,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(maintenance_service.start_monitoring())",
       "function": "main",
-      "line": 646,
+      "line": 675,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(maintenance_service.start_monitoring())",
       "function": "main",
-      "line": 799,
+      "line": 837,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(monitoring_service.start_monitoring())",
       "function": "main",
-      "line": 626,
+      "line": 628,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(monitoring_service.start_monitoring())",
       "function": "main",
-      "line": 787,
+      "line": 817,
       "path": "main.py"
     },
     {
@@ -14780,31 +14970,31 @@
     {
       "call": "asyncio.create_task(traffic_monitoring_scheduler.start_monitoring())",
       "function": "main",
-      "line": 659,
+      "line": 688,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(version_service.start_periodic_check())",
       "function": "main",
-      "line": 691,
+      "line": 720,
       "path": "main.py"
     },
     {
       "call": "asyncio.create_task(version_service.start_periodic_check())",
       "function": "main",
-      "line": 807,
+      "line": 845,
       "path": "main.py"
     },
     {
       "call": "device_first_recovery_service.start(bot=bot)",
       "function": "main",
-      "line": 634,
+      "line": 636,
       "path": "main.py"
     },
     {
       "call": "device_first_recovery_service.start(bot=bot)",
       "function": "main",
-      "line": 793,
+      "line": 831,
       "path": "main.py"
     },
     {
