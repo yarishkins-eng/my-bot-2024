@@ -110,15 +110,15 @@ minimum ratio sample.
 
 ## Kill switch and recovery
 
-- Automatic: any threshold above ends the shadow task; `main.py` records the
-  fixed fail-closed state and never restarts it. A whole-cycle timeout cancels
-  the in-flight read path before recording `cycle_deadline_exceeded`.
-- Operator: keep/set `ENTITLEMENT_AUTHORITY_SHADOW_KILL_SWITCH=true` (or
-  `SHADOW=false`) only through the reviewed allowlisted
-  `control-entitlement-shadow.yml` workflow. The production `.env` remains a
-  permanent `SHADOW=false`/`KILL_SWITCH=true` baseline; the protected runtime
-  override is ephemeral. The double interlock prevents SHADOW alone from
-  starting. See `gate2-shadow-control-prerequisite-release-card.md`.
+- Automatic: any threshold above ends the isolated sidecar. It has Docker
+  restart policy `no`, so circuit STOP is durable across process, Docker and
+  host restarts. A seven-day host-owned lease is an additional hard limit.
+- Operator: `DISABLE_SHADOW` in the reviewed allowlisted
+  `control-entitlement-shadow.yml` workflow deletes only the lease and isolated
+  sidecar. It never restarts the production bot and has no dependency on bot
+  health, PostgreSQL, RemnaWave or `.env`. The production `.env` remains the
+  permanent `SHADOW=false`/`KILL_SWITCH=true` baseline. See
+  `gate2-shadow-control-prerequisite-release-card.md`.
 - Code rollback, if required, is a protected revert commit followed by
   `deploy-migration.yml`, because the revert still changes `main.py` and
   `app/config.py` and the ordinary deploy guard must stop it. Previous and

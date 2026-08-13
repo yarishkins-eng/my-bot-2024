@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Verify that dotenv cannot override the safe Gate 2 code defaults."""
+"""Fail closed when dotenv can influence the reviewed shadow contract."""
 
 from __future__ import annotations
 
 import argparse
-import re
 import stat
 import sys
 from pathlib import Path
 
 
-SAFE_BASELINE = {
-    'ENTITLEMENT_AUTHORITY_CHECKOUT_ADMISSION_ENABLED': 'false',
-    'ENTITLEMENT_AUTHORITY_PROJECTOR_ENABLED': 'false',
-    'ENTITLEMENT_AUTHORITY_READY_NOTIFICATIONS_ENABLED': 'false',
-    'ENTITLEMENT_AUTHORITY_SHADOW_ENABLED': 'false',
-    'ENTITLEMENT_AUTHORITY_SHADOW_KILL_SWITCH': 'true',
-}
-_ASSIGNMENT = re.compile(r'^([A-Z][A-Z0-9_]*)=(true|false)(?:\r?\n)?$')
+# Production currently has none of these names in dotenv.  Rejecting every
+# case-insensitive mention is deliberately stricter than attempting to emulate
+# the combined Docker Compose, python-dotenv and Pydantic parsing grammars.
+_FORBIDDEN_TOKENS = (
+    'ENTITLEMENT_AUTHORITY_CHECKOUT_ADMISSION_ENABLED',
+    'ENTITLEMENT_AUTHORITY_PROJECTOR_ENABLED',
+    'ENTITLEMENT_AUTHORITY_READY_NOTIFICATIONS_ENABLED',
+    'ENTITLEMENT_AUTHORITY_SHADOW_',
+    'MULTI_TARIFF_ENABLED',
+)
 
 
 class BaselineRefused(Exception):
@@ -42,20 +43,11 @@ def verify(path: Path) -> None:
     if b'\x00' in raw:
         raise BaselineRefused('env_contains_nul')
     try:
-        lines = raw.decode('utf-8').splitlines(keepends=True)
+        text = raw.decode('utf-8').upper()
     except UnicodeDecodeError as error:
         raise BaselineRefused('env_not_utf8') from error
-
-    values: dict[str, list[str]] = {key: [] for key in SAFE_BASELINE}
-    for line in lines:
-        match = _ASSIGNMENT.fullmatch(line)
-        if match is not None and match.group(1) in values:
-            values[match.group(1)].append(match.group(2))
-
-    if any(len(found) > 1 for found in values.values()):
-        raise BaselineRefused('managed_flag_duplicate')
-    if any(found and found[0] != SAFE_BASELINE[key] for key, found in values.items()):
-        raise BaselineRefused('managed_flag_not_safe')
+    if any(token in text for token in _FORBIDDEN_TOKENS):
+        raise BaselineRefused('managed_shadow_setting_present')
 
 
 def main() -> int:

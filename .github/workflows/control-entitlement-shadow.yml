@@ -1,8 +1,8 @@
 name: Control Gate 2 entitlement shadow
 
-# The production .env remains the permanent disabled baseline. This workflow
-# creates only a temporary, fixed Compose override for the existing bot image.
-# It never writes .env, the database, RemnaWave or user/business data.
+# ENABLE starts one isolated read-only sidecar from the exact deployed image.
+# DISABLE only removes its lease/container.  Neither action restarts the bot,
+# edits dotenv, touches DB/Panel, nor accepts arbitrary commands or values.
 
 on:
   workflow_dispatch:
@@ -15,15 +15,15 @@ on:
           - DISABLE_SHADOW
           - ENABLE_SHADOW
       expected_deployed_sha:
-        description: 'Exact 40-char production deploy-state SHA'
-        required: true
+        description: 'Required for ENABLE: exact 40-char production deploy-state SHA'
+        required: false
         type: string
       owner_go_no_go:
         description: 'Exact phrase: OWNER_APPROVED'
         required: true
         type: string
       release_card_reference:
-        description: 'Approved Gate 2 observation/stop record (no secrets)'
+        description: 'Approved Gate 2 observation/stop record (safe characters only)'
         required: true
         type: string
 
@@ -35,76 +35,166 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  enable_verify:
+    if: inputs.action == 'ENABLE_SHADOW'
     uses: ./.github/workflows/lint.yml
 
-  control:
-    needs: [verify]
+  enable:
+    if: inputs.action == 'ENABLE_SHADOW'
+    needs: [enable_verify]
     runs-on: ubuntu-latest
     environment: teplo-vpn-production-controlled-change
     timeout-minutes: 12
     steps:
-      - name: Validate protected shadow-control gate
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate exact current-main enable request
         env:
-          CONTROL_ACTION: ${{ inputs.action }}
           EXPECTED_DEPLOYED_SHA: ${{ inputs.expected_deployed_sha }}
           OWNER_GO_NO_GO: ${{ inputs.owner_go_no_go }}
           RELEASE_CARD_REFERENCE: ${{ inputs.release_card_reference }}
           TARGET_REF: ${{ github.ref }}
+          TARGET_SHA: ${{ github.sha }}
+          REQUEST_ACTOR: ${{ github.actor }}
         run: |
           set -Eeuo pipefail
-          case "$CONTROL_ACTION" in
-            ENABLE_SHADOW|DISABLE_SHADOW) ;;
-            *) exit 64 ;;
-          esac
-          [[ "$EXPECTED_DEPLOYED_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$OWNER_GO_NO_GO" = 'OWNER_APPROVED'
-          test -n "$RELEASE_CARD_REFERENCE"
           test "$TARGET_REF" = 'refs/heads/main'
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_DEPLOYED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REQUEST_ACTOR" =~ ^[A-Za-z0-9-]{1,39}$ ]]
+          [[ "$RELEASE_CARD_REFERENCE" =~ ^[A-Za-z0-9._:/@-]{1,160}$ ]]
+          test "$OWNER_GO_NO_GO" = 'OWNER_APPROVED'
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(git rev-parse origin/main)" = "$TARGET_SHA"
 
-      - name: Apply only the reviewed runtime transition
+      - name: Transfer only reviewed enable primitives
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: >-
+            .github/scripts/control-entitlement-shadow.sh,
+            .github/scripts/verify-entitlement-shadow-baseline.py,
+            .github/scripts/run-entitlement-shadow-sidecar.py,
+            .github/scripts/watchdog-entitlement-shadow-bootstrap.sh
+          target: /var/lib/teplo-vpn/deploy-state/entitlement-shadow-transfer-${{ github.run_id }}-${{ github.run_attempt }}
+          strip_components: 2
+
+      - name: Start only the isolated read-only sidecar
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         env:
-          CONTROL_ACTION: ${{ inputs.action }}
           TARGET_SHA: ${{ github.sha }}
           WORKFLOW_RUN_ID: ${{ github.run_id }}
           WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
-          CONTROL_SCRIPT_SHA256: ${{ hashFiles('.github/scripts/control-entitlement-shadow.sh') }}
-          CLASSIFIER_SHA256: ${{ hashFiles('.github/scripts/classify-entitlement-shadow-control.sh') }}
-          BASELINE_VERIFIER_SHA256: ${{ hashFiles('.github/scripts/verify-entitlement-shadow-baseline.py') }}
           EXPECTED_DEPLOYED_SHA: ${{ inputs.expected_deployed_sha }}
+          REQUEST_ACTOR: ${{ github.actor }}
+          RELEASE_CARD_REFERENCE: ${{ inputs.release_card_reference }}
+          CONTROL_SHA256: ${{ hashFiles('.github/scripts/control-entitlement-shadow.sh') }}
+          BASELINE_SHA256: ${{ hashFiles('.github/scripts/verify-entitlement-shadow-baseline.py') }}
+          SIDECAR_SHA256: ${{ hashFiles('.github/scripts/run-entitlement-shadow-sidecar.py') }}
+          WATCHDOG_SHA256: ${{ hashFiles('.github/scripts/watchdog-entitlement-shadow-bootstrap.sh') }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 10m
-          envs: CONTROL_ACTION,TARGET_SHA,WORKFLOW_RUN_ID,WORKFLOW_RUN_ATTEMPT,CONTROL_SCRIPT_SHA256,CLASSIFIER_SHA256,BASELINE_VERIFIER_SHA256,EXPECTED_DEPLOYED_SHA
+          envs: TARGET_SHA,WORKFLOW_RUN_ID,WORKFLOW_RUN_ATTEMPT,EXPECTED_DEPLOYED_SHA,REQUEST_ACTOR,RELEASE_CARD_REFERENCE,CONTROL_SHA256,BASELINE_SHA256,SIDECAR_SHA256,WATCHDOG_SHA256
           script: |
             set -Eeuo pipefail
             readonly REPO_DIR='/opt/remnawave-bedolaga-telegram-bot'
             readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'
-            readonly RUNTIME_DIR='/tmp/teplo-entitlement-shadow-control'
-            readonly CONTROL_SCRIPT="$RUNTIME_DIR/control-entitlement-shadow.sh"
-            readonly CLASSIFIER="$RUNTIME_DIR/classify-entitlement-shadow-control.sh"
-            readonly BASELINE_VERIFIER="$RUNTIME_DIR/verify-entitlement-shadow-baseline.py"
-            readonly RAW_BASE="https://raw.githubusercontent.com/${{ github.repository }}/${TARGET_SHA}/.github/scripts"
+            readonly TRANSFER_DIR="$STATE_DIR/entitlement-shadow-transfer-${WORKFLOW_RUN_ID}-${WORKFLOW_RUN_ATTEMPT}"
             cleanup() {
-              rm -f -- "$CONTROL_SCRIPT" "$CLASSIFIER" "$BASELINE_VERIFIER"
-              rmdir -- "$RUNTIME_DIR" 2>/dev/null || true
+              rm -f -- \
+                "$TRANSFER_DIR/control-entitlement-shadow.sh" \
+                "$TRANSFER_DIR/verify-entitlement-shadow-baseline.py" \
+                "$TRANSFER_DIR/run-entitlement-shadow-sidecar.py" \
+                "$TRANSFER_DIR/watchdog-entitlement-shadow-bootstrap.sh"
+              rmdir -- "$TRANSFER_DIR" 2>/dev/null || true
             }
             trap cleanup EXIT
-            umask 077
-            mkdir "$RUNTIME_DIR"
-            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-              "$RAW_BASE/control-entitlement-shadow.sh" --output "$CONTROL_SCRIPT"
-            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-              "$RAW_BASE/classify-entitlement-shadow-control.sh" --output "$CLASSIFIER"
-            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-              "$RAW_BASE/verify-entitlement-shadow-baseline.py" --output "$BASELINE_VERIFIER"
-            test "$(sha256sum "$CONTROL_SCRIPT" | awk '{ print $1 }')" = "$CONTROL_SCRIPT_SHA256"
-            test "$(sha256sum "$CLASSIFIER" | awk '{ print $1 }')" = "$CLASSIFIER_SHA256"
-            test "$(sha256sum "$BASELINE_VERIFIER" | awk '{ print $1 }')" = "$BASELINE_VERIFIER_SHA256"
-            chmod 700 "$CONTROL_SCRIPT" "$CLASSIFIER" "$BASELINE_VERIFIER"
-            "$CONTROL_SCRIPT" \
-              "$CONTROL_ACTION" "$TARGET_SHA" "$WORKFLOW_RUN_ID" "$WORKFLOW_RUN_ATTEMPT" \
-              "$REPO_DIR" "$STATE_DIR" "$EXPECTED_DEPLOYED_SHA" "$CLASSIFIER" "$BASELINE_VERIFIER"
+            test "$(sha256sum "$TRANSFER_DIR/control-entitlement-shadow.sh" | awk '{ print $1 }')" = "$CONTROL_SHA256"
+            test "$(sha256sum "$TRANSFER_DIR/verify-entitlement-shadow-baseline.py" | awk '{ print $1 }')" = "$BASELINE_SHA256"
+            test "$(sha256sum "$TRANSFER_DIR/run-entitlement-shadow-sidecar.py" | awk '{ print $1 }')" = "$SIDECAR_SHA256"
+            test "$(sha256sum "$TRANSFER_DIR/watchdog-entitlement-shadow-bootstrap.sh" | awk '{ print $1 }')" = "$WATCHDOG_SHA256"
+            chmod 700 "$TRANSFER_DIR"/*.sh "$TRANSFER_DIR"/*.py
+            "$TRANSFER_DIR/control-entitlement-shadow.sh" \
+              ENABLE_SHADOW "$TARGET_SHA" "$WORKFLOW_RUN_ID" "$WORKFLOW_RUN_ATTEMPT" \
+              "$EXPECTED_DEPLOYED_SHA" "$REQUEST_ACTOR" "$RELEASE_CARD_REFERENCE" \
+              "$REPO_DIR" "$STATE_DIR" \
+              "$TRANSFER_DIR/verify-entitlement-shadow-baseline.py" \
+              "$TRANSFER_DIR/run-entitlement-shadow-sidecar.py" \
+              "$TRANSFER_DIR/watchdog-entitlement-shadow-bootstrap.sh"
+
+  disable:
+    if: inputs.action == 'DISABLE_SHADOW'
+    runs-on: ubuntu-latest
+    environment: teplo-vpn-production-controlled-change
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate exact current-main emergency disable request
+        env:
+          OWNER_GO_NO_GO: ${{ inputs.owner_go_no_go }}
+          RELEASE_CARD_REFERENCE: ${{ inputs.release_card_reference }}
+          TARGET_REF: ${{ github.ref }}
+          TARGET_SHA: ${{ github.sha }}
+          REQUEST_ACTOR: ${{ github.actor }}
+        run: |
+          set -Eeuo pipefail
+          test "$TARGET_REF" = 'refs/heads/main'
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REQUEST_ACTOR" =~ ^[A-Za-z0-9-]{1,39}$ ]]
+          [[ "$RELEASE_CARD_REFERENCE" =~ ^[A-Za-z0-9._:/@-]{1,160}$ ]]
+          test "$OWNER_GO_NO_GO" = 'OWNER_APPROVED'
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(git rev-parse origin/main)" = "$TARGET_SHA"
+
+      - name: Transfer only the reviewed emergency disable primitive
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: .github/scripts/disable-entitlement-shadow.sh
+          target: /var/lib/teplo-vpn/deploy-state/entitlement-shadow-transfer-${{ github.run_id }}-${{ github.run_attempt }}
+          strip_components: 2
+
+      - name: Remove the shadow lease and sidecar only
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        env:
+          TARGET_SHA: ${{ github.sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REQUEST_ACTOR: ${{ github.actor }}
+          RELEASE_CARD_REFERENCE: ${{ inputs.release_card_reference }}
+          DISABLE_SHA256: ${{ hashFiles('.github/scripts/disable-entitlement-shadow.sh') }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 2m
+          envs: TARGET_SHA,WORKFLOW_RUN_ID,WORKFLOW_RUN_ATTEMPT,REQUEST_ACTOR,RELEASE_CARD_REFERENCE,DISABLE_SHA256
+          script: |
+            set -Eeuo pipefail
+            readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'
+            readonly RUNTIME_DIR='/var/lib/teplo-vpn/entitlement-shadow-runtime'
+            readonly TRANSFER_DIR="$STATE_DIR/entitlement-shadow-transfer-${WORKFLOW_RUN_ID}-${WORKFLOW_RUN_ATTEMPT}"
+            cleanup() {
+              rm -f -- "$TRANSFER_DIR/disable-entitlement-shadow.sh"
+              rmdir -- "$TRANSFER_DIR" 2>/dev/null || true
+            }
+            trap cleanup EXIT
+            test "$(sha256sum "$TRANSFER_DIR/disable-entitlement-shadow.sh" | awk '{ print $1 }')" = "$DISABLE_SHA256"
+            chmod 700 "$TRANSFER_DIR/disable-entitlement-shadow.sh"
+            "$TRANSFER_DIR/disable-entitlement-shadow.sh" \
+              "$TARGET_SHA" "$WORKFLOW_RUN_ID" "$WORKFLOW_RUN_ATTEMPT" \
+              "$REQUEST_ACTOR" "$RELEASE_CARD_REFERENCE" "$STATE_DIR" "$RUNTIME_DIR"

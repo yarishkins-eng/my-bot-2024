@@ -8,109 +8,126 @@ release of the protected control path only. It does **not** authorize
 
 ## Fixed control contract
 
-The workflow exposes exactly two choices:
+The manual workflow exposes exactly two choices under the protected
+`teplo-vpn-production-controlled-change` Environment:
 
-- `DISABLE_SHADOW`: runtime `SHADOW=false`, `KILL_SWITCH=true`;
-- `ENABLE_SHADOW`: runtime `SHADOW=true`, `KILL_SWITCH=false`.
+- `ENABLE_SHADOW`: starts one isolated read-only sidecar only after reusable
+  CI, exact-current-main/deploy/image/schema checks and first successful cycle;
+- `DISABLE_SHADOW`: removes the sidecar lease and fixed sidecar container only.
 
-Both choices hard-set checkout admission, projector and ready notifications to
-`false`. There is no arbitrary key, value, command, path or SHA input. The
-workflow is manual, serializes with production deploys, requires branch
-`main`, the protected `teplo-vpn-production-controlled-change` Environment,
-the exact owner phrase, the owner-supplied exact production deploy-state SHA
-and a non-secret release-card reference.
+There is no arbitrary key, value, command, path or image input. Both actions
+require `main`, the exact owner phrase, a strictly validated non-secret
+release-card reference and a recorded approval actor. Enable additionally
+requires the owner-supplied exact production deploy-state SHA. A stale workflow
+re-run is rejected because both jobs require their checked-out SHA to equal
+current `origin/main`.
 
-Both actions run the full reusable CI first and keep the same protected
-Environment approval and runtime preflight. If GitHub Actions or CI itself is
-unavailable, the safe state remains the permanent disabled `.env` baseline;
-no manual production mutation is authorized by this card.
+## Isolation boundary
 
-## State outside Git
+Shadow never runs inside `remnawave_bot`. Enable does not stop, recreate or
+restart that container and proves its ID, image and start time remain unchanged.
+The sidecar is created directly from the immutable running bot image ID with:
 
-The production `.env` is a permanent fail-closed baseline. The control path:
+- restart policy `no`;
+- read-only root filesystem and bounded tmpfs;
+- all Linux capabilities dropped and `no-new-privileges`;
+- memory, CPU and PID limits;
+- only the production DB and RemnaWave networks;
+- no Docker socket, bot data/log volume, Telegram token, payment credentials,
+  SMTP, Redis or cabinet secrets;
+- only the DB and RemnaWave credentials needed for read-only observation,
+  copied to a mode-`0600` temporary env file and deleted immediately after
+  container creation;
+- a fixed dummy `BOT_TOKEN`, because Settings requires the field although the
+  sidecar never constructs a Telegram bot.
 
-1. allows each managed variable to be absent (the reviewed code defaults) or
-   present exactly once;
-2. requires any explicit writer/shadow value to be `false` and an explicit
-   kill-switch value to be `true`;
-3. requires a regular UTF-8 file that is not group/world writable;
-4. records a SHA-256 fingerprint before runtime mutation;
-5. never writes, copies, prints or exports the file and proves the fingerprint
-   unchanged afterwards.
+The fixed reviewed matrix is hard-set and verified from the created container:
+all three writer flags `false`, shadow `true`, kill switch `false`,
+`MULTI_TARIFF_ENABLED=false`, 10% cohort, 18 identities per 15-minute cycle,
+12 sequential Panel GET/minute, 4-second Panel timeout, 180-second cycle limit
+and the reviewed numeric STOP thresholds. DB pool is limited to two
+connections with no overflow.
 
-The runtime transition uses a root-only temporary Compose override in
-`/var/lib/teplo-vpn/deploy-state`, never in the Git worktree. The fixed
-override contains only the five non-secret entitlement booleans. It is deleted
-after the transition. A keyed mode-`0600` audit records action, resulting mode,
-exact source SHA, unchanged image ID, GitHub run/attempt and completion time;
-it contains no user, payment, Panel or secret data.
+The sidecar entrypoint imports only the Gate 2 read-only service. Every scan
+uses a PostgreSQL READ ONLY transaction. Panel access is the reviewed redacted
+single GET without retry. It exits when its host-owned lease is missing,
+malformed, superseded or expired, and exits when the shadow service opens its
+circuit. Since restart policy is `no`, a circuit STOP remains stopped across
+Docker or host restarts.
 
-## Preflight and mutation boundary
+## Permanent baseline and policy control
 
-Before stopping the bot, the script proves:
+Production `.env` remains unchanged and permanently defaults to shadow off and
+kill switch on. The baseline verifier treats any case-insensitive mention of a
+writer/shadow/multi-tariff managed key as unsafe, including comments, quoted,
+`export`, whitespace and alternate boolean forms. It does not parse or print
+values. Existing unrelated traffic/device policy keys are permitted because
+the sidecar overrides and verifies the reviewed effective values. The script
+records and rechecks the `.env` SHA-256 fingerprint.
 
-- server Git worktree is exact; `origin/main` is the workflow SHA;
-- enabling uses the exact currently deployed main SHA; disabling may run when
-  deployed SHA is an ancestor of newer main;
-- deploy-state SHA/image equal the live source/image;
-- bot is healthy; enabling requires migration recovery journal `completed`,
-  while emergency disabling accepts only the known `prepared`, `completed` or
-  `recovered` phases;
-- PostgreSQL revision is exactly `0103`, read through `BEGIN READ ONLY`;
-- production `.env` is the safe baseline above.
+No code path writes `.env`, PostgreSQL, Redis, RemnaWave, payments, webhook,
+notifications, subscriptions or user/business data. The production bot is not
+addressed by any mutating Docker command.
 
-The transition stops only the bot service, force-creates it from the unchanged
-current image with the fixed override, proves the five effective environment
-values before start, starts it, waits for health and proves exactly one
-`python main.py`. Enabling additionally requires the startup marker
-`Read-only shadow запущен`; disabling requires `SHADOW=false`.
+## Durable bootstrap and hard-kill policy
 
-No image build/pull, Git checkout, migration, DDL/DML, Panel call, VPN-node
-restart, payment, webhook, notification or user-data action belongs to this
-path.
+Before creating the sidecar, Enable writes a five-minute prepared lease and
+arms an independent root-owned transient systemd watchdog. The shell ERR trap
+removes the lease and sidecar on ordinary failure. If the runner, SSH process
+or control shell is killed and the trap cannot run, the watchdog independently
+removes every sidecar whose lease did not reach a valid completed state.
 
-## Failure and interruption policy
+Enable waits for a real `entitlement_shadow_cycle`, refuses circuit/stopped/
+lease-loss markers, rechecks the unchanged bot, dotenv fingerprint and nine
+empty authority tables, then atomically changes the lease to `completed` with
+a seven-day expiry. The watchdog treats only that exact completed lease as the
+commit point and idempotently materializes the keyed/root-only audit if the
+workflow response is lost. A re-run recovers the same completed lease/audit;
+it never performs a second enable transition. Conflicting or orphan state is
+fail-closed.
 
-Any failure after mutation starts invokes a fixed disabled recovery using the
-same captured image and then verifies health, process count, logs, effective
-flags and unchanged `.env` fingerprint. The requested run still fails so the
-partial result is never reported as success. If safe disable cannot be
-proven, the bot container is stopped rather than leaving an unverified shadow
-runtime active.
+The sidecar checks the lease every two seconds. At seven days it exits and does
+not restart. Automatic circuit STOP also exits and does not restart. A new
+observation therefore always needs a new protected owner-approved Enable run.
 
-A runner/SSH/process kill cannot persist an enabled override: the override
-exists only in a root-only temporary directory and the production `.env`
-remains disabled. A killed run can temporarily leave the bot stopped or the
-current container running; the separately protected `DISABLE_SHADOW` action
-recreates and proves the safe disabled runtime. No automatic unreviewed
-takeover is attempted.
+## Emergency disable
 
-## Prerequisite release
+Disable deliberately skips reusable CI. It still requires current reviewed
+workflow code and protected Environment approval, but the production-side
+primitive does not depend on Git state, bot health, deploy-state, migration
+journal, PostgreSQL, Redis, RemnaWave or `.env`.
 
-The prerequisite is released by protected PR merge followed by the ordinary
-production deploy of the exact merge SHA. The ordinary deploy runs because
-the release-card update is part of the tracked source diff; it installs the
-workflow, scripts and tests while preserving the permanent disabled `.env`
-baseline.
-The ordinary deploy must complete healthy and prove:
+It acquires the dedicated control lock, stops the exact pending watchdog when
+identifiable, removes the lease first (causing self-termination), then removes
+only `teplo_entitlement_shadow`. It never addresses `remnawave_bot`. If Docker
+is unavailable after lease removal, it reports failure rather than falsely
+claiming success; restart policy `no` still prevents an old sidecar from
+returning when Docker restarts. The disable audit is keyed by workflow
+run/attempt and is idempotent under lost response/re-run.
 
-- exact source/deploy-state merge SHA and exact built image;
-- schema remains `0103`, no migration files changed;
-- all four entitlement flags remain `false`, kill switch remains `true`;
-- shadow task/metrics and authority workers remain absent;
-- all nine authority tables remain empty;
-- no Panel mutation or user/business-data mutation occurred.
+## Prerequisite release and verification
 
-After those checks, perform one protected `DISABLE_SHADOW` rehearsal only. It
-must recreate the same image in disabled mode, keep `.env` byte-identical,
-write a keyed audit and leave bot/PostgreSQL/Redis/HTTP/Telegram healthy. This
-is the dormant prerequisite release; it is not shadow observation.
+The prerequisite is released by protected PR merge and ordinary production
+deploy of the exact reviewed merge SHA. Shadow remains absent. Required checks:
 
-STOP on any SHA/image/schema/flag/baseline mismatch, Environment protection
-drift, `.env` fingerprint change, unexpected process, authority row, Panel
-mutation, missing audit, degraded health, PII/secrets in output, or inability
-to prove fail-safe disable.
+1. exact merge SHA/tree, exact-SHA CI and fresh reviewer/skeptic GO with
+   `P0=0`, `P1=0`;
+2. schema still `0103`; no migration, Compose, Dockerfile, app writer or
+   business-flow file changed;
+3. production bot/PostgreSQL/Redis/HTTP/Telegram healthy; bot ID/start time
+   stable during the separate disable rehearsal;
+4. all four production entitlement flags `false`, kill switch `true`;
+5. no shadow/projector/notification worker and all nine authority tables empty;
+6. Panel GET-only verification and zero release-related Panel mutation marker;
+7. one protected `DISABLE_SHADOW` rehearsal: absent lease/sidecar, keyed audit,
+   no bot restart, unchanged dotenv and unchanged business-state fingerprints.
 
-Only after exact-SHA reviewer and skeptic GO, successful prerequisite release
-and successful protected disable rehearsal may the owner issue a separate GO
-for `ENABLE_SHADOW` and the seven-day read-only observation window.
+STOP on any SHA/image/schema/Environment drift, changed `.env`, unexpected
+sidecar, bot restart, authority row, Panel mutation, user/business mutation,
+missing audit, secret/PII emission or inability to prove idempotent disable.
+
+After the dormant release and rehearsal, stop. `ENABLE_SHADOW`, the seven-day
+observation, canary, projector and writer cutover each require later separate
+owner decisions. The two known writer-cutover P2 blockers remain outside this
+prerequisite: durable receipt proof for `bind_uuid()` and lack of RemnaWave
+CAS/ETag.
