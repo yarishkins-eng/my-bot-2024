@@ -116,9 +116,11 @@ minimum ratio sample.
 - Operator: keep/set `ENTITLEMENT_AUTHORITY_SHADOW_KILL_SWITCH=true` (or
   `SHADOW=false`) through the protected environment and restart the existing
   bot deployment. The double interlock prevents SHADOW alone from starting.
-- Code rollback, if required, is an ordinary protected revert of the Gate 2
-  code. Schema stays `0103`; no downgrade, data repair or Panel action is part
-  of shadow recovery.
+- Code rollback, if required, is a protected revert commit followed by
+  `deploy-migration.yml`, because the revert still changes `main.py` and
+  `app/config.py` and the ordinary deploy guard must stop it. Previous and
+  target schema stay `0103`, so this recovery runs no Alembic DDL/DML; no
+  downgrade, data repair or Panel action is part of shadow recovery.
 
 ## Required evidence before any deploy
 
