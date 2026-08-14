@@ -299,8 +299,10 @@ if [ -r "$LEASE_FILE" ]; then
       "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$existing_run_attempt" \
       "$existing_watchdog_audit" "$existing_secret" "$existing_container_id"
     [ -r "$existing_audit" ] && cmp -s "$existing_audit" "$LEASE_FILE" || fail 'completed_audit_recovery_failed'
-    cp "$existing_audit" "$AUDIT_FILE"
-    chmod 600 "$AUDIT_FILE"
+    # The watchdog has already published the keyed and latest audit files with
+    # temp-file + atomic-rename semantics.  Do not copy the keyed file over the
+    # latest file here: a killed controller could truncate the durable receipt.
+    [ -r "$AUDIT_FILE" ] && cmp -s "$AUDIT_FILE" "$existing_audit" || fail 'latest_audit_recovery_failed'
     verify_bot_snapshot_unchanged "$BOT_CONTAINER_ID" "$CURRENT_IMAGE_ID" "$BOT_STARTED_AT"
     verify_sidecar_active "$existing_container_id" "$CURRENT_IMAGE_ID"
     printf 'Gate 2 isolated read-only shadow completion was recovered from its durable lease.\n'

@@ -165,6 +165,9 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     )[0]
     assert completed_recovery.index('verify_bot_snapshot_unchanged') < completed_recovery.index('exit 0')
     assert completed_recovery.index('verify_sidecar_active') < completed_recovery.index('exit 0')
+    assert 'cmp -s "$AUDIT_FILE" "$existing_audit"' in completed_recovery
+    assert 'cp "$existing_audit" "$AUDIT_FILE"' not in completed_recovery
+    assert 'chmod 600 "$AUDIT_FILE"' not in completed_recovery
     assert 'WATCHDOG_PENDING_UNIT' in source
     assert 'WATCHDOG_EXACT_UNIT' in source
     assert source.index('--unit="$WATCHDOG_EXACT_UNIT"') < source.rindex(
