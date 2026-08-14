@@ -92,7 +92,9 @@ ID before another Enable attempt.
 Enable waits for a real `entitlement_shadow_cycle` with `sampled > 0`, refuses circuit/stopped/
 lease-loss markers, rechecks the unchanged bot, dotenv fingerprint and nine
 empty authority tables, then atomically changes the lease to `completed` with
-a seven-day expiry. The watchdog treats only that exact completed lease as the
+a seven-day expiry. The lease also binds the original production bot container
+ID and start time, so lost-response recovery cannot silently accept a restarted
+or recreated bot as its new baseline. The watchdog treats only that exact completed lease as the
 commit point, arms a separate host-owned hard-expiry timer, and idempotently
 materializes both keyed and latest root-only audits if the workflow response is
 lost. A re-run (including a later run-attempt of the same GitHub run) recovers
@@ -110,6 +112,18 @@ absent and a disabled latest audit is durable. A receipt comparison I/O error
 is a STOP, not a mismatch. All production deploy/recovery routes refuse the
 marker, and an Enable recovery completes cleanup then requires a fresh
 owner-approved workflow run.
+
+Before controller-only final bot/sidecar validation, the controller arms an
+independent 60-second watchdog and atomically publishes
+`failed-enable-guard.state`. This is a cleanup-on-owner-death decision:
+SIGKILL after it is armed cannot leave a completed observation active. The
+watchdog uses the same guard around its own final post-audit snapshot. Keyed
+and latest receipts are published atomically before that guard, so a lost
+response during receipt publication remains recoverable; after the guard is
+armed, any owner death is fail-closed cleanup. A surviving owner removes only
+its exact guard after every final gate passes. An independent retry converts a
+surviving guard into the exact cleanup intent and finishes disablement. All
+production deploy/recovery routes refuse both markers.
 
 The sidecar checks the lease every two seconds. Independently, the host expiry
 timer removes that exact container generation at seven days, even if the
@@ -135,13 +149,15 @@ old generation's bootstrap/expiry timers. It never addresses
 `remnawave_bot`. If Docker is unavailable after lease removal, it reports
 failure rather than falsely claiming success; the helper retries, while
 restart policy `no` prevents an old sidecar from returning after a daemon
-restart. The disable audit is keyed by workflow run/attempt and is idempotent
+restart. Once fixed-name absence is proven, the helper also clears any
+interrupted failed-enable guard/cleanup marker, so emergency Disable does not
+leave every deploy path permanently blocked. The disable audit is keyed by workflow run/attempt and is idempotent
 under lost response/re-run.
 
 All four production image/schema switch workflows share the same concurrency
 group and contain an inline fail-closed guard. Ordinary, migration,
 infrastructure and migration-recovery deploys refuse to run while a shadow
-lease, disable/failed-enable cleanup marker or sidecar exists. Operators must
+lease, disable/failed-enable guard or cleanup marker, or sidecar exists. Operators must
 complete the appropriate cleanup first, so an observation can never silently
 continue against a newer source, image or schema.
 
@@ -171,7 +187,10 @@ absent. Required checks:
 
 1. exact merge SHA/tree, exact-SHA CI and fresh reviewer/skeptic GO with
    `P0=0`, `P1=0`;
-   CI must run the dedicated real-Docker hard-kill/watchdog proof without skip;
+   CI must run the dedicated real-Docker hard-kill/watchdog proof without skip:
+   it must actually SIGKILL a guard-owning controller process and prove that
+   an independent watchdog removes the real `restart=no` container and writes
+   disabled evidence;
 2. schema still `0103`; no migration, Compose, Dockerfile, app writer or
    business-flow file changed; production deploy/recovery workflow changes are
    limited to the active-shadow interlock and the protected source-only

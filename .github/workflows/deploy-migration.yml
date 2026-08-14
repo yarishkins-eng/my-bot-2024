@@ -121,6 +121,10 @@ jobs:
               echo 'Refusing migration deploy: a failed shadow enable cleanup is still in progress.' >&2
               exit 64
             }
+            test ! -e "$SHADOW_RUNTIME_DIR/failed-enable-guard.state" || {
+              echo 'Refusing migration deploy: a shadow finalization guard is still armed.' >&2
+              exit 64
+            }
             docker info >/dev/null 2>&1 || {
               echo 'Refusing migration deploy: Docker state cannot be verified.' >&2
               exit 64

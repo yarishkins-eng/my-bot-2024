@@ -21,6 +21,8 @@ readonly RUNTIME_DIR="$7"
 readonly SIDECAR='teplo_entitlement_shadow'
 readonly LEASE_FILE="$RUNTIME_DIR/lease.state"
 readonly DISABLE_TOMBSTONE_FILE="$RUNTIME_DIR/disable.state"
+readonly CLEANUP_INTENT_FILE="$RUNTIME_DIR/failed-enable-cleanup.state"
+readonly CONTROLLER_GUARD_FILE="$RUNTIME_DIR/failed-enable-guard.state"
 readonly AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.state"
 readonly RUN_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.audit"
 readonly LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"
@@ -65,6 +67,7 @@ install_helper() {
     'set -Eeuo pipefail' \
     'lease="$1"; tombstone="$2"; sidecar="$3"; expected_id="$4"; expected_run="$5"; expected_attempt="$6"; disable_run="$7"; disable_attempt="$8"' \
     'state="$(dirname "$0")"' \
+    'runtime="$(dirname "$lease")"' \
     'if [ "${TEPLO_SHADOW_CONTROL_LOCK_HELD:-0}" != 1 ]; then exec 9>"$state/bot-production.entitlement-shadow-control.lock"; flock -w 30 9 || exit 1; fi' \
     'tombstone_run="$(sed -n "s/^workflow_run_id=//p" "$tombstone" 2>/dev/null || true)"' \
     'tombstone_attempt="$(sed -n "s/^workflow_run_attempt=//p" "$tombstone" 2>/dev/null || true)"' \
@@ -92,6 +95,7 @@ install_helper() {
     'docker info >/dev/null 2>&1 || exit 1' \
     'remaining="$(docker container ls -a --no-trunc --filter "name=^/${sidecar}$" --format "{{.ID}}")" || exit 1' \
     '[ -z "$remaining" ] || exit 1' \
+    'rm -f -- "$runtime/failed-enable-cleanup.state" "$runtime/failed-enable-guard.state"' \
     'keyed="$state/bot-production.entitlement-shadow-control.${disable_run}.${disable_attempt}.audit"' \
     'latest="$state/bot-production.entitlement-shadow-control.state"' \
     'if [ -e "$keyed" ]; then' \
@@ -154,6 +158,8 @@ TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$HELPER" "$LEASE_FILE" "$DISABLE_TOMBSTONE_FIL
 docker info >/dev/null 2>&1 || fail 'docker_unavailable_after_lease_removal'
 ! docker inspect "$SIDECAR" >/dev/null 2>&1 || fail 'sidecar_still_present'
 [ ! -e "$DISABLE_TOMBSTONE_FILE" ] || fail 'disable_tombstone_still_present'
+[ ! -e "$CLEANUP_INTENT_FILE" ] || fail 'failed_enable_cleanup_intent_still_present'
+[ ! -e "$CONTROLLER_GUARD_FILE" ] || fail 'failed_enable_cleanup_guard_still_present'
 
 systemctl stop "${DISABLE_UNIT}.timer" "${DISABLE_UNIT}.service" >/dev/null 2>&1 || true
 if [ "$old_run_id" != 'none' ]; then

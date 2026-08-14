@@ -23,6 +23,7 @@ readonly EXPECTED_CONTAINER_ID="$8"
 readonly STATE_DIR="$(dirname "$AUDIT_FILE")"
 readonly RUNTIME_DIR="$(dirname "$LEASE_FILE")"
 readonly CLEANUP_INTENT_FILE="$RUNTIME_DIR/failed-enable-cleanup.state"
+readonly CONTROLLER_GUARD_FILE="$RUNTIME_DIR/failed-enable-guard.state"
 readonly RUN_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.audit"
 readonly LATEST_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.state"
 readonly LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"
@@ -72,6 +73,44 @@ cleanup_intent_is_exact() {
     [ "$(state_file_value "$CLEANUP_INTENT_FILE" policy_version || true)" = "$POLICY_VERSION" ] &&
     [ "$(state_file_value "$CLEANUP_INTENT_FILE" workflow_run_id || true)" = "$RUN_ID" ] &&
     [ "$(state_file_value "$CLEANUP_INTENT_FILE" workflow_run_attempt || true)" = "$RUN_ATTEMPT" ]
+}
+
+controller_guard_is_exact() {
+  [ -r "$CONTROLLER_GUARD_FILE" ] &&
+    [ "$(state_file_value "$CONTROLLER_GUARD_FILE" format_version || true)" = '2' ] &&
+    { [ "$(state_file_value "$CONTROLLER_GUARD_FILE" phase || true)" = 'prepared' ] ||
+      [ "$(state_file_value "$CONTROLLER_GUARD_FILE" phase || true)" = 'completed' ]; } &&
+    [ "$(state_file_value "$CONTROLLER_GUARD_FILE" action || true)" = 'ENABLE_SHADOW' ] &&
+    [ "$(state_file_value "$CONTROLLER_GUARD_FILE" policy_version || true)" = "$POLICY_VERSION" ] &&
+    [ "$(state_file_value "$CONTROLLER_GUARD_FILE" workflow_run_id || true)" = "$RUN_ID" ] &&
+    [ "$(state_file_value "$CONTROLLER_GUARD_FILE" workflow_run_attempt || true)" = "$RUN_ATTEMPT" ]
+}
+
+ensure_controller_guard() {
+  if [ -e "$CONTROLLER_GUARD_FILE" ]; then
+    controller_guard_is_exact
+    return
+  fi
+  [ -r "$LEASE_FILE" ] || return 1
+  [ "$(lease_generation)" = 'exact' ] || return 1
+  guard_tmp="$(mktemp "$RUNTIME_DIR/failed-enable-guard.XXXXXX")" || return 1
+  if ! cp "$LEASE_FILE" "$guard_tmp" || ! chmod 444 "$guard_tmp"; then
+    rm -f -- "$guard_tmp"
+    return 1
+  fi
+  if cmp -s "$guard_tmp" "$LEASE_FILE"; then
+    :
+  else
+    cmp_rc=$?
+    rm -f -- "$guard_tmp"
+    [ "$cmp_rc" = '1' ] || return 1
+    return 1
+  fi
+  mv "$guard_tmp" "$CONTROLLER_GUARD_FILE" || {
+    rm -f -- "$guard_tmp"
+    return 1
+  }
+  controller_guard_is_exact
 }
 
 ensure_cleanup_intent() {
@@ -389,6 +428,7 @@ cleanup_failed_enable_generation() {
   [ "$remove_own_generation_rc" = '0' ] || return "$remove_own_generation_rc"
   write_disabled_audit AUTO_DISABLE_FAILED_ENABLE || return 1
   rm -f -- "$CLEANUP_INTENT_FILE" || return 1
+  rm -f -- "$CONTROLLER_GUARD_FILE" || return 1
 }
 
 arm_expiry() {
@@ -418,6 +458,14 @@ if [ -e "$CLEANUP_INTENT_FILE" ]; then
   cleanup_intent_is_exact || fail 'failed_enable_cleanup_intent_conflict'
   cleanup_failed_enable_generation || fail 'failed_enable_cleanup_unverified'
   exit 0
+fi
+
+if [ -e "$CONTROLLER_GUARD_FILE" ]; then
+  controller_guard_is_exact || fail 'failed_enable_controller_guard_conflict'
+  if [ "${TEPLO_SHADOW_CONTROLLER_GUARD_HELD:-0}" != '1' ]; then
+    cleanup_failed_enable_generation || fail 'failed_enable_guard_cleanup_unverified'
+    exit 0
+  fi
 fi
 
 if [ "$MODE" = 'EXPIRY' ]; then
@@ -456,8 +504,16 @@ if [ -r "$LEASE_FILE" ] && \
     cleanup_failed_enable_generation || fail 'conflicting_active_audit_cleanup_unverified'
     fail 'completed_audit_conflict'
   }
+  watchdog_owns_guard=0
+  if [ ! -e "$CONTROLLER_GUARD_FILE" ]; then
+    ensure_controller_guard || fail 'watchdog_owner_death_guard_failed'
+    watchdog_owns_guard=1
+  fi
   if ! capture_container_snapshot || ! snapshot_matches_completed_lease; then
     cleanup_failed_enable_generation || fail 'post_audit_cleanup_unverified'
+  fi
+  if [ "$watchdog_owns_guard" = '1' ]; then
+    rm -f -- "$CONTROLLER_GUARD_FILE" || fail 'watchdog_owner_death_guard_release_failed'
   fi
   exit 0
 fi

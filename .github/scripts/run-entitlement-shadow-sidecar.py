@@ -31,6 +31,8 @@ _ALLOWED_KEYS = {
     'workflow_sha',
     'deployed_sha',
     'image',
+    'bot_container_id',
+    'bot_started_at',
     'workflow_run_id',
     'workflow_run_attempt',
     'approval_actor',

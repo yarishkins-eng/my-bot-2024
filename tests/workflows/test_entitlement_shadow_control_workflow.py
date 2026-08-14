@@ -4,6 +4,7 @@ import fcntl
 import os
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import time
@@ -156,9 +157,8 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     )
     assert source.count('verify_bot_snapshot_unchanged') >= 4
     first_commit_check = source.index('verify_bot_snapshot_unchanged', source.index('cycle_seen=0'))
-    second_commit_check = source.index('verify_bot_snapshot_unchanged', first_commit_check + 1)
-    assert first_commit_check < source.index('write_lease completed') < second_commit_check
-    final_commit_check = source.index('verify_bot_snapshot_unchanged', second_commit_check + 1)
+    final_commit_check = source.index('verify_bot_snapshot_unchanged', first_commit_check + 1)
+    assert first_commit_check < source.index('write_lease completed') < final_commit_check
     assert source.index('latest_audit_not_durable') < final_commit_check < source.rindex('MUTATION_STARTED=0')
     completed_recovery = source.split('if [ "$lease_phase" = \'completed\' ]; then', 1)[1].split(
         '[ "$lease_phase" = \'prepared\' ]',
@@ -166,9 +166,12 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     )[0]
     assert completed_recovery.index('verify_bot_snapshot_unchanged') < completed_recovery.index('exit 0')
     assert completed_recovery.index('verify_sidecar_active') < completed_recovery.index('exit 0')
-    recovery_watchdog = completed_recovery.index('TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG_INSTALLED"')
+    recovery_watchdog = completed_recovery.index(
+        'TEPLO_SHADOW_CONTROL_LOCK_HELD=1 TEPLO_SHADOW_CONTROLLER_GUARD_HELD=1'
+    )
     assert completed_recovery.index('MUTATION_STARTED=1') < recovery_watchdog
     assert completed_recovery.index('trap cleanup_failed_enable ERR') < recovery_watchdog
+    assert completed_recovery.index('arm_controller_cleanup_guard') < recovery_watchdog
     final_recovery_gate = completed_recovery.index('verify_sidecar_active', recovery_watchdog)
     assert final_recovery_gate < completed_recovery.index('MUTATION_STARTED=0')
     assert final_recovery_gate < completed_recovery.index('trap - ERR')
@@ -180,12 +183,17 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     assert 'rm -f -- "$LEASE_FILE"' not in cleanup_body
     assert 'rm -f -- "$CLEANUP_INTENT_FILE"' not in cleanup_body
     assert 'failed-enable-cleanup.state' in source
-    cleanup_recovery = source.index('if [ -e "$CLEANUP_INTENT_FILE" ]; then', source.index('flock -n 9'))
+    assert 'failed-enable-guard.state' in source
+    cleanup_recovery = source.index(
+        'if [ -e "$CONTROLLER_GUARD_FILE" ] || [ -e "$CLEANUP_INTENT_FILE" ]; then',
+        source.index('flock -n 9'),
+    )
     assert cleanup_recovery < source.index('test ! -e "$CONTROL_PLANE_JOURNAL"')
     assert cleanup_recovery < source.index('git fetch --no-tags origin')
     assert cleanup_recovery < source.index('actual_schema=')
     assert 'WATCHDOG_PENDING_UNIT' in source
     assert 'WATCHDOG_EXACT_UNIT' in source
+    assert 'WATCHDOG_FINAL_UNIT' in source
     assert source.index('--unit="$WATCHDOG_EXACT_UNIT"') < source.rindex(
         'systemctl stop "${WATCHDOG_PENDING_UNIT}.timer"'
     )
@@ -235,6 +243,7 @@ def test_every_production_switch_refuses_an_active_shadow() -> None:
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/lease.state"' in source
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/disable.state"' in source
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/failed-enable-cleanup.state"' in source
+        assert 'test ! -e "$SHADOW_RUNTIME_DIR/failed-enable-guard.state"' in source
         assert 'docker info >/dev/null 2>&1' in source
         assert "--filter 'name=^/teplo_entitlement_shadow$'" in source
         assert "--format '{{.ID}}'" in source
@@ -297,6 +306,8 @@ def test_disable_is_independent_of_bot_and_business_systems() -> None:
 
     assert "readonly SIDECAR='teplo_entitlement_shadow'" in source
     assert 'rm -f -- "$LEASE_FILE"' in source
+    assert 'failed-enable-cleanup.state' in source
+    assert 'failed-enable-guard.state' in source
     assert 'docker rm --force "$actual"' in source
     assert 'docker info' in source
     assert 'systemd-run' in source
@@ -425,6 +436,14 @@ if [ "$1" = inspect ]; then
         rm -f "$CONTAINER_PRESENT"
         exit 1
       fi
+      if [ "${FAKE_KILL_PARENT_BEFORE_SNAPSHOT_CALL:-0}" = "$snapshot_calls" ]; then
+        kill -9 "$PPID"
+        exit 137
+      fi
+      if [ "${FAKE_BLOCK_BEFORE_SNAPSHOT_CALL:-0}" = "$snapshot_calls" ]; then
+        touch "$FAKE_BLOCK_READY_FILE"
+        exec sleep 300
+      fi
       fake_image="$(printf '%064d' 0 | tr 0 b)"
       fake_sha="$(printf '%040d' 0 | tr 0 a)"
       printf '%s|sha256:%s|%s|%s|entitlement-shadow-readonly|%s|%s|%s|%s|gate2-readonly-v1\n' \
@@ -519,6 +538,8 @@ def _lease(run_id: str, run_attempt: str, phase: str, expires: int) -> str:
         f'workflow_sha={"a" * 40}\n'
         f'deployed_sha={"a" * 40}\n'
         f'image=sha256:{"b" * 64}\n'
+        f'bot_container_id={"c" * 64}\n'
+        'bot_started_at=2026-08-13T00:00:00+03:00\n'
         f'workflow_run_id={run_id}\n'
         f'workflow_run_attempt={run_attempt}\n'
         'approval_actor=owner\n'
@@ -1045,6 +1066,8 @@ def test_controller_failure_cleanup_recovers_after_kill_between_watchdog_and_fin
         directory.mkdir()
     lease = runtime / 'lease.state'
     lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    controller_guard = runtime / 'failed-enable-guard.state'
+    controller_guard.write_text(lease.read_text())
     keyed = state / f'bot-production.entitlement-shadow-control.{run_id}.{run_attempt}.audit'
     watchdog_keyed = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
     latest = state / 'bot-production.entitlement-shadow-control.state'
@@ -1069,6 +1092,7 @@ def test_controller_failure_cleanup_recovers_after_kill_between_watchdog_and_fin
         f'LEASE_FILE={shlex.quote(str(lease))}\n'
         f'RUNTIME_DIR={shlex.quote(str(runtime))}\n'
         f'CLEANUP_INTENT_FILE={shlex.quote(str(runtime / "failed-enable-cleanup.state"))}\n'
+        f'CONTROLLER_GUARD_FILE={shlex.quote(str(controller_guard))}\n'
         'SIDECAR=teplo_entitlement_shadow\n'
         f'RUN_ID={run_id}\n'
         f'RUN_ATTEMPT={run_attempt}\n'
@@ -1093,6 +1117,7 @@ def test_controller_failure_cleanup_recovers_after_kill_between_watchdog_and_fin
         'AUDIT_RM_CALLS_FILE': str(tmp_path / 'audit-rm-calls'),
         'KILL_AFTER_AUDIT_RM_CALL': kill_after_audit_rm_call,
     }
+    (tmp_path / 'container-present').touch()
 
     killed = subprocess.run(  # noqa: S603 - kill in the exact controller cleanup functions
         [str(harness)],
@@ -1132,9 +1157,86 @@ def test_controller_failure_cleanup_recovers_after_kill_between_watchdog_and_fin
     assert recovered.returncode == 0, recovered.stderr
     assert not lease.exists()
     assert not cleanup_intent.exists()
+    assert not controller_guard.exists()
     assert not watchdog_keyed.exists()
     assert not keyed.exists()
     assert 'runtime_mode=disabled' in latest.read_text()
+
+
+def test_watchdog_owner_death_guard_forces_cleanup_after_sigkill(tmp_path: Path) -> None:
+    run_id, run_attempt = '4601', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    container_id = 'd' * 64
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    expected_env = tmp_path / 'expected-env'
+    expected_env.write_text(_fixed_policy_env())
+    _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
+    audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
+    secret = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
+        'EXPECTED_ENV_FILE': str(expected_env),
+        'FAKE_BLOCK_BEFORE_SNAPSHOT_CALL': '4',
+        'FAKE_BLOCK_READY_FILE': str(tmp_path / 'watchdog-final-snapshot-ready'),
+    }
+    command = [
+        str(WATCHDOG),
+        'BOOTSTRAP',
+        str(lease),
+        'teplo_entitlement_shadow',
+        run_id,
+        run_attempt,
+        str(audit),
+        str(secret),
+        container_id,
+    ]
+
+    owner = subprocess.Popen(  # noqa: S603 - killed watchdog owns a dedicated process group
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+        start_new_session=True,
+    )
+    guard = runtime / 'failed-enable-guard.state'
+    ready = tmp_path / 'watchdog-final-snapshot-ready'
+    deadline = time.monotonic() + 10
+    while not ready.exists() and owner.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready.exists(), owner.stderr.read() if owner.stderr else 'watchdog did not reach final guarded snapshot'
+    os.killpg(owner.pid, signal.SIGKILL)
+    assert owner.wait(timeout=5) < 0
+    assert guard.read_text() == lease.read_text()
+    assert container_present.exists()
+    environment.pop('FAKE_BLOCK_BEFORE_SNAPSHOT_CALL')
+    environment.pop('FAKE_BLOCK_READY_FILE')
+
+    recovered = subprocess.run(  # noqa: S603 - independent retry must consume the durable guard
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not guard.exists()
+    assert not lease.exists()
+    assert not container_present.exists()
+    assert 'runtime_mode=disabled' in (state / 'bot-production.entitlement-shadow-control.state').read_text()
 
 
 def test_watchdog_refuses_paused_completed_sidecar(tmp_path: Path) -> None:
@@ -1329,6 +1431,10 @@ def test_stale_disable_helper_never_removes_newer_generation(tmp_path: Path) -> 
     _write_fake_flock(fake_bin)
     lease = runtime / 'lease.state'
     lease.write_text(_lease(old_run_id, old_attempt, 'completed', 4102444800))
+    cleanup_intent = runtime / 'failed-enable-cleanup.state'
+    controller_guard = runtime / 'failed-enable-guard.state'
+    cleanup_intent.write_text(lease.read_text())
+    controller_guard.write_text(lease.read_text())
     container_present = tmp_path / 'container-present'
     container_present.touch()
     docker_calls = tmp_path / 'docker-calls'
@@ -1359,6 +1465,8 @@ def test_stale_disable_helper_never_removes_newer_generation(tmp_path: Path) -> 
     )
     assert result.returncode == 0, result.stderr
     assert not container_present.exists()
+    assert not cleanup_intent.exists()
+    assert not controller_guard.exists()
     keyed = state / f'bot-production.entitlement-shadow-control.{old_run_id}.{old_attempt}.audit'
     latest = state / 'bot-production.entitlement-shadow-control.state'
     assert 'action=DISABLE_SHADOW\n' in keyed.read_text()
@@ -1790,8 +1898,8 @@ def _docker_path() -> str | None:
     return shutil.which('docker')
 
 
-def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path) -> None:
-    """Adversarial proof uses a local scratch image and no network pull."""
+def test_real_docker_watchdog_recovers_after_controller_sigkill(tmp_path: Path) -> None:
+    """Kill the guard-owning controller and prove independent real-Docker cleanup."""
     require_real_docker = os.environ.get('TEPLO_REQUIRE_REAL_DOCKER_SHADOW_TEST') == '1'
     docker = _docker_path()
     compiler = shutil.which('cc')
@@ -1843,7 +1951,7 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
             text=True,
             timeout=60,
         )
-        lease.write_text(_lease(run_id, run_attempt, 'prepared', 1))
+        lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
         secret_env.write_text('SECRET=redacted\n')
         subprocess.run(  # noqa: S603 - fixed Docker path and generated test image
             [
@@ -1861,18 +1969,49 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
                 f'teplo.workflow_run_id={run_id}',
                 '--label',
                 f'teplo.workflow_run_attempt={run_attempt}',
+                '--label',
+                'teplo.policy_version=gate2-readonly-v1',
                 image,
             ],
             check=True,
             capture_output=True,
             text=True,
         )
-        subprocess.run(  # noqa: S603 - fixed Docker path and isolated test container
-            [docker, 'pause', 'teplo_entitlement_shadow'],
+        container_id = subprocess.run(  # noqa: S603 - fixed Docker path and isolated test container
+            [docker, 'inspect', '--format', '{{.Id}}', 'teplo_entitlement_shadow'],
             check=True,
             capture_output=True,
             text=True,
+        ).stdout.strip()
+        assert len(container_id) == 64
+        guard = runtime / 'failed-enable-guard.state'
+        ready = tmp_path / 'controller-guard-ready'
+        controller = tmp_path / 'guard-owning-controller.sh'
+        controller.write_text(
+            '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+            f'exec 9>{shlex.quote(str(state / "bot-production.entitlement-shadow-control.lock"))}\n'
+            'flock 9\n'
+            f'guard_tmp="$(mktemp {shlex.quote(str(runtime / "failed-enable-guard.XXXXXX"))})"\n'
+            f'cp {shlex.quote(str(lease))} "$guard_tmp"\n'
+            'chmod 444 "$guard_tmp"\n'
+            f'mv "$guard_tmp" {shlex.quote(str(guard))}\n'
+            f'touch {shlex.quote(str(ready))}\n'
+            'exec sleep 300\n'
         )
+        controller.chmod(0o755)
+        owner = subprocess.Popen(  # noqa: S603 - fixed generated controller killed adversarially
+            [str(controller)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and owner.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ready.exists(), owner.stderr.read() if owner.stderr else 'controller did not arm guard'
+        owner.kill()
+        assert owner.wait(timeout=5) < 0
+        assert guard.read_text() == lease.read_text()
 
         result = subprocess.run(  # noqa: S603 - fixed repository watchdog
             [
@@ -1884,7 +2023,7 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
                 run_attempt,
                 str(audit),
                 str(secret_env),
-                'pending',
+                container_id,
             ],
             check=False,
             capture_output=True,
@@ -1900,6 +2039,7 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
         )
         assert inspect.returncode != 0
         assert not lease.exists()
+        assert not guard.exists()
         assert not secret_env.exists()
         disabled_audit = (
             state
