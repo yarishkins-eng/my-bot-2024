@@ -132,14 +132,25 @@ jobs:
               test "$stored_image" = "$current_image"
             }
 
-            write_deployed_state() {
+            write_deployed_state_for() {
+              deployed_sha="$1"
+              expected_container_id="$2"
+              expected_image="$3"
+              expected_started_at="$4"
+              [[ "$deployed_sha" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$expected_container_id" =~ ^[0-9a-f]{64}$ ]]
+              [[ "$expected_image" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ "$expected_started_at" =~ ^[^[:space:]]+$ ]]
               install -d -m 700 "$STATE_DIR"
               state_tmp="$(mktemp "$STATE_DIR/bot-production.XXXXXX")"
-              deployed_image="$(docker inspect --format '{{.Image}}' remnawave_bot)"
-              [[ "$deployed_image" =~ ^sha256:[0-9a-f]{64}$ ]]
-              printf 'sha=%s\nimage=%s\n' "$TARGET_SHA" "$deployed_image" > "$state_tmp"
+              printf 'sha=%s\nimage=%s\n' "$deployed_sha" "$expected_image" > "$state_tmp"
               chmod 600 "$state_tmp"
               mv "$state_tmp" "$STATE_FILE"
+            }
+
+            write_deployed_state() {
+              write_deployed_state_for \
+                "$TARGET_SHA" "$PREVIOUS_CONTAINER_ID" "$PREVIOUS_IMAGE_ID" "$PREVIOUS_STARTED_AT"
             }
 
             capture_bot_snapshot() {
@@ -147,6 +158,8 @@ jobs:
               BOT_SNAPSHOT_IMAGE=''
               BOT_SNAPSHOT_STARTED_AT=''
               BOT_SNAPSHOT_HEALTH=''
+              BOT_SNAPSHOT_RUNNING=''
+              BOT_SNAPSHOT_PAUSED=''
               BOT_SNAPSHOT_ID="$(docker inspect --format '{{.Id}}' remnawave_bot)" || {
                 echo 'Refusing controlled deploy: bot container ID cannot be verified.' >&2
                 return 1
@@ -163,10 +176,20 @@ jobs:
                 echo 'Refusing controlled deploy: bot health cannot be verified.' >&2
                 return 1
               }
+              BOT_SNAPSHOT_RUNNING="$(docker inspect --format '{{.State.Running}}' remnawave_bot)" || {
+                echo 'Refusing controlled deploy: bot running state cannot be verified.' >&2
+                return 1
+              }
+              BOT_SNAPSHOT_PAUSED="$(docker inspect --format '{{.State.Paused}}' remnawave_bot)" || {
+                echo 'Refusing controlled deploy: bot paused state cannot be verified.' >&2
+                return 1
+              }
               [[ "$BOT_SNAPSHOT_ID" =~ ^[0-9a-f]{64}$ ]]
               [[ "$BOT_SNAPSHOT_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]]
               [[ "$BOT_SNAPSHOT_STARTED_AT" =~ ^[^[:space:]]+$ ]]
               test "$BOT_SNAPSHOT_HEALTH" = 'healthy'
+              test "$BOT_SNAPSHOT_RUNNING" = 'true'
+              test "$BOT_SNAPSHOT_PAUSED" = 'false'
             }
 
             journal_value() {
@@ -217,6 +240,52 @@ jobs:
             if [ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]; then
               echo "Refusing controlled deploy: workflow=$TARGET_SHA, origin/main=$REMOTE_MAIN_SHA." >&2
               exit 33
+            fi
+
+            if [ -e "$CONTROL_PLANE_JOURNAL" ] && [ "$(journal_value target_sha)" != "$TARGET_SHA" ]; then
+              stale_base_sha="$(journal_value base_sha)"
+              stale_target_sha="$(journal_value target_sha)"
+              stale_state_sha="$(sed -n 's/^sha=//p' "$STATE_FILE")"
+              stale_state_image="$(sed -n 's/^image=//p' "$STATE_FILE")"
+              test "$(journal_value format_version)" = '1'
+              test "$(journal_value phase)" = 'prepared'
+              [[ "$stale_base_sha" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$stale_target_sha" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$stale_state_sha" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$stale_state_image" =~ ^sha256:[0-9a-f]{64}$ ]]
+              git cat-file -e "${stale_base_sha}^{commit}"
+              git cat-file -e "${stale_target_sha}^{commit}"
+              git merge-base --is-ancestor "$stale_base_sha" "$stale_target_sha"
+              git merge-base --is-ancestor "$stale_target_sha" "$TARGET_SHA"
+              capture_bot_snapshot
+              test "$(journal_value image)" = "$BOT_SNAPSHOT_IMAGE"
+              test "$(journal_value container_id)" = "$BOT_SNAPSHOT_ID"
+              test "$(journal_value started_at)" = "$BOT_SNAPSHOT_STARTED_AT"
+              test "$stale_state_image" = "$BOT_SNAPSHOT_IMAGE"
+
+              if [ "$PREVIOUS_SHA" = "$stale_base_sha" ] && [ "$stale_state_sha" = "$stale_base_sha" ]; then
+                rm -f -- "$CONTROL_PLANE_JOURNAL"
+                echo "Cancelled an interrupted pre-checkout control-plane transition to $stale_target_sha." >&2
+                exit 64
+              fi
+              if [ "$PREVIOUS_SHA" = "$stale_target_sha" ] && [ "$stale_state_sha" = "$stale_base_sha" ]; then
+                write_deployed_state_for \
+                  "$stale_target_sha" "$BOT_SNAPSHOT_ID" "$BOT_SNAPSHOT_IMAGE" "$BOT_SNAPSHOT_STARTED_AT"
+                capture_bot_snapshot
+                test "$BOT_SNAPSHOT_ID" = "$(journal_value container_id)"
+                test "$BOT_SNAPSHOT_IMAGE" = "$(journal_value image)"
+                test "$BOT_SNAPSHOT_STARTED_AT" = "$(journal_value started_at)"
+                rm -f -- "$CONTROL_PLANE_JOURNAL"
+                echo "Finalized the interrupted control-plane transition to $stale_target_sha; start a new protected run for $TARGET_SHA." >&2
+                exit 64
+              fi
+              if [ "$PREVIOUS_SHA" = "$stale_target_sha" ] && [ "$stale_state_sha" = "$stale_target_sha" ]; then
+                rm -f -- "$CONTROL_PLANE_JOURNAL"
+                echo "Cleared the completed control-plane transition to $stale_target_sha; start a new protected run for $TARGET_SHA." >&2
+                exit 64
+              fi
+              echo 'Refusing controlled deploy: stale control-plane journal state is not safely reconcilable.' >&2
+              exit 38
             fi
 
             if [ "$PREVIOUS_SHA" = "$TARGET_SHA" ]; then
@@ -344,6 +413,10 @@ jobs:
               test "$BOT_SNAPSHOT_IMAGE" = "$PREVIOUS_IMAGE_ID"
               test "$BOT_SNAPSHOT_STARTED_AT" = "$PREVIOUS_STARTED_AT"
               write_deployed_state
+              capture_bot_snapshot
+              test "$BOT_SNAPSHOT_ID" = "$PREVIOUS_CONTAINER_ID"
+              test "$BOT_SNAPSHOT_IMAGE" = "$PREVIOUS_IMAGE_ID"
+              test "$BOT_SNAPSHOT_STARTED_AT" = "$PREVIOUS_STARTED_AT"
               rm -f -- "$CONTROL_PLANE_JOURNAL"
               echo "Protected control-plane source activated without rebuilding or restarting the bot at $(date --iso-8601=seconds)"
               exit 0
@@ -357,5 +430,7 @@ jobs:
             # Follow the owner-approved rollback plan recorded in the release card on failure.
             compose up -d --wait --wait-timeout 240 "$SERVICE"
             compose ps "$SERVICE"
-            write_deployed_state
+            capture_bot_snapshot
+            write_deployed_state_for \
+              "$TARGET_SHA" "$BOT_SNAPSHOT_ID" "$BOT_SNAPSHOT_IMAGE" "$BOT_SNAPSHOT_STARTED_AT"
             echo "Controlled container health confirmed for $TARGET_SHA at $(date --iso-8601=seconds)"

@@ -139,6 +139,7 @@ container_is_exact_generation() {
 container_matches_completed_lease() {
   container_is_exact_generation &&
     [ "$(container_value '{{.State.Running}}')" = 'true' ] &&
+    [ "$(container_value '{{.State.Paused}}')" = 'false' ] &&
     [ "$(container_value '{{.Image}}')" = "$(lease_value image)" ] &&
     [ "$(container_label teplo.workflow_sha)" = "$(lease_value workflow_sha)" ] &&
     [ "$(container_label teplo.deployed_sha)" = "$(lease_value deployed_sha)" ] &&

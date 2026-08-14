@@ -223,6 +223,8 @@ CURRENT_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$BOT_CONTAINER")"
 [[ "$CURRENT_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'invalid_image_id'
 [ "$(state_value image "$DEPLOY_STATE_FILE")" = "$CURRENT_IMAGE_ID" ] || fail 'deploy_state_image_mismatch'
 [ "$(docker inspect --format '{{.State.Health.Status}}' "$BOT_CONTAINER")" = 'healthy' ] || fail 'bot_not_healthy'
+[ "$(docker inspect --format '{{.State.Running}}' "$BOT_CONTAINER")" = 'true' ] || fail 'bot_not_running'
+[ "$(docker inspect --format '{{.State.Paused}}' "$BOT_CONTAINER")" = 'false' ] || fail 'bot_paused'
 BOT_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$BOT_CONTAINER")"
 BOT_STARTED_AT="$(docker inspect --format '{{.State.StartedAt}}' "$BOT_CONTAINER")"
 [ -r "$MIGRATION_STATE_FILE" ] || fail 'migration_state_missing'
@@ -417,6 +419,7 @@ docker start "$SIDECAR" >/dev/null
 cycle_seen=0
 for _ in $(seq 1 115); do
   [ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR" 2>/dev/null || true)" = 'true' ] || fail 'sidecar_stopped_before_first_cycle'
+  [ "$(docker inspect --format '{{.State.Paused}}' "$SIDECAR" 2>/dev/null || true)" = 'false' ] || fail 'sidecar_paused_before_first_cycle'
   sidecar_logs="$(docker logs --since "$SIDE_STARTED_AT" "$SIDECAR" 2>&1 || true)"
   if printf '%s\n' "$sidecar_logs" | grep -Eq 'entitlement_shadow_circuit_open|entitlement_shadow_sidecar_(stopped|refused)|entitlement_shadow_lease_lost'; then
     fail 'sidecar_failed_before_first_cycle'
@@ -438,6 +441,7 @@ completed_expires="$(( $(date +%s) + OBSERVATION_SECONDS ))"
 write_lease completed "$completed_expires" "$(date --iso-8601=seconds)"
 sleep 3
 [ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR")" = 'true' ] || fail 'sidecar_not_running_after_commit'
+[ "$(docker inspect --format '{{.State.Paused}}' "$SIDECAR")" = 'false' ] || fail 'sidecar_paused_after_commit'
 TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG_INSTALLED" BOOTSTRAP \
   "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$RUN_ATTEMPT" "$WATCHDOG_AUDIT_FILE" \
   "$STATE_DIR/entitlement-shadow-secrets-${RUN_ID}-${RUN_ATTEMPT}.env" "$SIDECAR_CONTAINER_ID"

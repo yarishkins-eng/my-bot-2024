@@ -22,6 +22,7 @@ ROLLBACK_SHA = 'b' * 40
 PRIOR_TARGET_SHA = 'e' * 40
 HISTORICAL_TARGET_SHA = '1' * 40
 HISTORICAL_ROLLBACK_SHA = '2' * 40
+ADVANCED_TARGET_SHA = '9' * 40
 MIGRATION_IMAGE = f'sha256:{"c" * 64}'
 ROLLBACK_IMAGE = f'sha256:{"d" * 64}'
 PREVIOUS_SCHEMA = '0102'
@@ -187,7 +188,11 @@ def _extract_ordinary_deploy_shell(repo_dir: Path, state_dir: Path) -> str:
     )
 
 
-def _extract_infrastructure_deploy_shell(repo_dir: Path, state_dir: Path) -> str:
+def _extract_infrastructure_deploy_shell(
+    repo_dir: Path,
+    state_dir: Path,
+    target_sha: str = PRIOR_TARGET_SHA,
+) -> str:
     workflow = INFRASTRUCTURE_DEPLOY_WORKFLOW.read_text()
     step = workflow.index('- name: Deploy the exact controlled infrastructure revision and wait for health')
     marker = workflow.index('          script: |\n', step)
@@ -201,7 +206,7 @@ def _extract_infrastructure_deploy_shell(repo_dir: Path, state_dir: Path) -> str
             "readonly STATE_DIR='/var/lib/teplo-vpn/deploy-state'",
             f"readonly STATE_DIR='{state_dir}'",
         )
-        .replace("readonly TARGET_SHA='${{ github.sha }}'", f"readonly TARGET_SHA='{PRIOR_TARGET_SHA}'")
+        .replace("readonly TARGET_SHA='${{ github.sha }}'", f"readonly TARGET_SHA='{target_sha}'")
     )
 
 
@@ -651,6 +656,10 @@ def _infrastructure_control_plane_integration(
     fail_health_inspect_at: int = 0,
     infrastructure_paths_changed: bool = False,
     control_plane_journal: bool = False,
+    workflow_target_sha: str = PRIOR_TARGET_SHA,
+    journal_target_sha: str | None = None,
+    bot_paused: bool = False,
+    change_container_at_id_call: int = 0,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
     repo = tmp_path / 'repo'
     state = tmp_path / 'state'
@@ -663,17 +672,19 @@ def _infrastructure_control_plane_integration(
     (fake / 'source').write_text(PRIOR_TARGET_SHA if source_already_at_target else ROLLBACK_SHA)
     (fake / 'container').write_text(('e' if recovery_container_changed else 'f') * 64)
     (fake / 'started').write_text('2026-08-13T00:00:00Z')
-    if control_plane_journal and not source_already_at_target:
+    if control_plane_journal and journal_target_sha is None:
+        journal_target_sha = workflow_target_sha
+    if journal_target_sha is not None:
         (state / 'bot-production.control-plane-transition.state').write_text(
             'format_version=1\n'
             'phase=prepared\n'
             f'base_sha={ROLLBACK_SHA}\n'
-            f'target_sha={PRIOR_TARGET_SHA}\n'
+            f'target_sha={journal_target_sha}\n'
             f'container_id={"f" * 64}\n'
             f'image={ROLLBACK_IMAGE}\n'
             'started_at=2026-08-13T00:00:00Z\n'
         )
-    if source_already_at_target:
+    elif source_already_at_target:
         (state / 'bot-production.control-plane-transition.state').write_text(
             'format_version=1\n'
             'phase=prepared\n'
@@ -693,6 +704,7 @@ case "$1" in
   rev-parse)
     if [ "$2" = HEAD ]; then cat "$FAKE_STATE/source"; else printf '%s\n' "$INFRA_TARGET_SHA"; fi
     ;;
+  cat-file) exit 0 ;;
   merge-base) exit 0 ;;
   diff)
     if [ "$2" = --quiet ] || [ "$4" = --quiet ]; then
@@ -744,6 +756,9 @@ elif [ "$1" = inspect ]; then
       id_calls="$(( id_calls + 1 ))"
       printf '%s\n' "$id_calls" > "$FAKE_STATE/id_calls"
       [ "${FAIL_CONTAINER_INSPECT_AT:-0}" != "$id_calls" ] || exit 125
+      if [ "${CHANGE_CONTAINER_AT_ID_CALL:-0}" = "$id_calls" ]; then
+        printf '%064d\n' 0 | tr 0 7 > "$FAKE_STATE/container"
+      fi
       cat "$FAKE_STATE/container"
       ;;
     *'.Image'*)
@@ -771,6 +786,8 @@ elif [ "$1" = inspect ]; then
       [ "${FAIL_HEALTH_INSPECT_AT:-0}" != "$health_calls" ] || exit 125
       printf 'healthy\n'
       ;;
+    *'.State.Running'*) printf 'true\n' ;;
+    *'.State.Paused'*) printf '%s\n' "${BOT_PAUSED:-false}" ;;
     *) exit 96 ;;
   esac
 elif [ "$1" = compose ]; then
@@ -792,11 +809,11 @@ fi
     _write_executable(fake_bin / 'find', '#!/usr/bin/env bash\nexit 0\n')
     (fake / 'image').write_text(ROLLBACK_IMAGE)
     shell = tmp_path / 'deploy-infrastructure.sh'
-    _write_executable(shell, _extract_infrastructure_deploy_shell(repo, state))
+    _write_executable(shell, _extract_infrastructure_deploy_shell(repo, state, workflow_target_sha))
     env = {
         'PATH': f'{fake_bin}:/usr/bin:/bin',
         'FAKE_STATE': str(fake),
-        'INFRA_TARGET_SHA': PRIOR_TARGET_SHA,
+        'INFRA_TARGET_SHA': workflow_target_sha,
         'MIGRATION_IMAGE': MIGRATION_IMAGE,
         'UNEXPECTED_GITHUB_PATH': '1' if unexpected_github_path else '0',
         'UNEXPECTED_BUSINESS_PATH': '1' if unexpected_business_path else '0',
@@ -807,6 +824,8 @@ fi
         'FAIL_STARTED_INSPECT_AT': str(fail_started_inspect_at),
         'FAIL_HEALTH_INSPECT_AT': str(fail_health_inspect_at),
         'INFRASTRUCTURE_PATHS_CHANGED': '1' if infrastructure_paths_changed else '0',
+        'BOT_PAUSED': 'true' if bot_paused else 'false',
+        'CHANGE_CONTAINER_AT_ID_CALL': str(change_container_at_id_call),
     }
     result = subprocess.run(  # noqa: S603 - extracted exact production workflow shell
         ['/bin/bash', str(shell)],
@@ -1298,7 +1317,7 @@ def test_protected_control_plane_release_recovers_kill_after_state_write(
 def test_protected_control_plane_state_write_fails_closed_on_image_inspect_error(
     tmp_path: Path,
 ) -> None:
-    # The third image lookup is write_deployed_state after all pre/post checks.
+    # The third image lookup is the final proof after the atomic state write.
     result, paths = _infrastructure_control_plane_integration(
         tmp_path,
         fail_image_inspect_at=3,
@@ -1306,7 +1325,7 @@ def test_protected_control_plane_state_write_fails_closed_on_image_inspect_error
 
     assert result.returncode != 0
     state = paths['state'].joinpath('bot-production.state').read_text()
-    assert state == f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n'
+    assert state == f'sha={PRIOR_TARGET_SHA}\nimage={ROLLBACK_IMAGE}\n'
     assert paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
 
 
@@ -1337,6 +1356,34 @@ def test_protected_control_plane_release_fails_closed_on_snapshot_inspect_error(
     assert state == f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n'
     if call == 2:
         assert paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
+
+
+def test_protected_control_plane_release_refuses_paused_healthy_bot(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(tmp_path, bot_paused=True)
+
+    assert result.returncode != 0
+    assert not paths['fake'].joinpath('mutations').exists()
+    assert paths['state'].joinpath('bot-production.state').read_text() == (
+        f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n'
+    )
+
+
+def test_protected_control_plane_release_keeps_journal_if_bot_restarts_at_state_commit(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(
+        tmp_path,
+        change_container_at_id_call=3,
+    )
+
+    assert result.returncode != 0
+    assert not paths['fake'].joinpath('mutations').exists()
+    assert paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
+    assert paths['state'].joinpath('bot-production.state').read_text() == (
+        f'sha={PRIOR_TARGET_SHA}\nimage={ROLLBACK_IMAGE}\n'
+    )
 
 
 def test_protected_control_plane_recovery_refuses_same_image_container_recreation(
@@ -1433,6 +1480,37 @@ def test_every_nonowning_deploy_path_refuses_prepared_control_plane_transition(
         assert 'control-plane transition is still prepared' in result.stderr
         assert not paths['fake'].joinpath('mutations').exists()
         assert paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
+
+
+@pytest.mark.parametrize(
+    ('source_at_old_target', 'deploy_state_at_old_target', 'expected_state_sha'),
+    [
+        (False, False, ROLLBACK_SHA),
+        (True, False, PRIOR_TARGET_SHA),
+        (True, True, PRIOR_TARGET_SHA),
+    ],
+)
+def test_advanced_main_reconciles_prior_control_plane_generation_then_stops(
+    tmp_path: Path,
+    source_at_old_target: bool,
+    deploy_state_at_old_target: bool,
+    expected_state_sha: str,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(
+        tmp_path,
+        source_already_at_target=source_at_old_target,
+        deploy_state_already_target=deploy_state_at_old_target,
+        workflow_target_sha=ADVANCED_TARGET_SHA,
+        journal_target_sha=PRIOR_TARGET_SHA,
+    )
+
+    assert result.returncode == 64, result.stderr
+    assert not paths['fake'].joinpath('mutations').exists()
+    assert not paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
+    state = paths['state'].joinpath('bot-production.state').read_text()
+    assert f'sha={expected_state_sha}\n' in state
+    assert f'image={ROLLBACK_IMAGE}\n' in state
+    assert paths['fake'].joinpath('source').read_text() != ADVANCED_TARGET_SHA
 
 
 def test_protected_control_plane_release_recovers_kill_after_source_checkout(

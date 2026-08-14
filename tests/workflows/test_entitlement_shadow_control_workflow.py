@@ -138,6 +138,10 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     assert 'docker compose up' not in source
     assert 'docker restart' not in source
     assert 'docker rm -f "$BOT_CONTAINER"' not in source
+    assert '\'{{.State.Running}}\' "$BOT_CONTAINER"' in source
+    assert '\'{{.State.Paused}}\' "$BOT_CONTAINER"' in source
+    assert '\'{{.State.Paused}}\' "$SIDECAR"' in source
+    assert "container_value '{{.State.Paused}}'" in WATCHDOG.read_text()
     assert 'WATCHDOG_PENDING_UNIT' in source
     assert 'WATCHDOG_EXACT_UNIT' in source
     assert source.index('--unit="$WATCHDOG_EXACT_UNIT"') < source.rindex(
@@ -305,6 +309,7 @@ if [ "$1" = inspect ]; then
   case "$*" in
     *'{{.Id}}'*) if [ -e "$CONTAINER_PRESENT" ]; then printf '%s\n' "$FAKE_CONTAINER_ID"; fi ;;
     *State.Running*) printf 'true\n' ;;
+    *State.Paused*) printf '%s\n' "${FAKE_CONTAINER_PAUSED:-false}" ;;
     *'{{.Image}}'*) printf 'sha256:%064d\n' 0 | tr 0 b ;;
     *teplo.role*) printf 'entitlement-shadow-readonly\n' ;;
     *teplo.workflow_sha*) printf '%040d\n' 0 | tr 0 a ;;
@@ -508,6 +513,53 @@ def test_watchdog_materializes_completed_audit_without_removing_sidecar(tmp_path
     assert keyed.read_text() == lease.read_text()
     assert latest.read_text() == lease.read_text()
     assert container_present.exists()
+
+
+def test_watchdog_refuses_paused_completed_sidecar(tmp_path: Path) -> None:
+    run_id = '24242424'
+    run_attempt = '1'
+    container_id = '2' * 64
+    lease = tmp_path / 'lease.state'
+    audit = tmp_path / 'audit.state'
+    secret = tmp_path / 'secret.env'
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    _write_fake_watchdog_docker(fake_bin, container_id)
+
+    result = subprocess.run(  # noqa: S603 - executes the fixed watchdog under test
+        [
+            str(WATCHDOG),
+            'BOOTSTRAP',
+            str(lease),
+            'teplo_entitlement_shadow',
+            run_id,
+            run_attempt,
+            str(audit),
+            str(secret),
+            container_id,
+        ],
+        env={
+            'PATH': f'{fake_bin}:/usr/bin:/bin',
+            'CONTAINER_PRESENT': str(container_present),
+            'FAKE_CONTAINER_ID': container_id,
+            'EXPECTED_RUN_ID': run_id,
+            'EXPECTED_RUN_ATTEMPT': run_attempt,
+            'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+            'FAKE_CONTAINER_PAUSED': 'true',
+            'TEPLO_SHADOW_CONTROL_LOCK_HELD': '1',
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert container_present.exists()
+    assert lease.exists()
+    assert not audit.exists()
 
 
 def test_watchdog_recovers_missing_latest_from_existing_durable_audits(tmp_path: Path) -> None:

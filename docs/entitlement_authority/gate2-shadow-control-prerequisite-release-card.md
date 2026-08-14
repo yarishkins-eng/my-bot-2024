@@ -149,7 +149,12 @@ the deploy-state write is completed by validating and clearing that same
 journal. Any restart or recreation is a STOP. While that journal is prepared,
 ordinary, migration and migration-recovery deploys, plus any Docker/Compose
 infrastructure switch, stop fail-closed under the same host lock; only the
-exact source-only infrastructure recovery may consume it. Shadow remains
+protected infrastructure workflow may consume it. If `main` has advanced, that
+workflow first proves and cancels or finalizes the older generation, then
+stops; a fresh protected run is required for the newer SHA. Every success gate
+requires exact stable container ID, image and start time plus `Running=true`,
+`Paused=false` and healthy both before and after the atomic deploy-state write.
+Shadow remains
 absent. Required checks:
 
 1. exact merge SHA/tree, exact-SHA CI and fresh reviewer/skeptic GO with
