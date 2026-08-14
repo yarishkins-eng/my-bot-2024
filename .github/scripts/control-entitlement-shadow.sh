@@ -139,6 +139,16 @@ authority_counts() {
     'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "BEGIN READ ONLY; SELECT concat_ws('"'"','"'"', (SELECT count(*) FROM entitlement_identities), (SELECT count(*) FROM entitlement_source_revisions), (SELECT count(*) FROM entitlement_overlays), (SELECT count(*) FROM entitlement_projection_commands), (SELECT count(*) FROM entitlement_observations), (SELECT count(*) FROM entitlement_webhook_inbox), (SELECT count(*) FROM entitlement_notification_intents), (SELECT count(*) FROM entitlement_cleanup_commands), (SELECT count(*) FROM entitlement_cleanup_tombstones)); COMMIT"'
 }
 
+fixed_sidecar_ids() {
+  docker container ls -a --no-trunc \
+    --filter "name=^/${SIDECAR}$" --format '{{.ID}}'
+}
+
+fixed_sidecar_is_absent() {
+  ids="$(fixed_sidecar_ids)" || return 1
+  [ -z "$ids" ]
+}
+
 cleanup_runtime() {
   set +e
   [ -z "$SIDECAR_ENV_FILE" ] || rm -f -- "$SIDECAR_ENV_FILE"
@@ -146,7 +156,7 @@ cleanup_runtime() {
   cleanup_verified=0
   if docker info >/dev/null 2>&1; then
     docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
-    if docker info >/dev/null 2>&1 && ! docker inspect "$SIDECAR" >/dev/null 2>&1; then
+    if docker info >/dev/null 2>&1 && fixed_sidecar_is_absent; then
       cleanup_verified=1
     fi
   fi
@@ -274,7 +284,7 @@ if [ -r "$LEASE_FILE" ]; then
     pending
   [ ! -e "$LEASE_FILE" ] || fail 'prepared_lease_cleanup_unverified'
   docker info >/dev/null 2>&1 || fail 'prepared_docker_unavailable'
-  ! docker inspect "$SIDECAR" >/dev/null 2>&1 || fail 'prepared_sidecar_cleanup_unverified'
+  fixed_sidecar_is_absent || fail 'prepared_sidecar_cleanup_unverified'
   [ ! -e "$existing_secret" ] || fail 'prepared_secret_cleanup_unverified'
   systemctl stop \
     "teplo-entitlement-shadow-watchdog-pending-${RUN_ID}-${existing_run_attempt}.timer" \
@@ -293,8 +303,9 @@ if [ -r "$LEASE_FILE" ]; then
   trap - ERR
   printf 'STOP:prepared_generation_cleaned_start_new_workflow_run\n' >&2
   exit 64
-elif docker inspect "$SIDECAR" >/dev/null 2>&1; then
-  fail 'sidecar_without_control_lease'
+else
+  existing_sidecar_ids="$(fixed_sidecar_ids)" || fail 'sidecar_state_unverified'
+  [ -z "$existing_sidecar_ids" ] || fail 'sidecar_without_control_lease'
 fi
 
 [ "$RUN_ATTEMPT" = '1' ] || fail 'rerun_without_completed_lease'
@@ -303,7 +314,6 @@ systemctl stop "${WATCHDOG_PENDING_UNIT}.timer" "${WATCHDOG_PENDING_UNIT}.servic
 MUTATION_STARTED=1
 trap cleanup_failed_enable ERR
 rm -f -- "$LEASE_FILE"
-docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
 install -m 555 "$SIDECAR_ENTRYPOINT" "$SIDECAR_INSTALLED"
 install -m 700 "$WATCHDOG" "$WATCHDOG_INSTALLED"
 prepared_expires="$(( $(date +%s) + BOOTSTRAP_SECONDS ))"

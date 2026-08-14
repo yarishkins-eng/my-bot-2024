@@ -69,7 +69,12 @@ jobs:
               echo 'Refusing deploy: Docker state cannot be verified.' >&2
               exit 64
             }
-            ! docker inspect teplo_entitlement_shadow >/dev/null 2>&1 || {
+            shadow_container_ids="$(docker container ls -a --no-trunc \
+              --filter 'name=^/teplo_entitlement_shadow$' --format '{{.ID}}')" || {
+              echo 'Refusing deploy: the shadow sidecar state cannot be verified.' >&2
+              exit 64
+            }
+            [ -z "$shadow_container_ids" ] || {
               echo 'Refusing deploy: disable the shadow sidecar first.' >&2
               exit 64
             }

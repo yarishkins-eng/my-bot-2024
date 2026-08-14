@@ -143,7 +143,10 @@ diff only when every path is in the exact reviewed scripts/workflows/docs/tests
 allowlist. It checks out the reviewed source and atomically advances deploy
 state while preserving the existing bot container ID, image and start time;
 it does not build, recreate or restart the bot. A kill after source checkout
-is recovered idempotently from the previous deploy-state SHA. Shadow remains
+is recovered only from a root-owned prepared journal containing the exact
+base/target SHA and prior bot container ID, image and start time. A kill after
+the deploy-state write is completed by validating and clearing that same
+journal. Any restart or recreation is a STOP. Shadow remains
 absent. Required checks:
 
 1. exact merge SHA/tree, exact-SHA CI and fresh reviewer/skeptic GO with

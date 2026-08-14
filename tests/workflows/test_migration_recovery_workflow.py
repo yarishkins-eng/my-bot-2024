@@ -213,6 +213,7 @@ def _recovery_integration(
     fail_checkout_once: bool = False,
     fail_audit_once: bool = False,
     fail_journal_mark_once: bool = False,
+    sidecar_list_error: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
     repo = tmp_path / 'repo'
     state = tmp_path / 'state'
@@ -283,6 +284,9 @@ if [ "$1" = 'compose' ]; then
   esac
 elif [ "$1" = 'info' ]; then
   exit 0
+elif [ "$1" = 'container' ] && [ "$2" = 'ls' ]; then
+  [ "${SIDECAR_LIST_ERROR:-0}" != 1 ] || exit 125
+  exit 0
 elif [ "$1" = 'inspect' ] && [ "${@: -1}" = 'teplo_entitlement_shadow' ]; then
   exit 1
 elif [ "$1" = 'inspect' ]; then
@@ -342,6 +346,7 @@ exec /bin/mv "$@"
         'REQUESTED_ROLLBACK_SHA': ROLLBACK_SHA,
         'FAKE_STATE': str(fake),
         'ROLLBACK_IMAGE': ROLLBACK_IMAGE,
+        'SIDECAR_LIST_ERROR': '1' if sidecar_list_error else '0',
     }
     result = subprocess.run(  # noqa: S603 - executes extracted production workflow shell
         ['/bin/bash', str(shell)],
@@ -383,6 +388,7 @@ def _deploy_normalization_integration(
     *,
     fail_git_guard: str | None = None,
     hard_kill_at: str | None = None,
+    sidecar_list_error: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
     repo = tmp_path / 'repo'
     state = tmp_path / 'state'
@@ -440,6 +446,9 @@ esac
 set -eu
 if [ "$1" = 'info' ]; then
   exit 0
+elif [ "$1" = 'container' ] && [ "$2" = 'ls' ]; then
+  [ "${SIDECAR_LIST_ERROR:-0}" != 1 ] || exit 125
+  exit 0
 elif [ "$1" = 'inspect' ] && [ "${@: -1}" = 'teplo_entitlement_shadow' ]; then
   exit 1
 elif [ "$1" = 'inspect' ]; then
@@ -488,6 +497,7 @@ fi
         'RELEASE_CARD_REFERENCE': 'recovery-prerequisite-test',
         'APPROVAL_ACTOR': 'test-reviewer',
         'OLD_IMAGE_TARGET_SCHEMA_COMPATIBILITY': 'OLD_IMAGE_TARGET_SCHEMA_COMPATIBLE',
+        'SIDECAR_LIST_ERROR': '1' if sidecar_list_error else '0',
     }
     result = subprocess.run(  # noqa: S603 - executes extracted production workflow shell
         ['/bin/bash', str(shell)],
@@ -509,6 +519,7 @@ def _ordinary_deploy_interlock_integration(
     recovery_audit: str | None = None,
     shadow_lock_barrier: bool = False,
     control_plane_changed: bool = False,
+    sidecar_list_error: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
     repo = tmp_path / 'repo'
     state = tmp_path / 'state'
@@ -550,6 +561,9 @@ esac
 set -eu
 if [ "$1" = 'info' ]; then
   exit 0
+elif [ "$1" = 'container' ] && [ "$2" = 'ls' ]; then
+  [ "${SIDECAR_LIST_ERROR:-0}" != 1 ] || exit 125
+  exit 0
 elif [ "$1" = 'inspect' ] && [ "${@: -1}" = 'teplo_entitlement_shadow' ]; then
   exit 1
 elif [ "$1" = 'inspect' ]; then
@@ -582,6 +596,7 @@ fi
         'ROLLBACK_IMAGE': ROLLBACK_IMAGE,
         'PREVIOUS_SCHEMA': PREVIOUS_SCHEMA,
         'CONTROL_PLANE_CHANGED': '1' if control_plane_changed else '0',
+        'SIDECAR_LIST_ERROR': '1' if sidecar_list_error else '0',
     }
     release_thread: threading.Thread | None = None
     if shadow_lock_barrier:
@@ -618,6 +633,10 @@ def _infrastructure_control_plane_integration(
     migration_risk_changed: bool = False,
     unexpected_business_path: bool = False,
     source_already_at_target: bool = False,
+    sidecar_list_error: bool = False,
+    recovery_container_changed: bool = False,
+    deploy_state_already_target: bool = False,
+    fail_image_inspect_at: int = 0,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
     repo = tmp_path / 'repo'
     state = tmp_path / 'state'
@@ -625,10 +644,21 @@ def _infrastructure_control_plane_integration(
     fake = tmp_path / 'fake'
     for directory in (repo, state, fake_bin, fake):
         directory.mkdir()
-    (state / 'bot-production.state').write_text(f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n')
+    deployed_sha = PRIOR_TARGET_SHA if deploy_state_already_target else ROLLBACK_SHA
+    (state / 'bot-production.state').write_text(f'sha={deployed_sha}\nimage={ROLLBACK_IMAGE}\n')
     (fake / 'source').write_text(PRIOR_TARGET_SHA if source_already_at_target else ROLLBACK_SHA)
-    (fake / 'container').write_text('f' * 64)
+    (fake / 'container').write_text(('e' if recovery_container_changed else 'f') * 64)
     (fake / 'started').write_text('2026-08-13T00:00:00Z')
+    if source_already_at_target:
+        (state / 'bot-production.control-plane-transition.state').write_text(
+            'format_version=1\n'
+            'phase=prepared\n'
+            f'base_sha={ROLLBACK_SHA}\n'
+            f'target_sha={PRIOR_TARGET_SHA}\n'
+            f'container_id={"f" * 64}\n'
+            f'image={ROLLBACK_IMAGE}\n'
+            'started_at=2026-08-13T00:00:00Z\n'
+        )
 
     _write_executable(
         fake_bin / 'git',
@@ -677,12 +707,22 @@ esac
 set -eu
 if [ "$1" = info ]; then
   exit 0
+elif [ "$1" = container ] && [ "$2" = ls ]; then
+  [ "${SIDECAR_LIST_ERROR:-0}" != 1 ] || exit 125
+  exit 0
 elif [ "$1" = inspect ] && [ "${@: -1}" = teplo_entitlement_shadow ]; then
   exit 1
 elif [ "$1" = inspect ]; then
   case "$3" in
     *'.Id'*) cat "$FAKE_STATE/container" ;;
-    *'.Image'*) cat "$FAKE_STATE/image" ;;
+    *'.Image'*)
+      image_calls=0
+      [ ! -e "$FAKE_STATE/image_calls" ] || image_calls="$(cat "$FAKE_STATE/image_calls")"
+      image_calls="$(( image_calls + 1 ))"
+      printf '%s\n' "$image_calls" > "$FAKE_STATE/image_calls"
+      [ "${FAIL_IMAGE_INSPECT_AT:-0}" != "$image_calls" ] || exit 125
+      cat "$FAKE_STATE/image"
+      ;;
     *'.Config.Image'*) printf 'teplo-bot:production\n' ;;
     *'.State.StartedAt'*) cat "$FAKE_STATE/started" ;;
     *'.State.Health.Status'*) printf 'healthy\n' ;;
@@ -716,6 +756,8 @@ fi
         'UNEXPECTED_GITHUB_PATH': '1' if unexpected_github_path else '0',
         'UNEXPECTED_BUSINESS_PATH': '1' if unexpected_business_path else '0',
         'MIGRATION_RISK_CHANGED': '1' if migration_risk_changed else '0',
+        'SIDECAR_LIST_ERROR': '1' if sidecar_list_error else '0',
+        'FAIL_IMAGE_INSPECT_AT': str(fail_image_inspect_at),
     }
     result = subprocess.run(  # noqa: S603 - extracted exact production workflow shell
         ['/bin/bash', str(shell)],
@@ -1187,6 +1229,91 @@ def test_protected_infrastructure_deploy_accepts_allowlisted_control_plane_only(
     assert paths['fake'].joinpath('started').read_text() == '2026-08-13T00:00:00Z'
     assert f'sha={PRIOR_TARGET_SHA}\n' in paths['state'].joinpath('bot-production.state').read_text()
     assert f'image={ROLLBACK_IMAGE}\n' in paths['state'].joinpath('bot-production.state').read_text()
+    assert not paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
+
+
+def test_protected_control_plane_release_recovers_kill_after_state_write(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(
+        tmp_path,
+        source_already_at_target=True,
+        deploy_state_already_target=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not paths['fake'].joinpath('mutations').exists()
+    assert not paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
+
+
+def test_protected_control_plane_state_write_fails_closed_on_image_inspect_error(
+    tmp_path: Path,
+) -> None:
+    # The third image lookup is write_deployed_state after all pre/post checks.
+    result, paths = _infrastructure_control_plane_integration(
+        tmp_path,
+        fail_image_inspect_at=3,
+    )
+
+    assert result.returncode != 0
+    state = paths['state'].joinpath('bot-production.state').read_text()
+    assert state == f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n'
+    assert paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
+
+
+def test_protected_control_plane_recovery_refuses_same_image_container_recreation(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(
+        tmp_path,
+        source_already_at_target=True,
+        recovery_container_changed=True,
+    )
+
+    assert result.returncode != 0
+    assert not paths['fake'].joinpath('mutations').exists()
+    assert f'sha={ROLLBACK_SHA}\n' in paths['state'].joinpath('bot-production.state').read_text()
+    assert paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
+
+
+def test_every_deploy_path_fails_closed_when_sidecar_listing_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    previous_state = f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n'
+    for name in ('ordinary', 'migration', 'recovery', 'infrastructure'):
+        (tmp_path / name).mkdir()
+    ordinary, ordinary_paths = _ordinary_deploy_interlock_integration(
+        tmp_path / 'ordinary',
+        current_source=ROLLBACK_SHA,
+        deploy_state=previous_state,
+        recovery_journal=_completed_v1_recovery_journal(),
+        sidecar_list_error=True,
+    )
+    migration, migration_paths = _deploy_normalization_integration(
+        tmp_path / 'migration',
+        previous_state,
+        sidecar_list_error=True,
+    )
+    recovery, recovery_paths = _recovery_integration(
+        tmp_path / 'recovery',
+        Scenario(),
+        sidecar_list_error=True,
+    )
+    infrastructure, infrastructure_paths = _infrastructure_control_plane_integration(
+        tmp_path / 'infrastructure',
+        sidecar_list_error=True,
+    )
+
+    for result, paths in (
+        (ordinary, ordinary_paths),
+        (migration, migration_paths),
+        (recovery, recovery_paths),
+        (infrastructure, infrastructure_paths),
+    ):
+        assert result.returncode == 64
+        assert 'sidecar state cannot be verified' in result.stderr
+        assert not paths['fake'].joinpath('mutations').exists()
+    assert not paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
 
 
 def test_protected_control_plane_release_recovers_kill_after_source_checkout(

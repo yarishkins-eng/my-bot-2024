@@ -183,7 +183,8 @@ def test_every_production_switch_refuses_an_active_shadow() -> None:
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/lease.state"' in source
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/disable.state"' in source
         assert 'docker info >/dev/null 2>&1' in source
-        assert '! docker inspect teplo_entitlement_shadow' in source
+        assert "--filter 'name=^/teplo_entitlement_shadow$'" in source
+        assert "--format '{{.ID}}'" in source
 
 
 def test_ordinary_deploy_routes_control_plane_changes_to_protected_infrastructure() -> None:
