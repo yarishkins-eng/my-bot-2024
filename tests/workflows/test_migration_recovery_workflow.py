@@ -660,6 +660,7 @@ def _infrastructure_control_plane_integration(
     journal_target_sha: str | None = None,
     bot_paused: bool = False,
     change_container_at_id_call: int = 0,
+    change_started_at_snapshot_call: int = 0,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
     repo = tmp_path / 'repo'
     state = tmp_path / 'state'
@@ -750,6 +751,37 @@ elif [ "$1" = inspect ] && [ "${@: -1}" = teplo_entitlement_shadow ]; then
   exit 1
 elif [ "$1" = inspect ]; then
   case "$3" in
+    *'{{.Id}}|{{.Image}}|{{.State.StartedAt}}|{{.State.Health.Status}}|{{.State.Running}}|{{.State.Paused}}'*)
+      id_calls=0
+      [ ! -e "$FAKE_STATE/id_calls" ] || id_calls="$(cat "$FAKE_STATE/id_calls")"
+      id_calls="$(( id_calls + 1 ))"
+      printf '%s\n' "$id_calls" > "$FAKE_STATE/id_calls"
+      image_calls=0
+      [ ! -e "$FAKE_STATE/image_calls" ] || image_calls="$(cat "$FAKE_STATE/image_calls")"
+      image_calls="$(( image_calls + 1 ))"
+      printf '%s\n' "$image_calls" > "$FAKE_STATE/image_calls"
+      started_calls=0
+      [ ! -e "$FAKE_STATE/started_calls" ] || started_calls="$(cat "$FAKE_STATE/started_calls")"
+      started_calls="$(( started_calls + 1 ))"
+      printf '%s\n' "$started_calls" > "$FAKE_STATE/started_calls"
+      health_calls=0
+      [ ! -e "$FAKE_STATE/health_calls" ] || health_calls="$(cat "$FAKE_STATE/health_calls")"
+      health_calls="$(( health_calls + 1 ))"
+      printf '%s\n' "$health_calls" > "$FAKE_STATE/health_calls"
+      [ "${FAIL_CONTAINER_INSPECT_AT:-0}" != "$id_calls" ] || exit 125
+      [ "${FAIL_IMAGE_INSPECT_AT:-0}" != "$image_calls" ] || exit 125
+      [ "${FAIL_STARTED_INSPECT_AT:-0}" != "$started_calls" ] || exit 125
+      [ "${FAIL_HEALTH_INSPECT_AT:-0}" != "$health_calls" ] || exit 125
+      if [ "${CHANGE_CONTAINER_AT_ID_CALL:-0}" = "$id_calls" ]; then
+        printf '%064d\n' 0 | tr 0 7 > "$FAKE_STATE/container"
+      fi
+      if [ "${CHANGE_STARTED_AT_SNAPSHOT_CALL:-0}" = "$started_calls" ]; then
+        printf '2026-08-13T00:00:01Z\n' > "$FAKE_STATE/started"
+      fi
+      printf '%s|%s|%s|healthy|true|%s\n' \
+        "$(cat "$FAKE_STATE/container")" "$(cat "$FAKE_STATE/image")" \
+        "$(cat "$FAKE_STATE/started")" "${BOT_PAUSED:-false}"
+      ;;
     *'.Id'*)
       id_calls=0
       [ ! -e "$FAKE_STATE/id_calls" ] || id_calls="$(cat "$FAKE_STATE/id_calls")"
@@ -826,6 +858,7 @@ fi
         'INFRASTRUCTURE_PATHS_CHANGED': '1' if infrastructure_paths_changed else '0',
         'BOT_PAUSED': 'true' if bot_paused else 'false',
         'CHANGE_CONTAINER_AT_ID_CALL': str(change_container_at_id_call),
+        'CHANGE_STARTED_AT_SNAPSHOT_CALL': str(change_started_at_snapshot_call),
     }
     result = subprocess.run(  # noqa: S603 - extracted exact production workflow shell
         ['/bin/bash', str(shell)],
@@ -1380,6 +1413,23 @@ def test_protected_control_plane_release_keeps_journal_if_bot_restarts_at_state_
 
     assert result.returncode != 0
     assert not paths['fake'].joinpath('mutations').exists()
+    assert paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
+    assert paths['state'].joinpath('bot-production.state').read_text() == (
+        f'sha={PRIOR_TARGET_SHA}\nimage={ROLLBACK_IMAGE}\n'
+    )
+
+
+def test_protected_control_plane_release_detects_same_id_restart_before_journal_clear(
+    tmp_path: Path,
+) -> None:
+    result, paths = _infrastructure_control_plane_integration(
+        tmp_path,
+        change_started_at_snapshot_call=3,
+    )
+
+    assert result.returncode != 0
+    assert not paths['fake'].joinpath('mutations').exists()
+    assert paths['fake'].joinpath('container').read_text() == 'f' * 64
     assert paths['state'].joinpath('bot-production.control-plane-transition.state').exists()
     assert paths['state'].joinpath('bot-production.state').read_text() == (
         f'sha={PRIOR_TARGET_SHA}\nimage={ROLLBACK_IMAGE}\n'

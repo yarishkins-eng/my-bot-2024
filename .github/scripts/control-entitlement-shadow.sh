@@ -69,14 +69,10 @@ state_value() {
 }
 
 capture_bot_snapshot() {
-  SNAPSHOT_ID="$(docker inspect --format '{{.Id}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_id_unavailable'
-  SNAPSHOT_IMAGE="$(docker inspect --format '{{.Image}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_image_unavailable'
-  SNAPSHOT_STARTED_AT="$(docker inspect --format '{{.State.StartedAt}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_started_at_unavailable'
-  SNAPSHOT_HEALTH="$(docker inspect --format '{{.State.Health.Status}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_health_unavailable'
-  SNAPSHOT_RUNNING="$(docker inspect --format '{{.State.Running}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_running_unavailable'
-  SNAPSHOT_PAUSED="$(docker inspect --format '{{.State.Paused}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_paused_unavailable'
-  SNAPSHOT_ID_AFTER="$(docker inspect --format '{{.Id}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_generation_unavailable'
-  [ "$SNAPSHOT_ID_AFTER" = "$SNAPSHOT_ID" ] || fail 'bot_snapshot_generation_changed'
+  snapshot_raw="$(docker inspect --format '{{.Id}}|{{.Image}}|{{.State.StartedAt}}|{{.State.Health.Status}}|{{.State.Running}}|{{.State.Paused}}' "$BOT_CONTAINER")" \
+    || fail 'bot_snapshot_unavailable'
+  IFS='|' read -r SNAPSHOT_ID SNAPSHOT_IMAGE SNAPSHOT_STARTED_AT SNAPSHOT_HEALTH SNAPSHOT_RUNNING SNAPSHOT_PAUSED SNAPSHOT_EXTRA <<< "$snapshot_raw"
+  [ -z "$SNAPSHOT_EXTRA" ] || fail 'invalid_bot_snapshot'
   [[ "$SNAPSHOT_ID" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid_bot_container_id'
   [[ "$SNAPSHOT_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'invalid_image_id'
   [[ "$SNAPSHOT_STARTED_AT" =~ ^[^[:space:]]+$ ]] || fail 'invalid_bot_started_at'

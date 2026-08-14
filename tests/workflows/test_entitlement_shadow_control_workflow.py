@@ -138,12 +138,16 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     assert 'docker compose up' not in source
     assert 'docker restart' not in source
     assert 'docker rm -f "$BOT_CONTAINER"' not in source
-    assert '\'{{.State.Running}}\' "$BOT_CONTAINER"' in source
-    assert '\'{{.State.Paused}}\' "$BOT_CONTAINER"' in source
     assert '\'{{.State.Paused}}\' "$SIDECAR"' in source
     assert "container_value '{{.State.Paused}}'" in WATCHDOG.read_text()
     assert 'control_plane_transition_prepared' in source
     assert source.index('control_plane_transition_prepared') < source.index('docker create')
+    snapshot_body = source.split('capture_bot_snapshot() {', 1)[1].split('\n}', 1)[0]
+    assert snapshot_body.count('docker inspect') == 1
+    assert (
+        '{{.Id}}|{{.Image}}|{{.State.StartedAt}}|{{.State.Health.Status}}|{{.State.Running}}|{{.State.Paused}}'
+        in snapshot_body
+    )
     assert source.count('verify_bot_snapshot_unchanged') >= 4
     first_commit_check = source.index('verify_bot_snapshot_unchanged', source.index('cycle_seen=0'))
     second_commit_check = source.index('verify_bot_snapshot_unchanged', first_commit_check + 1)

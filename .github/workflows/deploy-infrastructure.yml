@@ -160,30 +160,14 @@ jobs:
               BOT_SNAPSHOT_HEALTH=''
               BOT_SNAPSHOT_RUNNING=''
               BOT_SNAPSHOT_PAUSED=''
-              BOT_SNAPSHOT_ID="$(docker inspect --format '{{.Id}}' remnawave_bot)" || {
-                echo 'Refusing controlled deploy: bot container ID cannot be verified.' >&2
+              bot_snapshot_raw="$(docker inspect --format '{{.Id}}|{{.Image}}|{{.State.StartedAt}}|{{.State.Health.Status}}|{{.State.Running}}|{{.State.Paused}}' remnawave_bot)" || {
+                echo 'Refusing controlled deploy: bot snapshot cannot be verified.' >&2
                 return 1
               }
-              BOT_SNAPSHOT_IMAGE="$(docker inspect --format '{{.Image}}' remnawave_bot)" || {
-                echo 'Refusing controlled deploy: bot image cannot be verified.' >&2
-                return 1
-              }
-              BOT_SNAPSHOT_STARTED_AT="$(docker inspect --format '{{.State.StartedAt}}' remnawave_bot)" || {
-                echo 'Refusing controlled deploy: bot start time cannot be verified.' >&2
-                return 1
-              }
-              BOT_SNAPSHOT_HEALTH="$(docker inspect --format '{{.State.Health.Status}}' remnawave_bot)" || {
-                echo 'Refusing controlled deploy: bot health cannot be verified.' >&2
-                return 1
-              }
-              BOT_SNAPSHOT_RUNNING="$(docker inspect --format '{{.State.Running}}' remnawave_bot)" || {
-                echo 'Refusing controlled deploy: bot running state cannot be verified.' >&2
-                return 1
-              }
-              BOT_SNAPSHOT_PAUSED="$(docker inspect --format '{{.State.Paused}}' remnawave_bot)" || {
-                echo 'Refusing controlled deploy: bot paused state cannot be verified.' >&2
-                return 1
-              }
+              IFS='|' read -r BOT_SNAPSHOT_ID BOT_SNAPSHOT_IMAGE BOT_SNAPSHOT_STARTED_AT \
+                BOT_SNAPSHOT_HEALTH BOT_SNAPSHOT_RUNNING BOT_SNAPSHOT_PAUSED BOT_SNAPSHOT_EXTRA \
+                <<< "$bot_snapshot_raw"
+              test -z "$BOT_SNAPSHOT_EXTRA"
               [[ "$BOT_SNAPSHOT_ID" =~ ^[0-9a-f]{64}$ ]]
               [[ "$BOT_SNAPSHOT_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]]
               [[ "$BOT_SNAPSHOT_STARTED_AT" =~ ^[^[:space:]]+$ ]]
