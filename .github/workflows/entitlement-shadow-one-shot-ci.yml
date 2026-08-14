@@ -1,0 +1,52 @@
+name: Entitlement shadow one-shot candidate CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/deploy.yml
+      - .github/workflows/entitlement-shadow-one-shot.yml
+      - .github/workflows/entitlement-shadow-one-shot-ci.yml
+      - .github/scripts/entitlement-shadow-one-shot-control.sh
+      - .github/scripts/entitlement_shadow_one_shot.py
+      - .github/scripts/entitlement_shadow_readonly_probe.py
+      - .github/scripts/entitlement_shadow_create_schema.py
+      - .github/scripts/test-entitlement-shadow-one-shot-e2e.sh
+      - tests/workflows/test_entitlement_shadow_one_shot.py
+      - docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-design.md
+      - docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-release-card.md
+  push:
+    branches:
+      - main
+      - codex/gate2-shadow-one-shot-prerequisite-20260814
+
+concurrency:
+  group: teplo-bot-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  verify:
+    uses: ./.github/workflows/lint.yml
+
+  candidate-boundary:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Verify public candidate boundary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test ! -e teplo-gate2-compatible-103094b9.tar.gz
+          printf 'candidate_sha=%s private_exact_image_e2e=required\n' "$CANDIDATE_SHA"
