@@ -23,6 +23,8 @@ DEPLOY = ROOT / '.github/workflows/deploy.yml'
 
 COMPATIBLE_SHA = '103094b96f96a412463753e56e3d996311b182ec'
 COMPATIBLE_IMAGE = 'sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
+AMD64_MANIFEST = 'sha256:39545077b550badb008c76b81312706f69085a0f79a79705b6bbe6ad3ad6c276'
+AMD64_CONFIG = 'sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67'
 FIXED_NAME = 'teplo-entitlement-shadow-one-shot'
 FIXED_ROLE = 'entitlement-shadow-one-shot'
 
@@ -230,9 +232,13 @@ def test_candidate_ci_is_isolated_from_production_credentials_and_host() -> None
     assert 'secrets.' not in workflow
     assert 'ssh-action' not in workflow
     assert 'scp-action' not in workflow
-    assert 'compatible-source' in workflow
-    assert 'docker build' in workflow
-    assert "docker image inspect --format '{{.Id}}'" in workflow
+    assert 'docker build' not in workflow
+    assert 'docker load' not in workflow
+    assert 'gh release download' not in workflow
+    assert 'teplo-gate2-private-ci' not in workflow
+    assert 'private_exact_image_e2e=required' in workflow
+    document = _workflow(CI_WORKFLOW)
+    assert set(document['jobs']) == {'verify', 'candidate-boundary'}
 
 
 def test_e2e_cleanup_is_bound_to_the_exact_run_label() -> None:
@@ -247,13 +253,11 @@ def test_e2e_cleanup_is_bound_to_the_exact_run_label() -> None:
     assert ' = "$RUN_KEY"' in cleanup
 
 
-def test_mandatory_ci_e2e_is_exact_image_and_cannot_skip() -> None:
-    workflow = CI_WORKFLOW.read_text(encoding='utf-8')
+def test_mandatory_private_e2e_contract_is_exact_image_and_cannot_skip() -> None:
     script = E2E.read_text(encoding='utf-8')
-    assert 'pull_request' in workflow and 'push' in workflow
-    assert COMPATIBLE_SHA in workflow and COMPATIBLE_IMAGE in workflow
-    assert 'continue-on-error' not in workflow
-    assert 'if: false' not in workflow
+    assert COMPATIBLE_SHA in script and AMD64_CONFIG in script
+    assert 'ONE_SHOT_E2E_IMAGE_REFERENCE' in script
+    assert 'docker network create --internal' in script
     assert 'skip' not in script.lower()
     for required in (
         'postgres:15-alpine',
@@ -275,6 +279,21 @@ def test_mandatory_ci_e2e_is_exact_image_and_cannot_skip() -> None:
         'forbidden-env-absent',
     ):
         assert required in script
+
+
+def test_oci_index_is_not_used_as_the_portable_docker_image_id() -> None:
+    controller = CONTROLLER.read_text(encoding='utf-8')
+    script = E2E.read_text(encoding='utf-8')
+    design = (ROOT / 'docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-design.md').read_text(
+        encoding='utf-8'
+    )
+    assert 'PRODUCTION_ENGINE_IMAGE_ID' in controller
+    assert 'PORTABLE_AMD64_CONFIG_DIGEST' in controller
+    assert 'runtime_image="${ONE_SHOT_E2E_IMAGE_REFERENCE:?}"' in controller
+    assert 'test "$IMAGE" = "$CONFIG_DIGEST"' in script
+    assert COMPATIBLE_IMAGE in design
+    assert AMD64_MANIFEST in design
+    assert AMD64_CONFIG in design
 
 
 def test_ordinary_deploy_has_exact_control_only_allowlist_before_ssh() -> None:

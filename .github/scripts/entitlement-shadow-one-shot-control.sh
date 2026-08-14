@@ -4,7 +4,8 @@ set -Eeuo pipefail
 readonly FIXED_NAME='teplo-entitlement-shadow-one-shot'
 readonly ROLE_LABEL='teplo.role=entitlement-shadow-one-shot'
 readonly COMPATIBLE_SHA='103094b96f96a412463753e56e3d996311b182ec'
-readonly COMPATIBLE_IMAGE='sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
+readonly PRODUCTION_ENGINE_IMAGE_ID='sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
+readonly PORTABLE_AMD64_CONFIG_DIGEST='sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67'
 readonly REPO_DIR='/opt/remnawave-bedolaga-telegram-bot'
 readonly STATE_FILE='/var/lib/teplo-vpn/deploy-state/bot-production.state'
 readonly ENV_FINGERPRINT='dc35bf7aa92d570c5f190b3e7ccb8e2f22aa87b5d3d46f9277d63252fbd1057c'
@@ -96,6 +97,7 @@ enable_shadow() {
   local entrypoint_path="$1"
   local expected_entrypoint_sha="$2"
   local actual_entrypoint_sha current_sha current_image db_network raw_output='' validated='' deadline
+  local runtime_image="$PRODUCTION_ENGINE_IMAGE_ID"
   local bot_container='remnawave_bot' db_container='remnawave_bot_db' panel_network='remnawave-network'
   local bot_id_before='' bot_started_before='' bot_restart_before=''
   local e2e_run_key='' attached_pid='' attached_rc=1 line='' monitor_seconds=0
@@ -114,6 +116,8 @@ enable_shadow() {
     db_container="${ONE_SHOT_E2E_DB_CONTAINER:?}"
     panel_network="${ONE_SHOT_E2E_PANEL_NETWORK:?}"
     e2e_run_key="${ONE_SHOT_E2E_RUN_KEY:?}"
+    runtime_image="${ONE_SHOT_E2E_IMAGE_REFERENCE:?}"
+    test "$runtime_image" = "$PORTABLE_AMD64_CONFIG_DIGEST"
     [[ "$e2e_run_key" =~ ^[A-Za-z0-9._-]+$ ]]
     e2e_label_args=(--label "teplo.e2e-run=$e2e_run_key")
     test "$(docker inspect --format '{{ index .Config.Labels "teplo.e2e" }}' "$bot_container")" = 'gate2-shadow-one-shot'
@@ -125,7 +129,7 @@ enable_shadow() {
     test "$(git -C "$REPO_DIR" rev-parse HEAD)" = "$COMPATIBLE_SHA"
   fi
   current_image="$(docker inspect --format '{{.Image}}' "$bot_container")"
-  test "$current_image" = "$COMPATIBLE_IMAGE"
+  test "$current_image" = "$runtime_image"
   db_network="$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$db_container" | head -n 1)"
   test -n "$db_network"
 
@@ -143,7 +147,7 @@ enable_shadow() {
     test "$(docker inspect --format '{{.State.Running}}' "$bot_container")" = 'true'
     test "$(docker inspect --format '{{.State.Paused}}' "$bot_container")" = 'false'
     test "$(docker inspect --format '{{.State.Health.Status}}' "$bot_container")" = 'healthy'
-    test "$(docker inspect --format '{{.Image}}' "$bot_container")" = "$COMPATIBLE_IMAGE"
+    test "$(docker inspect --format '{{.Image}}' "$bot_container")" = "$PRODUCTION_ENGINE_IMAGE_ID"
     test "$(git -C "$REPO_DIR" rev-parse HEAD)" = "$COMPATIBLE_SHA"
     test "$(sed -n 's/^sha=//p' "$STATE_FILE")" = "$COMPATIBLE_SHA"
     runtime_flags="$(docker exec "$bot_container" python -c "from app.config import settings; print('|'.join(str(int(v)) for v in (settings.ENTITLEMENT_AUTHORITY_CHECKOUT_ADMISSION_ENABLED,settings.ENTITLEMENT_AUTHORITY_PROJECTOR_ENABLED,settings.ENTITLEMENT_AUTHORITY_READY_NOTIFICATIONS_ENABLED,settings.ENTITLEMENT_AUTHORITY_SHADOW_ENABLED,settings.ENTITLEMENT_AUTHORITY_SHADOW_KILL_SWITCH,settings.MULTI_TARIFF_ENABLED)))")"
@@ -211,7 +215,7 @@ enable_shadow() {
     --env ENTITLEMENT_AUTHORITY_SHADOW_MAX_TOTAL_DRIFT_COUNT=4 \
     --env ENTITLEMENT_AUTHORITY_SHADOW_MAX_TOTAL_DRIFT_BASIS_POINTS=2000 \
     --env MULTI_TARIFF_ENABLED=false \
-    "$COMPATIBLE_IMAGE" \
+    "$runtime_image" \
     timeout --signal=TERM --kill-after="${KILL_AFTER_SECONDS}s" "${TERM_SECONDS}s" \
       python /opt/teplo/entitlement_shadow_one_shot.py >/dev/null
 
@@ -234,7 +238,7 @@ enable_shadow() {
   docker network connect "$panel_network" "$FIXED_NAME"
   entrypoint_path="$(readlink -f "$entrypoint_path")"
   docker inspect "$FIXED_NAME" | jq -e \
-    --arg image "$COMPATIBLE_IMAGE" \
+    --arg image "$runtime_image" \
     --arg source "$entrypoint_path" \
     --arg db_network "$db_network" \
     --arg panel_network "$panel_network" '
@@ -259,7 +263,7 @@ enable_shadow() {
   sidecar_env_keys="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$FIXED_NAME" \
     | sed 's/=.*//' | LC_ALL=C sort -u)"
   allowed_env_keys="$(
-    docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$COMPATIBLE_IMAGE" | sed 's/=.*//'
+    docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$runtime_image" | sed 's/=.*//'
     printf '%s\n' BOT_TOKEN POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
       REMNAWAVE_API_URL REMNAWAVE_API_KEY REMNAWAVE_AUTH_TYPE DEFAULT_TRAFFIC_RESET_STRATEGY \
       ENTITLEMENT_AUTHORITY_CHECKOUT_ADMISSION_ENABLED ENTITLEMENT_AUTHORITY_PROJECTOR_ENABLED \

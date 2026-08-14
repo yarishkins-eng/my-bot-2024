@@ -1,4 +1,4 @@
-name: Entitlement shadow one-shot exact-image CI
+name: Entitlement shadow one-shot candidate CI
 
 on:
   pull_request:
@@ -28,54 +28,25 @@ permissions:
   contents: read
 
 env:
-  COMPATIBLE_SHA: 103094b96f96a412463753e56e3d996311b182ec
-  COMPATIBLE_IMAGE: sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e
   CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   verify:
     uses: ./.github/workflows/lint.yml
 
-  exact-image-e2e:
+  candidate-boundary:
     needs: verify
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ env.CANDIDATE_SHA }}
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ env.COMPATIBLE_SHA }}
-          path: compatible-source
-
-      - name: Reproduce exact immutable compatible image
+      - name: Verify public candidate boundary
         shell: bash
         run: |
           set -Eeuo pipefail
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          test "$(git -C compatible-source rev-parse HEAD)" = "$COMPATIBLE_SHA"
-          build_dir="$(mktemp -d "$RUNNER_TEMP/teplo-compatible-build.XXXXXX")"
-          trap 'rm -rf "$build_dir"' EXIT
-          git -C compatible-source archive "$COMPATIBLE_SHA" | tar -x -C "$build_dir"
-          docker build --tag teplo-gate2-compatible:ci "$build_dir"
-          test "$(docker image inspect --format '{{.Id}}' teplo-gate2-compatible:ci)" = "$COMPATIBLE_IMAGE"
-          printf 'candidate_sha=%s compatible_sha=%s compatible_image=%s\n' "$CANDIDATE_SHA" "$COMPATIBLE_SHA" "$COMPATIBLE_IMAGE"
-
-      - name: Run mandatory isolated Linux exact-image E2E
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          chmod 700 .github/scripts/entitlement-shadow-one-shot-control.sh \
-            .github/scripts/test-entitlement-shadow-one-shot-e2e.sh
-          chmod 444 .github/scripts/entitlement_shadow_one_shot.py \
-            .github/scripts/entitlement_shadow_readonly_probe.py \
-            .github/scripts/entitlement_shadow_create_schema.py
-          .github/scripts/test-entitlement-shadow-one-shot-e2e.sh \
-            .github/scripts/entitlement_shadow_one_shot.py \
-            .github/scripts/entitlement-shadow-one-shot-control.sh \
-            .github/scripts/entitlement_shadow_readonly_probe.py \
-            .github/scripts/entitlement_shadow_create_schema.py \
-            '${{ github.run_id }}-${{ github.run_attempt }}' \
-            "$GITHUB_WORKSPACE/compatible-source"
+          test ! -e teplo-gate2-compatible-103094b9.tar.gz
+          printf 'candidate_sha=%s private_exact_image_e2e=required\n' "$CANDIDATE_SHA"

@@ -5,6 +5,33 @@ change.  Compatible dormant runtime: source
 `103094b96f96a412463753e56e3d996311b182ec`, schema `0103`, image
 `sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e`.
 
+## Exact-image identity and private E2E
+
+The owner-only Docker archive is identified by SHA-256
+`cc305348078ae92b4320758f84fbb1f176688e73be548266cd9ca4446026342b`.
+Its verified OCI chain is:
+
+- OCI index: `sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e`;
+- linux/amd64 manifest: `sha256:39545077b550badb008c76b81312706f69085a0f79a79705b6bbe6ad3ad6c276`;
+- image config: `sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67`.
+
+The OCI index is not treated as a portable Docker `.Id`. Production keeps its
+separately observed local engine image identity; after portable linux/amd64
+load, E2E addresses and inspects the config digest. The complete digest chain
+is verified before load.
+
+The archive is not public and is not committed. It is stored with local mode
+`0600` under a `0700` owner directory and as an owner-only release asset in a
+separate private companion repository. Only a manual workflow in that private
+repository can download it. That workflow has no production secrets or host
+access, has no pull-request/fork trigger, checks out an exact public candidate
+SHA without persisted credentials, and uploads no image or workflow artifact.
+Candidate scripts execute inside a one-use Docker-in-Docker sandbox whose
+outer network mode is `none`; the workflow requires the containerd image store
+before loading linux/amd64. The sidecar, database, and fake Panel use only
+internal isolated Docker networks. Public repository and fork workflows run
+candidate checks only and cannot access the private image.
+
 ## Process and container lifecycle
 
 `ENABLE_SHADOW` is a manual, protected action.  It transfers one reviewed
@@ -91,6 +118,8 @@ it uses no glob.
 
 This design requires no scheduler, long lease, systemd unit/timer, watchdog,
 revoke tombstone, takeover state machine, source pin journal, or general
-production transition supervisor.  The only durable additions are reviewed
-Git/workflow/docs/tests files; dormant release leaves the production
-application image, source checkout, configuration, and data unchanged.
+production transition supervisor. The durable additions are reviewed
+Git/workflow/docs/tests files plus the owner-only companion repository and its
+private immutable CI input. They do not add a production control process.
+Production application image, source checkout, configuration, and data remain
+unchanged.

@@ -9,6 +9,14 @@ not authorize `ENABLE_SHADOW` or a live production observation.
   `103094b96f96a412463753e56e3d996311b182ec`.
 - Compatible deployed image ID:
   `sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e`.
+- Owner-only archive SHA-256:
+  `cc305348078ae92b4320758f84fbb1f176688e73be548266cd9ca4446026342b`.
+- OCI index:
+  `sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e`.
+- linux/amd64 manifest:
+  `sha256:39545077b550badb008c76b81312706f69085a0f79a79705b6bbe6ad3ad6c276`.
+- linux/amd64 config:
+  `sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67`.
 - Schema: exactly `0103`; all nine authority tables must be empty.
 - Production `.env` SHA-256:
   `dc35bf7aa92d570c5f190b3e7ccb8e2f22aa87b5d3d46f9277d63252fbd1057c`.
@@ -19,6 +27,20 @@ not authorize `ENABLE_SHADOW` or a live production observation.
 Any drift is a hard stop. Updating this boundary requires a new reviewed
 candidate, exact-image E2E, exact-SHA CI, reviewer GO, skeptic GO, and a new
 owner decision.
+
+The OCI index and the portable Docker `.Id` are distinct evidence. The private
+E2E verifies the full archive/index/amd64-manifest/config chain, loads only
+linux/amd64, and compares the loaded Docker `.Id` with the config digest, not
+with the OCI index.
+
+The archive remains owner-only (`0700` directory, `0600` local file) and is
+available only to a manual workflow in a separate private companion
+repository. The public repository and fork workflows receive neither the
+archive nor credentials for that repository. The private workflow has no
+production credentials, no production host access, no PR/fork trigger, and
+publishes no artifact. Candidate code runs only inside a disposable
+Docker-in-Docker sandbox with outer network mode `none`; the job fails unless
+the sandbox reports a containerd-backed image store.
 
 ## Released control surface
 
@@ -96,6 +118,11 @@ Before the dormant release:
    bot identity/image/start/restart count, `.env`, schema, business-data
    fingerprints, Panel mutation markers, authority-table counts and worker
    count.
+
+For the current prerequisite verification, the owner explicitly prohibited
+merge, deploy, and production `ENABLE_SHADOW`. Work stops after a new exact
+candidate SHA, green public candidate CI, green private exact-image E2E, and
+fresh reviewer/skeptic verdicts. Those results do not authorize release.
 
 After that rehearsal, stop. Production `ENABLE_SHADOW` remains forbidden until
 a separate explicit owner GO.
