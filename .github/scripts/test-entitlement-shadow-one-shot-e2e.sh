@@ -39,7 +39,9 @@ cleanup() {
     rmdir "$ACTIVE_RUN_DIR" 2>/dev/null
   fi
   rm -f "$WORK_DIR/fake_panel.py" "$WORK_DIR/panel-counts.json" \
-    "$WORK_DIR/controller-sigkill.out"
+    "$WORK_DIR/controller-sigkill.out" "$WORK_DIR/query-fail-bin/docker" \
+    "$WORK_DIR/query-fail-bin/timeout"
+  rmdir "$WORK_DIR/query-fail-bin" 2>/dev/null
   rmdir "$WORK_DIR" 2>/dev/null
 }
 trap cleanup EXIT HUP INT TERM
@@ -324,6 +326,23 @@ while docker inspect "$FIXED_NAME" >/dev/null 2>&1; do
   sleep 1
 done
 echo 'scenario=controller-sigkill container-absent'
+
+mkdir "$WORK_DIR/query-fail-bin"
+printf '%s\n' '#!/bin/sh' 'exit 125' > "$WORK_DIR/query-fail-bin/docker"
+printf '%s\n' '#!/bin/sh' 'shift' 'exec "$@"' > "$WORK_DIR/query-fail-bin/timeout"
+chmod 700 "$WORK_DIR/query-fail-bin/docker" "$WORK_DIR/query-fail-bin/timeout"
+set +e
+query_failure_output="$(PATH="$WORK_DIR/query-fail-bin:$PATH" invoke_control DISABLE_SHADOW 2>&1)"
+query_failure_rc=$?
+set -e
+if [ "$query_failure_rc" = '0' ] \
+  || printf '%s' "$query_failure_output" | grep -q 'cleanup_result=absent_noop'; then
+  echo 'Docker query failure was misclassified as absent' >&2
+  exit 1
+fi
+rm -f "$WORK_DIR/query-fail-bin/docker" "$WORK_DIR/query-fail-bin/timeout"
+rmdir "$WORK_DIR/query-fail-bin"
+echo 'scenario=disable-query-failure fail-closed'
 
 disable_output="$(invoke_control DISABLE_SHADOW)"
 printf '%s' "$disable_output" | grep -q 'cleanup_result=absent_noop'

@@ -111,7 +111,10 @@ observation.
 
 `DISABLE_SHADOW` depends only on Docker access.  It does not read or require
 the database, Panel, Redis, schema, production source, `.env`, or bot health.
-Absent is a successful no-op.  A running, stopped, or paused exact-name
+Absent is a successful no-op only after a bounded exact-name Docker query
+succeeds with an empty result. Daemon/socket unavailability, query timeout,
+any non-zero exit, or ambiguous output fails closed without `absent_noop` or
+unlinking the run primitives. A running, stopped, or paused exact-name
 container is removed only after its exact `teplo.role` label is verified.
 An unexpected label or ambiguous identity fails closed and cannot touch
 `remnawave_bot`.  Available output is accepted only through the same strict

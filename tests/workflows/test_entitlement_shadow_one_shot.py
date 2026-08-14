@@ -215,6 +215,42 @@ def test_disable_is_independent_and_fail_closed() -> None:
         assert forbidden not in disable.lower()
     assert 'cleanup_result=absent_noop' in disable
     assert 'foreign' in disable.lower()
+    assert 'query_exact_container_id' in disable
+    assert 'docker container ls --all --no-trunc' in source
+    assert '--filter "name=^/${FIXED_NAME}$"' in source
+    assert 'timeout "${DOCKER_QUERY_SECONDS}s"' in source
+
+
+def test_disable_fails_closed_when_exact_name_docker_query_fails(tmp_path: Path) -> None:
+    controller = tmp_path / 'entitlement-shadow-one-shot-control.sh'
+    entrypoint = tmp_path / 'entitlement_shadow_one_shot.py'
+    controller.write_bytes(CONTROLLER.read_bytes())
+    entrypoint.write_bytes(ENTRYPOINT.read_bytes())
+    controller.chmod(0o700)
+    entrypoint.chmod(0o444)
+
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    fake_docker = fake_bin / 'docker'
+    fake_timeout = fake_bin / 'timeout'
+    fake_docker.write_text('#!/bin/sh\nexit 125\n', encoding='utf-8')
+    fake_timeout.write_text('#!/bin/sh\nshift\nexec "$@"\n', encoding='utf-8')
+    fake_docker.chmod(0o700)
+    fake_timeout.chmod(0o700)
+
+    env = {**os.environ, 'PATH': f'{fake_bin}:{os.environ["PATH"]}'}
+    result = subprocess.run(  # noqa: S603 - exact temporary controller under test
+        [str(controller), 'DISABLE_SHADOW', str(entrypoint), '0' * 64],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert 'cleanup_result=absent_noop' not in result.stdout
+    assert controller.exists()
+    assert entrypoint.exists()
 
 
 def test_controller_never_publishes_raw_container_output() -> None:
@@ -277,6 +313,7 @@ def test_mandatory_private_e2e_contract_is_exact_image_and_cannot_skip() -> None
         'injected-dml-rejected',
         'actual-panel-timeout',
         'hard-deadline-primitive',
+        'disable-query-failure',
         'forbidden-env-absent',
     ):
         assert required in script

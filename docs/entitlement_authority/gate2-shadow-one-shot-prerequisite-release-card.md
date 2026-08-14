@@ -96,7 +96,9 @@ Disable depends only on Docker and the fixed container identity
 `teplo-entitlement-shadow-one-shot` with label
 `teplo.role=entitlement-shadow-one-shot`.
 
-- Absent is an idempotent no-op.
+- Absent is an idempotent no-op only after a bounded exact-name Docker query
+  succeeds with an empty result; daemon/socket failure, timeout, any non-zero
+  query exit, or ambiguous output fails closed without `absent_noop`.
 - Running, stopped, or paused owned containers are removed.
 - A foreign fixed-name container fails closed and is never removed.
 - Raw logs are never published. Strict aggregate evidence is retained when it

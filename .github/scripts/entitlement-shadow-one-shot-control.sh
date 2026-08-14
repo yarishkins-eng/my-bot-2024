@@ -13,14 +13,33 @@ readonly CYCLE_SECONDS='180'
 readonly TERM_SECONDS='195'
 readonly KILL_AFTER_SECONDS='10'
 readonly ABSENT_BY_SECONDS='210'
+readonly DOCKER_QUERY_SECONDS='10'
 
 require_exact_role() {
-  local actual_role
-  actual_role="$(docker inspect --format '{{ index .Config.Labels "teplo.role" }}' "$FIXED_NAME")"
+  local container_ref="${1:-$FIXED_NAME}" actual_role
+  actual_role="$(docker inspect --format '{{ index .Config.Labels "teplo.role" }}' "$container_ref")"
   if [ "$actual_role" != 'entitlement-shadow-one-shot' ]; then
     echo 'foreign fixed-name container; refusing action' >&2
     return 1
   fi
+}
+
+query_exact_container_id() {
+  local exact_container_id=''
+  if ! exact_container_id="$(timeout "${DOCKER_QUERY_SECONDS}s" \
+    docker container ls --all --no-trunc \
+      --filter "name=^/${FIXED_NAME}$" --format '{{.ID}}' 2>/dev/null)"; then
+    echo 'exact-name Docker query failed; refusing absent classification' >&2
+    return 1
+  fi
+  if [ -z "$exact_container_id" ]; then
+    return 0
+  fi
+  if [[ ! "$exact_container_id" =~ ^[0-9a-f]{64}$ ]]; then
+    echo 'exact-name Docker query returned ambiguous identity' >&2
+    return 1
+  fi
+  printf '%s' "$exact_container_id"
 }
 
 validate_evidence() {
@@ -69,17 +88,24 @@ unlink_run_primitives() {
 
 disable_shadow() {
   local entrypoint_path="${1:-}" expected_entrypoint_sha="${2:-}" raw_output='' validated=''
-  if ! docker inspect "$FIXED_NAME" >/dev/null 2>&1; then
+  local exact_container_id='' remaining_container_id=''
+  if ! exact_container_id="$(query_exact_container_id)"; then
+    return 1
+  fi
+  if [ -z "$exact_container_id" ]; then
     unlink_run_primitives "$entrypoint_path"
     echo 'observation_evidence=unproved'
     echo 'cleanup_result=absent_noop'
     return 0
   fi
   # Ownership is proven from the exact teplo.role label; foreign containers fail closed.
-  require_exact_role
-  raw_output="$(docker logs "$FIXED_NAME" 2>/dev/null || true)"
-  docker rm -f "$FIXED_NAME" >/dev/null
-  if docker inspect "$FIXED_NAME" >/dev/null 2>&1; then
+  require_exact_role "$exact_container_id"
+  raw_output="$(docker logs "$exact_container_id" 2>/dev/null || true)"
+  docker rm -f "$exact_container_id" >/dev/null
+  if ! remaining_container_id="$(query_exact_container_id)"; then
+    return 1
+  fi
+  if [ -n "$remaining_container_id" ]; then
     echo 'fixed-name one-shot container remains after cleanup' >&2
     return 1
   fi
