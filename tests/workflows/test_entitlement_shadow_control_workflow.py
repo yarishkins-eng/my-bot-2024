@@ -175,11 +175,17 @@ def test_enable_rerun_without_completed_lease_is_rejected() -> None:
 def test_every_production_switch_refuses_an_active_shadow() -> None:
     for workflow in DEPLOY_WORKFLOWS:
         source = workflow.read_text()
+        assert 'readonly CONTROL_PLANE_JOURNAL="$STATE_DIR/bot-production.control-plane-transition.state"' in source
         assert "readonly SHADOW_RUNTIME_DIR='/var/lib/teplo-vpn/entitlement-shadow-runtime'" in source
         assert 'readonly SHADOW_CONTROL_LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"' in source
         assert 'exec 8>"$SHADOW_CONTROL_LOCK_FILE"' in source
         assert 'flock -w 30 8' in source
         assert source.index('flock -w 30 8') < source.index('test ! -e "$SHADOW_RUNTIME_DIR/lease.state"')
+        if workflow.name == 'deploy-infrastructure.yml':
+            assert '[ "$infrastructure_paths_changed" = \'1\' ] && [ -e "$CONTROL_PLANE_JOURNAL" ]' in source
+        else:
+            assert source.index('flock -w 30 8') < source.index('test ! -e "$CONTROL_PLANE_JOURNAL"')
+            assert 'test ! -e "$CONTROL_PLANE_JOURNAL"' in source
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/lease.state"' in source
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/disable.state"' in source
         assert 'docker info >/dev/null 2>&1' in source

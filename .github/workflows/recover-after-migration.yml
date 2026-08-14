@@ -76,6 +76,7 @@ jobs:
             readonly STATE_FILE="$STATE_DIR/bot-production.state"
             readonly RECOVERY_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
             readonly RECOVERY_AUDIT_FILE="$STATE_DIR/bot-production.migration-recovery.${TARGET_SHA}.audit"
+            readonly CONTROL_PLANE_JOURNAL="$STATE_DIR/bot-production.control-plane-transition.state"
             readonly SHADOW_RUNTIME_DIR='/var/lib/teplo-vpn/entitlement-shadow-runtime'
             readonly SHADOW_CONTROL_LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"
             RECOVERY_DIR=''
@@ -92,6 +93,10 @@ jobs:
             exec 8>"$SHADOW_CONTROL_LOCK_FILE"
             flock -w 30 8 || {
               echo 'Refusing recovery: shadow control is busy.' >&2
+              exit 64
+            }
+            test ! -e "$CONTROL_PLANE_JOURNAL" || {
+              echo 'Refusing recovery: a protected control-plane transition is still prepared.' >&2
               exit 64
             }
             test ! -e "$SHADOW_RUNTIME_DIR/lease.state" || {

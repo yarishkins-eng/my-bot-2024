@@ -146,7 +146,10 @@ it does not build, recreate or restart the bot. A kill after source checkout
 is recovered only from a root-owned prepared journal containing the exact
 base/target SHA and prior bot container ID, image and start time. A kill after
 the deploy-state write is completed by validating and clearing that same
-journal. Any restart or recreation is a STOP. Shadow remains
+journal. Any restart or recreation is a STOP. While that journal is prepared,
+ordinary, migration and migration-recovery deploys, plus any Docker/Compose
+infrastructure switch, stop fail-closed under the same host lock; only the
+exact source-only infrastructure recovery may consume it. Shadow remains
 absent. Required checks:
 
 1. exact merge SHA/tree, exact-SHA CI and fresh reviewer/skeptic GO with
