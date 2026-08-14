@@ -3,6 +3,15 @@
 This card releases only a dormant, protected one-shot control path. It does
 not authorize `ENABLE_SHADOW` or a live production observation.
 
+## Authority blocker
+
+One of the two exact DB/Panel cases in the aggregate `sampled=4` result has no
+proven durable commercial or admin authority for its current expiry. This is
+`authority_unproven`, not a finding that the expiry is invalid or wrong. It is
+a pre-existing blocker for scheduler/projector/writer cutover and automatic
+repairs. No repair or user-access change is included, and production
+progression remains stopped pending a separate owner decision.
+
 ## Immutable compatibility boundary
 
 - Compatible deployed source SHA:

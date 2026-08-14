@@ -226,3 +226,79 @@ def test_shadow_evaluator_is_pure_redacted_and_exact() -> None:
     assert not hasattr(exact, 'desired_hash_prefix')
     assert not hasattr(exact, 'observed_hash_prefix')
     assert 'owner-fingerprint' not in repr(exact)
+
+
+@pytest.mark.parametrize(
+    ('db_expiry', 'panel_expiry'),
+    [
+        ('2026-09-12T00:00:24.084771+00:00', '2026-09-12T00:00:24.084000+00:00'),
+        ('2026-09-12T00:00:24.815158+00:00', '2026-09-12T00:00:24.815000+00:00'),
+    ],
+)
+def test_shadow_expiry_in_same_utc_millisecond_bucket_is_exact(
+    db_expiry: str,
+    panel_expiry: str,
+) -> None:
+    desired = snapshot(expire_at=datetime.fromisoformat(db_expiry))
+    observed = snapshot(expire_at=datetime.fromisoformat(panel_expiry))
+
+    assert ReadOnlyShadowEvaluator.evaluate(desired, observed) == ReadOnlyShadowEvaluator.evaluate(
+        desired,
+        desired,
+    )
+
+
+def test_shadow_expiry_is_compared_after_utc_normalization() -> None:
+    desired = snapshot(expire_at=datetime.fromisoformat('2026-09-12T03:00:24.084771+03:00'))
+    observed = snapshot(expire_at=datetime.fromisoformat('2026-09-12T00:00:24.084000+00:00'))
+
+    metric = ReadOnlyShadowEvaluator.evaluate(desired, observed)
+
+    assert metric.state == 'exact'
+    assert metric.mismatch_fields == ()
+
+
+def test_shadow_adjacent_millisecond_buckets_drift_even_when_one_microsecond_apart() -> None:
+    desired = snapshot(expire_at=datetime.fromisoformat('2026-09-12T00:00:24.084999+00:00'))
+    observed = snapshot(expire_at=datetime.fromisoformat('2026-09-12T00:00:24.085000+00:00'))
+
+    metric = ReadOnlyShadowEvaluator.evaluate(desired, observed)
+
+    assert metric.state == 'drift'
+    assert metric.mismatch_fields == ('expire_at',)
+
+
+def test_shadow_expiry_difference_of_exactly_one_millisecond_is_drift() -> None:
+    desired = snapshot(expire_at=datetime.fromisoformat('2026-09-12T00:00:24.085000+00:00'))
+    observed = snapshot(expire_at=datetime.fromisoformat('2026-09-12T00:00:24.084000+00:00'))
+
+    metric = ReadOnlyShadowEvaluator.evaluate(desired, observed)
+
+    assert metric.state == 'drift'
+    assert metric.mismatch_fields == ('expire_at',)
+
+
+def test_shadow_sub_millisecond_expiry_does_not_mask_other_strict_drift() -> None:
+    desired = snapshot(expire_at=datetime.fromisoformat('2026-09-12T00:00:24.084771+00:00'))
+    observed = snapshot(
+        expire_at=datetime.fromisoformat('2026-09-12T00:00:24.084000+00:00'),
+        status='DISABLED',
+    )
+
+    metric = ReadOnlyShadowEvaluator.evaluate(desired, observed)
+
+    assert metric.state == 'drift'
+    assert metric.mismatch_fields == ('status',)
+
+
+def test_global_comparator_and_snapshot_hashes_remain_strict_for_sub_millisecond_expiry() -> None:
+    desired = snapshot(expire_at=datetime.fromisoformat('2026-09-12T00:00:24.084771+00:00'))
+    observed = snapshot(expire_at=datetime.fromisoformat('2026-09-12T00:00:24.084000+00:00'))
+
+    comparison = compare_snapshots(desired, observed)
+
+    assert comparison.exact is False
+    assert comparison.mismatch_fields == ('expire_at',)
+    assert comparison.desired_hash == desired.desired_hash
+    assert comparison.observed_hash == observed.desired_hash
+    assert comparison.desired_hash != comparison.observed_hash

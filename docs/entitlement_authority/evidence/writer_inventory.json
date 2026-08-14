@@ -2582,7 +2582,7 @@
     {
       "field": "status",
       "function": "<module>",
-      "line": 12,
+      "line": 13,
       "path": "app/services/entitlement_authority/shadow.py"
     },
     {
@@ -4556,7 +4556,7 @@
     {
       "field": "status",
       "function": "normalize_shadow_observation",
-      "line": 149,
+      "line": 161,
       "path": "app/services/entitlement_authority/shadow.py"
     },
     {
@@ -14629,7 +14629,7 @@
     "app/**/*.py",
     "main.py"
   ],
-  "sha256": "e455090e4d38db6903114a59fb318cfa1556cc0c2b1ea0a38d0be0024479a227",
+  "sha256": "d99dac45348e726783af25f2a9d2d761565493a9be74b79093b861e204f26f97",
   "startup_registrations": [
     {
       "call": "asyncio.create_task(                                     _refresh_remnawave_description(                                         remnawave_uuid=sub.remnawave_uuid,                                         description=description,                                         telegram_id=db_user.telegram_id",

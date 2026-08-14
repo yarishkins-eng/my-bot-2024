@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from .types import EntitlementSnapshot, compare_snapshots
 
@@ -34,10 +35,21 @@ class ReadOnlyShadowEvaluator:
         if observed is None:
             return ShadowMetric('missing', ('panel_uuid',))
         comparison = compare_snapshots(desired, observed)
+        mismatch_fields = comparison.mismatch_fields
+        if 'expire_at' in mismatch_fields and _same_utc_millisecond_bucket(desired.expire_at, observed.expire_at):
+            mismatch_fields = tuple(field for field in mismatch_fields if field != 'expire_at')
         return ShadowMetric(
-            'exact' if comparison.exact else 'drift',
-            comparison.mismatch_fields,
+            'exact' if not mismatch_fields else 'drift',
+            mismatch_fields,
         )
+
+
+def _same_utc_millisecond_bucket(left: datetime, right: datetime) -> bool:
+    def truncate(value: datetime) -> datetime:
+        normalized = value.astimezone(UTC)
+        return normalized.replace(microsecond=normalized.microsecond // 1_000 * 1_000)
+
+    return truncate(left) == truncate(right)
 
 
 @dataclass(frozen=True, slots=True)
