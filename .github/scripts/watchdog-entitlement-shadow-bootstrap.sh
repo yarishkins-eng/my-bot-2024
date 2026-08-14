@@ -304,7 +304,7 @@ materialize_completed_audits() {
 remove_matching_active_audits() {
   for target in "$RUN_AUDIT_FILE" "$AUDIT_FILE" "$LATEST_AUDIT_FILE"; do
     if [ -e "$target" ] && cmp -s "$target" "$LEASE_FILE"; then
-      rm -f -- "$target"
+      rm -f -- "$target" || return 1
     fi
   done
 }
@@ -366,12 +366,12 @@ if [ -r "$LEASE_FILE" ] && \
     fail 'expiry_watchdog_arm_failed'
   fi
   materialize_completed_audits || {
-    remove_matching_active_audits
+    remove_matching_active_audits || fail 'conflicting_active_audit_cleanup_unverified'
     remove_own_generation || true
     fail 'completed_audit_conflict'
   }
   if ! capture_container_snapshot || ! snapshot_matches_completed_lease; then
-    remove_matching_active_audits
+    remove_matching_active_audits || fail 'post_audit_cleanup_unverified'
     remove_own_generation_rc=0
     remove_own_generation || remove_own_generation_rc=$?
     [ "$remove_own_generation_rc" = '0' ] || fail 'post_audit_container_removal_unverified'
@@ -380,6 +380,11 @@ if [ -r "$LEASE_FILE" ] && \
   exit 0
 fi
 
+# A prior watchdog may have been killed while removing provisional active
+# receipts after the completed sidecar became invalid.  Finish that cleanup
+# while the exact lease is still available for byte-for-byte fencing, then
+# remove the generation and publish the disabled receipt.
+remove_matching_active_audits || fail 'bootstrap_active_audit_cleanup_unverified'
 remove_own_generation_rc=0
 remove_own_generation || remove_own_generation_rc=$?
 [ "$remove_own_generation_rc" = '10' ] && exit 0

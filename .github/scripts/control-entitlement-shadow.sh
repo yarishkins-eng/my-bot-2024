@@ -187,10 +187,88 @@ fixed_sidecar_is_absent() {
   [ -z "$ids" ]
 }
 
+cleanup_lease_value() {
+  key="$1"
+  count="$(grep -Ec "^${key}=[^[:space:]]+$" "$LEASE_FILE" 2>/dev/null || true)"
+  [ "$count" = '1' ] || return 1
+  sed -n "s/^${key}=//p" "$LEASE_FILE"
+}
+
+cleanup_provisional_active_audits() {
+  [ -r "$LEASE_FILE" ] || return 0
+  lease_run_id="$(cleanup_lease_value workflow_run_id)" || return 1
+  lease_run_attempt="$(cleanup_lease_value workflow_run_attempt)" || return 1
+  [[ "$lease_run_id" =~ ^[0-9]+$ ]] || return 1
+  [[ "$lease_run_attempt" =~ ^[0-9]+$ ]] || return 1
+  lease_run_audit="$STATE_DIR/bot-production.entitlement-shadow-control.${lease_run_id}.${lease_run_attempt}.audit"
+  lease_watchdog_audit="$STATE_DIR/bot-production.entitlement-shadow-watchdog.${lease_run_id}.${lease_run_attempt}.audit"
+  for target in "$lease_run_audit" "$lease_watchdog_audit"; do
+    if [ -e "$target" ]; then
+      cmp -s "$target" "$LEASE_FILE" || return 1
+      rm -f -- "$target" || return 1
+    fi
+  done
+  if [ -e "$AUDIT_FILE" ] && cmp -s "$AUDIT_FILE" "$LEASE_FILE"; then
+    rm -f -- "$AUDIT_FILE" || return 1
+  fi
+}
+
+atomic_replace_audit() {
+  source_file="$1"
+  target="$2"
+  target_tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
+  if ! cp "$source_file" "$target_tmp" || ! chmod 600 "$target_tmp" || ! mv "$target_tmp" "$target"; then
+    rm -f -- "$target_tmp"
+    return 1
+  fi
+}
+
+publish_immutable_audit() {
+  source_file="$1"
+  target="$2"
+  if [ -e "$target" ]; then
+    cmp -s "$source_file" "$target"
+    return
+  fi
+  target_tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
+  if ! cp "$source_file" "$target_tmp" || ! chmod 600 "$target_tmp"; then
+    rm -f -- "$target_tmp"
+    return 1
+  fi
+  if [ -e "$target" ]; then
+    cmp -s "$source_file" "$target" || {
+      rm -f -- "$target_tmp"
+      return 1
+    }
+    rm -f -- "$target_tmp"
+    return 0
+  fi
+  mv "$target_tmp" "$target" || {
+    rm -f -- "$target_tmp"
+    return 1
+  }
+}
+
+write_cleanup_unverified_audit() {
+  failure_audit="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.cleanup-unverified"
+  failure_tmp="$(mktemp "${failure_audit}.XXXXXX" 2>/dev/null)" || return 1
+  printf 'format_version=2\nphase=cleanup_unverified\naction=AUTO_DISABLE_FAILED_ENABLE\nruntime_mode=unknown\nworkflow_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\ncompleted_at=%s\n' \
+    "$WORKFLOW_SHA" "$RUN_ID" "$RUN_ATTEMPT" "$(date --iso-8601=seconds)" > "$failure_tmp" || return 1
+  chmod 600 "$failure_tmp" || return 1
+  if [ -e "$failure_audit" ]; then
+    rm -f -- "$failure_tmp"
+    return 0
+  fi
+  mv "$failure_tmp" "$failure_audit"
+}
+
 cleanup_runtime() {
   set +e
   [ -z "$SIDECAR_ENV_FILE" ] || rm -f -- "$SIDECAR_ENV_FILE"
-  rm -f -- "$LEASE_FILE"
+  audit_cleanup_verified=0
+  if cleanup_provisional_active_audits && rm -f -- "$LEASE_FILE"; then
+    audit_cleanup_verified=1
+  fi
   cleanup_verified=0
   if docker info >/dev/null 2>&1; then
     docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
@@ -198,22 +276,27 @@ cleanup_runtime() {
       cleanup_verified=1
     fi
   fi
-  if [ "$cleanup_verified" = '1' ] && [ -n "${RUN_AUDIT_FILE:-}" ]; then
+  if [ "$cleanup_verified" = '1' ] && [ "$audit_cleanup_verified" = '1' ] && [ -n "${RUN_AUDIT_FILE:-}" ]; then
     audit_tmp="$(mktemp "$STATE_DIR/bot-production.entitlement-shadow-control.XXXXXX" 2>/dev/null || true)"
     if [ -n "$audit_tmp" ]; then
-      printf 'format_version=2\nphase=completed\naction=AUTO_DISABLE_FAILED_ENABLE\nruntime_mode=disabled\nworkflow_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\napproval_actor=%s\nrelease_card_reference=%s\ncompleted_at=%s\n' \
+      if printf 'format_version=2\nphase=completed\naction=AUTO_DISABLE_FAILED_ENABLE\nruntime_mode=disabled\nworkflow_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\napproval_actor=%s\nrelease_card_reference=%s\ncompleted_at=%s\n' \
         "$WORKFLOW_SHA" "$RUN_ID" "$RUN_ATTEMPT" "$ACTOR" "$RELEASE_CARD" \
-        "$(date --iso-8601=seconds)" > "$audit_tmp"
-      chmod 600 "$audit_tmp"
-      cp "$audit_tmp" "$RUN_AUDIT_FILE"
-      chmod 600 "$RUN_AUDIT_FILE"
-      mv "$audit_tmp" "$AUDIT_FILE"
+        "$(date --iso-8601=seconds)" > "$audit_tmp" && chmod 600 "$audit_tmp"; then
+        if publish_immutable_audit "$audit_tmp" "$RUN_AUDIT_FILE" && atomic_replace_audit "$audit_tmp" "$AUDIT_FILE"; then
+          rm -f -- "$audit_tmp"
+        else
+          rm -f -- "$audit_tmp"
+          write_cleanup_unverified_audit || true
+        fi
+      else
+        rm -f -- "$audit_tmp"
+        write_cleanup_unverified_audit || true
+      fi
+    else
+      write_cleanup_unverified_audit || true
     fi
   elif [ -n "${RUN_AUDIT_FILE:-}" ]; then
-    failure_audit="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.cleanup-unverified"
-    printf 'format_version=2\nphase=cleanup_unverified\naction=AUTO_DISABLE_FAILED_ENABLE\nruntime_mode=unknown\nworkflow_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\ncompleted_at=%s\n' \
-      "$WORKFLOW_SHA" "$RUN_ID" "$RUN_ATTEMPT" "$(date --iso-8601=seconds)" > "$failure_audit"
-    chmod 600 "$failure_audit"
+    write_cleanup_unverified_audit || true
   fi
   set -e
 }
