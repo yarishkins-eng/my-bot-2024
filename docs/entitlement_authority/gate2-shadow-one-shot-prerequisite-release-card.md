@@ -28,10 +28,11 @@ Any drift is a hard stop. Updating this boundary requires a new reviewed
 candidate, exact-image E2E, exact-SHA CI, reviewer GO, skeptic GO, and a new
 owner decision.
 
-The OCI index and the portable Docker `.Id` are distinct evidence. The private
+The OCI index and a portable Docker `.Id` are distinct evidence. The private
 E2E verifies the full archive/index/amd64-manifest/config chain, loads only
-linux/amd64, and compares the loaded Docker `.Id` with the config digest, not
-with the OCI index.
+linux/amd64, and uses the OCI index only as the runtime reference accepted by
+the compatible containerd image store. It does not compare the OCI index with
+Docker `.Id`. The config digest remains separate archive content evidence.
 
 The archive remains owner-only (`0700` directory, `0600` local file) and is
 available only to a manual workflow in a separate private companion
@@ -41,6 +42,9 @@ production credentials, no production host access, no PR/fork trigger, and
 publishes no artifact. Candidate code runs only inside a disposable
 Docker-in-Docker sandbox with outer network mode `none`; the job fails unless
 the sandbox reports a containerd-backed image store.
+The exact companion harness commit is
+`760d840c37303290a8823530db4daa97c34f4004`; both its Docker-in-Docker base
+and PostgreSQL fixture are registry-digest pinned.
 
 ## Released control surface
 

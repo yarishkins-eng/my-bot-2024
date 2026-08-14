@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 readonly CONFIG_DIGEST='sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67'
+readonly OCI_INDEX_DIGEST='sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
 readonly COMPATIBLE_SHA='103094b96f96a412463753e56e3d996311b182ec'
 readonly FIXED_NAME='teplo-entitlement-shadow-one-shot'
 readonly ENTRYPOINT="${1:?entrypoint path required}"
@@ -10,7 +11,7 @@ readonly READONLY_PROBE="${3:?read-only probe path required}"
 readonly SCHEMA_HELPER="${4:?schema helper path required}"
 readonly RUN_KEY="${5:?run key required}"
 readonly COMPATIBLE_SOURCE_DIR="${6:?compatible source dir required}"
-readonly IMAGE="${7:?portable linux/amd64 config digest required}"
+readonly IMAGE="${7:?exact containerd OCI index reference required}"
 readonly WORK_DIR="$(mktemp -d "/tmp/teplo-shadow-e2e-${RUN_KEY}.XXXXXX")"
 readonly DB_NAME="teplo-shadow-db-${RUN_KEY}"
 readonly BOT_NAME="teplo-shadow-config-${RUN_KEY}"
@@ -44,8 +45,8 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 test "$(git -C "$COMPATIBLE_SOURCE_DIR" rev-parse HEAD)" = "$COMPATIBLE_SHA"
-test "$IMAGE" = "$CONFIG_DIGEST"
-test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$IMAGE"
+test "$IMAGE" = "$OCI_INDEX_DIGEST"
+docker image inspect "$IMAGE" >/dev/null
 if docker inspect "$FIXED_NAME" >/dev/null 2>&1; then
   echo 'fixed one-shot name is occupied before isolated test' >&2
   exit 1

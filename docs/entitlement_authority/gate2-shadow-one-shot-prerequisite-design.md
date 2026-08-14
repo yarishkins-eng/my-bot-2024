@@ -16,9 +16,11 @@ Its verified OCI chain is:
 - image config: `sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67`.
 
 The OCI index is not treated as a portable Docker `.Id`. Production keeps its
-separately observed local engine image identity; after portable linux/amd64
-load, E2E addresses and inspects the config digest. The complete digest chain
-is verified before load.
+separately observed local engine image identity. The private E2E verifies the
+complete digest chain before load, then uses the OCI index only as the runtime
+reference accepted by the compatible containerd image store. It never compares
+that reference with Docker `.Id`; the linux/amd64 config digest remains separate
+content evidence verified directly from the archive.
 
 The archive is not public and is not committed. It is stored with local mode
 `0600` under a `0700` owner directory and as an owner-only release asset in a
@@ -26,6 +28,9 @@ separate private companion repository. Only a manual workflow in that private
 repository can download it. That workflow has no production secrets or host
 access, has no pull-request/fork trigger, checks out an exact public candidate
 SHA without persisted credentials, and uploads no image or workflow artifact.
+The reviewed private harness is pinned at companion commit
+`760d840c37303290a8823530db4daa97c34f4004`; its Docker-in-Docker base and
+PostgreSQL fixture are both pinned by registry digest.
 Candidate scripts execute inside a one-use Docker-in-Docker sandbox whose
 outer network mode is `none`; the workflow requires the containerd image store
 before loading linux/amd64. The sidecar, database, and fake Panel use only

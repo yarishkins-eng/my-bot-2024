@@ -5,7 +5,7 @@ readonly FIXED_NAME='teplo-entitlement-shadow-one-shot'
 readonly ROLE_LABEL='teplo.role=entitlement-shadow-one-shot'
 readonly COMPATIBLE_SHA='103094b96f96a412463753e56e3d996311b182ec'
 readonly PRODUCTION_ENGINE_IMAGE_ID='sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
-readonly PORTABLE_AMD64_CONFIG_DIGEST='sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67'
+readonly EXACT_E2E_OCI_INDEX_REFERENCE='sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
 readonly REPO_DIR='/opt/remnawave-bedolaga-telegram-bot'
 readonly STATE_FILE='/var/lib/teplo-vpn/deploy-state/bot-production.state'
 readonly ENV_FINGERPRINT='dc35bf7aa92d570c5f190b3e7ccb8e2f22aa87b5d3d46f9277d63252fbd1057c'
@@ -117,7 +117,7 @@ enable_shadow() {
     panel_network="${ONE_SHOT_E2E_PANEL_NETWORK:?}"
     e2e_run_key="${ONE_SHOT_E2E_RUN_KEY:?}"
     runtime_image="${ONE_SHOT_E2E_IMAGE_REFERENCE:?}"
-    test "$runtime_image" = "$PORTABLE_AMD64_CONFIG_DIGEST"
+    test "$runtime_image" = "$EXACT_E2E_OCI_INDEX_REFERENCE"
     [[ "$e2e_run_key" =~ ^[A-Za-z0-9._-]+$ ]]
     e2e_label_args=(--label "teplo.e2e-run=$e2e_run_key")
     test "$(docker inspect --format '{{ index .Config.Labels "teplo.e2e" }}' "$bot_container")" = 'gate2-shadow-one-shot'

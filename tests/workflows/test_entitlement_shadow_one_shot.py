@@ -288,9 +288,11 @@ def test_oci_index_is_not_used_as_the_portable_docker_image_id() -> None:
         encoding='utf-8'
     )
     assert 'PRODUCTION_ENGINE_IMAGE_ID' in controller
-    assert 'PORTABLE_AMD64_CONFIG_DIGEST' in controller
+    assert 'EXACT_E2E_OCI_INDEX_REFERENCE' in controller
     assert 'runtime_image="${ONE_SHOT_E2E_IMAGE_REFERENCE:?}"' in controller
-    assert 'test "$IMAGE" = "$CONFIG_DIGEST"' in script
+    assert 'test "$IMAGE" = "$OCI_INDEX_DIGEST"' in script
+    assert "--format '{{.Id}}'" not in script
+    assert 'never compares\nthat reference with Docker `.Id`' in design
     assert COMPATIBLE_IMAGE in design
     assert AMD64_MANIFEST in design
     assert AMD64_CONFIG in design
