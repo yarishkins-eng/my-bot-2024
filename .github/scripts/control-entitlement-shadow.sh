@@ -91,6 +91,20 @@ verify_bot_snapshot_unchanged() {
   [ "$SNAPSHOT_STARTED_AT" = "$expected_started_at" ] || fail 'bot_restarted'
 }
 
+verify_sidecar_active() {
+  expected_id="$1"
+  expected_image="$2"
+  sidecar_snapshot_raw="$(docker inspect --format '{{.Id}}|{{.Image}}|{{.State.Running}}|{{.State.Paused}}' "$SIDECAR")" \
+    || fail 'sidecar_snapshot_unavailable'
+  IFS='|' read -r SIDECAR_SNAPSHOT_ID SIDECAR_SNAPSHOT_IMAGE SIDECAR_SNAPSHOT_RUNNING \
+    SIDECAR_SNAPSHOT_PAUSED SIDECAR_SNAPSHOT_EXTRA <<< "$sidecar_snapshot_raw"
+  [ -z "$SIDECAR_SNAPSHOT_EXTRA" ] || fail 'invalid_sidecar_snapshot'
+  [ "$SIDECAR_SNAPSHOT_ID" = "$expected_id" ] || fail 'sidecar_generation_changed'
+  [ "$SIDECAR_SNAPSHOT_IMAGE" = "$expected_image" ] || fail 'sidecar_image_changed'
+  [ "$SIDECAR_SNAPSHOT_RUNNING" = 'true' ] || fail 'sidecar_not_running'
+  [ "$SIDECAR_SNAPSHOT_PAUSED" = 'false' ] || fail 'sidecar_paused'
+}
+
 audit_value() {
   key="$1"
   file="$2"
@@ -287,6 +301,8 @@ if [ -r "$LEASE_FILE" ]; then
     [ -r "$existing_audit" ] && cmp -s "$existing_audit" "$LEASE_FILE" || fail 'completed_audit_recovery_failed'
     cp "$existing_audit" "$AUDIT_FILE"
     chmod 600 "$AUDIT_FILE"
+    verify_bot_snapshot_unchanged "$BOT_CONTAINER_ID" "$CURRENT_IMAGE_ID" "$BOT_STARTED_AT"
+    verify_sidecar_active "$existing_container_id" "$CURRENT_IMAGE_ID"
     printf 'Gate 2 isolated read-only shadow completion was recovered from its durable lease.\n'
     exit 0
   fi
@@ -440,8 +456,7 @@ docker start "$SIDECAR" >/dev/null
 
 cycle_seen=0
 for _ in $(seq 1 115); do
-  [ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR" 2>/dev/null || true)" = 'true' ] || fail 'sidecar_stopped_before_first_cycle'
-  [ "$(docker inspect --format '{{.State.Paused}}' "$SIDECAR" 2>/dev/null || true)" = 'false' ] || fail 'sidecar_paused_before_first_cycle'
+  verify_sidecar_active "$SIDECAR_CONTAINER_ID" "$CURRENT_IMAGE_ID"
   sidecar_logs="$(docker logs --since "$SIDE_STARTED_AT" "$SIDECAR" 2>&1 || true)"
   if printf '%s\n' "$sidecar_logs" | grep -Eq 'entitlement_shadow_circuit_open|entitlement_shadow_sidecar_(stopped|refused)|entitlement_shadow_lease_lost'; then
     fail 'sidecar_failed_before_first_cycle'
@@ -460,8 +475,7 @@ verify_bot_snapshot_unchanged "$BOT_CONTAINER_ID" "$CURRENT_IMAGE_ID" "$BOT_STAR
 completed_expires="$(( $(date +%s) + OBSERVATION_SECONDS ))"
 write_lease completed "$completed_expires" "$(date --iso-8601=seconds)"
 sleep 3
-[ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR")" = 'true' ] || fail 'sidecar_not_running_after_commit'
-[ "$(docker inspect --format '{{.State.Paused}}' "$SIDECAR")" = 'false' ] || fail 'sidecar_paused_after_commit'
+verify_sidecar_active "$SIDECAR_CONTAINER_ID" "$CURRENT_IMAGE_ID"
 verify_bot_snapshot_unchanged "$BOT_CONTAINER_ID" "$CURRENT_IMAGE_ID" "$BOT_STARTED_AT"
 TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG_INSTALLED" BOOTSTRAP \
   "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$RUN_ATTEMPT" "$WATCHDOG_AUDIT_FILE" \
@@ -469,8 +483,7 @@ TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG_INSTALLED" BOOTSTRAP \
 [ -r "$RUN_AUDIT_FILE" ] && cmp -s "$RUN_AUDIT_FILE" "$LEASE_FILE" || fail 'run_audit_not_durable'
 [ -r "$AUDIT_FILE" ] && cmp -s "$AUDIT_FILE" "$LEASE_FILE" || fail 'latest_audit_not_durable'
 verify_bot_snapshot_unchanged "$BOT_CONTAINER_ID" "$CURRENT_IMAGE_ID" "$BOT_STARTED_AT"
-[ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR")" = 'true' ] || fail 'sidecar_not_running_at_success'
-[ "$(docker inspect --format '{{.State.Paused}}' "$SIDECAR")" = 'false' ] || fail 'sidecar_paused_at_success'
+verify_sidecar_active "$SIDECAR_CONTAINER_ID" "$CURRENT_IMAGE_ID"
 systemctl stop "${WATCHDOG_EXACT_UNIT}.timer" "${WATCHDOG_EXACT_UNIT}.service" >/dev/null 2>&1 || true
 MUTATION_STARTED=0
 trap - ERR

@@ -138,8 +138,13 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     assert 'docker compose up' not in source
     assert 'docker restart' not in source
     assert 'docker rm -f "$BOT_CONTAINER"' not in source
-    assert '\'{{.State.Paused}}\' "$SIDECAR"' in source
-    assert "container_value '{{.State.Paused}}'" in WATCHDOG.read_text()
+    sidecar_snapshot_body = source.split('verify_sidecar_active() {', 1)[1].split('\n}', 1)[0]
+    assert sidecar_snapshot_body.count('docker inspect') == 1
+    assert '{{.Id}}|{{.Image}}|{{.State.Running}}|{{.State.Paused}}' in sidecar_snapshot_body
+    watchdog_source = WATCHDOG.read_text()
+    watchdog_snapshot_body = watchdog_source.split('capture_container_snapshot() {', 1)[1].split('\n}', 1)[0]
+    assert watchdog_snapshot_body.count('docker inspect') == 1
+    assert '{{.Id}}|{{.Image}}|{{.State.Running}}|{{.State.Paused}}|' in watchdog_snapshot_body
     assert 'control_plane_transition_prepared' in source
     assert source.index('control_plane_transition_prepared') < source.index('docker create')
     snapshot_body = source.split('capture_bot_snapshot() {', 1)[1].split('\n}', 1)[0]
@@ -154,6 +159,12 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     assert first_commit_check < source.index('write_lease completed') < second_commit_check
     final_commit_check = source.index('verify_bot_snapshot_unchanged', second_commit_check + 1)
     assert source.index('latest_audit_not_durable') < final_commit_check < source.rindex('MUTATION_STARTED=0')
+    completed_recovery = source.split('if [ "$lease_phase" = \'completed\' ]; then', 1)[1].split(
+        '[ "$lease_phase" = \'prepared\' ]',
+        1,
+    )[0]
+    assert completed_recovery.index('verify_bot_snapshot_unchanged') < completed_recovery.index('exit 0')
+    assert completed_recovery.index('verify_sidecar_active') < completed_recovery.index('exit 0')
     assert 'WATCHDOG_PENDING_UNIT' in source
     assert 'WATCHDOG_EXACT_UNIT' in source
     assert source.index('--unit="$WATCHDOG_EXACT_UNIT"') < source.rindex(
@@ -319,6 +330,22 @@ if [ "$1" = inspect ]; then
   target="${@: -1}"
   if [ "$target" != teplo_entitlement_shadow ] && [ "$target" != "$FAKE_CONTAINER_ID" ]; then exit 1; fi
   case "$*" in
+    *'{{.Id}}|{{.Image}}|{{.State.Running}}|{{.State.Paused}}|'*)
+      snapshot_calls_file="${DOCKER_CALLS}.snapshots"
+      snapshot_calls=0
+      [ ! -e "$snapshot_calls_file" ] || snapshot_calls="$(cat "$snapshot_calls_file")"
+      snapshot_calls="$(( snapshot_calls + 1 ))"
+      printf '%s\n' "$snapshot_calls" > "$snapshot_calls_file"
+      fake_image="$(printf '%064d' 0 | tr 0 b)"
+      fake_sha="$(printf '%040d' 0 | tr 0 a)"
+      printf '%s|sha256:%s|%s|%s|entitlement-shadow-readonly|%s|%s|%s|%s|gate2-readonly-v1\n' \
+        "$FAKE_CONTAINER_ID" "$fake_image" "${FAKE_CONTAINER_RUNNING:-true}" \
+        "${FAKE_CONTAINER_PAUSED:-false}" "${FAKE_LABEL_RUN_ID:-$EXPECTED_RUN_ID}" \
+        "${FAKE_LABEL_RUN_ATTEMPT:-$EXPECTED_RUN_ATTEMPT}" "$fake_sha" "$fake_sha"
+      if [ "${FAKE_STOP_AFTER_SNAPSHOT_CALL:-0}" = "$snapshot_calls" ]; then
+        rm -f "$CONTAINER_PRESENT"
+      fi
+      ;;
     *'{{.Id}}'*) if [ -e "$CONTAINER_PRESENT" ]; then printf '%s\n' "$FAKE_CONTAINER_ID"; fi ;;
     *State.Running*) printf 'true\n' ;;
     *State.Paused*) printf '%s\n' "${FAKE_CONTAINER_PAUSED:-false}" ;;
@@ -525,6 +552,67 @@ def test_watchdog_materializes_completed_audit_without_removing_sidecar(tmp_path
     assert keyed.read_text() == lease.read_text()
     assert latest.read_text() == lease.read_text()
     assert container_present.exists()
+
+
+def test_watchdog_does_not_materialize_active_audit_after_sidecar_exit(tmp_path: Path) -> None:
+    run_id, run_attempt = '458', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    container_id = '8' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
+    audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
+    secret_env = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
+    secret_env.write_text('SECRET=redacted\n')
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    expected_env = tmp_path / 'expected-env'
+    expected_env.write_text(_fixed_policy_env())
+    docker_calls = tmp_path / 'docker-calls'
+
+    result = subprocess.run(  # noqa: S603 - fixed repository watchdog
+        [
+            str(WATCHDOG),
+            'BOOTSTRAP',
+            str(lease),
+            'teplo_entitlement_shadow',
+            run_id,
+            run_attempt,
+            str(audit),
+            str(secret_env),
+            container_id,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+            'DOCKER_CALLS': str(docker_calls),
+            'EXPECTED_RUN_ID': run_id,
+            'EXPECTED_RUN_ATTEMPT': run_attempt,
+            'FAKE_CONTAINER_ID': container_id,
+            'CONTAINER_PRESENT': str(container_present),
+            'EXPECTED_ENV_FILE': str(expected_env),
+            'FAKE_STOP_AFTER_SNAPSHOT_CALL': '1',
+        },
+    )
+
+    active_audit = state / f'bot-production.entitlement-shadow-control.{run_id}.{run_attempt}.audit'
+    disabled_audit = state / (
+        f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_BOOTSTRAP.audit'
+    )
+    assert result.returncode == 0, result.stderr
+    assert not container_present.exists()
+    assert not lease.exists()
+    assert not active_audit.exists()
+    assert disabled_audit.exists()
+    assert 'runtime_mode=disabled' in disabled_audit.read_text()
 
 
 def test_watchdog_refuses_paused_completed_sidecar(tmp_path: Path) -> None:

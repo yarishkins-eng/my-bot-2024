@@ -77,11 +77,6 @@ container_target() {
   fi
 }
 
-container_value() {
-  format="$1"
-  docker inspect --format "$format" "$(container_target)" 2>/dev/null || true
-}
-
 container_id_for_removal() {
   inspect_tmp="$(mktemp "$STATE_DIR/entitlement-shadow-inspect.XXXXXX")"
   if docker inspect --format '{{.Id}}' "$(container_target)" > "$inspect_tmp" 2>/dev/null; then
@@ -116,34 +111,48 @@ fixed_sidecar_is_absent() {
   [ -z "$remaining" ]
 }
 
-container_label() {
-  key="$1"
-  container_value "{{index .Config.Labels \"${key}\"}}"
-}
-
 exact_env() {
   key="$1"
   expected="$2"
   [ "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$(container_target)" 2>/dev/null | grep -Fxc "${key}=${expected}" || true)" = '1' ]
 }
 
+capture_container_snapshot() {
+  container_snapshot_raw="$(docker inspect --format '{{.Id}}|{{.Image}}|{{.State.Running}}|{{.State.Paused}}|{{index .Config.Labels "teplo.role"}}|{{index .Config.Labels "teplo.workflow_run_id"}}|{{index .Config.Labels "teplo.workflow_run_attempt"}}|{{index .Config.Labels "teplo.workflow_sha"}}|{{index .Config.Labels "teplo.deployed_sha"}}|{{index .Config.Labels "teplo.policy_version"}}' "$(container_target)" 2>/dev/null)" || return 1
+  IFS='|' read -r CONTAINER_SNAPSHOT_ID CONTAINER_SNAPSHOT_IMAGE CONTAINER_SNAPSHOT_RUNNING \
+    CONTAINER_SNAPSHOT_PAUSED CONTAINER_SNAPSHOT_ROLE CONTAINER_SNAPSHOT_RUN_ID \
+    CONTAINER_SNAPSHOT_RUN_ATTEMPT CONTAINER_SNAPSHOT_WORKFLOW_SHA \
+    CONTAINER_SNAPSHOT_DEPLOYED_SHA CONTAINER_SNAPSHOT_POLICY_VERSION \
+    CONTAINER_SNAPSHOT_EXTRA <<< "$container_snapshot_raw"
+  [ -z "$CONTAINER_SNAPSHOT_EXTRA" ] || return 1
+  [[ "$CONTAINER_SNAPSHOT_ID" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$CONTAINER_SNAPSHOT_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+}
+
+snapshot_is_exact_generation() {
+  { [ "$EXPECTED_CONTAINER_ID" = 'pending' ] || [ "$CONTAINER_SNAPSHOT_ID" = "$EXPECTED_CONTAINER_ID" ]; } &&
+    [ "$CONTAINER_SNAPSHOT_ROLE" = 'entitlement-shadow-readonly' ] &&
+    [ "$CONTAINER_SNAPSHOT_RUN_ID" = "$RUN_ID" ] &&
+    [ "$CONTAINER_SNAPSHOT_RUN_ATTEMPT" = "$RUN_ATTEMPT" ]
+}
+
 container_is_exact_generation() {
-  actual_id="$(container_value '{{.Id}}')"
-  [[ "$actual_id" =~ ^[0-9a-f]{64}$ ]] &&
-    { [ "$EXPECTED_CONTAINER_ID" = 'pending' ] || [ "$actual_id" = "$EXPECTED_CONTAINER_ID" ]; } &&
-    [ "$(container_label teplo.role)" = 'entitlement-shadow-readonly' ] &&
-    [ "$(container_label teplo.workflow_run_id)" = "$RUN_ID" ] &&
-    [ "$(container_label teplo.workflow_run_attempt)" = "$RUN_ATTEMPT" ]
+  capture_container_snapshot && snapshot_is_exact_generation
+}
+
+snapshot_matches_completed_lease() {
+  snapshot_is_exact_generation &&
+    [ "$CONTAINER_SNAPSHOT_RUNNING" = 'true' ] &&
+    [ "$CONTAINER_SNAPSHOT_PAUSED" = 'false' ] &&
+    [ "$CONTAINER_SNAPSHOT_IMAGE" = "$(lease_value image)" ] &&
+    [ "$CONTAINER_SNAPSHOT_WORKFLOW_SHA" = "$(lease_value workflow_sha)" ] &&
+    [ "$CONTAINER_SNAPSHOT_DEPLOYED_SHA" = "$(lease_value deployed_sha)" ] &&
+    [ "$CONTAINER_SNAPSHOT_POLICY_VERSION" = "$POLICY_VERSION" ]
 }
 
 container_matches_completed_lease() {
-  container_is_exact_generation &&
-    [ "$(container_value '{{.State.Running}}')" = 'true' ] &&
-    [ "$(container_value '{{.State.Paused}}')" = 'false' ] &&
-    [ "$(container_value '{{.Image}}')" = "$(lease_value image)" ] &&
-    [ "$(container_label teplo.workflow_sha)" = "$(lease_value workflow_sha)" ] &&
-    [ "$(container_label teplo.deployed_sha)" = "$(lease_value deployed_sha)" ] &&
-    [ "$(container_label teplo.policy_version)" = "$POLICY_VERSION" ] &&
+  capture_container_snapshot &&
+    snapshot_matches_completed_lease &&
     exact_env ENTITLEMENT_AUTHORITY_CHECKOUT_ADMISSION_ENABLED false &&
     exact_env ENTITLEMENT_AUTHORITY_PROJECTOR_ENABLED false &&
     exact_env ENTITLEMENT_AUTHORITY_READY_NOTIFICATIONS_ENABLED false &&
@@ -181,7 +190,9 @@ container_matches_completed_lease() {
     exact_env ENTITLEMENT_AUTHORITY_SHADOW_MAX_CRITICAL_DRIFT_COUNT 2 &&
     exact_env ENTITLEMENT_AUTHORITY_SHADOW_MAX_CRITICAL_DRIFT_BASIS_POINTS 1000 &&
     exact_env ENTITLEMENT_AUTHORITY_SHADOW_MAX_TOTAL_DRIFT_COUNT 4 &&
-    exact_env ENTITLEMENT_AUTHORITY_SHADOW_MAX_TOTAL_DRIFT_BASIS_POINTS 2000
+    exact_env ENTITLEMENT_AUTHORITY_SHADOW_MAX_TOTAL_DRIFT_BASIS_POINTS 2000 &&
+    capture_container_snapshot &&
+    snapshot_matches_completed_lease
 }
 
 remove_own_generation() {
@@ -265,8 +276,9 @@ materialize_completed_audits() {
 
 arm_expiry() {
   expires_epoch="$1"
-  actual_id="$(container_value '{{.Id}}')"
-  [[ "$actual_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  capture_container_snapshot || return 1
+  snapshot_matches_completed_lease || return 1
+  actual_id="$CONTAINER_SNAPSHOT_ID"
   remaining="$(( expires_epoch - $(date +%s) ))"
   [ "$remaining" -gt 0 ] || return 1
   expiry_unit="teplo-entitlement-shadow-expiry-${RUN_ID}-${RUN_ATTEMPT}-${expires_epoch}"
