@@ -142,6 +142,14 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     assert '\'{{.State.Paused}}\' "$BOT_CONTAINER"' in source
     assert '\'{{.State.Paused}}\' "$SIDECAR"' in source
     assert "container_value '{{.State.Paused}}'" in WATCHDOG.read_text()
+    assert 'control_plane_transition_prepared' in source
+    assert source.index('control_plane_transition_prepared') < source.index('docker create')
+    assert source.count('verify_bot_snapshot_unchanged') >= 4
+    first_commit_check = source.index('verify_bot_snapshot_unchanged', source.index('cycle_seen=0'))
+    second_commit_check = source.index('verify_bot_snapshot_unchanged', first_commit_check + 1)
+    assert first_commit_check < source.index('write_lease completed') < second_commit_check
+    final_commit_check = source.index('verify_bot_snapshot_unchanged', second_commit_check + 1)
+    assert source.index('latest_audit_not_durable') < final_commit_check < source.rindex('MUTATION_STARTED=0')
     assert 'WATCHDOG_PENDING_UNIT' in source
     assert 'WATCHDOG_EXACT_UNIT' in source
     assert source.index('--unit="$WATCHDOG_EXACT_UNIT"') < source.rindex(
@@ -519,15 +527,19 @@ def test_watchdog_refuses_paused_completed_sidecar(tmp_path: Path) -> None:
     run_id = '24242424'
     run_attempt = '1'
     container_id = '2' * 64
-    lease = tmp_path / 'lease.state'
-    audit = tmp_path / 'audit.state'
-    secret = tmp_path / 'secret.env'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
     fake_bin = tmp_path / 'bin'
-    fake_bin.mkdir()
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    lease = runtime / 'lease.state'
+    audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
+    secret = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
     container_present = tmp_path / 'container-present'
     container_present.touch()
     lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
     _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
 
     result = subprocess.run(  # noqa: S603 - executes the fixed watchdog under test
         [
@@ -541,8 +553,9 @@ def test_watchdog_refuses_paused_completed_sidecar(tmp_path: Path) -> None:
             str(secret),
             container_id,
         ],
-        env={
-            'PATH': f'{fake_bin}:/usr/bin:/bin',
+        env=os.environ
+        | {
+            'PATH': f'{fake_bin}:{os.environ["PATH"]}',
             'CONTAINER_PRESENT': str(container_present),
             'FAKE_CONTAINER_ID': container_id,
             'EXPECTED_RUN_ID': run_id,
@@ -556,10 +569,14 @@ def test_watchdog_refuses_paused_completed_sidecar(tmp_path: Path) -> None:
         text=True,
     )
 
-    assert result.returncode != 0
-    assert container_present.exists()
-    assert lease.exists()
-    assert not audit.exists()
+    assert result.returncode == 0, result.stderr
+    assert not container_present.exists()
+    assert not lease.exists()
+    disabled_audit = state / (
+        f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_BOOTSTRAP.audit'
+    )
+    assert disabled_audit.exists()
+    assert 'action=AUTO_DISABLE_BOOTSTRAP' in disabled_audit.read_text()
 
 
 def test_watchdog_recovers_missing_latest_from_existing_durable_audits(tmp_path: Path) -> None:

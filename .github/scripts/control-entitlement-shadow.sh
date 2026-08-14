@@ -32,6 +32,7 @@ readonly SIDECAR='teplo_entitlement_shadow'
 readonly BOT_CONTAINER='remnawave_bot'
 readonly DEPLOY_STATE_FILE="$STATE_DIR/bot-production.state"
 readonly MIGRATION_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.state"
+readonly CONTROL_PLANE_JOURNAL="$STATE_DIR/bot-production.control-plane-transition.state"
 readonly LEASE_FILE="$RUNTIME_DIR/lease.state"
 readonly DISABLE_TOMBSTONE_FILE="$RUNTIME_DIR/disable.state"
 readonly AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.state"
@@ -65,6 +66,33 @@ state_value() {
   count="$(grep -Ec "^${key}=[^[:space:]]+$" "$file" || true)"
   [ "$count" = '1' ] || fail "missing_or_duplicate_${key}"
   sed -n "s/^${key}=//p" "$file"
+}
+
+capture_bot_snapshot() {
+  SNAPSHOT_ID="$(docker inspect --format '{{.Id}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_id_unavailable'
+  SNAPSHOT_IMAGE="$(docker inspect --format '{{.Image}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_image_unavailable'
+  SNAPSHOT_STARTED_AT="$(docker inspect --format '{{.State.StartedAt}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_started_at_unavailable'
+  SNAPSHOT_HEALTH="$(docker inspect --format '{{.State.Health.Status}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_health_unavailable'
+  SNAPSHOT_RUNNING="$(docker inspect --format '{{.State.Running}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_running_unavailable'
+  SNAPSHOT_PAUSED="$(docker inspect --format '{{.State.Paused}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_paused_unavailable'
+  SNAPSHOT_ID_AFTER="$(docker inspect --format '{{.Id}}' "$BOT_CONTAINER")" || fail 'bot_snapshot_generation_unavailable'
+  [ "$SNAPSHOT_ID_AFTER" = "$SNAPSHOT_ID" ] || fail 'bot_snapshot_generation_changed'
+  [[ "$SNAPSHOT_ID" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid_bot_container_id'
+  [[ "$SNAPSHOT_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'invalid_image_id'
+  [[ "$SNAPSHOT_STARTED_AT" =~ ^[^[:space:]]+$ ]] || fail 'invalid_bot_started_at'
+  [ "$SNAPSHOT_HEALTH" = 'healthy' ] || fail 'bot_not_healthy'
+  [ "$SNAPSHOT_RUNNING" = 'true' ] || fail 'bot_not_running'
+  [ "$SNAPSHOT_PAUSED" = 'false' ] || fail 'bot_paused'
+}
+
+verify_bot_snapshot_unchanged() {
+  expected_id="$1"
+  expected_image="$2"
+  expected_started_at="$3"
+  capture_bot_snapshot
+  [ "$SNAPSHOT_ID" = "$expected_id" ] || fail 'bot_container_changed'
+  [ "$SNAPSHOT_IMAGE" = "$expected_image" ] || fail 'bot_image_changed'
+  [ "$SNAPSHOT_STARTED_AT" = "$expected_started_at" ] || fail 'bot_restarted'
 }
 
 audit_value() {
@@ -205,6 +233,7 @@ install -d -m 700 "$STATE_DIR"
 install -d -m 755 "$RUNTIME_DIR"
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail 'control_busy'
+test ! -e "$CONTROL_PLANE_JOURNAL" || fail 'control_plane_transition_prepared'
 
 cd "$REPO_DIR"
 [ -z "$(git status --porcelain)" ] || fail 'server_worktree_not_exact'
@@ -219,14 +248,11 @@ git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
 deployed_sha="$(state_value sha "$DEPLOY_STATE_FILE")"
 [ "$deployed_sha" = "$EXPECTED_DEPLOYED_SHA" ] || fail 'owner_expected_deployed_sha_mismatch'
 [ "$deployed_sha" = "$WORKFLOW_SHA" ] || fail 'enable_requires_exact_deployed_main'
-CURRENT_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$BOT_CONTAINER")"
-[[ "$CURRENT_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'invalid_image_id'
+capture_bot_snapshot
+CURRENT_IMAGE_ID="$SNAPSHOT_IMAGE"
+BOT_CONTAINER_ID="$SNAPSHOT_ID"
+BOT_STARTED_AT="$SNAPSHOT_STARTED_AT"
 [ "$(state_value image "$DEPLOY_STATE_FILE")" = "$CURRENT_IMAGE_ID" ] || fail 'deploy_state_image_mismatch'
-[ "$(docker inspect --format '{{.State.Health.Status}}' "$BOT_CONTAINER")" = 'healthy' ] || fail 'bot_not_healthy'
-[ "$(docker inspect --format '{{.State.Running}}' "$BOT_CONTAINER")" = 'true' ] || fail 'bot_not_running'
-[ "$(docker inspect --format '{{.State.Paused}}' "$BOT_CONTAINER")" = 'false' ] || fail 'bot_paused'
-BOT_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$BOT_CONTAINER")"
-BOT_STARTED_AT="$(docker inspect --format '{{.State.StartedAt}}' "$BOT_CONTAINER")"
 [ -r "$MIGRATION_STATE_FILE" ] || fail 'migration_state_missing'
 [ "$(state_value phase "$MIGRATION_STATE_FILE")" = 'completed' ] || fail 'migration_state_not_completed'
 actual_schema="$(docker compose -f docker-compose.yml exec -T postgres sh -lc \
@@ -431,9 +457,7 @@ for _ in $(seq 1 115); do
   sleep 2
 done
 [ "$cycle_seen" = '1' ] || fail 'first_shadow_cycle_timeout'
-[ "$(docker inspect --format '{{.Id}}' "$BOT_CONTAINER")" = "$BOT_CONTAINER_ID" ] || fail 'bot_container_changed'
-[ "$(docker inspect --format '{{.State.StartedAt}}' "$BOT_CONTAINER")" = "$BOT_STARTED_AT" ] || fail 'bot_restarted'
-[ "$(docker inspect --format '{{.Image}}' "$BOT_CONTAINER")" = "$CURRENT_IMAGE_ID" ] || fail 'bot_image_changed'
+verify_bot_snapshot_unchanged "$BOT_CONTAINER_ID" "$CURRENT_IMAGE_ID" "$BOT_STARTED_AT"
 [ "$(sha256sum "$REPO_DIR/.env" | awk '{ print $1 }')" = "$ENV_FINGERPRINT_BEFORE" ] || fail 'dotenv_changed'
 [ "$(authority_counts)" = "$AUTHORITY_COUNTS_BEFORE" ] || fail 'authority_tables_changed'
 
@@ -442,11 +466,15 @@ write_lease completed "$completed_expires" "$(date --iso-8601=seconds)"
 sleep 3
 [ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR")" = 'true' ] || fail 'sidecar_not_running_after_commit'
 [ "$(docker inspect --format '{{.State.Paused}}' "$SIDECAR")" = 'false' ] || fail 'sidecar_paused_after_commit'
+verify_bot_snapshot_unchanged "$BOT_CONTAINER_ID" "$CURRENT_IMAGE_ID" "$BOT_STARTED_AT"
 TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG_INSTALLED" BOOTSTRAP \
   "$LEASE_FILE" "$SIDECAR" "$RUN_ID" "$RUN_ATTEMPT" "$WATCHDOG_AUDIT_FILE" \
   "$STATE_DIR/entitlement-shadow-secrets-${RUN_ID}-${RUN_ATTEMPT}.env" "$SIDECAR_CONTAINER_ID"
 [ -r "$RUN_AUDIT_FILE" ] && cmp -s "$RUN_AUDIT_FILE" "$LEASE_FILE" || fail 'run_audit_not_durable'
 [ -r "$AUDIT_FILE" ] && cmp -s "$AUDIT_FILE" "$LEASE_FILE" || fail 'latest_audit_not_durable'
+verify_bot_snapshot_unchanged "$BOT_CONTAINER_ID" "$CURRENT_IMAGE_ID" "$BOT_STARTED_AT"
+[ "$(docker inspect --format '{{.State.Running}}' "$SIDECAR")" = 'true' ] || fail 'sidecar_not_running_at_success'
+[ "$(docker inspect --format '{{.State.Paused}}' "$SIDECAR")" = 'false' ] || fail 'sidecar_paused_at_success'
 systemctl stop "${WATCHDOG_EXACT_UNIT}.timer" "${WATCHDOG_EXACT_UNIT}.service" >/dev/null 2>&1 || true
 MUTATION_STARTED=0
 trap - ERR
