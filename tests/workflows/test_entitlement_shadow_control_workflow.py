@@ -307,6 +307,26 @@ def _write_fake_flock(fake_bin: Path) -> None:
     _write_executable(fake_bin / 'flock', '#!/usr/bin/env bash\nexit 0\n')
 
 
+def _write_killing_cp(fake_bin: Path) -> None:
+    _write_executable(
+        fake_bin / 'cp',
+        r"""#!/usr/bin/env bash
+counter_file="$CP_CALLS_FILE"
+count=0
+[ ! -e "$counter_file" ] || count="$(cat "$counter_file")"
+count="$((count + 1))"
+printf '%s\n' "$count" > "$counter_file"
+if [ "${KILL_ON_CP_CALL:-0}" = "$count" ]; then
+  printf 'partial-audit\n' > "${@: -1}"
+  kill -KILL "$PPID"
+  sleep 1
+  exit 137
+fi
+exec /bin/cp "$@"
+""",
+    )
+
+
 def _write_real_flock(fake_bin: Path) -> None:
     _write_executable(
         fake_bin / 'flock',
@@ -559,6 +579,86 @@ def test_watchdog_materializes_completed_audit_without_removing_sidecar(tmp_path
     assert keyed.read_text() == lease.read_text()
     assert latest.read_text() == lease.read_text()
     assert container_present.exists()
+
+
+@pytest.mark.parametrize('kill_on_cp_call', ['2', '3', '4'])
+def test_watchdog_recovers_after_kill_during_atomic_audit_publication(
+    tmp_path: Path,
+    kill_on_cp_call: str,
+) -> None:
+    run_id, run_attempt = '4567', kill_on_cp_call
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    container_id = 'e' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
+    _write_killing_cp(fake_bin)
+    audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
+    secret_env = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
+    secret_env.write_text('SECRET=redacted\n')
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    expected_env = tmp_path / 'expected-env'
+    expected_env.write_text(_fixed_policy_env())
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
+        'EXPECTED_ENV_FILE': str(expected_env),
+        'CP_CALLS_FILE': str(tmp_path / 'cp-calls'),
+        'KILL_ON_CP_CALL': kill_on_cp_call,
+    }
+    command = [
+        str(WATCHDOG),
+        'BOOTSTRAP',
+        str(lease),
+        'teplo_entitlement_shadow',
+        run_id,
+        run_attempt,
+        str(audit),
+        str(secret_env),
+        container_id,
+    ]
+
+    killed = subprocess.run(  # noqa: S603 - fixed watchdog with an injected process kill
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    keyed = state / f'bot-production.entitlement-shadow-control.{run_id}.{run_attempt}.audit'
+    latest = state / 'bot-production.entitlement-shadow-control.state'
+    assert killed.returncode != 0
+    assert lease.exists()
+    assert container_present.exists()
+    for final_receipt in (keyed, audit, latest):
+        if final_receipt.exists():
+            assert final_receipt.read_text() == lease.read_text()
+
+    recovered = subprocess.run(  # noqa: S603 - retry proves lost-response recovery
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert container_present.exists()
+    assert lease.exists()
+    assert keyed.read_text() == lease.read_text()
+    assert audit.read_text() == lease.read_text()
+    assert latest.read_text() == lease.read_text()
 
 
 @pytest.mark.parametrize(

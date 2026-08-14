@@ -227,9 +227,39 @@ remove_own_generation() {
 replace_latest() {
   source_file="$1"
   latest_tmp="$(mktemp "$STATE_DIR/bot-production.entitlement-shadow-latest.XXXXXX")"
-  cp "$source_file" "$latest_tmp"
-  chmod 600 "$latest_tmp"
-  mv "$latest_tmp" "$LATEST_AUDIT_FILE"
+  if ! cp "$source_file" "$latest_tmp" || ! chmod 600 "$latest_tmp" || ! mv "$latest_tmp" "$LATEST_AUDIT_FILE"; then
+    rm -f -- "$latest_tmp"
+    return 1
+  fi
+}
+
+publish_keyed_audit() {
+  source_file="$1"
+  target="$2"
+  if [ -e "$target" ]; then
+    cmp -s "$source_file" "$target"
+    return
+  fi
+
+  target_tmp="$(mktemp "${target}.XXXXXX")"
+  if ! cp "$source_file" "$target_tmp" || ! chmod 600 "$target_tmp"; then
+    rm -f -- "$target_tmp"
+    return 1
+  fi
+  # The per-generation lock serializes normal publishers.  Keep the existence
+  # recheck so a manually recovered receipt can never be overwritten.
+  if [ -e "$target" ]; then
+    cmp -s "$source_file" "$target" || {
+      rm -f -- "$target_tmp"
+      return 1
+    }
+    rm -f -- "$target_tmp"
+    return 0
+  fi
+  mv "$target_tmp" "$target" || {
+    rm -f -- "$target_tmp"
+    return 1
+  }
 }
 
 write_disabled_audit() {
@@ -257,18 +287,15 @@ write_disabled_audit() {
 
 materialize_completed_audits() {
   audit_tmp="$(mktemp "$STATE_DIR/bot-production.entitlement-shadow-watchdog.XXXXXX")"
-  cp "$LEASE_FILE" "$audit_tmp"
-  chmod 600 "$audit_tmp"
+  if ! cp "$LEASE_FILE" "$audit_tmp" || ! chmod 600 "$audit_tmp"; then
+    rm -f -- "$audit_tmp"
+    return 1
+  fi
   for target in "$RUN_AUDIT_FILE" "$AUDIT_FILE"; do
-    if [ -e "$target" ]; then
-      cmp -s "$audit_tmp" "$target" || {
-        rm -f -- "$audit_tmp"
-        return 1
-      }
-    else
-      cp "$audit_tmp" "$target"
-      chmod 600 "$target"
-    fi
+    publish_keyed_audit "$audit_tmp" "$target" || {
+      rm -f -- "$audit_tmp"
+      return 1
+    }
   done
   rm -f -- "$audit_tmp"
   replace_latest "$RUN_AUDIT_FILE"
