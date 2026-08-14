@@ -99,6 +99,18 @@ lost. A re-run (including a later run-attempt of the same GitHub run) recovers
 the same completed lease/audit; it never performs a second enable transition.
 Conflicting or orphan state is fail-closed.
 
+If any final Enable or completed-recovery gate fails, cleanup first atomically
+copies the exact lease to `failed-enable-cleanup.state`. That immutable copy is
+the durable deny/cleanup decision and the byte-for-byte receipt preimage. It is
+written before any active receipt, lease or container is removed. Controller
+and watchdog retries must finish that same generation's cleanup; they may not
+re-evaluate a recovered sidecar as active. The marker remains until all
+lease-equal provisional receipts are removed, the exact sidecar is proven
+absent and a disabled latest audit is durable. A receipt comparison I/O error
+is a STOP, not a mismatch. All production deploy/recovery routes refuse the
+marker, and an Enable recovery completes cleanup then requires a fresh
+owner-approved workflow run.
+
 The sidecar checks the lease every two seconds. Independently, the host expiry
 timer removes that exact container generation at seven days, even if the
 sidecar process is paused. Automatic circuit STOP exits and does not restart.
@@ -129,9 +141,9 @@ under lost response/re-run.
 All four production image/schema switch workflows share the same concurrency
 group and contain an inline fail-closed guard. Ordinary, migration,
 infrastructure and migration-recovery deploys refuse to run while a shadow
-lease or sidecar exists. Operators must complete `DISABLE_SHADOW` first, so an
-observation can never silently continue against a newer source, image or
-schema.
+lease, disable/failed-enable cleanup marker or sidecar exists. Operators must
+complete the appropriate cleanup first, so an observation can never silently
+continue against a newer source, image or schema.
 
 ## Prerequisite release and verification
 

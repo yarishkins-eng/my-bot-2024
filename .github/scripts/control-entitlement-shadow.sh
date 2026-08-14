@@ -35,6 +35,7 @@ readonly MIGRATION_STATE_FILE="$STATE_DIR/bot-production.migration-recovery.stat
 readonly CONTROL_PLANE_JOURNAL="$STATE_DIR/bot-production.control-plane-transition.state"
 readonly LEASE_FILE="$RUNTIME_DIR/lease.state"
 readonly DISABLE_TOMBSTONE_FILE="$RUNTIME_DIR/disable.state"
+readonly CLEANUP_INTENT_FILE="$RUNTIME_DIR/failed-enable-cleanup.state"
 readonly AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.state"
 readonly RUN_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.audit"
 readonly WATCHDOG_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-watchdog.${RUN_ID}.${RUN_ATTEMPT}.audit"
@@ -187,68 +188,6 @@ fixed_sidecar_is_absent() {
   [ -z "$ids" ]
 }
 
-cleanup_lease_value() {
-  key="$1"
-  count="$(grep -Ec "^${key}=[^[:space:]]+$" "$LEASE_FILE" 2>/dev/null || true)"
-  [ "$count" = '1' ] || return 1
-  sed -n "s/^${key}=//p" "$LEASE_FILE"
-}
-
-cleanup_provisional_active_audits() {
-  [ -r "$LEASE_FILE" ] || return 0
-  lease_run_id="$(cleanup_lease_value workflow_run_id)" || return 1
-  lease_run_attempt="$(cleanup_lease_value workflow_run_attempt)" || return 1
-  [[ "$lease_run_id" =~ ^[0-9]+$ ]] || return 1
-  [[ "$lease_run_attempt" =~ ^[0-9]+$ ]] || return 1
-  lease_run_audit="$STATE_DIR/bot-production.entitlement-shadow-control.${lease_run_id}.${lease_run_attempt}.audit"
-  lease_watchdog_audit="$STATE_DIR/bot-production.entitlement-shadow-watchdog.${lease_run_id}.${lease_run_attempt}.audit"
-  for target in "$lease_run_audit" "$lease_watchdog_audit"; do
-    if [ -e "$target" ]; then
-      cmp -s "$target" "$LEASE_FILE" || return 1
-      rm -f -- "$target" || return 1
-    fi
-  done
-  if [ -e "$AUDIT_FILE" ] && cmp -s "$AUDIT_FILE" "$LEASE_FILE"; then
-    rm -f -- "$AUDIT_FILE" || return 1
-  fi
-}
-
-atomic_replace_audit() {
-  source_file="$1"
-  target="$2"
-  target_tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
-  if ! cp "$source_file" "$target_tmp" || ! chmod 600 "$target_tmp" || ! mv "$target_tmp" "$target"; then
-    rm -f -- "$target_tmp"
-    return 1
-  fi
-}
-
-publish_immutable_audit() {
-  source_file="$1"
-  target="$2"
-  if [ -e "$target" ]; then
-    cmp -s "$source_file" "$target"
-    return
-  fi
-  target_tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
-  if ! cp "$source_file" "$target_tmp" || ! chmod 600 "$target_tmp"; then
-    rm -f -- "$target_tmp"
-    return 1
-  fi
-  if [ -e "$target" ]; then
-    cmp -s "$source_file" "$target" || {
-      rm -f -- "$target_tmp"
-      return 1
-    }
-    rm -f -- "$target_tmp"
-    return 0
-  fi
-  mv "$target_tmp" "$target" || {
-    rm -f -- "$target_tmp"
-    return 1
-  }
-}
-
 write_cleanup_unverified_audit() {
   failure_audit="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.cleanup-unverified"
   failure_tmp="$(mktemp "${failure_audit}.XXXXXX" 2>/dev/null)" || return 1
@@ -265,37 +204,21 @@ write_cleanup_unverified_audit() {
 cleanup_runtime() {
   set +e
   [ -z "$SIDECAR_ENV_FILE" ] || rm -f -- "$SIDECAR_ENV_FILE"
-  audit_cleanup_verified=0
-  if cleanup_provisional_active_audits && rm -f -- "$LEASE_FILE"; then
-    audit_cleanup_verified=1
+  cleanup_source="$LEASE_FILE"
+  [ -e "$CLEANUP_INTENT_FILE" ] && cleanup_source="$CLEANUP_INTENT_FILE"
+  cleanup_run_id="$(audit_value workflow_run_id "$cleanup_source" 2>/dev/null || true)"
+  cleanup_run_attempt="$(audit_value workflow_run_attempt "$cleanup_source" 2>/dev/null || true)"
+  cleanup_watchdog_audit="$STATE_DIR/bot-production.entitlement-shadow-watchdog.${cleanup_run_id}.${cleanup_run_attempt}.audit"
+  cleanup_secret="$STATE_DIR/entitlement-shadow-secrets-${cleanup_run_id}-${cleanup_run_attempt}.env"
+  cleanup_rc=1
+  if [[ "$cleanup_run_id" =~ ^[0-9]+$ ]] && [[ "$cleanup_run_attempt" =~ ^[0-9]+$ ]]; then
+    TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG" BOOTSTRAP \
+      "$LEASE_FILE" "$SIDECAR" "$cleanup_run_id" "$cleanup_run_attempt" \
+      "$cleanup_watchdog_audit" "$cleanup_secret" pending
+    cleanup_rc=$?
   fi
-  cleanup_verified=0
-  if docker info >/dev/null 2>&1; then
-    docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
-    if docker info >/dev/null 2>&1 && fixed_sidecar_is_absent; then
-      cleanup_verified=1
-    fi
-  fi
-  if [ "$cleanup_verified" = '1' ] && [ "$audit_cleanup_verified" = '1' ] && [ -n "${RUN_AUDIT_FILE:-}" ]; then
-    audit_tmp="$(mktemp "$STATE_DIR/bot-production.entitlement-shadow-control.XXXXXX" 2>/dev/null || true)"
-    if [ -n "$audit_tmp" ]; then
-      if printf 'format_version=2\nphase=completed\naction=AUTO_DISABLE_FAILED_ENABLE\nruntime_mode=disabled\nworkflow_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\napproval_actor=%s\nrelease_card_reference=%s\ncompleted_at=%s\n' \
-        "$WORKFLOW_SHA" "$RUN_ID" "$RUN_ATTEMPT" "$ACTOR" "$RELEASE_CARD" \
-        "$(date --iso-8601=seconds)" > "$audit_tmp" && chmod 600 "$audit_tmp"; then
-        if publish_immutable_audit "$audit_tmp" "$RUN_AUDIT_FILE" && atomic_replace_audit "$audit_tmp" "$AUDIT_FILE"; then
-          rm -f -- "$audit_tmp"
-        else
-          rm -f -- "$audit_tmp"
-          write_cleanup_unverified_audit || true
-        fi
-      else
-        rm -f -- "$audit_tmp"
-        write_cleanup_unverified_audit || true
-      fi
-    else
-      write_cleanup_unverified_audit || true
-    fi
-  elif [ -n "${RUN_AUDIT_FILE:-}" ]; then
+  if [ "$cleanup_rc" != '0' ] || [ -e "$CLEANUP_INTENT_FILE" ] || [ -e "$LEASE_FILE" ] || \
+    ! docker info >/dev/null 2>&1 || ! fixed_sidecar_is_absent; then
     write_cleanup_unverified_audit || true
   fi
   set -e
@@ -326,6 +249,29 @@ install -d -m 700 "$STATE_DIR"
 install -d -m 755 "$RUNTIME_DIR"
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail 'control_busy'
+
+# A killed failed-enable cleanup is a durable deny state.  Recover it before
+# bot, DB, Git, or Panel preflight so cleanup remains available during an
+# unrelated production incident.  A fresh owner-approved run is then required.
+if [ -e "$CLEANUP_INTENT_FILE" ]; then
+  [ -x "$WATCHDOG" ] || fail 'watchdog_not_executable_for_cleanup_recovery'
+  cleanup_run_id="$(audit_value workflow_run_id "$CLEANUP_INTENT_FILE" || true)"
+  cleanup_run_attempt="$(audit_value workflow_run_attempt "$CLEANUP_INTENT_FILE" || true)"
+  [[ "$cleanup_run_id" =~ ^[0-9]+$ ]] || fail 'invalid_failed_enable_cleanup_intent'
+  [[ "$cleanup_run_attempt" =~ ^[0-9]+$ ]] || fail 'invalid_failed_enable_cleanup_intent'
+  cleanup_watchdog_audit="$STATE_DIR/bot-production.entitlement-shadow-watchdog.${cleanup_run_id}.${cleanup_run_attempt}.audit"
+  cleanup_secret="$STATE_DIR/entitlement-shadow-secrets-${cleanup_run_id}-${cleanup_run_attempt}.env"
+  TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG" BOOTSTRAP \
+    "$LEASE_FILE" "$SIDECAR" "$cleanup_run_id" "$cleanup_run_attempt" \
+    "$cleanup_watchdog_audit" "$cleanup_secret" pending || fail 'failed_enable_cleanup_recovery_failed'
+  [ ! -e "$CLEANUP_INTENT_FILE" ] || fail 'failed_enable_cleanup_intent_still_present'
+  [ ! -e "$LEASE_FILE" ] || fail 'failed_enable_cleanup_lease_still_present'
+  docker info >/dev/null 2>&1 || fail 'failed_enable_cleanup_docker_unavailable'
+  fixed_sidecar_is_absent || fail 'failed_enable_cleanup_sidecar_still_present'
+  printf 'A prior failed shadow enable was cleaned; start a new approved workflow run.\n' >&2
+  exit 64
+fi
+
 test ! -e "$CONTROL_PLANE_JOURNAL" || fail 'control_plane_transition_prepared'
 
 cd "$REPO_DIR"
@@ -371,6 +317,8 @@ if [ -r "$LEASE_FILE" ]; then
     [ "$(state_value approval_actor "$LEASE_FILE")" = "$ACTOR" ] || fail 'completed_lease_conflict'
     [ "$(state_value release_card_reference "$LEASE_FILE")" = "$RELEASE_CARD" ] || fail 'completed_lease_conflict'
     [ "$(state_value policy_version "$LEASE_FILE")" = "$POLICY_VERSION" ] || fail 'completed_lease_conflict'
+    MUTATION_STARTED=1
+    trap cleanup_failed_enable ERR
     existing_container_id="$(docker inspect --format '{{.Id}}' "$SIDECAR" 2>/dev/null || true)"
     [[ "$existing_container_id" =~ ^[0-9a-f]{64}$ ]] || fail 'completed_sidecar_missing'
     existing_audit="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${existing_run_attempt}.audit"
@@ -388,6 +336,8 @@ if [ -r "$LEASE_FILE" ]; then
     [ -r "$AUDIT_FILE" ] && cmp -s "$AUDIT_FILE" "$existing_audit" || fail 'latest_audit_recovery_failed'
     verify_bot_snapshot_unchanged "$BOT_CONTAINER_ID" "$CURRENT_IMAGE_ID" "$BOT_STARTED_AT"
     verify_sidecar_active "$existing_container_id" "$CURRENT_IMAGE_ID"
+    MUTATION_STARTED=0
+    trap - ERR
     printf 'Gate 2 isolated read-only shadow completion was recovered from its durable lease.\n'
     exit 0
   fi

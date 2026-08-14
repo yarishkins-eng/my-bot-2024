@@ -21,6 +21,8 @@ readonly AUDIT_FILE="$6"
 readonly SECRET_ENV_FILE="$7"
 readonly EXPECTED_CONTAINER_ID="$8"
 readonly STATE_DIR="$(dirname "$AUDIT_FILE")"
+readonly RUNTIME_DIR="$(dirname "$LEASE_FILE")"
+readonly CLEANUP_INTENT_FILE="$RUNTIME_DIR/failed-enable-cleanup.state"
 readonly RUN_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.${RUN_ID}.${RUN_ATTEMPT}.audit"
 readonly LATEST_AUDIT_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.state"
 readonly LOCK_FILE="$STATE_DIR/bot-production.entitlement-shadow-control.lock"
@@ -51,6 +53,52 @@ lease_value() {
   count="$(grep -Ec "^${key}=[^[:space:]]+$" "$LEASE_FILE" 2>/dev/null || true)"
   [ "$count" = '1' ] || return 1
   sed -n "s/^${key}=//p" "$LEASE_FILE"
+}
+
+state_file_value() {
+  file="$1"
+  key="$2"
+  count="$(grep -Ec "^${key}=[^[:space:]]+$" "$file" 2>/dev/null || true)"
+  [ "$count" = '1' ] || return 1
+  sed -n "s/^${key}=//p" "$file"
+}
+
+cleanup_intent_is_exact() {
+  [ -r "$CLEANUP_INTENT_FILE" ] &&
+    [ "$(state_file_value "$CLEANUP_INTENT_FILE" format_version || true)" = '2' ] &&
+    { [ "$(state_file_value "$CLEANUP_INTENT_FILE" phase || true)" = 'prepared' ] ||
+      [ "$(state_file_value "$CLEANUP_INTENT_FILE" phase || true)" = 'completed' ]; } &&
+    [ "$(state_file_value "$CLEANUP_INTENT_FILE" action || true)" = 'ENABLE_SHADOW' ] &&
+    [ "$(state_file_value "$CLEANUP_INTENT_FILE" policy_version || true)" = "$POLICY_VERSION" ] &&
+    [ "$(state_file_value "$CLEANUP_INTENT_FILE" workflow_run_id || true)" = "$RUN_ID" ] &&
+    [ "$(state_file_value "$CLEANUP_INTENT_FILE" workflow_run_attempt || true)" = "$RUN_ATTEMPT" ]
+}
+
+ensure_cleanup_intent() {
+  if [ -e "$CLEANUP_INTENT_FILE" ]; then
+    cleanup_intent_is_exact
+    return
+  fi
+  [ -r "$LEASE_FILE" ] || return 1
+  [ "$(lease_generation)" = 'exact' ] || return 1
+  cleanup_tmp="$(mktemp "$RUNTIME_DIR/failed-enable-cleanup.XXXXXX")" || return 1
+  if ! cp "$LEASE_FILE" "$cleanup_tmp" || ! chmod 444 "$cleanup_tmp"; then
+    rm -f -- "$cleanup_tmp"
+    return 1
+  fi
+  if cmp -s "$cleanup_tmp" "$LEASE_FILE"; then
+    :
+  else
+    cmp_rc=$?
+    rm -f -- "$cleanup_tmp"
+    [ "$cmp_rc" = '1' ] || return 1
+    return 1
+  fi
+  mv "$cleanup_tmp" "$CLEANUP_INTENT_FILE" || {
+    rm -f -- "$cleanup_tmp"
+    return 1
+  }
+  cleanup_intent_is_exact
 }
 
 lease_generation() {
@@ -273,7 +321,12 @@ write_disabled_audit() {
   if [ -e "$disabled_audit" ]; then
     existing_action="$(sed -n 's/^action=//p' "$disabled_audit" 2>/dev/null || true)"
     existing_mode="$(sed -n 's/^runtime_mode=//p' "$disabled_audit" 2>/dev/null || true)"
-    [ "$existing_action" = "$action" ] && [ "$existing_mode" = 'disabled' ] || {
+    existing_policy="$(sed -n 's/^policy_version=//p' "$disabled_audit" 2>/dev/null || true)"
+    existing_run_id="$(sed -n 's/^workflow_run_id=//p' "$disabled_audit" 2>/dev/null || true)"
+    existing_run_attempt="$(sed -n 's/^workflow_run_attempt=//p' "$disabled_audit" 2>/dev/null || true)"
+    [ "$existing_action" = "$action" ] && [ "$existing_mode" = 'disabled' ] && \
+      [ "$existing_policy" = "$POLICY_VERSION" ] && [ "$existing_run_id" = "$RUN_ID" ] && \
+      [ "$existing_run_attempt" = "$RUN_ATTEMPT" ] || {
       rm -f -- "$audit_tmp"
       return 1
     }
@@ -302,11 +355,40 @@ materialize_completed_audits() {
 }
 
 remove_matching_active_audits() {
+  preimage_file="$1"
   for target in "$RUN_AUDIT_FILE" "$AUDIT_FILE" "$LATEST_AUDIT_FILE"; do
-    if [ -e "$target" ] && cmp -s "$target" "$LEASE_FILE"; then
+    [ -e "$target" ] || continue
+    if cmp -s "$target" "$preimage_file"; then
       rm -f -- "$target" || return 1
+      continue
+    else
+      cmp_rc=$?
     fi
+    [ "$cmp_rc" = '1' ] || return 1
   done
+}
+
+remove_lease_matching_cleanup_intent() {
+  [ -e "$LEASE_FILE" ] || return 0
+  if cmp -s "$LEASE_FILE" "$CLEANUP_INTENT_FILE"; then
+    rm -f -- "$LEASE_FILE"
+    return
+  else
+    cmp_rc=$?
+  fi
+  [ "$cmp_rc" = '1' ] || return 1
+  return 1
+}
+
+cleanup_failed_enable_generation() {
+  ensure_cleanup_intent || return 1
+  remove_matching_active_audits "$CLEANUP_INTENT_FILE" || return 1
+  remove_lease_matching_cleanup_intent || return 1
+  remove_own_generation_rc=0
+  remove_own_generation || remove_own_generation_rc=$?
+  [ "$remove_own_generation_rc" = '0' ] || return "$remove_own_generation_rc"
+  write_disabled_audit AUTO_DISABLE_FAILED_ENABLE || return 1
+  rm -f -- "$CLEANUP_INTENT_FILE" || return 1
 }
 
 arm_expiry() {
@@ -329,6 +411,14 @@ arm_expiry() {
 }
 
 generation="$(lease_generation)"
+
+# Once cleanup intent is durable, this generation can never be reconsidered
+# active.  Every controller/watchdog retry must finish the same exact cleanup.
+if [ -e "$CLEANUP_INTENT_FILE" ]; then
+  cleanup_intent_is_exact || fail 'failed_enable_cleanup_intent_conflict'
+  cleanup_failed_enable_generation || fail 'failed_enable_cleanup_unverified'
+  exit 0
+fi
 
 if [ "$MODE" = 'EXPIRY' ]; then
   remove_own_generation_rc=0
@@ -359,23 +449,15 @@ if [ -r "$LEASE_FILE" ] && \
   container_matches_completed_lease; then
   rm -f -- "$SECRET_ENV_FILE"
   if ! arm_expiry "$(lease_value expires_epoch)"; then
-    remove_own_generation_rc=0
-    remove_own_generation || remove_own_generation_rc=$?
-    [ "$remove_own_generation_rc" = '0' ] || fail 'expiry_arm_and_cleanup_failed'
-    write_disabled_audit AUTO_DISABLE_EXPIRY_ARM_FAILED || fail 'expiry_arm_failure_audit_unverified'
+    cleanup_failed_enable_generation || fail 'expiry_arm_and_cleanup_failed'
     fail 'expiry_watchdog_arm_failed'
   fi
   materialize_completed_audits || {
-    remove_matching_active_audits || fail 'conflicting_active_audit_cleanup_unverified'
-    remove_own_generation || true
+    cleanup_failed_enable_generation || fail 'conflicting_active_audit_cleanup_unverified'
     fail 'completed_audit_conflict'
   }
   if ! capture_container_snapshot || ! snapshot_matches_completed_lease; then
-    remove_matching_active_audits || fail 'post_audit_cleanup_unverified'
-    remove_own_generation_rc=0
-    remove_own_generation || remove_own_generation_rc=$?
-    [ "$remove_own_generation_rc" = '0' ] || fail 'post_audit_container_removal_unverified'
-    write_disabled_audit AUTO_DISABLE_BOOTSTRAP || fail 'post_audit_disable_unverified'
+    cleanup_failed_enable_generation || fail 'post_audit_cleanup_unverified'
   fi
   exit 0
 fi
@@ -384,9 +466,12 @@ fi
 # receipts after the completed sidecar became invalid.  Finish that cleanup
 # while the exact lease is still available for byte-for-byte fencing, then
 # remove the generation and publish the disabled receipt.
-remove_matching_active_audits || fail 'bootstrap_active_audit_cleanup_unverified'
-remove_own_generation_rc=0
-remove_own_generation || remove_own_generation_rc=$?
-[ "$remove_own_generation_rc" = '10' ] && exit 0
-[ "$remove_own_generation_rc" = '0' ] || fail 'bootstrap_container_removal_unverified'
-write_disabled_audit AUTO_DISABLE_BOOTSTRAP || fail 'bootstrap_audit_unverified'
+if [ -r "$LEASE_FILE" ]; then
+  cleanup_failed_enable_generation || fail 'bootstrap_cleanup_unverified'
+else
+  remove_own_generation_rc=0
+  remove_own_generation || remove_own_generation_rc=$?
+  [ "$remove_own_generation_rc" = '10' ] && exit 0
+  [ "$remove_own_generation_rc" = '0' ] || fail 'bootstrap_container_removal_unverified'
+  write_disabled_audit AUTO_DISABLE_BOOTSTRAP || fail 'bootstrap_audit_unverified'
+fi

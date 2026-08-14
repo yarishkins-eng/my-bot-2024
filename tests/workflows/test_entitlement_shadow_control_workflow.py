@@ -166,14 +166,24 @@ def test_enable_uses_isolated_immutable_bounded_sidecar() -> None:
     )[0]
     assert completed_recovery.index('verify_bot_snapshot_unchanged') < completed_recovery.index('exit 0')
     assert completed_recovery.index('verify_sidecar_active') < completed_recovery.index('exit 0')
+    recovery_watchdog = completed_recovery.index('TEPLO_SHADOW_CONTROL_LOCK_HELD=1 "$WATCHDOG_INSTALLED"')
+    assert completed_recovery.index('MUTATION_STARTED=1') < recovery_watchdog
+    assert completed_recovery.index('trap cleanup_failed_enable ERR') < recovery_watchdog
+    final_recovery_gate = completed_recovery.index('verify_sidecar_active', recovery_watchdog)
+    assert final_recovery_gate < completed_recovery.index('MUTATION_STARTED=0')
+    assert final_recovery_gate < completed_recovery.index('trap - ERR')
     assert 'cmp -s "$AUDIT_FILE" "$existing_audit"' in completed_recovery
     assert 'cp "$existing_audit" "$AUDIT_FILE"' not in completed_recovery
     assert 'chmod 600 "$AUDIT_FILE"' not in completed_recovery
     cleanup_body = source.split('cleanup_runtime() {', 1)[1].split('\n}', 1)[0]
-    assert cleanup_body.index('cleanup_provisional_active_audits') < cleanup_body.index('rm -f -- "$LEASE_FILE"')
-    assert 'cp "$audit_tmp" "$RUN_AUDIT_FILE"' not in cleanup_body
-    assert 'publish_immutable_audit "$audit_tmp" "$RUN_AUDIT_FILE"' in cleanup_body
-    assert 'atomic_replace_audit "$audit_tmp" "$AUDIT_FILE"' in cleanup_body
+    assert '"$WATCHDOG" BOOTSTRAP' in cleanup_body
+    assert 'rm -f -- "$LEASE_FILE"' not in cleanup_body
+    assert 'rm -f -- "$CLEANUP_INTENT_FILE"' not in cleanup_body
+    assert 'failed-enable-cleanup.state' in source
+    cleanup_recovery = source.index('if [ -e "$CLEANUP_INTENT_FILE" ]; then', source.index('flock -n 9'))
+    assert cleanup_recovery < source.index('test ! -e "$CONTROL_PLANE_JOURNAL"')
+    assert cleanup_recovery < source.index('git fetch --no-tags origin')
+    assert cleanup_recovery < source.index('actual_schema=')
     assert 'WATCHDOG_PENDING_UNIT' in source
     assert 'WATCHDOG_EXACT_UNIT' in source
     assert source.index('--unit="$WATCHDOG_EXACT_UNIT"') < source.rindex(
@@ -224,6 +234,7 @@ def test_every_production_switch_refuses_an_active_shadow() -> None:
             assert 'test ! -e "$CONTROL_PLANE_JOURNAL"' in source
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/lease.state"' in source
         assert 'test ! -e "$SHADOW_RUNTIME_DIR/disable.state"' in source
+        assert 'test ! -e "$SHADOW_RUNTIME_DIR/failed-enable-cleanup.state"' in source
         assert 'docker info >/dev/null 2>&1' in source
         assert "--filter 'name=^/teplo_entitlement_shadow$'" in source
         assert "--format '{{.ID}}'" in source
@@ -360,6 +371,20 @@ case "$target" in
     ;;
 esac
 exec /bin/rm "$@"
+""",
+    )
+
+
+def _write_failing_receipt_cmp(fake_bin: Path) -> None:
+    _write_executable(
+        fake_bin / 'cmp',
+        r"""#!/usr/bin/env bash
+for value in "$@"; do
+  if [ "$(basename "$value")" = "${FAIL_CMP_BASENAME:-never}" ]; then
+    exit 2
+  fi
+done
+exec /usr/bin/cmp "$@"
 """,
     )
 
@@ -554,9 +579,9 @@ def test_watchdog_removes_uncommitted_sidecar_after_controller_kill(tmp_path: Pa
     assert not container_present.exists()
     assert docker_calls.read_text().strip() == f'rm --force {container_id}'
     disabled_audit = (
-        state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_BOOTSTRAP.audit'
+        state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_FAILED_ENABLE.audit'
     )
-    assert 'action=AUTO_DISABLE_BOOTSTRAP\n' in disabled_audit.read_text()
+    assert 'action=AUTO_DISABLE_FAILED_ENABLE\n' in disabled_audit.read_text()
     assert stat.S_IMODE(disabled_audit.stat().st_mode) == 0o600
 
 
@@ -828,9 +853,15 @@ def test_watchdog_retry_finishes_provisional_audit_cleanup_after_kill(
 
     keyed = state / f'bot-production.entitlement-shadow-control.{run_id}.{run_attempt}.audit'
     latest = state / 'bot-production.entitlement-shadow-control.state'
+    cleanup_intent = runtime / 'failed-enable-cleanup.state'
     assert killed.returncode != 0
     assert lease.exists()
+    assert cleanup_intent.read_text() == lease.read_text()
     assert any(path.exists() for path in (keyed, audit, latest)) == (kill_after_audit_rm_call != '3')
+
+    # Model a transient invalid snapshot: the sidecar is valid again before
+    # retry.  The durable cleanup intent must still force exact cleanup.
+    container_present.touch()
 
     recovered = subprocess.run(  # noqa: S603 - retry must finish exact receipt cleanup
         command,
@@ -842,6 +873,7 @@ def test_watchdog_retry_finishes_provisional_audit_cleanup_after_kill(
 
     assert recovered.returncode == 0, recovered.stderr
     assert not lease.exists()
+    assert not cleanup_intent.exists()
     assert not container_present.exists()
     assert not keyed.exists()
     assert not audit.exists()
@@ -850,6 +882,154 @@ def test_watchdog_retry_finishes_provisional_audit_cleanup_after_kill(
     )
     assert disabled_audits
     assert 'runtime_mode=disabled' in latest.read_text()
+
+
+@pytest.mark.parametrize(
+    'failing_receipt',
+    [
+        'bot-production.entitlement-shadow-control.4588.1.audit',
+        'bot-production.entitlement-shadow-watchdog.4588.1.audit',
+        'bot-production.entitlement-shadow-control.state',
+    ],
+)
+def test_watchdog_cmp_io_error_keeps_cleanup_intent_and_lease(
+    tmp_path: Path,
+    failing_receipt: str,
+) -> None:
+    run_id, run_attempt = '4588', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(run_id, run_attempt, 'completed', 4102444800))
+    container_id = '7' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
+    _write_failing_receipt_cmp(fake_bin)
+    audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
+    secret = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    expected_env = tmp_path / 'expected-env'
+    expected_env.write_text(_fixed_policy_env())
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
+        'EXPECTED_ENV_FILE': str(expected_env),
+        'FAKE_STOP_BEFORE_SNAPSHOT_CALL': '4',
+        'FAIL_CMP_BASENAME': failing_receipt,
+    }
+    command = [
+        str(WATCHDOG),
+        'BOOTSTRAP',
+        str(lease),
+        'teplo_entitlement_shadow',
+        run_id,
+        run_attempt,
+        str(audit),
+        str(secret),
+        container_id,
+    ]
+
+    failed = subprocess.run(  # noqa: S603 - injected receipt read failure
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    cleanup_intent = runtime / 'failed-enable-cleanup.state'
+    assert failed.returncode != 0
+    assert lease.exists()
+    assert cleanup_intent.read_text() == lease.read_text()
+    assert (state / failing_receipt).exists()
+
+    environment.pop('FAIL_CMP_BASENAME')
+    recovered = subprocess.run(  # noqa: S603 - exact cleanup retry
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not lease.exists()
+    assert not cleanup_intent.exists()
+
+
+def test_watchdog_recovers_disabled_latest_after_kill_post_keyed_audit(tmp_path: Path) -> None:
+    run_id, run_attempt = '4589', '1'
+    state = tmp_path / 'state'
+    runtime = tmp_path / 'runtime'
+    fake_bin = tmp_path / 'bin'
+    for directory in (state, runtime, fake_bin):
+        directory.mkdir()
+    lease = runtime / 'lease.state'
+    lease.write_text(_lease(run_id, run_attempt, 'prepared', 1))
+    container_id = '6' * 64
+    _write_fake_watchdog_docker(fake_bin, container_id)
+    _write_fake_flock(fake_bin)
+    _write_killing_cp(fake_bin)
+    audit = state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.audit'
+    secret = state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'
+    container_present = tmp_path / 'container-present'
+    container_present.touch()
+    environment = os.environ | {
+        'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        'DOCKER_CALLS': str(tmp_path / 'docker-calls'),
+        'EXPECTED_RUN_ID': run_id,
+        'EXPECTED_RUN_ATTEMPT': run_attempt,
+        'FAKE_CONTAINER_ID': container_id,
+        'CONTAINER_PRESENT': str(container_present),
+        'CP_CALLS_FILE': str(tmp_path / 'cp-calls'),
+        'KILL_ON_CP_CALL': '2',
+    }
+    command = [
+        str(WATCHDOG),
+        'BOOTSTRAP',
+        str(lease),
+        'teplo_entitlement_shadow',
+        run_id,
+        run_attempt,
+        str(audit),
+        str(secret),
+        'pending',
+    ]
+
+    killed = subprocess.run(  # noqa: S603 - kill between keyed and latest disabled audit
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    disabled = state / (
+        f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_FAILED_ENABLE.audit'
+    )
+    cleanup_intent = runtime / 'failed-enable-cleanup.state'
+    assert killed.returncode != 0
+    assert disabled.exists()
+    assert cleanup_intent.exists()
+    assert not (state / 'bot-production.entitlement-shadow-control.state').exists()
+
+    recovered = subprocess.run(  # noqa: S603 - lost-response retry reuses durable keyed audit
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    latest = state / 'bot-production.entitlement-shadow-control.state'
+    assert recovered.returncode == 0, recovered.stderr
+    assert latest.read_text() == disabled.read_text()
+    assert not cleanup_intent.exists()
 
 
 @pytest.mark.parametrize('kill_after_audit_rm_call', ['1', '2', '3'])
@@ -871,16 +1051,14 @@ def test_controller_failure_cleanup_recovers_after_kill_between_watchdog_and_fin
     for receipt in (keyed, watchdog_keyed, latest):
         receipt.write_text(lease.read_text())
     _write_fake_watchdog_docker(fake_bin, 'a' * 64)
+    _write_fake_flock(fake_bin)
     _write_killing_active_audit_rm(fake_bin)
 
     enable_source = ENABLE.read_text()
     function_names = (
         'fixed_sidecar_ids',
         'fixed_sidecar_is_absent',
-        'cleanup_lease_value',
-        'cleanup_provisional_active_audits',
-        'atomic_replace_audit',
-        'publish_immutable_audit',
+        'audit_value',
         'write_cleanup_unverified_audit',
         'cleanup_runtime',
     )
@@ -890,6 +1068,7 @@ def test_controller_failure_cleanup_recovers_after_kill_between_watchdog_and_fin
         f'STATE_DIR={shlex.quote(str(state))}\n'
         f'LEASE_FILE={shlex.quote(str(lease))}\n'
         f'RUNTIME_DIR={shlex.quote(str(runtime))}\n'
+        f'CLEANUP_INTENT_FILE={shlex.quote(str(runtime / "failed-enable-cleanup.state"))}\n'
         'SIDECAR=teplo_entitlement_shadow\n'
         f'RUN_ID={run_id}\n'
         f'RUN_ATTEMPT={run_attempt}\n'
@@ -898,9 +1077,10 @@ def test_controller_failure_cleanup_recovers_after_kill_between_watchdog_and_fin
         'RELEASE_CARD=gate2-test\n'
         f'AUDIT_FILE={shlex.quote(str(latest))}\n'
         f'RUN_AUDIT_FILE={shlex.quote(str(keyed))}\n'
+        f'WATCHDOG={shlex.quote(str(WATCHDOG))}\n'
         "SIDECAR_ENV_FILE=''\n"
         + ''.join(_shell_function(enable_source, name) for name in function_names)
-        + 'cleanup_runtime\n'
+        + 'cleanup_runtime\nexit 64\n'
     )
     harness.chmod(0o755)
     environment = os.environ | {
@@ -923,9 +1103,26 @@ def test_controller_failure_cleanup_recovers_after_kill_between_watchdog_and_fin
     )
     assert killed.returncode != 0
     assert lease.exists()
+    cleanup_intent = runtime / 'failed-enable-cleanup.state'
+    assert cleanup_intent.exists(), killed.stderr
+
+    # The invalid decision may have been transient.  A real watchdog retry
+    # must honor the durable cleanup intent instead of rematerializing ACTIVE.
+    (tmp_path / 'container-present').touch()
+    environment.pop('KILL_AFTER_AUDIT_RM_CALL')
 
     recovered = subprocess.run(  # noqa: S603 - retry exact controller cleanup functions
-        [str(harness)],
+        [
+            str(WATCHDOG),
+            'BOOTSTRAP',
+            str(lease),
+            'teplo_entitlement_shadow',
+            run_id,
+            run_attempt,
+            str(watchdog_keyed),
+            str(state / f'entitlement-shadow-secrets-{run_id}-{run_attempt}.env'),
+            'pending',
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -934,9 +1131,10 @@ def test_controller_failure_cleanup_recovers_after_kill_between_watchdog_and_fin
 
     assert recovered.returncode == 0, recovered.stderr
     assert not lease.exists()
+    assert not cleanup_intent.exists()
     assert not watchdog_keyed.exists()
-    assert 'runtime_mode=disabled' in keyed.read_text()
-    assert latest.read_text() == keyed.read_text()
+    assert not keyed.exists()
+    assert 'runtime_mode=disabled' in latest.read_text()
 
 
 def test_watchdog_refuses_paused_completed_sidecar(tmp_path: Path) -> None:
@@ -989,10 +1187,10 @@ def test_watchdog_refuses_paused_completed_sidecar(tmp_path: Path) -> None:
     assert not container_present.exists()
     assert not lease.exists()
     disabled_audit = state / (
-        f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_BOOTSTRAP.audit'
+        f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_FAILED_ENABLE.audit'
     )
     assert disabled_audit.exists()
-    assert 'action=AUTO_DISABLE_BOOTSTRAP' in disabled_audit.read_text()
+    assert 'action=AUTO_DISABLE_FAILED_ENABLE' in disabled_audit.read_text()
 
 
 def test_watchdog_recovers_missing_latest_from_existing_durable_audits(tmp_path: Path) -> None:
@@ -1564,7 +1762,7 @@ def test_watchdog_never_audits_transient_inspect_as_absent(tmp_path: Path) -> No
 
     assert first.returncode != 0
     assert container_present.exists()
-    assert not list(state.glob('*AUTO_DISABLE_BOOTSTRAP.audit'))
+    assert not list(state.glob('*AUTO_DISABLE_FAILED_ENABLE.audit'))
 
     retry = subprocess.run(  # noqa: S603 - fixed repository watchdog under test
         [
@@ -1585,7 +1783,7 @@ def test_watchdog_never_audits_transient_inspect_as_absent(tmp_path: Path) -> No
     )
     assert retry.returncode == 0, retry.stderr
     assert not container_present.exists()
-    assert list(state.glob('*AUTO_DISABLE_BOOTSTRAP.audit'))
+    assert list(state.glob('*AUTO_DISABLE_FAILED_ENABLE.audit'))
 
 
 def _docker_path() -> str | None:
@@ -1704,9 +1902,10 @@ def test_real_docker_watchdog_removes_running_restart_no_sidecar(tmp_path: Path)
         assert not lease.exists()
         assert not secret_env.exists()
         disabled_audit = (
-            state / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_BOOTSTRAP.audit'
+            state
+            / f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_FAILED_ENABLE.audit'
         )
-        assert 'action=AUTO_DISABLE_BOOTSTRAP\n' in disabled_audit.read_text()
+        assert 'action=AUTO_DISABLE_FAILED_ENABLE\n' in disabled_audit.read_text()
     finally:
         subprocess.run(  # noqa: S603 - resolved fixed Docker executable
             [docker, 'rm', '--force', 'teplo_entitlement_shadow'],

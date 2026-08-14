@@ -70,6 +70,10 @@ jobs:
               echo 'Refusing deploy: a shadow disable is still in progress.' >&2
               exit 64
             }
+            test ! -e "$SHADOW_RUNTIME_DIR/failed-enable-cleanup.state" || {
+              echo 'Refusing deploy: a failed shadow enable cleanup is still in progress.' >&2
+              exit 64
+            }
             docker info >/dev/null 2>&1 || {
               echo 'Refusing deploy: Docker state cannot be verified.' >&2
               exit 64
