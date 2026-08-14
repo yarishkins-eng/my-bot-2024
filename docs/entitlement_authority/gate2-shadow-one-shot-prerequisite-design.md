@@ -69,8 +69,11 @@ allowlist, fixed mismatch/cohort names, fixed stop codes, and bounded integer
 values.  Raw lines and exception text are never published or grepped.  Only
 the canonical aggregate event plus keyed controller facts appear in the
 GitHub workflow log/summary; nothing is retained on the production host.
-Missing, malformed, or lost evidence is `observation_evidence=unproved`, never
-a successful observation.
+The controller attaches stdout atomically with `docker start -a`; it does not
+start and then race a separate logs call. Missing, malformed, oversized, lost,
+or non-zero-process evidence is `observation_evidence=unproved` and makes
+Enable fail after absence and production postchecks. It is never a successful
+observation.
 
 ## Emergency Disable
 

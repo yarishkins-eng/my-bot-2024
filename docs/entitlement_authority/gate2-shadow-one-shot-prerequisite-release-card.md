@@ -53,7 +53,10 @@ provider, policy and `ReadOnlyShadowRunner` exactly once. The existing source
 owns `SET TRANSACTION READ ONLY` and the local statement timeout. The existing
 Panel method owns the redacted GET and `max_retries=0` boundary. Incidental
 application logs are dropped; stdout contains exactly one validated bounded
-aggregate JSON event.
+aggregate JSON event. The controller validates the live created-container
+inspect state, attaches before start with `docker start -a`, and treats
+missing, malformed, oversized, or non-zero-process evidence as a failed
+Enable after cleanup and postchecks.
 
 The in-container cycle deadline is 180 seconds, TERM deadline 195 seconds,
 hard kill follows after 10 seconds, and the fixed-name auto-remove container

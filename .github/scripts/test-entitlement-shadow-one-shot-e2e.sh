@@ -9,6 +9,7 @@ readonly CONTROLLER="${2:?controller path required}"
 readonly READONLY_PROBE="${3:?read-only probe path required}"
 readonly SCHEMA_HELPER="${4:?schema helper path required}"
 readonly RUN_KEY="${5:?run key required}"
+readonly COMPATIBLE_SOURCE_DIR="${6:?compatible source dir required}"
 readonly WORK_DIR="$(mktemp -d "/tmp/teplo-shadow-e2e-${RUN_KEY}.XXXXXX")"
 readonly DB_NAME="teplo-shadow-db-${RUN_KEY}"
 readonly BOT_NAME="teplo-shadow-config-${RUN_KEY}"
@@ -25,7 +26,11 @@ chmod 777 "$WORK_DIR"
 
 cleanup() {
   set +e
-  docker rm -f "$FIXED_NAME" "$PANEL_NAME" "$BOT_NAME" "$DB_NAME" >/dev/null 2>&1
+  if docker inspect "$FIXED_NAME" >/dev/null 2>&1 \
+    && [ "$(docker inspect --format '{{ index .Config.Labels \"teplo.e2e-run\" }}' "$FIXED_NAME")" = "$RUN_KEY" ]; then
+    docker rm -f "$FIXED_NAME" >/dev/null 2>&1
+  fi
+  docker rm -f "$PANEL_NAME" "$BOT_NAME" "$DB_NAME" >/dev/null 2>&1
   docker network rm "$PANEL_NETWORK" "$DB_NETWORK" >/dev/null 2>&1
   if [ -n "$ACTIVE_RUN_DIR" ]; then
     rm -f "$ACTIVE_CONTROLLER" "$ACTIVE_ENTRYPOINT"
@@ -37,7 +42,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-test "$(git -C /opt/remnawave-bedolaga-telegram-bot rev-parse HEAD)" = "$COMPATIBLE_SHA"
+test "$(git -C "$COMPATIBLE_SOURCE_DIR" rev-parse HEAD)" = "$COMPATIBLE_SHA"
 test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$IMAGE"
 if docker inspect "$FIXED_NAME" >/dev/null 2>&1; then
   echo 'fixed one-shot name is occupied before isolated test' >&2
@@ -198,6 +203,7 @@ invoke_control() {
     ONE_SHOT_E2E_BOT_CONTAINER="$BOT_NAME" \
     ONE_SHOT_E2E_DB_CONTAINER="$DB_NAME" \
     ONE_SHOT_E2E_PANEL_NETWORK="$PANEL_NETWORK" \
+    ONE_SHOT_E2E_RUN_KEY="$RUN_KEY" \
     "$ACTIVE_CONTROLLER" "$action" "$ACTIVE_ENTRYPOINT" \
       "$(sha256sum "$ACTIVE_ENTRYPOINT" | awk '{print $1}')" 2>&1)"
   rc=$?
@@ -232,7 +238,7 @@ assert_summary() {
 }
 assert_summary "$success_output" '"sampled":1'
 assert_summary "$success_output" '"exact":1'
-assert_summary "$success_output" 'security_evidence=uid-1000,readonly-rootfs,two-networks'
+assert_summary "$success_output" 'security_evidence=exact-image,uid-1000,readonly-rootfs,limits,caps,no-new-privileges,restart-no,no-healthcheck,one-readonly-mount,two-networks,forbidden-env-absent'
 assert_summary "$success_output" 'container_absent=true'
 python3 - "$WORK_DIR/panel-counts.json" <<'PY'
 import json, sys
@@ -259,7 +265,14 @@ printf '%s' "$error_output" | grep -q '"panel_read_errors":1'
 printf '%s' "$error_output" | grep -q 'container_absent=true'
 echo 'scenario=error aggregate-only container-absent'
 
+start_panel delay
+timeout_output="$(run_controller)"
+printf '%s' "$timeout_output" | grep -q '"panel_read_errors":1'
+printf '%s' "$timeout_output" | grep -q 'container_absent=true'
+echo 'scenario=actual-panel-timeout aggregate-only container-absent'
+
 docker run -d --rm --name "$FIXED_NAME" --label teplo.role=entitlement-shadow-one-shot \
+  --label "teplo.e2e-run=$RUN_KEY" \
   --read-only --cap-drop ALL --security-opt no-new-privileges:true --restart no \
   "$IMAGE" timeout --signal=TERM --kill-after=1s 2s sleep 60 >/dev/null
 deadline=$((SECONDS + 8))
@@ -267,7 +280,7 @@ while docker inspect "$FIXED_NAME" >/dev/null 2>&1; do
   test "$SECONDS" -lt "$deadline"
   sleep 1
 done
-echo 'scenario=timeout container-absent'
+echo 'scenario=hard-deadline-primitive container-absent'
 
 start_panel delay
 prepare_run_primitives
@@ -275,6 +288,7 @@ ONE_SHOT_E2E_MODE=exact-isolated-contract-v1 \
 ONE_SHOT_E2E_BOT_CONTAINER="$BOT_NAME" \
 ONE_SHOT_E2E_DB_CONTAINER="$DB_NAME" \
 ONE_SHOT_E2E_PANEL_NETWORK="$PANEL_NETWORK" \
+ONE_SHOT_E2E_RUN_KEY="$RUN_KEY" \
   "$ACTIVE_CONTROLLER" ENABLE_SHADOW "$ACTIVE_ENTRYPOINT" \
     "$(sha256sum "$ACTIVE_ENTRYPOINT" | awk '{print $1}')" \
   >"$WORK_DIR/controller-sigkill.out" 2>&1 &
@@ -311,13 +325,16 @@ printf '%s' "$disable_output" | grep -q 'cleanup_result=absent_noop'
 for state in running stopped paused; do
   case "$state" in
     running)
-      docker run -d --name "$FIXED_NAME" --label teplo.role=entitlement-shadow-one-shot "$IMAGE" sleep 60 >/dev/null
+      docker run -d --name "$FIXED_NAME" --label teplo.role=entitlement-shadow-one-shot \
+        --label "teplo.e2e-run=$RUN_KEY" "$IMAGE" sleep 60 >/dev/null
       ;;
     stopped)
-      docker create --name "$FIXED_NAME" --label teplo.role=entitlement-shadow-one-shot "$IMAGE" true >/dev/null
+      docker create --name "$FIXED_NAME" --label teplo.role=entitlement-shadow-one-shot \
+        --label "teplo.e2e-run=$RUN_KEY" "$IMAGE" true >/dev/null
       ;;
     paused)
-      docker run -d --name "$FIXED_NAME" --label teplo.role=entitlement-shadow-one-shot "$IMAGE" sleep 60 >/dev/null
+      docker run -d --name "$FIXED_NAME" --label teplo.role=entitlement-shadow-one-shot \
+        --label "teplo.e2e-run=$RUN_KEY" "$IMAGE" sleep 60 >/dev/null
       docker pause "$FIXED_NAME" >/dev/null
       ;;
   esac
@@ -325,7 +342,8 @@ for state in running stopped paused; do
   printf '%s' "$disable_output" | grep -q 'cleanup_result=removed_owned_one_shot'
   ! docker inspect "$FIXED_NAME" >/dev/null 2>&1
 done
-docker create --name "$FIXED_NAME" --label teplo.role=foreign "$IMAGE" true >/dev/null
+docker create --name "$FIXED_NAME" --label teplo.role=foreign \
+  --label "teplo.e2e-run=$RUN_KEY" "$IMAGE" true >/dev/null
 if invoke_control DISABLE_SHADOW >/dev/null 2>&1; then
   echo 'foreign ownership was not rejected' >&2
   exit 1

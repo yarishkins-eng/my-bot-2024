@@ -95,9 +95,13 @@ disable_shadow() {
 enable_shadow() {
   local entrypoint_path="$1"
   local expected_entrypoint_sha="$2"
-  local actual_entrypoint_sha current_sha current_image db_network raw_output validated deadline
+  local actual_entrypoint_sha current_sha current_image db_network raw_output='' validated='' deadline
   local bot_container='remnawave_bot' db_container='remnawave_bot_db' panel_network='remnawave-network'
   local bot_id_before='' bot_started_before='' bot_restart_before=''
+  local e2e_run_key='' attached_pid='' attached_rc=1 line='' monitor_seconds=0
+  local started=false primitives_unlinked=false evidence_proven=false output_overflow=false
+  local sidecar_env_keys='' allowed_env_keys='' forbidden_env=''
+  local -a e2e_label_args=()
 
   if docker inspect "$FIXED_NAME" >/dev/null 2>&1; then
     echo 'fixed-name container already exists; refusing adoption or replacement' >&2
@@ -109,6 +113,9 @@ enable_shadow() {
     bot_container="${ONE_SHOT_E2E_BOT_CONTAINER:?}"
     db_container="${ONE_SHOT_E2E_DB_CONTAINER:?}"
     panel_network="${ONE_SHOT_E2E_PANEL_NETWORK:?}"
+    e2e_run_key="${ONE_SHOT_E2E_RUN_KEY:?}"
+    [[ "$e2e_run_key" =~ ^[A-Za-z0-9._-]+$ ]]
+    e2e_label_args=(--label "teplo.e2e-run=$e2e_run_key")
     test "$(docker inspect --format '{{ index .Config.Labels "teplo.e2e" }}' "$bot_container")" = 'gate2-shadow-one-shot'
     test "$(docker inspect --format '{{ index .Config.Labels "teplo.e2e" }}' "$db_container")" = 'gate2-shadow-one-shot'
     test "$(docker network inspect --format '{{ index .Labels "teplo.e2e" }}' "$panel_network")" = 'gate2-shadow-one-shot'
@@ -154,10 +161,12 @@ enable_shadow() {
     bot_started_before="$(docker inspect --format '{{.State.StartedAt}}' "$bot_container")"
     bot_restart_before="$(docker inspect --format '{{.RestartCount}}' "$bot_container")"
   fi
+  command -v jq >/dev/null
 
   docker create --rm \
     --name "$FIXED_NAME" \
     --label "$ROLE_LABEL" \
+    "${e2e_label_args[@]}" \
     --user 1000:1000 \
     --read-only \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
@@ -207,27 +216,124 @@ enable_shadow() {
       python /opt/teplo/entitlement_shadow_one_shot.py >/dev/null
 
   cleanup_created() {
-    docker rm -f "$FIXED_NAME" >/dev/null 2>&1 || true
+    if ! docker inspect "$FIXED_NAME" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! require_exact_role; then
+      echo 'cleanup refused a foreign fixed-name container' >&2
+      return 1
+    fi
+    if [ -n "$e2e_run_key" ] \
+      && [ "$(docker inspect --format '{{ index .Config.Labels \"teplo.e2e-run\" }}' "$FIXED_NAME")" != "$e2e_run_key" ]; then
+      echo 'cleanup refused a fixed-name container from another E2E run' >&2
+      return 1
+    fi
+    docker rm -f "$FIXED_NAME" >/dev/null
   }
   trap cleanup_created EXIT HUP INT TERM
   docker network connect "$panel_network" "$FIXED_NAME"
-  test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$FIXED_NAME")" = 'true'
-  test "$(docker inspect --format '{{.Config.User}}' "$FIXED_NAME")" = '1000:1000'
-  test "$(docker inspect --format '{{len .NetworkSettings.Networks}}' "$FIXED_NAME")" = '2'
+  entrypoint_path="$(readlink -f "$entrypoint_path")"
+  docker inspect "$FIXED_NAME" | jq -e \
+    --arg image "$COMPATIBLE_IMAGE" \
+    --arg source "$entrypoint_path" \
+    --arg db_network "$db_network" \
+    --arg panel_network "$panel_network" '
+      .[0] |
+      .Image == $image and
+      .Config.User == "1000:1000" and
+      .HostConfig.ReadonlyRootfs == true and
+      .HostConfig.Memory == 268435456 and
+      .HostConfig.NanoCpus == 500000000 and
+      .HostConfig.PidsLimit == 128 and
+      .HostConfig.CapDrop == ["ALL"] and
+      .HostConfig.SecurityOpt == ["no-new-privileges:true"] and
+      .HostConfig.RestartPolicy.Name == "no" and
+      .Config.Healthcheck.Test == ["NONE"] and
+      ((.NetworkSettings.Networks | keys | sort) == ([$db_network, $panel_network] | sort)) and
+      (.Mounts | length) == 1 and
+      .Mounts[0].Type == "bind" and
+      .Mounts[0].Source == $source and
+      .Mounts[0].Destination == "/opt/teplo/entitlement_shadow_one_shot.py" and
+      .Mounts[0].RW == false
+    ' >/dev/null
+  sidecar_env_keys="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$FIXED_NAME" \
+    | sed 's/=.*//' | LC_ALL=C sort -u)"
+  allowed_env_keys="$(
+    docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$COMPATIBLE_IMAGE" | sed 's/=.*//'
+    printf '%s\n' BOT_TOKEN POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
+      REMNAWAVE_API_URL REMNAWAVE_API_KEY REMNAWAVE_AUTH_TYPE DEFAULT_TRAFFIC_RESET_STRATEGY \
+      ENTITLEMENT_AUTHORITY_CHECKOUT_ADMISSION_ENABLED ENTITLEMENT_AUTHORITY_PROJECTOR_ENABLED \
+      ENTITLEMENT_AUTHORITY_READY_NOTIFICATIONS_ENABLED ENTITLEMENT_AUTHORITY_SHADOW_ENABLED \
+      ENTITLEMENT_AUTHORITY_SHADOW_KILL_SWITCH ENTITLEMENT_AUTHORITY_SHADOW_COHORT_BASIS_POINTS \
+      ENTITLEMENT_AUTHORITY_SHADOW_MAX_IDENTITIES_PER_CYCLE ENTITLEMENT_AUTHORITY_SHADOW_SCHEDULE_SECONDS \
+      ENTITLEMENT_AUTHORITY_SHADOW_PANEL_READS_PER_MINUTE ENTITLEMENT_AUTHORITY_SHADOW_PANEL_TIMEOUT_SECONDS \
+      ENTITLEMENT_AUTHORITY_SHADOW_DB_STATEMENT_TIMEOUT_MS ENTITLEMENT_AUTHORITY_SHADOW_MAX_CYCLE_SECONDS \
+      ENTITLEMENT_AUTHORITY_SHADOW_MIN_RATIO_SAMPLE ENTITLEMENT_AUTHORITY_SHADOW_MAX_PANEL_READ_ERRORS \
+      ENTITLEMENT_AUTHORITY_SHADOW_MAX_PANEL_READ_ERROR_BASIS_POINTS ENTITLEMENT_AUTHORITY_SHADOW_MAX_MISSING_COUNT \
+      ENTITLEMENT_AUTHORITY_SHADOW_MAX_MISSING_BASIS_POINTS ENTITLEMENT_AUTHORITY_SHADOW_MAX_CRITICAL_DRIFT_COUNT \
+      ENTITLEMENT_AUTHORITY_SHADOW_MAX_CRITICAL_DRIFT_BASIS_POINTS ENTITLEMENT_AUTHORITY_SHADOW_MAX_TOTAL_DRIFT_COUNT \
+      ENTITLEMENT_AUTHORITY_SHADOW_MAX_TOTAL_DRIFT_BASIS_POINTS MULTI_TARIFF_ENABLED
+  )"
+  test -z "$(comm -23 <(printf '%s\n' "$sidecar_env_keys") <(printf '%s\n' "$allowed_env_keys" | LC_ALL=C sort -u))"
+  test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$FIXED_NAME" \
+    | grep -c '^BOT_TOKEN=0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA$')" = '1'
+  for forbidden_env in REDIS_URL TELEGRAM_BOT_TOKEN YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY \
+    SMTP_PASSWORD CABINET_SECRET_KEY CABINET_ADMIN_PASSWORD; do
+    ! printf '%s\n' "$sidecar_env_keys" | grep -Fxq "$forbidden_env"
+  done
   if [ "${ONE_SHOT_E2E_MODE:-}" != 'exact-isolated-contract-v1' ]; then
     production_preflight
   fi
-  command -v jq >/dev/null
   deadline=$((SECONDS + ABSENT_BY_SECONDS))
-  docker start "$FIXED_NAME" >/dev/null
-  unlink_run_primitives "$entrypoint_path"
-  echo 'security_evidence=uid-1000,readonly-rootfs,two-networks'
-  echo 'start_confirmed=true'
-
   monitor_seconds=$((deadline - SECONDS))
   test "$monitor_seconds" -gt 0
-  raw_output="$(timeout --signal=TERM --kill-after=2s "${monitor_seconds}s" docker logs -f "$FIXED_NAME" 2>&1 || true)"
-  if validated="$(printf '%s' "$raw_output" | validate_evidence 2>/dev/null)"; then
+  exec 3< <(timeout --signal=TERM --kill-after=2s "${monitor_seconds}s" docker start -a "$FIXED_NAME" 2>&1)
+  attached_pid="$!"
+  while docker inspect "$FIXED_NAME" >/dev/null 2>&1; do
+    if [ "$started" = false ] \
+      && [ "$(docker inspect --format '{{.State.Running}}' "$FIXED_NAME" 2>/dev/null || true)" = 'true' ]; then
+      started=true
+      unlink_run_primitives "$entrypoint_path"
+      primitives_unlinked=true
+      echo 'security_evidence=exact-image,uid-1000,readonly-rootfs,limits,caps,no-new-privileges,restart-no,no-healthcheck,one-readonly-mount,two-networks,forbidden-env-absent'
+      echo 'start_confirmed=true'
+    fi
+    if IFS= read -r -t 1 -u 3 line; then
+      if [ "$(( ${#raw_output} + ${#line} + 1 ))" -le 65536 ]; then
+        raw_output+="${raw_output:+$'\n'}$line"
+      else
+        output_overflow=true
+      fi
+    fi
+    if [ "$(docker inspect --format '{{.State.Running}}' "$FIXED_NAME" 2>/dev/null || true)" != 'true' ] \
+      && [ -z "$(jobs -pr)" ]; then
+      break
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      break
+    fi
+  done
+  while IFS= read -r -u 3 line; do
+    if [ "$(( ${#raw_output} + ${#line} + 1 ))" -le 65536 ]; then
+      raw_output+="${raw_output:+$'\n'}$line"
+    else
+      output_overflow=true
+    fi
+  done
+  exec 3<&-
+  set +e
+  wait "$attached_pid"
+  attached_rc=$?
+  set -e
+  if [ "$started" = false ] && [ "$attached_rc" = '0' ]; then
+    unlink_run_primitives "$entrypoint_path"
+    primitives_unlinked=true
+    echo 'security_evidence=exact-image,uid-1000,readonly-rootfs,limits,caps,no-new-privileges,restart-no,no-healthcheck,one-readonly-mount,two-networks,forbidden-env-absent'
+    echo 'start_confirmed=completed-before-running-poll'
+  fi
+  if [ "$attached_rc" = '0' ] && [ "$output_overflow" = false ] \
+    && validated="$(printf '%s' "$raw_output" | validate_evidence 2>/dev/null)"; then
+    evidence_proven=true
     printf 'observation_evidence=%s\n' "$validated"
   else
     echo 'observation_evidence=unproved'
@@ -249,6 +355,9 @@ enable_shadow() {
   fi
   trap - EXIT HUP INT TERM
   echo 'container_absent=true'
+  if [ "$primitives_unlinked" = false ] || [ "$evidence_proven" = false ]; then
+    return 1
+  fi
 }
 
 main() {

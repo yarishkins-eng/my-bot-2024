@@ -174,6 +174,9 @@ def test_controller_has_fixed_identity_hard_deadlines_and_security_options() -> 
         '10',
         '210',
         'remnawave-network',
+        'one-readonly-mount',
+        'forbidden-env-absent',
+        'docker start -a',
     ):
         assert required in source
     assert '/var/run/docker.sock' not in source
@@ -218,6 +221,30 @@ def test_controller_never_publishes_raw_container_output() -> None:
     assert 'printf \'%s\\n\' "$raw_output"' not in source
     assert 'validate_evidence' in source
     assert 'observation_evidence=unproved' in source
+    assert 'attached_rc' in source
+    assert 'evidence_proven=false' in source
+
+
+def test_candidate_ci_is_isolated_from_production_credentials_and_host() -> None:
+    workflow = CI_WORKFLOW.read_text(encoding='utf-8')
+    assert 'secrets.' not in workflow
+    assert 'ssh-action' not in workflow
+    assert 'scp-action' not in workflow
+    assert 'compatible-source' in workflow
+    assert 'docker build' in workflow
+    assert "docker image inspect --format '{{.Id}}'" in workflow
+
+
+def test_e2e_cleanup_is_bound_to_the_exact_run_label() -> None:
+    controller = CONTROLLER.read_text(encoding='utf-8')
+    script = E2E.read_text(encoding='utf-8')
+    assert 'ONE_SHOT_E2E_RUN_KEY' in controller
+    assert 'teplo.e2e-run' in controller
+    assert 'teplo.e2e-run' in script
+    cleanup = script[script.index('cleanup()') : script.index('trap cleanup')]
+    assert 'docker rm -f "$FIXED_NAME"' in cleanup
+    assert '!= "$RUN_KEY"' not in cleanup
+    assert ' = "$RUN_KEY"' in cleanup
 
 
 def test_mandatory_ci_e2e_is_exact_image_and_cannot_skip() -> None:
@@ -243,6 +270,9 @@ def test_mandatory_ci_e2e_is_exact_image_and_cannot_skip() -> None:
         'two-networks',
         'uid-1000',
         'injected-dml-rejected',
+        'actual-panel-timeout',
+        'hard-deadline-primitive',
+        'forbidden-env-absent',
     ):
         assert required in script
 
