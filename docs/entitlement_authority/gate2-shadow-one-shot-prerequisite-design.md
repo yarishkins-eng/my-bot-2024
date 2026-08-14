@@ -60,8 +60,7 @@ state are never written or restarted.
 ## Identity and evidence
 
 The fixed container name is `teplo-entitlement-shadow-one-shot`; its required
-label is `teplo.role=entitlement-shadow-one-shot`.  A second label binds the
-reviewed control release SHA.  Any existing fixed-name container makes Enable
+label is `teplo.role=entitlement-shadow-one-shot`.  Any existing fixed-name container makes Enable
 fail without inspect-based adoption, removal, restart, or replacement.
 
 The entrypoint suppresses incidental application logging and emits exactly

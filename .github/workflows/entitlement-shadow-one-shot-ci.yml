@@ -1,0 +1,100 @@
+name: Entitlement shadow one-shot exact-image CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/deploy.yml
+      - .github/workflows/entitlement-shadow-one-shot.yml
+      - .github/workflows/entitlement-shadow-one-shot-ci.yml
+      - .github/scripts/entitlement-shadow-one-shot-control.sh
+      - .github/scripts/entitlement_shadow_one_shot.py
+      - .github/scripts/entitlement_shadow_readonly_probe.py
+      - .github/scripts/entitlement_shadow_create_schema.py
+      - .github/scripts/test-entitlement-shadow-one-shot-e2e.sh
+      - tests/workflows/test_entitlement_shadow_one_shot.py
+      - docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-design.md
+      - docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-release-card.md
+  push:
+    branches:
+      - main
+      - codex/gate2-shadow-one-shot-prerequisite-20260814
+
+concurrency:
+  group: teplo-bot-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  COMPATIBLE_SHA: 103094b96f96a412463753e56e3d996311b182ec
+  COMPATIBLE_IMAGE: sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e
+  REMOTE_RUN_DIR: /tmp/teplo-shadow-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  verify:
+    uses: ./.github/workflows/lint.yml
+
+  exact-image-e2e:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Hash exact candidate primitives
+        id: hashes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf 'controller=%s\n' "$(sha256sum .github/scripts/entitlement-shadow-one-shot-control.sh | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          printf 'entrypoint=%s\n' "$(sha256sum .github/scripts/entitlement_shadow_one_shot.py | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          printf 'readonly_probe=%s\n' "$(sha256sum .github/scripts/entitlement_shadow_readonly_probe.py | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          printf 'schema_helper=%s\n' "$(sha256sum .github/scripts/entitlement_shadow_create_schema.py | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          printf 'e2e=%s\n' "$(sha256sum .github/scripts/test-entitlement-shadow-one-shot-e2e.sh | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          printf 'candidate_sha=%s compatible_sha=%s compatible_image=%s\n' "$CANDIDATE_SHA" "$COMPATIBLE_SHA" "$COMPATIBLE_IMAGE"
+
+      - name: Transfer exact candidate test primitives
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: .github/scripts/entitlement-shadow-one-shot-control.sh,.github/scripts/entitlement_shadow_one_shot.py,.github/scripts/entitlement_shadow_readonly_probe.py,.github/scripts/entitlement_shadow_create_schema.py,.github/scripts/test-entitlement-shadow-one-shot-e2e.sh
+          target: ${{ env.REMOTE_RUN_DIR }}
+          strip_components: 2
+          overwrite: false
+
+      - name: Run mandatory isolated Linux exact-image E2E
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 12m
+          script: |
+            set -Eeuo pipefail
+            readonly RUN_DIR='${{ env.REMOTE_RUN_DIR }}'
+            readonly CONTROLLER="$RUN_DIR/entitlement-shadow-one-shot-control.sh"
+            readonly ENTRYPOINT="$RUN_DIR/entitlement_shadow_one_shot.py"
+            readonly READONLY_PROBE="$RUN_DIR/entitlement_shadow_readonly_probe.py"
+            readonly SCHEMA_HELPER="$RUN_DIR/entitlement_shadow_create_schema.py"
+            readonly E2E="$RUN_DIR/test-entitlement-shadow-one-shot-e2e.sh"
+            cleanup_transfer() {
+              rm -f "$CONTROLLER" "$ENTRYPOINT" "$READONLY_PROBE" "$SCHEMA_HELPER" "$E2E"
+              rmdir "$RUN_DIR" 2>/dev/null || true
+            }
+            trap cleanup_transfer EXIT HUP INT TERM
+            test "$(sha256sum "$CONTROLLER" | awk '{print $1}')" = '${{ steps.hashes.outputs.controller }}'
+            test "$(sha256sum "$ENTRYPOINT" | awk '{print $1}')" = '${{ steps.hashes.outputs.entrypoint }}'
+            test "$(sha256sum "$READONLY_PROBE" | awk '{print $1}')" = '${{ steps.hashes.outputs.readonly_probe }}'
+            test "$(sha256sum "$SCHEMA_HELPER" | awk '{print $1}')" = '${{ steps.hashes.outputs.schema_helper }}'
+            test "$(sha256sum "$E2E" | awk '{print $1}')" = '${{ steps.hashes.outputs.e2e }}'
+            chmod 700 "$CONTROLLER" "$E2E"
+            chmod 444 "$ENTRYPOINT" "$READONLY_PROBE" "$SCHEMA_HELPER"
+            "$E2E" "$ENTRYPOINT" "$CONTROLLER" "$READONLY_PROBE" "$SCHEMA_HELPER" '${{ github.run_id }}-${{ github.run_attempt }}'
