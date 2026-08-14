@@ -274,6 +274,14 @@ materialize_completed_audits() {
   replace_latest "$RUN_AUDIT_FILE"
 }
 
+remove_matching_active_audits() {
+  for target in "$RUN_AUDIT_FILE" "$AUDIT_FILE" "$LATEST_AUDIT_FILE"; do
+    if [ -e "$target" ] && cmp -s "$target" "$LEASE_FILE"; then
+      rm -f -- "$target"
+    fi
+  done
+}
+
 arm_expiry() {
   expires_epoch="$1"
   capture_container_snapshot || return 1
@@ -331,9 +339,17 @@ if [ -r "$LEASE_FILE" ] && \
     fail 'expiry_watchdog_arm_failed'
   fi
   materialize_completed_audits || {
+    remove_matching_active_audits
     remove_own_generation || true
     fail 'completed_audit_conflict'
   }
+  if ! capture_container_snapshot || ! snapshot_matches_completed_lease; then
+    remove_matching_active_audits
+    remove_own_generation_rc=0
+    remove_own_generation || remove_own_generation_rc=$?
+    [ "$remove_own_generation_rc" = '0' ] || fail 'post_audit_container_removal_unverified'
+    write_disabled_audit AUTO_DISABLE_BOOTSTRAP || fail 'post_audit_disable_unverified'
+  fi
   exit 0
 fi
 

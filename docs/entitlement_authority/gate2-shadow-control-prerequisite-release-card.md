@@ -161,8 +161,9 @@ absent. Required checks:
    `P0=0`, `P1=0`;
    CI must run the dedicated real-Docker hard-kill/watchdog proof without skip;
 2. schema still `0103`; no migration, Compose, Dockerfile, app writer or
-   business-flow file changed; production deploy/recovery workflows changed
-   only to add the active-shadow interlock;
+   business-flow file changed; production deploy/recovery workflow changes are
+   limited to the active-shadow interlock and the protected source-only
+   control-plane transition/recovery described above;
 3. production bot/PostgreSQL/Redis/HTTP/Telegram healthy; bot ID/start time
    stable during the separate disable rehearsal;
 4. all four production entitlement flags `false`, kill switch `true`;

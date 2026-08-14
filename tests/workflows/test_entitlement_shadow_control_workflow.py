@@ -336,6 +336,10 @@ if [ "$1" = inspect ]; then
       [ ! -e "$snapshot_calls_file" ] || snapshot_calls="$(cat "$snapshot_calls_file")"
       snapshot_calls="$(( snapshot_calls + 1 ))"
       printf '%s\n' "$snapshot_calls" > "$snapshot_calls_file"
+      if [ "${FAKE_STOP_BEFORE_SNAPSHOT_CALL:-0}" = "$snapshot_calls" ]; then
+        rm -f "$CONTAINER_PRESENT"
+        exit 1
+      fi
       fake_image="$(printf '%064d' 0 | tr 0 b)"
       fake_sha="$(printf '%040d' 0 | tr 0 a)"
       printf '%s|sha256:%s|%s|%s|entitlement-shadow-readonly|%s|%s|%s|%s|gate2-readonly-v1\n' \
@@ -554,7 +558,15 @@ def test_watchdog_materializes_completed_audit_without_removing_sidecar(tmp_path
     assert container_present.exists()
 
 
-def test_watchdog_does_not_materialize_active_audit_after_sidecar_exit(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ('stop_after_snapshot', 'stop_before_snapshot'),
+    [('1', '0'), ('2', '0'), ('3', '0'), ('0', '4')],
+)
+def test_watchdog_does_not_materialize_active_audit_after_sidecar_exit(
+    tmp_path: Path,
+    stop_after_snapshot: str,
+    stop_before_snapshot: str,
+) -> None:
     run_id, run_attempt = '458', '1'
     state = tmp_path / 'state'
     runtime = tmp_path / 'runtime'
@@ -599,20 +611,23 @@ def test_watchdog_does_not_materialize_active_audit_after_sidecar_exit(tmp_path:
             'FAKE_CONTAINER_ID': container_id,
             'CONTAINER_PRESENT': str(container_present),
             'EXPECTED_ENV_FILE': str(expected_env),
-            'FAKE_STOP_AFTER_SNAPSHOT_CALL': '1',
+            'FAKE_STOP_AFTER_SNAPSHOT_CALL': stop_after_snapshot,
+            'FAKE_STOP_BEFORE_SNAPSHOT_CALL': stop_before_snapshot,
         },
     )
 
     active_audit = state / f'bot-production.entitlement-shadow-control.{run_id}.{run_attempt}.audit'
-    disabled_audit = state / (
-        f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_BOOTSTRAP.audit'
+    disabled_audits = list(
+        state.glob(f'bot-production.entitlement-shadow-watchdog.{run_id}.{run_attempt}.AUTO_DISABLE_*.audit')
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode in {0, 64}, result.stderr
     assert not container_present.exists()
     assert not lease.exists()
     assert not active_audit.exists()
-    assert disabled_audit.exists()
-    assert 'runtime_mode=disabled' in disabled_audit.read_text()
+    assert disabled_audits
+    assert all('runtime_mode=disabled' in item.read_text() for item in disabled_audits)
+    latest = state / 'bot-production.entitlement-shadow-control.state'
+    assert 'runtime_mode=disabled' in latest.read_text()
 
 
 def test_watchdog_refuses_paused_completed_sidecar(tmp_path: Path) -> None:
