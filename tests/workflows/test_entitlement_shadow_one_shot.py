@@ -256,6 +256,7 @@ def test_e2e_cleanup_is_bound_to_the_exact_run_label() -> None:
 def test_mandatory_private_e2e_contract_is_exact_image_and_cannot_skip() -> None:
     script = E2E.read_text(encoding='utf-8')
     assert COMPATIBLE_SHA in script and AMD64_CONFIG in script
+    assert 'git -c safe.directory="$COMPATIBLE_SOURCE_DIR"' in script
     assert 'ONE_SHOT_E2E_IMAGE_REFERENCE' in script
     assert 'docker network create --internal' in script
     assert 'skip' not in script.lower()

@@ -44,7 +44,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-test "$(git -C "$COMPATIBLE_SOURCE_DIR" rev-parse HEAD)" = "$COMPATIBLE_SHA"
+test "$(git -c safe.directory="$COMPATIBLE_SOURCE_DIR" -C "$COMPATIBLE_SOURCE_DIR" rev-parse HEAD)" = "$COMPATIBLE_SHA"
 test "$IMAGE" = "$OCI_INDEX_DIGEST"
 docker image inspect "$IMAGE" >/dev/null
 if docker inspect "$FIXED_NAME" >/dev/null 2>&1; then
