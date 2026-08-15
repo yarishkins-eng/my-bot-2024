@@ -3,14 +3,25 @@
 This card releases only a dormant, protected one-shot control path. It does
 not authorize `ENABLE_SHADOW` or a live production observation.
 
-## Authority blocker
+This is the historical prerequisite card. The later Gate 2.1 runtime release
+uses `docs/entitlement_authority/gate2-1-expiry-precision-release-card.md` and
+requires an ordinary application deploy; this card does not authorize it.
 
-One of the two exact DB/Panel cases in the aggregate `sampled=4` result has no
-proven durable commercial or admin authority for its current expiry. This is
-`authority_unproven`, not a finding that the expiry is invalid or wrong. It is
-a pre-existing blocker for scheduler/projector/writer cutover and automatic
-repairs. No repair or user-access change is included, and production
-progression remains stopped pending a separate owner decision.
+## Owner-confirmed compensation
+
+One of the two exact DB/Panel cases in the aggregate `sampled=4` result was
+initially classified as `authority_unproven`. The owner has now explicitly
+confirmed the current expiry as compensation for a paid subscription that was
+reset by a Teplo service defect. Exact identity, expiry, reason, and the new
+owner decision remain in an owner-only local receipt; public evidence stays
+aggregated.
+
+This resolves the business-authority classification but does not reconstruct a
+historical payment or admin audit event. No repair or user-access change is
+included. The Gate 2.1 runtime candidate is not deployed, and this historical
+prerequisite card does not authorize its release or any further production
+action. Release-path evidence, a reviewed compatibility boundary, and a
+separate owner approval remain mandatory before any progression.
 
 ## Immutable compatibility boundary
 

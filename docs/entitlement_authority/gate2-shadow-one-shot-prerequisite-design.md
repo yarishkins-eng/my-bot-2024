@@ -5,14 +5,28 @@ change.  Compatible dormant runtime: source
 `103094b96f96a412463753e56e3d996311b182ec`, schema `0103`, image
 `sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e`.
 
-## Authority blocker found by the completed one-shot
+This is the historical one-shot prerequisite design. The later Gate 2.1
+runtime release uses
+`docs/entitlement_authority/gate2-1-expiry-precision-release-card.md`; this
+document does not authorize that deploy.
 
-In the aggregate `sampled=4` result, one of the two exact DB/Panel cases has
-no proven durable commercial or admin authority for its current expiry. Its
-state is `authority_unproven`, not evidence that the expiry is invalid or
-wrong. This pre-existing gap blocks scheduler/projector/writer cutover and all
-automatic repairs. The current local candidate does not change user access,
-perform a repair, or authorize any further production progression.
+## Owner-confirmed compensation for the case identified by the completed one-shot
+
+In the aggregate `sampled=4` result, one of the two exact DB/Panel cases was
+initially classified as `authority_unproven`. The owner has now explicitly
+confirmed the current expiry as compensation for a paid subscription that was
+reset by a Teplo service defect. Exact identity, expiry, reason, and the recorded
+decision remain in an owner-only local receipt; public evidence stays
+aggregated.
+
+This new confirmation resolves the business-authority classification. It is
+not a reconstructed historical payment or admin audit event. The Gate 2.1
+runtime candidate does not change user access, perform a repair, or authorize
+another one-shot, scheduler/projector/writer cutover, or any other production
+action. That runtime candidate is not deployed, and this historical
+prerequisite design does not authorize its release. Its release path and new
+runtime compatibility boundary still require separate reviewed evidence and
+owner approval.
 
 ## Exact-image identity and private E2E
 

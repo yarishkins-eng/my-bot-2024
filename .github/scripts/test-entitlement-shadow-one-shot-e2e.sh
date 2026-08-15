@@ -10,8 +10,9 @@ readonly CONTROLLER="${2:?controller path required}"
 readonly READONLY_PROBE="${3:?read-only probe path required}"
 readonly SCHEMA_HELPER="${4:?schema helper path required}"
 readonly RUN_KEY="${5:?run key required}"
-readonly COMPATIBLE_SOURCE_DIR="${6:?compatible source dir required}"
-readonly IMAGE="${7:?exact containerd OCI index reference required}"
+readonly RUNTIME_SOURCE_DIR="${6:?runtime source dir required}"
+readonly IMAGE="${7:?exact runtime image reference required}"
+readonly RUNTIME_SOURCE_SHA="${8:-$COMPATIBLE_SHA}"
 readonly WORK_DIR="$(mktemp -d "/tmp/teplo-shadow-e2e-${RUN_KEY}.XXXXXX")"
 readonly DB_NAME="teplo-shadow-db-${RUN_KEY}"
 readonly BOT_NAME="teplo-shadow-config-${RUN_KEY}"
@@ -46,9 +47,17 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-test "$(git -c safe.directory="$COMPATIBLE_SOURCE_DIR" -C "$COMPATIBLE_SOURCE_DIR" rev-parse HEAD)" = "$COMPATIBLE_SHA"
-test "$IMAGE" = "$OCI_INDEX_DIGEST"
+test "$(git -c safe.directory="$RUNTIME_SOURCE_DIR" -C "$RUNTIME_SOURCE_DIR" rev-parse HEAD)" = "$RUNTIME_SOURCE_SHA"
 docker image inspect "$IMAGE" >/dev/null
+if [ "$RUNTIME_SOURCE_SHA" = "$COMPATIBLE_SHA" ]; then
+  test "$IMAGE" = "$OCI_INDEX_DIGEST"
+else
+  test "$(docker image inspect --format '{{ index .Config.Labels "teplo.gate2.runtime-source-sha" }}' "$IMAGE")" = "$RUNTIME_SOURCE_SHA"
+  test "$(docker image inspect --format '{{ index .Config.Labels "teplo.gate2.base-oci-index" }}' "$IMAGE")" = "$OCI_INDEX_DIGEST"
+  expected_shadow_sha="$(sha256sum "$RUNTIME_SOURCE_DIR/app/services/entitlement_authority/shadow.py" | awk '{print $1}')"
+  actual_shadow_sha="$(docker run --rm --entrypoint sha256sum "$IMAGE" /app/app/services/entitlement_authority/shadow.py | awk '{print $1}')"
+  test "$actual_shadow_sha" = "$expected_shadow_sha"
+fi
 if docker inspect "$FIXED_NAME" >/dev/null 2>&1; then
   echo 'fixed one-shot name is occupied before isolated test' >&2
   exit 1
@@ -87,7 +96,7 @@ INSERT INTO subscriptions
        (user_id, status, is_trial, start_date, end_date, traffic_limit_gb,
         traffic_used_gb, purchased_traffic_gb, device_limit, connected_squads,
         is_daily_paused, in_grace, remnawave_short_id, remnawave_uuid)
-SELECT id, 'limited', false, now(), '2030-01-01T00:00:00Z', 10,
+SELECT id, 'limited', false, now(), '2030-01-01T00:00:00.084771Z', 10,
        0, 0, 1, '[]'::json, false, false, 'gate2synthetic01', '$PANEL_UUID'
   FROM users WHERE telegram_id=$TELEGRAM_ID;
 SQL
@@ -119,9 +128,12 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(8)
         if SCENARIO == 'error':
             self.send_response(503); self.end_headers(); return
+        expire_at = '2030-01-01T00:00:00.084000Z'
+        if SCENARIO == 'adjacent_ms':
+            expire_at = '2030-01-01T00:00:00.085000Z'
         body = json.dumps({'response': {
             'uuid': UUID, 'telegramId': 900000001, 'status': 'LIMITED',
-            'expireAt': '2030-01-01T00:00:00.000000Z',
+            'expireAt': expire_at,
             'trafficLimitBytes': 10737418240, 'trafficLimitStrategy': 'NO_RESET',
             'hwidDeviceLimit': 1, 'activeInternalSquads': [],
             'externalSquadUuid': None,
@@ -210,6 +222,7 @@ invoke_control() {
     ONE_SHOT_E2E_PANEL_NETWORK="$PANEL_NETWORK" \
     ONE_SHOT_E2E_RUN_KEY="$RUN_KEY" \
     ONE_SHOT_E2E_IMAGE_REFERENCE="$IMAGE" \
+    ONE_SHOT_E2E_RUNTIME_SOURCE_SHA="$RUNTIME_SOURCE_SHA" \
     "$ACTIVE_CONTROLLER" "$action" "$ACTIVE_ENTRYPOINT" \
       "$(sha256sum "$ACTIVE_ENTRYPOINT" | awk '{print $1}')" 2>&1)"
   rc=$?
@@ -252,7 +265,26 @@ with open(sys.argv[1], encoding='utf-8') as stream:
     counts = json.load(stream)
 assert counts == {'GET': 1, 'POST': 0, 'PATCH': 0, 'PUT': 0, 'DELETE': 0}, counts
 PY
-echo 'scenario=success sampled=1 mutations=0 container-absent readonly-rootfs two-networks uid-1000'
+echo 'scenario=same-millisecond sampled=1 exact=1 mutations=0 container-absent readonly-rootfs two-networks uid-1000'
+
+start_panel adjacent_ms
+before="$(fingerprint)"
+adjacent_output="$(run_controller)"
+after="$(fingerprint)"
+test "$before" = "$after"
+assert_summary "$adjacent_output" '"sampled":1'
+assert_summary "$adjacent_output" '"exact":0'
+assert_summary "$adjacent_output" '"drift":1'
+assert_summary "$adjacent_output" '"critical_drift":1'
+assert_summary "$adjacent_output" '"mismatch_fields":{"expire_at":1}'
+assert_summary "$adjacent_output" 'container_absent=true'
+python3 - "$WORK_DIR/panel-counts.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as stream:
+    counts = json.load(stream)
+assert counts == {'GET': 1, 'POST': 0, 'PATCH': 0, 'PUT': 0, 'DELETE': 0}, counts
+PY
+echo 'scenario=adjacent-millisecond sampled=1 drift=1 expire-at-only mutations=0 container-absent'
 
 probe_output="$(docker run --rm --network "$DB_NETWORK" --user 1000:1000 --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=8m --cap-drop ALL \
@@ -296,6 +328,7 @@ ONE_SHOT_E2E_DB_CONTAINER="$DB_NAME" \
 ONE_SHOT_E2E_PANEL_NETWORK="$PANEL_NETWORK" \
 ONE_SHOT_E2E_RUN_KEY="$RUN_KEY" \
 ONE_SHOT_E2E_IMAGE_REFERENCE="$IMAGE" \
+ONE_SHOT_E2E_RUNTIME_SOURCE_SHA="$RUNTIME_SOURCE_SHA" \
   "$ACTIVE_CONTROLLER" ENABLE_SHADOW "$ACTIVE_ENTRYPOINT" \
     "$(sha256sum "$ACTIVE_ENTRYPOINT" | awk '{print $1}')" \
   >"$WORK_DIR/controller-sigkill.out" 2>&1 &

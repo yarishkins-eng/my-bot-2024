@@ -20,6 +20,7 @@ CONTROLLER = ROOT / '.github/scripts/entitlement-shadow-one-shot-control.sh'
 ENTRYPOINT = ROOT / '.github/scripts/entitlement_shadow_one_shot.py'
 E2E = ROOT / '.github/scripts/test-entitlement-shadow-one-shot-e2e.sh'
 DEPLOY = ROOT / '.github/workflows/deploy.yml'
+GATE21_RELEASE_CARD = ROOT / 'docs/entitlement_authority/gate2-1-expiry-precision-release-card.md'
 
 COMPATIBLE_SHA = '103094b96f96a412463753e56e3d996311b182ec'
 COMPATIBLE_IMAGE = 'sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
@@ -272,7 +273,13 @@ def test_candidate_ci_is_isolated_from_production_credentials_and_host() -> None
     assert 'docker load' not in workflow
     assert 'gh release download' not in workflow
     assert 'teplo-gate2-private-ci' not in workflow
-    assert 'private_exact_image_e2e=required' in workflow
+    assert 'private_candidate_runtime_e2e=required' in workflow
+    assert 'codex/gate2-1-expiry-precision-20260815' in workflow
+    assert 'app/services/entitlement_authority/shadow.py' in workflow
+    assert 'tests/entitlement_authority/test_foundation_logic.py' in workflow
+    assert 'gate2-1-expiry-precision-release-card.md' in workflow
+    assert 'ab5825959363a7477cbcaf2d040c0bd6bb99076b' in workflow
+    assert 'runtime_diff=shadow.py' in workflow
     document = _workflow(CI_WORKFLOW)
     assert set(document['jobs']) == {'verify', 'candidate-boundary'}
 
@@ -292,8 +299,11 @@ def test_e2e_cleanup_is_bound_to_the_exact_run_label() -> None:
 def test_mandatory_private_e2e_contract_is_exact_image_and_cannot_skip() -> None:
     script = E2E.read_text(encoding='utf-8')
     assert COMPATIBLE_SHA in script and AMD64_CONFIG in script
-    assert 'git -c safe.directory="$COMPATIBLE_SOURCE_DIR"' in script
+    assert 'git -c safe.directory="$RUNTIME_SOURCE_DIR"' in script
+    assert 'teplo.gate2.runtime-source-sha' in script
+    assert 'teplo.gate2.base-oci-index' in script
     assert 'ONE_SHOT_E2E_IMAGE_REFERENCE' in script
+    assert 'ONE_SHOT_E2E_RUNTIME_SOURCE_SHA' in script
     assert 'docker network create --internal' in script
     assert 'skip' not in script.lower()
     for required in (
@@ -315,6 +325,9 @@ def test_mandatory_private_e2e_contract_is_exact_image_and_cannot_skip() -> None
         'hard-deadline-primitive',
         'disable-query-failure',
         'forbidden-env-absent',
+        'same-millisecond',
+        'adjacent-millisecond',
+        '"mismatch_fields":{"expire_at":1}',
     ):
         assert required in script
 
@@ -328,7 +341,12 @@ def test_oci_index_is_not_used_as_the_portable_docker_image_id() -> None:
     assert 'PRODUCTION_ENGINE_IMAGE_ID' in controller
     assert 'EXACT_E2E_OCI_INDEX_REFERENCE' in controller
     assert 'runtime_image="${ONE_SHOT_E2E_IMAGE_REFERENCE:?}"' in controller
+    assert 'e2e_runtime_source_sha="${ONE_SHOT_E2E_RUNTIME_SOURCE_SHA:-$COMPATIBLE_SHA}"' in controller
+    assert 'teplo.gate2.runtime-source-sha' in controller
+    assert 'teplo.gate2.base-oci-index' in controller
+    assert 'if [ "$RUNTIME_SOURCE_SHA" = "$COMPATIBLE_SHA" ]' in script
     assert 'test "$IMAGE" = "$OCI_INDEX_DIGEST"' in script
+    assert 'teplo.gate2.base-oci-index' in script
     assert "--format '{{.Id}}'" not in script
     assert 'never compares\nthat reference with Docker `.Id`' in design
     assert COMPATIBLE_IMAGE in design
@@ -357,6 +375,22 @@ def test_ordinary_deploy_has_exact_control_only_allowlist_before_ssh() -> None:
         assert allowed in source
     assert 'control_only=true' in source
     assert "control_only != 'true'" in source
+    classifier_source = source[classifier:ssh]
+    assert 'app/services/entitlement_authority/shadow.py' not in classifier_source
+    assert '*) control_only=false ;;' in classifier_source
+
+
+def test_gate21_release_card_requires_an_ordinary_dormant_runtime_deploy() -> None:
+    card = GATE21_RELEASE_CARD.read_text(encoding='utf-8')
+    assert 'ab5825959363a7477cbcaf2d040c0bd6bb99076b' in card
+    assert 'ordinary non-migration application deploy' in card
+    assert 'rebuilds and restarts the production bot' in card
+    assert 'private candidate-runtime E2E' in card
+    assert '`ENABLE_SHADOW` remains forbidden' in card
+    assert 'does not authorize another one-shot' in card
+    assert 'git revert' in card
+    assert 'schema remains `0103`' in card
+    assert 'deliberately not\nthe historical Gate 2 control-only route' in card
 
 
 def test_shell_files_have_valid_bash_syntax() -> None:

@@ -126,7 +126,7 @@ enable_shadow() {
   local runtime_image="$PRODUCTION_ENGINE_IMAGE_ID"
   local bot_container='remnawave_bot' db_container='remnawave_bot_db' panel_network='remnawave-network'
   local bot_id_before='' bot_started_before='' bot_restart_before=''
-  local e2e_run_key='' attached_pid='' attached_rc=1 line='' monitor_seconds=0
+  local e2e_run_key='' e2e_runtime_source_sha='' attached_pid='' attached_rc=1 line='' monitor_seconds=0
   local started=false primitives_unlinked=false evidence_proven=false output_overflow=false
   local sidecar_env_keys='' allowed_env_keys='' forbidden_env=''
   local -a e2e_label_args=()
@@ -143,7 +143,14 @@ enable_shadow() {
     panel_network="${ONE_SHOT_E2E_PANEL_NETWORK:?}"
     e2e_run_key="${ONE_SHOT_E2E_RUN_KEY:?}"
     runtime_image="${ONE_SHOT_E2E_IMAGE_REFERENCE:?}"
-    test "$runtime_image" = "$EXACT_E2E_OCI_INDEX_REFERENCE"
+    e2e_runtime_source_sha="${ONE_SHOT_E2E_RUNTIME_SOURCE_SHA:-$COMPATIBLE_SHA}"
+    [[ "$e2e_runtime_source_sha" =~ ^[0-9a-f]{40}$ ]]
+    if [ "$e2e_runtime_source_sha" = "$COMPATIBLE_SHA" ]; then
+      test "$runtime_image" = "$EXACT_E2E_OCI_INDEX_REFERENCE"
+    else
+      test "$(docker image inspect --format '{{ index .Config.Labels "teplo.gate2.runtime-source-sha" }}' "$runtime_image")" = "$e2e_runtime_source_sha"
+      test "$(docker image inspect --format '{{ index .Config.Labels "teplo.gate2.base-oci-index" }}' "$runtime_image")" = "$EXACT_E2E_OCI_INDEX_REFERENCE"
+    fi
     [[ "$e2e_run_key" =~ ^[A-Za-z0-9._-]+$ ]]
     e2e_label_args=(--label "teplo.e2e-run=$e2e_run_key")
     test "$(docker inspect --format '{{ index .Config.Labels "teplo.e2e" }}' "$bot_container")" = 'gate2-shadow-one-shot'
