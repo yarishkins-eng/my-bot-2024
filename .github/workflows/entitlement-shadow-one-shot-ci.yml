@@ -12,17 +12,22 @@ on:
       - .github/scripts/entitlement_shadow_readonly_probe.py
       - .github/scripts/entitlement_shadow_create_schema.py
       - .github/scripts/test-entitlement-shadow-one-shot-e2e.sh
-      - app/services/entitlement_authority/shadow.py
-      - tests/entitlement_authority/test_foundation_logic.py
       - tests/workflows/test_entitlement_shadow_one_shot.py
-      - docs/entitlement_authority/gate2-1-expiry-precision-release-card.md
+      - docs/entitlement_authority/gate2-2-one-shot-revalidation-release-card.md
       - docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-design.md
       - docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-release-card.md
   push:
     branches:
       - main
-      - codex/gate2-shadow-one-shot-prerequisite-20260814
-      - codex/gate2-1-expiry-precision-20260815
+      - codex/gate2-2-one-shot-revalidation-20260815
+    paths:
+      - .github/workflows/deploy.yml
+      - .github/workflows/entitlement-shadow-one-shot.yml
+      - .github/workflows/entitlement-shadow-one-shot-ci.yml
+      - .github/scripts/entitlement-shadow-one-shot-control.sh
+      - .github/scripts/test-entitlement-shadow-one-shot-e2e.sh
+      - tests/workflows/test_entitlement_shadow_one_shot.py
+      - docs/entitlement_authority/gate2-2-one-shot-revalidation-release-card.md
 
 concurrency:
   group: teplo-bot-production-deploy
@@ -33,7 +38,7 @@ permissions:
 
 env:
   CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-  GATE21_BASE_SHA: ab5825959363a7477cbcaf2d040c0bd6bb99076b
+  GATE22_BASE_SHA: 39a0a0dcc5467f6cfe802629213dc3a57273ea25
 
 jobs:
   verify:
@@ -54,27 +59,21 @@ jobs:
         run: |
           set -Eeuo pipefail
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          git cat-file -e "${GATE21_BASE_SHA}^{commit}"
-          git merge-base --is-ancestor "$GATE21_BASE_SHA" "$CANDIDATE_SHA"
-          test ! -e teplo-gate2-compatible-103094b9.tar.gz
-          mapfile -t changed < <(git diff --name-only "$GATE21_BASE_SHA" "$CANDIDATE_SHA")
+          git cat-file -e "${GATE22_BASE_SHA}^{commit}"
+          git merge-base --is-ancestor "$GATE22_BASE_SHA" "$CANDIDATE_SHA"
+          test ! -e teplo-gate2-2-current-39a0a0dc.tar.gz
+          mapfile -t changed < <(git diff --name-only "$GATE22_BASE_SHA" "$CANDIDATE_SHA")
           mapfile -t expected < <(printf '%s\n' \
             '.github/scripts/entitlement-shadow-one-shot-control.sh' \
             '.github/scripts/test-entitlement-shadow-one-shot-e2e.sh' \
+            '.github/workflows/deploy.yml' \
             '.github/workflows/entitlement-shadow-one-shot-ci.yml' \
-            'app/services/entitlement_authority/shadow.py' \
-            'docs/entitlement_authority/evidence/writer_closure.json' \
-            'docs/entitlement_authority/evidence/writer_inventory.json' \
-            'docs/entitlement_authority/evidence/writer_union.json' \
-            'docs/entitlement_authority/gate2-1-expiry-precision-release-card.md' \
-            'docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-design.md' \
-            'docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-release-card.md' \
-            'tests/entitlement_authority/test_foundation_logic.py' \
+            '.github/workflows/entitlement-shadow-one-shot.yml' \
+            'docs/entitlement_authority/gate2-2-one-shot-revalidation-release-card.md' \
             'tests/workflows/test_entitlement_shadow_one_shot.py')
           diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${changed[@]}")
-          test "$(git diff --name-only "$GATE21_BASE_SHA" "$CANDIDATE_SHA" -- app | tr -d '\n')" = \
-            'app/services/entitlement_authority/shadow.py'
-          git diff --quiet "$GATE21_BASE_SHA" "$CANDIDATE_SHA" -- \
+          git diff --quiet "$GATE22_BASE_SHA" "$CANDIDATE_SHA" -- app
+          git diff --quiet "$GATE22_BASE_SHA" "$CANDIDATE_SHA" -- \
             migrations alembic.ini app/database main.py app/config.py Dockerfile .dockerignore docker-compose.yml
-          printf 'candidate_sha=%s base_sha=%s runtime_diff=shadow.py private_candidate_runtime_e2e=required\n' \
-            "$CANDIDATE_SHA" "$GATE21_BASE_SHA"
+          printf 'candidate_sha=%s base_sha=%s runtime_diff=none private_candidate_runtime_e2e=required\n' \
+            "$CANDIDATE_SHA" "$GATE22_BASE_SHA"

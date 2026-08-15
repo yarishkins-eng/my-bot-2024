@@ -21,11 +21,16 @@ ENTRYPOINT = ROOT / '.github/scripts/entitlement_shadow_one_shot.py'
 E2E = ROOT / '.github/scripts/test-entitlement-shadow-one-shot-e2e.sh'
 DEPLOY = ROOT / '.github/workflows/deploy.yml'
 GATE21_RELEASE_CARD = ROOT / 'docs/entitlement_authority/gate2-1-expiry-precision-release-card.md'
+GATE22_RELEASE_CARD = ROOT / 'docs/entitlement_authority/gate2-2-one-shot-revalidation-release-card.md'
 
-COMPATIBLE_SHA = '103094b96f96a412463753e56e3d996311b182ec'
-COMPATIBLE_IMAGE = 'sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
-AMD64_MANIFEST = 'sha256:39545077b550badb008c76b81312706f69085a0f79a79705b6bbe6ad3ad6c276'
-AMD64_CONFIG = 'sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67'
+GATE22_BASE_SHA = '39a0a0dcc5467f6cfe802629213dc3a57273ea25'
+COMPATIBLE_SHA = GATE22_BASE_SHA
+COMPATIBLE_IMAGE = 'sha256:35dd4dfcd12932fc2cba9c84ef0345ada97ec848e1c3cb8efe52d098873f9f86'
+AMD64_MANIFEST = 'sha256:f44a431e3f89b8857e65608fbb16a5e4235587242dd8314c7c5047ec202786ea'
+AMD64_CONFIG = 'sha256:090dc7c8340dab6c90400f8f9d9554878ff3c998c16c883a4f2b44d03ca68ab3'
+HISTORICAL_COMPATIBLE_IMAGE = 'sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
+HISTORICAL_AMD64_MANIFEST = 'sha256:39545077b550badb008c76b81312706f69085a0f79a79705b6bbe6ad3ad6c276'
+HISTORICAL_AMD64_CONFIG = 'sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67'
 FIXED_NAME = 'teplo-entitlement-shadow-one-shot'
 FIXED_ROLE = 'entitlement-shadow-one-shot'
 
@@ -93,6 +98,7 @@ def test_control_workflow_is_main_exact_sha_protected_and_serialized() -> None:
     assert 'github.sha' in rendered
     assert COMPATIBLE_SHA in rendered
     assert COMPATIBLE_IMAGE in rendered
+    assert 'docs/entitlement_authority/gate2-2-one-shot-revalidation-release-card.md' in rendered
     assert re.search(r'sha256sum|shasum -a 256', rendered)
     assert 'github.run_id' in rendered and 'github.run_attempt' in rendered
     assert 'appleboy/scp-action@' in rendered
@@ -274,13 +280,24 @@ def test_candidate_ci_is_isolated_from_production_credentials_and_host() -> None
     assert 'gh release download' not in workflow
     assert 'teplo-gate2-private-ci' not in workflow
     assert 'private_candidate_runtime_e2e=required' in workflow
-    assert 'codex/gate2-1-expiry-precision-20260815' in workflow
-    assert 'app/services/entitlement_authority/shadow.py' in workflow
-    assert 'tests/entitlement_authority/test_foundation_logic.py' in workflow
-    assert 'gate2-1-expiry-precision-release-card.md' in workflow
-    assert 'ab5825959363a7477cbcaf2d040c0bd6bb99076b' in workflow
-    assert 'runtime_diff=shadow.py' in workflow
+    assert 'codex/gate2-2-one-shot-revalidation-20260815' in workflow
+    assert 'gate2-2-one-shot-revalidation-release-card.md' in workflow
+    assert GATE22_BASE_SHA in workflow
+    assert 'runtime_diff=none' in workflow
+    assert 'app/services/entitlement_authority/shadow.py' not in workflow
+    assert 'tests/entitlement_authority/test_foundation_logic.py' not in workflow
     document = _workflow(CI_WORKFLOW)
+    push = document['on']['push']
+    assert isinstance(push, dict)
+    assert push['paths'] == [
+        '.github/workflows/deploy.yml',
+        '.github/workflows/entitlement-shadow-one-shot.yml',
+        '.github/workflows/entitlement-shadow-one-shot-ci.yml',
+        '.github/scripts/entitlement-shadow-one-shot-control.sh',
+        '.github/scripts/test-entitlement-shadow-one-shot-e2e.sh',
+        'tests/workflows/test_entitlement_shadow_one_shot.py',
+        'docs/entitlement_authority/gate2-2-one-shot-revalidation-release-card.md',
+    ]
     assert set(document['jobs']) == {'verify', 'candidate-boundary'}
 
 
@@ -300,10 +317,9 @@ def test_mandatory_private_e2e_contract_is_exact_image_and_cannot_skip() -> None
     script = E2E.read_text(encoding='utf-8')
     assert COMPATIBLE_SHA in script and AMD64_CONFIG in script
     assert 'git -c safe.directory="$RUNTIME_SOURCE_DIR"' in script
-    assert 'teplo.gate2.runtime-source-sha' in script
-    assert 'teplo.gate2.base-oci-index' in script
     assert 'ONE_SHOT_E2E_IMAGE_REFERENCE' in script
     assert 'ONE_SHOT_E2E_RUNTIME_SOURCE_SHA' in script
+    assert 'ONE_SHOT_E2E_OCI_INDEX_REFERENCE' in script
     assert 'docker network create --internal' in script
     assert 'skip' not in script.lower()
     for required in (
@@ -342,16 +358,16 @@ def test_oci_index_is_not_used_as_the_portable_docker_image_id() -> None:
     assert 'EXACT_E2E_OCI_INDEX_REFERENCE' in controller
     assert 'runtime_image="${ONE_SHOT_E2E_IMAGE_REFERENCE:?}"' in controller
     assert 'e2e_runtime_source_sha="${ONE_SHOT_E2E_RUNTIME_SOURCE_SHA:-$COMPATIBLE_SHA}"' in controller
-    assert 'teplo.gate2.runtime-source-sha' in controller
-    assert 'teplo.gate2.base-oci-index' in controller
-    assert 'if [ "$RUNTIME_SOURCE_SHA" = "$COMPATIBLE_SHA" ]' in script
-    assert 'test "$IMAGE" = "$OCI_INDEX_DIGEST"' in script
-    assert 'teplo.gate2.base-oci-index' in script
+    assert 'test "$e2e_runtime_source_sha" = "$COMPATIBLE_SHA"' in controller
+    assert 'test "$e2e_oci_index" = "$EXACT_E2E_OCI_INDEX_REFERENCE"' in controller
+    assert 'test "$RUNTIME_SOURCE_SHA" = "$COMPATIBLE_SHA"' in script
+    assert 'test "$IMAGE" = "$OCI_INDEX_DIGEST"' not in script
+    assert 'actual_shadow_sha' in script and 'expected_shadow_sha' in script
     assert "--format '{{.Id}}'" not in script
     assert 'never compares\nthat reference with Docker `.Id`' in design
-    assert COMPATIBLE_IMAGE in design
-    assert AMD64_MANIFEST in design
-    assert AMD64_CONFIG in design
+    assert HISTORICAL_COMPATIBLE_IMAGE in design
+    assert HISTORICAL_AMD64_MANIFEST in design
+    assert HISTORICAL_AMD64_CONFIG in design
 
 
 def test_ordinary_deploy_has_exact_control_only_allowlist_before_ssh() -> None:
@@ -371,6 +387,7 @@ def test_ordinary_deploy_has_exact_control_only_allowlist_before_ssh() -> None:
         'tests/workflows/test_entitlement_shadow_one_shot.py',
         'docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-design.md',
         'docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-release-card.md',
+        'docs/entitlement_authority/gate2-2-one-shot-revalidation-release-card.md',
     ):
         assert allowed in source
     assert 'control_only=true' in source
@@ -391,6 +408,29 @@ def test_gate21_release_card_requires_an_ordinary_dormant_runtime_deploy() -> No
     assert 'git revert' in card
     assert 'schema remains `0103`' in card
     assert 'deliberately not\nthe historical Gate 2 control-only route' in card
+
+
+def test_gate22_release_card_is_control_only_and_requires_two_owner_gates() -> None:
+    card = GATE22_RELEASE_CARD.read_text(encoding='utf-8')
+    for required in (
+        GATE22_BASE_SHA,
+        COMPATIBLE_IMAGE,
+        AMD64_MANIFEST,
+        AMD64_CONFIG,
+        'fb9684ef36688ebd5dcdc89f79586ac48d69196bf163ca15b25623d8ecc0f355',
+        'control-only',
+        'does not authorize PR, merge, deploy, or `ENABLE_SHADOW`',
+        'separate owner GO for PR/merge',
+        'separate owner GO for exactly one `ENABLE_SHADOW`',
+        'no `app/**` runtime change',
+        '`sampled > 0`',
+        'drift=0',
+        'Panel writes=0',
+        'GitHub `main` equals the exact reviewed Gate 2.2 merge/control SHA',
+        'production source and deploy-state remain the compatible runtime SHA',
+        'STOP',
+    ):
+        assert required in card
 
 
 def test_shell_files_have_valid_bash_syntax() -> None:

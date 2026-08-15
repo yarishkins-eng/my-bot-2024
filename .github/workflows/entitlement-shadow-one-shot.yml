@@ -36,9 +36,9 @@ jobs:
     timeout-minutes: 12
     environment: teplo-vpn-production-controlled-change
     env:
-      COMPATIBLE_SHA: 103094b96f96a412463753e56e3d996311b182ec
-      COMPATIBLE_IMAGE: sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e
-      RELEASE_CARD: docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-release-card.md
+      COMPATIBLE_SHA: 39a0a0dcc5467f6cfe802629213dc3a57273ea25
+      COMPATIBLE_IMAGE: sha256:35dd4dfcd12932fc2cba9c84ef0345ada97ec848e1c3cb8efe52d098873f9f86
+      RELEASE_CARD: docs/entitlement_authority/gate2-2-one-shot-revalidation-release-card.md
       REMOTE_RUN_DIR: /tmp/teplo-shadow-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
       request_actor: ${{ github.actor }}
     steps:

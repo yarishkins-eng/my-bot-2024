@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly CONFIG_DIGEST='sha256:133309254d834f18ec0a50f9b57d7c37cdd73fda9b57bf7bdcb7ae8084f1fe67'
-readonly OCI_INDEX_DIGEST='sha256:52df4d9531f5bb5084af19752cdcf593609687a35da2a0fa26c2995aac2d8b1e'
-readonly COMPATIBLE_SHA='103094b96f96a412463753e56e3d996311b182ec'
+readonly CONFIG_DIGEST='sha256:090dc7c8340dab6c90400f8f9d9554878ff3c998c16c883a4f2b44d03ca68ab3'
+readonly OCI_INDEX_DIGEST='sha256:35dd4dfcd12932fc2cba9c84ef0345ada97ec848e1c3cb8efe52d098873f9f86'
+readonly COMPATIBLE_SHA='39a0a0dcc5467f6cfe802629213dc3a57273ea25'
 readonly FIXED_NAME='teplo-entitlement-shadow-one-shot'
 readonly ENTRYPOINT="${1:?entrypoint path required}"
 readonly CONTROLLER="${2:?controller path required}"
@@ -49,15 +49,10 @@ trap cleanup EXIT HUP INT TERM
 
 test "$(git -c safe.directory="$RUNTIME_SOURCE_DIR" -C "$RUNTIME_SOURCE_DIR" rev-parse HEAD)" = "$RUNTIME_SOURCE_SHA"
 docker image inspect "$IMAGE" >/dev/null
-if [ "$RUNTIME_SOURCE_SHA" = "$COMPATIBLE_SHA" ]; then
-  test "$IMAGE" = "$OCI_INDEX_DIGEST"
-else
-  test "$(docker image inspect --format '{{ index .Config.Labels "teplo.gate2.runtime-source-sha" }}' "$IMAGE")" = "$RUNTIME_SOURCE_SHA"
-  test "$(docker image inspect --format '{{ index .Config.Labels "teplo.gate2.base-oci-index" }}' "$IMAGE")" = "$OCI_INDEX_DIGEST"
-  expected_shadow_sha="$(sha256sum "$RUNTIME_SOURCE_DIR/app/services/entitlement_authority/shadow.py" | awk '{print $1}')"
-  actual_shadow_sha="$(docker run --rm --entrypoint sha256sum "$IMAGE" /app/app/services/entitlement_authority/shadow.py | awk '{print $1}')"
-  test "$actual_shadow_sha" = "$expected_shadow_sha"
-fi
+test "$RUNTIME_SOURCE_SHA" = "$COMPATIBLE_SHA"
+expected_shadow_sha="$(sha256sum "$RUNTIME_SOURCE_DIR/app/services/entitlement_authority/shadow.py" | awk '{print $1}')"
+actual_shadow_sha="$(docker run --rm --entrypoint sha256sum "$IMAGE" /app/app/services/entitlement_authority/shadow.py | awk '{print $1}')"
+test "$actual_shadow_sha" = "$expected_shadow_sha"
 if docker inspect "$FIXED_NAME" >/dev/null 2>&1; then
   echo 'fixed one-shot name is occupied before isolated test' >&2
   exit 1
@@ -223,6 +218,7 @@ invoke_control() {
     ONE_SHOT_E2E_RUN_KEY="$RUN_KEY" \
     ONE_SHOT_E2E_IMAGE_REFERENCE="$IMAGE" \
     ONE_SHOT_E2E_RUNTIME_SOURCE_SHA="$RUNTIME_SOURCE_SHA" \
+    ONE_SHOT_E2E_OCI_INDEX_REFERENCE="$OCI_INDEX_DIGEST" \
     "$ACTIVE_CONTROLLER" "$action" "$ACTIVE_ENTRYPOINT" \
       "$(sha256sum "$ACTIVE_ENTRYPOINT" | awk '{print $1}')" 2>&1)"
   rc=$?
@@ -329,6 +325,7 @@ ONE_SHOT_E2E_PANEL_NETWORK="$PANEL_NETWORK" \
 ONE_SHOT_E2E_RUN_KEY="$RUN_KEY" \
 ONE_SHOT_E2E_IMAGE_REFERENCE="$IMAGE" \
 ONE_SHOT_E2E_RUNTIME_SOURCE_SHA="$RUNTIME_SOURCE_SHA" \
+ONE_SHOT_E2E_OCI_INDEX_REFERENCE="$OCI_INDEX_DIGEST" \
   "$ACTIVE_CONTROLLER" ENABLE_SHADOW "$ACTIVE_ENTRYPOINT" \
     "$(sha256sum "$ACTIVE_ENTRYPOINT" | awk '{print $1}')" \
   >"$WORK_DIR/controller-sigkill.out" 2>&1 &
