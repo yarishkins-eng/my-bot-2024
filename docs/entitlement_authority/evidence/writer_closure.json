@@ -5060,9 +5060,9 @@
     },
     {
       "access_relevant": false,
-      "entry_id": "5aca70a19aea68c5d01ba6c35628d9694a2d14432dfc24a62e7a39834d5e1677",
+      "entry_id": "e83c2210a159f14ed6c7f38f5adca84761ee5925b9ee7d9cca780a8d24f39e18",
       "evidence": "exact desired/observed schema declaration, not a writer",
-      "line": 12,
+      "line": 13,
       "path": "app/services/entitlement_authority/shadow.py",
       "primitive": "metadata_only",
       "section": "field_literals",
@@ -5071,9 +5071,9 @@
     },
     {
       "access_relevant": false,
-      "entry_id": "2d031937d008730c80fe893d44ad18b8c397e61a6fbf83e9960ed98ca19258da",
+      "entry_id": "f9438bf1358d1bd29b3da77412cc35fda2268f2fc8e217fd64fe06dfc1a0fa44",
       "evidence": "exact desired/observed schema declaration, not a writer",
-      "line": 149,
+      "line": 161,
       "path": "app/services/entitlement_authority/shadow.py",
       "primitive": "metadata_only",
       "section": "field_literals",
@@ -23672,6 +23672,6 @@
     }
   ],
   "format": 1,
-  "inventory_sha256": "e455090e4d38db6903114a59fb318cfa1556cc0c2b1ea0a38d0be0024479a227",
-  "sha256": "bd73f8ae50ae691ae6b9ba7ce47c70a05b2d163eb26e714cab07d198f9646449"
+  "inventory_sha256": "d99dac45348e726783af25f2a9d2d761565493a9be74b79093b861e204f26f97",
+  "sha256": "358cb19897e47c8fa79972e3862e80751fc1afac34874617c43524aa97c01c0c"
 }
