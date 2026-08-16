@@ -1,3 +1,9 @@
+# Внимание: этот файл входит в список migration-risk путей обычного деплоя
+# (.github/workflows/deploy.yml, exit 14) наравне с migrations, alembic.ini,
+# app/database и main.py. Любая правка здесь выкладывается только ручным
+# воркфлоу «Deploy bot migration to production», и до его зелёного прогона
+# все обычные деплои будут отказывать.
+
 import html
 import os
 import re
