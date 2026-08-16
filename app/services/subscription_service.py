@@ -62,6 +62,45 @@ def get_traffic_reset_strategy(tariff=None):
     return getattr(TrafficLimitStrategy, mapped_strategy)
 
 
+def find_panel_echo_mismatch(sent: dict, panel_user: RemnaWaveUser) -> str | None:
+    """Сверяет ответ панели ТОЛЬКО по полям, которые реально ушли в этом запросе.
+
+    Требовать подтверждения полей, которых в запросе не было, нельзя: часть подписок
+    зависла бы в вечном повторе. Сквады уходят только непустым списком, лимит устройств —
+    только когда резолвер вернул не None, а при включённом grace `expireAt` равен
+    `grace_until`, а не `end_date`. Поэтому источник ожидания — сам payload.
+
+    Returns:
+        Имя разошедшегося поля либо None, если всё отправленное подтверждено.
+    """
+    if 'expire_at' in sent:
+        expected_expire = sent['expire_at']
+        actual_expire = getattr(panel_user, 'expire_at', None)
+        if expected_expire is None or actual_expire is None:
+            if expected_expire is not actual_expire:
+                return 'expire_at'
+        else:
+            expected_utc = expected_expire if expected_expire.tzinfo else expected_expire.replace(tzinfo=UTC)
+            actual_utc = actual_expire if actual_expire.tzinfo else actual_expire.replace(tzinfo=UTC)
+            # Допуск на округление времени панелью; сдвиг срока меряется днями, не секундами.
+            if abs((actual_utc - expected_utc).total_seconds()) > 60:
+                return 'expire_at'
+
+    if 'hwid_device_limit' in sent and getattr(panel_user, 'hwid_device_limit', None) != sent['hwid_device_limit']:
+        return 'hwid_device_limit'
+
+    if 'active_internal_squads' in sent:
+        actual_squads = {
+            squad.get('uuid', '')
+            for squad in (getattr(panel_user, 'active_internal_squads', None) or [])
+            if squad.get('uuid')
+        }
+        if actual_squads != set(sent['active_internal_squads']):
+            return 'active_internal_squads'
+
+    return None
+
+
 @dataclass
 class PropagateSquadsResult:
     """Результат применения скводов тарифа к подпискам."""
@@ -595,6 +634,7 @@ class SubscriptionService:
         reset_traffic: bool = False,
         reset_reason: str | None = None,
         sync_squads: bool = True,
+        verify_panel_echo: bool = False,
         commit: bool = True,
         access_point_term_projection: bool = False,
         access_point_term_ends_at: datetime | None = None,
@@ -715,6 +755,19 @@ class SubscriptionService:
                     update_kwargs['external_squad_uuid'] = ext_squad_uuid
 
                 updated_user = await api.update_user(**update_kwargs)
+
+                # Выдача после оплаты обязана убедиться, что панель приняла отправленное,
+                # а не только ответила 200. Сверяем ровно то, что ушло в этом запросе.
+                if verify_panel_echo:
+                    mismatched_field = find_panel_echo_mismatch(update_kwargs, updated_user)
+                    if mismatched_field is not None:
+                        logger.error(
+                            'Панель не подтвердила отправленное поле — синхронизацию не засчитываем',
+                            subscription_id=subscription.id,
+                            remnawave_uuid=remnawave_uuid,
+                            mismatched_field=mismatched_field,
+                        )
+                        return None
 
                 if reset_traffic:
                     if settings.is_multi_tariff_enabled():
@@ -1045,6 +1098,15 @@ class SubscriptionService:
                 logger.error('Пользователь не найден для подписки', subscription_id=subscription.id)
                 return False, 'user_not_found'
 
+            # Подписке нечего выдавать: это отдельный диагноз, а не повод для бесконечного
+            # повтора. Форсируют только пути выдачи после оплаты — им нужен оператор.
+            if force_panel_sync and not subscription.connected_squads:
+                logger.error(
+                    'Синхронизация невозможна: у подписки пустой список серверов',
+                    subscription_id=subscription.id,
+                )
+                return False, 'no_entitlements_to_provision'
+
             # Проверяем, нужна ли синхронизация
             sub_uuid = subscription.remnawave_uuid if settings.is_multi_tariff_enabled() else user.remnawave_uuid
             needs_sync = force_panel_sync or not subscription.subscription_url or not sub_uuid
@@ -1083,14 +1145,38 @@ class SubscriptionService:
                     subscription,
                     reset_traffic=False,
                     sync_squads=True,
+                    # Проекция оплаченного срока проверяется своим механизмом выше по стеку;
+                    # здесь сверяем эхо только на обычных путях выдачи после оплаты.
+                    verify_panel_echo=force_panel_sync and not access_point_term_projection,
                     commit=commit,
                     access_point_term_projection=access_point_term_projection,
                     access_point_term_ends_at=access_point_term_ends_at,
                 )
-                # Если update не удался (пользователь удалён из RemnaWave) — пробуем создать
+                # Пересоздавать пользователя можно ТОЛЬКО когда панель прямо ответила «такого
+                # нет» (404). update_remnawave_user отдаёт None и на таймауте, и на любой
+                # ошибке API: обнулив UUID в этом случае, мы осиротили бы живой профиль в
+                # панели и убили бы уже розданный клиенту конфиг.
                 if not result:
+                    try:
+                        async with self.get_api_client() as api:
+                            panel_user = await api.get_user_by_uuid(sub_uuid)
+                    except Exception as probe_error:
+                        logger.warning(
+                            'Панель недоступна после неудачного обновления — UUID не трогаем',
+                            subscription_id=subscription.id,
+                            remnawave_uuid=sub_uuid,
+                            probe_error=probe_error,
+                        )
+                        return False, 'panel_unavailable'
+                    if panel_user is not None:
+                        logger.warning(
+                            'Пользователь в панели есть, но обновление не прошло — отдаём в повтор',
+                            subscription_id=subscription.id,
+                            remnawave_uuid=sub_uuid,
+                        )
+                        return False, 'panel_update_failed'
                     logger.warning(
-                        'Не удалось обновить пользователя в RemnaWave, пробуем создать заново',
+                        'Панель подтвердила отсутствие пользователя, создаём заново',
                         remnawave_uuid=sub_uuid,
                     )
                     # Сбрасываем старый UUID, create_remnawave_user установит новый
