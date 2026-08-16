@@ -13,7 +13,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.services import subscription_service as subscription_service_module
-from app.services.device_first_checkout_service import process_direct_provisioning_outbox
+from app.services.device_first_checkout_service import (
+    process_direct_provisioning_outbox,
+    process_provisioning_outbox,
+)
 from app.services.subscription_service import SubscriptionService, find_panel_echo_mismatch
 
 
@@ -77,6 +80,8 @@ async def test_forced_sync_writes_to_panel_even_when_url_and_uuid_exist(monkeypa
 
     assert (ready, error) == (True, None)
     service.update_remnawave_user.assert_awaited_once()
+    # Проводка сверки эха: без этой проверки её можно удалить, и тесты останутся зелёными.
+    assert service.update_remnawave_user.await_args.kwargs['verify_panel_echo'] is True
 
 
 @pytest.mark.asyncio
@@ -133,16 +138,48 @@ async def test_panel_confirmed_absence_still_recreates_user(monkeypatch):
     """Настоящее удаление из панели (404) по-прежнему лечится пересозданием."""
     api = SimpleNamespace(get_user_by_uuid=AsyncMock(return_value=None))
     service = _service_with_panel(api, update_result=None)
+    # Первый вызов — неудачное обновление, второй — добивочная отправка серверов.
+    service.update_remnawave_user = AsyncMock(side_effect=[None, SimpleNamespace(uuid='panel-new')])
     user = _user()
+    subscription = _provisioned_subscription()
     monkeypatch.setattr(subscription_service_module, 'get_user_by_id', AsyncMock(return_value=user))
+
+    ready, error = await service.ensure_subscription_synced(AsyncMock(), subscription, force_panel_sync=True)
+
+    assert (ready, error) == (True, None)
+    service.create_remnawave_user.assert_awaited_once()
+    # В одиночном режиме обнуляется UUID пользователя, в мультитарифном — подписки.
+    assert (user.remnawave_uuid, subscription.remnawave_uuid).count(None) >= 1
+
+
+@pytest.mark.asyncio
+async def test_recreated_profile_gets_its_servers_pushed(monkeypatch):
+    """POST может проигнорировать серверы: без добивочного PATCH клиент получил бы пустой конфиг."""
+    api = SimpleNamespace(get_user_by_uuid=AsyncMock(return_value=None))
+    service = _service_with_panel(api)
+    service.update_remnawave_user = AsyncMock(side_effect=[None, SimpleNamespace(uuid='panel-new')])
+    monkeypatch.setattr(subscription_service_module, 'get_user_by_id', AsyncMock(return_value=_user()))
 
     ready, error = await service.ensure_subscription_synced(
         AsyncMock(), _provisioned_subscription(), force_panel_sync=True
     )
 
     assert (ready, error) == (True, None)
-    service.create_remnawave_user.assert_awaited_once()
-    assert user.remnawave_uuid is None
+    assert service.update_remnawave_user.await_count == 2
+    assert service.update_remnawave_user.await_args.kwargs['sync_squads'] is True
+
+
+@pytest.mark.asyncio
+async def test_recreated_profile_without_servers_is_not_called_ready(monkeypatch):
+    api = SimpleNamespace(get_user_by_uuid=AsyncMock(return_value=None))
+    service = _service_with_panel(api, update_result=None)
+    monkeypatch.setattr(subscription_service_module, 'get_user_by_id', AsyncMock(return_value=_user()))
+
+    ready, error = await service.ensure_subscription_synced(
+        AsyncMock(), _provisioned_subscription(), force_panel_sync=True
+    )
+
+    assert (ready, error) == (False, 'panel_squads_not_applied')
 
 
 @pytest.mark.asyncio
@@ -285,6 +322,45 @@ async def test_panel_refusal_leaves_order_in_retry_and_sends_no_ready_message():
     assert checkout.provisioning_state == 'retry'
     assert checkout.lifecycle_state != 'ready'
     db.add.assert_not_called()  # уведомления «✅ Подписка готова» быть не должно
+
+
+def _legacy_worker_db(checkout, subscription, row):
+    """Легаси-воркер сначала прогоняет direct-проход — он должен вернуть пусто."""
+    return SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result([]), Result([row])]),
+        get=AsyncMock(side_effect=[checkout, subscription]),
+        commit=AsyncMock(),
+        add=MagicMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_provisioning_worker_also_forces_the_panel_write():
+    """Второй адрес выдачи из пункта А. Без этого теста форс можно удалить незаметно."""
+    row, checkout, subscription = _worker_rows()
+    db = _legacy_worker_db(checkout, subscription, row)
+    synced = AsyncMock(return_value=(True, None))
+
+    with patch('app.services.subscription_service.SubscriptionService.ensure_subscription_synced', synced):
+        await process_provisioning_outbox(db, limit=1)
+
+    assert synced.await_args.kwargs['force_panel_sync'] is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_worker_refusal_keeps_order_out_of_ready():
+    row, checkout, subscription = _worker_rows()
+    db = _legacy_worker_db(checkout, subscription, row)
+
+    with patch(
+        'app.services.subscription_service.SubscriptionService.ensure_subscription_synced',
+        AsyncMock(return_value=(False, 'panel_unavailable')),
+    ):
+        await process_provisioning_outbox(db, limit=1)
+
+    assert row.status == 'retry'
+    assert checkout.provisioning_state == 'retry'
+    assert checkout.lifecycle_state != 'ready'
 
 
 @pytest.mark.asyncio

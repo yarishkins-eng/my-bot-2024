@@ -65,6 +65,10 @@ def get_traffic_reset_strategy(tariff=None):
 def find_panel_echo_mismatch(sent: dict, panel_user: RemnaWaveUser) -> str | None:
     """Сверяет ответ панели ТОЛЬКО по полям, которые реально ушли в этом запросе.
 
+    Диагностика, а не запрет: результат идёт в лог и не влияет на исход синхронизации
+    (см. вызов в update_remnawave_user). Функция обязана быть неспособной бросить
+    исключение — иначе она сама станет источником отказа выдачи.
+
     Требовать подтверждения полей, которых в запросе не было, нельзя: часть подписок
     зависла бы в вечном повторе. Сквады уходят только непустым списком, лимит устройств —
     только когда резолвер вернул не None, а при включённом grace `expireAt` равен
@@ -73,29 +77,42 @@ def find_panel_echo_mismatch(sent: dict, panel_user: RemnaWaveUser) -> str | Non
     Returns:
         Имя разошедшегося поля либо None, если всё отправленное подтверждено.
     """
-    if 'expire_at' in sent:
+    # Условия — как на проводе: api.update_user кладёт поле по truthiness, а не по наличию
+    # ключа (remnawave_api.py:782-783). Иначе потребуем подтверждения того, что не отправляли.
+    if sent.get('expire_at'):
         expected_expire = sent['expire_at']
         actual_expire = getattr(panel_user, 'expire_at', None)
-        if expected_expire is None or actual_expire is None:
-            if expected_expire is not actual_expire:
-                return 'expire_at'
-        else:
-            expected_utc = expected_expire if expected_expire.tzinfo else expected_expire.replace(tzinfo=UTC)
-            actual_utc = actual_expire if actual_expire.tzinfo else actual_expire.replace(tzinfo=UTC)
-            # Допуск на округление времени панелью; сдвиг срока меряется днями, не секундами.
-            if abs((actual_utc - expected_utc).total_seconds()) > 60:
-                return 'expire_at'
+        if actual_expire is None:
+            return 'expire_at'
+        expected_utc = expected_expire if expected_expire.tzinfo else expected_expire.replace(tzinfo=UTC)
+        actual_utc = actual_expire if actual_expire.tzinfo else actual_expire.replace(tzinfo=UTC)
+        # Допуск на округление времени панелью; сдвиг срока меряется днями, не секундами.
+        if abs((actual_utc - expected_utc).total_seconds()) > 60:
+            return 'expire_at'
 
-    if 'hwid_device_limit' in sent and getattr(panel_user, 'hwid_device_limit', None) != sent['hwid_device_limit']:
+    if (
+        sent.get('hwid_device_limit') is not None
+        and getattr(panel_user, 'hwid_device_limit', None) != sent['hwid_device_limit']
+    ):
         return 'hwid_device_limit'
 
-    if 'active_internal_squads' in sent:
-        actual_squads = {
-            squad.get('uuid', '')
-            for squad in (getattr(panel_user, 'active_internal_squads', None) or [])
-            if squad.get('uuid')
-        }
-        if actual_squads != set(sent['active_internal_squads']):
+    if sent.get('active_internal_squads'):
+        # Форма элемента не гарантирована: в бою приходят словари, но код проекта уже
+        # обжигался на этом (см. admin_users.py:3383-3395) и разбирает три формы. Тут
+        # исключение недопустимо вдвойне: оно всплывёт как отказ синхронизации.
+        actual_squads = set()
+        for squad in getattr(panel_user, 'active_internal_squads', None) or []:
+            if isinstance(squad, dict):
+                squad_uuid = squad.get('uuid')
+            elif isinstance(squad, str):
+                squad_uuid = squad
+            else:
+                squad_uuid = getattr(squad, 'uuid', None)
+            if squad_uuid:
+                actual_squads.add(squad_uuid)
+        # Панель может вернуть надмножество (например, сквад от externalSquadUuid),
+        # поэтому требуем включения отправленного, а не точного равенства.
+        if not set(sent['active_internal_squads']).issubset(actual_squads):
             return 'active_internal_squads'
 
     return None
@@ -756,18 +773,23 @@ class SubscriptionService:
 
                 updated_user = await api.update_user(**update_kwargs)
 
-                # Выдача после оплаты обязана убедиться, что панель приняла отправленное,
-                # а не только ответила 200. Сверяем ровно то, что ушло в этом запросе.
+                # Сверка отправленного с ответом панели. 🔴 НАМЕРЕННО только запись в лог:
+                # что PATCH-ответ вообще содержит activeInternalSquads, доказательств нет
+                # (при отсутствии ключа _parse_user подставит [], remnawave_api.py:1791),
+                # а ложное несовпадение подвесило бы КАЖДЫЙ оплаченный заказ в вечном
+                # повторе — ровно та авария, от которой предостерегал аудит этапа 1.
+                # Само подтверждение записи даёт уже сам форс: api.update_user либо вернул
+                # объект, либо бросил исключение. Превращать сверку в запрет — только после
+                # того, как логи с боевого покажут, что ложных срабатываний нет.
                 if verify_panel_echo:
                     mismatched_field = find_panel_echo_mismatch(update_kwargs, updated_user)
                     if mismatched_field is not None:
                         logger.error(
-                            'Панель не подтвердила отправленное поле — синхронизацию не засчитываем',
+                            'Панель не подтвердила отправленное поле',
                             subscription_id=subscription.id,
                             remnawave_uuid=remnawave_uuid,
                             mismatched_field=mismatched_field,
                         )
-                        return None
 
                 if reset_traffic:
                     if settings.is_multi_tariff_enabled():
@@ -1138,6 +1160,7 @@ class SubscriptionService:
 
             # Пытаемся синхронизировать
             result = None
+            created_new_profile = False
             if sub_uuid:
                 # Пробуем обновить существующего пользователя
                 result = await self.update_remnawave_user(
@@ -1192,6 +1215,7 @@ class SubscriptionService:
                         access_point_term_projection=access_point_term_projection,
                         access_point_term_ends_at=access_point_term_ends_at,
                     )
+                    created_new_profile = result is not None
             else:
                 # Создаём нового пользователя
                 result = await self.create_remnawave_user(
@@ -1202,6 +1226,29 @@ class SubscriptionService:
                     access_point_term_projection=access_point_term_projection,
                     access_point_term_ends_at=access_point_term_ends_at,
                 )
+                created_new_profile = result is not None
+
+            # POST может проигнорировать activeInternalSquads — в проекте это известно и
+            # лечится добивочным PATCH (purchase.py:3412, miniapp.py:7914,
+            # daily_subscription_service.py:282). Без него «Подписка готова» на пути выдачи
+            # означала бы профиль без единого сервера: клиент платит и получает пустой конфиг.
+            if created_new_profile and force_panel_sync and subscription.connected_squads:
+                patched = await self.update_remnawave_user(
+                    db,
+                    subscription,
+                    reset_traffic=False,
+                    sync_squads=True,
+                    verify_panel_echo=not access_point_term_projection,
+                    commit=commit,
+                    access_point_term_projection=access_point_term_projection,
+                    access_point_term_ends_at=access_point_term_ends_at,
+                )
+                if not patched:
+                    logger.warning(
+                        'Профиль создан, но серверы дослать не удалось — отдаём в повтор',
+                        subscription_id=subscription.id,
+                    )
+                    return False, 'panel_squads_not_applied'
 
             if result:
                 await db.refresh(subscription)
