@@ -2553,6 +2553,53 @@ _PROVISIONING_RU = {
 }
 _POST_PAID_REVERSAL_PREFIX = 'post_paid_provider_terminal'
 
+# Причина, при которой счёт заведомо не оплачен. 🔴 Список намеренно из ОДНОГО члена.
+# Аудит пункта 4.2б называл четыре, но три из них проверены по коду и оказались не про
+# отсутствие денег:
+#   · `provider_response_missing_safe_redirect` — счёт у Platega УЖЕ СОЗДАН и привязан
+#     (`device_first_payment_service.py:1391`), брак только в ссылке; деньги могут прийти,
+#     а переопроса у этого состояния нет (`:2138-2144` берёт лишь причину ниже);
+#   · `provider_invoice_creation_incomplete` — состояние максимального незнания: id счёта
+#     нет вовсе, и код прямо пишет, что повтор невозможен (`:2114-2117`). «Денег не было» —
+#     догадка, а не факт;
+#   · `tariff_missing_after_quote` — ставится до всякой проверки состояния заказа
+#     (`_lock_direct_context`) и о деньгах не знает ничего.
+# Всем троим верный ответ — `unknown`: у него есть свой честный текст.
+# Сам список — ЗАПАСНОЙ вопрос, а не первый: он спрашивается только после того, как факты
+# о деньгах в базе ответили «ничего не приходило». Обратный порядок дал бы «денег не было»
+# при поздней оплате — она деньги приносит, а `terminal_reason` оставляет прежним.
+_NO_MONEY_TERMINAL_REASONS = frozenset({'provider_invoice_missing_or_elapsed_expiry'})
+
+
+async def checkout_money_state(db: AsyncSession, checkout: SubscriptionCheckout) -> str:
+    """Брали ли с клиента деньги: `no_money` | `money_in_flight` | `unknown`.
+
+    Этим полем ветвятся клиентские экраны бота и кабинета, поэтому вопрос ровно один и
+    ответ грубый. Владельцу нужен подробный разбор — он в `_money_verdict` ниже, и оба
+    ответа обязаны сходиться: сторож `test_money_state_agrees_with_owner_verdict`.
+    """
+    if str(checkout.terminal_reason or '').startswith(_POST_PAID_REVERSAL_PREFIX):
+        # Платёж был и отозван платёжной системой. Зачисленная сумма на попытке при этом
+        # НЕ обнуляется, поэтому без этой проверки клиент прочитал бы «платёж получен» про
+        # деньги, которые ему уже вернули. Своего экрана у отзыва нет — честнее не
+        # утверждать ничего. Тот же вопрос первым задаёт и `_money_verdict`.
+        return 'unknown'
+    if checkout.funding_mode == 'wallet':
+        # Оплата с баланса не создаёт `CheckoutPaymentAttempt` вовсе, поэтому единственный
+        # признак денег здесь — само списание.
+        return 'money_in_flight' if checkout.debit_transaction_id is not None else 'no_money'
+    credited_attempts = await db.scalar(
+        select(func.count(CheckoutPaymentAttempt.id)).where(
+            CheckoutPaymentAttempt.checkout_id == checkout.id,
+            CheckoutPaymentAttempt.credited_amount_kopeks > 0,
+        )
+    )
+    if credited_attempts or checkout.debit_transaction_id is not None:
+        return 'money_in_flight'
+    if str(checkout.terminal_reason or '') in _NO_MONEY_TERMINAL_REASONS:
+        return 'no_money'
+    return 'unknown'
+
 
 async def _money_verdict(db: AsyncSession, checkout: SubscriptionCheckout) -> str:
     """Что владельцу делать с деньгами. Цена ошибки здесь — двойной возврат либо отказ в нём."""
@@ -2586,9 +2633,11 @@ async def _money_verdict(db: AsyncSession, checkout: SubscriptionCheckout) -> st
     )
     if checkout.debit_transaction_id is not None or money_at_provider:
         return '🔴 Деньги: клиент оплатил через платёжную систему. С баланса не списывали.'
-    if str(checkout.terminal_reason or '') == 'provider_invoice_missing_or_elapsed_expiry':
+    if str(checkout.terminal_reason or '') in _NO_MONEY_TERMINAL_REASONS:
         # Тут код ЗНАЕТ ответ: счёт истёк неоплаченным. Отправлять владельца искать
         # несуществующий платёж — сочинять ему работу и сомнение на пустом месте.
+        # Список общий с клиентским вердиктом: два ответа про один заказ обязаны сходиться,
+        # иначе владелец возвращает деньги, о которых клиенту сказали «их не было».
         return '🟢 Деньги: клиент не оплатил, счёт истёк. Списания не было, возврат не нужен.'
     return '⚠️ Деньги: в базе списания не видно. Проверьте платёж в личном кабинете Platega.'
 
@@ -2628,8 +2677,9 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
         await _money_verdict(db, checkout),
     ]
     if checkout.lifecycle_state == 'operator_review':
-        # Формулировка «Оплату нужно проверить» взята слово в слово из кабинета и из
-        # клиентского экрана бота: одно состояние обязано звучать одинаково везде.
+        # 🔴 Строка ВЛАДЕЛЬЦУ, и с пункта 4.2б она намеренно НЕ совпадает с клиентской.
+        # У клиента теперь три разных экрана по факту денег; владельцу же нужен один вход
+        # в разбор, а точный ответ про деньги стоит строкой выше (`_money_verdict`).
         lines.append(f'⚠️ Оплату нужно проверить: {reason_ru or "причину видно только по коду"}.')
     else:
         # Настоящая ошибка панели лежит не в заказе, а в строке очереди выдачи. Без неё
@@ -2806,6 +2856,20 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
     return sent
 
 
+def _drop_frozen_money_state(response: dict[str, Any]) -> dict[str, Any]:
+    """Вердикт о деньгах не хранится в записи идемпотентности.
+
+    Повтор с тем же ключом отдаёт сохранённый ответ дословно. Замороженное «мы ничего не
+    списали» пережило бы приход денег — ровно тот отказ, ради которого вердикт и вынесли
+    на бэкенд. Без ключа фронт показывает нейтральный текст и ничего не утверждает.
+    """
+    cleaned = {key: value for key, value in response.items() if key != 'money_state'}
+    nested = cleaned.get('checkout')
+    if isinstance(nested, dict) and 'money_state' in nested:
+        cleaned['checkout'] = {key: value for key, value in nested.items() if key != 'money_state'}
+    return cleaned
+
+
 async def store_mutation_result(
     db: AsyncSession,
     mutation: DeviceFirstMutation,
@@ -2813,6 +2877,6 @@ async def store_mutation_result(
     response: dict[str, Any],
     status_code: int = 200,
 ) -> None:
-    mutation.response_json = response
+    mutation.response_json = _drop_frozen_money_state(response)
     mutation.status_code = status_code
     await db.commit()

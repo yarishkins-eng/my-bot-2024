@@ -22,6 +22,7 @@ from app.services.device_first_checkout_service import (
     build_purchase_options,
     cancel_checkout,
     cancel_checkout_for_new_calculation,
+    checkout_money_state,
     commit_direct_wallet_checkout,
     confirm_checkout,
     create_or_resume_direct_checkout,
@@ -1391,18 +1392,51 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
             ]
         )
     elif result['ui_state'] == 'operator_review':
-        # Этап 4.0 создал новый путь в это состояние с ДЕНЕЖНОГО пути, поэтому общий else
-        # ниже стал прямой ложью: он отрицает списание, которое произошло. Текст взят
-        # слово в слово из кабинета (cabinet-code, DeviceFirstConfigurator) — одно и то же
-        # состояние обязано звучать одинаково в боте и в мини-аппе.
-        # 🔴 Это МИНИМУМ, а не пункт 4.2: выход из состояния и уведомление владельца — там.
-        caption = _text(
-            user,
-            '⚠️ <b>Оплату нужно проверить</b>\n\nПлатёж получен. Он требует ручной проверки — '
-            'не оплачивайте повторно и не создавайте новый заказ, пока не ответит поддержка.',
-            '⚠️ <b>Payment needs review</b>\n\nPayment received. It requires a manual check — '
-            'do not pay again or create a new order until support replies.',
-        )
+        # Этап 4.0 завёл сюда ДЕНЕЖНЫЙ путь, но в это же состояние падает и брошенная
+        # корзина, где денег не было вовсе (мина F). Пункт 4.2б: спрашиваем бэкенд, брали
+        # ли деньги, и говорим правду — «Платёж получен» всем подряд активно мешало
+        # заплатить тем, кто как раз хотел.
+        # 🔴 Ни в одной ветке НЕ звать оформлять заказ заново: запрет живёт в коде
+        # (`operator_hold`, `device_first_checkout_service.py:631-646`), и триал закрыт
+        # тем же замком. Снимают его мина F и пункт 4.4, не этот экран.
+        money_state = await checkout_money_state(db, checkout)
+        if money_state == 'no_money':
+            # Не «счёт просрочен»: сюда же попадает оплата с баланса, где счёта нет вовсе.
+            # 🔴 Предупреждение про старую ссылку обязано остаться. Причина, по которой
+            # заказ здесь, ставится когда провайдер ещё считает счёт живым
+            # (`device_first_payment_service.py:696-703`), то есть ссылка может принять
+            # деньги. Возврат таких денег на баланс требует статуса `cancelled` (`:1946-1952`),
+            # а у нас `operator_review` — значит сумма ляжет кредитом сверки на ручной разбор.
+            caption = _text(
+                user,
+                '⚠️ <b>Оплата не прошла</b>\n\nМы ничего не списали. Если у вас осталась ссылка '
+                'на оплату — не платите по ней: заказ уже на разборе, и такой платёж придётся '
+                'разбирать вручную. Новый заказ пока не оформить. Напишите в поддержку.',
+                "⚠️ <b>Payment didn't go through</b>\n\nWe haven't charged you. If you still have "
+                'the payment link, do not use it: the order is already under review, and such a '
+                "payment would have to be sorted out by hand. You can't place a new order yet. "
+                'Contact support.',
+            )
+        elif money_state == 'money_in_flight':
+            # Слово в слово с кабинетом. «Платёж получен» здесь сказать нельзя: тем же
+            # путём проходит отозванный платёж, и деньги у клиента уже вернулись.
+            caption = _text(
+                user,
+                '⚠️ <b>Оплату нужно проверить</b>\n\nПлатёж требует ручной проверки. '
+                'Не оплачивайте и не создавайте новый заказ, пока не ответит поддержка.',
+                '⚠️ <b>Payment needs a check</b>\n\nThe payment needs manual review. '
+                'Do not pay or create another order until support replies.',
+            )
+        else:
+            # Про деньги не утверждаем ничего — ни списания, ни его отсутствия. Поэтому и
+            # «повторно» нельзя: это слово само по себе означает «первый платёж был».
+            caption = _text(
+                user,
+                '⚠️ <b>Заказ на разборе</b>\n\nМы проверяем его вручную. Платить по нему сейчас '
+                'не нужно, и новый заказ пока не оформить. Напишите в поддержку.',
+                '⚠️ <b>The order is under review</b>\n\nWe are checking it manually. '
+                "Do not pay for it now, and you can't place a new order yet. Contact support.",
+            )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1735,6 +1769,19 @@ def _safe_error_detail(user: User, error: DeviceFirstError | str) -> str:
             'Этот счёт уже закрыт. Выберите срок и устройства для нового заказа.',
             'This invoice is closed. Choose a period and devices for a new order.',
         ),
+        # Без этой строки отказ падал в общий запасной текст «попробуйте ещё раз или начните
+        # новый расчёт» — то есть звал ровно туда, откуда его только что отбили. Про деньги
+        # здесь не говорим ничего: код отказа их не знает, а экран заказа скажет точно.
+        # 🔴 Этот код бросают 12+ мест, и не все из них запирают клиента: часть — разовые
+        # несоответствия внутри одной операции (`settlement_mode`, довыдача продажи), после
+        # которых новый заказ оформить МОЖНО. Поэтому текст утверждает только то, что верно
+        # везде: эту операцию продолжить нельзя и нужен человек. Про деньги молчим — код
+        # отказа их не знает, а экран заказа скажет точно.
+        'operator_review_required': _text(
+            user,
+            'Заказ требует ручной проверки, поэтому продолжить сейчас не получится. Напишите в поддержку.',
+            'The order needs a manual check, so it cannot continue right now. Contact support.',
+        ),
     }
     return messages.get(
         error.code,
@@ -1766,7 +1813,12 @@ async def _render_error(callback: types.CallbackQuery, user: User, error: Device
                 ],
                 [_main_menu(user)],
             ]
-    elif isinstance(error, DeviceFirstError) and error.code == 'legacy_trial_reconciliation_required':
+    elif isinstance(error, DeviceFirstError) and error.code in {
+        'legacy_trial_reconciliation_required',
+        # Текст этого отказа посылает человека в поддержку — значит кнопка туда обязана
+        # быть. Без неё совет упирается в пустой экран с одной кнопкой «в меню».
+        'operator_review_required',
+    }:
         rows = [
             [
                 InlineKeyboardButton(
@@ -1847,7 +1899,16 @@ async def _render_fused_pay_error(
     if error.code in {'reprice_required', 'wallet_insufficient', 'invalid_selection'}:
         await _render_fused_refresh(callback, user, db, state, days=days, devices=devices, error=error)
         return
-    if error.code in {'funding_mode_locked', 'reconciliation_required', 'open_checkout_exists', 'invalid_state'}:
+    if error.code in {
+        'funding_mode_locked',
+        'reconciliation_required',
+        'open_checkout_exists',
+        'invalid_state',
+        # Заказ на разборе — тоже владелец экрана: там честный вердикт о деньгах, а в
+        # общем экране ошибки его нет. Кабинет так делает давно
+        # (`DeviceFirstConfigurator.tsx:344-347`), бот отставал.
+        'operator_review_required',
+    }:
         # A live or ambiguous provider invoice owns the screen: it offers the
         # explicit abandon action (late payment becomes one wallet credit) or
         # the canonical status check, never a silent supersede.  A
