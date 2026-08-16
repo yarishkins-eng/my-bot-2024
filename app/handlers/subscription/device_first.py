@@ -1390,6 +1390,30 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                 [_main_menu(user)],
             ]
         )
+    elif result['ui_state'] == 'operator_review':
+        # Этап 4.0 создал новый путь в это состояние с ДЕНЕЖНОГО пути, поэтому общий else
+        # ниже стал прямой ложью: он отрицает списание, которое произошло. Текст взят
+        # слово в слово из кабинета (cabinet-code, DeviceFirstConfigurator) — одно и то же
+        # состояние обязано звучать одинаково в боте и в мини-аппе.
+        # 🔴 Это МИНИМУМ, а не пункт 4.2: выход из состояния и уведомление владельца — там.
+        caption = _text(
+            user,
+            '⚠️ <b>Оплату нужно проверить</b>\n\nПлатёж получен. Он требует ручной проверки — '
+            'не оплачивайте повторно и не создавайте новый заказ, пока не ответит поддержка.',
+            '⚠️ <b>Payment needs review</b>\n\nPayment received. It requires a manual check — '
+            'do not pay again or create a new order until support replies.',
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=_text(user, 'Связаться с поддержкой', 'Contact support'),
+                        callback_data='menu_support',
+                    )
+                ],
+                [_main_menu(user)],
+            ]
+        )
     else:
         caption = _text(
             user,
