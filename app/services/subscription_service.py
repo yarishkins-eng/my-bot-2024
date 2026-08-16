@@ -469,10 +469,23 @@ class SubscriptionService:
                 return updated_user
 
         except RemnaWaveAPIError as e:
-            logger.error('Ошибка RemnaWave API', error=e)
+            # Единственный сигнал владельцу о недоехавшей оплате — без номера подписки
+            # его нельзя было связать ни с человеком, ни с заказом (хвост этапа 4.0).
+            logger.error(
+                'Ошибка RemnaWave API',
+                error=e,
+                subscription_id=subscription.id,
+                user_id=subscription.user_id,
+                remnawave_uuid=subscription.remnawave_uuid,
+            )
             return None
         except Exception as e:
-            logger.error('Ошибка создания RemnaWave пользователя', error=e)
+            logger.error(
+                'Ошибка создания RemnaWave пользователя',
+                error=e,
+                subscription_id=subscription.id,
+                user_id=subscription.user_id,
+            )
             return None
 
     async def _create_or_update_remnawave_user_multi(
@@ -846,10 +859,21 @@ class SubscriptionService:
                 return updated_user
 
         except RemnaWaveAPIError as e:
-            logger.error('Ошибка RemnaWave API', error=e)
+            logger.error(
+                'Ошибка RemnaWave API',
+                error=e,
+                subscription_id=subscription.id,
+                user_id=subscription.user_id,
+                remnawave_uuid=subscription.remnawave_uuid,
+            )
             return None
         except Exception as e:
-            logger.error('Ошибка обновления RemnaWave пользователя', error=e)
+            logger.error(
+                'Ошибка обновления RemnaWave пользователя',
+                error=e,
+                subscription_id=subscription.id,
+                user_id=subscription.user_id,
+            )
             return None
 
     async def push_panel_state(
