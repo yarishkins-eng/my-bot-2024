@@ -28,43 +28,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Classify exact Gate 2 control-only merge
-        id: gate2_control
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [ '${{ github.event_name }}' != 'push' ]; then
-            echo 'control_only=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          readonly BASE='${{ github.event.before }}'
-          readonly TARGET='${{ github.sha }}'
-          git cat-file -e "${BASE}^{commit}"
-          git cat-file -e "${TARGET}^{commit}"
-          mapfile -t changed < <(git diff --name-only "$BASE" "$TARGET")
-          test "${#changed[@]}" -gt 0
-          control_only=true
-          for path in "${changed[@]}"; do
-            case "$path" in
-              .github/workflows/deploy.yml|\
-              .github/workflows/entitlement-shadow-one-shot.yml|\
-              .github/workflows/entitlement-shadow-one-shot-ci.yml|\
-              .github/scripts/entitlement-shadow-one-shot-control.sh|\
-              .github/scripts/entitlement_shadow_one_shot.py|\
-              .github/scripts/entitlement_shadow_readonly_probe.py|\
-              .github/scripts/entitlement_shadow_create_schema.py|\
-              .github/scripts/test-entitlement-shadow-one-shot-e2e.sh|\
-              tests/workflows/test_entitlement_shadow_one_shot.py|\
-              docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-design.md|\
-              docs/entitlement_authority/gate2-shadow-one-shot-prerequisite-release-card.md)
-                ;;
-              *) control_only=false ;;
-            esac
-          done
-          echo "control_only=$control_only" >> "$GITHUB_OUTPUT"
-
       - name: Deploy the exact non-migration revision and wait for health
-        if: steps.gate2_control.outputs.control_only != 'true'
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
