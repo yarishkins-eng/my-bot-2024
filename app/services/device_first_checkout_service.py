@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 
 import structlog
-from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2412,6 +2412,10 @@ def owner_alert_candidate_query(*, since: datetime, limit: int):
         .where(
             # ЗАМОК 1 — архивная когорта требует удалённого пользователя.
             User.account_erased_at.is_(None),
+            # И не рассказываем владельцу про человека, который уже попросил себя удалить:
+            # его заказ загоняет в `operator_review` отдельный забор, а PII на этот момент
+            # ещё не вычищено — карточка с именем и ссылкой ушла бы в админ-чат.
+            User.account_erasure_requested_at.is_(None),
             # ЗАМОК 2 — окно свежести; архивные заказы старше его на две недели.
             SubscriptionCheckout.updated_at >= since,
             or_(SubscriptionCheckout.lifecycle_state == 'operator_review', stuck_provisioning),
@@ -2445,6 +2449,8 @@ async def queue_owner_order_stuck_alerts(db: AsyncSession, *, limit: int = 20) -
     у пяти архивных заказов строки нет, значит и не помешает.
     """
     if not _owner_alerts_enabled():
+        # Без этой строки выключенные уведомления выглядели бы как «застрявших заказов нет».
+        logger.warning('device_first_owner_alerts_disabled')
         return 0
     since = datetime.now(UTC) - OWNER_ALERT_LOOKBACK
     checkout_ids = list((await db.execute(owner_alert_candidate_query(since=since, limit=limit))).scalars().all())
@@ -2484,24 +2490,17 @@ async def revive_stale_notifications(db: AsyncSession) -> tuple[int, int]:
     сообщать владельцу о заказе шестичасовой давности уже поздно.
     """
     now = datetime.now(UTC)
-    doomed = list(
-        (
-            await db.execute(
-                select(DeviceFirstNotificationOutbox.checkout_id).where(
-                    DeviceFirstNotificationOutbox.status == 'failed',
-                    DeviceFirstNotificationOutbox.created_at <= now - NOTIFICATION_MAX_AGE,
-                )
-            )
-        )
-        .scalars()
-        .all()
+    # `sending` попадает в этот свип, но НЕ в оживление: строка, брошенная крахом между
+    # «взял» и «отправил», иначе оставалась бы невидимой вечно. Возраст 6 часов на порядки
+    # больше десятиминутной аренды, так что живую отправку свип не задевает.
+    hopeless = and_(
+        DeviceFirstNotificationOutbox.status.in_(('failed', 'sending')),
+        DeviceFirstNotificationOutbox.created_at <= now - NOTIFICATION_MAX_AGE,
     )
+    doomed = list((await db.execute(select(DeviceFirstNotificationOutbox.checkout_id).where(hopeless))).scalars().all())
     dead = await db.execute(
         update(DeviceFirstNotificationOutbox)
-        .where(
-            DeviceFirstNotificationOutbox.status == 'failed',
-            DeviceFirstNotificationOutbox.created_at <= now - NOTIFICATION_MAX_AGE,
-        )
+        .where(hopeless)
         .values(status='dead', lease_token=None, lease_expires_at=None)
     )
     revived = await db.execute(
@@ -2565,18 +2564,32 @@ async def _money_verdict(db: AsyncSession, checkout: SubscriptionCheckout) -> st
         if checkout.debit_transaction_id is not None:
             return '🔴 Деньги: списаны с баланса клиента.'
         return '🟢 Деньги: с баланса не списаны, остались у клиента.'
-    credited_status = await db.scalar(
-        select(CheckoutPaymentAttempt.status)
-        .where(
+    # 🔴 Попыток у заказа может быть несколько, и `credited_amount_kopeks > 0` ставится
+    # при ТРЁХ разных статусах: `credited` (деньги уже на балансе клиента),
+    # `operator_review` (удержаны как кредит сверки, на баланс НЕ попали), `paid_processing`.
+    # Выбирать «какую-нибудь» попытку нельзя: вердикт стал бы невоспроизводимым, а это
+    # ровно те две ошибки, от которых функция и защищает. Поэтому спрашиваем фактами.
+    money_on_balance = await db.scalar(
+        select(func.count(CheckoutPaymentAttempt.id)).where(
+            CheckoutPaymentAttempt.checkout_id == checkout.id,
+            CheckoutPaymentAttempt.credited_amount_kopeks > 0,
+            CheckoutPaymentAttempt.status == 'credited',
+        )
+    )
+    if money_on_balance:
+        return '🟡 Деньги: оплата прошла и уже лежит на балансе клиента. Возврат не нужен.'
+    money_at_provider = await db.scalar(
+        select(func.count(CheckoutPaymentAttempt.id)).where(
             CheckoutPaymentAttempt.checkout_id == checkout.id,
             CheckoutPaymentAttempt.credited_amount_kopeks > 0,
         )
-        .limit(1)
     )
-    if credited_status == 'credited':
-        return '🟡 Деньги: оплата прошла и уже лежит на балансе клиента. Возврат не нужен.'
-    if checkout.debit_transaction_id is not None or credited_status is not None:
+    if checkout.debit_transaction_id is not None or money_at_provider:
         return '🔴 Деньги: клиент оплатил через платёжную систему. С баланса не списывали.'
+    if str(checkout.terminal_reason or '') == 'provider_invoice_missing_or_elapsed_expiry':
+        # Тут код ЗНАЕТ ответ: счёт истёк неоплаченным. Отправлять владельца искать
+        # несуществующий платёж — сочинять ему работу и сомнение на пустом месте.
+        return '🟢 Деньги: клиент не оплатил, счёт истёк. Списания не было, возврат не нужен.'
     return '⚠️ Деньги: в базе списания не видно. Проверьте платёж в личном кабинете Platega.'
 
 
@@ -2595,7 +2608,12 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
     lines = ['🔴 <b>ЗАКАЗ ЗАВИС</b>', '']
     if user is not None:
         name = html.escape(user.full_name or f'клиент {checkout.user_id}')
-        lines.append(f'👤 <a href="tg://user?id={user.telegram_id}">{name}</a> (<code>{user.telegram_id}</code>)')
+        # `telegram_id` намеренно nullable (email-only пользователи). Подставить сюда None —
+        # значит получить отказ Telegram на всё сообщение и потерять тревогу целиком.
+        if user.telegram_id:
+            lines.append(f'👤 <a href="tg://user?id={user.telegram_id}">{name}</a> (<code>{user.telegram_id}</code>)')
+        else:
+            lines.append(f'👤 {name} (id {checkout.user_id}, телеграма нет)')
         if user.username:
             lines.append(f'📱 @{html.escape(user.username)}')
     else:
@@ -2614,14 +2632,32 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
         # клиентского экрана бота: одно состояние обязано звучать одинаково везде.
         lines.append(f'⚠️ Оплату нужно проверить: {reason_ru or "причину видно только по коду"}.')
     else:
-        lines.append(f'⚠️ Выдача {provisioning_ru}. Бот продолжает пробовать сам.')
-    lines.append('📵 VPN клиенту не выдан.')
-    if checkout.lifecycle_state == 'operator_review' and settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE:
+        # Настоящая ошибка панели лежит не в заказе, а в строке очереди выдачи. Без неё
+        # владелец видел «выдача застряла» вообще без причины.
+        stuck_error = await db.scalar(
+            select(DeviceFirstOutbox.last_error)
+            .where(DeviceFirstOutbox.checkout_id == checkout.id, DeviceFirstOutbox.status == 'retry')
+            .order_by(DeviceFirstOutbox.id.desc())
+            .limit(1)
+        )
+        cause = _TERMINAL_REASON_RU.get(str(stuck_error or ''), str(stuck_error or '')) if stuck_error else ''
+        lines.append(
+            f'⚠️ Выдача {provisioning_ru}{f": {html.escape(cause)}" if cause else ""}. Бот продолжает пробовать сам.'
+        )
+    if str(checkout.provisioning_state) != 'ready':
+        # При chargeback подписка уже выдана и работает — безусловная строка была бы ложью.
+        lines.append('📵 VPN клиенту не выдан.')
+    # Блокировка нового заказа шире, чем `operator_review`: заказ, застрявший на выдаче,
+    # держит клиента через `direct_provisioning_recovery` ровно так же.
+    blocked = checkout.lifecycle_state == 'operator_review' or str(checkout.provisioning_state) in {'pending', 'retry'}
+    if blocked and str(getattr(checkout, 'settlement_mode', '')) == DIRECT_SETTLEMENT_MODE:
         lines.append('🚫 Новый заказ он оформить не может, пока висит этот.')
     lines += [
         '',
         'Кнопки для разбора в боте пока нет. Напишите клиенту сами. Возврат делается '
-        'в Platega, подписку выдаём руками в карточке пользователя.',
+        'в Platega, подписку выдаём руками <b>в кабинете</b>: пользователь → «Создать подписку».',
+        '⛔ В чат-админке этого не делать: выдача там заглушена, а кнопка «Обнулить подписку» '
+        'оставляет подписку без серверов и намертво запирает смену серверов тарифа.',
         '',
         f'Заказ: <code>{html.escape(str(checkout.public_id))}</code>',
         f'Состояние: <code>{html.escape(str(checkout.lifecycle_state))}</code> / '
@@ -2632,9 +2668,16 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
     return '\n'.join(lines)
 
 
+# 🔴 НЕ заменять на `TERMINAL_STATES` (`:44`) и не сводить с набором из `crud/tariff.py:32`
+# при исполнении «мины C». Здесь смысл другой: это «заказ больше не требует владельца».
+# `operator_review` терминален для заказа, но для тревоги — наоборот, единственный повод её
+# послать. Добавите его сюда — тревоги перестанут уходить совсем, молча.
+_OWNER_ALERT_RESOLVED_STATES = frozenset({'ready', 'cancelled', 'expired'})
+
+
 def _owner_alert_is_obsolete(checkout: SubscriptionCheckout) -> bool:
     """Заказ успел доехать сам, пока строка ждала отправки — тревогу слать уже нельзя."""
-    return checkout.lifecycle_state in {'ready', 'cancelled', 'expired'}
+    return checkout.lifecycle_state in _OWNER_ALERT_RESOLVED_STATES
 
 
 async def _send_owner_order_stuck_alert(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> bool:
@@ -2710,7 +2753,17 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
         row = await db.get(DeviceFirstNotificationOutbox, row_id)
         if row is None:
             continue
-        checkout = await db.get(SubscriptionCheckout, row.checkout_id)
+        # 🔴 Не `db.get`: сессия общая с циклом мониторинга, `expire_on_commit=False`, и заказ
+        # почти наверняка уже лежит в её памяти с полями получасовой давности. Тревога тогда
+        # решала бы «доехал или нет» по протухшей копии — и владелец вернул бы деньги за
+        # выданную подписку. Перечитываем из базы принудительно, как это делает erasure-сервис.
+        checkout = (
+            await db.execute(
+                select(SubscriptionCheckout)
+                .where(SubscriptionCheckout.id == row.checkout_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
         error: str | None = None
         obsolete = False
         try:

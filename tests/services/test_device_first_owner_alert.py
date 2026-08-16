@@ -53,12 +53,21 @@ def test_candidate_query_skips_already_queued_checkouts():
 
 def test_candidate_query_takes_only_stuck_orders():
     sql = _compiled_candidate_sql()
-    assert 'operator_review' in str(
+    literal = str(
         owner_alert_candidate_query(since=datetime(2026, 8, 16, tzinfo=UTC), limit=1).compile(
             compile_kwargs={'literal_binds': True}
         )
     )
+    assert 'operator_review' in literal
     assert 'device_first_outbox' in sql
+    # 🔴 Две причины тревоги соединены ИЛИ. Заменить на И — значит молча выключить весь
+    # пункт 4.3 для основного случая (заказ в operator_review вообще без строки выдачи).
+    assert ' OR ' in literal.split('WHERE', 1)[1]
+
+
+def test_candidate_query_skips_users_who_asked_to_be_deleted():
+    """Человеку, подавшему заявку на удаление, PII в админ-чат уходить не должно."""
+    assert 'users.account_erasure_requested_at is null' in _compiled_candidate_sql().lower()
 
 
 def test_lookback_window_cannot_reach_the_archived_cohort():
@@ -244,25 +253,26 @@ def _checkout():
 
 def _worker_db(rows, *, checkout, user):
     db = MagicMock()
-    db.execute = AsyncMock(return_value=_Result(rows))
+    # Порядок запросов воркера: захват строк → на каждую строку заказ (принудительным
+    # перечитыванием, не из памяти сессии) → перечитывание самой строки под аренду.
+    results: list[_Result] = [_Result(rows)]
+    for row in rows:
+        results.append(_Result([checkout] if checkout is not None else []))
+        results.append(_Result([row]))
+    db.execute = AsyncMock(side_effect=results)
     db.commit = AsyncMock()
     db.rollback = AsyncMock()
     db.add = MagicMock()
     db.scalar = AsyncMock(return_value=0)
 
     async def _get(model, key):
-        if model.__name__ == 'SubscriptionCheckout':
-            return checkout
         if model.__name__ == 'User':
             return user
-        return rows[0] if rows else None
-
-    async def _get_row(model, key):
         if model.__name__ == 'DeviceFirstNotificationOutbox':
             return next((row for row in rows if row.id == key), None)
-        return await _get(model, key)
+        return None
 
-    db.get = AsyncMock(side_effect=_get_row)
+    db.get = AsyncMock(side_effect=_get)
     return db
 
 
@@ -413,7 +423,19 @@ async def test_money_already_on_client_balance_is_not_refunded_twice():
 async def test_no_visible_debit_sends_the_owner_to_the_provider():
     checkout = _checkout()
     checkout.funding_mode = 'platega'
+    checkout.terminal_reason = 'provider_invoice_verification_mismatch'
     assert 'Platega' in await service_module._money_verdict(_money_db(), checkout)
+
+
+@pytest.mark.asyncio
+async def test_expired_unpaid_invoice_does_not_send_the_owner_hunting():
+    """Подтверждено Platega по заказу 32: «Платёж не завершён», возврат недоступен."""
+    checkout = _checkout()
+    checkout.funding_mode = 'platega'
+    checkout.terminal_reason = 'provider_invoice_missing_or_elapsed_expiry'
+    verdict = await service_module._money_verdict(_money_db(), checkout)
+    assert 'не оплатил' in verdict
+    assert 'Platega' not in verdict
 
 
 # --- разметка и данные клиента ---------------------------------------------------------
@@ -436,6 +458,40 @@ async def test_machine_codes_are_translated_for_the_owner():
     assert 'Оплату нужно проверить' in text
     assert 'счёт у платёжной системы просрочен или не найден' in text
     assert 'Кнопки для разбора в боте пока нет' in text
+
+
+@pytest.mark.asyncio
+async def test_owner_is_sent_to_the_cabinet_and_warned_off_the_chat_admin():
+    """Выдача в чат-админке заглушена, а соседняя «Обнулить подписку» — это мина A."""
+    text = await service_module._owner_order_stuck_text(_money_db(), _checkout())
+    assert 'в кабинете' in text
+    assert 'Обнулить подписку' in text
+
+
+@pytest.mark.asyncio
+async def test_money_verdict_actually_reaches_the_message():
+    """Вердикт можно было выкинуть из текста, и ни один тест этого не замечал."""
+    checkout = _checkout()
+    checkout.funding_mode = 'wallet'
+    checkout.debit_transaction_id = 77
+    text = await service_module._owner_order_stuck_text(_money_db(), checkout)
+    assert await service_module._money_verdict(_money_db(), checkout) in text
+
+
+@pytest.mark.asyncio
+async def test_client_without_telegram_does_not_break_the_alert():
+    """`telegram_id` nullable: подстановка None отбивается Telegram и теряет тревогу целиком."""
+    user = SimpleNamespace(id=186, telegram_id=None, username=None, full_name='Почтовый клиент')
+    text = await service_module._owner_order_stuck_text(_money_db(user=user), _checkout())
+    assert 'tg://user?id=None' not in text
+    assert 'телеграма нет' in text
+
+
+def test_operator_review_is_never_treated_as_a_resolved_order():
+    """🔴 Сторож под мину C: свести этот набор с `TERMINAL_STATES` — значит убить тревоги."""
+    assert 'operator_review' not in service_module._OWNER_ALERT_RESOLVED_STATES
+    assert service_module._owner_alert_is_obsolete(SimpleNamespace(lifecycle_state='operator_review')) is False
+    assert service_module._owner_alert_is_obsolete(SimpleNamespace(lifecycle_state='ready')) is True
 
 
 @pytest.mark.asyncio
