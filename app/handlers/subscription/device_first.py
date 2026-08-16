@@ -1402,12 +1402,19 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
         money_state = await checkout_money_state(db, checkout)
         if money_state == 'no_money':
             # Не «счёт просрочен»: сюда же попадает оплата с баланса, где счёта нет вовсе.
+            # 🔴 Предупреждение про старую ссылку обязано остаться. Причина, по которой
+            # заказ здесь, ставится когда провайдер ещё считает счёт живым
+            # (`device_first_payment_service.py:696-703`), то есть ссылка может принять
+            # деньги. Возврат таких денег на баланс требует статуса `cancelled` (`:1946-1952`),
+            # а у нас `operator_review` — значит сумма ляжет кредитом сверки на ручной разбор.
             caption = _text(
                 user,
-                '⚠️ <b>Оплата не прошла</b>\n\nМы ничего не списали. Заказ пока у нас на разборе, '
-                'и новый оформить не получится, пока разбор идёт. Напишите в поддержку.',
-                "⚠️ <b>Payment didn't go through</b>\n\nWe haven't charged you. The order is still "
-                "with us for review, and you can't place a new one until that is done. "
+                '⚠️ <b>Оплата не прошла</b>\n\nМы ничего не списали. Если у вас осталась ссылка '
+                'на оплату — не платите по ней: заказ уже на разборе, и такой платёж придётся '
+                'разбирать вручную. Новый заказ пока не оформить. Напишите в поддержку.',
+                "⚠️ <b>Payment didn't go through</b>\n\nWe haven't charged you. If you still have "
+                'the payment link, do not use it: the order is already under review, and such a '
+                "payment would have to be sorted out by hand. You can't place a new order yet. "
                 'Contact support.',
             )
         elif money_state == 'money_in_flight':
@@ -1765,11 +1772,15 @@ def _safe_error_detail(user: User, error: DeviceFirstError | str) -> str:
         # Без этой строки отказ падал в общий запасной текст «попробуйте ещё раз или начните
         # новый расчёт» — то есть звал ровно туда, откуда его только что отбили. Про деньги
         # здесь не говорим ничего: код отказа их не знает, а экран заказа скажет точно.
+        # 🔴 Этот код бросают 12+ мест, и не все из них запирают клиента: часть — разовые
+        # несоответствия внутри одной операции (`settlement_mode`, довыдача продажи), после
+        # которых новый заказ оформить МОЖНО. Поэтому текст утверждает только то, что верно
+        # везде: эту операцию продолжить нельзя и нужен человек. Про деньги молчим — код
+        # отказа их не знает, а экран заказа скажет точно.
         'operator_review_required': _text(
             user,
-            'Предыдущий заказ пока у нас на разборе. Новый не оформить, пока разбор идёт — напишите в поддержку.',
-            "Your previous order is still with us for review. You can't place a new one until "
-            'that is done — contact support.',
+            'Заказ требует ручной проверки, поэтому продолжить сейчас не получится. Напишите в поддержку.',
+            'The order needs a manual check, so it cannot continue right now. Contact support.',
         ),
     }
     return messages.get(

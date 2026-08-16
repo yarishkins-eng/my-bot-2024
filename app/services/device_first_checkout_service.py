@@ -2856,6 +2856,20 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
     return sent
 
 
+def _drop_frozen_money_state(response: dict[str, Any]) -> dict[str, Any]:
+    """Вердикт о деньгах не хранится в записи идемпотентности.
+
+    Повтор с тем же ключом отдаёт сохранённый ответ дословно. Замороженное «мы ничего не
+    списали» пережило бы приход денег — ровно тот отказ, ради которого вердикт и вынесли
+    на бэкенд. Без ключа фронт показывает нейтральный текст и ничего не утверждает.
+    """
+    cleaned = {key: value for key, value in response.items() if key != 'money_state'}
+    nested = cleaned.get('checkout')
+    if isinstance(nested, dict) and 'money_state' in nested:
+        cleaned['checkout'] = {key: value for key, value in nested.items() if key != 'money_state'}
+    return cleaned
+
+
 async def store_mutation_result(
     db: AsyncSession,
     mutation: DeviceFirstMutation,
@@ -2863,6 +2877,6 @@ async def store_mutation_result(
     response: dict[str, Any],
     status_code: int = 200,
 ) -> None:
-    mutation.response_json = response
+    mutation.response_json = _drop_frozen_money_state(response)
     mutation.status_code = status_code
     await db.commit()

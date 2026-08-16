@@ -126,6 +126,43 @@ async def test_every_no_money_reason_is_actually_classified():
         assert await checkout_money_state(_db(), _checkout(terminal_reason=reason)) == 'no_money'
 
 
+@pytest.mark.asyncio
+async def test_the_money_question_actually_asks_about_this_checkout():
+    """🔴 Сторож формы SQL: сам запрос не исполняется ни одним тестом — все подменяют базу.
+
+    Мутационный прогон показал, что можно убрать условие `credited_amount_kopeks > 0` или
+    сверять `checkout_id` с `user_id` — и все тесты останутся зелёными, а классификатор
+    начнёт считать деньгами чужие и проваленные попытки. Поэтому проверяем сам текст
+    запроса, как это уже делает сторож тревоги владельцу.
+    """
+    db = MagicMock()
+    db.scalar = AsyncMock(return_value=0)
+    await checkout_money_state(db, _checkout())
+
+    sql = str(db.scalar.await_args[0][0].compile(compile_kwargs={'literal_binds': False})).lower()
+    assert 'checkout_payment_attempts.checkout_id' in sql
+    assert 'checkout_payment_attempts.credited_amount_kopeks >' in sql
+    assert 'user_id' not in sql
+
+
+def test_the_no_money_set_stays_a_single_proven_reason():
+    """Сторож от тихого расширения набора.
+
+    Он общий с вердиктом владельцу, а тест согласия перебирает этот же набор — то есть
+    новая причина проходит оба и молча начинает печатать владельцу «возврат не нужен».
+    Расширять набор можно только опровергнув по коду, что на причине могут висеть деньги.
+    """
+    assert set(service_module._NO_MONEY_TERMINAL_REASONS) == {'provider_invoice_missing_or_elapsed_expiry'}
+
+
+@pytest.mark.asyncio
+async def test_missing_funding_mode_falls_to_the_provider_branch():
+    """Колонка nullable. `None` обязан идти по провайдерской ветке — она спрашивает факты."""
+    checkout = _checkout(funding_mode=None, terminal_reason='direct_payment_binding_mismatch')
+    assert await checkout_money_state(_db(credited_attempts=1), checkout) == 'money_in_flight'
+    assert await checkout_money_state(_db(), checkout) == 'unknown'
+
+
 # --- сторож: клиент и владелец обязаны видеть про заказ одно и то же -------------------
 
 
@@ -153,9 +190,12 @@ async def test_money_state_agrees_with_owner_verdict():
     ]
     for checkout, credited in cases:
         state = await checkout_money_state(_db(credited_attempts=credited), checkout)
-        # `_money_verdict` спрашивает базу дважды и первым вопросом отделяет «уже на балансе».
+        # 🔴 `_money_verdict` спрашивает базу ДВАЖДЫ: сначала «лежит ли уже на балансе»
+        # (статус `credited`), потом «есть ли вообще зачисление». Один мок на оба вопроса
+        # всегда даёт первый ответ, и ветка «оплатил через платёжную систему» — та самая,
+        # где деньги у НАС, — не проверялась бы никогда. Отвечаем по очереди.
         verdict_db = MagicMock()
-        verdict_db.scalar = AsyncMock(return_value=credited)
+        verdict_db.scalar = AsyncMock(side_effect=[0, credited])
         verdict = await service_module._money_verdict(verdict_db, checkout)
         claims_money = '🔴' in verdict or '🟡' in verdict
         claims_no_money = '🟢' in verdict
@@ -175,11 +215,11 @@ async def test_money_state_agrees_with_owner_verdict():
 # --- экран заказа в боте ---------------------------------------------------------------
 
 
-async def _screen(money_state: str):
+async def _screen(money_state: str, language: str = 'ru'):
     from app.handlers.subscription.device_first import _render_checkout
 
     callback = SimpleNamespace()
-    user = SimpleNamespace(id=196, language='ru', balance_kopeks=0)
+    user = SimpleNamespace(id=196, language=language, balance_kopeks=0)
     with (
         patch(
             'app.handlers.subscription.device_first.serialize_checkout',
@@ -204,7 +244,22 @@ async def test_unpaid_customer_is_not_told_that_the_payment_arrived():
     assert 'Платёж получен' not in caption
     assert 'Мы ничего не списали' in caption
     # Не «счёт просрочен»: сюда же приходит оплата с баланса, где счёта нет вовсе.
-    assert 'счёт' not in caption.lower()
+    assert 'просрочен' not in caption.lower()
+
+
+@pytest.mark.asyncio
+async def test_unpaid_customer_is_still_warned_off_the_old_payment_link():
+    """🔴 Убрав ложь «платёж получен», нельзя убрать вместе с ней и это предупреждение.
+
+    Причина `provider_invoice_missing_or_elapsed_expiry` ставится, когда провайдер ещё
+    считает счёт живым, — ссылка может принять деньги. А возврат таких денег на баланс
+    требует статуса `cancelled` (`device_first_payment_service.py:1946-1952`), которого
+    здесь нет: сумма ляжет кредитом сверки на ручной разбор.
+    """
+    caption, _ = await _screen('no_money')
+    assert 'не платите по ней' in caption.lower()
+    # И при этом не обещаем зачисления на баланс — для этого состояния это неправда.
+    assert 'баланс' not in caption.lower()
 
 
 @pytest.mark.asyncio
@@ -222,6 +277,22 @@ async def test_unknown_money_state_claims_nothing_in_either_direction():
     assert 'не списали' not in caption
     # «Повторно» само по себе утверждает, что первый платёж был.
     assert 'повторно' not in caption.lower()
+    # Положительная половина: молчать про деньги — не значит бросить человека без выхода.
+    assert 'напишите в поддержку' in caption.lower()
+
+
+@pytest.mark.asyncio
+async def test_the_english_half_is_honest_too():
+    """Мутация подменила английский `no_money` на старую ложь — и весь набор остался зелёным:
+    экранные тесты были жёстко на русском, хотя бот отвечает на двух языках."""
+    unpaid, _ = await _screen('no_money', language='en')
+    assert 'Payment received' not in unpaid
+    assert "haven't charged you" in unpaid
+    assert 'do not use it' in unpaid.lower()
+
+    unknown, _ = await _screen('unknown', language='en')
+    assert 'Payment received' not in unknown
+    assert 'contact support' in unknown.lower()
 
 
 @pytest.mark.asyncio
@@ -258,6 +329,25 @@ async def test_cabinet_pays_nothing_for_the_field_on_other_screens():
     assert 'money_state' not in await _cabinet_payload('awaiting_payment')
 
 
+@pytest.mark.asyncio
+async def test_money_verdict_is_never_frozen_into_an_idempotency_replay():
+    """Повтор с тем же ключом отдаёт сохранённый ответ дословно — вердикт туда не кладём.
+
+    Иначе «мы ничего не списали» переживёт приход денег: ровно тот отказ, ради которого
+    вердикт и вынесли на бэкенд.
+    """
+    db = MagicMock()
+    db.commit = AsyncMock()
+    mutation = SimpleNamespace(response_json=None, status_code=None)
+    await service_module.store_mutation_result(
+        db,
+        mutation,
+        response={'checkout': {'ui_state': 'operator_review', 'money_state': 'no_money'}},
+    )
+    assert 'money_state' not in mutation.response_json['checkout']
+    assert mutation.response_json['checkout']['ui_state'] == 'operator_review'
+
+
 # --- отказ в момент, когда человек пытается заплатить ----------------------------------
 
 
@@ -270,7 +360,46 @@ def test_operator_review_refusal_no_longer_invites_a_retry():
     message = _safe_error_detail(user, DeviceFirstError('operator_review_required', 'x'))
     assert 'Попробуйте ещё раз' not in message
     assert 'новый расчёт' not in message
-    assert 'на разборе' in message
+    assert 'ручной проверки' in message
+    assert 'поддержку' in message
+    # 🔴 Код бросают и там, где клиент НЕ заперт: утверждать «новый заказ не оформить» нельзя.
+    assert 'не оформить' not in message
+
+
+@pytest.mark.asyncio
+async def test_refused_payment_lands_on_the_honest_order_screen_not_a_flat_error():
+    """Главное поведение правки, и мутация показала, что его не держал ни один тест.
+
+    Нажав «Оплатить» при зависшем заказе, человек обязан попасть на экран с вердиктом о
+    деньгах, а не на плоскую ошибку без него. Кабинет так делает давно.
+    """
+    from app.handlers.subscription.device_first import _render_fused_pay_error
+    from app.services.device_first_checkout_service import DeviceFirstError
+
+    callback = SimpleNamespace(data='df:pf:30:2', answer=AsyncMock())
+    user = SimpleNamespace(id=196, language='ru', balance_kopeks=0)
+    checkout = _checkout()
+    with (
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=checkout),
+        ),
+        patch('app.handlers.subscription.device_first._render_checkout', AsyncMock()) as render,
+        patch('app.handlers.subscription.device_first._render_error', AsyncMock()) as flat_error,
+    ):
+        await _render_fused_pay_error(
+            callback,
+            user,
+            AsyncMock(),
+            AsyncMock(),
+            DeviceFirstError('operator_review_required', 'x'),
+            days=30,
+            devices=2,
+        )
+
+    assert render.await_count == 1, 'отказ ушёл мимо честного экрана заказа'
+    assert render.await_args[0][3] is checkout
+    assert flat_error.await_count == 0
 
 
 @pytest.mark.asyncio

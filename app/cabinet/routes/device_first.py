@@ -219,7 +219,10 @@ async def _serialize_cabinet_checkout(
     # пункта 4.2б он утверждал списание всем подряд. Вердикт считает бэкенд по фактам:
     # ветка «по `terminal_reason`» на фронте при поздней оплате сказала бы «денег не было»,
     # когда деньги есть. Ключа может не быть (старый бэкенд) — фронт обязан это пережить.
-    if payload.get('ui_state') == 'operator_review' and callable(getattr(db, 'scalar', None)):
+    # 🔴 Без защитного `callable(getattr(db, 'scalar'))`: у настоящей сессии `scalar` есть
+    # всегда, а такое условие молча выключило бы честный вердикт на любой будущей обёртке
+    # сессии — и ни один тест бы не покраснел.
+    if payload.get('ui_state') == 'operator_review':
         payload['money_state'] = await checkout_money_state(db, checkout)
     return payload
 
