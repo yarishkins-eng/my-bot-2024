@@ -2722,6 +2722,8 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
         await queue_owner_order_stuck_alerts(db, limit=limit)
         await revive_stale_notifications(db)
     except Exception as error:
+        # Здесь rollback обязателен, в отличие от тихого прохода: после исключения сессия
+        # отравлена, и без него следующий же запрос упал бы с PendingRollbackError.
         await db.rollback()
         logger.error('device_first_owner_alert_pass_failed', error=type(error).__name__)
     rows = list(
