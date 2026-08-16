@@ -2122,13 +2122,25 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
         checkout = await db.get(SubscriptionCheckout, row.checkout_id)
         subscription = await db.get(Subscription, row.payload_json['subscription_id'])
         try:
-            ok, error = await SubscriptionService().ensure_subscription_synced(db, subscription)
+            # Выдача обязана дойти до панели даже когда ссылка и UUID уже есть: у пришедших
+            # с триала они есть всегда, и без форса панель не получала ни срок, ни устройства.
+            ok, error = await SubscriptionService().ensure_subscription_synced(
+                db,
+                subscription,
+                force_panel_sync=True,
+            )
             row.status = 'done' if ok else 'retry'
             row.last_error = error
             row.available_at = datetime.now(UTC) + timedelta(minutes=min(60, 2**row.attempts))
             checkout.provisioning_state = 'ready' if ok else 'retry'
             if ok:
                 checkout.lifecycle_state = 'ready'
+            elif error == 'no_entitlements_to_provision':
+                # Повтор не поможет: выдавать нечего. Нужен оператор, а не круг повторов.
+                row.status = 'failed'
+                checkout.lifecycle_state = 'operator_review'
+                checkout.terminal_reason = error
+                _event('operator_review', checkout, reason=error)
             if ok and bot is not None:
                 user = await db.get(User, checkout.user_id)
                 if user and user.telegram_id:
@@ -2270,7 +2282,13 @@ async def _process_direct_provisioning_outbox(
                     subscription=subscription,
                 )
                 if access_point_delivered is None:
-                    ok, sync_error = await SubscriptionService().ensure_subscription_synced(db, subscription)
+                    # Форс обязателен: без него подписка с уже существующими ссылкой и UUID
+                    # объявляется готовой, не получив в панели ни нового срока, ни устройств.
+                    ok, sync_error = await SubscriptionService().ensure_subscription_synced(
+                        db,
+                        subscription,
+                        force_panel_sync=True,
+                    )
                 elif access_point_delivered:
                     ok, sync_error = True, None
                 else:
@@ -2324,6 +2342,13 @@ async def _process_direct_provisioning_outbox(
             if notification is None:
                 db.add(DeviceFirstNotificationOutbox(checkout_id=checkout.id, notification_type='ready'))
             processed += 1
+        elif sync_error == 'no_entitlements_to_provision':
+            # Повтор не поможет: выдавать нечего. Нужен оператор, а не круг повторов.
+            current.status = 'failed'
+            checkout.provisioning_state = 'retry'
+            checkout.lifecycle_state = 'operator_review'
+            checkout.terminal_reason = sync_error
+            _event('operator_review', checkout, reason=sync_error)
         else:
             current.status = 'retry'
             current.available_at = datetime.now(UTC) + timedelta(minutes=min(60, 2**current.attempts))
