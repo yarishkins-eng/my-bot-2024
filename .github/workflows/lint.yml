@@ -1,7 +1,8 @@
 name: Lint
 
 on:
-  # release.yml calls this workflow as a reusable job for tagged releases.
+  # deploy.yml, deploy-migration.yml, deploy-infrastructure.yml and
+  # recover-after-migration.yml call this workflow as a reusable job.
   workflow_call:
   pull_request:
     branches: ['**']
