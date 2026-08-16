@@ -2137,7 +2137,9 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
                 checkout.lifecycle_state = 'ready'
             elif error == 'no_entitlements_to_provision':
                 # Повтор не поможет: выдавать нечего. Нужен оператор, а не круг повторов.
-                row.status = 'failed'
+                # Статус строки — как в post-paid reversal (payment/platega.py): выборки
+                # воркера берут только pending/retry/processing, значит очередь встала.
+                row.status = 'operator_review'
                 checkout.lifecycle_state = 'operator_review'
                 checkout.terminal_reason = error
                 _event('operator_review', checkout, reason=error)
@@ -2344,7 +2346,8 @@ async def _process_direct_provisioning_outbox(
             processed += 1
         elif sync_error == 'no_entitlements_to_provision':
             # Повтор не поможет: выдавать нечего. Нужен оператор, а не круг повторов.
-            current.status = 'failed'
+            # Статус строки — как в post-paid reversal (payment/platega.py:138).
+            current.status = 'operator_review'
             checkout.provisioning_state = 'retry'
             checkout.lifecycle_state = 'operator_review'
             checkout.terminal_reason = sync_error

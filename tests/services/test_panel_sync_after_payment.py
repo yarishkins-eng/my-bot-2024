@@ -305,7 +305,7 @@ async def test_order_without_servers_goes_to_operator_instead_of_endless_retry()
         processed = await process_direct_provisioning_outbox(db, checkout_id=checkout.id, limit=1)
 
     assert processed == 0
-    assert claimed.status == 'failed'
+    assert claimed.status == 'operator_review'  # тот же словарь, что в post-paid reversal
     assert checkout.lifecycle_state == 'operator_review'
     assert checkout.terminal_reason == 'no_entitlements_to_provision'
     db.add.assert_not_called()
