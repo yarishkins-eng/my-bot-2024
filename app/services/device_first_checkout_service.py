@@ -2553,6 +2553,44 @@ _PROVISIONING_RU = {
 }
 _POST_PAID_REVERSAL_PREFIX = 'post_paid_provider_terminal'
 
+# Причины, при которых счёт заведомо не был оплачен: он либо не выставлен вовсе, либо
+# просрочен пустым. Список — ЗАПАСНОЙ вопрос, а не первый: он спрашивается только после
+# того, как факты о деньгах в базе ответили «ничего не приходило». Обратный порядок дал бы
+# «денег не было» при поздней оплате — она деньги приносит, а `terminal_reason` заказа
+# оставляет прежним.
+_NO_MONEY_TERMINAL_REASONS = frozenset(
+    {
+        'provider_invoice_missing_or_elapsed_expiry',
+        'provider_invoice_creation_incomplete',
+        'provider_response_missing_safe_redirect',
+        'tariff_missing_after_quote',
+    }
+)
+
+
+async def checkout_money_state(db: AsyncSession, checkout: SubscriptionCheckout) -> str:
+    """Брали ли с клиента деньги: `no_money` | `money_in_flight` | `unknown`.
+
+    Этим полем ветвятся клиентские экраны бота и кабинета, поэтому вопрос ровно один и
+    ответ грубый. Владельцу нужен подробный разбор — он в `_money_verdict` ниже, и оба
+    ответа обязаны сходиться: сторож `test_money_state_agrees_with_owner_verdict`.
+    """
+    if checkout.funding_mode == 'wallet':
+        # Оплата с баланса не создаёт `CheckoutPaymentAttempt` вовсе, поэтому единственный
+        # признак денег здесь — само списание.
+        return 'money_in_flight' if checkout.debit_transaction_id is not None else 'no_money'
+    credited_attempts = await db.scalar(
+        select(func.count(CheckoutPaymentAttempt.id)).where(
+            CheckoutPaymentAttempt.checkout_id == checkout.id,
+            CheckoutPaymentAttempt.credited_amount_kopeks > 0,
+        )
+    )
+    if credited_attempts or checkout.debit_transaction_id is not None:
+        return 'money_in_flight'
+    if str(checkout.terminal_reason or '') in _NO_MONEY_TERMINAL_REASONS:
+        return 'no_money'
+    return 'unknown'
+
 
 async def _money_verdict(db: AsyncSession, checkout: SubscriptionCheckout) -> str:
     """Что владельцу делать с деньгами. Цена ошибки здесь — двойной возврат либо отказ в нём."""
@@ -2586,10 +2624,12 @@ async def _money_verdict(db: AsyncSession, checkout: SubscriptionCheckout) -> st
     )
     if checkout.debit_transaction_id is not None or money_at_provider:
         return '🔴 Деньги: клиент оплатил через платёжную систему. С баланса не списывали.'
-    if str(checkout.terminal_reason or '') == 'provider_invoice_missing_or_elapsed_expiry':
-        # Тут код ЗНАЕТ ответ: счёт истёк неоплаченным. Отправлять владельца искать
-        # несуществующий платёж — сочинять ему работу и сомнение на пустом месте.
-        return '🟢 Деньги: клиент не оплатил, счёт истёк. Списания не было, возврат не нужен.'
+    if str(checkout.terminal_reason or '') in _NO_MONEY_TERMINAL_REASONS:
+        # Тут код ЗНАЕТ ответ: счёт либо не выставлен, либо истёк неоплаченным. Отправлять
+        # владельца искать несуществующий платёж — сочинять ему работу и сомнение на пустом
+        # месте. Список общий с клиентским вердиктом: два ответа про один заказ обязаны
+        # сходиться, иначе владелец возвращает деньги, о которых клиенту сказали «их не было».
+        return '🟢 Деньги: клиент не оплатил этот счёт. Списания не было, возврат не нужен.'
     return '⚠️ Деньги: в базе списания не видно. Проверьте платёж в личном кабинете Platega.'
 
 

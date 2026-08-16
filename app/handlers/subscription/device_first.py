@@ -22,6 +22,7 @@ from app.services.device_first_checkout_service import (
     build_purchase_options,
     cancel_checkout,
     cancel_checkout_for_new_calculation,
+    checkout_money_state,
     commit_direct_wallet_checkout,
     confirm_checkout,
     create_or_resume_direct_checkout,
@@ -1391,18 +1392,40 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
             ]
         )
     elif result['ui_state'] == 'operator_review':
-        # Этап 4.0 создал новый путь в это состояние с ДЕНЕЖНОГО пути, поэтому общий else
-        # ниже стал прямой ложью: он отрицает списание, которое произошло. Текст взят
-        # слово в слово из кабинета (cabinet-code, DeviceFirstConfigurator) — одно и то же
-        # состояние обязано звучать одинаково в боте и в мини-аппе.
-        # 🔴 Это МИНИМУМ, а не пункт 4.2: выход из состояния и уведомление владельца — там.
-        caption = _text(
-            user,
-            '⚠️ <b>Оплату нужно проверить</b>\n\nПлатёж получен. Он требует ручной проверки — '
-            'не оплачивайте повторно и не создавайте новый заказ, пока не ответит поддержка.',
-            '⚠️ <b>Payment needs review</b>\n\nPayment received. It requires a manual check — '
-            'do not pay again or create a new order until support replies.',
-        )
+        # Этап 4.0 завёл сюда ДЕНЕЖНЫЙ путь, но в это же состояние падает и брошенная
+        # корзина, где денег не было вовсе (мина F). Пункт 4.2б: спрашиваем бэкенд, брали
+        # ли деньги, и говорим правду — «Платёж получен» всем подряд активно мешало
+        # заплатить тем, кто как раз хотел.
+        # 🔴 Ни в одной ветке НЕ звать оформлять заказ заново: запрет живёт в коде
+        # (`operator_hold`, `device_first_checkout_service.py:631-646`), и триал закрыт
+        # тем же замком. Снимают его мина F и пункт 4.4, не этот экран.
+        money_state = await checkout_money_state(db, checkout)
+        if money_state == 'no_money':
+            caption = _text(
+                user,
+                '⚠️ <b>Счёт на оплату просрочен</b>\n\nДеньги не списаны — оплата не прошла. '
+                'Заказ ещё проверяется, и пока проверка идёт, оформить новый нельзя. '
+                'Напишите в поддержку, чтобы её ускорить.',
+                '⚠️ <b>The invoice has expired</b>\n\nNo money was taken — the payment did not go '
+                'through. The order is still being checked, and a new one cannot be created while '
+                'it is. Write to support to speed that up.',
+            )
+        elif money_state == 'money_in_flight':
+            caption = _text(
+                user,
+                '⚠️ <b>Оплату нужно проверить</b>\n\nПлатёж получен. Он требует ручной проверки — '
+                'не оплачивайте повторно и не создавайте новый заказ, пока не ответит поддержка.',
+                '⚠️ <b>Payment needs review</b>\n\nPayment received. It requires a manual check — '
+                'do not pay again or create a new order until support replies.',
+            )
+        else:
+            caption = _text(
+                user,
+                '⚠️ <b>Заказ на проверке</b>\n\nМы проверяем его вручную. Повторно оплачивать не '
+                'нужно и новый заказ пока создать нельзя — напишите в поддержку, и мы разберёмся.',
+                '⚠️ <b>The order is under review</b>\n\nWe are checking it by hand. Do not pay again, '
+                'and a new order cannot be created yet — write to support and we will sort it out.',
+            )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1734,6 +1757,16 @@ def _safe_error_detail(user: User, error: DeviceFirstError | str) -> str:
             user,
             'Этот счёт уже закрыт. Выберите срок и устройства для нового заказа.',
             'This invoice is closed. Choose a period and devices for a new order.',
+        ),
+        # Без этой строки отказ падал в общий запасной текст «попробуйте ещё раз или начните
+        # новый расчёт» — то есть звал ровно туда, откуда его только что отбили. Про деньги
+        # здесь не говорим ничего: код отказа их не знает, а экран заказа скажет точно.
+        'operator_review_required': _text(
+            user,
+            'Предыдущий заказ ещё проверяется — пока проверка не закончится, новый создать нельзя. '
+            'Напишите в поддержку, чтобы её ускорить.',
+            'Your previous order is still being checked — a new one cannot be created until that '
+            'finishes. Write to support to speed it up.',
         ),
     }
     return messages.get(

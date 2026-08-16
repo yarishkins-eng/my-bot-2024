@@ -30,6 +30,7 @@ from app.services.device_first_checkout_service import (
     build_purchase_options,
     cancel_checkout,
     cancel_checkout_for_new_calculation,
+    checkout_money_state,
     commit_direct_wallet_checkout,
     confirm_checkout,
     create_checkout,
@@ -214,6 +215,12 @@ async def _serialize_cabinet_checkout(
             payload['provider_invoice_expires_at'] = (
                 invoice_expires_at.isoformat() if invoice_expires_at is not None else None
             )
+    # Экран разбора — единственное место, где мини-апп обязан говорить про деньги, и до
+    # пункта 4.2б он утверждал списание всем подряд. Вердикт считает бэкенд по фактам:
+    # ветка «по `terminal_reason`» на фронте при поздней оплате сказала бы «денег не было»,
+    # когда деньги есть. Ключа может не быть (старый бэкенд) — фронт обязан это пережить.
+    if payload.get('ui_state') == 'operator_review' and callable(getattr(db, 'scalar', None)):
+        payload['money_state'] = await checkout_money_state(db, checkout)
     return payload
 
 
