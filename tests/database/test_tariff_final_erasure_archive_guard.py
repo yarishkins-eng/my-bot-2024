@@ -241,3 +241,92 @@ async def test_archive_for_another_tariff_never_receives_the_pinned_exception(mo
                 await tariff_crud._assert_tariff_squad_change_has_no_live_checkout(db, SimpleNamespace(id=4))
     finally:
         engine.dispose()
+
+
+# --- мина C, безопасная часть: тупиковые заказы больше не запирают тариф -----------------
+
+
+def _insert_plain_checkout(connection, *, checkout_id: int, tariff_id: int, lifecycle_state: str) -> None:
+    """Заказ без платёжной попытки — проверяется ровно первая ветвь забора."""
+    connection.execute(
+        text(
+            'INSERT INTO subscription_checkouts (id, tariff_id, lifecycle_state) '
+            f"VALUES ({checkout_id}, {tariff_id}, '{lifecycle_state}')"
+        )
+    )
+
+
+def _fence_on_plain_checkout(lifecycle_state: str):
+    engine = create_engine('sqlite:///:memory:')
+    with engine.begin() as connection:
+        _create_schema(connection)
+        _insert_plain_checkout(connection, checkout_id=40, tariff_id=3, lifecycle_state=lifecycle_state)
+    return engine
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lifecycle_state', ('conflict', 'reprice_required', 'failed'))
+async def test_dead_end_states_no_longer_lock_the_tariff(lifecycle_state: str) -> None:
+    """Мина C. Из этих состояний заказ не оживает и выдан быть не может.
+
+    Поиск живого заказа клиента их не выбирает (`device_first_checkout_service.py:389-406`),
+    а все входы в выдачу требуют `confirmed` / `awaiting_funds` / `fulfilling`. Значит
+    захваченный набор серверов защищать не от чего, а раньше один такой заказ запирал
+    смену серверов тарифа навсегда.
+    """
+    engine = _fence_on_plain_checkout(lifecycle_state)
+    try:
+        with sessionmaker(engine)() as sync_db:
+            await tariff_crud._assert_tariff_squad_change_has_no_live_checkout(
+                _async_db(sync_db), SimpleNamespace(id=3)
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_operator_review_still_locks_the_tariff() -> None:
+    """🔴 СТОРОЖ. Не добавлять `operator_review` в `_CHECKOUT_TERMINAL_STATES`.
+
+    Доска этапа просила свести набор с `TERMINAL_STATES`, но ревью показало, что для
+    `operator_review` это дыра, и он оставлен под забором намеренно:
+      1) он оживает штатно — воркер сверки адресно берёт попытки в `operator_review` с
+         причиной `provider_invoice_missing_or_elapsed_expiry`
+         (`device_first_payment_service.py:2138-2144`) и возвращает их в `pending`/`awaiting_funds`;
+      2) на нём часто висят деньги: поздняя оплата ставит `attempt.status='operator_review'`
+         вместе с `payment.is_paid=True` (`:2002-2020`), а этот статус не входит в
+         `_DIRECT_PROVIDER_ATTEMPT_OPEN_STATES` — вторая ветвь забора его не ловит;
+      3) сверка снимка прав с текущим тарифом включается только при
+         `provenance == 'access_point_policy'` (`device_first_checkout_service.py:1730`),
+         а такого режима нет ни у одного тарифа.
+    То есть для оплаченного неразобранного заказа этот забор — единственная защита.
+    Размыкать такие заказы должен пункт 4.4, а не расширение набора.
+    """
+    engine = _fence_on_plain_checkout('operator_review')
+    try:
+        with sessionmaker(engine)() as sync_db:
+            with pytest.raises(ValueError, match='live checkout or Platega invoice'):
+                await tariff_crud._assert_tariff_squad_change_has_no_live_checkout(
+                    _async_db(sync_db), SimpleNamespace(id=3)
+                )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lifecycle_state', ('draft', 'confirmed', 'awaiting_funds', 'armed', 'fulfilling'))
+async def test_open_states_still_lock_the_tariff(lifecycle_state: str) -> None:
+    """Сторож против дальнейшего расширения: живой заказ по-прежнему держит забор.
+
+    Любое из этих состояний в терминальном наборе означало бы смену серверов под клиентом,
+    который уже видит цену и вот-вот заплатит.
+    """
+    engine = _fence_on_plain_checkout(lifecycle_state)
+    try:
+        with sessionmaker(engine)() as sync_db:
+            with pytest.raises(ValueError, match='live checkout or Platega invoice'):
+                await tariff_crud._assert_tariff_squad_change_has_no_live_checkout(
+                    _async_db(sync_db), SimpleNamespace(id=3)
+                )
+    finally:
+        engine.dispose()
