@@ -77,8 +77,14 @@ def find_panel_echo_mismatch(sent: dict, panel_user: RemnaWaveUser) -> str | Non
     Returns:
         Имя разошедшегося поля либо None, если всё отправленное подтверждено.
     """
-    # Условия — как на проводе: api.update_user кладёт поле по truthiness, а не по наличию
-    # ключа (remnawave_api.py:782-783). Иначе потребуем подтверждения того, что не отправляли.
+    # Условия — как на проводе: expire_at уходит по truthiness (remnawave_api.py:782-783),
+    # остальные по `is not None` (:788, :794). Иначе потребуем подтверждения неотправленного.
+    #
+    # status первым: это единственное поле, от которого зависит, работает ли VPN вообще.
+    # Срок, устройства и серверы могут совпасть все три, а профиль стоять DISABLED.
+    if sent.get('status') is not None and getattr(panel_user, 'status', None) != sent['status']:
+        return 'status'
+
     if sent.get('expire_at'):
         expected_expire = sent['expire_at']
         actual_expire = getattr(panel_user, 'expire_at', None)
@@ -782,9 +788,21 @@ class SubscriptionService:
                 # объект, либо бросил исключение. Превращать сверку в запрет — только после
                 # того, как логи с боевого покажут, что ложных срабатываний нет.
                 if verify_panel_echo:
-                    mismatched_field = find_panel_echo_mismatch(update_kwargs, updated_user)
+                    # try/except обязателен: PATCH уже прошёл, а ссылка ещё не записана
+                    # (:813 ниже). Исключение отсюда потеряло бы свежий subscription_url и
+                    # ушло бы в общий except как отказ синхронизации — то есть диагностика
+                    # сама стала бы причиной вечного повтора. Формы данных не гарантированы:
+                    # connected_squads — свободная JSON-колонка (models.py:2471).
+                    try:
+                        mismatched_field = find_panel_echo_mismatch(update_kwargs, updated_user)
+                    except Exception as echo_error:
+                        mismatched_field = None
+                        logger.warning('Сверку ответа панели выполнить не удалось', echo_error=echo_error)
                     if mismatched_field is not None:
-                        logger.error(
+                        # warning, а не error: error уходит в чат владельцу (logging_handler.py),
+                        # а поле activeInternalSquads в PATCH-ответе непроверено — ложные
+                        # срабатывания забили бы дедуп и заглушили настоящие сигналы.
+                        logger.warning(
                             'Панель не подтвердила отправленное поле',
                             subscription_id=subscription.id,
                             remnawave_uuid=remnawave_uuid,
@@ -1228,10 +1246,12 @@ class SubscriptionService:
                 )
                 created_new_profile = result is not None
 
-            # POST может проигнорировать activeInternalSquads — в проекте это известно и
-            # лечится добивочным PATCH (purchase.py:3412, miniapp.py:7914,
-            # daily_subscription_service.py:282). Без него «Подписка готова» на пути выдачи
-            # означала бы профиль без единого сервера: клиент платит и получает пустой конфиг.
+            # Добивочный PATCH после создания профиля. Честно о причине: api.create_user
+            # сквады отправляет (remnawave_api.py:609-610), так что это подстраховка, а не
+            # лечение доказанного дефекта панели — та же подстраховка стоит в трёх местах
+            # проекта (purchase.py:3412, miniapp.py:7914, daily_subscription_service.py:282).
+            # Второй, не менее важный смысл: путь создания профиля иначе НЕ проверяется
+            # сверкой вовсе — create_remnawave_user зовёт панель мимо update_remnawave_user.
             if created_new_profile and force_panel_sync and subscription.connected_squads:
                 patched = await self.update_remnawave_user(
                     db,

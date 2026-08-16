@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.external.remnawave_api import UserStatus
 from app.services import subscription_service as subscription_service_module
 from app.services.device_first_checkout_service import (
     process_direct_provisioning_outbox,
@@ -197,6 +198,14 @@ async def test_subscription_without_servers_is_diagnosed_not_retried(monkeypatch
 
 
 # --- сверка эха панели: только фактически отправленные поля ----------------------------
+
+
+def test_echo_check_catches_a_profile_the_panel_left_disabled():
+    """Срок, устройства и серверы могут совпасть все три, а VPN не работать."""
+    sent = {'status': UserStatus.ACTIVE}
+    panel_user = SimpleNamespace(status=UserStatus.DISABLED)
+
+    assert find_panel_echo_mismatch(sent, panel_user) == 'status'
 
 
 def test_echo_check_ignores_fields_that_were_never_sent():
