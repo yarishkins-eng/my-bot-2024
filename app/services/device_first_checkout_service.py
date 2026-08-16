@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 
 import structlog
-from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +46,19 @@ TERMINAL_STATES = {'ready', 'cancelled', 'expired', 'failed', 'reprice_required'
 LEGACY_SETTLEMENT_MODE = 'legacy_deposit'
 DIRECT_SETTLEMENT_MODE = 'direct_purchase_v2'
 KOPEKS_PER_RUBLE = 100
+READY_NOTIFICATION_TYPE = 'ready'
+OWNER_ALERT_NOTIFICATION_TYPE = 'order_stuck'
+# Окно свежести для строки владельцу. Оно же — второй замок от смертельной ловушки:
+# пять архивных заказов тарифа 3 не обновлялись с 03.08.2026, в окно они не попадают.
+OWNER_ALERT_LOOKBACK = timedelta(hours=24)
+# Сколько раз выдача должна отлежаться в повторе, прежде чем это перестанет быть
+# «панель моргнула» и станет «оплата не доехала». Повторы при этом НЕ прекращаются.
+OWNER_ALERT_STUCK_PROVISION_ATTEMPTS = 5
+# Повтор уведомлений (пункт 4.8). Колонок attempts/available_at у этой таблицы нет,
+# заводить их нельзя (app/database → exit 14 → ручной воркфлоу), поэтому паузу между
+# попытками держим по updated_at, а число попыток не храним вовсе.
+NOTIFICATION_RETRY_AFTER = timedelta(minutes=10)
+NOTIFICATION_MAX_AGE = timedelta(hours=6)
 logger = structlog.get_logger(__name__)
 
 
@@ -2337,12 +2351,17 @@ async def _process_direct_provisioning_outbox(
                 await db.execute(
                     select(DeviceFirstNotificationOutbox).where(
                         DeviceFirstNotificationOutbox.checkout_id == checkout.id,
-                        DeviceFirstNotificationOutbox.notification_type == 'ready',
+                        DeviceFirstNotificationOutbox.notification_type == READY_NOTIFICATION_TYPE,
                     )
                 )
             ).scalar_one_or_none()
             if notification is None:
-                db.add(DeviceFirstNotificationOutbox(checkout_id=checkout.id, notification_type='ready'))
+                db.add(
+                    DeviceFirstNotificationOutbox(
+                        checkout_id=checkout.id,
+                        notification_type=READY_NOTIFICATION_TYPE,
+                    )
+                )
             processed += 1
         elif sync_error == 'no_entitlements_to_provision':
             # Повтор не поможет: выдавать нечего. Нужен оператор, а не круг повторов.
@@ -2360,10 +2379,187 @@ async def _process_direct_provisioning_outbox(
     return processed
 
 
+def _owner_alerts_enabled() -> bool:
+    """Владелец получает строки, только если админ-чат вообще настроен."""
+    return bool(getattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', False)) and bool(
+        getattr(settings, 'ADMIN_NOTIFICATIONS_CHAT_ID', None)
+    )
+
+
+def owner_alert_candidate_query(*, since: datetime, limit: int):
+    """Заказы, о которых владелец ещё не знает. Оба замка живут здесь — и только здесь."""
+    already_queued = exists(
+        select(DeviceFirstNotificationOutbox.id).where(
+            DeviceFirstNotificationOutbox.checkout_id == SubscriptionCheckout.id,
+            DeviceFirstNotificationOutbox.notification_type == OWNER_ALERT_NOTIFICATION_TYPE,
+        )
+    )
+    # Выдача, застрявшая в повторе, деньгами уже забрана, но заказ ещё не терминален:
+    # для владельца это тот же случай «оплата не доехала».
+    stuck_provisioning = exists(
+        select(DeviceFirstOutbox.id).where(
+            DeviceFirstOutbox.checkout_id == SubscriptionCheckout.id,
+            DeviceFirstOutbox.status == 'retry',
+            DeviceFirstOutbox.attempts >= OWNER_ALERT_STUCK_PROVISION_ATTEMPTS,
+        )
+    )
+    return (
+        select(SubscriptionCheckout.id)
+        .join(User, User.id == SubscriptionCheckout.user_id)
+        .where(
+            # ЗАМОК 1 — архивная когорта требует удалённого пользователя.
+            User.account_erased_at.is_(None),
+            # ЗАМОК 2 — окно свежести; архивные заказы старше его на две недели.
+            SubscriptionCheckout.updated_at >= since,
+            or_(SubscriptionCheckout.lifecycle_state == 'operator_review', stuck_provisioning),
+            # ЗАМОК 3 — та же уникальность, что защищает от повторной отправки.
+            ~already_queued,
+        )
+        .order_by(SubscriptionCheckout.id)
+        .limit(limit)
+    )
+
+
+async def queue_owner_order_stuck_alerts(db: AsyncSession, *, limit: int = 20) -> int:
+    """Поставить владельцу по одной строке на каждый свежезастрявший заказ.
+
+    🔴 **Никакого backfill.** Строка аутбокса уведомлений по любому из пяти архивных
+    заказов тарифа 3 навсегда запретила бы менять его серверы: когорта отбирается
+    условием «у заказа НЕТ строки в этом аутбоксе» (``crud/tariff.py:106-110``), а её
+    отпечаток сверяется точно (``:290-296``). Отсюда два независимых замка, каждый из
+    которых сам по себе достаточен:
+
+    1. ``User.account_erased_at IS NULL`` — когорта требует **удалённого** пользователя
+       (``crud/tariff.py:168-171``); все пять заказов принадлежат удалённым 170 и 173;
+    2. окно ``OWNER_ALERT_LOOKBACK`` по ``updated_at`` — те пять не менялись с 03.08.2026.
+
+    Третий, уже существующий: уникальность ``(checkout_id, notification_type)``.
+    """
+    if not _owner_alerts_enabled():
+        return 0
+    since = datetime.now(UTC) - OWNER_ALERT_LOOKBACK
+    checkout_ids = list((await db.execute(owner_alert_candidate_query(since=since, limit=limit))).scalars().all())
+    queued = 0
+    for checkout_id in checkout_ids:
+        db.add(
+            DeviceFirstNotificationOutbox(
+                checkout_id=checkout_id,
+                notification_type=OWNER_ALERT_NOTIFICATION_TYPE,
+            )
+        )
+        try:
+            await db.commit()
+        except IntegrityError:
+            # Второй воркер успел раньше: строка на этот заказ уже есть.
+            await db.rollback()
+            continue
+        queued += 1
+    return queued
+
+
+async def revive_stale_notifications(db: AsyncSession) -> tuple[int, int]:
+    """Пункт 4.8: строка ``failed`` больше не мертва навсегда.
+
+    Воркер берёт только ``pending`` (``:2371``), а неудачная отправка ставила ``failed`` —
+    строка не повторялась никогда и нигде не была видна. Возвращаем её в ``pending`` через
+    паузу и уводим в терминальный ``dead``, когда повторять уже поздно.
+    ``sending`` не трогаем: это намеренная защита «не отправить дважды».
+    """
+    now = datetime.now(UTC)
+    dead = await db.execute(
+        update(DeviceFirstNotificationOutbox)
+        .where(
+            DeviceFirstNotificationOutbox.status == 'failed',
+            DeviceFirstNotificationOutbox.created_at <= now - NOTIFICATION_MAX_AGE,
+        )
+        .values(status='dead', lease_token=None, lease_expires_at=None)
+    )
+    revived = await db.execute(
+        update(DeviceFirstNotificationOutbox)
+        .where(
+            DeviceFirstNotificationOutbox.status == 'failed',
+            DeviceFirstNotificationOutbox.updated_at <= now - NOTIFICATION_RETRY_AFTER,
+        )
+        .values(status='pending', lease_token=None, lease_expires_at=None)
+    )
+    dead_count = int(dead.rowcount or 0)
+    revived_count = int(revived.rowcount or 0)
+    if dead_count or revived_count:
+        await db.commit()
+    else:
+        await db.rollback()
+    if dead_count:
+        logger.error('device_first_notification_gave_up', rows=dead_count)
+    return revived_count, dead_count
+
+
+async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionCheckout) -> str:
+    """Одно сообщение владельцу: кто, за что, сколько и списаны ли деньги."""
+    user = await db.get(User, checkout.user_id)
+    snapshot = checkout.sale_snapshot if isinstance(checkout.sale_snapshot, dict) else {}
+    tariff_name = str(snapshot.get('tariff_name') or f'тариф {checkout.tariff_id}')
+    who = user.full_name if user is not None else f'пользователь {checkout.user_id}'
+    contact = f'@{user.username}' if user is not None and user.username else f'tg {getattr(user, "telegram_id", "?")}'
+    credited = await db.scalar(
+        select(func.count(CheckoutPaymentAttempt.id)).where(
+            CheckoutPaymentAttempt.checkout_id == checkout.id,
+            CheckoutPaymentAttempt.credited_amount_kopeks > 0,
+        )
+    )
+    if checkout.debit_transaction_id is not None:
+        money = '🔴 деньги списаны с баланса'
+    elif credited:
+        money = '🔴 оплата у провайдера прошла'
+    elif checkout.funding_mode == 'wallet':
+        money = '🟢 списания с баланса нет'
+    else:
+        money = '⚠️ списания не видно — сверьте счёт у провайдера'
+    lines = [
+        '🔴 <b>Заказ завис — нужен разбор</b>',
+        '',
+        f'Клиент: {html.escape(str(who))} ({html.escape(contact)}), id {checkout.user_id}',
+        f'Заказ: <code>{html.escape(str(checkout.public_id))}</code>',
+        f'Что покупал: {html.escape(tariff_name)}, {checkout.period_days} дн., {checkout.selected_device_limit} устр.',
+        f'Сумма: {(checkout.tariff_total_kopeks or 0) / KOPEKS_PER_RUBLE:.0f} ₽',
+        f'Деньги: {money}',
+        f'Состояние: {html.escape(str(checkout.lifecycle_state))} / '
+        f'выдача {html.escape(str(checkout.provisioning_state))}',
+        f'Причина: {html.escape(str(checkout.terminal_reason or "выдача застряла в повторе"))}',
+    ]
+    if checkout.lifecycle_state == 'operator_review':
+        lines += ['', '⚠️ Пока заказ висит, клиент не может оформить новый.']
+    return '\n'.join(lines)
+
+
+async def _send_owner_order_stuck_alert(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
+    from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
+
+    service = AdminNotificationService(bot)
+    if not service.is_enabled:
+        raise RuntimeError('admin_notifications_disabled')
+    text = await _owner_order_stuck_text(db, checkout)
+    if not await service.send_admin_notification(text, category=NotificationCategory.ERRORS):
+        raise RuntimeError('admin_notification_not_delivered')
+
+
+async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
+    user = await db.get(User, checkout.user_id)
+    if user is None or not user.telegram_id:
+        raise RuntimeError('telegram_recipient_unavailable')
+    text = (
+        '✅ Your VPN subscription is ready. Open the cabinet to connect.'
+        if user.language == 'en'
+        else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
+    )
+    await bot.send_message(user.telegram_id, text)
+
+
 async def process_device_first_notification_outbox(db: AsyncSession, *, bot, limit: int = 20) -> int:
     """Send at most once: a crash after handing off to Telegram stays ``sending``."""
     if bot is None:
         return 0
+    await queue_owner_order_stuck_alerts(db, limit=limit)
+    await revive_stale_notifications(db)
     rows = list(
         (
             await db.execute(
@@ -2394,17 +2590,16 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
         if row is None:
             continue
         checkout = await db.get(SubscriptionCheckout, row.checkout_id)
-        user = await db.get(User, checkout.user_id) if checkout else None
         error: str | None = None
         try:
-            if user is None or not user.telegram_id:
-                raise RuntimeError('telegram_recipient_unavailable')
-            text = (
-                '✅ Your VPN subscription is ready. Open the cabinet to connect.'
-                if user.language == 'en'
-                else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
-            )
-            await bot.send_message(user.telegram_id, text)
+            if checkout is None:
+                raise RuntimeError('checkout_unavailable')
+            # 🔴 Развилка по типу обязательна: без неё строка для владельца уходит
+            # клиентским текстом «✅ Подписка готова» — про сорванный заказ.
+            if row.notification_type == OWNER_ALERT_NOTIFICATION_TYPE:
+                await _send_owner_order_stuck_alert(db, bot=bot, checkout=checkout)
+            else:
+                await _send_client_ready_message(db, bot=bot, checkout=checkout)
         except Exception as exc:  # do not retry an uncertain external send
             error = type(exc).__name__
         current = (
