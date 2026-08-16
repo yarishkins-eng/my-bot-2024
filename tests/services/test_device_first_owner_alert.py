@@ -133,47 +133,76 @@ class _Update:
         self.rowcount = rowcount
 
 
-@pytest.mark.asyncio
-async def test_failed_notification_is_returned_to_pending():
+def _revive_db(dead_rows, revived_rows, *, doomed=()):
     db = MagicMock()
-    db.execute = AsyncMock(side_effect=[_Update(0), _Update(2)])
+    db.execute = AsyncMock(side_effect=[_Result(list(doomed)), _Update(dead_rows), _Update(revived_rows)])
     db.commit = AsyncMock()
     db.rollback = AsyncMock()
-    revived, dead = await revive_stale_notifications(db)
-    assert (revived, dead) == (2, 0)
+    return db
+
+
+def _revive_statements(db):
+    """Скомпилированный SQL обоих UPDATE — так проверяется их WHERE, а не только результат."""
+    from sqlalchemy.dialects import postgresql
+
+    out = []
+    for call in db.execute.await_args_list[1:]:
+        out.append(str(call.args[0].compile(dialect=postgresql.dialect(), compile_kwargs={'literal_binds': True})))
+    return out
+
+
+@pytest.mark.asyncio
+async def test_failed_owner_alert_is_returned_to_pending():
+    db = _revive_db(0, 2)
+    assert await revive_stale_notifications(db) == (2, 0)
     db.commit.assert_awaited()
-    statements = [str(call.args[0]) for call in db.execute.await_args_list]
-    assert any("status='dead'" in s or 'SET status=' in s for s in statements)
 
 
 @pytest.mark.asyncio
 async def test_hopeless_notification_stops_instead_of_looping_forever():
-    db = MagicMock()
-    db.execute = AsyncMock(side_effect=[_Update(1), _Update(0)])
-    db.commit = AsyncMock()
-    db.rollback = AsyncMock()
-    revived, dead = await revive_stale_notifications(db)
-    assert (revived, dead) == (0, 1)
+    db = _revive_db(1, 0, doomed=[32])
+    assert await revive_stale_notifications(db) == (0, 1)
 
 
 @pytest.mark.asyncio
-async def test_quiet_pass_does_not_commit():
-    db = MagicMock()
-    db.execute = AsyncMock(side_effect=[_Update(0), _Update(0)])
-    db.commit = AsyncMock()
-    db.rollback = AsyncMock()
+async def test_quiet_pass_still_closes_the_shared_transaction():
+    """Сессия общая с циклом мониторинга: `rollback` на тихом проходе съел бы чужую работу."""
+    db = _revive_db(0, 0)
     assert await revive_stale_notifications(db) == (0, 0)
-    db.commit.assert_not_awaited()
+    db.commit.assert_awaited()
+    db.rollback.assert_not_awaited()
 
 
-def test_dead_transition_runs_before_revive():
-    """Иначе строка, которой пора умереть, вечно возвращалась бы в `pending`."""
-    source = service_module.revive_stale_notifications.__doc__ or ''
-    assert 'dead' in source
-    import inspect
+@pytest.mark.asyncio
+async def test_client_ready_message_is_never_retried():
+    """Для клиента `failed` означает НЕИЗВЕСТНЫЙ исход: Telegram мог сообщение принять."""
+    db = _revive_db(0, 0)
+    await revive_stale_notifications(db)
+    _dead_sql, revive_sql = _revive_statements(db)
+    assert "notification_type = 'order_stuck'" in revive_sql
+    assert "status = 'failed'" in revive_sql
 
-    body = inspect.getsource(service_module.revive_stale_notifications)
-    assert body.index("status='dead'") < body.index("status='pending'")
+
+@pytest.mark.asyncio
+async def test_dead_counts_age_from_creation_and_revive_from_last_try():
+    """Перепутать колонки — значит либо не повторять вовсе, либо повторять вечно."""
+    db = _revive_db(0, 0)
+    await revive_stale_notifications(db)
+    dead_sql, revive_sql = _revive_statements(db)
+    assert 'created_at <=' in dead_sql and 'updated_at <=' not in dead_sql
+    assert 'updated_at <=' in revive_sql
+    assert "status='dead'" in dead_sql.replace(' ', '').replace('SETstatus=', 'status=')
+
+
+@pytest.mark.asyncio
+async def test_owner_alert_stuck_in_sending_is_reopened_but_client_one_is_not():
+    """Рестарт бота между «взял строку» и «отправил» оставлял её в `sending` навсегда."""
+    db = _revive_db(0, 0)
+    await revive_stale_notifications(db)
+    _dead_sql, revive_sql = _revive_statements(db)
+    assert "status = 'sending'" in revive_sql
+    assert 'lease_expires_at <=' in revive_sql
+    assert revive_sql.count("notification_type = 'order_stuck'") == 1
 
 
 # --- развилка отправки: владельцу не должно уйти «✅ Подписка готова» -------------------
@@ -208,6 +237,8 @@ def _checkout():
         funding_mode='platega',
         debit_transaction_id=None,
         sale_snapshot={'tariff_name': 'Базовый'},
+        settlement_mode='direct_purchase_v2',
+        updated_at=datetime(2026, 8, 16, 12, 59, tzinfo=UTC),
     )
 
 
@@ -257,7 +288,7 @@ async def test_owner_alert_does_not_use_the_client_ready_text():
     bot.send_message.assert_not_awaited()
     text = admin.send_admin_notification.await_args.args[0]
     assert 'Подписка готова' not in text
-    assert 'Заказ завис' in text
+    assert 'ЗАКАЗ ЗАВИС' in text
     assert '649' in text
     assert 'Базовый' in text
     assert row.status == 'sent'
@@ -306,11 +337,113 @@ async def test_undelivered_owner_alert_is_marked_failed_not_sent():
 
 
 @pytest.mark.asyncio
-async def test_money_taken_is_stated_explicitly_for_the_owner():
+async def test_alert_is_not_sent_when_the_order_recovered_by_itself():
+    """Панель полежала 30 минут и поднялась: тревога устарела, возврат делать нельзя."""
+    row = _outbox_row(1, OWNER_ALERT_NOTIFICATION_TYPE)
     checkout = _checkout()
-    checkout.debit_transaction_id = 77
+    checkout.lifecycle_state = 'ready'
+    checkout.provisioning_state = 'ready'
+    user = SimpleNamespace(id=186, telegram_id=1, username=None, language='ru', full_name='Tiger')
+    db = _worker_db([row], checkout=checkout, user=user)
+    bot = MagicMock()
+    admin = MagicMock()
+    admin.is_enabled = True
+    admin.send_admin_notification = AsyncMock(return_value=True)
+
+    with (
+        patch.object(service_module, 'queue_owner_order_stuck_alerts', AsyncMock(return_value=0)),
+        patch.object(service_module, 'revive_stale_notifications', AsyncMock(return_value=(0, 0))),
+        patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin),
+    ):
+        sent = await process_device_first_notification_outbox(db, bot=bot, limit=10)
+
+    assert sent == 0
+    admin.send_admin_notification.assert_not_awaited()
+    assert row.status == 'obsolete'
+
+
+# --- вердикт о деньгах: цена ошибки здесь — двойной возврат либо отказ в нём -----------
+
+
+def _money_db(attempt_status=None, user=None):
     db = MagicMock()
-    db.get = AsyncMock(return_value=SimpleNamespace(id=186, telegram_id=1, username=None, full_name='Tiger'))
-    db.scalar = AsyncMock(return_value=0)
+    db.get = AsyncMock(return_value=user or SimpleNamespace(id=186, telegram_id=1, username=None, full_name='Tiger'))
+    db.scalar = AsyncMock(return_value=attempt_status)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_card_payment_is_never_called_a_balance_debit():
+    """`debit_transaction_id` заполняется при ОБОИХ способах оплаты — по нему судить нельзя."""
+    checkout = _checkout()
+    checkout.funding_mode = 'platega'
+    checkout.debit_transaction_id = 77
+    verdict = await service_module._money_verdict(_money_db(), checkout)
+    assert 'с баланса' not in verdict.replace('С баланса не списывали', '')
+    assert 'платёжную систему' in verdict
+
+
+@pytest.mark.asyncio
+async def test_balance_payment_is_reported_as_a_balance_debit():
+    checkout = _checkout()
+    checkout.funding_mode = 'wallet'
+    checkout.debit_transaction_id = 77
+    assert 'списаны с баланса клиента' in await service_module._money_verdict(_money_db(), checkout)
+
+
+@pytest.mark.asyncio
+async def test_chargeback_does_not_ask_the_owner_for_a_refund():
+    """Платёж уже отозван: возврат сверху — двойная потеря."""
+    checkout = _checkout()
+    checkout.terminal_reason = 'post_paid_provider_terminal:chargebacked'
+    checkout.debit_transaction_id = 77
+    verdict = await service_module._money_verdict(_money_db(attempt_status='credited'), checkout)
+    assert 'Возврат делать НЕ нужно' in verdict
+
+
+@pytest.mark.asyncio
+async def test_money_already_on_client_balance_is_not_refunded_twice():
+    checkout = _checkout()
+    checkout.funding_mode = 'platega'
+    verdict = await service_module._money_verdict(_money_db(attempt_status='credited'), checkout)
+    assert 'Возврат не нужен' in verdict
+
+
+@pytest.mark.asyncio
+async def test_no_visible_debit_sends_the_owner_to_the_provider():
+    checkout = _checkout()
+    checkout.funding_mode = 'platega'
+    assert 'Platega' in await service_module._money_verdict(_money_db(), checkout)
+
+
+# --- разметка и данные клиента ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hostile_client_name_cannot_break_the_message():
+    checkout = _checkout()
+    user = SimpleNamespace(id=186, telegram_id=1, username='<i>x', full_name='<b>Вася</b>')
+    text = await service_module._owner_order_stuck_text(_money_db(user=user), checkout)
+    assert '<b>Вася</b>' not in text
+    assert '&lt;b&gt;Вася&lt;/b&gt;' in text
+    assert '&lt;i&gt;x' in text
+
+
+@pytest.mark.asyncio
+async def test_machine_codes_are_translated_for_the_owner():
+    checkout = _checkout()
+    text = await service_module._owner_order_stuck_text(_money_db(), checkout)
+    assert 'Оплату нужно проверить' in text
+    assert 'счёт у платёжной системы просрочен или не найден' in text
+    assert 'Кнопки для разбора в боте пока нет' in text
+
+
+@pytest.mark.asyncio
+async def test_missing_user_row_does_not_produce_garbage_contact():
+    checkout = _checkout()
+    db = MagicMock()
+    db.get = AsyncMock(return_value=None)
+    db.scalar = AsyncMock(return_value=None)
     text = await service_module._owner_order_stuck_text(db, checkout)
-    assert 'деньги списаны с баланса' in text
+    assert 'tg ?' not in text
+    assert 'карточка недоступна' in text
