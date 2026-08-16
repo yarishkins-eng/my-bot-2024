@@ -29,7 +29,27 @@ from app.services.device_first_eligibility import normalize_device_purchase_opti
 logger = structlog.get_logger(__name__)
 
 
-_CHECKOUT_TERMINAL_STATES = ('ready', 'cancelled', 'expired')
+# Мина C, безопасная часть. `conflict`/`reprice_required`/`failed` — настоящие тупики:
+# поиск живого заказа клиента берёт только `OPEN_STATES` плюс `operator_review`
+# (`device_first_checkout_service.py:389-406`), а все входы в выдачу требуют `confirmed`,
+# `awaiting_funds` или `fulfilling`. Выдать такой заказ нельзя ничем, значит и захваченный
+# набор серверов защищать не от чего. Раньше один такой заказ запирал смену серверов тарифа
+# навсегда — чистильщика для них нет (пункт 4.5).
+#
+# 🔴 `operator_review` сюда НЕ добавлять, хотя доска этапа этого просила. Проверено ревью:
+#   1) он оживает штатно — воркер сверки адресно выбирает попытки в `operator_review` с
+#      причиной `provider_invoice_missing_or_elapsed_expiry` (`device_first_payment_service.py:2138-2144`)
+#      и возвращает их в `pending` / `awaiting_funds` (`:708`, `:720-722`);
+#   2) на нём часто ВИСЯТ ДЕНЬГИ: поздняя оплата ставит `attempt.status='operator_review'`
+#      вместе с `payment.is_paid=True` и кредитом сверки (`:2002-2020`, `:1821-1826`), а этот
+#      статус не входит в `_DIRECT_PROVIDER_ATTEMPT_OPEN_STATES` — вторая ветвь забора его не ловит;
+#   3) сверка снимка прав с текущим тарифом при выдаче НЕ спасает: она включается только при
+#      `provenance == 'access_point_policy'` (`device_first_checkout_service.py:1730`), а такого
+#      режима нет ни у одного тарифа (проверено на боевом: `native_squads` и `legacy_snapshot`).
+# То есть для `operator_review` этот забор — единственная работающая защита. Снять его —
+# значит разрешить менять серверы под оплаченным неразобранным заказом. Разомкнуть их штатно
+# должен пункт 4.4 (разбор заказов оператором), он же снимает вшитый архивный отпечаток.
+_CHECKOUT_TERMINAL_STATES = ('ready', 'cancelled', 'expired', 'failed', 'reprice_required', 'conflict')
 _DIRECT_PROVIDER_ATTEMPT_OPEN_STATES = ('creating', 'pending', 'paid_processing')
 _HISTORICAL_ERASED_DIRECT_MISMATCH = 'direct_payment_binding_mismatch'
 _APPROVED_FINAL_ERASURE_ARCHIVE_TARIFF_ID = 3
