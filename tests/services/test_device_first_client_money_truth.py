@@ -157,11 +157,19 @@ async def test_money_state_agrees_with_owner_verdict():
         verdict_db = MagicMock()
         verdict_db.scalar = AsyncMock(return_value=credited)
         verdict = await service_module._money_verdict(verdict_db, checkout)
+        claims_money = '🔴' in verdict or '🟡' in verdict
         claims_no_money = '🟢' in verdict
         if state == 'money_in_flight':
-            assert not claims_no_money, f'клиенту сказали «деньги есть», владельцу — «{verdict}»'
+            # Сильная форма: владельцу обязаны сказать про деньги ПРЯМО, а не просто
+            # промолчать. Слабая («не сказали, что денег нет») пропустила бы вердикт
+            # «в базе списания не видно» — а это отказ в возврате тому, кто заплатил.
+            assert claims_money, f'клиенту сказали «деньги есть», владельцу — «{verdict}»'
         if state == 'no_money':
             assert claims_no_money, f'клиенту сказали «денег нет», владельцу — «{verdict}»'
+        if state == 'unknown':
+            # Нейтральной ветке обязан соответствовать неуверенный вердикт: если владелец
+            # уверен, а клиент нет — значит классификатор потерял факт, который есть у него.
+            assert not claims_no_money, f'клиент не знает, а владельцу сказали «денег нет»: «{verdict}»'
 
 
 # --- экран заказа в боте ---------------------------------------------------------------
