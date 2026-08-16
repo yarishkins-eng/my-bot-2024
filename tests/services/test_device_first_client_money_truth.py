@@ -93,6 +93,34 @@ async def test_unrecognised_reason_stays_unknown_instead_of_guessing():
 
 
 @pytest.mark.asyncio
+async def test_reversed_payment_is_not_reported_as_money_we_hold():
+    """🔴 Отзыв платежа: деньги ушли клиенту обратно, а зачисление на попытке осталось.
+
+    Без ранней проверки причины классификатор увидел бы `credited > 0` и сказал «платёж
+    получен» про деньги, которых у нас нет, — и заодно разошёлся бы с вердиктом владельцу,
+    который для этого случая пишет «возврат делать НЕ нужно».
+    """
+    checkout = _checkout(terminal_reason='post_paid_provider_terminal:chargebacked')
+    assert await checkout_money_state(_db(credited_attempts=1), checkout) == 'unknown'
+
+
+@pytest.mark.asyncio
+async def test_reasons_that_only_look_unpaid_are_left_unknown():
+    """Аудит пункта называл эти причины безденежными — проверка по коду это опровергла.
+
+    `provider_response_missing_safe_redirect` ставится ПОСЛЕ привязки счёта у Platega
+    (`device_first_payment_service.py:1391`), а переопроса у этого состояния нет. Сказать
+    «денег не было» — значит убрать у владельца единственную подсказку их найти.
+    """
+    for reason in (
+        'provider_response_missing_safe_redirect',
+        'provider_invoice_creation_incomplete',
+        'tariff_missing_after_quote',
+    ):
+        assert await checkout_money_state(_db(), _checkout(terminal_reason=reason)) == 'unknown'
+
+
+@pytest.mark.asyncio
 async def test_every_no_money_reason_is_actually_classified():
     for reason in service_module._NO_MONEY_TERMINAL_REASONS:
         assert await checkout_money_state(_db(), _checkout(terminal_reason=reason)) == 'no_money'
@@ -117,6 +145,10 @@ async def test_money_state_agrees_with_owner_verdict():
         (_checkout(funding_mode='wallet', terminal_reason='entitlement_changed'), 0),
         (_checkout(debit_transaction_id=77), 0),
         (_checkout(terminal_reason='direct_payment_binding_mismatch'), 0),
+        # Отзыв платежа — единственный случай, где две функции реально расходились.
+        (_checkout(terminal_reason='post_paid_provider_terminal:chargebacked'), 1),
+        (_checkout(terminal_reason='provider_response_missing_safe_redirect'), 0),
+        (_checkout(terminal_reason='provider_invoice_creation_incomplete'), 0),
         *[(_checkout(terminal_reason=reason), 0) for reason in service_module._NO_MONEY_TERMINAL_REASONS],
     ]
     for checkout, credited in cases:
@@ -125,10 +157,9 @@ async def test_money_state_agrees_with_owner_verdict():
         verdict_db = MagicMock()
         verdict_db.scalar = AsyncMock(return_value=credited)
         verdict = await service_module._money_verdict(verdict_db, checkout)
-        claims_money = '🔴' in verdict or '🟡' in verdict
         claims_no_money = '🟢' in verdict
         if state == 'money_in_flight':
-            assert claims_money, f'клиенту сказали «деньги есть», владельцу — «{verdict}»'
+            assert not claims_no_money, f'клиенту сказали «деньги есть», владельцу — «{verdict}»'
         if state == 'no_money':
             assert claims_no_money, f'клиенту сказали «денег нет», владельцу — «{verdict}»'
 
@@ -163,21 +194,26 @@ async def _screen(money_state: str):
 async def test_unpaid_customer_is_not_told_that_the_payment_arrived():
     caption, _ = await _screen('no_money')
     assert 'Платёж получен' not in caption
-    assert 'Деньги не списаны' in caption
+    assert 'Мы ничего не списали' in caption
+    # Не «счёт просрочен»: сюда же приходит оплата с баланса, где счёта нет вовсе.
+    assert 'счёт' not in caption.lower()
 
 
 @pytest.mark.asyncio
 async def test_paid_customer_still_reads_the_warning_against_paying_twice():
     caption, _ = await _screen('money_in_flight')
-    assert 'Платёж получен' in caption
-    assert 'не оплачивайте повторно' in caption
+    assert 'Не оплачивайте' in caption
+    # «Платёж получен» нельзя даже здесь: тем же путём проходит отозванный платёж.
+    assert 'Платёж получен' not in caption
 
 
 @pytest.mark.asyncio
 async def test_unknown_money_state_claims_nothing_in_either_direction():
     caption, _ = await _screen('unknown')
     assert 'Платёж получен' not in caption
-    assert 'Деньги не списаны' not in caption
+    assert 'не списали' not in caption
+    # «Повторно» само по себе утверждает, что первый платёж был.
+    assert 'повторно' not in caption.lower()
 
 
 @pytest.mark.asyncio
@@ -226,4 +262,19 @@ def test_operator_review_refusal_no_longer_invites_a_retry():
     message = _safe_error_detail(user, DeviceFirstError('operator_review_required', 'x'))
     assert 'Попробуйте ещё раз' not in message
     assert 'новый расчёт' not in message
-    assert 'проверяется' in message
+    assert 'на разборе' in message
+
+
+@pytest.mark.asyncio
+async def test_refusal_that_sends_to_support_gives_a_button_to_get_there():
+    """Совет без кнопки — тупик: у соседних кодов кнопка есть, у этого не было."""
+    from app.handlers.subscription.device_first import _render_error
+    from app.services.device_first_checkout_service import DeviceFirstError
+
+    callback = SimpleNamespace(data='df:p:owned', answer=AsyncMock())
+    user = SimpleNamespace(id=196, language='ru')
+    with patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output:
+        await _render_error(callback, user, DeviceFirstError('operator_review_required', 'x'))
+
+    keyboard = output.await_args.kwargs['keyboard'].inline_keyboard
+    assert 'menu_support' in [button.callback_data for row in keyboard for button in row]
