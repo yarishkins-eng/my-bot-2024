@@ -1109,14 +1109,42 @@ def test_no_way_to_move_a_client_between_servers_exists_today():
 
     cabinet_source = inspect.getsource(cabinet_admin)
     assert 'Tariff relabel requires an approved location entitlement plan' in cabinet_source
-    assert 'delete(Subscription)' in cabinet_source, 'кабинетный сброс всё ещё удаляет подписку'
+    assert 'delete(Subscription)' in cabinet_source, 'кабинетный сброс перестал удалять подписку — текст устарел'
+
+    # 🔴 Самый вероятный кандидат на расчехление в этапе 3 — это «Переезд сквада»,
+    # то есть буквально функция переезда. Оживят её в любой из трёх точек входа —
+    # «Готовой кнопки для этого пока нет» станет ложью, и напомнить об этом больше нечем.
+    from app.cabinet.routes import admin_remnawave as cabinet_remnawave
+    from app.handlers.admin import remnawave as chat_remnawave
+    from app.webapi.routes import remnawave as webapi_remnawave
+
+    for module, marker in (
+        (cabinet_remnawave, 'Raw Squad migration is retired'),
+        (webapi_remnawave, 'Raw Squad migration is retired'),
+        (chat_remnawave, 'Переезд технических групп отключён'),
+    ):
+        assert marker in inspect.getsource(module), f'переезд сквада ожил в {module.__name__} — текст тревоги устарел'
 
 
-def test_the_alert_never_names_a_path_that_does_not_exist():
-    """Две предыдущие версии текста звали в мёртвые кнопки. Третьей не будет."""
-    import inspect
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drift_type', [ENTITLEMENT_DRIFT_NOTIFICATION_TYPE, TARGET_DRIFT_NOTIFICATION_TYPE])
+async def test_the_alert_never_names_a_path_that_does_not_exist(drift_type):
+    """Две предыдущие версии текста звали в мёртвые кнопки. Третьей не будет.
 
-    source = inspect.getsource(service._send_owner_checkout_drift_alert)
-    for dead_path in ('Сменить сервер', 'на карточке клиента', 'Чат-админка →'):
-        assert dead_path not in source.split('advice = (')[1].split(')')[0], f'снова мёртвый путь: {dead_path}'
-    assert 'Готовой кнопки для этого сегодня нет' in source
+    🔴 Проверяем СОБРАННОЕ сообщение, а не исходник. Первая версия сторожа резала код по
+    `advice = (` и `)`: одна скобка внутри текста молча обрезала бы окно, вторая ветка
+    сообщения в окно не попадала вовсе, а фраза, оставшаяся только в комментарии, держала
+    бы тест зелёным. Сторож, читающий текст глазами владельца, таких дыр не имеет.
+    """
+    admin = MagicMock()
+    admin.is_enabled = True
+    admin.send_admin_notification = AsyncMock(return_value=True)
+
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        await service._send_owner_checkout_drift_alert(
+            _alert_db(), bot=MagicMock(), checkout=checkout_stub(), notification_type=drift_type
+        )
+
+    text = admin.send_admin_notification.await_args.args[0]
+    for dead_path in ('Сменить сервер', 'на карточке клиента', 'Чат-админка', 'Переезд сквада'):
+        assert dead_path not in text, f'снова мёртвый путь в тексте владельцу: {dead_path}'
