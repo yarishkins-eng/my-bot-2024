@@ -879,6 +879,11 @@ async def test_late_payment_after_the_abandoned_cart_closes_lands_on_the_balance
     assert user.balance_kopeks == 35_000
     assert attempt.status == 'credited'
     assert attempt.reconciliation_reason == 'late_paid_wallet_credit'
+    # 🔴 На этой строке висят ОБА новых экрана — бота и мини-аппа. Мутационный прогон
+    # показал, что её можно убрать при 2600 зелёных тестах: тесты смотрели только на
+    # попытку, а по заказу ветвятся экраны.
+    assert checkout.terminal_reason == 'late_paid_wallet_credit'
+    assert checkout.lifecycle_state == 'cancelled'
     # Старый заказ не оживает и подписку не выдаёт — деньги стали балансом, и только им.
     assert checkout.fulfillment_state == 'not_started'
     fulfill.assert_not_awaited()
@@ -913,6 +918,66 @@ async def test_a_live_invoice_without_an_elapsed_deadline_is_never_closed_by_min
     assert checkout.lifecycle_state == 'awaiting_funds'
     assert checkout.terminal_reason is None
     assert attempt.status == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_the_closed_cart_invoice_stays_in_the_reconciliation_sweep():
+    """🔴 Единственное, что удерживает счёт в опросе после закрытия, — одно слово в выборке.
+
+    Мина F перевела попытку в `reconciliation`. Убери это слово из предиката воркера — и
+    брошенный счёт перестанет опрашиваться вовсе: поздняя оплата не будет замечена, деньги
+    не дойдут ни до баланса, ни до разбора. Мутация пережила весь набор из 2600 тестов,
+    потому что раньше у этого состояния был свой адресный пункт выборки.
+    """
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = []
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=result)
+
+    await reconcile_device_first_payments(db, limit=5)
+
+    sql = str(db.execute.await_args[0][0].compile(compile_kwargs={'literal_binds': True}))
+    # 🔴 Проверять надо ИМЕННО эту ветвь, а не наличие слова в запросе: `reconciliation`
+    # есть и во второй ветви (счета без опознанного id), поэтому слабая проверка
+    # «слово встречается» переживала мутацию — поймано на самопроверке сторожа.
+    assert (
+        "checkout_payment_attempts.status IN ('pending', 'reconciliation', 'paid_processing') "
+        'AND checkout_payment_attempts.provider_payment_id IS NOT NULL'
+    ) in sql
+
+
+def test_a_closed_cart_is_shown_as_cancelled_and_not_as_endless_processing():
+    """Связка «состояние заказа → экран» не проверялась нигде: тесты экранов её подменяют.
+
+    Убери `cancelled` из `checkout_ui_state` — и обе новые ветки (бот и мини-апп) молча
+    умирают, а клиент видит вечный «Оформляем VPN». Все 2600 тестов при этом зелёные.
+    """
+    from app.services.device_first_checkout_service import checkout_ui_state
+
+    closed = SimpleNamespace(
+        lifecycle_state='cancelled',
+        provisioning_state='not_started',
+        fulfillment_state='not_started',
+    )
+    assert checkout_ui_state(closed) == 'cancelled'
+
+
+def test_only_the_exact_abandoned_pair_unlocks_the_trial():
+    """Забор триала снимает ровно пара «cancelled + локально брошено», и ничего шире.
+
+    Обе мутации — «всегда False» (триал заперт навсегда) и «смотреть только на состояние»
+    (триал открыт там, где нельзя) — пережили полный набор.
+    """
+    from app.services.trial_activation_service import _is_locally_abandoned
+
+    abandoned = SimpleNamespace(lifecycle_state='cancelled', terminal_reason='cancelled_by_user_after_invoice')
+    provider_cancelled = SimpleNamespace(lifecycle_state='cancelled', terminal_reason='provider_terminal:canceled')
+    still_on_review = SimpleNamespace(
+        lifecycle_state='operator_review', terminal_reason='cancelled_by_user_after_invoice'
+    )
+    assert _is_locally_abandoned(abandoned) is True
+    assert _is_locally_abandoned(provider_cancelled) is False
+    assert _is_locally_abandoned(still_on_review) is False
 
 
 def _stub_direct_create_identity_binding(monkeypatch, added):
