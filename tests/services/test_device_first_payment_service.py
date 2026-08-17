@@ -761,6 +761,157 @@ async def test_exact_pending_invoice_reopens_only_the_prior_missing_deadline_hol
     assert checkout.terminal_reason is None
 
 
+def _expired_deadline_payload():
+    """Точный живой счёт, который провайдер всё ещё держит «в ожидании»."""
+
+    return {
+        'id': 'provider-1',
+        'status': 'PENDING',
+        'paymentMethod': 'SBPQR',
+        'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+    }
+
+
+@pytest.mark.asyncio
+async def test_expired_provider_deadline_closes_the_cart_instead_of_calling_an_operator():
+    """🔴 Мина F. Срок счёта вышел, денег нет — это брошенная корзина, а не авария.
+
+    До этой правки такой заказ уходил в `operator_review` и запирал человеку новую покупку,
+    запирал смену серверов тарифа и слал владельцу тревогу «ЗАКАЗ ЗАВИС». Разбирать было
+    нечего: оба живых случая (заказы 32 и 34) закрылись сами, когда Platega через ~6 часов
+    отчиталась отменой.
+    """
+    from app.services.device_first_checkout_service import _owner_alert_is_obsolete
+
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    payment.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+    )
+
+    applied = await _apply_direct_pending_provider_observation(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload=_expired_deadline_payload(),
+        observed_after=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    assert applied is False
+    # Пара «состояние + причина» выбрана не по смыслу, а по единственному условию возврата
+    # поздних денег на баланс (`device_first_payment_service.py:1944-1952`).
+    assert checkout.lifecycle_state == 'cancelled'
+    assert checkout.terminal_reason == 'cancelled_by_user_after_invoice'
+    assert checkout.quote_state == 'expired'
+    assert checkout.funding_state == 'invoice_abandoned'
+    # 🔴 Требование 3: забор тарифа — `or_` из двух ветвей, и отмена заказа размыкает только
+    # первую. Вторая смотрит на статус попытки (`crud/tariff.py:53`, `:336-342`): останься
+    # он `pending` — тариф был бы заперт молча, до первой попытки владельца сменить серверы.
+    assert attempt.status == 'reconciliation'
+    assert attempt.status not in ('creating', 'pending', 'paid_processing')
+    assert attempt.reconciliation_reason == 'provider_invoice_abandoned_after_expiry'
+    assert payment.status == 'VERIFYING'
+    # Ни одного признака аварии: `operator_hold` не запирает покупку, тревога владельцу гаснет.
+    assert 'operator_review' not in {checkout.lifecycle_state, attempt.status, payment.status}
+    assert _owner_alert_is_obsolete(checkout) is True
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_late_payment_after_the_abandoned_cart_closes_lands_on_the_balance():
+    """🔴 Отрицательный сценарий, которого прямо требует план: деньги не должны потеряться.
+
+    Ссылка Platega после закрытия корзины остаётся живой — на этом стоит вся посылка мины F.
+    Заплатит человек позже — сумма обязана лечь ему на баланс, а не повиснуть кредитом сверки
+    на ручной разбор. Возврат работает ТОЛЬКО на паре `cancelled` + одна из двух причин, то
+    есть этот тест и есть проверка, что мина F закрывает корзину правильно.
+    """
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    payment.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    payment.transaction_id = None
+    user.balance_kopeks = 0
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=None),
+        execute=AsyncMock(
+            side_effect=[
+                # Мина F закрывает корзину: Payment -> User -> Attempt -> Checkout.
+                Result(payment),
+                Result(user),
+                Result(attempt),
+                Result(checkout),
+                # Поздняя точная оплата: тот же порядок замков и отсутствующая строка ledger.
+                Result(payment),
+                Result(user),
+                Result(attempt),
+                Result(checkout),
+                Result(None),
+            ]
+        ),
+        add=MagicMock(),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+    )
+
+    closed = await _apply_direct_pending_provider_observation(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload=_expired_deadline_payload(),
+        observed_after=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    assert closed is False
+    assert checkout.lifecycle_state == 'cancelled'
+
+    with patch(
+        'app.services.device_first_payment_service.fulfill_direct_external_checkout',
+        AsyncMock(),
+    ) as fulfill:
+        await settle_device_first_platega_payment(
+            db,
+            payment=payment,
+            payload={'id': 'provider-1', 'paymentMethod': 2, 'paymentDetails': {'amount': '350.00', 'currency': 'RUB'}},
+        )
+
+    assert user.balance_kopeks == 35_000
+    assert attempt.status == 'credited'
+    assert attempt.reconciliation_reason == 'late_paid_wallet_credit'
+    # Старый заказ не оживает и подписку не выдаёт — деньги стали балансом, и только им.
+    assert checkout.fulfillment_state == 'not_started'
+    fulfill.assert_not_awaited()
+    ledger_rows = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if getattr(call.args[0], 'device_first_ledger_key', None) == 'direct_late_invoice:41'
+    ]
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0].amount_kopeks == 35_000
+
+
+@pytest.mark.asyncio
+async def test_a_live_invoice_without_an_elapsed_deadline_is_never_closed_by_mine_f():
+    """Обратная половина: мина F не смеет закрывать счёт, срок которого ещё идёт."""
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    payment.expires_at = datetime.now(UTC) + timedelta(minutes=5)
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+    )
+
+    applied = await _apply_direct_pending_provider_observation(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload=_expired_deadline_payload(),
+        observed_after=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    assert applied is True
+    assert checkout.lifecycle_state == 'awaiting_funds'
+    assert checkout.terminal_reason is None
+    assert attempt.status == 'pending'
+
+
 def _stub_direct_create_identity_binding(monkeypatch, added):
     """Keep POST orchestration tests focused; lock fencing is tested below."""
 

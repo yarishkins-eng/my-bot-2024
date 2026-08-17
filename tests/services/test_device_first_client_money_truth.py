@@ -145,14 +145,23 @@ async def test_the_money_question_actually_asks_about_this_checkout():
     assert 'user_id' not in sql
 
 
-def test_the_no_money_set_stays_a_single_proven_reason():
-    """Сторож от тихого расширения набора.
+def test_the_no_money_set_stays_the_two_proven_reasons():
+    """Сторож от тихого расширения набора. Имена прописаны буквами намеренно.
 
     Он общий с вердиктом владельцу, а тест согласия перебирает этот же набор — то есть
     новая причина проходит оба и молча начинает печатать владельцу «возврат не нужен».
     Расширять набор можно только опровергнув по коду, что на причине могут висеть деньги.
+
+    🔴 Вторую причину добавила мина F: с неё брошенная корзина закрывается в `cancelled`
+    с `cancelled_by_user_after_invoice` (`device_first_payment_service.py:696-737`). Она
+    ставится только там, где `payment.is_paid` ложно, а пришедшие позже деньги её не
+    сохраняют — переписывают в `late_paid_wallet_credit` (`:1987-1991`) либо уводят заказ
+    в разбор по удалению аккаунта (`:1821-1833`).
     """
-    assert set(service_module._NO_MONEY_TERMINAL_REASONS) == {'provider_invoice_missing_or_elapsed_expiry'}
+    assert set(service_module._NO_MONEY_TERMINAL_REASONS) == {
+        'provider_invoice_missing_or_elapsed_expiry',
+        'cancelled_by_user_after_invoice',
+    }
 
 
 @pytest.mark.asyncio
@@ -415,3 +424,79 @@ async def test_refusal_that_sends_to_support_gives_a_button_to_get_there():
 
     keyboard = output.await_args.kwargs['keyboard'].inline_keyboard
     assert 'menu_support' in [button.callback_data for row in keyboard for button in row]
+
+
+# --- мина F: экран закрытой брошенной корзины ------------------------------------------
+
+
+async def _cancelled_screen(terminal_reason: str, money_state: str = 'no_money', language: str = 'ru'):
+    """Экран заказа, закрытого миной F, глазами клиента."""
+
+    from app.handlers.subscription.device_first import _render_checkout
+
+    callback = SimpleNamespace()
+    user = SimpleNamespace(id=196, language=language, balance_kopeks=0)
+    checkout = _checkout(lifecycle_state='cancelled', terminal_reason=terminal_reason)
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            MagicMock(return_value={'ui_state': 'cancelled'}),
+        ),
+        patch(
+            'app.handlers.subscription.device_first.checkout_money_state',
+            AsyncMock(return_value=money_state),
+        ),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output,
+    ):
+        await _render_checkout(callback, user, AsyncMock(), checkout)
+    return output.await_args.kwargs['caption']
+
+
+@pytest.mark.asyncio
+async def test_closed_cart_still_warns_about_the_link_that_stayed_alive():
+    """🔴 Требование 4 мины F. Предупреждение не должно исчезнуть вместе с состоянием.
+
+    Раньше «не платите по старой ссылке» жило на экране разбора. Мина F увела заказ в
+    `cancelled`, и без этой строки клиент остался бы вообще без предупреждения — а ссылка
+    Platega живая, на этом стоит вся посылка мины: провайдер ещё считает счёт «в ожидании».
+    """
+    caption = await _cancelled_screen('cancelled_by_user_after_invoice')
+    assert 'Деньги не списаны' in caption
+    assert 'на баланс' in caption
+    # Обещать подписку за поздний платёж нельзя: старый заказ не оживает никогда.
+    assert 'не оформится' in caption
+
+
+@pytest.mark.asyncio
+async def test_closed_cart_says_the_purchase_is_open_again():
+    """Половина мины F, ради которой она делалась: замок снят, и это надо сказать вслух."""
+    caption = await _cancelled_screen('cancelled_by_user_after_invoice')
+    assert 'прямо сейчас' in caption
+    # И ни одного слова из лексикона разбора: разбирать тут больше нечего.
+    assert 'поддержку' not in caption.lower()
+
+
+@pytest.mark.asyncio
+async def test_closed_cart_never_claims_no_charge_when_money_did_arrive():
+    """Про деньги спрашиваем базу, а не название причины — урок пункта 4.2б.
+
+    Причина у заказа остаётся прежней, а поздняя оплата приносит деньги: ветка «по причине»
+    сказала бы «не списали» ровно тогда, когда сумма уже у нас.
+    """
+    caption = await _cancelled_screen('cancelled_by_user_after_invoice', money_state='money_in_flight')
+    assert 'Деньги не списаны' not in caption
+
+
+@pytest.mark.asyncio
+async def test_provider_cancelled_invoice_keeps_its_old_screen():
+    """Отмену объявила сама Platega — ссылка мертва, и предупреждать о ней было бы неправдой."""
+    caption = await _cancelled_screen('provider_terminal:canceled')
+    assert 'Предыдущий счёт закрыт' in caption
+    assert 'на баланс' not in caption
+
+
+@pytest.mark.asyncio
+async def test_the_english_half_of_the_closed_cart_is_honest_too():
+    caption = await _cancelled_screen('cancelled_by_user_after_invoice', language='en')
+    assert 'No money was charged' in caption
+    assert 'credited to your balance' in caption

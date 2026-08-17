@@ -1309,19 +1309,38 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[button], [_main_menu(user)]])
     elif result['ui_state'] == 'cancelled':
         provider_terminal = str(getattr(checkout, 'terminal_reason', '')).startswith('provider_terminal:')
-        caption = _text(
-            user,
-            (
-                '✅ <b>Предыдущий счёт закрыт</b>\n\nВыберите срок и устройства для нового заказа.'
-                if provider_terminal
-                else '🛑 <b>Заказ отменён</b>\n\nЭтот заказ больше не будет оформлен.'
-            ),
-            (
-                '✅ <b>The previous invoice is closed</b>\n\nChoose a period and devices for a new order.'
-                if provider_terminal
-                else '🛑 <b>Order cancelled</b>\n\nThis order will not be completed.'
-            ),
-        )
+        # 🔴 Мина F. Сюда теперь приходит и брошенная корзина, закрытая после срока счёта
+        # (`device_first_payment_service.py:696-731`). У неё, в отличие от отмены самой
+        # Platega, платёжная ссылка может ещё принять деньги — про это обязано быть сказано.
+        # Текст взят слово в слово из ручной отмены заказа (`:1702-1717`): состояние то же
+        # самое, причина заказа та же, и два разных описания одного состояния расходились бы.
+        # 🔴 Про деньги спрашиваем БЭКЕНД, а не название причины: обещать «не списали» по
+        # `terminal_reason` — ровно та ошибка, которую разбирал пункт 4.2б.
+        locally_abandoned = getattr(checkout, 'terminal_reason', '') == 'cancelled_by_user_after_invoice'
+        if locally_abandoned and await checkout_money_state(db, checkout) == 'no_money':
+            caption = _text(
+                user,
+                '🛑 <b>Заказ отменён</b>\n\nДеньги не списаны. Если старая ссылка будет оплачена '
+                'позднее, сумма один раз зачислится на баланс — прежняя подписка не оформится. '
+                'Новый заказ можно оформить прямо сейчас.',
+                '🛑 <b>Order cancelled</b>\n\nNo money was charged. If the old link is paid later, '
+                'the amount is credited to your balance once — the previous subscription will not '
+                'be activated. You can place a new order right now.',
+            )
+        else:
+            caption = _text(
+                user,
+                (
+                    '✅ <b>Предыдущий счёт закрыт</b>\n\nВыберите срок и устройства для нового заказа.'
+                    if provider_terminal
+                    else '🛑 <b>Заказ отменён</b>\n\nЭтот заказ больше не будет оформлен.'
+                ),
+                (
+                    '✅ <b>The previous invoice is closed</b>\n\nChoose a period and devices for a new order.'
+                    if provider_terminal
+                    else '🛑 <b>Order cancelled</b>\n\nThis order will not be completed.'
+                ),
+            )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
