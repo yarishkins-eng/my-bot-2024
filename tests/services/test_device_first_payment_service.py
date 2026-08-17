@@ -806,14 +806,17 @@ async def test_expired_provider_deadline_closes_the_cart_instead_of_calling_an_o
     assert checkout.quote_state == 'expired'
     assert checkout.funding_state == 'invoice_abandoned'
     # 🔴 Требование 3: забор тарифа — `or_` из двух ветвей, и отмена заказа размыкает только
-    # первую. Вторая смотрит на статус попытки (`crud/tariff.py:53`, `:336-342`): останься
-    # он `pending` — тариф был бы заперт молча, до первой попытки владельца сменить серверы.
+    # первую. Вторая смотрит на статус попытки мимо заказа. Сравниваем с САМИМ набором забора,
+    # а не со списком-копией: иначе тест переживёт добавление `reconciliation` в тот набор и
+    # тариф останется заперт молча, до первой попытки владельца сменить серверы.
+    from app.database.crud.tariff import _CHECKOUT_TERMINAL_STATES, _DIRECT_PROVIDER_ATTEMPT_OPEN_STATES
+
     assert attempt.status == 'reconciliation'
-    assert attempt.status not in ('creating', 'pending', 'paid_processing')
+    assert attempt.status not in _DIRECT_PROVIDER_ATTEMPT_OPEN_STATES
+    assert checkout.lifecycle_state in _CHECKOUT_TERMINAL_STATES
     assert attempt.reconciliation_reason == 'provider_invoice_abandoned_after_expiry'
     assert payment.status == 'VERIFYING'
     # Ни одного признака аварии: `operator_hold` не запирает покупку, тревога владельцу гаснет.
-    assert 'operator_review' not in {checkout.lifecycle_state, attempt.status, payment.status}
     assert _owner_alert_is_obsolete(checkout) is True
     db.commit.assert_awaited_once()
 

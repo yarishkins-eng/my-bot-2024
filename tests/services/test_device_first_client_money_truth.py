@@ -262,8 +262,12 @@ async def test_unpaid_customer_is_still_warned_off_the_old_payment_link():
 
     Причина `provider_invoice_missing_or_elapsed_expiry` ставится, когда провайдер ещё
     считает счёт живым, — ссылка может принять деньги. А возврат таких денег на баланс
-    требует статуса `cancelled` (`device_first_payment_service.py:1946-1952`), которого
+    требует статуса `cancelled` (`device_first_payment_service.py:1976-1985`), которого
     здесь нет: сумма ляжет кредитом сверки на ручной разбор.
+
+    ⚠️ С мины F эту причину больше не присваивает никто: брошенная корзина уходит в
+    `cancelled`. Сторож остаётся живым и нужным — на боевом лежат пять заказов в этом
+    состоянии, и до пункта 4.4 они никуда не денутся.
     """
     caption, _ = await _screen('no_money')
     assert 'не платите по ней' in caption.lower()
@@ -330,6 +334,19 @@ async def _cabinet_payload(ui_state: str):
 async def test_cabinet_gets_the_verdict_on_the_review_screen():
     """Считает бэкенд: ветка «по `terminal_reason`» на фронте при поздней оплате соврёт."""
     assert (await _cabinet_payload('operator_review'))['money_state'] == 'no_money'
+
+
+@pytest.mark.asyncio
+async def test_cabinet_gets_the_verdict_on_the_closed_cart_too():
+    """🔴 Мина F. Экранов, где мини-апп говорит про деньги, стало два.
+
+    Брошенная корзина больше не висит в разборе — она закрывается сама. Не отдай мы поле
+    здесь, предупреждение «старая ссылка ещё принимает деньги» исчезло бы ровно у тех, кто
+    покупает через мини-апп, — и человек, которому мы только что вернули право купить,
+    оплатил бы прежний счёт.
+    """
+    payload = await _cabinet_payload('cancelled')
+    assert payload['money_state'] == 'no_money'
 
 
 @pytest.mark.asyncio
