@@ -1092,15 +1092,31 @@ async def test_a_missing_tariff_returns_early_instead_of_relying_on_the_catch_al
     resolve.assert_not_awaited()
 
 
-def test_the_chat_admin_server_button_is_still_stubbed():
-    """🔴 Сторож на ТЕКСТ тревоги (класс мины H и мины AB).
+def test_no_way_to_move_a_client_between_servers_exists_today():
+    """🔴 Сторожа на ТЕКСТ тревоги (класс мины H и мины AB).
 
-    Сообщение владельцу утверждает, что кнопка «Сменить сервер» в чат-админке для переноса
-    не работает. Оживят её (этап 2в) — тест покраснеет и напомнит переписать текст.
+    Текст утверждает «готовой кнопки нет». Это правда ровно до тех пор, пока мертвы ВСЕ
+    три пути. Оживят любой (пункты 2.9, 2б, этап 3) — тест покраснеет и напомнит
+    переписать текст, вместо того чтобы владелец читал устаревшую инструкцию.
     """
     import inspect
 
+    from app.cabinet.routes import admin_users as cabinet_admin
     from app.handlers.admin import users as admin_users
 
-    source = inspect.getsource(admin_users.toggle_user_server)
-    assert 'Ручное изменение технических серверов отключено' in source
+    chat_button = inspect.getsource(admin_users.toggle_user_server)
+    assert 'Ручное изменение технических серверов отключено' in chat_button
+
+    cabinet_source = inspect.getsource(cabinet_admin)
+    assert 'Tariff relabel requires an approved location entitlement plan' in cabinet_source
+    assert 'delete(Subscription)' in cabinet_source, 'кабинетный сброс всё ещё удаляет подписку'
+
+
+def test_the_alert_never_names_a_path_that_does_not_exist():
+    """Две предыдущие версии текста звали в мёртвые кнопки. Третьей не будет."""
+    import inspect
+
+    source = inspect.getsource(service._send_owner_checkout_drift_alert)
+    for dead_path in ('Сменить сервер', 'на карточке клиента', 'Чат-админка →'):
+        assert dead_path not in source.split('advice = (')[1].split(')')[0], f'снова мёртвый путь: {dead_path}'
+    assert 'Готовой кнопки для этого сегодня нет' in source
