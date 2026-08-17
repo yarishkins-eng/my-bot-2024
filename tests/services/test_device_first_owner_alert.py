@@ -184,12 +184,18 @@ async def test_quiet_pass_still_closes_the_shared_transaction():
 
 @pytest.mark.asyncio
 async def test_client_ready_message_is_never_retried():
-    """Для клиента `failed` означает НЕИЗВЕСТНЫЙ исход: Telegram мог сообщение принять."""
+    """Для клиента `failed` означает НЕИЗВЕСТНЫЙ исход: Telegram мог сообщение принять.
+
+    🔴 Проверяем НАМЕРЕНИЕ, а не буквальную строку: пункт 4.1 добавил владельцу ещё два типа,
+    и сторож на `notification_type = 'order_stuck'` покраснел бы, хотя клиентская строка
+    по-прежнему не повторяется. Красным он обязан становиться от `'ready'` в списке.
+    """
     db = _revive_db(0, 0)
     await revive_stale_notifications(db)
     _dead_sql, revive_sql = _revive_statements(db)
-    assert "notification_type = 'order_stuck'" in revive_sql
+    assert "'order_stuck'" in revive_sql
     assert "status = 'failed'" in revive_sql
+    assert f"'{READY_NOTIFICATION_TYPE}'" not in revive_sql, 'клиентская строка не должна повторяться никогда'
 
 
 @pytest.mark.asyncio
@@ -211,7 +217,14 @@ async def test_owner_alert_stuck_in_sending_is_reopened_but_client_one_is_not():
     _dead_sql, revive_sql = _revive_statements(db)
     assert "status = 'sending'" in revive_sql
     assert 'lease_expires_at <=' in revive_sql
-    assert revive_sql.count("notification_type = 'order_stuck'") == 1
+    # Оживление ограничено ровно строками ВЛАДЕЛЬЦУ: все его типы внутри, клиентский снаружи.
+    # 🔴 Имена ЗАШИТЫ намеренно. Первая версия этого сторожа перебирала
+    # `OWNER_NOTIFICATION_TYPES` — ту самую константу, которую код подставляет в `.in_()`, —
+    # и потому переживала схлопывание константы до одного типа. Скептик волны 2 это доказал
+    # экспериментом. Сторож, ломающийся только вместе с кодом, бесполезен.
+    assert "'ready'" not in revive_sql
+    for owner_type in ('order_stuck', 'entitlement_drift', 'target_drift'):
+        assert f"'{owner_type}'" in revive_sql, f'строка владельцу {owner_type} не оживляется'
 
 
 # --- развилка отправки: владельцу не должно уйти «✅ Подписка готова» -------------------
