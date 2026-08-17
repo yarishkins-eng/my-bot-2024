@@ -1318,16 +1318,34 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
         # уже выбирает новый расчёт, а сюда он попадает, не нажимая ничего.
         # 🔴 Про деньги спрашиваем БЭКЕНД, а не название причины: обещать «не списали» по
         # `terminal_reason` — ровно та ошибка, которую разбирал пункт 4.2б.
-        locally_abandoned = getattr(checkout, 'terminal_reason', '') == 'cancelled_by_user_after_invoice'
-        if locally_abandoned and await checkout_money_state(db, checkout) == 'no_money':
+        terminal_reason = str(getattr(checkout, 'terminal_reason', '') or '')
+        locally_abandoned = terminal_reason == 'cancelled_by_user_after_invoice'
+        # Поздняя оплата закрытого заказа — единственный случай, когда деньги ЕСТЬ. Причина
+        # ставится ровно в момент зачисления на баланс (`device_first_payment_service.py:2019-2023`),
+        # но утверждаем это только вместе с фактом денег из базы, а не по одной причине.
+        late_paid = terminal_reason == 'late_paid_wallet_credit'
+        money_state = await checkout_money_state(db, checkout) if locally_abandoned or late_paid else None
+        if late_paid and money_state == 'money_in_flight':
             caption = _text(
                 user,
-                '🛑 <b>Заказ отменён</b>\n\nДеньги не списаны. Если старая ссылка будет оплачена '
-                'позднее, сумма один раз зачислится на баланс — прежняя подписка не оформится. '
+                '💰 <b>Деньги на балансе</b>\n\nОплата по старому счёту дошла уже после того, как мы '
+                'закрыли заказ, — подпиской он не станет. Сумму мы зачислили вам на баланс: оформите '
+                'новый заказ, и он оплатится с него.',
+                '💰 <b>The money is on your balance</b>\n\nThe payment for the old invoice arrived after '
+                'we had closed the order, so it will not become a subscription. We credited the amount '
+                'to your balance: place a new order and it will be paid from there.',
+            )
+        elif locally_abandoned and money_state == 'no_money':
+            caption = _text(
+                user,
+                '🛑 <b>Заказ отменён</b>\n\nОплату мы так и не получили и закрыли этот заказ. Сами мы '
+                'ничего не списывали. Старая ссылка на оплату может ещё работать — не платите по ней: '
+                'деньги придут вам на баланс, а подписка по этому заказу всё равно не оформится. '
                 'Новый заказ можно оформить прямо сейчас.',
-                '🛑 <b>Order cancelled</b>\n\nNo money was charged. If the old link is paid later, '
-                'the amount is credited to your balance once — the previous subscription will not '
-                'be activated. You can place a new order right now.',
+                '🛑 <b>Order cancelled</b>\n\nWe never received the payment, so we closed this order. '
+                "We haven't charged you anything. The old payment link may still work — do not use it: "
+                "the money would go to your balance, and this order still won't become a subscription. "
+                'You can place a new order right now.',
             )
         else:
             caption = _text(

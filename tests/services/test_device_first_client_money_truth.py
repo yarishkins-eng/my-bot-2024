@@ -476,12 +476,35 @@ async def test_closed_cart_still_warns_about_the_link_that_stayed_alive():
     Раньше «не платите по старой ссылке» жило на экране разбора. Мина F увела заказ в
     `cancelled`, и без этой строки клиент остался бы вообще без предупреждения — а ссылка
     Platega живая, на этом стоит вся посылка мины: провайдер ещё считает счёт «в ожидании».
+
+    🔴 Запрет обязан быть ПРЯМЫМ. Первая версия текста описывала последствие («сумма
+    зачислится на баланс») — ревью показало, что так это читается как выгода и скорее
+    подталкивает оплатить.
     """
     caption = await _cancelled_screen('cancelled_by_user_after_invoice')
-    assert 'Деньги не списаны' in caption
+    assert 'не платите по ней' in caption.lower()
+    assert 'ничего не списывали' in caption
     assert 'на баланс' in caption
     # Обещать подписку за поздний платёж нельзя: старый заказ не оживает никогда.
     assert 'не оформится' in caption
+    # Про «прежнюю подписку» говорить нельзя: заказ бывает и на продление живой подписки.
+    assert 'прежняя подписка' not in caption.lower()
+
+
+@pytest.mark.asyncio
+async def test_late_payment_on_a_closed_cart_is_not_met_with_silence():
+    """🔴 Единственный случай, когда деньги ЕСТЬ, — и три линзы ревью нашли тут молчание.
+
+    Поздняя оплата кладёт сумму на баланс и меняет причину заказа. До этой ветки человек
+    читал «Этот заказ больше не будет оформлен» — про деньги ни слова, хотя они только что
+    пришли, и никакого уведомления при зачислении нет.
+    """
+    caption = await _cancelled_screen('late_paid_wallet_credit', money_state='money_in_flight')
+    assert 'баланс' in caption.lower()
+    assert 'не станет' in caption or 'не оформится' in caption
+    # Утверждение про деньги держится на факте из базы, а не на одной причине заказа.
+    silent = await _cancelled_screen('late_paid_wallet_credit', money_state='unknown')
+    assert 'зачислили вам на баланс' not in silent
 
 
 @pytest.mark.asyncio
@@ -515,5 +538,6 @@ async def test_provider_cancelled_invoice_keeps_its_old_screen():
 @pytest.mark.asyncio
 async def test_the_english_half_of_the_closed_cart_is_honest_too():
     caption = await _cancelled_screen('cancelled_by_user_after_invoice', language='en')
-    assert 'No money was charged' in caption
-    assert 'credited to your balance' in caption
+    assert "We haven't charged you anything" in caption
+    assert 'do not use it' in caption.lower()
+    assert 'balance' in caption.lower()
