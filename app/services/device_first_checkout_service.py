@@ -48,6 +48,11 @@ DIRECT_SETTLEMENT_MODE = 'direct_purchase_v2'
 KOPEKS_PER_RUBLE = 100
 READY_NOTIFICATION_TYPE = 'ready'
 OWNER_ALERT_NOTIFICATION_TYPE = 'order_stuck'
+# Пункт 4.1-Б. Права тарифа изменились между расчётом и оплатой. Заказ при этом выдаётся
+# захваченным набором — расхождение только СООБЩАЕТСЯ. Колонка `notification_type` —
+# обычный `String(48)` без CHECK (`models.py:3042`), поэтому новое значение не требует
+# ни миграции, ни ручного воркфлоу.
+ENTITLEMENT_DRIFT_NOTIFICATION_TYPE = 'entitlement_drift'
 # Окно свежести для строки владельцу. Оно же — второй замок от смертельной ловушки:
 # пять архивных заказов тарифа 3 не обновлялись с 03.08.2026, в окно они не попадают.
 OWNER_ALERT_LOOKBACK = timedelta(hours=24)
@@ -506,6 +511,157 @@ def _subscription_snapshot(subscription: Subscription | None) -> dict[str, Any]:
         'end_date': subscription.end_date.isoformat() if subscription.end_date else None,
         'updated_at': subscription.updated_at.isoformat() if subscription.updated_at else None,
     }
+
+
+# Пункт 4.1. Ключи, расхождение по которым означает «это уже ДРУГАЯ подписка», а не
+# «прошло время». Только они запрещают выдать оплаченный заказ.
+#
+# 🔴 Почему список явный, а не «сравнить словари целиком». Слепок снимается при создании
+# заказа (`:745`) и сверяется трижды: дважды до денег и один раз ПОСЛЕ (`:1711`), где
+# отказ означает «деньги взяли, подписку не выдали». Сравнение целиком ловило не подмену,
+# а время:
+#   `updated_at` стоит с `onupdate=func.now()` (`models.py:2486`) — его двигает ЛЮБАЯ
+#   запись в строку подписки, включая почасовую синхронизацию трафика
+#   (`subscription_service.py:1127`). То есть у активно пользующегося VPN человека —
+#   ровно у того, кто и приходит продлевать, — слепок протухал сам собой.
+#   `status` и `end_date` законно меняет монитор (`MONITORING_INTERVAL=60`): триал,
+#   истёкший между расчётом и оплатой, — это норма, а не повод уводить заказ в разбор.
+# Проверено на боевом: слепок заказа 36 (создан 12:41) держал `status='active'` и
+# `updated_at` от 14.08, а к 13:20 строка подписки 134 была переписана. Заплати человек
+# по тому счёту — заказ ушёл бы в `operator_review` с забранными деньгами.
+_SNAPSHOT_IDENTITY_KEYS = ('id', 'tariff_id', 'is_trial')
+
+# Двигаются законно и выдачу не запрещают. Но расхождение по ним пишется в лог: без этой
+# строки «сверку ослабили» невозможно отличить от «сверка никогда и не срабатывала».
+_SNAPSHOT_TOLERATED_KEYS = ('status', 'end_date', 'device_limit')
+
+
+def _snapshot_identity_drift(captured: Any, target: Subscription | None) -> tuple[str, ...]:
+    """Ключи, по которым захваченный слепок разошёлся с живой подпиской «по личности».
+
+    🔴 Отсутствие значимого ключа в старом слепке — это «не знаем», а НЕ «совпало».
+    Слепок без `id` молча проходил бы любую проверку, то есть сверка выключилась бы сама
+    на старых заказах. Считаем такой ключ разошедшимся и пересчитываем заказ.
+    """
+    if target is None:
+        return ('id',)
+    if not isinstance(captured, dict) or not captured:
+        return _SNAPSHOT_IDENTITY_KEYS
+    fresh = _subscription_snapshot(target)
+    return tuple(key for key in _SNAPSHOT_IDENTITY_KEYS if key not in captured or captured[key] != fresh[key])
+
+
+def _snapshot_tolerated_changes(captured: Any, target: Subscription | None) -> tuple[str, ...]:
+    if target is None or not isinstance(captured, dict) or not captured:
+        return ()
+    fresh = _subscription_snapshot(target)
+    return tuple(key for key in _SNAPSHOT_TOLERATED_KEYS if key in captured and captured[key] != fresh[key])
+
+
+def _target_snapshot_drift(
+    checkout: SubscriptionCheckout,
+    captured: Any,
+    target: Subscription | None,
+    *,
+    stage: str,
+) -> tuple[str, ...]:
+    """Решить, разошёлся ли слепок, и записать в лог то, что мы сознательно пропустили."""
+    drift = _snapshot_identity_drift(captured, target)
+    tolerated = _snapshot_tolerated_changes(captured, target)
+    if drift or tolerated:
+        _event(
+            'target_snapshot_compared',
+            checkout,
+            stage=stage,
+            drift=','.join(drift) or None,
+            tolerated=','.join(tolerated) or None,
+        )
+    return drift
+
+
+async def _resolve_checkout_entitlement(
+    db: AsyncSession,
+    *,
+    tariff: Tariff,
+    target: Subscription | None,
+):
+    """Единственное определение «чьи права мы берём» — подписки или тарифа.
+
+    🔴 Вынесено в одно место пунктом 4.1, и это не косметика. Сверка перед выдачей
+    обязана переспрашивать ТОТ ЖЕ источник: у платной подписки на `native_squads`
+    права берутся из её собственных `connected_squads`
+    (`public_location_entitlement_service.py:467-471`), а не из `allowed_squads` тарифа.
+    Сравни одно с другим — и каждое продление отчиталось бы ложным расхождением: на
+    боевом 105 подписок сидят на старых сквадах, а тариф 3 уже переведён на три новых.
+    Ровно в переезд Польши это залило бы владельца ложными тревогами.
+    """
+    from app.services.public_location_entitlement_service import (
+        get_subscription_resolved_entitlement,
+        resolve_tariff_entitlement,
+    )
+
+    if target is not None and not target.is_trial and getattr(tariff, 'entitlement_mode', None) == 'native_squads':
+        return await get_subscription_resolved_entitlement(db, target.id)
+    return await resolve_tariff_entitlement(db, tariff)
+
+
+async def _report_entitlement_drift_without_blocking(
+    db: AsyncSession,
+    *,
+    checkout: SubscriptionCheckout,
+    target: Subscription | None,
+    captured: Any,
+) -> None:
+    """Пункт 4.1-Б: права разъехались между расчётом и оплатой — сказать, но НЕ запретить.
+
+    🔴 **Запретом это делать нельзя, и это решение владельца, а не упрощение.** Отказ в
+    этой точке означает: деньги взяты, подписка не выдана, клиент заперт `operator_hold`,
+    тариф заперт забором живых заказов — а разобрать заказ нечем до пункта 4.4. Этап 3 и
+    есть массовая правка `allowed_squads`, то есть запрет производил бы такие оплаченные
+    заказы пачками прямо в момент переезда Польши. Клиент получает захваченный набор — тот,
+    за который заплатил, — а расхождение уходит владельцу.
+    Превращать в запрет — отдельным решением после 4.4, когда логи покажут, что ложных
+    срабатываний нет.
+
+    🔴 Функция обязана быть немой при любой своей поломке: она стоит ВНУТРИ денежной
+    транзакции, и её собственная ошибка не имеет права отменить выдачу оплаченной подписки.
+    """
+    try:
+        tariff = await db.get(Tariff, checkout.tariff_id)
+        if tariff is None:
+            return
+        current = await _resolve_checkout_entitlement(db, tariff=tariff, target=target)
+        captured_hash = getattr(captured, 'snapshot_hash', None)
+        if captured_hash is None or current.snapshot_hash == captured_hash:
+            return
+        _event(
+            'entitlement_drift_tolerated',
+            checkout,
+            captured_squads=len(captured.squad_uuids),
+            current_squads=len(current.squad_uuids),
+            provenance=current.provenance,
+        )
+        # Не полагаемся на IntegrityError: перехватить его здесь нечем — rollback отменил бы
+        # саму продажу. Поэтому спрашиваем заранее, а уникальный индекс остаётся страховкой.
+        already = await db.scalar(
+            select(DeviceFirstNotificationOutbox.id).where(
+                DeviceFirstNotificationOutbox.checkout_id == checkout.id,
+                DeviceFirstNotificationOutbox.notification_type == ENTITLEMENT_DRIFT_NOTIFICATION_TYPE,
+            )
+        )
+        if already is None:
+            db.add(
+                DeviceFirstNotificationOutbox(
+                    checkout_id=checkout.id,
+                    notification_type=ENTITLEMENT_DRIFT_NOTIFICATION_TYPE,
+                )
+            )
+    except Exception as error:
+        logger.warning(
+            'device_first_entitlement_drift_check_failed',
+            checkout_id=checkout.public_id,
+            error=type(error).__name__,
+        )
 
 
 async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]:
@@ -1207,7 +1363,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
             await db.commit()
             _event('conflict', checkout, reason=checkout.terminal_reason)
             return checkout
-    elif target is None or _subscription_snapshot(target) != checkout.target_snapshot:
+    elif _target_snapshot_drift(checkout, checkout.target_snapshot, target, stage='arm'):
         checkout.lifecycle_state = 'conflict'
         checkout.terminal_reason = 'target_subscription_changed'
         await db.commit()
@@ -1221,20 +1377,10 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         _event('conflict', checkout, reason=checkout.terminal_reason)
         return checkout
 
-    from app.services.public_location_entitlement_service import (
-        EntitlementResolutionError,
-        get_subscription_resolved_entitlement,
-        resolve_tariff_entitlement,
-    )
+    from app.services.public_location_entitlement_service import EntitlementResolutionError
 
     try:
-        entitlement = (
-            await get_subscription_resolved_entitlement(db, target.id)
-            if target is not None
-            and not target.is_trial
-            and getattr(tariff, 'entitlement_mode', None) == 'native_squads'
-            else await resolve_tariff_entitlement(db, tariff)
-        )
+        entitlement = await _resolve_checkout_entitlement(db, tariff=tariff, target=target)
     except EntitlementResolutionError as error:
         checkout.lifecycle_state = 'conflict'
         checkout.terminal_reason = 'location_policy_not_sellable'
@@ -1436,7 +1582,7 @@ async def _validate_direct_pre_commit(
             checkout.terminal_reason = 'subscription_appeared'
             await db.commit()
             return None
-    elif target is None or _subscription_snapshot(target) != checkout.target_snapshot:
+    elif _target_snapshot_drift(checkout, checkout.target_snapshot, target, stage='confirm'):
         checkout.lifecycle_state = 'conflict'
         checkout.terminal_reason = 'target_subscription_changed'
         await db.commit()
@@ -1708,7 +1854,10 @@ async def _complete_direct_sale_locked(
             checkout.lifecycle_state = 'operator_review'
             checkout.terminal_reason = 'subscription_appeared_after_payment'
             raise DeviceFirstError('operator_review_required', 'Subscription changed after payment')
-    elif target is None or _subscription_snapshot(target) != snapshot.get('target_snapshot'):
+    elif _target_snapshot_drift(checkout, snapshot.get('target_snapshot'), target, stage='fulfil'):
+        # 🔴 Единственное место сверки, где отказ стоит денег: сюда приходят уже
+        # оплаченные заказы. Поэтому здесь запрещает только подмена самой подписки
+        # (`_SNAPSHOT_IDENTITY_KEYS`), а не прошедшее время.
         checkout.lifecycle_state = 'operator_review'
         checkout.terminal_reason = 'target_subscription_changed_after_payment'
         raise DeviceFirstError('operator_review_required', 'Subscription changed after payment')
@@ -1761,6 +1910,8 @@ async def _complete_direct_sale_locked(
                 'operator_review_required',
                 'The captured access evidence changed after the unpaid invoice',
             )
+    else:
+        await _report_entitlement_drift_without_blocking(db, checkout=checkout, target=target, captured=entitlement)
 
     # The subscription row/immutable term is prepared before the debit or
     # provider receipt is made durable.  A term constraint or source-fence
@@ -2772,6 +2923,39 @@ async def _send_owner_order_stuck_alert(db: AsyncSession, *, bot, checkout: Subs
     return True
 
 
+async def _send_owner_entitlement_drift_alert(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
+    """Пункт 4.1-Б: заказ ВЫДАН, но набор серверов тарифа успел измениться, пока клиент платил.
+
+    🔴 `_owner_alert_is_obsolete` здесь применять нельзя: она гасит тревогу на `ready`, а эта
+    строка как раз про успешно выданный заказ — она была бы «устаревшей» всегда.
+    """
+    from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
+
+    service = AdminNotificationService(bot)
+    if not service.is_enabled:
+        raise RuntimeError('admin_notifications_disabled')
+    user = await db.get(User, checkout.user_id)
+    snapshot = checkout.sale_snapshot if isinstance(checkout.sale_snapshot, dict) else {}
+    tariff_name = html.escape(str(snapshot.get('tariff_name') or f'тариф {checkout.tariff_id}'))
+    who = html.escape(user.full_name) if user is not None and user.full_name else f'клиент id {checkout.user_id}'
+    text = '\n'.join(
+        [
+            '⚠️ <b>СЕРВЕРЫ ТАРИФА ИЗМЕНИЛИСЬ, ПОКА КЛИЕНТ ПЛАТИЛ</b>',
+            '',
+            f'👤 {who} (id {checkout.user_id})',
+            f'🏷️ Тариф: <b>{tariff_name}</b> • заказ <code>{html.escape(str(checkout.public_id))}</code>',
+            '',
+            '🟢 Подписка <b>выдана</b>, деньги приняты, разбирать нечего. Клиент получил тот',
+            'набор серверов, который ему показали при расчёте.',
+            '',
+            '👉 Если вы в этот момент переводили тариф на новые серверы — этого клиента',
+            'нужно перевести вручную, сам он не переедет.',
+        ]
+    )
+    if not await service.send_admin_notification(text, category=NotificationCategory.ERRORS):
+        raise RuntimeError('admin_notification_not_delivered')
+
+
 async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
     user = await db.get(User, checkout.user_id)
     if user is None or not user.telegram_id:
@@ -2851,6 +3035,10 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
             # клиентским текстом «✅ Подписка готова» — про сорванный заказ.
             if row.notification_type == OWNER_ALERT_NOTIFICATION_TYPE:
                 obsolete = not await _send_owner_order_stuck_alert(db, bot=bot, checkout=checkout)
+            elif row.notification_type == ENTITLEMENT_DRIFT_NOTIFICATION_TYPE:
+                # 🔴 Ветка обязана стоять ДО `else`: без неё строка владельцу ушла бы
+                # клиенту текстом «✅ Подписка готова» — вторым сообщением про тот же заказ.
+                await _send_owner_entitlement_drift_alert(db, bot=bot, checkout=checkout)
             else:
                 await _send_client_ready_message(db, bot=bot, checkout=checkout)
         except Exception as exc:  # do not retry an uncertain external send
