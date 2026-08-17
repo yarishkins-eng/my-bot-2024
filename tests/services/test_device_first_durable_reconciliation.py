@@ -9,6 +9,7 @@
 (на боевом такие все 15 из 15). Это прямое требование блока «4.1 подробно» плана.
 """
 
+from contextlib import suppress
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -46,6 +47,7 @@ def checkout_stub(**overrides):
         'user_id': 189,
         'tariff_id': 3,
         'lifecycle_state': 'armed',
+        'provisioning_state': 'ready',
         'sale_snapshot': {'tariff_name': 'Базовый'},
     }
     base.update(overrides)
@@ -166,13 +168,31 @@ def test_an_unchanged_snapshot_writes_nothing_at_all():
 # --- 4.1-Б. Сверка прав: сообщает, но не запрещает ----------------------------------
 
 
-def _drift_db(*, tariff, resolved, existing_row=None):
+def live_user(**overrides):
+    base = {
+        'id': 189,
+        'telegram_id': 123456,
+        'username': 'k',
+        'language': 'ru',
+        'full_name': 'Клиент',
+        'account_erased_at': None,
+        'account_erasure_requested_at': None,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _drift_db(*, tariff, resolved=None, existing_row=None):
     db = MagicMock()
     db.get = AsyncMock(return_value=tariff)
     db.scalar = AsyncMock(return_value=existing_row)
     db.add = MagicMock()
     db.commit = AsyncMock()
     return db
+
+
+def _enabled_alerts():
+    return patch.object(service, '_owner_alerts_enabled', return_value=True)
 
 
 @pytest.mark.asyncio
@@ -231,7 +251,10 @@ async def test_drift_queues_one_owner_row_and_never_touches_the_order():
     db = _drift_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), resolved=current)
 
     with patch.object(service, '_resolve_checkout_entitlement', AsyncMock(return_value=current)):
-        await service._report_entitlement_drift_without_blocking(db, checkout=checkout, target=None, captured=captured)
+        with _enabled_alerts():
+            await service._report_entitlement_drift_without_blocking(
+                db, checkout=checkout, user=live_user(), target=None, captured=captured
+            )
 
     db.add.assert_called_once()
     queued = db.add.call_args.args[0]
@@ -248,9 +271,10 @@ async def test_no_row_when_the_entitlement_did_not_move():
     db = _drift_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), resolved=same)
 
     with patch.object(service, '_resolve_checkout_entitlement', AsyncMock(return_value=same)):
-        await service._report_entitlement_drift_without_blocking(
-            db, checkout=checkout_stub(), target=None, captured=same
-        )
+        with _enabled_alerts():
+            await service._report_entitlement_drift_without_blocking(
+                db, checkout=checkout_stub(), user=live_user(), target=None, captured=same
+            )
 
     db.add.assert_not_called()
 
@@ -263,9 +287,10 @@ async def test_a_second_pass_does_not_queue_a_duplicate_row():
     db = _drift_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), resolved=current, existing_row=7)
 
     with patch.object(service, '_resolve_checkout_entitlement', AsyncMock(return_value=current)):
-        await service._report_entitlement_drift_without_blocking(
-            db, checkout=checkout_stub(), target=None, captured=captured
-        )
+        with _enabled_alerts():
+            await service._report_entitlement_drift_without_blocking(
+                db, checkout=checkout_stub(), user=live_user(), target=None, captured=captured
+            )
 
     db.add.assert_not_called()
 
@@ -277,9 +302,10 @@ async def test_the_drift_check_can_never_break_the_sale():
     db = _drift_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), resolved=None)
 
     with patch.object(service, '_resolve_checkout_entitlement', AsyncMock(side_effect=RuntimeError('panel down'))):
-        await service._report_entitlement_drift_without_blocking(
-            db, checkout=checkout_stub(), target=None, captured=captured
-        )
+        with _enabled_alerts():
+            await service._report_entitlement_drift_without_blocking(
+                db, checkout=checkout_stub(), user=live_user(), target=None, captured=captured
+            )
 
     db.add.assert_not_called()
 
@@ -289,9 +315,10 @@ async def test_a_missing_tariff_is_silent_too():
     captured = ResolvedEntitlement((), ('old-squad',), 0, 'native_squads')
     db = _drift_db(tariff=None, resolved=None)
 
-    await service._report_entitlement_drift_without_blocking(
-        db, checkout=checkout_stub(), target=None, captured=captured
-    )
+    with _enabled_alerts():
+        await service._report_entitlement_drift_without_blocking(
+            db, checkout=checkout_stub(), user=live_user(), target=None, captured=captured
+        )
 
     db.add.assert_not_called()
 
@@ -403,3 +430,322 @@ async def test_the_drift_alert_survives_a_ready_order():
 def test_the_two_owner_notification_types_stay_distinct():
     assert ENTITLEMENT_DRIFT_NOTIFICATION_TYPE != OWNER_ALERT_NOTIFICATION_TYPE
     assert len(ENTITLEMENT_DRIFT_NOTIFICATION_TYPE) <= 48, 'колонка notification_type — String(48)'
+    assert len(service.TARGET_DRIFT_NOTIFICATION_TYPE) <= 48
+
+
+# --- находки волны 1: каждая закрыта своим сторожем ---------------------------------
+
+
+def test_every_snapshot_key_is_either_significant_or_logged():
+    """Ключ, не попавший ни в один список, невидим в обе стороны — ни сверки, ни следа."""
+    covered = set(service._SNAPSHOT_IDENTITY_KEYS) | set(service._SNAPSHOT_TOLERATED_KEYS)
+    assert set(service._subscription_snapshot(live_trial())) == covered
+
+
+def test_the_noisy_field_still_leaves_a_trace():
+    """Главный случай пункта: сдвинулся ТОЛЬКО updated_at. Он обязан попасть в лог."""
+    captured = service._subscription_snapshot(live_trial())
+    moved = live_trial(updated_at=datetime(2026, 8, 17, 13, 20, 56, tzinfo=UTC))
+
+    with patch.object(service, '_event') as event:
+        service._target_snapshot_drift(checkout_stub(), captured, moved, stage='fulfil')
+
+    event.assert_called_once()
+    assert event.call_args.kwargs['tolerated'] == 'updated_at'
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_entitlement_is_reported_not_swallowed():
+    """🔴 Находка волны 1. Смена серверов СНАЧАЛА ломает разрешение прав и только потом
+    даёт другой ответ. Проглотив ошибку, мы молчали бы ровно в переезде Польши."""
+    from app.services.public_location_entitlement_service import EntitlementResolutionError
+
+    db = _drift_db(tariff=SimpleNamespace(id=4, entitlement_mode='legacy_snapshot'))
+    boom = AsyncMock(side_effect=EntitlementResolutionError('legacy tariff UUIDs do not match its manifest'))
+
+    with patch.object(service, '_resolve_checkout_entitlement', boom), _enabled_alerts():
+        await service._report_entitlement_drift_without_blocking(
+            db,
+            checkout=checkout_stub(),
+            user=live_user(),
+            target=None,
+            captured=ResolvedEntitlement((), ('old',), 0, 'legacy_manifest'),
+        )
+
+    db.add.assert_called_once()
+    assert db.add.call_args.args[0].notification_type == ENTITLEMENT_DRIFT_NOTIFICATION_TYPE
+
+
+@pytest.mark.asyncio
+async def test_reordering_the_same_servers_is_not_a_drift():
+    """Хеш чувствителен к порядку, состав — нет. Сообщающей сверке нужен состав."""
+    captured = ResolvedEntitlement((), ('squad-a', 'squad-b'), 0, 'native_squads')
+    reordered = ResolvedEntitlement((), ('squad-b', 'squad-a'), 0, 'native_squads')
+    assert captured.snapshot_hash != reordered.snapshot_hash, 'иначе тест ничего не проверяет'
+    db = _drift_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'))
+
+    with patch.object(service, '_resolve_checkout_entitlement', AsyncMock(return_value=reordered)), _enabled_alerts():
+        await service._report_entitlement_drift_without_blocking(
+            db, checkout=checkout_stub(), user=live_user(), target=None, captured=captured
+        )
+
+    db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['account_erased_at', 'account_erasure_requested_at'])
+async def test_an_erased_user_never_gets_named_in_the_admin_chat(field):
+    """Тот же замок PII, что у тревоги 4.3."""
+    db = _drift_db(tariff=None)
+
+    with _enabled_alerts():
+        await service._queue_owner_checkout_drift_row(
+            db,
+            checkout=checkout_stub(),
+            user=live_user(**{field: datetime(2026, 8, 1, tzinfo=UTC)}),
+            notification_type=service.TARGET_DRIFT_NOTIFICATION_TYPE,
+        )
+
+    db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_nothing_is_queued_while_owner_alerts_are_off():
+    """Иначе выключенный админ-чат копит строки, которые гарантированно упадут."""
+    db = _drift_db(tariff=None)
+
+    with patch.object(service, '_owner_alerts_enabled', return_value=False):
+        await service._queue_owner_checkout_drift_row(
+            db,
+            checkout=checkout_stub(),
+            user=live_user(),
+            notification_type=service.TARGET_DRIFT_NOTIFICATION_TYPE,
+        )
+
+    db.add.assert_not_called()
+
+
+def test_both_new_owner_types_are_retried_and_the_client_one_is_not():
+    """Для владельца проект решил: потеря дороже дубля. Клиенту — наоборот."""
+    assert service.READY_NOTIFICATION_TYPE not in service.OWNER_NOTIFICATION_TYPES
+    for owner_type in (
+        OWNER_ALERT_NOTIFICATION_TYPE,
+        ENTITLEMENT_DRIFT_NOTIFICATION_TYPE,
+        service.TARGET_DRIFT_NOTIFICATION_TYPE,
+    ):
+        assert owner_type in service.OWNER_NOTIFICATION_TYPES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('lifecycle', 'provisioning', 'must_claim_delivered'),
+    [('ready', 'ready', True), ('operator_review', 'not_started', False), ('fulfilling', 'pending', False)],
+)
+async def test_the_alert_never_claims_delivery_that_did_not_happen(lifecycle, provisioning, must_claim_delivered):
+    """🔴 Проверено экспериментом: строка, добавленная до `begin_nested`, переживает откат
+    сейвпоинта. Значит заказ мог уйти в разбор, а мы бы писали «разбирать нечего»."""
+    checkout = checkout_stub(lifecycle_state=lifecycle, provisioning_state=provisioning)
+    admin = MagicMock()
+    admin.is_enabled = True
+    admin.send_admin_notification = AsyncMock(return_value=True)
+    db = MagicMock()
+    db.get = AsyncMock(return_value=live_user())
+
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        await service._send_owner_checkout_drift_alert(
+            db, bot=MagicMock(), checkout=checkout, notification_type=ENTITLEMENT_DRIFT_NOTIFICATION_TYPE
+        )
+
+    text = admin.send_admin_notification.await_args.args[0]
+    assert ('Подписка выдана' in text) is must_claim_delivered
+    if not must_claim_delivered:
+        assert 'ЗАКАЗ ЗАВИС' in text, 'владельца надо отправить к тому сообщению, по которому он и будет действовать'
+
+
+@pytest.mark.asyncio
+async def test_the_reset_alert_tells_the_owner_his_block_was_undone():
+    """Находка волны 1: «Обнулить подписку» отменяется пришедшим платежом молча."""
+    admin = MagicMock()
+    admin.is_enabled = True
+    admin.send_admin_notification = AsyncMock(return_value=True)
+    db = MagicMock()
+    db.get = AsyncMock(return_value=live_user())
+
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        await service._send_owner_checkout_drift_alert(
+            db,
+            bot=MagicMock(),
+            checkout=checkout_stub(lifecycle_state='ready', provisioning_state='ready'),
+            notification_type=service.TARGET_DRIFT_NOTIFICATION_TYPE,
+        )
+
+    text = admin.send_admin_notification.await_args.args[0]
+    assert 'Обнулить подписку' in text
+    assert 'повторить' in text
+    assert 'серверов' not in text, 'это другая причина — не путать владельца сменой серверов'
+
+
+def test_the_alert_identifies_the_client_and_escapes_his_name():
+    """Владельца просят пойти и что-то сделать с клиентом — он должен его опознать."""
+    hostile = live_user(full_name='<b>Вася</b> & Ко', username='vasya')
+    line = service._owner_client_line(hostile, checkout_stub())
+
+    assert 'tg://user?id=123456' in line
+    assert '@vasya' in line
+    assert '&lt;b&gt;' in line and '<b>Вася' not in line
+
+
+# --- находки волны 1 на самом денежном пути ------------------------------------------
+
+
+class _Savepoint:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+def _paid_sale(target, *, snapshot_device_limit=5):
+    """Оплаченный заказ на продление живой платной подписки, режим НЕ access-point."""
+    entitlement = ResolvedEntitlement((), ('squad-1',), 0, 'native_squads')
+    checkout = SimpleNamespace(
+        id=40,
+        public_id='checkout-40',
+        user_id=189,
+        tariff_id=3,
+        lifecycle_state='armed',
+        provisioning_state='not_started',
+        fulfillment_state='not_started',
+        funding_mode='wallet',
+        expect_no_subscription=False,
+        selected_device_limit=snapshot_device_limit,
+        period_days=30,
+        tariff_total_kopeks=36_900,
+        wallet_applied_kopeks=36_900,
+        external_payable_kopeks=0,
+        target_snapshot=service._subscription_snapshot(target),
+        sale_snapshot={
+            'currency': 'RUB',
+            'tariff_total_kopeks': 36_900,
+            'funding_mode': 'wallet',
+            'period_days': 30,
+            'traffic_limit_gb': 100,
+            'device_limit': snapshot_device_limit,
+            'tariff_id': 3,
+            'tariff_name': 'Базовый',
+            'target_snapshot': service._subscription_snapshot(target),
+            'entitlement': entitlement.snapshot_payload(),
+            'entitlement_hash': entitlement.snapshot_hash,
+        },
+    )
+    return checkout, entitlement
+
+
+def _sale_db(*, tariff, user, existing_row=None):
+    db = MagicMock()
+
+    async def _get(model, _key):
+        return {'Tariff': tariff, 'User': user}.get(model.__name__)
+
+    db.get = AsyncMock(side_effect=_get)
+    db.scalar = AsyncMock(return_value=existing_row)
+    db.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None))
+    db.add = MagicMock()
+    db.commit = AsyncMock()
+    db.begin_nested = MagicMock(return_value=_Savepoint())
+    return db
+
+
+@pytest.mark.asyncio
+async def test_a_customer_never_loses_devices_he_paid_for_separately(monkeypatch):
+    """🔴 Находка волны 1, нашли три ревьюера независимо.
+
+    Человек продлевает на 5 устройств, а пока идёт платёж — докупает в кабинете ещё 2
+    (деньги списаны, лимит 7). `extend_subscription` присваивает лимит без разговоров,
+    поэтому выдача вернула бы 5 и молча съела оплаченное. Берём больший.
+    """
+    target = live_trial(id=134, is_trial=False, device_limit=7, status='active')
+    checkout, entitlement = _paid_sale(target, snapshot_device_limit=5)
+    user = live_user(balance_kopeks=100_000)
+    db = _sale_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), user=user)
+    extend = AsyncMock(return_value=target)
+
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, 'extend_subscription', extend)
+    monkeypatch.setattr(service, '_resolve_checkout_entitlement', AsyncMock(return_value=entitlement))
+    monkeypatch.setattr(service, '_owner_alerts_enabled', lambda: True)
+
+    # Продажа идёт дальше по денежному пути и упирается в неполные моки — нам важно
+    # только то, что случилось ДО этого места.
+    with suppress(Exception):
+        await service._complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
+
+    extend.assert_awaited_once()
+    assert extend.await_args.kwargs['device_limit'] == 7, 'оплаченные устройства нельзя отнимать'
+
+
+@pytest.mark.asyncio
+async def test_a_reset_undone_by_a_late_payment_reaches_the_owner(monkeypatch):
+    """🔴 Находка волны 1: «Обнулить подписку» отменяется пришедшим платежом молча.
+
+    Обнуление не трогает ни `id`, ни `tariff_id`, ни `is_trial` — то есть новая сверка его
+    пропускает, и это правильно (деньги взяты, подписку надо выдать). Но владелец обязан
+    узнать, что его отключение сняли.
+    """
+    target = live_trial(id=134, is_trial=False, device_limit=5, status='active')
+    checkout, entitlement = _paid_sale(target, snapshot_device_limit=5)
+    # Админ обнулил подписку уже ПОСЛЕ того, как заказ снял слепок.
+    target.status = 'disabled'
+    target.end_date = datetime(2026, 8, 18, tzinfo=UTC)
+    user = live_user(balance_kopeks=100_000)
+    db = _sale_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), user=user)
+
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, 'extend_subscription', AsyncMock(return_value=target))
+    monkeypatch.setattr(service, '_resolve_checkout_entitlement', AsyncMock(return_value=entitlement))
+    monkeypatch.setattr(service, '_owner_alerts_enabled', lambda: True)
+
+    # Продажа идёт дальше по денежному пути и упирается в неполные моки — нам важно
+    # только то, что случилось ДО этого места.
+    with suppress(Exception):
+        await service._complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
+
+    queued = [call.args[0] for call in db.add.call_args_list]
+    types = {getattr(row, 'notification_type', None) for row in queued}
+    assert service.TARGET_DRIFT_NOTIFICATION_TYPE in types, 'владелец обязан узнать, что обнуление сняли'
+    # Заказ при этом НЕ уходит в разбор: деньги взяты, подписку выдаём.
+    assert getattr(checkout, 'terminal_reason', None) != 'target_subscription_changed_after_payment'
+
+
+@pytest.mark.asyncio
+async def test_pure_background_noise_does_not_bother_the_owner(monkeypatch):
+    """Сдвинулся только `updated_at` — строки владельцу быть не должно, иначе она придёт
+    почти на каждую покупку и обесценит сам канал."""
+    target = live_trial(id=134, is_trial=False, device_limit=5, status='active')
+    checkout, entitlement = _paid_sale(target, snapshot_device_limit=5)
+    target.updated_at = datetime(2026, 8, 18, 9, 0, tzinfo=UTC)
+    user = live_user(balance_kopeks=100_000)
+    db = _sale_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), user=user)
+
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, 'extend_subscription', AsyncMock(return_value=target))
+    monkeypatch.setattr(service, '_resolve_checkout_entitlement', AsyncMock(return_value=entitlement))
+    monkeypatch.setattr(service, '_owner_alerts_enabled', lambda: True)
+
+    # Продажа идёт дальше по денежному пути и упирается в неполные моки — нам важно
+    # только то, что случилось ДО этого места.
+    with suppress(Exception):
+        await service._complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
+
+    types = {getattr(call.args[0], 'notification_type', None) for call in db.add.call_args_list}
+    assert service.TARGET_DRIFT_NOTIFICATION_TYPE not in types
+
+
+def test_the_alert_text_has_no_hand_rolled_line_breaks():
+    """Перенос строки в коде — это настоящий перенос в Telegram посреди предложения."""
+    import inspect
+
+    source = inspect.getsource(service._send_owner_checkout_drift_alert)
+    for fragment in ('Деньги пришли,', 'Пока человек платил,'):
+        assert fragment in source
