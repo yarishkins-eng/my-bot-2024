@@ -688,18 +688,54 @@ async def _apply_direct_pending_provider_observation(
         if existing_expiry is not None and observed_expiry is not None
         else existing_expiry or observed_expiry
     )
-    # A known elapsed provider deadline is contradictory with a fresh live
-    # status and remains fail-closed. A missing deadline is different: Platega
-    # has confirmed the exact invoice is PENDING/INPROGRESS, but does not
-    # expose its TTL. Keep one durable invoice and poll its canonical status;
-    # do not convert a usable payment into an operator-only screen.
+    # A missing deadline is not a hold: Platega has confirmed the exact invoice
+    # is PENDING/INPROGRESS but does not expose its TTL. Keep one durable
+    # invoice and poll its canonical status.
+    #
+    # 🔴 Мина F. Истёкший срок счёта — это БРОШЕННАЯ КОРЗИНА, а не авария, и здесь есть
+    # всё, чтобы одно отличить от другого: счёт опознан точно (`_has_exact_direct_invoice_details`
+    # выше), денег нет (`payment.is_paid` ложно, иначе вышли бы на :661), а срок назвала
+    # САМА Platega (`expiresIn`, :676 и :718) и он уже прошёл. Разбирать тут нечего: оба
+    # живых случая (заказы 32 и 34) закрылись сами, когда провайдер через ~6 часов отчитался
+    # отменой. Прежний `operator_review` при этом запирал клиенту новую покупку
+    # (`device_first_checkout_service.py:631-647`), запирал смену серверов тарифа
+    # (`crud/tariff.py:320-357`) и слал владельцу ложную тревогу «ЗАКАЗ ЗАВИС».
+    #
+    # 🔴 Целевое состояние выбрано не произвольно: оно обязано совпасть с ручной отменой
+    # (`abandon_direct_checkout_for_new_calculation`, `:1038-1045`), потому что
+    #   · `cancelled` + `cancelled_by_user_after_invoice` — единственная пара, при которой
+    #     ПОЗДНЯЯ оплата вернётся человеку на баланс (`:1976-1985`). Закрытие в `expired` или
+    #     с новой причиной сломало бы возврат: сумма повисла бы кредитом сверки;
+    #   · та же пара снимает забор триала (`trial_activation_service.py:298-299`);
+    #   · 🔴 попытка ОБЯЗАНА уйти из `pending`, иначе главного мина F не сделает: забор смены
+    #     серверов — это `or_` из двух ветвей (`crud/tariff.py:348-354`), и отмена заказа
+    #     размыкает только первую. Вторая (`live_provider_attempt`, `:336-342`) смотрит мимо
+    #     заказа, на `CheckoutPaymentAttempt.status in ('creating','pending','paid_processing')`
+    #     (`:53`), — тариф остался бы заперт молча, до первой попытки владельца сменить серверы.
+    # Название причины попытки отличается от ручной отмены намеренно (читателей у неё ноль,
+    # проверено грепом по `app/`), но 🔴 считать мину F по базе им НЕЛЬЗЯ: когда провайдер
+    # наконец отчитается отменой, `_release_direct_terminal_invoice` перезапишет и причину
+    # попытки, и `terminal_reason` заказа (`:444-457`) — по живым случаям это ~6 часов.
+    # Долговечный след ровно один: событие лога `device_first_direct_invoice_abandoned_after_
+    # provider_deadline` ниже. Считать по нему.
+    # `next_reconcile_at` намеренно не трогаем: у вызова из воркера бэкофф уже проставлен
+    # (`:2283-2287`), у вызова при создании счёта стоит срок из `:1353`. В обоих случаях счёт
+    # остаётся в выборке опроса (`:2140-2145`) — поздняя оплата не потеряется.
     if provider_expires_at is not None and provider_expires_at <= datetime.now(UTC):
-        payment.status = 'OPERATOR_REVIEW'
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'provider_invoice_missing_or_elapsed_expiry'
-        checkout.lifecycle_state = 'operator_review'
-        checkout.terminal_reason = 'provider_invoice_missing_or_elapsed_expiry'
+        payment.status = 'VERIFYING'
+        attempt.status = 'reconciliation'
+        attempt.reconciliation_reason = 'provider_invoice_abandoned_after_expiry'
+        checkout.lifecycle_state = 'cancelled'
+        checkout.quote_state = 'expired'
+        checkout.funding_state = 'invoice_abandoned'
+        checkout.terminal_reason = 'cancelled_by_user_after_invoice'
         await db.commit()
+        logger.info(
+            'device_first_direct_invoice_abandoned_after_provider_deadline',
+            checkout_id=checkout.public_id,
+            attempt_id=attempt.id,
+            payment_id=payment.id,
+        )
         return False
 
     amount_kopeks, currency = PlategaService.parse_amount_currency(payload) or (0, '')

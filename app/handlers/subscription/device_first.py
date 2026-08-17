@@ -1309,19 +1309,58 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[button], [_main_menu(user)]])
     elif result['ui_state'] == 'cancelled':
         provider_terminal = str(getattr(checkout, 'terminal_reason', '')).startswith('provider_terminal:')
-        caption = _text(
-            user,
-            (
-                '✅ <b>Предыдущий счёт закрыт</b>\n\nВыберите срок и устройства для нового заказа.'
-                if provider_terminal
-                else '🛑 <b>Заказ отменён</b>\n\nЭтот заказ больше не будет оформлен.'
-            ),
-            (
-                '✅ <b>The previous invoice is closed</b>\n\nChoose a period and devices for a new order.'
-                if provider_terminal
-                else '🛑 <b>Order cancelled</b>\n\nThis order will not be completed.'
-            ),
-        )
+        # 🔴 Мина F. Сюда теперь приходит и брошенная корзина, закрытая после срока счёта
+        # (`device_first_payment_service.py:696-737`). У неё, в отличие от отмены самой
+        # Platega, платёжная ссылка может ещё принять деньги — про это обязано быть сказано.
+        # Обещание про баланс дословно повторяет экран ручной отмены (`:1725-1735`): состояние
+        # и причина заказа те же, и два разных описания одного состояния расходились бы.
+        # Добавлена только строка «оформить прямо сейчас» — при ручной отмене человек и так
+        # уже выбирает новый расчёт, а сюда он попадает, не нажимая ничего.
+        # 🔴 Про деньги спрашиваем БЭКЕНД, а не название причины: обещать «не списали» по
+        # `terminal_reason` — ровно та ошибка, которую разбирал пункт 4.2б.
+        terminal_reason = str(getattr(checkout, 'terminal_reason', '') or '')
+        locally_abandoned = terminal_reason == 'cancelled_by_user_after_invoice'
+        # Поздняя оплата закрытого заказа — единственный случай, когда деньги ЕСТЬ. Причина
+        # ставится ровно в момент зачисления на баланс (`device_first_payment_service.py:2019-2023`),
+        # но утверждаем это только вместе с фактом денег из базы, а не по одной причине.
+        late_paid = terminal_reason == 'late_paid_wallet_credit'
+        money_state = await checkout_money_state(db, checkout) if locally_abandoned or late_paid else None
+        if late_paid and money_state == 'money_in_flight':
+            caption = _text(
+                user,
+                '💰 <b>Деньги на балансе</b>\n\nОплата по старому счёту дошла уже после того, как мы '
+                'закрыли заказ, — подпиской он не станет. Сумму мы зачислили вам на баланс: оформите '
+                'новый заказ, и он оплатится с него.',
+                '💰 <b>The money is on your balance</b>\n\nThe payment for the old invoice arrived after '
+                'we had closed the order, so it will not become a subscription. We credited the amount '
+                'to your balance: place a new order and it will be paid from there.',
+            )
+        elif locally_abandoned and money_state == 'no_money':
+            caption = _text(
+                user,
+                '🛑 <b>Заказ отменён</b>\n\nОплату мы так и не получили и закрыли этот заказ. Сами мы '
+                'ничего не списывали. Старая ссылка на оплату может ещё работать — не платите по ней: '
+                'деньги придут вам на баланс, а подписка по этому заказу всё равно не оформится. '
+                'Новый заказ можно оформить прямо сейчас.',
+                '🛑 <b>Order cancelled</b>\n\nWe never received the payment, so we closed this order. '
+                "We haven't charged you anything. The old payment link may still work — do not use it: "
+                "the money would go to your balance, and this order still won't become a subscription. "
+                'You can place a new order right now.',
+            )
+        else:
+            caption = _text(
+                user,
+                (
+                    '✅ <b>Предыдущий счёт закрыт</b>\n\nВыберите срок и устройства для нового заказа.'
+                    if provider_terminal
+                    else '🛑 <b>Заказ отменён</b>\n\nЭтот заказ больше не будет оформлен.'
+                ),
+                (
+                    '✅ <b>The previous invoice is closed</b>\n\nChoose a period and devices for a new order.'
+                    if provider_terminal
+                    else '🛑 <b>Order cancelled</b>\n\nThis order will not be completed.'
+                ),
+            )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1392,20 +1431,22 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
             ]
         )
     elif result['ui_state'] == 'operator_review':
-        # Этап 4.0 завёл сюда ДЕНЕЖНЫЙ путь, но в это же состояние падает и брошенная
-        # корзина, где денег не было вовсе (мина F). Пункт 4.2б: спрашиваем бэкенд, брали
-        # ли деньги, и говорим правду — «Платёж получен» всем подряд активно мешало
-        # заплатить тем, кто как раз хотел.
+        # Этап 4.0 завёл сюда ДЕНЕЖНЫЙ путь. Пункт 4.2б: спрашиваем бэкенд, брали ли деньги,
+        # и говорим правду — «Платёж получен» всем подряд активно мешало заплатить тем, кто
+        # как раз хотел.
+        # ⚠️ С мины F брошенная корзина сюда БОЛЬШЕ НЕ ПАДАЕТ (её ветка — `cancelled` выше).
+        # Ветка `no_money` осталась для оплаты с баланса без списания и для строк, доставшихся
+        # от прежних версий. 🔴 Пять архивных заказов тарифа 3 сюда НЕ относятся: у них причина
+        # `direct_payment_binding_mismatch`, и вердикт им — «не знаем», проверено на боевом.
         # 🔴 Ни в одной ветке НЕ звать оформлять заказ заново: запрет живёт в коде
         # (`operator_hold`, `device_first_checkout_service.py:631-646`), и триал закрыт
         # тем же замком. Снимают его мина F и пункт 4.4, не этот экран.
         money_state = await checkout_money_state(db, checkout)
         if money_state == 'no_money':
             # Не «счёт просрочен»: сюда же попадает оплата с баланса, где счёта нет вовсе.
-            # 🔴 Предупреждение про старую ссылку обязано остаться. Причина, по которой
-            # заказ здесь, ставится когда провайдер ещё считает счёт живым
-            # (`device_first_payment_service.py:696-703`), то есть ссылка может принять
-            # деньги. Возврат таких денег на баланс требует статуса `cancelled` (`:1946-1952`),
+            # 🔴 Предупреждение про старую ссылку обязано остаться: у заказа, лежащего в этом
+            # состоянии со старых времён, счёт у провайдера мог остаться живым. Возврат таких
+            # денег на баланс требует статуса `cancelled` (`device_first_payment_service.py:1976-1985`),
             # а у нас `operator_review` — значит сумма ляжет кредитом сверки на ручной разбор.
             caption = _text(
                 user,
