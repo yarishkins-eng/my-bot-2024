@@ -527,14 +527,15 @@ def _subscription_snapshot(subscription: Subscription | None) -> dict[str, Any]:
 # Пункт 4.1. Ключи, расхождение по которым означает «это уже ДРУГАЯ подписка», а не
 # «прошло время». Только они запрещают выдать оплаченный заказ.
 #
-# 🔴 Почему список явный, а не «сравнить словари целиком». Слепок снимается при создании
-# заказа (`:745`) и сверяется трижды: дважды до денег и один раз ПОСЛЕ (`:1711`), где
-# отказ означает «деньги взяли, подписку не выдали». Сравнение целиком ловило не подмену,
-# а время:
+# 🔴 Почему список явный, а не «сравнить словари целиком». Слепок снимается в
+# `create_checkout` и сверяется трижды (ищи `_target_snapshot_drift`, а не номера строк —
+# они уезжали уже внутри этой ветки): дважды до денег и один раз ПОСЛЕ, где отказ означает
+# «деньги взяли, подписку не выдали». Сравнение целиком ловило не подмену, а время:
 #   `updated_at` стоит с `onupdate=func.now()` (`models.py:2486`) — его двигает ЛЮБАЯ
-#   запись в строку подписки, включая почасовую синхронизацию трафика
-#   (`subscription_service.py:1127`). То есть у активно пользующегося VPN человека —
-#   ровно у того, кто и приходит продлевать, — слепок протухал сам собой.
+#   запись в строку подписки. Синхронизация трафика (`subscription_service.py:1127`) идёт
+#   при открытии мини-аппы и в хендлере покупки; отдельного планировщика у неё нет, но
+#   человек, оформляющий заказ, эти экраны и открывает. То есть слепок протухал сам собой
+#   ровно у того, кто продлевает.
 #   `status` и `end_date` законно меняет монитор (`MONITORING_INTERVAL=60`): триал,
 #   истёкший между расчётом и оплатой, — это норма, а не повод уводить заказ в разбор.
 # Проверено на боевом: слепок заказа 36 (создан 12:41) держал `status='active'` и
@@ -548,6 +549,10 @@ _SNAPSHOT_IDENTITY_KEYS = ('id', 'tariff_id', 'is_trial')
 # случай (фоновая запись сдвинула только его) не оставлял бы ВООБЩЕ никакого следа, и
 # обещание строкой выше было бы неправдой ровно там, где оно нужнее всего.
 _SNAPSHOT_TOLERATED_KEYS = ('status', 'end_date', 'device_limit', 'updated_at')
+
+# Статусы, в которые подписка сама не переходит: их ставит человек из админки.
+# `expired` и `limited` сюда НЕ входят — это часы и трафик.
+_ADMIN_SUPPRESSED_STATUSES = ('disabled',)
 
 
 def _snapshot_identity_drift(captured: Any, target: Subscription | None) -> tuple[str, ...]:
@@ -570,6 +575,35 @@ def _snapshot_tolerated_changes(captured: Any, target: Subscription | None) -> t
         return ()
     fresh = _subscription_snapshot(target)
     return tuple(key for key in _SNAPSHOT_TOLERATED_KEYS if key in captured and captured[key] != fresh[key])
+
+
+def _administrative_target_change(captured: Any, target: Subscription | None) -> tuple[str, ...]:
+    """Изменения под оплаченным заказом, которые сделал ЧЕЛОВЕК, а не часы.
+
+    🔴 Тревожить владельца можно только этим. Терпимых расхождений много, и почти все они
+    штатные: истёк триал, кончился трафик (`status='limited'`), клиент сам докупил
+    устройства, сдвинулся `updated_at`. Слать по ним строку — значит заливать канал
+    сообщениями «вы отключали этого человека?» там, где владелец не делал ничего, и
+    подталкивать его отключить платящего клиента. Канал, который кричит на каждую
+    покупку, перестают читать — ровно этим уже испорчены другие тревоги проекта.
+
+    Признак вмешательства — подпись кнопки «Обнулить подписку»
+    (`crud/subscription.py:1743-1749`): статус становится `disabled`, а срок уезжает НАЗАД.
+    """
+    if target is None or not isinstance(captured, dict) or not captured:
+        return ()
+    fresh = _subscription_snapshot(target)
+    changed: list[str] = []
+    if fresh['status'] != captured.get('status') and fresh['status'] in _ADMIN_SUPPRESSED_STATUSES:
+        changed.append('status')
+    before, after = captured.get('end_date'), fresh['end_date']
+    if isinstance(before, str) and isinstance(after, str):
+        try:
+            if datetime.fromisoformat(after) < datetime.fromisoformat(before):
+                changed.append('end_date')
+        except ValueError:
+            pass
+    return tuple(changed)
 
 
 def _target_snapshot_drift(
@@ -602,8 +636,10 @@ async def _resolve_checkout_entitlement(
     """Чьи права мы берём — подписки или тарифа.
 
     ⚠️ Это НЕ единственная копия правила: то же условие живёт в `create_checkout` и в
-    `_validate_direct_pre_commit`, и они не взаимозаменяемы (там свои kwargs для
-    access-point-режима). Правишь правило здесь — проверь все три, иначе место захвата и
+    `_validate_direct_pre_commit`. Условие там дословно такое же, а вызов отличается: те два
+    передают `access_point_quote_context=True`, а этот хелпер — как и код, из которого он
+    выделен, — не передаёт ничего. Для боевых режимов это безразлично: в access-point-ветку
+    сверка расхождения не заходит. Правишь правило — проверь все три, иначе место захвата и
     место сверки разъедутся, и тревога придёт на КАЖДУЮ покупку.
 
     🔴 Сверка перед выдачей
@@ -677,7 +713,7 @@ async def _report_entitlement_drift_without_blocking(
     ни своим выводом. Оговорка про «немоту» честная, но НЕ абсолютная: она стоит внутри
     денежной транзакции, и настоящий отказ базы (обрыв, таймаут) её переживёт и убьёт
     продажу дальше по коду. Сессия создаётся с `autoflush=False`
-    (`app/database/database.py:99`), поэтому лишнего флаша её SELECT-ы не вызывают.
+    (`app/database/database.py:100`), поэтому лишнего флаша её SELECT-ы не вызывают.
     """
     from app.services.public_location_entitlement_service import EntitlementResolutionError
 
@@ -1917,14 +1953,11 @@ async def _complete_direct_sale_locked(
         checkout.lifecycle_state = 'operator_review'
         checkout.terminal_reason = 'target_subscription_changed_after_payment'
         raise DeviceFirstError('operator_review_required', 'Subscription changed after payment')
-    elif [key for key in _snapshot_tolerated_changes(snapshot.get('target_snapshot'), target) if key != 'updated_at']:
-        # 🔴 Подписка менялась под оплаченным заказом, но не «подменой» — выдаём. Сказать об
-        # этом владельцу ОБЯЗАНЫ: раньше такой заказ уходил в разбор, и он о нём узнавал.
-        # Самый дорогой случай — админское «Обнулить подписку»: оно не трогает ни `id`, ни
-        # `tariff_id`, ни `is_trial`, поэтому пришедший следом платёж отменяет его целиком,
-        # включая отключение в панели. Без этой строки — совершенно молча.
-        # Одинокий `updated_at` исключён намеренно: это чистый шум фоновой записи, и строка
-        # по нему приходила бы владельцу почти на каждую покупку.
+    elif _administrative_target_change(snapshot.get('target_snapshot'), target):
+        # 🔴 Подписку под оплаченным заказом ГАСИЛ человек — выдаём (деньги взяты), но
+        # обязаны сказать владельцу. Самый дорогой случай — «Обнулить подписку»: она не
+        # трогает ни `id`, ни `tariff_id`, ни `is_trial`, поэтому пришедший следом платёж
+        # отменяет её целиком, включая отключение в панели. Без этой строки — молча.
         await _queue_owner_checkout_drift_row(
             db, checkout=checkout, user=user, notification_type=TARGET_DRIFT_NOTIFICATION_TYPE
         )
@@ -2012,11 +2045,22 @@ async def _complete_direct_sale_locked(
                     int(snapshot['period_days']),
                     tariff_id=int(snapshot['tariff_id']),
                     traffic_limit_gb=int(snapshot['traffic_limit_gb']),
-                    # 🔴 Никогда не опускаем живой лимит. `device_limit` теперь терпимый ключ,
-                    # а `extend_subscription` присваивает его без разговоров — значит человек,
-                    # докупивший устройства в кабинете, пока шёл платёж, потерял бы их вместе
-                    # с деньгами. Оба лимита оплачены, поэтому берём больший.
-                    device_limit=max(int(snapshot['device_limit']), int(target.device_limit or 0)),
+                    # 🔴 У ПЛАТНОЙ подписки никогда не опускаем живой лимит: `device_limit`
+                    # теперь терпимый ключ, а `extend_subscription` присваивает его без
+                    # разговоров — значит человек, докупивший устройства в кабинете, пока шёл
+                    # платёж, потерял бы их вместе с деньгами. Оба лимита оплачены.
+                    # 🔴 А у ТРИАЛА — строго то, что купили. Триальщику намеренно разрешено
+                    # взять меньше устройств, чем было в триале (`device_first_eligibility.py:90`
+                    # отдаёт ему весь список без нижней границы, и оба живых гарда исключают
+                    # триал явно). Возьми здесь max — и триальные устройства достались бы
+                    # бесплатно, а потом стали бы полом навсегда (`:93-107` делает текущий
+                    # лимит полом для платной). На боевом это живой случай: 21 триал на трёх
+                    # устройствах против платных на двух.
+                    device_limit=(
+                        int(snapshot['device_limit'])
+                        if target.is_trial
+                        else max(int(snapshot['device_limit']), int(target.device_limit or 0))
+                    ),
                     connected_squads=list(entitlement.squad_uuids),
                     convert_trial=True,
                     commit=False,
@@ -2997,7 +3041,10 @@ async def _send_owner_order_stuck_alert(db: AsyncSession, *, bot, checkout: Subs
 
 
 def _owner_client_line(user: User | None, checkout: SubscriptionCheckout) -> str:
-    """Как опознать клиента. Ровно тот же вид, что и в тревоге «ЗАКАЗ ЗАВИС».
+    """Как опознать клиента: ссылка на профиль, telegram id и @username.
+
+    ⚠️ Не тождественно тревоге «ЗАКАЗ ЗАВИС»: там username вынесен отдельной строкой.
+    Свести оба текста в один хелпер — отдельная уборка, в объём пункта она не входит.
 
     `telegram_id` намеренно nullable (есть email-only пользователи). Подставить сюда None —
     значит получить отказ Telegram на всё сообщение и потерять его целиком.
@@ -3045,10 +3092,14 @@ async def _send_owner_checkout_drift_alert(
             'Пока человек платил, набор серверов по этому заказу успел поменяться. Деньги пришли, '
             'и за заказом закреплены те серверы, которые были в нём на момент оплаты. '
         )
+        # 🔴 Путь называем только проверенный. Кнопка «🌍 Сменить сервер» в чат-админке
+        # ЗАГЛУШЕНА (`app/handlers/admin/users.py:3836-3844`: экран открывается, а нажатие
+        # отвечает отказом), и отправить туда владельца — это повторить мину AB.
+        # Сторож на заглушку стоит в тестах: оживят кнопку — тест покраснеет и напомнит.
         advice = (
             'На будущее: если вы сейчас переводите тариф на новые серверы, этого клиента придётся '
-            'перенести руками, сам он туда не переедет. Чат-админка → карточка клиента → '
-            '«🌍 Сменить сервер».'
+            'перенести руками, сам он туда не переедет. Делается это в кабинете, на карточке '
+            'клиента. В чат-админке кнопка «Сменить сервер» для этого не работает.'
         )
     else:
         headline = 'ℹ️ <b>Подписка клиента менялась, пока шла оплата</b>'
@@ -3164,8 +3215,13 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
                 await _send_owner_checkout_drift_alert(
                     db, bot=bot, checkout=checkout, notification_type=row.notification_type
                 )
-            else:
+            elif row.notification_type == READY_NOTIFICATION_TYPE:
                 await _send_client_ready_message(db, bot=bot, checkout=checkout)
+            else:
+                # 🔴 Fail-closed. Раньше здесь стоял голый `else`, и любой НОВЫЙ тип уходил
+                # бы клиенту текстом «✅ Подписка готова». Незнакомый тип — это наша ошибка,
+                # и увидеть её должны мы, а не клиент.
+                raise RuntimeError(f'unknown_notification_type:{row.notification_type}')
         except Exception as exc:  # do not retry an uncertain external send
             # Причину пишем текстом: иначе `last_error` у всех отказов был бы 'RuntimeError'
             # и «категория выключена» не отличалось бы от «Telegram не принял».

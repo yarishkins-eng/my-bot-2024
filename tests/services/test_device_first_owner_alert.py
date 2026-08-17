@@ -218,10 +218,12 @@ async def test_owner_alert_stuck_in_sending_is_reopened_but_client_one_is_not():
     assert "status = 'sending'" in revive_sql
     assert 'lease_expires_at <=' in revive_sql
     # Оживление ограничено ровно строками ВЛАДЕЛЬЦУ: все его типы внутри, клиентский снаружи.
-    # 🔴 Проверяем САМ ЗАПРОС, а не константу рядом с ним: сторож, перебирающий тот же
-    # список, что и код, пережил мутацию «оживлять только старый тип» и ничего не поймал.
-    assert f"'{READY_NOTIFICATION_TYPE}'" not in revive_sql
-    for owner_type in service_module.OWNER_NOTIFICATION_TYPES:
+    # 🔴 Имена ЗАШИТЫ намеренно. Первая версия этого сторожа перебирала
+    # `OWNER_NOTIFICATION_TYPES` — ту самую константу, которую код подставляет в `.in_()`, —
+    # и потому переживала схлопывание константы до одного типа. Скептик волны 2 это доказал
+    # экспериментом. Сторож, ломающийся только вместе с кодом, бесполезен.
+    assert "'ready'" not in revive_sql
+    for owner_type in ('order_stuck', 'entitlement_drift', 'target_drift'):
         assert f"'{owner_type}'" in revive_sql, f'строка владельцу {owner_type} не оживляется'
 
 

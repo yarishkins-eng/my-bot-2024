@@ -20,6 +20,7 @@ from app.services import device_first_checkout_service as service
 from app.services.device_first_checkout_service import (
     ENTITLEMENT_DRIFT_NOTIFICATION_TYPE,
     OWNER_ALERT_NOTIFICATION_TYPE,
+    TARGET_DRIFT_NOTIFICATION_TYPE,
     process_device_first_notification_outbox,
 )
 from app.services.public_location_entitlement_service import ResolvedEntitlement
@@ -375,13 +376,14 @@ def _worker_db(rows, *, checkout, user):
 
 
 @pytest.mark.asyncio
-async def test_the_drift_row_goes_to_the_owner_and_never_to_the_client():
+@pytest.mark.parametrize('drift_type', [ENTITLEMENT_DRIFT_NOTIFICATION_TYPE, TARGET_DRIFT_NOTIFICATION_TYPE])
+async def test_the_drift_row_goes_to_the_owner_and_never_to_the_client(drift_type):
     """🔴 Мутация «убрать ветку из диспетчера» обязана ронять этот тест.
 
     Без ветки строка проваливается в `else` и клиент получает ВТОРОЕ «✅ Подписка готова»
     по тому же заказу — про изменение, которое его вообще не касается.
     """
-    row = _outbox_row(1, ENTITLEMENT_DRIFT_NOTIFICATION_TYPE)
+    row = _outbox_row(1, drift_type)
     user = SimpleNamespace(id=189, telegram_id=123456, username='k', language='ru', full_name='Клиент')
     db = _worker_db([row], checkout=checkout_stub(lifecycle_state='ready'), user=user)
     bot = MagicMock()
@@ -749,3 +751,356 @@ def test_the_alert_text_has_no_hand_rolled_line_breaks():
     source = inspect.getsource(service._send_owner_checkout_drift_alert)
     for fragment in ('Деньги пришли,', 'Пока человек платил,'):
         assert fragment in source
+
+
+# --- находки волны 2 (скептик, 91 мутация): 30 переживших закрываются здесь -----------
+
+
+def test_the_drift_function_actually_returns_the_drift():
+    """🔴 Самая опасная мутация волны 2: `return ()` вместо `return drift`.
+
+    Одной строкой выключается ВЕСЬ пункт 4.1 — все три сверки становятся пустышкой, а лог
+    продолжает писаться, то есть по логам подмену не заметить. Ни один тест этого не ловил:
+    все проверяли `_snapshot_identity_drift`, а не то, что её ответ доходит до вызывающих.
+    """
+    captured = service._subscription_snapshot(live_trial())
+
+    assert service._target_snapshot_drift(checkout_stub(), captured, live_trial(id=999), stage='fulfil') == ('id',)
+    assert service._target_snapshot_drift(checkout_stub(), captured, None, stage='arm') == ('id',)
+
+
+def test_all_three_comparison_sites_are_wired_with_distinct_stages():
+    """Ветку сверки можно удалить в любом из трёх мест — заказ поедет против чужой подписки."""
+    import inspect
+
+    sites = {
+        'arm': service.fulfill_checkout,
+        'confirm': service._validate_direct_pre_commit,
+        'fulfil': service._complete_direct_sale_locked,
+    }
+    for stage, func in sites.items():
+        source = inspect.getsource(func)
+        assert '_target_snapshot_drift(' in source, f'сверка снята со стадии {stage}'
+        assert f"stage='{stage}'" in source, f'стадия {stage} потеряна — в логах будет враньё'
+
+
+@pytest.mark.asyncio
+async def test_a_substituted_subscription_after_payment_still_stops_the_sale(monkeypatch):
+    """Интеграционно, на самом денежном пути: подмена подписки обязана дать разбор."""
+    target = live_trial(id=134, is_trial=False, device_limit=5, status='active')
+    checkout, entitlement = _paid_sale(target, snapshot_device_limit=5)
+    substituted = live_trial(id=999, is_trial=False, device_limit=5, status='active')
+    user = live_user(balance_kopeks=100_000)
+    db = _sale_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), user=user)
+    extend = AsyncMock(return_value=substituted)
+
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, 'extend_subscription', extend)
+    monkeypatch.setattr(service, '_resolve_checkout_entitlement', AsyncMock(return_value=entitlement))
+
+    with pytest.raises(service.DeviceFirstError) as raised:
+        await service._complete_direct_sale_locked(db, checkout=checkout, user=user, target=substituted)
+
+    assert raised.value.code == 'operator_review_required'
+    assert checkout.lifecycle_state == 'operator_review'
+    assert checkout.terminal_reason == 'target_subscription_changed_after_payment'
+    extend.assert_not_awaited(), 'подписка не должна выдаваться по подменённой цели'
+
+
+@pytest.mark.asyncio
+async def test_the_entitlement_check_is_actually_wired_into_the_sale(monkeypatch):
+    """🔴 Все восемь тестов 4.1-Б дёргали функцию напрямую. Что она вообще подключена
+    к продаже, не проверял никто — вызов можно было заменить на `pass` молча."""
+    target = live_trial(id=134, is_trial=False, device_limit=5, status='active')
+    checkout, entitlement = _paid_sale(target, snapshot_device_limit=5)
+    moved = ResolvedEntitlement((), ('squad-НОВЫЙ',), 0, 'native_squads')
+    user = live_user(balance_kopeks=100_000)
+    db = _sale_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), user=user)
+
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, 'extend_subscription', AsyncMock(return_value=target))
+    monkeypatch.setattr(service, '_resolve_checkout_entitlement', AsyncMock(return_value=moved))
+    monkeypatch.setattr(service, '_owner_alerts_enabled', lambda: True)
+
+    with suppress(Exception):
+        await service._complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
+
+    types = {getattr(call.args[0], 'notification_type', None) for call in db.add.call_args_list}
+    assert ENTITLEMENT_DRIFT_NOTIFICATION_TYPE in types, 'сверка прав отключена от продажи'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('snapshot_limit', 'live_limit', 'is_trial', 'expected'),
+    [
+        (5, 7, False, 7),  # докупил устройства во время платежа — не отнимаем
+        (5, 1, False, 5),  # купил апгрейд — выдаём купленное, а не старое
+        (1, 3, True, 1),  # 🔴 триалу намеренно можно взять МЕНЬШЕ, чем было в триале
+    ],
+)
+async def test_the_issued_device_limit_is_right_in_both_directions(
+    monkeypatch, snapshot_limit, live_limit, is_trial, expected
+):
+    """Односторонний тест не отличал половинки `max`, а безусловный `max` дарил
+    триальщику устройства навсегда: они становятся полом для платной подписки."""
+    target = live_trial(id=134, is_trial=is_trial, device_limit=live_limit, status='active')
+    checkout, entitlement = _paid_sale(target, snapshot_device_limit=snapshot_limit)
+    user = live_user(balance_kopeks=100_000)
+    db = _sale_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), user=user)
+    extend = AsyncMock(return_value=target)
+
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, 'extend_subscription', extend)
+    monkeypatch.setattr(service, '_resolve_checkout_entitlement', AsyncMock(return_value=entitlement))
+    monkeypatch.setattr(service, '_owner_alerts_enabled', lambda: True)
+
+    with suppress(Exception):
+        await service._complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
+
+    assert extend.await_args.kwargs['device_limit'] == expected
+
+
+# --- тревога владельцу не должна кричать на штатных событиях -------------------------
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('status', 'expired'),  # истёк триал — часы, не человек
+        ('status', 'limited'),  # кончился трафик — вебхук панели
+        ('device_limit', 9),  # клиент сам докупил устройства
+        ('updated_at', datetime(2026, 8, 18, tzinfo=UTC)),  # фоновая запись
+    ],
+)
+def test_ordinary_events_never_alarm_the_owner(field, value):
+    """🔴 Находка прогона сценариев: текст звал отключить платящего клиента там, где
+    владелец не делал ничего. Канал, который кричит на каждую покупку, перестают читать."""
+    captured = service._subscription_snapshot(live_trial())
+
+    assert service._administrative_target_change(captured, live_trial(**{field: value})) == ()
+
+
+@pytest.mark.parametrize(
+    ('field', 'value', 'expected'),
+    [
+        ('status', 'disabled', 'status'),  # подпись «Обнулить подписку»
+        ('end_date', datetime(2026, 8, 1, tzinfo=UTC), 'end_date'),  # срок уехал НАЗАД
+    ],
+)
+def test_an_administrative_suppression_does_alarm_the_owner(field, value, expected):
+    captured = service._subscription_snapshot(live_trial())
+
+    assert expected in service._administrative_target_change(captured, live_trial(**{field: value}))
+
+
+def test_extending_the_term_is_not_an_alarm():
+    """Срок вперёд — это подарок от владельца, а не гашение. Тревожить нечем."""
+    captured = service._subscription_snapshot(live_trial())
+    extended = live_trial(end_date=datetime(2026, 12, 1, tzinfo=UTC))
+
+    assert service._administrative_target_change(captured, extended) == ()
+
+
+def test_the_alarm_never_fires_on_a_broken_snapshot():
+    for hostile in (None, {}, [], 0, 'строка', SimpleNamespace()):
+        assert service._administrative_target_change(hostile, live_trial()) == ()
+
+
+# --- доставка: молчаливая потеря строки владельцу -----------------------------------
+
+
+def _alert_db(user=None):
+    db = MagicMock()
+    db.get = AsyncMock(return_value=user if user is not None else live_user())
+    return db
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_admin_chat_leaves_the_row_for_a_retry():
+    """Без исключения строка пометилась бы `sent` и исчезла навсегда вместо повтора."""
+    admin = MagicMock()
+    admin.is_enabled = False
+
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        with pytest.raises(RuntimeError, match='admin_notifications_disabled'):
+            await service._send_owner_checkout_drift_alert(
+                _alert_db(), bot=MagicMock(), checkout=checkout_stub(), notification_type=TARGET_DRIFT_NOTIFICATION_TYPE
+            )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_telegram_send_is_not_reported_as_sent():
+    admin = MagicMock()
+    admin.is_enabled = True
+    admin.send_admin_notification = AsyncMock(return_value=False)
+
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        with pytest.raises(RuntimeError, match='admin_notification_not_delivered'):
+            await service._send_owner_checkout_drift_alert(
+                _alert_db(), bot=MagicMock(), checkout=checkout_stub(), notification_type=TARGET_DRIFT_NOTIFICATION_TYPE
+            )
+
+
+@pytest.mark.asyncio
+async def test_the_alert_goes_to_the_errors_category():
+    """Другая категория — другой топик: доставка «успешна», но владелец ничего не видит."""
+    from app.services.admin_notification_service import NotificationCategory
+
+    admin = MagicMock()
+    admin.is_enabled = True
+    admin.send_admin_notification = AsyncMock(return_value=True)
+
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        await service._send_owner_checkout_drift_alert(
+            _alert_db(), bot=MagicMock(), checkout=checkout_stub(), notification_type=TARGET_DRIFT_NOTIFICATION_TYPE
+        )
+
+    assert admin.send_admin_notification.await_args.kwargs['category'] is NotificationCategory.ERRORS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('lifecycle', 'provisioning'),
+    [('ready', 'pending'), ('fulfilling', 'ready'), ('operator_review', 'ready')],
+)
+async def test_a_half_finished_order_is_never_called_delivered(lifecycle, provisioning):
+    """Прежняя параметризация подбирала только согласованные пары, поэтому каждую половину
+    условия `and` можно было выбросить незаметно."""
+    admin = MagicMock()
+    admin.is_enabled = True
+    admin.send_admin_notification = AsyncMock(return_value=True)
+
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        await service._send_owner_checkout_drift_alert(
+            _alert_db(),
+            bot=MagicMock(),
+            checkout=checkout_stub(lifecycle_state=lifecycle, provisioning_state=provisioning),
+            notification_type=ENTITLEMENT_DRIFT_NOTIFICATION_TYPE,
+        )
+
+    assert 'Подписка выдана' not in admin.send_admin_notification.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_every_client_controlled_field_is_escaped():
+    """Telegram отбивает ВСЁ сообщение на битом HTML — владелец не узнаёт о заказе вовсе.
+    Прежний тест был враждебен только к имени, а `username` и название тарифа — нет."""
+    admin = MagicMock()
+    admin.is_enabled = True
+    admin.send_admin_notification = AsyncMock(return_value=True)
+    hostile_user = live_user(full_name='<b>Вася</b>', username='<i>x')
+    checkout = checkout_stub(sale_snapshot={'tariff_name': 'Базовый <b>'})
+
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        await service._send_owner_checkout_drift_alert(
+            _alert_db(hostile_user),
+            bot=MagicMock(),
+            checkout=checkout,
+            notification_type=ENTITLEMENT_DRIFT_NOTIFICATION_TYPE,
+        )
+
+    text = admin.send_admin_notification.await_args.args[0]
+    for raw in ('<b>Вася', '<i>x', 'Базовый <b>'):
+        assert raw not in text, f'не экранировано: {raw}'
+    assert str(checkout.public_id) in text, 'по какому заказу — владелец должен видеть'
+
+
+def test_an_email_only_client_gets_no_broken_profile_link():
+    """`tg://user?id=None` — это отказ Telegram на всё сообщение."""
+    line = service._owner_client_line(live_user(telegram_id=None), checkout_stub())
+
+    assert 'tg://' not in line
+    assert 'None' not in line
+
+
+def test_a_missing_client_card_does_not_break_the_alert():
+    assert 'недоступна' in service._owner_client_line(None, checkout_stub())
+
+
+def test_the_alert_body_has_no_newlines_inside_sentences():
+    """Прежний сторож искал подстроки в исходнике и вставленный `\\n` переживал."""
+    import re
+
+    admin_text_lines = [
+        'Пока человек платил, набор серверов по этому заказу успел поменяться.',
+        'Пока человек платил, его подписку меняли',
+    ]
+    source = __import__('inspect').getsource(service._send_owner_checkout_drift_alert)
+    for fragment in admin_text_lines:
+        assert fragment in source
+    # Ни один литерал внутри сборки текста не содержит переноса, кроме разделителей абзацев.
+    body = source.split("text = '\\n'.join(")[1]
+    assert not re.search(r"'[^'\n]*\\n[^'\n]*[а-яА-Я]", body), 'перенос строки внутри предложения'
+
+
+# --- сторожа, которые переживали мутацию сами ----------------------------------------
+
+
+def test_the_identity_set_is_pinned_by_hard_coded_names():
+    """Сравнение возврата с той же константой — тавтология: пустой набор её переживал."""
+    assert service._snapshot_identity_drift({}, live_trial()) == ('id', 'tariff_id', 'is_trial')
+    assert service._snapshot_identity_drift(None, live_trial()) == ('id', 'tariff_id', 'is_trial')
+
+
+def test_a_key_never_lives_in_both_lists():
+    assert not set(service._SNAPSHOT_IDENTITY_KEYS) & set(service._SNAPSHOT_TOLERATED_KEYS)
+
+
+@pytest.mark.parametrize('hostile', [None, [], 0, 'строка', SimpleNamespace(), True])
+def test_a_broken_snapshot_blocks_instead_of_crashing(hostile):
+    """Внутри денежной транзакции `TypeError` дороже отказа: деградируем в «заблокировать»."""
+    assert service._snapshot_identity_drift(hostile, live_trial()) == ('id', 'tariff_id', 'is_trial')
+    assert service._snapshot_tolerated_changes(hostile, live_trial()) == ()
+
+
+def test_an_old_snapshot_without_a_key_is_not_a_tolerated_change():
+    """Иначе каждый заказ со старым слепком слал бы владельцу строку — канал зальёт."""
+    assert service._snapshot_tolerated_changes({'id': 134}, live_trial()) == ()
+
+
+@pytest.mark.asyncio
+async def test_the_duplicate_check_asks_about_this_type_not_just_this_order():
+    """Без `notification_type` в WHERE строка не ставится, если у заказа уже есть любая
+    другая (`ready` есть почти всегда) — тревога исчезает молча."""
+    db = _drift_db(tariff=None)
+
+    with _enabled_alerts():
+        await service._queue_owner_checkout_drift_row(
+            db, checkout=checkout_stub(), user=live_user(), notification_type=TARGET_DRIFT_NOTIFICATION_TYPE
+        )
+
+    compiled = str(db.scalar.await_args.args[0])
+    assert 'notification_type' in compiled
+    assert 'checkout_id' in compiled
+
+
+@pytest.mark.asyncio
+async def test_a_missing_tariff_returns_early_instead_of_relying_on_the_catch_all():
+    """Защита не должна держаться на защите: `except Exception` — последний рубеж, не первый."""
+    db = _drift_db(tariff=None)
+    resolve = AsyncMock()
+
+    with patch.object(service, '_resolve_checkout_entitlement', resolve), _enabled_alerts():
+        await service._report_entitlement_drift_without_blocking(
+            db,
+            checkout=checkout_stub(),
+            user=live_user(),
+            target=None,
+            captured=ResolvedEntitlement((), ('old',), 0, 'native_squads'),
+        )
+
+    resolve.assert_not_awaited()
+
+
+def test_the_chat_admin_server_button_is_still_stubbed():
+    """🔴 Сторож на ТЕКСТ тревоги (класс мины H и мины AB).
+
+    Сообщение владельцу утверждает, что кнопка «Сменить сервер» в чат-админке для переноса
+    не работает. Оживят её (этап 2в) — тест покраснеет и напомнит переписать текст.
+    """
+    import inspect
+
+    from app.handlers.admin import users as admin_users
+
+    source = inspect.getsource(admin_users.toggle_user_server)
+    assert 'Ручное изменение технических серверов отключено' in source
