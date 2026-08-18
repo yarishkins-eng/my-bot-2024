@@ -35,6 +35,7 @@ from app.handlers.admin import (
     maintenance as admin_maintenance,
     messages as admin_messages,
     monitoring as admin_monitoring,
+    orders_review as admin_orders_review,
     overpay_certificate as admin_overpay_certificate,
     payments as admin_payments,
     polls as admin_polls,
@@ -236,6 +237,7 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     admin_required_channels.register_handlers(dp)
     admin_quick_amounts.register_handlers(dp)
     admin_overpay_certificate.register_handlers(dp)
+    admin_orders_review.register_handlers(dp)
     register_channel_member_handlers(dp)
     register_gift_activation_handlers(dp)
     common.register_handlers(dp)

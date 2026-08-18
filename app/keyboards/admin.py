@@ -71,6 +71,15 @@ def get_admin_main_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
                     callback_data='admin_payments',
                 ),
             ],
+            # Пункт 4.4. Отдельной строкой и в главном меню, а не в подменю: сюда ведёт
+            # тревога «ЗАКАЗ ЗАВИС», и человек приходит по ней в спешке, с деньгами
+            # клиента на руках. Прятать такой вход на второй уровень нельзя.
+            [
+                InlineKeyboardButton(
+                    text=_t(texts, 'ADMIN_MAIN_ORDERS_REVIEW', '🧾 Заказы на разборе'),
+                    callback_data='admin_orders_review',
+                ),
+            ],
             [InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')],
         ]
     )

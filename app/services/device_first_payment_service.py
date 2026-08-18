@@ -36,6 +36,8 @@ from app.database.models import (
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
     LEGACY_SETTLEMENT_MODE,
+    OPERATOR_CLOSED_TERMINAL_REASON,
+    OPERATOR_REFUND_RECONCILIATION_REASON,
     DeviceFirstError,
     device_first_new_checkouts_enabled,
     device_first_top_up_kopeks,
@@ -1939,11 +1941,16 @@ async def _settle_direct_platega_payment_locked(
     # settled into the customer's wallet, never into the stale subscription.
     # The same signed/canonical confirmation may arrive again, so that credit
     # must be as idempotent as the ordinary paid-processing path.
+    # 🔴 Вторая метка — пункт 4.4. Оператор вернул деньги кнопкой разбора, и у того
+    # возврата СВОЙ ключ книги (`operator_review_refund:{checkout}`), про который ключ
+    # `direct_late_invoice:{attempt}` ниже ничего не знает. Без этой метки повторное
+    # подтверждение того же платежа прошло бы мимо обоих сторожей и зачислило сумму
+    # второй раз. Метку ставит `refund_operator_review_checkout`.
     if (
         mismatch_reason is None
         and payment.is_paid
         and attempt.status == 'credited'
-        and attempt.reconciliation_reason == 'late_paid_wallet_credit'
+        and attempt.reconciliation_reason in ('late_paid_wallet_credit', OPERATOR_REFUND_RECONCILIATION_REASON)
     ):
         return payment
 
@@ -1985,6 +1992,11 @@ async def _settle_direct_platega_payment_locked(
             and (
                 str(checkout.terminal_reason or '').startswith('provider_terminal:')
                 or checkout.terminal_reason == 'cancelled_by_user_after_invoice'
+                # Пункт 4.4. Заказ закрыл оператор кнопкой разбора. Деньги, пришедшие
+                # после этого, обязаны вернуться клиенту на баланс ровно так же: без
+                # этого члена они заново запрут его в `operator_review`, из которого мы
+                # его только что вывели, и он снова не сможет оформить покупку.
+                or checkout.terminal_reason == OPERATOR_CLOSED_TERMINAL_REASON
             )
         ):
             # The provider accepted money after it had authoritatively closed

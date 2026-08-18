@@ -1169,8 +1169,22 @@ async def admin_resolve_reconciliation_credit(
         raise HTTPException(status_code=404, detail='Reconciliation credit not found')
     if credit.status != 'operator_review':
         raise HTTPException(status_code=409, detail={'code': 'already_resolved'})
-    # ``transfer_to_wallet`` is a request for the separately authorised support
-    # process; this endpoint stores no balance mutation and no provider action.
+    # 🔴 Мина AC (пункт 4.4). Раньше маршрут принимал `transfer_to_wallet`, но денег не
+    # двигал — только помечал строку. Оператор нажимал «вернуть на баланс» и уходил в
+    # уверенности, что вернул. Теперь этот выбор отбивается, а возврат делается там, где
+    # он настоящий: чат-админка → «Заказы на разборе» → «Вернуть деньги на баланс».
+    if request.resolution == 'transfer_to_wallet':
+        raise HTTPException(
+            status_code=409,
+            detail={
+                'code': 'wallet_transfer_not_performed_here',
+                'message': (
+                    'Этот маршрут только фиксирует решение и НЕ переводит деньги. '
+                    'Возврат на баланс делается в чат-админке: «Заказы на разборе» → заказ → '
+                    '«Вернуть деньги на баланс».'
+                ),
+            },
+        )
     from datetime import UTC, datetime
 
     credit.status = 'resolved'
