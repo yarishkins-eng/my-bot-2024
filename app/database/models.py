@@ -3052,6 +3052,33 @@ class DeviceFirstNotificationOutbox(Base):
     checkout = relationship('SubscriptionCheckout')
 
 
+class TariffSquadRolloutSnapshot(Base):
+    """Durable pre-image of one subscription's squads, taken before a rollout batch.
+
+    ``propagate_tariff_squads`` used to keep this in a process-local dict, so a
+    restart mid-rollout left the Panel changed, the database not, and nothing to
+    roll back from.  One row per subscription per rollout; ``restored_at`` marks
+    the rows already returned to their pre-image.
+    """
+
+    __tablename__ = 'tariff_squad_rollout_snapshots'
+    __table_args__ = (
+        UniqueConstraint('rollout_id', 'subscription_id', name='uq_tariff_rollout_subscription'),
+        Index('ix_tariff_rollout_lookup', 'tariff_id', 'created_at'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    rollout_id = Column(String(64), nullable=False)
+    tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='CASCADE'), nullable=False)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), nullable=False)
+    previous_squads = Column(JSON, nullable=False, default=list)
+    previous_subscription_url = Column(Text, nullable=True)
+    applied_squads = Column(JSON, nullable=False, default=list)
+    batch_no = Column(Integer, nullable=False, default=0)
+    restored_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+
+
 class SubscriptionConversion(Base):
     __tablename__ = 'subscription_conversions'
     __table_args__ = (
