@@ -3339,30 +3339,43 @@ async def list_operator_review_checkouts(
     rows = await db.execute(
         select(SubscriptionCheckout)
         .join(User, User.id == SubscriptionCheckout.user_id)
-        .where(
-            SubscriptionCheckout.lifecycle_state == 'operator_review',
-            # 🔴 Тот же замок, что стоит на тревоге владельцу, и по той же причине:
-            # человек подал заявку на удаление, но PII ещё НЕ вычищено (чистка идёт
-            # только при финализации). Карточка показала бы оператору имя, @username и
-            # ссылку `tg://user?id=` на того, кто просил себя забыть. Заказы уже
-            # ФИНАЛИЗИРОВАННЫХ удалений остаются: там поля обнулены, показывать нечего,
-            # а закрывать их надо — это и есть пять архивных заказов тарифа 3.
-            or_(
-                User.account_erasure_requested_at.is_(None),
-                User.account_erased_at.is_not(None),
-            ),
-        )
+        .where(*_operator_review_visible_conditions())
         .order_by(SubscriptionCheckout.updated_at.desc(), SubscriptionCheckout.id.desc())
         .limit(limit)
     )
     return list(rows.scalars().all())
 
 
+def _operator_review_visible_conditions() -> tuple[Any, ...]:
+    """Условия видимости заказа на разборе. ОДИН источник для списка и счётчика.
+
+    🔴 Раньше замок стоял только на списке, а счётчик считал всё. Расхождение читалось
+    как страничная навигация («Показаны свежие 5» из 6), которой нет, а в худшем случае
+    экран писал «разбирать нечего» при удержанных деньгах живого клиента. Прогон
+    сценария нашёл оба исхода.
+    """
+    return (
+        SubscriptionCheckout.lifecycle_state == 'operator_review',
+        # 🔴 Тот же замок, что стоит на тревоге владельцу, и по той же причине:
+        # человек подал заявку на удаление, но PII ещё НЕ вычищено (чистка идёт
+        # только при финализации). Карточка показала бы оператору имя, @username и
+        # ссылку `tg://user?id=` на того, кто просил себя забыть. Заказы уже
+        # ФИНАЛИЗИРОВАННЫХ удалений остаются: там поля обнулены, показывать нечего,
+        # а закрывать их надо — это и есть пять архивных заказов тарифа 3.
+        or_(
+            User.account_erasure_requested_at.is_(None),
+            User.account_erased_at.is_not(None),
+        ),
+    )
+
+
 async def count_operator_review_checkouts(db: AsyncSession) -> int:
-    """Сколько всего ждёт разбора — счётчик на кнопке."""
+    """Сколько ждёт разбора. Считается ТЕМ ЖЕ условием, что и список."""
     return int(
         await db.scalar(
-            select(func.count(SubscriptionCheckout.id)).where(SubscriptionCheckout.lifecycle_state == 'operator_review')
+            select(func.count(SubscriptionCheckout.id))
+            .join(User, User.id == SubscriptionCheckout.user_id)
+            .where(*_operator_review_visible_conditions())
         )
         or 0
     )
@@ -3379,7 +3392,7 @@ async def operator_review_card(db: AsyncSession, checkout: SubscriptionCheckout)
     return await _owner_order_stuck_text(db, checkout)
 
 
-async def _refundable_amount_kopeks(db: AsyncSession, checkout: SubscriptionCheckout) -> tuple[int, str]:
+async def refundable_amount_kopeks(db: AsyncSession, checkout: SubscriptionCheckout) -> tuple[int, str]:
     """Сколько можно вернуть и почему. Второе значение — причина отказа, если сумма 0.
 
     🔴 Возвращаем ТОЛЬКО то, что база может доказать. Нельзя брать `tariff_total_kopeks`:
@@ -3463,7 +3476,7 @@ async def refund_operator_review_checkout(
     ).scalar_one_or_none()
     if existing is not None:
         return False, f'Возврат уже сделан раньше: {settings.format_price(int(existing.amount_kopeks))}.'
-    amount_kopeks, refusal = await _refundable_amount_kopeks(db, checkout)
+    amount_kopeks, refusal = await refundable_amount_kopeks(db, checkout)
     if amount_kopeks <= 0:
         return False, f'Возврат не сделан: {refusal}.'
     # 🔴 Блокировка строки клиента ОБЯЗАТЕЛЬНА: `db.get` — обычный SELECT, а `+=` ниже
@@ -3520,8 +3533,11 @@ async def refund_operator_review_checkout(
             resolved_at=datetime.now(UTC),
         )
     )
-    # 🔴 Мина U. Прямая запись `Transaction` минует аутбокс, а он — единственное место,
-    # где раздаются побочные эффекты пополнения: уведомление клиенту и владельцу.
+    # 🔴 Мина U. Прямая запись `Transaction` минует аутбокс, а он раздаёт побочные эффекты
+    # пополнения: событие для кабинета и внешних вебхуков, проверку промогруппы.
+    # ⚠️ Сообщения в Telegram аутбокс НЕ шлёт — подписчиков у события в проекте ноль
+    # (проверено: `event_emitter.on(` не вызывается нигде). Прежний комментарий здесь это
+    # утверждал, и это было неправдой. Клиента уведомляет обработчик кнопки, у него есть бот.
     job = await ensure_deposit_outbox(db, transaction_id=transaction.id, checkout_id=checkout.id)
     # 🔴 А вот реферальную комиссию с ВОЗВРАТА платить нельзя: покупки не состоялось,
     # деньги просто вернулись владельцу. Шаг комиссии пропускается только статусом

@@ -77,7 +77,7 @@ async def test_a_chargebacked_order_is_never_refunded():
     ту же сумму второй раз — и это при том, что вердикт в той же карточке пишет
     «возврат делать НЕ нужно»."""
     db = _db()
-    amount, refusal = await service._refundable_amount_kopeks(
+    amount, refusal = await service.refundable_amount_kopeks(
         db, _checkout(terminal_reason='post_paid_provider_terminal:chargebacked')
     )
     assert amount == 0
@@ -90,7 +90,7 @@ async def test_an_order_whose_subscription_exists_is_never_refunded():
     ОДНИМ блоком, сразу после создания подписки. Значит возврат по такому заказу
     сделал бы уже выданную подписку бесплатной."""
     db = _db()
-    amount, refusal = await service._refundable_amount_kopeks(db, _checkout(created_subscription_id=55))
+    amount, refusal = await service.refundable_amount_kopeks(db, _checkout(created_subscription_id=55))
     assert amount == 0
     assert 'уже создана' in refusal
 
@@ -100,7 +100,7 @@ async def test_a_wallet_order_with_a_debit_always_has_a_subscription():
     """Кошельковая ветка недостижима иначе: списание ставится тем же блоком, что и
     подписка. Поэтому забор «подписка создана» обязан сработать РАНЬШЕ неё."""
     db = _db()
-    amount, refusal = await service._refundable_amount_kopeks(
+    amount, refusal = await service.refundable_amount_kopeks(
         db, _checkout(funding_mode='wallet', debit_transaction_id=7, created_subscription_id=55)
     )
     assert amount == 0
@@ -110,7 +110,7 @@ async def test_a_wallet_order_with_a_debit_always_has_a_subscription():
 @pytest.mark.asyncio
 async def test_a_wallet_order_without_a_debit_has_nothing_to_return():
     db = _db()
-    amount, refusal = await service._refundable_amount_kopeks(db, _checkout(funding_mode='wallet'))
+    amount, refusal = await service.refundable_amount_kopeks(db, _checkout(funding_mode='wallet'))
     assert amount == 0
     assert 'ничего не списывали' in refusal
 
@@ -123,7 +123,7 @@ async def test_a_closing_account_is_never_credited(field):
     owner = _healthy_owner()
     setattr(owner, field, datetime(2026, 8, 1, tzinfo=UTC))
     db = _db(owner=owner)
-    amount, refusal = await service._refundable_amount_kopeks(db, _checkout())
+    amount, refusal = await service.refundable_amount_kopeks(db, _checkout())
     assert amount == 0
     assert 'аккаунт клиента удаляется' in refusal
 
@@ -132,7 +132,7 @@ async def test_a_closing_account_is_never_credited(field):
 async def test_a_decision_already_recorded_in_the_cabinet_stops_the_payout():
     """🔴 Мина L. Оператор мог вернуть деньги руками в Platega и записать это решение."""
     db = _db(scalars=[1])
-    amount, refusal = await service._refundable_amount_kopeks(db, _checkout())
+    amount, refusal = await service.refundable_amount_kopeks(db, _checkout())
     assert amount == 0
     assert 'решение оператора в кабинете' in refusal
 
@@ -140,7 +140,7 @@ async def test_a_decision_already_recorded_in_the_cabinet_stops_the_payout():
 @pytest.mark.asyncio
 async def test_money_already_on_the_balance_is_never_refunded_twice():
     db = _db(scalars=[0, None, 1])
-    amount, refusal = await service._refundable_amount_kopeks(db, _checkout())
+    amount, refusal = await service.refundable_amount_kopeks(db, _checkout())
     assert amount == 0
     assert 'уже вернулись' in refusal
 
@@ -148,7 +148,7 @@ async def test_money_already_on_the_balance_is_never_refunded_twice():
 @pytest.mark.asyncio
 async def test_provider_money_held_for_review_is_refundable():
     db = _db(scalars=[0, 64900])
-    amount, refusal = await service._refundable_amount_kopeks(db, _checkout())
+    amount, refusal = await service.refundable_amount_kopeks(db, _checkout())
     assert (amount, refusal) == (64900, '')
 
 
@@ -156,7 +156,7 @@ async def test_provider_money_held_for_review_is_refundable():
 async def test_without_proof_of_payment_the_operator_is_sent_to_platega():
     """Нельзя возвращать «по прайсу»: клиент мог заплатить другую сумму."""
     db = _db(scalars=[0, None, None])
-    amount, refusal = await service._refundable_amount_kopeks(db, _checkout())
+    amount, refusal = await service.refundable_amount_kopeks(db, _checkout())
     assert amount == 0
     assert 'Platega' in refusal
 
@@ -168,7 +168,7 @@ async def test_the_refundable_query_asks_only_about_held_money():
     Проверяется скомпилированный SQL, а не константа рядом с ним (урок этапа 4.1).
     """
     db = _db(scalars=[0, 64900])
-    await service._refundable_amount_kopeks(db, _checkout())
+    await service.refundable_amount_kopeks(db, _checkout())
     compiled = str(db.scalar.await_args[0][0].compile(compile_kwargs={'literal_binds': True}))
     assert 'operator_review' in compiled
     assert 'credited_amount_kopeks > 0' in compiled
@@ -317,20 +317,57 @@ def test_every_button_is_actually_registered():
 
 
 @pytest.mark.asyncio
-async def test_the_card_shows_the_live_order_not_a_snapshot():
-    """🔴 Мина M: тревога в чате — снимок момента, карточка обязана собираться заново."""
-    db = MagicMock()
-    db.get = AsyncMock(return_value=SimpleNamespace(id=186, telegram_id=1, username=None, full_name='Tiger'))
-    db.scalar = AsyncMock(return_value=None)
-    text = await service.operator_review_card(db, _checkout())
-    assert 'Заказы на разборе' in text
-    assert 'Деньги' in text
+async def test_the_list_and_the_counter_agree_on_what_is_visible():
+    """🔴 Скептик: оба замка списка пережили мутацию — сторожа на них не было вовсе.
+
+    Проверяем СКОМПИЛИРОВАННЫЙ SQL обоих запросов. Расхождение списка и счётчика
+    читалось как страничная навигация, которой нет, а в худшем случае давало
+    «разбирать нечего» при удержанных деньгах живого клиента.
+    """
+    from sqlalchemy import func, select
+
+    from app.database.models import SubscriptionCheckout, User
+
+    conditions = service._operator_review_visible_conditions()
+    sql = str(
+        select(func.count(SubscriptionCheckout.id))
+        .join(User, User.id == SubscriptionCheckout.user_id)
+        .where(*conditions)
+        .compile(compile_kwargs={'literal_binds': True})
+    )
+    # Замок 1: берём только то, что ждёт человека.
+    assert "lifecycle_state = 'operator_review'" in sql
+    # Замок 2: PII людей, подавших заявку на удаление, в админ-чат не уходит.
+    assert 'account_erasure_requested_at IS NULL' in sql
+    # ...но финализированные удаления остаются: их заказы надо закрывать.
+    assert 'account_erased_at IS NOT NULL' in sql
+    # Условий ровно два — третье добавили бы молча, и список разошёлся бы со счётчиком.
+    assert len(conditions) == 2
 
 
-def test_the_list_only_takes_orders_waiting_for_a_human():
-    """Сторож формы запроса: без фильтра список утянул бы все заказы подряд."""
-    import inspect
-    import re
+def test_the_alert_stops_promising_a_section_that_will_not_have_the_order():
+    """🔴 Скептик: ветвление текста тревоги пережило мутацию «всегда звать в разбор».
 
-    source = inspect.getsource(service.list_operator_review_checkouts)
-    assert re.search(r"lifecycle_state\s*==\s*'operator_review'", source)
+    Тревога рассылается по ДВУМ условиям, а список берёт только `operator_review`.
+    Для застрявшей выдачи инструкция «идите в раздел разбора» — это повторение мины H.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    def _alert_db():
+        db = MagicMock()
+        db.get = AsyncMock(return_value=SimpleNamespace(id=186, telegram_id=1, username=None, full_name='Tiger'))
+        db.scalar = AsyncMock(return_value=None)
+        return db
+
+    on_review = asyncio.run(service._owner_order_stuck_text(_alert_db(), _checkout()))
+    assert 'Заказы на разборе' in on_review
+    assert 'этот заказ' in on_review
+
+    stuck = asyncio.run(
+        service._owner_order_stuck_text(
+            _alert_db(), _checkout(lifecycle_state='fulfilling', provisioning_state='retry')
+        )
+    )
+    assert 'этого заказа не будет' in stuck
+    assert 'Разбирать руками не нужно' in stuck

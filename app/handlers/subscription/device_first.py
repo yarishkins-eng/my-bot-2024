@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import CheckoutPaymentAttempt, PlategaPayment, Tariff, User
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
+    OPERATOR_CLOSED_TERMINAL_REASON,
     DeviceFirstError,
     arm_checkout,
     build_purchase_options,
@@ -1324,8 +1325,35 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
         # ставится ровно в момент зачисления на баланс (`device_first_payment_service.py:2019-2023`),
         # но утверждаем это только вместе с фактом денег из базы, а не по одной причине.
         late_paid = terminal_reason == 'late_paid_wallet_credit'
-        money_state = await checkout_money_state(db, checkout) if locally_abandoned or late_paid else None
-        if late_paid and money_state == 'money_in_flight':
+        # 🔴 Пункт 4.4. Заказ закрыл оператор кнопкой разбора. Без этой ветки экран уходил
+        # в общий «Заказ отменён» и не говорил про деньги НИЧЕГО — при том что на разбор
+        # попадает ровно тот заказ, где сумма удержана. Мини-апп такую ветку получил, и
+        # два экрана про одно состояние расходились бы: ровно то, что запрещает пункт 4.2б.
+        operator_closed = terminal_reason == OPERATOR_CLOSED_TERMINAL_REASON
+        money_state = (
+            await checkout_money_state(db, checkout) if locally_abandoned or late_paid or operator_closed else None
+        )
+        if operator_closed:
+            caption = (
+                _text(
+                    user,
+                    '🛑 <b>Заказ закрыт поддержкой</b>\n\nПодпиской он не станет. Списаний по нему не '
+                    'было. Новый заказ можно оформить прямо сейчас.',
+                    '🛑 <b>Order closed by support</b>\n\nIt will not become a subscription. Nothing was '
+                    'charged for it. You can place a new order right now.',
+                )
+                if money_state == 'no_money'
+                else _text(
+                    user,
+                    '🛑 <b>Заказ закрыт поддержкой</b>\n\nПодпиской он не станет. Если оплата по нему '
+                    'прошла, поддержка вернёт сумму на ваш баланс. Проверьте баланс перед новым '
+                    'заказом: с него он и оплатится.',
+                    '🛑 <b>Order closed by support</b>\n\nIt will not become a subscription. If a payment '
+                    'went through, support will return the amount to your balance. Check your balance '
+                    'before placing a new order — it will be paid from there.',
+                )
+            )
+        elif late_paid and money_state == 'money_in_flight':
             caption = _text(
                 user,
                 '💰 <b>Деньги на балансе</b>\n\nОплата по старому счёту дошла уже после того, как мы '
