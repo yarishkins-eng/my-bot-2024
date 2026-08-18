@@ -2293,3 +2293,48 @@ async def test_late_payment_after_an_operator_closed_the_order_lands_on_the_bala
     assert attempt.status != 'operator_review'
     assert checkout.fulfillment_state == 'not_started'
     fulfill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_webhook_after_an_operator_refund_never_pays_twice():
+    """🔴 P0, найден ревью пункта 4.4. Два пути возврата — два РАЗНЫХ ключа книги.
+
+    Ручной возврат оператора пишет `operator_review_refund:{checkout}`, а поздний
+    платёж — `direct_late_invoice:{attempt}`, и про чужой ключ ни один не знает.
+    Platega повторяет одно и то же подписанное подтверждение (в этом файле уже два
+    ранних выхода ровно от повторов). Без метки на попытке повторная доставка после
+    «вернул → закрыл» зачислила бы ту же сумму ВТОРОЙ раз.
+
+    Метку ставит `refund_operator_review_checkout`; здесь проверяется, что платёжный
+    сервис её уважает — то есть баланс не двигается и новых строк книги не появляется.
+    """
+    from app.services.device_first_checkout_service import (
+        OPERATOR_CLOSED_TERMINAL_REASON,
+        OPERATOR_REFUND_RECONCILIATION_REASON,
+    )
+
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    payment.status = 'CONFIRMED'
+    payment.is_paid = True
+    user.balance_kopeks = 35_000
+    # Состояние сразу после «Вернуть деньги» + «Закрыть заказ».
+    attempt.status = 'credited'
+    attempt.reconciliation_reason = OPERATOR_REFUND_RECONCILIATION_REASON
+    checkout.lifecycle_state = 'cancelled'
+    checkout.terminal_reason = OPERATOR_CLOSED_TERMINAL_REASON
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=None),
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        add=MagicMock(),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+    )
+
+    await settle_device_first_platega_payment(
+        db,
+        payment=payment,
+        payload={'id': 'provider-1', 'paymentMethod': 2, 'paymentDetails': {'amount': '350.00', 'currency': 'RUB'}},
+    )
+
+    assert user.balance_kopeks == 35_000, 'повторный вебхук зачислил деньги второй раз'
+    db.add.assert_not_called()

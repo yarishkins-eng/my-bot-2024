@@ -27,6 +27,7 @@ from app.database.models import (
     DeviceFirstMutation,
     DeviceFirstNotificationOutbox,
     DeviceFirstOutbox,
+    DeviceFirstReconciliationCredit,
     Subscription,
     SubscriptionCheckout,
     SubscriptionEntitlementTerm,
@@ -2997,15 +2998,26 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
     blocked = checkout.lifecycle_state == 'operator_review' or str(checkout.provisioning_state) in {'pending', 'retry'}
     if blocked and str(getattr(checkout, 'settlement_mode', '')) == DIRECT_SETTLEMENT_MODE:
         lines.append('🚫 Новый заказ он оформить не может, пока висит этот.')
+    lines.append('')
+    # 🔴 Пункт 4.4 переписал эти строки: до него кнопки разбора не существовало нигде,
+    # и текст честно отправлял владельца делать всё руками. Теперь она есть — но ТОЛЬКО
+    # для заказов в `operator_review`. Тревога же рассылается по ДВУМ условиям (см.
+    # `owner_alert_candidate_query`), и вторая половина — застрявшая выдача — в раздел
+    # разбора не попадает. Отправить туда владельца с таким заказом значило бы повторить
+    # ровно ту мину H, которую этот же пункт и снимает: инструкция, ведущая в пустоту.
+    if checkout.lifecycle_state == 'operator_review':
+        lines += [
+            '🛠️ Разобрать: админ-панель → «🧾 Заказы на разборе» → этот заказ. Там две кнопки: '
+            'вернуть деньги клиенту на баланс и закрыть заказ.',
+            '⛔ Возврат руками в кабинете Platega база НЕ увидит: клиент останется заперт, '
+            'а кнопка возврата предложит вернуть те же деньги второй раз.',
+        ]
+    else:
+        lines.append(
+            '🛠️ Разбирать руками не нужно и нечем: бот продолжает пробовать выдачу сам. '
+            'В разделе «🧾 Заказы на разборе» этого заказа не будет — он туда не попадает.'
+        )
     lines += [
-        '',
-        # 🔴 Пункт 4.4 переписал эти строки: до него кнопки разбора не существовало нигде,
-        # и текст честно отправлял владельца делать всё руками. Теперь она есть, и путь
-        # ровно один — иначе мы снова пошлём человека в мёртвую кнопку (урок этапа 4.1).
-        '🛠️ Разобрать: админ-панель → «🧾 Заказы на разборе» → этот заказ. Там две кнопки: '
-        'вернуть деньги клиенту на баланс и закрыть заказ.',
-        '⛔ Возврат руками в кабинете Platega база НЕ увидит: клиент останется заперт, '
-        'а кнопка возврата предложит вернуть те же деньги второй раз.',
         '',
         f'Заказ: <code>{html.escape(str(checkout.public_id))}</code>',
         f'Состояние: <code>{html.escape(str(checkout.lifecycle_state))}</code> / '
@@ -3310,6 +3322,9 @@ async def store_mutation_result(
 #   3) Забор триала (`trial_activation_service`) смотрит на `lifecycle_state`, а не на
 #      причину, и `cancelled` его устраивает — трогать там нечего.
 OPERATOR_CLOSED_TERMINAL_REASON = 'cancelled_by_operator_review'
+# Метка на попытке после ручного возврата. Её единственная работа — попасть в ранний
+# выход платёжного сервиса, чтобы повторный вебхук провайдера не заплатил второй раз.
+OPERATOR_REFUND_RECONCILIATION_REASON = 'operator_refund_wallet_credit'
 # Ключ книги для возврата. Идемпотентность строится на нём, а не на статусах: повторное
 # нажатие кнопки обязано быть безопасным, а Telegram доставляет колбэки не по разу.
 OPERATOR_REFUND_LEDGER_PREFIX = 'operator_review_refund'
@@ -3323,7 +3338,20 @@ async def list_operator_review_checkouts(
     """Заказы, ждущие человека. Самые свежие сверху."""
     rows = await db.execute(
         select(SubscriptionCheckout)
-        .where(SubscriptionCheckout.lifecycle_state == 'operator_review')
+        .join(User, User.id == SubscriptionCheckout.user_id)
+        .where(
+            SubscriptionCheckout.lifecycle_state == 'operator_review',
+            # 🔴 Тот же замок, что стоит на тревоге владельцу, и по той же причине:
+            # человек подал заявку на удаление, но PII ещё НЕ вычищено (чистка идёт
+            # только при финализации). Карточка показала бы оператору имя, @username и
+            # ссылку `tg://user?id=` на того, кто просил себя забыть. Заказы уже
+            # ФИНАЛИЗИРОВАННЫХ удалений остаются: там поля обнулены, показывать нечего,
+            # а закрывать их надо — это и есть пять архивных заказов тарифа 3.
+            or_(
+                User.account_erasure_requested_at.is_(None),
+                User.account_erased_at.is_not(None),
+            ),
+        )
         .order_by(SubscriptionCheckout.updated_at.desc(), SubscriptionCheckout.id.desc())
         .limit(limit)
     )
@@ -3358,13 +3386,41 @@ async def _refundable_amount_kopeks(db: AsyncSession, checkout: SubscriptionChec
     клиент мог заплатить другую сумму (частичная оплата, курс, комиссия провайдера), и
     возврат «по прайсу» — это выдача чужих денег.
     """
+    # 🔴 ЗАБОР 1 — отзыв платежа. `credited_amount_kopeks` при chargeback НЕ обнуляется
+    # (это зафиксировано в `checkout_money_state` выше), поэтому без этой проверки кнопка
+    # вернула бы деньги, которые платёжная система уже забрала у нас и отдала клиенту.
+    # Тот же вопрос оба канонических вердикта задают ПЕРВЫМ — задаём и мы.
+    if str(checkout.terminal_reason or '').startswith(_POST_PAID_REVERSAL_PREFIX):
+        return 0, 'платёж отозван платёжной системой — она уже вернула деньги клиенту'
+    # 🔴 ЗАБОР 2 — подписка по заказу уже создана. `debit_transaction_id` и
+    # `created_subscription_id` присваиваются ОДНИМ блоком (`:1571-1575` и `:2127-2131`),
+    # сразу после `create_paid_subscription`/`extend_subscription`. Значит у заказа с
+    # оплатой с баланса, дошедшего до списания, подписка есть всегда, и возврат сделал бы
+    # её бесплатной. Этот же забор ловит провайдерский заказ, застрявший на ВЫДАЧЕ:
+    # деньги там наши, но лечится это выдачей, а не возвратом.
+    if checkout.created_subscription_id is not None:
+        return 0, 'подписка по заказу уже создана — возврат сделал бы её бесплатной'
     if checkout.funding_mode == 'wallet':
-        if checkout.debit_transaction_id is None:
-            return 0, 'с баланса ничего не списывали — возвращать нечего'
-        debited = await db.get(Transaction, checkout.debit_transaction_id)
-        if debited is None:
-            return 0, 'списание в книге не найдено — разбирайте руками'
-        return int(abs(debited.amount_kopeks)), ''
+        # Досюда кошельковый заказ доходит только без списания: с ним забор 2 уже сработал.
+        return 0, 'с баланса ничего не списывали — возвращать нечего'
+    # 🔴 ЗАБОР 3 — аккаунт закрывается. `_fence_account_erasure_payment` ставит ровно ту
+    # пару признаков, по которой мы считаем сумму, и его докстринг требует обратного:
+    # «reviewable, never creditable». Деньги на баланс удаляемого аккаунта — это ещё и
+    # тихой перевод ворот удаления, которые смотрят на наличие баланса.
+    owner = await db.get(User, checkout.user_id)
+    if owner is not None and (owner.account_erased_at or owner.account_erasure_requested_at):
+        return 0, 'аккаунт клиента удаляется — на такой баланс зачислять нельзя, возврат делается в Platega'
+    # 🔴 ЗАБОР 4 — оператор уже решил судьбу денег в кабинете. Строка сверки со статусом
+    # `resolved` означает «решение принято»; если это был возврат в Platega, вторая
+    # выплата здесь отдала бы те же деньги дважды (мина L).
+    resolved_credit = await db.scalar(
+        select(func.count(DeviceFirstReconciliationCredit.id)).where(
+            DeviceFirstReconciliationCredit.checkout_id == checkout.id,
+            DeviceFirstReconciliationCredit.status == 'resolved',
+        )
+    )
+    if resolved_credit:
+        return 0, 'по этому платежу уже записано решение оператора в кабинете — проверьте его, прежде чем платить'
     # Провайдерская оплата. `credited_amount_kopeks > 0` живёт при трёх статусах попытки,
     # и вернуть можно только удержанное (`operator_review`): при `credited` деньги уже
     # лежат у клиента на балансе, при `paid_processing` заказ ещё в штатной выдаче.
@@ -3396,6 +3452,11 @@ async def refund_operator_review_checkout(
     admin_user_id: int,
 ) -> tuple[bool, str]:
     """Вернуть деньги заказа на баланс клиента. Идемпотентно по ключу книги."""
+    # Сторож состояния — такой же, как у закрытия. Инлайн-кнопка живёт в переписке
+    # Telegram вечно, поэтому старая карточка остаётся рабочей кнопкой возврата ещё
+    # долго после того, как заказ уехал из разбора.
+    if checkout.lifecycle_state != 'operator_review':
+        return False, f'Заказ уже не на разборе (сейчас «{checkout.lifecycle_state}») — возврат не сделан.'
     ledger_key = f'{OPERATOR_REFUND_LEDGER_PREFIX}:{checkout.id}'
     existing = (
         await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == ledger_key).with_for_update())
@@ -3405,7 +3466,15 @@ async def refund_operator_review_checkout(
     amount_kopeks, refusal = await _refundable_amount_kopeks(db, checkout)
     if amount_kopeks <= 0:
         return False, f'Возврат не сделан: {refusal}.'
-    user = await db.get(User, checkout.user_id, populate_existing=True)
+    # 🔴 Блокировка строки клиента ОБЯЗАТЕЛЬНА: `db.get` — обычный SELECT, а `+=` ниже
+    # это read-modify-write. Параллельное пополнение в этом окне потерялось бы целиком.
+    # Канонический путь возврата (`device_first_payment_service`) держит весь финансовый
+    # граф под `FOR UPDATE` — здесь нужен хотя бы владелец баланса.
+    user = (
+        await db.execute(
+            select(User).where(User.id == checkout.user_id).with_for_update().execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if user is None:
         return False, 'Возврат не сделан: карточка клиента недоступна.'
     user.balance_kopeks += amount_kopeks
@@ -3421,10 +3490,43 @@ async def refund_operator_review_checkout(
     )
     db.add(transaction)
     await db.flush()
+    # 🔴 Пометить попытки ОБЯЗАТЕЛЬНО, и вот почему. У возврата поздних денег свой ключ
+    # книги (`direct_late_invoice:{attempt.id}`), и он про наш ключ ничего не знает.
+    # Provider повторяет одно и то же подписанное подтверждение — код это прямо
+    # признаёт. Без пометки повторный вебхук после закрытия заказа зачислил бы ту же
+    # сумму ВТОРОЙ раз. Пара «`credited` + причина» — это ровно тот ранний выход,
+    # который уже есть в платёжном сервисе, и мы попадаем в него.
+    await db.execute(
+        update(CheckoutPaymentAttempt)
+        .where(
+            CheckoutPaymentAttempt.checkout_id == checkout.id,
+            CheckoutPaymentAttempt.status == 'operator_review',
+            CheckoutPaymentAttempt.credited_amount_kopeks > 0,
+        )
+        .values(status='credited', reconciliation_reason=OPERATOR_REFUND_RECONCILIATION_REASON)
+    )
+    # Строка сверки — то место, где кабинет показывает «ждёт решения». Оставить её
+    # открытой значит позвать второго оператора вернуть те же деньги ещё раз.
+    await db.execute(
+        update(DeviceFirstReconciliationCredit)
+        .where(
+            DeviceFirstReconciliationCredit.checkout_id == checkout.id,
+            DeviceFirstReconciliationCredit.status == 'operator_review',
+        )
+        .values(
+            status='resolved',
+            resolution='transfer_to_wallet',
+            resolved_by_user_id=admin_user_id,
+            resolved_at=datetime.now(UTC),
+        )
+    )
     # 🔴 Мина U. Прямая запись `Transaction` минует аутбокс, а он — единственное место,
-    # где раздаются побочные эффекты пополнения: уведомление клиенту, уведомление
-    # владельцу и реферальная комиссия партнёру. Без этой строки возврат молчит для всех.
-    await ensure_deposit_outbox(db, transaction_id=transaction.id, checkout_id=checkout.id)
+    # где раздаются побочные эффекты пополнения: уведомление клиенту и владельцу.
+    job = await ensure_deposit_outbox(db, transaction_id=transaction.id, checkout_id=checkout.id)
+    # 🔴 А вот реферальную комиссию с ВОЗВРАТА платить нельзя: покупки не состоялось,
+    # деньги просто вернулись владельцу. Шаг комиссии пропускается только статусом
+    # `done` — воркер смотрит `!= 'done'`. Уведомление при этом остаётся: у него свой шаг.
+    job.referral_status = 'done'
     await db.commit()
     logger.warning(
         'device_first_operator_refund',
@@ -3441,9 +3543,12 @@ async def close_operator_review_checkout(
     checkout: SubscriptionCheckout,
     admin_user_id: int,
 ) -> tuple[bool, str]:
-    """Закрыть заказ. Это снимает замок с клиента и с тарифа."""
+    """Закрыть заказ. Это снимает с клиента запрет на новую покупку."""
     if checkout.lifecycle_state != 'operator_review':
         return False, f'Заказ уже не на разборе (сейчас «{checkout.lifecycle_state}»).'
+    # Исходную причину затирать нельзя молча: по ней потом восстанавливают, что вообще
+    # произошло, а в поле останется только «закрыл оператор». Пишем её в лог перед заменой.
+    previous_reason = str(checkout.terminal_reason or '')
     checkout.lifecycle_state = 'cancelled'
     checkout.terminal_reason = OPERATOR_CLOSED_TERMINAL_REASON
     await db.commit()
@@ -3451,5 +3556,8 @@ async def close_operator_review_checkout(
         'device_first_operator_closed_checkout',
         checkout_id=checkout.public_id,
         admin_user_id=admin_user_id,
+        previous_terminal_reason=previous_reason or None,
     )
-    return True, 'Заказ закрыт. Клиент снова может оформлять покупку.'
+    # 🔴 Обещать «и тариф разблокирован» здесь нельзя. Забор тарифа снимается, только
+    # когда по нему не осталось НИ ОДНОГО неразобранного заказа, а их бывает несколько.
+    return True, 'Заказ закрыт. Этот заказ больше не мешает клиенту оформить новую покупку.'

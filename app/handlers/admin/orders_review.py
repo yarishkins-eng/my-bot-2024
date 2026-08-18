@@ -116,12 +116,16 @@ async def show_orders_review_list(callback: types.CallbackQuery, db_user: User, 
     lines = [f'🧾 <b>Заказы на разборе: {total}</b>', '']
     if total > len(checkouts):
         lines += [f'Показаны свежие {len(checkouts)}.', '']
-    lines.append('Клиент по такому заказу заперт: новый оформить он не может.')
+    lines.append('Пока такой заказ висит, клиент чаще всего не может оформить новый.')
     buttons = []
     for item in checkouts:
         snapshot = item.sale_snapshot if isinstance(item.sale_snapshot, dict) else {}
         tariff_name = str(snapshot.get('tariff_name') or f'тариф {item.tariff_id}')
-        buttons.append((f'#{item.id} · {tariff_name} · клиент {item.user_id}', f'{CARD_PREFIX}{item.id}'))
+        # 🔴 Первые 8 знаков публичного номера — то же, что напечатано в тревоге строкой
+        # «Заказ: ...». Без них по тревоге свой заказ в списке не найти: внутренний id
+        # заказа и внутренний id клиента в тревоге не встречаются ни разу.
+        public_head = str(item.public_id or '')[:8]
+        buttons.append((f'{public_head} · {tariff_name} · клиент {item.user_id}', f'{CARD_PREFIX}{item.id}'))
     buttons.append(('⬅️ Назад', 'admin_panel'))
     await _edit(callback, '\n'.join(lines), _rows(*buttons))
 
