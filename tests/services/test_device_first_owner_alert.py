@@ -470,15 +470,38 @@ async def test_machine_codes_are_translated_for_the_owner():
     text = await service_module._owner_order_stuck_text(_money_db(), checkout)
     assert 'Оплату нужно проверить' in text
     assert 'счёт у платёжной системы просрочен или не найден' in text
-    assert 'Кнопки для разбора в боте пока нет' in text
+    # Пункт 4.4 сделал кнопку разбора, и прежняя фраза «кнопки в боте пока нет» стала
+    # ложью. Сторож переписан в том же коммите — как и требовала мина H.
+    assert 'Кнопки для разбора в боте пока нет' not in text
+    assert 'Заказы на разборе' in text
 
 
 @pytest.mark.asyncio
-async def test_owner_is_sent_to_the_cabinet_and_warned_off_the_chat_admin():
-    """Выдача в чат-админке заглушена, а соседняя «Обнулить подписку» — это мина A."""
+async def test_owner_is_sent_to_the_button_that_actually_exists():
+    """Мина H: текст тревоги — это инструкция, и она обязана вести в ЖИВУЮ кнопку.
+
+    До пункта 4.4 текст звал в кабинет и отговаривал от чат-админки. Теперь разбор
+    живёт именно в чат-админке, а прежний совет стал вредным: кабинетный «Сбросить
+    подписку» физически удаляет подписку с оплаченным сроком (урок этапа 4.1).
+    """
     text = await service_module._owner_order_stuck_text(_money_db(), _checkout())
-    assert 'в кабинете' in text
-    assert 'Обнулить подписку' in text
+    assert 'админ-панель' in text
+    assert 'Заказы на разборе' in text
+    # Ручной возврат в Platega база не видит (мина L) — владельца обязаны предупредить,
+    # иначе кнопка возврата предложит отдать те же деньги второй раз.
+    assert 'Platega' in text
+
+
+@pytest.mark.asyncio
+async def test_the_alert_never_names_a_dead_button_again():
+    """Сторож против рецидива: три пути, которые на 18.08.2026 мертвы или опасны.
+
+    Проверяется собранное сообщение, а не исходник функции: разбор кода по скобкам
+    ломается от одной скобки внутри текста (урок этапа 4.1).
+    """
+    text = await service_module._owner_order_stuck_text(_money_db(), _checkout())
+    for dead in ('Обнулить подписку', 'Сбросить подписку', 'Сделать платной'):
+        assert dead not in text
 
 
 @pytest.mark.asyncio
@@ -516,3 +539,22 @@ async def test_missing_user_row_does_not_produce_garbage_contact():
     text = await service_module._owner_order_stuck_text(db, checkout)
     assert 'tg ?' not in text
     assert 'карточка недоступна' in text
+
+
+@pytest.mark.asyncio
+async def test_the_stuck_alert_goes_to_the_errors_category():
+    """🔴 Мина AI (пункт 4.4): категорию можно было убрать при полностью зелёном наборе.
+
+    Доставка при этом «успешна», но сообщение уходит в другой топик, и владелец не
+    видит ничего. У тревоги этапа 4.1 такой сторож был, у этой — не было.
+    """
+    from app.services.admin_notification_service import NotificationCategory
+
+    admin = MagicMock()
+    admin.is_enabled = True
+    admin.send_admin_notification = AsyncMock(return_value=True)
+
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        await service_module._send_owner_order_stuck_alert(_money_db(), bot=MagicMock(), checkout=_checkout())
+
+    assert admin.send_admin_notification.await_args.kwargs['category'] is NotificationCategory.ERRORS

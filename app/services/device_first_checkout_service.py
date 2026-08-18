@@ -37,6 +37,7 @@ from app.database.models import (
     TransactionType,
     User,
 )
+from app.services.device_first_deposit_outbox_service import ensure_deposit_outbox
 from app.services.device_first_eligibility import resolve_single_eligible_tariff, tariff_eligibility
 from app.services.pricing_engine import pricing_engine
 
@@ -2998,10 +2999,13 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
         lines.append('🚫 Новый заказ он оформить не может, пока висит этот.')
     lines += [
         '',
-        'Кнопки для разбора в боте пока нет. Напишите клиенту сами. Возврат делается '
-        'в Platega, подписку выдаём руками <b>в кабинете</b>: пользователь → «Создать подписку».',
-        '⛔ В чат-админке этого не делать: выдача там заглушена, а кнопка «Обнулить подписку» '
-        'оставляет подписку без серверов и намертво запирает смену серверов тарифа.',
+        # 🔴 Пункт 4.4 переписал эти строки: до него кнопки разбора не существовало нигде,
+        # и текст честно отправлял владельца делать всё руками. Теперь она есть, и путь
+        # ровно один — иначе мы снова пошлём человека в мёртвую кнопку (урок этапа 4.1).
+        '🛠️ Разобрать: админ-панель → «🧾 Заказы на разборе» → этот заказ. Там две кнопки: '
+        'вернуть деньги клиенту на баланс и закрыть заказ.',
+        '⛔ Возврат руками в кабинете Platega база НЕ увидит: клиент останется заперт, '
+        'а кнопка возврата предложит вернуть те же деньги второй раз.',
         '',
         f'Заказ: <code>{html.escape(str(checkout.public_id))}</code>',
         f'Состояние: <code>{html.escape(str(checkout.lifecycle_state))}</code> / '
@@ -3285,3 +3289,167 @@ async def store_mutation_result(
     mutation.response_json = _drop_frozen_money_state(response)
     mutation.status_code = status_code
     await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Пункт 4.4. Разбор заказов оператором.
+#
+# До этого пункта заказ, упавший в `operator_review`, разобрать было НЕЧЕМ: списка нет
+# ни в чат-админке, ни в веб-админке, ни в кабинете (проверено grep'ом, ноль вхождений).
+# А заказ при этом держит клиента (`operator_hold`, `:879` и `:1609`) и запирает смену
+# серверов тарифа (`crud/tariff.py`). Ниже — ровно три вещи: показать, вернуть, закрыть.
+# ---------------------------------------------------------------------------
+
+# 🔴 Причина закрытия ОПЕРАТОРОМ. Три места, где она обязана быть учтена, — и почему:
+#   1) `_NO_MONEY_TERMINAL_REASONS` — сюда НЕ добавлять. Этот набор означает «код ЗНАЕТ,
+#      что денег не брали». Оператор закрывает и оплаченные заказы тоже, и утверждать за
+#      него «списания не было» — ровно та ложь, которую снимал пункт 4.2б.
+#   2) Условие позднего платежа в `device_first_payment_service` — добавить ОБЯЗАТЕЛЬНО,
+#      иначе деньги, пришедшие после закрытия, не вернутся клиенту на баланс, а заново
+#      запрут его в `operator_review` (мина F, требование про `provider_terminal:*`).
+#   3) Забор триала (`trial_activation_service`) смотрит на `lifecycle_state`, а не на
+#      причину, и `cancelled` его устраивает — трогать там нечего.
+OPERATOR_CLOSED_TERMINAL_REASON = 'cancelled_by_operator_review'
+# Ключ книги для возврата. Идемпотентность строится на нём, а не на статусах: повторное
+# нажатие кнопки обязано быть безопасным, а Telegram доставляет колбэки не по разу.
+OPERATOR_REFUND_LEDGER_PREFIX = 'operator_review_refund'
+
+
+async def list_operator_review_checkouts(
+    db: AsyncSession,
+    *,
+    limit: int = 20,
+) -> list[SubscriptionCheckout]:
+    """Заказы, ждущие человека. Самые свежие сверху."""
+    rows = await db.execute(
+        select(SubscriptionCheckout)
+        .where(SubscriptionCheckout.lifecycle_state == 'operator_review')
+        .order_by(SubscriptionCheckout.updated_at.desc(), SubscriptionCheckout.id.desc())
+        .limit(limit)
+    )
+    return list(rows.scalars().all())
+
+
+async def count_operator_review_checkouts(db: AsyncSession) -> int:
+    """Сколько всего ждёт разбора — счётчик на кнопке."""
+    return int(
+        await db.scalar(
+            select(func.count(SubscriptionCheckout.id)).where(SubscriptionCheckout.lifecycle_state == 'operator_review')
+        )
+        or 0
+    )
+
+
+async def operator_review_card(db: AsyncSession, checkout: SubscriptionCheckout) -> str:
+    """Карточка заказа для оператора.
+
+    🔴 Намеренно ТОТ ЖЕ текст, что уходит тревогой владельцу (`_owner_order_stuck_text`).
+    Две причины: во-первых, один текст — одно место правки; во-вторых, тревога в чате —
+    это снимок момента (мина M), а карточка собирается заново при каждом открытии, то
+    есть оператор всегда видит живое состояние заказа, даже если тревоге неделя.
+    """
+    return await _owner_order_stuck_text(db, checkout)
+
+
+async def _refundable_amount_kopeks(db: AsyncSession, checkout: SubscriptionCheckout) -> tuple[int, str]:
+    """Сколько можно вернуть и почему. Второе значение — причина отказа, если сумма 0.
+
+    🔴 Возвращаем ТОЛЬКО то, что база может доказать. Нельзя брать `tariff_total_kopeks`:
+    клиент мог заплатить другую сумму (частичная оплата, курс, комиссия провайдера), и
+    возврат «по прайсу» — это выдача чужих денег.
+    """
+    if checkout.funding_mode == 'wallet':
+        if checkout.debit_transaction_id is None:
+            return 0, 'с баланса ничего не списывали — возвращать нечего'
+        debited = await db.get(Transaction, checkout.debit_transaction_id)
+        if debited is None:
+            return 0, 'списание в книге не найдено — разбирайте руками'
+        return int(abs(debited.amount_kopeks)), ''
+    # Провайдерская оплата. `credited_amount_kopeks > 0` живёт при трёх статусах попытки,
+    # и вернуть можно только удержанное (`operator_review`): при `credited` деньги уже
+    # лежат у клиента на балансе, при `paid_processing` заказ ещё в штатной выдаче.
+    held = await db.scalar(
+        select(func.sum(CheckoutPaymentAttempt.credited_amount_kopeks)).where(
+            CheckoutPaymentAttempt.checkout_id == checkout.id,
+            CheckoutPaymentAttempt.status == 'operator_review',
+            CheckoutPaymentAttempt.credited_amount_kopeks > 0,
+        )
+    )
+    if held:
+        return int(held), ''
+    already_credited = await db.scalar(
+        select(func.count(CheckoutPaymentAttempt.id)).where(
+            CheckoutPaymentAttempt.checkout_id == checkout.id,
+            CheckoutPaymentAttempt.status == 'credited',
+            CheckoutPaymentAttempt.credited_amount_kopeks > 0,
+        )
+    )
+    if already_credited:
+        return 0, 'деньги уже вернулись клиенту на баланс — второй раз не нужно'
+    return 0, 'в базе нет подтверждённого списания. Проверьте платёж в кабинете Platega и вернитесь'
+
+
+async def refund_operator_review_checkout(
+    db: AsyncSession,
+    *,
+    checkout: SubscriptionCheckout,
+    admin_user_id: int,
+) -> tuple[bool, str]:
+    """Вернуть деньги заказа на баланс клиента. Идемпотентно по ключу книги."""
+    ledger_key = f'{OPERATOR_REFUND_LEDGER_PREFIX}:{checkout.id}'
+    existing = (
+        await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == ledger_key).with_for_update())
+    ).scalar_one_or_none()
+    if existing is not None:
+        return False, f'Возврат уже сделан раньше: {settings.format_price(int(existing.amount_kopeks))}.'
+    amount_kopeks, refusal = await _refundable_amount_kopeks(db, checkout)
+    if amount_kopeks <= 0:
+        return False, f'Возврат не сделан: {refusal}.'
+    user = await db.get(User, checkout.user_id, populate_existing=True)
+    if user is None:
+        return False, 'Возврат не сделан: карточка клиента недоступна.'
+    user.balance_kopeks += amount_kopeks
+    transaction = Transaction(
+        user_id=user.id,
+        type=TransactionType.DEPOSIT.value,
+        amount_kopeks=amount_kopeks,
+        description=f'Возврат по заказу {checkout.public_id} (разбор оператором)',
+        payment_method='manual',
+        device_first_checkout_id=checkout.id,
+        device_first_ledger_key=ledger_key,
+        is_completed=True,
+    )
+    db.add(transaction)
+    await db.flush()
+    # 🔴 Мина U. Прямая запись `Transaction` минует аутбокс, а он — единственное место,
+    # где раздаются побочные эффекты пополнения: уведомление клиенту, уведомление
+    # владельцу и реферальная комиссия партнёру. Без этой строки возврат молчит для всех.
+    await ensure_deposit_outbox(db, transaction_id=transaction.id, checkout_id=checkout.id)
+    await db.commit()
+    logger.warning(
+        'device_first_operator_refund',
+        checkout_id=checkout.public_id,
+        amount_kopeks=amount_kopeks,
+        admin_user_id=admin_user_id,
+    )
+    return True, f'Возвращено на баланс: {settings.format_price(amount_kopeks)}.'
+
+
+async def close_operator_review_checkout(
+    db: AsyncSession,
+    *,
+    checkout: SubscriptionCheckout,
+    admin_user_id: int,
+) -> tuple[bool, str]:
+    """Закрыть заказ. Это снимает замок с клиента и с тарифа."""
+    if checkout.lifecycle_state != 'operator_review':
+        return False, f'Заказ уже не на разборе (сейчас «{checkout.lifecycle_state}»).'
+    checkout.lifecycle_state = 'cancelled'
+    checkout.terminal_reason = OPERATOR_CLOSED_TERMINAL_REASON
+    await db.commit()
+    logger.warning(
+        'device_first_operator_closed_checkout',
+        checkout_id=checkout.public_id,
+        admin_user_id=admin_user_id,
+    )
+    return True, 'Заказ закрыт. Клиент снова может оформлять покупку.'

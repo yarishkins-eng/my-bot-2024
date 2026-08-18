@@ -2247,3 +2247,49 @@ async def test_late_quote_payment_is_credited_to_balance_but_never_auto_fulfills
     assert attempt.reconciliation_reason == 'quote_expired_paid_credited_to_balance_only'
     assert job.fulfillment_status == 'not_required'
     process.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_late_payment_after_an_operator_closed_the_order_lands_on_the_balance():
+    """🔴 Пункт 4.4. Оператор закрыл заказ кнопкой, а деньги пришли следом.
+
+    Без нового члена в условии возврата (`device_first_payment_service`) такая оплата
+    заново швырнула бы клиента в `operator_review` — то есть заперла бы ему покупку
+    ровно там, откуда оператор его только что вывел. Тест поведенческий: имя причины
+    берётся из кода, а проверяется РЕЗУЛЬТАТ — баланс, статус попытки и то, что старый
+    заказ не ожил.
+    """
+    from app.services.device_first_checkout_service import OPERATOR_CLOSED_TERMINAL_REASON
+
+    payment, user, attempt, checkout = _terminal_direct_rows()
+    payment.transaction_id = None
+    user.balance_kopeks = 0
+    # Ровно то состояние, которое оставляет кнопка «Закрыть заказ».
+    checkout.lifecycle_state = 'cancelled'
+    checkout.terminal_reason = OPERATOR_CLOSED_TERMINAL_REASON
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=None),
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout), Result(None)]),
+        add=MagicMock(),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+    )
+
+    with patch(
+        'app.services.device_first_payment_service.fulfill_direct_external_checkout',
+        AsyncMock(),
+    ) as fulfill:
+        await settle_device_first_platega_payment(
+            db,
+            payment=payment,
+            payload={'id': 'provider-1', 'paymentMethod': 2, 'paymentDetails': {'amount': '350.00', 'currency': 'RUB'}},
+        )
+
+    assert user.balance_kopeks == 35_000
+    assert attempt.status == 'credited'
+    assert attempt.reconciliation_reason == 'late_paid_wallet_credit'
+    # 🔴 Главное отрицание: заказ НЕ вернулся на разбор и клиента не запер.
+    assert checkout.lifecycle_state == 'cancelled'
+    assert attempt.status != 'operator_review'
+    assert checkout.fulfillment_state == 'not_started'
+    fulfill.assert_not_awaited()
