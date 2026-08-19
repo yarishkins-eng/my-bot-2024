@@ -5,8 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.crud.rbac import AuditLogCRUD
 from app.database.crud.server_squad import get_all_server_squads
 from app.database.crud.tariff import (
+    assert_tariff_squad_rollout_allowed,
     create_tariff,
     delete_tariff,
     get_all_tariffs,
@@ -18,6 +20,7 @@ from app.database.crud.tariff import (
     update_tariff,
 )
 from app.database.models import PromoGroup, Subscription, Tariff, Transaction, TransactionType, User
+from app.services.subscription_service import SubscriptionService
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.tariffs import (
