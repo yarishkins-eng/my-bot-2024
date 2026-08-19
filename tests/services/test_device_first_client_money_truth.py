@@ -535,11 +535,57 @@ async def test_closed_cart_never_claims_no_charge_when_money_did_arrive():
 
 
 @pytest.mark.asyncio
-async def test_provider_cancelled_invoice_keeps_its_old_screen():
-    """Отмену объявила сама Platega — ссылка мертва, и предупреждать о ней было бы неправдой."""
+async def test_provider_cancelled_invoice_warns_about_the_link_too():
+    """🔴 Мина AR (пункт 4.5). ПЕРЕПИСАН: прежняя посылка сторожа опровергнута кодом.
+
+    Он утверждал «отмену объявила сама Platega — ссылка мертва, предупреждать было бы
+    неправдой», и это утверждение ничем не подкреплено. Код проекта говорит ровно
+    обратное, в двух независимых местах:
+
+      1) `device_first_payment_service` возвращает поздние деньги на баланс именно по
+         префиксу `provider_terminal:` — ветку писали не для недостижимого случая;
+      2) очередь сверки опрашивает такие попытки ВЕЧНО, и её собственный комментарий
+         объясняет почему: «we do not assume terminal-status finality that is not
+         documented by the provider».
+
+    То есть проект сам не считает закрытый провайдером счёт мёртвым. А это самый частый
+    способ закрытия на боевом — и до пункта 4.5 он был единственным, у которого
+    предупреждения не было нигде: ни в боте, ни в мини-аппе.
+
+    Формулировка взята слово в слово из ветки брошенной корзины: состояние для человека
+    то же самое, и второй текст про одно и то же — ровно то расхождение, которое
+    запретил пункт 4.2б. Осторожность здесь дешевле ошибки: если ссылка всё-таки мертва,
+    «может ещё работать» никому не вредит; если жива — спасает от оплаты в никуда.
+    """
     caption = await _cancelled_screen('provider_terminal:canceled')
     assert 'Предыдущий счёт закрыт' in caption
-    assert 'на баланс' not in caption
+    assert 'не платите по ней' in caption.lower()
+    # Последствие называем целиком: без второй половины «не оформится» строка про баланс
+    # читается как выгода и скорее подталкивает оплатить (урок ревью мины F).
+    assert 'на баланс' in caption
+    assert 'не оформится' in caption
+    # И приглашение к новому заказу никуда не делось — иначе экран стал бы тупиком.
+    assert 'Выберите срок' in caption
+
+
+@pytest.mark.asyncio
+async def test_the_provider_warning_disappears_once_the_money_actually_arrived():
+    """Предупреждение про «не платите» обязано умереть в тот момент, когда уже заплатили.
+
+    Поздняя оплата переписывает причину заказа на `late_paid_wallet_credit`, и человек
+    попадает в другую ветку. Если бы предупреждение осталось, мы говорили бы «не платите
+    по старой ссылке» тому, кто по ней только что заплатил.
+    """
+    caption = await _cancelled_screen('late_paid_wallet_credit', money_state='money_in_flight')
+    assert 'не платите по ней' not in caption.lower()
+
+
+@pytest.mark.asyncio
+async def test_the_english_provider_warning_says_the_same_thing():
+    caption = await _cancelled_screen('provider_terminal:canceled', language='en')
+    assert 'previous invoice is closed' in caption.lower()
+    assert 'do not use it' in caption.lower()
+    assert 'balance' in caption.lower()
 
 
 @pytest.mark.asyncio
@@ -548,3 +594,36 @@ async def test_the_english_half_of_the_closed_cart_is_honest_too():
     assert "We haven't charged you anything" in caption
     assert 'do not use it' in caption.lower()
     assert 'balance' in caption.lower()
+
+
+@pytest.mark.asyncio
+async def test_the_owner_verdict_asks_the_same_question_about_the_same_checkout():
+    """🔴 Мина N (пункт 4.5). У клиентского вердикта сторож формы SQL есть, у вердикта
+    ВЛАДЕЛЬЦУ его не было: все тесты `_money_verdict` подменяют `db.scalar`, и его два
+    запроса не исполняются ни разу. Правка `WHERE` разводит два ответа про один заказ
+    молча — а расхождение здесь стоит двойного возврата либо отказа в нём.
+
+    Пункт 4.5 это обострил: карточка разбора собирается ровно этим вердиктом, и с ним
+    оператор впервые смотрит на заказы, которых раньше на экране не было вовсе.
+    """
+    from app.services.device_first_checkout_service import _money_verdict
+
+    db = MagicMock()
+    db.scalar = AsyncMock(return_value=0)
+    await _money_verdict(db, _checkout(funding_mode='platega'))
+
+    asked = [
+        str(call[0][0].compile(compile_kwargs={'literal_binds': False})).lower() for call in db.scalar.await_args_list
+    ]
+    assert len(asked) == 2
+    for sql in asked:
+        # Заказ спрашивают по своему ключу, а не по владельцу: иначе вердикт соберёт
+        # деньги ЧУЖИХ заказов того же человека.
+        assert 'checkout_payment_attempts.checkout_id' in sql
+        assert 'user_id' not in sql
+        assert 'checkout_payment_attempts.credited_amount_kopeks >' in sql
+    # Первый вопрос — «деньги уже на балансе», и он обязан быть сужен статусом:
+    # без него вердикт объявит балансом удержанные у провайдера деньги.
+    assert 'checkout_payment_attempts.status' in asked[0]
+    # Второй — «деньги вообще есть», и он статусом сужен быть НЕ должен.
+    assert 'checkout_payment_attempts.status' not in asked[1]

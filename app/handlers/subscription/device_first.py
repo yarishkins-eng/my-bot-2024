@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import CheckoutPaymentAttempt, PlategaPayment, Tariff, User
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
+    OPEN_STATES,
     OPERATOR_CLOSED_TERMINAL_REASON,
     DeviceFirstError,
     arm_checkout,
@@ -1376,15 +1377,27 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                 'You can place a new order right now.',
             )
         else:
+            # 🔴 Мина AR (пункт 4.5). Счёт закрыл САМ провайдер — это самый частый способ
+            # закрытия на боевом, и предупреждения о живой ссылке у него не было нигде.
+            # Формулировка взята слово в слово из ветки брошенной корзины выше: состояние
+            # для человека то же самое, и придумывать второй текст про одно и то же —
+            # ровно то расхождение, которое запрещает пункт 4.2б. Правда проверена по
+            # коду: причина `provider_terminal:*` входит в канонический список возврата
+            # поздних денег на баланс (`device_first_payment_service`), то есть «деньги
+            # придут вам на баланс» — не обещание, а описание уже работающей ветки.
             caption = _text(
                 user,
                 (
-                    '✅ <b>Предыдущий счёт закрыт</b>\n\nВыберите срок и устройства для нового заказа.'
+                    '✅ <b>Предыдущий счёт закрыт</b>\n\nСтарая ссылка на оплату может ещё работать — не '
+                    'платите по ней: деньги придут вам на баланс, а подписка по этому заказу всё равно не '
+                    'оформится.\n\nВыберите срок и устройства для нового заказа.'
                     if provider_terminal
                     else '🛑 <b>Заказ отменён</b>\n\nЭтот заказ больше не будет оформлен.'
                 ),
                 (
-                    '✅ <b>The previous invoice is closed</b>\n\nChoose a period and devices for a new order.'
+                    '✅ <b>The previous invoice is closed</b>\n\nThe old payment link may still work — do not '
+                    "use it: the money would go to your balance, and this order still won't become a "
+                    'subscription.\n\nChoose a period and devices for a new order.'
                     if provider_terminal
                     else '🛑 <b>Order cancelled</b>\n\nThis order will not be completed.'
                 ),
@@ -1556,6 +1569,15 @@ async def arm(
             user_id=db_user.id,
             for_update=True,
         )
+        # 🔴 Мина AT (пункт 4.5). Инлайн-кнопка живёт в переписке Telegram вечно, а
+        # `get_owned_checkout` терминальные строки отдаёт спокойно. Без этого сторожа
+        # ветка «баланса не хватает» рисовала «💳 Выберите способ оплаты» поверх уже
+        # отменённого заказа. Деньги при этом не двигались (переходы под `FOR UPDATE`
+        # отвергают не-`confirmed`), но человек видел живой экран оплаты мёртвого заказа.
+        # Показываем настоящее состояние заказа — тем же экраном, что и везде.
+        if checkout.lifecycle_state not in OPEN_STATES:
+            await _render_checkout(callback, db_user, db, checkout)
+            return
         if getattr(checkout, 'settlement_mode', None) == DIRECT_SETTLEMENT_MODE:
             if db_user.balance_kopeks >= checkout.tariff_total_kopeks:
                 checkout = await commit_direct_wallet_checkout(db, public_id=checkout.public_id, user_id=db_user.id)
