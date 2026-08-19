@@ -798,6 +798,9 @@ async def test_arm_renders_exact_server_shortage_and_configuration() -> None:
         selected_device_limit=5,
         period_days=90,
         quoted_price_kopeks=45000,
+        # Пункт 4.5 поставил в `arm` сторож терминального состояния (мина AT), поэтому
+        # у живого заказа состояние обязано быть настоящим, а не подразумеваться.
+        lifecycle_state='confirmed',
     )
 
     with (
@@ -1787,3 +1790,65 @@ async def test_provider_amount_out_of_range_offers_balance_top_up_or_support_in_
     assert 'payment provider' in caption
     assert 'Top up your balance' in caption
     assert 'contact support' in caption
+
+
+# ---------------------------------------------------------------------------
+# Мина AT (пункт 4.5). Бот перерисовывал ЗАКРЫТЫЙ заказ как живой экран оплаты.
+#
+# Инлайн-кнопка живёт в переписке Telegram вечно, а `get_owned_checkout` терминальные
+# строки отдаёт спокойно. Ветка «баланса не хватает» звала экран способов оплаты вообще
+# без вопроса о состоянии заказа. Деньги при этом не двигались (все переходы под
+# `FOR UPDATE` отвергают не-`confirmed`), но человек видел «💳 Выберите способ оплаты»
+# у заказа, который сам же отменил минуту назад.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'state',
+    ['cancelled', 'expired', 'operator_review', 'conflict', 'failed', 'reprice_required'],
+)
+async def test_arm_never_offers_payment_for_an_order_that_is_already_closed(state) -> None:
+    """Состояния литералами: сторож, читающий ту же константу, что и код, пуст."""
+    callback = SimpleNamespace(data='df:a:owned-checkout', answer=AsyncMock())
+    # Баланса заведомо не хватает — то есть код пошёл бы ровно в дырявую ветку.
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    checkout = SimpleNamespace(
+        public_id='owned-checkout',
+        selected_device_limit=5,
+        period_days=90,
+        quoted_price_kopeks=45000,
+        tariff_total_kopeks=45000,
+        settlement_mode='direct_purchase_v2',
+        lifecycle_state=state,
+    )
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.get_owned_checkout',
+            AsyncMock(return_value=checkout),
+        ),
+        patch(
+            'app.handlers.subscription.device_first._render_direct_payment_methods',
+            AsyncMock(),
+        ) as methods,
+        patch(
+            'app.handlers.subscription.device_first.commit_direct_wallet_checkout',
+            AsyncMock(),
+        ) as commit,
+        patch(
+            'app.handlers.subscription.device_first.arm_checkout',
+            AsyncMock(),
+        ) as arm_it,
+        patch(
+            'app.handlers.subscription.device_first._render_checkout',
+            AsyncMock(),
+        ) as render,
+    ):
+        await arm(callback, user, AsyncMock(), AsyncMock())
+
+    methods.assert_not_awaited()
+    commit.assert_not_awaited()
+    arm_it.assert_not_awaited()
+    # Человек видит настоящее состояние своего заказа — тем же экраном, что и везде.
+    render.assert_awaited_once()

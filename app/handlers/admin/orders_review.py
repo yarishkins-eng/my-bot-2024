@@ -1,8 +1,14 @@
-"""Пункт 4.4. Разбор заказов, застрявших на `operator_review`.
+"""Пункт 4.4. Разбор заказов, которые сами никуда не поедут.
+
+Пункт 4.5 расширил экран с одного состояния (`operator_review`) до четырёх: сюда же
+попали `conflict`, `failed` и `reprice_required`. Второй панели «закрыть заказ» не
+заводили намеренно (мина AK) — набор состояний живёт одной константой
+`OPERATOR_REVIEWABLE_STATES`, и её же спрашивают обе кнопки.
 
 До этого модуля разобрать такой заказ было НЕЧЕМ: списка не существовало ни в
-чат-админке, ни в веб-админке, ни в кабинете. Заказ при этом держит клиента
-(`operator_hold` отбивает новую покупку) и запирает смену серверов тарифа.
+чат-админке, ни в веб-админке, ни в кабинете. Заказ на разборе при этом держит клиента
+(`operator_hold` отбивает новую покупку) и запирает смену серверов тарифа; остановившийся
+заказ не держит ни того, ни другого — он навсегда лишает клиента пробного периода.
 
 Здесь ровно три действия: показать список, вернуть деньги на баланс, закрыть заказ.
 🔴 Выдачи подписки тут НЕТ и она сюда не просится (решение владельца 18.08.2026):
@@ -21,9 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import SubscriptionCheckout, User
 from app.services.device_first_checkout_service import (
+    OPERATOR_REVIEWABLE_STATES,
     close_operator_review_checkout,
     count_operator_review_checkouts,
     list_operator_review_checkouts,
+    operator_close_unblocks,
     operator_review_card,
     refund_operator_review_checkout,
     refundable_amount_kopeks,
@@ -56,22 +64,25 @@ ACTIONS = {
             'Такой возврат база не видит, и тогда клиент получит их дважды.\n\n'
             'Деньги лягут ему на баланс в боте — он сможет купить подписку сам.'
         ),
-        'after': '\n\nТеперь заказ можно закрыть — это снимет замок с клиента.',
+        'after': '\n\nТеперь заказ можно закрыть.',  # что даст закрытие — считает operator_close_unblocks
     },
     'close': {
         'button': '✅ Закрыть заказ',
         'confirm': '✅ Да, закрыть',
         # 🔴 Оба обещания прежней версии были неверны, и обе неточности нашёл прогон
         # сценария: разблокировка тарифа зависит от ДРУГИХ заказов на нём, а «найти будет
-        # труднее» — на самом деле «этой кнопкой уже никогда»: список берёт только
-        # `operator_review`, а поиска заказа по номеру в проекте нет нигде.
-        'question': (
-            '✅ <b>Закрыть заказ {order}?</b>\n\n'
-            'Этот заказ перестанет мешать клиенту оформить новую покупку.\n\n'
-            '🔴 <b>Сначала верните деньги, если они были.</b> После закрытия заказ уйдёт из '
-            'списка навсегда, и вернуть по нему деньги этой кнопкой будет уже нельзя — '
-            'останется только Platega и правка баланса вручную.'
-        ),
+        # труднее» — на самом деле «этой кнопкой уже никогда»: поиска заказа по номеру в
+        # проекте нет нигде, а закрытый заказ из списка уходит (после 4.5 список берёт
+        # четыре состояния, но `cancelled` среди них по-прежнему нет).
+        # 🔴 Пункт 4.5 сделал обещание переменной. Заказ на разборе держит новую покупку,
+        # а остановившийся (`conflict`/`failed`/`reprice_required`) её не держит вовсе —
+        # он держит пробный период. Одно обещание на оба случая было бы ложью в половине.
+        # 🔴 И {money} — P0 критика полноты. До 4.5 в списке лежали только денежные заказы,
+        # и оператор был настороже. Теперь большинство строк — рутина, у которой верное
+        # действие «просто закрыть», то есть экран сам вырабатывает рефлекс «карточка →
+        # закрыть → к списку». Прежний текст говорил «верните деньги, ЕСЛИ они были», не
+        # спрашивая базу, — хотя ответ считает соседняя кнопка. Теперь цифра называется.
+        'question': ('✅ <b>Закрыть заказ {order}?</b>\n\n{unblocks}\n\n{money}'),
         'after': '',
     },
 }
@@ -123,8 +134,10 @@ async def show_orders_review_list(callback: types.CallbackQuery, db_user: User, 
     if total > len(checkouts):
         # Листалки нет намеренно: если заказов больше двадцати, это инцидент, а не разбор.
         # Но и молчать нельзя — иначе экран выглядит полным списком, которым не является.
-        lines += [f'Показаны {len(checkouts)} самых свежих. Остальные появятся, когда разберёте эти.', '']
-    lines.append('Пока такой заказ висит, клиент чаще всего не может оформить новый.')
+        lines += [f'Показаны {len(checkouts)} из них. Остальные появятся, когда разберёте эти.', '']
+    # Список — свалка двух несравнимых случаев, и обещать про них одно нельзя. Что держит
+    # каждый конкретный заказ, написано в его карточке; здесь — только как их различать.
+    lines.append('💰 — деньги могут быть удержаны, разбирать первым. ⏸ — заказ просто остановился.')
     buttons = []
     for item in checkouts:
         snapshot = item.sale_snapshot if isinstance(item.sale_snapshot, dict) else {}
@@ -133,7 +146,11 @@ async def show_orders_review_list(callback: types.CallbackQuery, db_user: User, 
         # «Заказ: ...». Без них по тревоге свой заказ в списке не найти: внутренний id
         # заказа и внутренний id клиента в тревоге не встречаются ни разу.
         public_head = str(item.public_id or '')[:8]
-        buttons.append((f'{public_head} · {tariff_name} · клиент {item.user_id}', f'{CARD_PREFIX}{item.id}'))
+        # 🔴 Пункт 4.5. Без этого значка строки стали неразличимы: заказ с удержанными
+        # деньгами выглядел так же, как рутинный протухший расчёт, и выбрать, за что
+        # хвататься, было нельзя. Тот же признак задаёт и порядок в запросе.
+        mark = '💰' if item.lifecycle_state == 'operator_review' else '⏸'
+        buttons.append((f'{mark} {public_head} · {tariff_name} · клиент {item.user_id}', f'{CARD_PREFIX}{item.id}'))
     buttons.append(('⬅️ Назад', 'admin_panel'))
     await _edit(callback, '\n'.join(lines), _rows(*buttons))
 
@@ -157,7 +174,7 @@ async def show_order_card(callback: types.CallbackQuery, db_user: User, db: Asyn
     # сам… разбирать руками не нужно и нечем» — про заказ, который никто не пробует и
     # деньги по которому не возвращены. Плюс рисовались обе кнопки, и обе отказывали
     # только после подтверждения. Такой заказ карточкой не показываем вовсе.
-    if checkout.lifecycle_state != 'operator_review':
+    if checkout.lifecycle_state not in OPERATOR_REVIEWABLE_STATES:
         await _edit(
             callback,
             f'✅ <b>Этот заказ уже разобран</b>\n\nСостояние: «{html.escape(str(checkout.lifecycle_state))}». '
@@ -188,24 +205,52 @@ async def ask_confirmation(callback: types.CallbackQuery, db_user: User, db: Asy
     if parsed is None or checkout is None:
         await callback.answer('Заказ не найден', show_alert=True)
         return
+    # 🔴 Сторож состояния — такой же, как у карточки. Без него протухшая кнопка из
+    # переписки обещала «клиент снова сможет…» про заказ, закрытый неделю назад, и отказ
+    # приходил только ПОСЛЕ подтверждения.
+    if checkout.lifecycle_state not in OPERATOR_REVIEWABLE_STATES:
+        await _edit(
+            callback,
+            f'✅ <b>Этот заказ уже разобран</b>\n\nСостояние: '
+            f'«{html.escape(str(checkout.lifecycle_state))}». Кнопки по нему не работают.',
+            _rows(('⬅️ К списку', MENU_CALLBACK)),
+        )
+        return
     action = ACTIONS[parsed[0]]
     # 🔴 Сумму показываем ДО нажатия. Прежняя версия называла её только в ответе, то есть
     # владелец подтверждал выплату вслепую: цифра на карточке — цена по прайсу, а уйдёт
     # та, что доказана базой, и это разные поля.
     amount = ''
+    money = ''
+    if parsed[0] == 'close':
+        # Спрашиваем ТОТ ЖЕ забор, что и кнопка возврата: два ответа про одни деньги на
+        # одном экране обязаны сходиться, иначе оператор выберет тот, что удобнее.
+        kopeks, _refusal = await refundable_amount_kopeks(db, checkout)
+        money = (
+            f'🔴 <b>По этому заказу можно вернуть {settings.format_price(kopeks)} — верните их ДО '
+            'закрытия.</b> После закрытия заказ уйдёт из списка навсегда, и этой кнопкой деньги '
+            'вернуть будет уже нельзя: останется только Platega и правка баланса вручную.'
+            if kopeks > 0
+            else 'Возвращать по нему нечего: подтверждённого списания в базе нет.'
+        )
     if parsed[0] == 'refund':
         kopeks, refusal = await refundable_amount_kopeks(db, checkout)
         if kopeks <= 0:
             await _edit(
                 callback,
-                f'⚠️ <b>Возвращать нечего</b>\n\n{html.escape(refusal.capitalize())}.',
+                f'⚠️ <b>Возвращать нечего</b>\n\n{html.escape(refusal[:1].upper() + refusal[1:])}.',
                 _rows(('⬅️ К заказу', f'{CARD_PREFIX}{checkout.id}')),
             )
             return
         amount = settings.format_price(kopeks)
     await _edit(
         callback,
-        action['question'].format(order=html.escape(str(checkout.public_id)), amount=amount),
+        action['question'].format(
+            order=html.escape(str(checkout.public_id)),
+            amount=amount,
+            unblocks=operator_close_unblocks(checkout),
+            money=money,
+        ),
         _rows(
             (action['confirm'], f'{GO_PREFIX}{parsed[0]}:{checkout.id}'),
             ('⬅️ Отмена', f'{CARD_PREFIX}{checkout.id}'),

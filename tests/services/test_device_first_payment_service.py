@@ -2338,3 +2338,63 @@ async def test_a_repeat_webhook_after_an_operator_refund_never_pays_twice():
 
     assert user.balance_kopeks == 35_000, 'повторный вебхук зачислил деньги второй раз'
     db.add.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Мины R и AD (пункт 4.5). Брошенный счёт опрашивался у провайдера ВЕЧНО и с плоским
+# интервалом «+6 часов». Опрос не выключаем — на нём висит возврат поздних денег, и
+# контракта финальности провайдер не даёт. Но интервал обязан расти.
+# ---------------------------------------------------------------------------
+
+
+def test_the_poll_of_a_closed_invoice_gets_rarer_but_never_stops():
+    """Числа литералами: сторож, читающий те же константы, что и код, ничего не ловит."""
+    from app.services.device_first_payment_service import terminal_reconcile_delay
+
+    # Первое наблюдение — прежние 6 часов: ничего не замедляем на свежем счёте.
+    assert terminal_reconcile_delay(0) == timedelta(hours=6)
+    assert terminal_reconcile_delay(1) == timedelta(hours=6)
+    assert terminal_reconcile_delay(2) == timedelta(hours=12)
+    assert terminal_reconcile_delay(3) == timedelta(hours=24)
+    # Потолок — неделя, и он именно потолок: «перестать смотреть» нельзя никогда.
+    assert terminal_reconcile_delay(50) == timedelta(days=7)
+    assert terminal_reconcile_delay(10**6) == timedelta(days=7)
+    # Колонка nullable в старых строках — падать на этом нельзя.
+    assert terminal_reconcile_delay(None) == timedelta(hours=6)
+
+
+@pytest.mark.asyncio
+async def test_the_growing_interval_is_actually_wired_into_the_release():
+    """🔴 Урок 4.1: тест на функцию не доказывает, что функция ПОДКЛЮЧЕНА.
+
+    Мутация «оставить плоские 6 часов» переживала бы проверку выше целиком.
+    """
+    payment, user, attempt, checkout = _terminal_direct_rows(lifecycle_state='cancelled')
+    attempt.terminal_observations = 4
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(payment), Result(user), Result(attempt), Result(checkout)]),
+        scalar=AsyncMock(return_value=None),
+        add=MagicMock(),
+        commit=AsyncMock(),
+    )
+    before = datetime.now(UTC)
+
+    released = await _release_direct_terminal_invoice(
+        db,
+        attempt_id=attempt.id,
+        payment_id=payment.id,
+        payload={
+            'id': 'provider-1',
+            'status': 'CANCELED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '350.00', 'currency': 'RUB'},
+        },
+        provider_status='CANCELED',
+        source='poll',
+    )
+
+    assert released is True
+    # Пятое наблюдение по счётчику → 6 ч × 2⁴ = 96 часов, а не прежние шесть.
+    assert attempt.terminal_observations == 5
+    assert attempt.next_reconcile_at - before >= timedelta(hours=95)
+    assert attempt.next_reconcile_at - before <= timedelta(hours=97)

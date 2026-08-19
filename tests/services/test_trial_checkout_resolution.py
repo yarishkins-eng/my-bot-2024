@@ -278,3 +278,129 @@ async def test_trial_resolution_then_late_exact_callback_credits_once_without_to
     ]
     assert len(ledger_rows) == 1
     fulfill.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Пункт 4.5. Застрявший заказ и пробный период — ЕДИНСТВЕННЫЙ доказанный вред
+# состояний `conflict` / `failed` / `reprice_required`.
+#
+# Тариф они не запирают (входят в `_CHECKOUT_TERMINAL_STATES`, `crud/tariff.py`), новую
+# покупку не блокируют (свип их не выбирает), тревогу владельцу не поднимают. Они делают
+# ровно одно: навсегда отнимают у человека право на пробный период. Мест, где это
+# решается, ДВА, и оба обязаны отпустить его после закрытия заказа.
+# ---------------------------------------------------------------------------
+
+STOPPED_STATES = ('conflict', 'failed', 'reprice_required')
+
+
+def _stopped_checkout(state: str):
+    """Заказ, который сам никуда не поедет: свип его не выбирает, повторов у него нет."""
+    return SimpleNamespace(
+        id=9,
+        user_id=7,
+        public_id='checkout-stuck-9',
+        tariff_id=3,
+        period_days=90,
+        selected_device_limit=3,
+        tariff_total_kopeks=64_900,
+        quoted_price_kopeks=64_900,
+        lifecycle_state=state,
+        quote_state='valid',
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        funding_state='invoice_terminal',
+        fulfillment_state='not_started',
+        financial_committed_at=None,
+        terminal_reason='payment_amount_mismatch',
+        updated_at=None,
+    )
+
+
+class _ReadOnlyTrialDb:
+    """Сессия классификатора: заказы, попытки, платежи — в том порядке, как он их просит."""
+
+    def __init__(self, checkouts):
+        self._answers = [Rows(list(checkouts)), Rows([])]
+
+    async def execute(self, _stmt):
+        return self._answers.pop(0)
+
+    async def get(self, _model, _ident):
+        return SimpleNamespace(name='Базовый')
+
+
+async def _close_with_the_operator_button(checkout) -> None:
+    """Ровно та кнопка, которую жмёт оператор, — без её обхода тест ничего не доказывает."""
+    from app.services.device_first_checkout_service import close_operator_review_checkout
+
+    done, _message = await close_operator_review_checkout(
+        SimpleNamespace(commit=AsyncMock()), checkout=checkout, admin_user_id=1
+    )
+    assert done is True
+
+
+@pytest.mark.parametrize('state', STOPPED_STATES)
+@pytest.mark.asyncio
+async def test_a_stopped_order_takes_the_trial_away_and_closing_gives_it_back(state):
+    """Классификатор (`/trial` и мини-апп). До закрытия — отказ, после — снова можно."""
+    from app.services.trial_activation_service import get_trial_checkout_context
+
+    checkout = _stopped_checkout(state)
+    blocked = await get_trial_checkout_context(_ReadOnlyTrialDb([checkout]), user_id=7)
+    assert blocked.state == 'reconciliation_required'
+    assert blocked.checkout.public_id == checkout.public_id
+
+    await _close_with_the_operator_button(checkout)
+
+    released = await get_trial_checkout_context(_ReadOnlyTrialDb([checkout]), user_id=7)
+    assert released.state == 'ready'
+
+
+class _TrialFenceReached(Exception):
+    """Управление дошло дальше забора — значит забор пропустил."""
+
+
+@pytest.mark.parametrize('state', STOPPED_STATES)
+@pytest.mark.asyncio
+async def test_the_mutating_path_also_lets_the_trial_through_after_closing(state):
+    """🔴 Второе место, и правка одного оставила бы второе врать.
+
+    Классификатор только рассказывает; выдаёт триал этот путь, и у него свой список
+    состояний. Проверяем поведением: до закрытия — отказ с кодом блокировки, после —
+    управление уходит за забор (ловим его собственным исключением).
+    """
+    checkout = _stopped_checkout(state)
+    locked = _LockedDirectContext(
+        user=SimpleNamespace(id=7, auth_type='telegram', restriction_subscription=False, balance_kopeks=0),
+        checkouts=[checkout],
+        attempts_by_checkout_id={},
+        payments_by_id={},
+    )
+    patches = (
+        patch('app.services.trial_activation_service._lock_direct_context_for_trial', AsyncMock(return_value=locked)),
+        patch('app.services.trial_activation_service.preview_trial_activation_charge', return_value=0),
+        patch(
+            'app.services.trial_activation_service._tariff_for_checkout',
+            AsyncMock(return_value=SimpleNamespace(name='Базовый')),
+        ),
+    )
+
+    with patches[0], patches[1], patches[2]:
+        db = SimpleNamespace(execute=AsyncMock(side_effect=[Rows([]), Rows([])]))
+        with pytest.raises(TrialCheckoutResolutionError) as blocked:
+            await activate_trial_with_checkout_resolution(db, user_id=7)
+    assert blocked.value.code == 'trial_blocked_by_reconciliation'
+
+    await _close_with_the_operator_button(checkout)
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch(
+            'app.services.trial_activation_service._trial_parameters',
+            AsyncMock(side_effect=_TrialFenceReached),
+        ),
+    ):
+        db = SimpleNamespace(execute=AsyncMock(side_effect=[Rows([]), Rows([])]))
+        with pytest.raises(_TrialFenceReached):
+            await activate_trial_with_checkout_resolution(db, user_id=7)
