@@ -2814,6 +2814,21 @@ _TERMINAL_REASON_RU = {
     'panel_update_failed': 'панель VPN не приняла изменения',
     'panel_unavailable': 'панель VPN не отвечает',
     'panel_squads_not_applied': 'панель VPN не применила серверы',
+    # 🔴 Пункт 4.5. Причины остановившихся заказов (`conflict`/`reprice_required`). Без них
+    # карточка на КАЖДОМ таком заказе печатала «причину видно только по коду» — то есть
+    # экран, сделанный ради того, чтобы перестать врать, просто замолчал. Все одиннадцать
+    # проверены грепом по присваиваниям `terminal_reason`, ни одной выдуманной.
+    'quote_expired': 'расчёт устарел, цену надо пересчитать',
+    'price_changed': 'цена изменилась после расчёта',
+    'entitlement_changed': 'набор серверов тарифа изменился после расчёта',
+    'tariff_no_longer_eligible': 'этот тариф клиенту больше не подходит',
+    'subscription_appeared': 'подписка у клиента появилась, пока шёл заказ',
+    'target_subscription_changed': 'подписка клиента изменилась, пока шёл заказ',
+    'device_limit_decrease_not_allowed': 'в заказе меньше устройств, чем у действующей подписки',
+    'location_policy_not_sellable': 'страну из заказа сейчас не продаём',
+    'non_positive_quote': 'расчёт вышел нулевым или отрицательным',
+    'entitlement_quote_missing_or_invalid': 'расчёт прав доступа не сошёлся',
+    'payment_amount_mismatch': 'платёжная система вернула сумму, отличную от счёта',
 }
 _PROVISIONING_RU = {
     'not_started': 'не начиналась',
@@ -2979,16 +2994,21 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
         lines.append(f'⚠️ Оплату нужно проверить: {reason_ru or "причину видно только по коду"}.')
     elif checkout.lifecycle_state in OPERATOR_REVIEWABLE_STATES:
         # Пункт 4.5. Эти заказы карточка раньше не показывала вовсе, а текст ниже про них
-        # врал: «бот продолжает пробовать сам» — не пробует, свип их не выбирает, повторов
-        # у них нет. 🔴 Кроме одного случая: очередь выдачи (`DeviceFirstOutbox`) живёт
-        # отдельно от состояния заказа и может ещё крутиться. Тогда «сам не поедет» стало
-        # бы новой ложью, а совет закрыть — вредным. Поэтому обещание условное.
-        still_trying = str(checkout.provisioning_state) in {'pending', 'retry'}
-        tail = '' if still_trying else ' Сам он дальше не поедет.'
-        lines.append(f'⚠️ Заказ остановился: {reason_ru or "причину видно только по коду"}.{tail}')
-        if still_trying:
-            lines.append(f'⏳ Выдача {provisioning_ru}: бот ещё пробует сам, закрывать заказ пока не нужно.')
-        lines.append('🎁 Пробный период бот клиенту не выдаст, пока этот заказ висит.')
+        # врал: «бот продолжает пробовать сам» — не пробует. Свип их не выбирает
+        # (`get_open_checkout_for_user`), очереди выдачи у них не бывает: строка
+        # `DeviceFirstOutbox` заводится одним блоком с `lifecycle_state='fulfilling'`
+        # (`:1582`, `:2147`), а все переходы в `conflict`/`reprice_required` живут ДО него.
+        # 🔴 Если эта пара всё-таки станет достижимой, здесь появится вредный совет —
+        # сторожить её отдельным `if` нельзя (спящая ветка врёт следующему агенту так же
+        # уверенно, как код), поэтому причина недостижимости записана прямо тут.
+        lines.append(f'⚠️ Заказ остановился: {reason_ru or "причину видно только по коду"}. Сам он не продолжится.')
+        # Карточка называет ТЕКУЩИЙ вред, а `operator_close_unblocks` — что даст закрытие.
+        # Это разные утверждения, и склеивать их в одно нельзя: у заказов, остановленных
+        # из-за уже существующей подписки, вреда нет вовсе.
+        if str(checkout.terminal_reason or '') in _REASONS_PROVING_CLIENT_ALREADY_HAS_SUBSCRIPTION:
+            lines.append('ℹ️ Клиенту он не мешает: подписка у него уже есть.')
+        else:
+            lines.append('🎁 Пока этот заказ висит, клиент не возьмёт пробный период.')
     else:
         # Настоящая ошибка панели лежит не в заказе, а в строке очереди выдачи. Без неё
         # владелец видел «выдача застряла» вообще без причины.
@@ -3004,7 +3024,10 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
         )
     if str(checkout.provisioning_state) != 'ready':
         # При chargeback подписка уже выдана и работает — безусловная строка была бы ложью.
-        lines.append('📵 VPN клиенту не выдан.')
+        # 🔴 «По этому заказу», а не «клиенту»: пункт 4.5 привёл сюда продлевающие заказы
+        # (`target_subscription_changed`, `device_limit_decrease_not_allowed`), где VPN у
+        # клиента работает, и прежняя формулировка звала оператора выдавать подписку заново.
+        lines.append('📵 По этому заказу VPN не выдан.')
     # Блокировка нового заказа шире, чем `operator_review`: заказ, застрявший на выдаче,
     # держит клиента через `direct_provisioning_recovery` ровно так же.
     blocked = checkout.lifecycle_state == 'operator_review' or str(checkout.provisioning_state) in {'pending', 'retry'}
@@ -3025,12 +3048,12 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
             'а кнопка возврата предложит вернуть те же деньги второй раз.',
         ]
     elif checkout.lifecycle_state in OPERATOR_REVIEWABLE_STATES:
-        # Ключ здесь — только состояние заказа, потому что видимость в разделе тоже
-        # решается только им. Совет «закрыть» не даём: выше стоит либо «сам не поедет»,
-        # либо «бот ещё пробует», и решение принимает человек, глядя на обе строки.
+        # Ключ здесь — только состояние заказа, потому что видимость в разделе решается
+        # только им. Кнопки называем так же, как в ветке выше: оператор приходит на экран,
+        # заранее зная, что там его ждёт.
         lines.append(
-            '🛠️ Разобрать: админ-панель → «🧾 Заказы на разборе» → этот заказ. '
-            'Про деньги смотрите строку выше: она считается по базе, а не по состоянию заказа.'
+            '🛠️ Разобрать: админ-панель → «🧾 Заказы на разборе» → этот заказ. Там две кнопки: '
+            'вернуть деньги клиенту на баланс и закрыть заказ. Про деньги — строка со значком 💵 выше.'
         )
     else:
         lines.append(
@@ -3368,7 +3391,16 @@ OPERATOR_REFUND_LEDGER_PREFIX = 'operator_review_refund'
 # не видит вовсе — они входят в его терминальный набор. Расширить её значит назвать
 # владельцу заказ, закрытие которого замок с тарифа не снимет, и увести его от настоящей
 # причины отказа.
+# ⚠️ `failed` в наборе — про исторические строки: `lifecycle_state = 'failed'` сегодня не
+# присваивается нигде в `app/` (проверено грепом). Живых состояний тут три, не четыре.
 OPERATOR_REVIEWABLE_STATES = frozenset({'operator_review', 'conflict', 'failed', 'reprice_required'})
+# 🔴 Причины, которые ставятся ТОЛЬКО клиенту с уже существующей подпиской. Забор триала
+# отбивает таких раньше, чем доходит до заказов: любая не-`PENDING` подписка даёт
+# `trial_already_used` (`trial_activation_service.py:654-656`). Значит закрытие такого
+# заказа не вернёт клиенту ни покупку, ни триал — и обещать это оператору нельзя.
+_REASONS_PROVING_CLIENT_ALREADY_HAS_SUBSCRIPTION = frozenset(
+    {'subscription_appeared', 'target_subscription_changed', 'device_limit_decrease_not_allowed'}
+)
 
 
 def operator_close_unblocks(checkout: SubscriptionCheckout) -> str:
@@ -3377,12 +3409,15 @@ def operator_close_unblocks(checkout: SubscriptionCheckout) -> str:
     Заказ на разборе держит клиенту новую покупку (`operator_hold` отбивает её напрямую).
     Остановившийся заказ (`conflict`/`failed`/`reprice_required`) покупку не держит вовсе —
     он держит **пробный период**: забор триала пропускает только `cancelled`, `expired` и
-    `ready` (`trial_activation_service.py:400`, `:677`). Обещать оператору одно на все
-    состояния — соврать ему в половине случаев.
+    `ready` (`trial_activation_service.py:400`, `:677`). А если заказ остановлен потому, что
+    подписка у клиента уже есть, — не держит и триала: тот закрыт другим забором, раньше.
+    Обещать оператору одно на все три случая — соврать ему в двух.
     """
     if checkout.lifecycle_state == 'operator_review':
-        return 'оформить новую покупку'
-    return 'получить пробный период'
+        return 'Клиент снова сможет оформить покупку.'
+    if str(checkout.terminal_reason or '') in _REASONS_PROVING_CLIENT_ALREADY_HAS_SUBSCRIPTION:
+        return 'Клиенту это ничего не даст: подписка у него уже есть. Заказ просто уйдёт из списка.'
+    return 'Клиент снова сможет взять пробный период.'
 
 
 async def list_operator_review_checkouts(
@@ -3390,12 +3425,24 @@ async def list_operator_review_checkouts(
     *,
     limit: int = 20,
 ) -> list[SubscriptionCheckout]:
-    """Заказы, ждущие человека. Самые свежие сверху."""
+    """Заказы, ждущие человека. Сначала те, где могут быть деньги, потом самые свежие.
+
+    🔴 Пункт 4.5. Раньше сортировка была только по свежести, и это было верно: все строки
+    списка значили одно и то же. Теперь список смешивает два несравнимых случая, и
+    `reprice_required` — это рутина (протухший за 30 минут расчёт, смена цены), которая
+    всегда свежее. Без этого приоритета двадцати таких заказов хватило бы, чтобы вытеснить
+    за экран `operator_review` с удержанными деньгами живого клиента, а ни листалки, ни
+    поиска по номеру в проекте нет.
+    """
     rows = await db.execute(
         select(SubscriptionCheckout)
         .join(User, User.id == SubscriptionCheckout.user_id)
         .where(*_operator_review_visible_conditions())
-        .order_by(SubscriptionCheckout.updated_at.desc(), SubscriptionCheckout.id.desc())
+        .order_by(
+            (SubscriptionCheckout.lifecycle_state == 'operator_review').desc(),
+            SubscriptionCheckout.updated_at.desc(),
+            SubscriptionCheckout.id.desc(),
+        )
         .limit(limit)
     )
     return list(rows.scalars().all())

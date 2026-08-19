@@ -64,7 +64,7 @@ ACTIONS = {
             'Такой возврат база не видит, и тогда клиент получит их дважды.\n\n'
             'Деньги лягут ему на баланс в боте — он сможет купить подписку сам.'
         ),
-        'after': '\n\nТеперь заказ можно закрыть — это снимет замок с клиента.',
+        'after': '\n\nТеперь заказ можно закрыть.',
     },
     'close': {
         'button': '✅ Закрыть заказ',
@@ -78,7 +78,7 @@ ACTIONS = {
         # он держит пробный период. Одно обещание на оба случая было бы ложью в половине.
         'question': (
             '✅ <b>Закрыть заказ {order}?</b>\n\n'
-            'Этот заказ перестанет мешать клиенту {unblocks}.\n\n'
+            '{unblocks}\n\n'
             '🔴 <b>Сначала верните деньги, если они были.</b> После закрытия заказ уйдёт из '
             'списка навсегда, и вернуть по нему деньги этой кнопкой будет уже нельзя — '
             'останется только Platega и правка баланса вручную.'
@@ -135,9 +135,9 @@ async def show_orders_review_list(callback: types.CallbackQuery, db_user: User, 
         # Листалки нет намеренно: если заказов больше двадцати, это инцидент, а не разбор.
         # Но и молчать нельзя — иначе экран выглядит полным списком, которым не является.
         lines += [f'Показаны {len(checkouts)} самых свежих. Остальные появятся, когда разберёте эти.', '']
-    # Список — свалка состояний, и обещать про все одно нельзя: заказ на разборе держит
-    # новую покупку, остановившийся держит пробный период. Общая строка называет оба.
-    lines.append('Пока такой заказ висит, клиент чаще всего не может оформить новый и не получит пробный период.')
+    # Список — свалка двух несравнимых случаев, и обещать про них одно нельзя. Что держит
+    # каждый конкретный заказ, написано в его карточке; здесь — только как их различать.
+    lines.append('💰 — деньги могут быть удержаны, разбирать первым. ⏸ — заказ просто остановился.')
     buttons = []
     for item in checkouts:
         snapshot = item.sale_snapshot if isinstance(item.sale_snapshot, dict) else {}
@@ -146,7 +146,11 @@ async def show_orders_review_list(callback: types.CallbackQuery, db_user: User, 
         # «Заказ: ...». Без них по тревоге свой заказ в списке не найти: внутренний id
         # заказа и внутренний id клиента в тревоге не встречаются ни разу.
         public_head = str(item.public_id or '')[:8]
-        buttons.append((f'{public_head} · {tariff_name} · клиент {item.user_id}', f'{CARD_PREFIX}{item.id}'))
+        # 🔴 Пункт 4.5. Без этого значка строки стали неразличимы: заказ с удержанными
+        # деньгами выглядел так же, как рутинный протухший расчёт, и выбрать, за что
+        # хвататься, было нельзя. Тот же признак задаёт и порядок в запросе.
+        mark = '💰' if item.lifecycle_state == 'operator_review' else '⏸'
+        buttons.append((f'{mark} {public_head} · {tariff_name} · клиент {item.user_id}', f'{CARD_PREFIX}{item.id}'))
     buttons.append(('⬅️ Назад', 'admin_panel'))
     await _edit(callback, '\n'.join(lines), _rows(*buttons))
 
@@ -200,6 +204,17 @@ async def ask_confirmation(callback: types.CallbackQuery, db_user: User, db: Asy
     checkout = await _load(db, parsed[1]) if parsed else None
     if parsed is None or checkout is None:
         await callback.answer('Заказ не найден', show_alert=True)
+        return
+    # 🔴 Сторож состояния — такой же, как у карточки. Без него протухшая кнопка из
+    # переписки обещала «клиент снова сможет…» про заказ, закрытый неделю назад, и отказ
+    # приходил только ПОСЛЕ подтверждения.
+    if checkout.lifecycle_state not in OPERATOR_REVIEWABLE_STATES:
+        await _edit(
+            callback,
+            f'✅ <b>Этот заказ уже разобран</b>\n\nСостояние: '
+            f'«{html.escape(str(checkout.lifecycle_state))}». Кнопки по нему не работают.',
+            _rows(('⬅️ К списку', MENU_CALLBACK)),
+        )
         return
     action = ACTIONS[parsed[0]]
     # 🔴 Сумму показываем ДО нажатия. Прежняя версия называла её только в ответе, то есть

@@ -439,12 +439,33 @@ async def test_a_stopped_order_reaches_the_money_question_instead_of_a_flat_refu
     assert 'нет подтверждённого списания' in message
 
 
-@pytest.mark.parametrize('state', STOPPED_STATES)
-def test_the_close_question_promises_the_right_thing(state):
-    """Заказ на разборе держит покупку, остановившийся — пробный период. Одно обещание
-    на оба случая было бы ложью ровно в половине нажатий."""
-    assert service.operator_close_unblocks(_checkout()) == 'оформить новую покупку'
-    assert service.operator_close_unblocks(_checkout(lifecycle_state=state)) == 'получить пробный период'
+# Причины, которые ставятся ТОЛЬКО клиенту с уже существующей подпиской: забор триала
+# отбивает такого раньше, чем доходит до заказов, поэтому закрытие ему ничего не даёт.
+REASONS_WITH_A_LIVE_SUBSCRIPTION = (
+    'subscription_appeared',
+    'target_subscription_changed',
+    'device_limit_decrease_not_allowed',
+)
+
+
+def test_the_close_question_promises_exactly_what_closing_gives():
+    """🔴 Три случая, а не два. Обещание одно на всех было бы ложью в двух из трёх."""
+    assert service.operator_close_unblocks(_checkout()) == 'Клиент снова сможет оформить покупку.'
+    stopped = service.operator_close_unblocks(_checkout(lifecycle_state='conflict', terminal_reason='quote_expired'))
+    assert stopped == 'Клиент снова сможет взять пробный период.'
+    for reason in REASONS_WITH_A_LIVE_SUBSCRIPTION:
+        nothing = service.operator_close_unblocks(_checkout(lifecycle_state='conflict', terminal_reason=reason))
+        assert 'ничего не даст' in nothing
+        assert 'пробный период' not in nothing
+
+
+def _card(checkout) -> str:
+    import asyncio
+
+    db = MagicMock()
+    db.get = AsyncMock(return_value=SimpleNamespace(id=186, telegram_id=1, username=None, full_name='Tiger'))
+    db.scalar = AsyncMock(return_value=None)
+    return asyncio.run(service._owner_order_stuck_text(db, checkout))
 
 
 @pytest.mark.parametrize('state', STOPPED_STATES)
@@ -452,37 +473,93 @@ def test_the_card_of_a_stopped_order_stops_lying(state):
     """🔴 До пункта 4.5 карточка этих заказов уходила в ветку «застряла выдача» и печатала
     две неправды: «бот продолжает пробовать сам» и «в разделе разбора этого заказа не
     будет» — про заказ, открытый из этого самого раздела."""
-    import asyncio
-
-    def _card_db():
-        db = MagicMock()
-        db.get = AsyncMock(return_value=SimpleNamespace(id=186, telegram_id=1, username=None, full_name='Tiger'))
-        db.scalar = AsyncMock(return_value=None)
-        return db
-
-    text = asyncio.run(service._owner_order_stuck_text(_card_db(), _checkout(lifecycle_state=state)))
+    text = _card(_checkout(lifecycle_state=state))
     assert 'Бот продолжает пробовать сам' not in text
     assert 'этого заказа не будет' not in text
     assert 'Заказы на разборе' in text
-    # И называет настоящий вред, ради которого пункт делался.
-    assert 'Пробный период' in text
-    assert 'Сам он дальше не поедет' in text
+    assert 'Сам он не продолжится' in text
+    assert 'клиент не возьмёт пробный период' in text
+    # И не зовёт выдавать подписку заново: заказ бывает продлевающим, VPN у клиента жив.
+    assert 'VPN клиенту не выдан' not in text
 
 
-def test_the_card_never_tells_the_operator_to_close_an_order_still_being_provisioned():
-    """🔴 Очередь выдачи живёт отдельно от состояния заказа и может ещё крутиться.
-    Тогда «сам не поедет» — новая ложь, а совет закрыть — вредный совет."""
-    import asyncio
+def test_every_reason_of_a_stopped_order_has_a_russian_name():
+    """🔴 P1 ревью: словарь причин знал только `operator_review`, и карточка КАЖДОГО нового
+    заказа печатала «причину видно только по коду». Экран, сделанный чтобы перестать врать,
+    просто замолчал. Имена литералами — сторож, читающий тот же словарь, что и код, пуст."""
+    for reason in (
+        'quote_expired',
+        'price_changed',
+        'entitlement_changed',
+        'tariff_no_longer_eligible',
+        'subscription_appeared',
+        'target_subscription_changed',
+        'device_limit_decrease_not_allowed',
+        'location_policy_not_sellable',
+        'non_positive_quote',
+        'entitlement_quote_missing_or_invalid',
+        'payment_amount_mismatch',
+    ):
+        text = _card(_checkout(lifecycle_state='conflict', terminal_reason=reason))
+        assert 'причину видно только по коду' not in text, reason
+        assert service._TERMINAL_REASON_RU[reason] in text
+
+
+def test_the_card_of_a_renewal_order_names_no_harm_that_does_not_exist():
+    """Заказ остановлен потому, что подписка у клиента уже есть. Пробного периода он и так
+    не получит — другим забором. Называть это вредом значит выдумать оператору беду."""
+    text = _card(_checkout(lifecycle_state='conflict', terminal_reason='target_subscription_changed'))
+    assert 'не возьмёт пробный период' not in text
+    assert 'подписка у него уже есть' in text
+
+
+@pytest.mark.asyncio
+async def test_money_orders_are_never_pushed_off_the_screen_by_routine_ones():
+    """🔴 P1 ревью: `reprice_required` — это рутина (протухший за 30 минут расчёт), её никто
+    не закрывает, и она всегда свежее. Двадцати таких строк хватило бы, чтобы вытеснить за
+    экран `operator_review` с удержанными деньгами, а листалки и поиска по номеру нет."""
+    from sqlalchemy import select
+
+    from app.database.models import SubscriptionCheckout, User
 
     db = MagicMock()
-    db.get = AsyncMock(return_value=SimpleNamespace(id=186, telegram_id=1, username=None, full_name='Tiger'))
-    db.scalar = AsyncMock(return_value=None)
+    rows = MagicMock()
+    rows.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))
+    db.execute = AsyncMock(return_value=rows)
+    await service.list_operator_review_checkouts(db, limit=20)
 
-    text = asyncio.run(
-        service._owner_order_stuck_text(db, _checkout(lifecycle_state='conflict', provisioning_state='retry'))
+    sql = str(db.execute.await_args[0][0].compile(compile_kwargs={'literal_binds': True}))
+    order_by = sql.split('ORDER BY', 1)[1]
+    # Признак «тут могут быть деньги» стоит ПЕРВЫМ ключом сортировки, свежесть — вторым.
+    assert order_by.index("'operator_review'") < order_by.index('updated_at')
+    # И это именно сортировка, а не фильтр: рутинные заказы с экрана не исчезают.
+    where = sql.split('WHERE', 1)[1].split('ORDER BY', 1)[0]
+    for state in ('conflict', 'failed', 'reprice_required'):
+        assert f"'{state}'" in where
+    del select, SubscriptionCheckout, User
+
+
+@pytest.mark.asyncio
+async def test_a_stale_confirmation_button_refuses_before_asking_anything():
+    """🔴 P2 ревью: у вопроса сторожа состояния не было. Протухшая кнопка из переписки
+    обещала «клиент снова сможет…» про заказ, закрытый неделю назад, и отказ приходил
+    только ПОСЛЕ подтверждения."""
+    from app.handlers.admin import orders_review
+
+    checkout = _checkout(lifecycle_state='cancelled')
+    screens = []
+    callback = SimpleNamespace(
+        data=f'{orders_review.ASK_PREFIX}close:{checkout.id}',
+        message=SimpleNamespace(edit_text=AsyncMock(side_effect=lambda text, **_: screens.append(text))),
+        answer=AsyncMock(),
     )
-    assert 'Сам он дальше не поедет' not in text
-    assert 'закрывать заказ пока не нужно' in text
+    db = _db()
+    db.get = AsyncMock(return_value=checkout)
+
+    await orders_review.ask_confirmation.__wrapped__.__wrapped__(callback, SimpleNamespace(id=1), db)
+
+    assert 'уже разобран' in screens[0]
+    assert 'снова сможет' not in screens[0]
 
 
 @pytest.mark.asyncio
@@ -492,11 +569,12 @@ async def test_the_whole_path_works_for_a_stopped_order_through_the_real_buttons
     Счётчик «залипших» и так равен нулю, поэтому «стало ноль» не доказывает ничего.
     Собираем случай сами и ведём его теми же обработчиками, что и живой оператор:
     список → карточка → вопрос → закрытие. Урок 4.1: тест на функцию не доказывает,
-    что функция ПОДКЛЮЧЕНА.
+    что функция ПОДКЛЮЧЕНА. Декораторы сняты намеренно — `@error_handler` проглотил бы
+    падение и сделал тест зелёным на сломанном коде.
     """
     from app.handlers.admin import orders_review
 
-    checkout = _checkout(lifecycle_state='conflict', terminal_reason='payment_amount_mismatch')
+    checkout = _checkout(lifecycle_state='conflict', terminal_reason='quote_expired')
     admin = SimpleNamespace(id=1)
     screens = []
 
@@ -523,13 +601,14 @@ async def test_the_whole_path_works_for_a_stopped_order_through_the_real_buttons
             _callback(f'{orders_review.GO_PREFIX}close:{checkout.id}'), admin, db
         )
 
-    # Заказ дошёл до списка — до пункта 4.5 он туда не попадал вовсе.
+    # Заказ дошёл до списка — до пункта 4.5 он туда не попадал вовсе — и отличим от денежного.
     assert 'Заказы на разборе: 1' in screens[0]
+    assert '⏸' in screens[0]
     # Карточка открылась, а не отбилась «этот заказ уже разобран».
     assert screens[1] == 'карточка заказа'
     # Вопрос обещает ровно то, что закрытие даёт ИМЕННО ЭТОМУ заказу.
-    assert 'получить пробный период' in screens[2]
-    assert 'оформить новую покупку' not in screens[2]
+    assert 'снова сможет взять пробный период' in screens[2]
+    assert 'оформить покупку' not in screens[2]
     # И заказ действительно закрыт — существующей причиной, без новой (мины K, AM, Y).
     assert screens[3].startswith('✅')
     assert checkout.lifecycle_state == 'cancelled'

@@ -1344,14 +1344,20 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                     'charged for it. You can place a new order right now.',
                 )
                 if money_state == 'no_money'
+                # 🔴 Пункт 4.5. Прежний текст обещал будущий возврат поддержкой. Для части
+                # заказов это неправда: у остановившихся с зачислением на баланс деньги уже
+                # ЛЕЖАТ на балансе, поддержка ничего возвращать не будет, а кнопка возврата
+                # у неё прямо отвечает «уже вернулись, второй раз не нужно». Человек ждал бы
+                # действия, которого никто не сделает. Говорим про баланс без обещаний и
+                # даём выход, если денег там нет.
                 else _text(
                     user,
-                    '🛑 <b>Заказ закрыт поддержкой</b>\n\nПодпиской он не станет. Если оплата по нему '
-                    'прошла, поддержка вернёт сумму на ваш баланс. Проверьте баланс перед новым '
-                    'заказом: с него он и оплатится.',
-                    '🛑 <b>Order closed by support</b>\n\nIt will not become a subscription. If a payment '
-                    'went through, support will return the amount to your balance. Check your balance '
-                    'before placing a new order — it will be paid from there.',
+                    '🛑 <b>Заказ закрыт поддержкой</b>\n\nПодпиской он не станет. Деньги по нему, если '
+                    'они списывались, идут вам на баланс — проверьте его перед новым заказом: с баланса '
+                    'заказ и оплатится. Если баланс не пополнился, напишите в поддержку.',
+                    '🛑 <b>Order closed by support</b>\n\nIt will not become a subscription. Any money '
+                    'charged for it goes to your balance — check it before placing a new order, it will be '
+                    'paid from there. If the balance did not change, contact support.',
                 )
             )
         elif late_paid and money_state == 'money_in_flight':
@@ -1388,16 +1394,16 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
             caption = _text(
                 user,
                 (
-                    '✅ <b>Предыдущий счёт закрыт</b>\n\nСтарая ссылка на оплату может ещё работать — не '
-                    'платите по ней: деньги придут вам на баланс, а подписка по этому заказу всё равно не '
-                    'оформится.\n\nВыберите срок и устройства для нового заказа.'
+                    '⚠️ <b>Предыдущий счёт закрыт</b>\n\nСтарая ссылка на оплату может ещё работать. Не '
+                    'платите по ней: сумма просто ляжет вам на баланс, а подписка по этому заказу всё равно '
+                    'не оформится.\n\nВыберите срок и устройства для нового заказа.'
                     if provider_terminal
                     else '🛑 <b>Заказ отменён</b>\n\nЭтот заказ больше не будет оформлен.'
                 ),
                 (
-                    '✅ <b>The previous invoice is closed</b>\n\nThe old payment link may still work — do not '
-                    "use it: the money would go to your balance, and this order still won't become a "
-                    'subscription.\n\nChoose a period and devices for a new order.'
+                    '⚠️ <b>The previous invoice is closed</b>\n\nThe old payment link may still work. Do not '
+                    "use it: the amount would simply land on your balance, and this order still won't become "
+                    'a subscription.\n\nChoose a period and devices for a new order.'
                     if provider_terminal
                     else '🛑 <b>Order cancelled</b>\n\nThis order will not be completed.'
                 ),

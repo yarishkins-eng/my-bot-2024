@@ -627,3 +627,30 @@ async def test_the_owner_verdict_asks_the_same_question_about_the_same_checkout(
     assert 'checkout_payment_attempts.status' in asked[0]
     # Второй — «деньги вообще есть», и он статусом сужен быть НЕ должен.
     assert 'checkout_payment_attempts.status' not in asked[1]
+
+
+@pytest.mark.asyncio
+async def test_the_closed_by_support_screen_promises_no_refund_that_will_never_happen():
+    """🔴 P2 ревью пункта 4.5. Прежний текст обещал: «поддержка вернёт сумму на ваш баланс».
+
+    Для части заказов это неправда. Остановившийся заказ с зачислением на баланс
+    (`payment_amount_mismatch`, `quote_expired_paid_credited_to_balance_only`) означает, что
+    деньги УЖЕ лежат у клиента, поддержка возвращать ничего не будет, а кнопка возврата у
+    неё прямо отвечает «деньги уже вернулись клиенту на баланс — второй раз не нужно».
+    Человек ждал бы действия, которого никто не сделает.
+    """
+    caption = await _cancelled_screen('cancelled_by_operator_review', money_state='money_in_flight')
+    assert 'поддержка вернёт' not in caption
+    # Про баланс сказать обязаны — иначе экран молчит там, где деньги как раз есть.
+    assert 'на баланс' in caption
+    # И оставляем выход, если на балансе пусто: иначе экран становится тупиком.
+    assert 'напишите в поддержку' in caption
+
+
+@pytest.mark.asyncio
+async def test_the_closed_by_support_screen_still_says_nothing_was_charged_when_it_was_not():
+    """Вторая половина той же развилки не должна пострадать: у заказа без денег текст
+    обязан остаться прямым, иначе мы посеем сомнение там, где ответ известен."""
+    caption = await _cancelled_screen('cancelled_by_operator_review', money_state='no_money')
+    assert 'Списаний по нему не было' in caption
+    assert 'напишите в поддержку' not in caption
