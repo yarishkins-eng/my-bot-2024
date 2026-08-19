@@ -471,7 +471,10 @@ def test_the_close_question_promises_exactly_what_closing_gives():
     assert stopped == 'Клиент снова сможет взять пробный период, если ещё им не пользовался.'
     for reason in REASONS_WITH_A_LIVE_SUBSCRIPTION:
         nothing = service.operator_close_unblocks(_checkout(lifecycle_state='conflict', terminal_reason=reason))
-        assert 'ничего не даст' in nothing
+        # 🔴 Мина BQ (ревизия 20.08.2026): формулировка обязана быть осторожной. Подписка
+        # могла быть в статусе `PENDING` — её забор триала пропускает, и тогда закрытие
+        # триал как раз вернёт. Отвечать «точно ничего» по причине заказа нельзя.
+        assert 'Скорее всего ничего' in nothing
         assert 'пробный период' not in nothing
 
 

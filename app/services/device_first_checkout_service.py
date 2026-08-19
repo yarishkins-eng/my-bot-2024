@@ -3420,10 +3420,14 @@ OPERATOR_REFUND_LEDGER_PREFIX = 'operator_review_refund'
 # ⚠️ `failed` в наборе — про исторические строки: `lifecycle_state = 'failed'` сегодня не
 # присваивается нигде в `app/` (проверено грепом). Живых состояний тут три, не четыре.
 OPERATOR_REVIEWABLE_STATES = frozenset({'operator_review', 'conflict', 'failed', 'reprice_required'})
-# 🔴 Причины, которые ставятся ТОЛЬКО клиенту с уже существующей подпиской. Забор триала
-# отбивает таких раньше, чем доходит до заказов: любая не-`PENDING` подписка даёт
-# `trial_already_used` (`trial_activation_service.py:654-656`). Значит закрытие такого
-# заказа не вернёт клиенту ни покупку, ни триал — и обещать это оператору нельзя.
+# 🔴 Причины, которые ставятся клиенту с уже существующей подпиской. Забор триала отбивает
+# таких раньше, чем доходит до заказов: любая не-`PENDING` подписка даёт `trial_already_used`
+# (`trial_activation_service.py:654-656`). Значит закрытие такого заказа скорее всего не
+# вернёт клиенту ни покупку, ни триал — и обещать это оператору нельзя.
+# ⚠️ Оговорка (мина BQ, ревизия 20.08.2026): «скорее всего», а не «точно». Подписка могла
+# быть в статусе `PENDING` — её тот забор пропускает, и тогда закрытие триал как раз вернёт.
+# Ответ по факту требует запроса к подпискам; здесь мы отвечаем по причине заказа, поэтому
+# формулировка обязана быть осторожной. Настоящее лечение — вопрос к базе, дом: 4ост.
 _REASONS_PROVING_CLIENT_ALREADY_HAS_SUBSCRIPTION = frozenset(
     {'subscription_appeared', 'target_subscription_changed', 'device_limit_decrease_not_allowed'}
 )
@@ -3442,7 +3446,7 @@ def operator_close_unblocks(checkout: SubscriptionCheckout) -> str:
     if checkout.lifecycle_state == 'operator_review':
         return 'Клиент снова сможет оформить покупку.'
     if str(checkout.terminal_reason or '') in _REASONS_PROVING_CLIENT_ALREADY_HAS_SUBSCRIPTION:
-        return 'Клиенту это ничего не даст: подписка у него уже есть. Заказ просто уйдёт из списка.'
+        return 'Скорее всего ничего: заказ остановился из-за уже существующей подписки клиента.'
     return 'Клиент снова сможет взять пробный период, если ещё им не пользовался.'
 
 
