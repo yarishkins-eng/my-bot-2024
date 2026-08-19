@@ -60,6 +60,8 @@ async def test_activate_button_reaches_the_purchase_and_does_not_fail_silently(
     # Поле pydantic живёт на ЭКЗЕМПЛЯРЕ: подмена на классе молча не применяется
     # (проверено). Для методов ниже — наоборот, нужна именно классовая.
     monkeypatch.setattr(settings, 'DEFAULT_DEVICE_LIMIT', 3, raising=False)
+    # Кнопка включена: эти тесты про РАБОТАЮЩИЙ путь. Заслонку стережёт отдельный тест ниже.
+    monkeypatch.setattr(settings, 'ACTIVATE_BUTTON_VISIBLE', True, raising=False)
     # is_multi_tariff_enabled / get_available_subscription_periods — методы pydantic-модели Settings,
     # подменяются на классе, а не на объекте (иначе pydantic отвергает присваивание).
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False, raising=False)
@@ -135,6 +137,8 @@ async def test_activate_button_consumes_the_promo_offer_it_looked_up(
     # Поле pydantic живёт на ЭКЗЕМПЛЯРЕ: подмена на классе молча не применяется
     # (проверено). Для методов ниже — наоборот, нужна именно классовая.
     monkeypatch.setattr(settings, 'DEFAULT_DEVICE_LIMIT', 3, raising=False)
+    # Кнопка включена: эти тесты про РАБОТАЮЩИЙ путь. Заслонку стережёт отдельный тест ниже.
+    monkeypatch.setattr(settings, 'ACTIVATE_BUTTON_VISIBLE', True, raising=False)
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False, raising=False)
     monkeypatch.setattr(type(settings), 'get_available_subscription_periods', lambda self: [30], raising=False)
     monkeypatch.setattr(
@@ -193,6 +197,7 @@ async def test_activate_button_does_not_burn_a_promo_offer_that_does_not_exist(
     callback.answer = AsyncMock()
 
     monkeypatch.setattr(settings, 'DEFAULT_DEVICE_LIMIT', 3, raising=False)
+    monkeypatch.setattr(settings, 'ACTIVATE_BUTTON_VISIBLE', True, raising=False)
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False, raising=False)
     monkeypatch.setattr(type(settings), 'get_available_subscription_periods', lambda self: [30], raising=False)
     monkeypatch.setattr(
@@ -232,3 +237,53 @@ async def test_activate_button_does_not_burn_a_promo_offer_that_does_not_exist(
         'ослаблено, а не взято из настоящей проверки. Так одноразовая скидка сгорает у тех, '
         'кому её не давали, и человек теряет её, ничего не получив взамен.'
     )
+
+
+@pytest.mark.anyio('asyncio')
+async def test_activate_button_is_fail_closed_when_the_flag_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Выключенная кнопка не двигает деньги, даже если нажатие всё-таки долетело.
+
+    Мина BA. Флаг `ACTIVATE_BUTTON_VISIBLE` управлял только ОТРИСОВКОЙ, а обработчик
+    зарегистрирован безусловно (`menu.py`, `register_handlers`) — значит callback долетает
+    сюда из админской рассылки с произвольной кнопкой (`admin/messages.py` штатно принимает
+    любое действие) и из любого старого сообщения в чате. Тот же вывод один раз уже сделали
+    на мине AA: заслонка обязана стоять в обработчике, а не в отрисовке.
+
+    Проверяем не «кнопка не нарисовалась», а «нажатие ничего не сделало»: ни одного похода
+    в базу, ни одного списания.
+    """
+    user = _make_user()
+    db = MagicMock()
+    callback = MagicMock()
+    callback.answer = AsyncMock()
+
+    monkeypatch.setattr(settings, 'ACTIVATE_BUTTON_VISIBLE', False, raising=False)
+
+    # Любое обращение к деньгам или к базе — провал теста, а не «неважная деталь».
+    def _forbidden(name):
+        async def _boom(*_args, **_kwargs):
+            raise AssertionError(f'Заслонка пропустила выполнение дальше: вызван {name}')
+
+        return _boom
+
+    monkeypatch.setattr('app.database.crud.user.subtract_user_balance', _forbidden('subtract_user_balance'))
+    monkeypatch.setattr('app.database.crud.user.lock_user_for_pricing', _forbidden('lock_user_for_pricing'))
+    monkeypatch.setattr(
+        'app.database.crud.subscription.get_subscription_by_user_id', _forbidden('get_subscription_by_user_id')
+    )
+    monkeypatch.setattr(
+        'app.database.crud.subscription.create_paid_subscription', _forbidden('create_paid_subscription')
+    )
+    monkeypatch.setattr(
+        'app.database.crud.server_squad.get_available_server_squads', _forbidden('get_available_server_squads')
+    )
+
+    await menu.handle_activate_button(callback, user, db)
+
+    callback.answer.assert_awaited_once()
+    answer = callback.answer.await_args.args[0]
+    assert 'отключена' in answer, f'человеку не сказали, что кнопка отключена: {answer!r}'
+    # db.execute/commit — MagicMock, так что факт обращения виден по счётчику вызовов.
+    assert not db.method_calls, f'заслонка всё-таки сходила в базу: {db.method_calls}'
