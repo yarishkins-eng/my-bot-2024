@@ -268,3 +268,45 @@ class SyncSquadsResponse(BaseModel):
     failed_count: int
     skipped_count: int
     errors: list[str] = Field(default_factory=list)
+
+
+class SquadRolloutRequest(BaseModel):
+    """Параметры раскатки серверов тарифа на выданные подписки."""
+
+    subscription_ids: list[int] | None = None
+    limit: int | None = Field(default=None, ge=1)
+    batch_size: int = Field(default=25, ge=1, le=200)
+
+
+class SquadRolloutPreviewResponse(BaseModel):
+    """Сухой прогон: что произойдёт, если нажать «Раскатать»."""
+
+    tariff_id: int
+    squads_to_set: list[str]
+    candidates: int
+    would_change: int
+    would_change_ids: list[int] = Field(default_factory=list)
+    skipped_traffic_risk_ids: list[int] = Field(default_factory=list)
+    shared_account_ids: list[int] = Field(default_factory=list)
+
+
+class SquadRolloutResponse(BaseModel):
+    """Результат раскатки или возврата по снимку."""
+
+    tariff_id: int
+    rollout_id: str
+    total: int
+    synced: int
+    batches_done: int
+    failed_ids: list[int] = Field(default_factory=list)
+    skipped_traffic_risk_ids: list[int] = Field(default_factory=list)
+    url_mismatch_ids: list[int] = Field(default_factory=list)
+    stopped_early: bool = False
+    # Возврат: пред-образ пуст, вернуть по нему нельзя — считаем отдельно от трафика.
+    unrestorable_ids: list[int] = Field(default_factory=list)
+    # Каждая причина пропуска — своё поле: одно на всех врёт владельцу о причине.
+    shared_account_ids: list[int] = Field(default_factory=list)
+    moved_on_ids: list[int] = Field(default_factory=list)
+    # Сколько подписок ещё ждут раскатки: кнопка идёт порциями.
+    remaining: int = 0
+    message: str
