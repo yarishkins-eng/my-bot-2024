@@ -3028,7 +3028,7 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
         # Это разные утверждения, и склеивать их в одно нельзя: у заказов, остановленных
         # из-за уже существующей подписки, вреда нет вовсе.
         if str(checkout.terminal_reason or '') in _REASONS_PROVING_CLIENT_ALREADY_HAS_SUBSCRIPTION:
-            lines.append('ℹ️ Клиенту он не мешает: подписка у него уже есть.')
+            lines.append('ℹ️ Клиенту он скорее всего не мешает: подписка у него уже есть.')
         else:
             lines.append('🎁 Пока этот заказ висит, клиент не возьмёт пробный период.')
     else:
@@ -3446,7 +3446,7 @@ def operator_close_unblocks(checkout: SubscriptionCheckout) -> str:
     if checkout.lifecycle_state == 'operator_review':
         return 'Клиент снова сможет оформить покупку.'
     if str(checkout.terminal_reason or '') in _REASONS_PROVING_CLIENT_ALREADY_HAS_SUBSCRIPTION:
-        return 'Скорее всего ничего: заказ остановился из-за уже существующей подписки клиента.'
+        return 'Клиенту это скорее всего ничего не даст: заказ остановился из-за его подписки.'
     return 'Клиент снова сможет взять пробный период, если ещё им не пользовался.'
 
 

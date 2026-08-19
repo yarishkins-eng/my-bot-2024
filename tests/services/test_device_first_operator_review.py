@@ -452,8 +452,9 @@ async def test_a_stopped_order_reaches_the_money_question_instead_of_a_flat_refu
     assert 'нет подтверждённого списания' in message
 
 
-# Причины, которые ставятся ТОЛЬКО клиенту с уже существующей подпиской: забор триала
-# отбивает такого раньше, чем доходит до заказов, поэтому закрытие ему ничего не даёт.
+# Причины, которые ставятся клиенту с уже существующей подпиской. Забор триала отбивает
+# такого раньше, чем доходит до заказов, — но только если подписка НЕ в статусе `PENDING`
+# (мина BQ). Поэтому и обещание, и карточка обязаны отвечать осторожно, а не категорично.
 REASONS_WITH_A_LIVE_SUBSCRIPTION = (
     'subscription_appeared',
     'target_subscription_changed',
@@ -474,8 +475,12 @@ def test_the_close_question_promises_exactly_what_closing_gives():
         # 🔴 Мина BQ (ревизия 20.08.2026): формулировка обязана быть осторожной. Подписка
         # могла быть в статусе `PENDING` — её забор триала пропускает, и тогда закрытие
         # триал как раз вернёт. Отвечать «точно ничего» по причине заказа нельзя.
-        assert 'Скорее всего ничего' in nothing
+        assert 'скорее всего ничего не даст' in nothing
         assert 'пробный период' not in nothing
+        # И это законченное предложение: тот же вариант подставляется в ответ после
+        # закрытия (`Заказ закрыт. {unblocks}`), где обрывок отвечал бы на вопрос,
+        # которого перед ним нет. Ровно так сломалась предыдущая правка.
+        assert nothing[0].isupper() and nothing.endswith('.')
 
 
 def _card(checkout) -> str:
@@ -560,6 +565,10 @@ def test_the_card_of_a_renewal_order_names_no_harm_that_does_not_exist():
     text = _card(_checkout(lifecycle_state='conflict', terminal_reason='target_subscription_changed'))
     assert 'не возьмёт пробный период' not in text
     assert 'подписка у него уже есть' in text
+    # 🔴 Мина BQ. Карточка и кнопка отвечают на один вопрос и обязаны быть одинаково
+    # осторожны: `PENDING`-подписку забор триала пропускает, и тогда заказ клиенту как
+    # раз мешает. Категоричное «не мешает» здесь было жёстче, чем обещание кнопки.
+    assert 'скорее всего не мешает' in text
 
 
 @pytest.mark.asyncio
@@ -711,7 +720,15 @@ async def test_the_answer_after_closing_is_a_whole_sentence_not_a_glued_one():
     Вспомогательная функция стала возвращать законченные предложения, а шаблон ответа
     остался прежним — владелец читал «…не мешает клиенту Клиент снова сможет…».
     """
-    for state, reason in (('operator_review', 'no_entitlements_to_provision'), ('conflict', 'quote_expired')):
+    for state, reason in (
+        ('operator_review', 'no_entitlements_to_provision'),
+        ('conflict', 'quote_expired'),
+        # 🔴 Третий вариант обещания сторож раньше не трогал — и именно на нём сломалась
+        # правка по ревизии. Проверяем ВСЕ ветки, а не те, ради которых писали.
+        ('conflict', 'target_subscription_changed'),
+        ('conflict', 'subscription_appeared'),
+        ('conflict', 'device_limit_decrease_not_allowed'),
+    ):
         checkout = _checkout(lifecycle_state=state, terminal_reason=reason)
         _done, message = await service.close_operator_review_checkout(_db(), checkout=checkout, admin_user_id=1)
         assert 'клиенту Клиент' not in message
