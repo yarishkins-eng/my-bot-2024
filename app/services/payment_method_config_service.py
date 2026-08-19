@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.database.models import PaymentMethodConfig, PromoGroup
+from app.database.models import PaymentMethodConfig, PromoGroup, User
 
 
 logger = structlog.get_logger(__name__)

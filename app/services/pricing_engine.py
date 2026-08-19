@@ -15,7 +15,7 @@ from app.utils.promo_offer import get_user_active_promo_discount_percent
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from app.database.models import Subscription, Tariff, User
+    from app.database.models import PromoGroup, Subscription, Tariff, User
 
 
 logger = structlog.get_logger(__name__)

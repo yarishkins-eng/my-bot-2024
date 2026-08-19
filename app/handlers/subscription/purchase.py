@@ -4703,7 +4703,16 @@ async def handle_simple_subscription_purchase(
                         text='💳 Другие способы оплаты', callback_data='simple_subscription_other_payment_methods'
                     )
                 ],
-                [types.InlineKeyboardButton(text=texts.BACK, callback_data='subscription_purchase')],
+                # Заглушка в конце строки — не починка, а МЕТКА МЁРТВОГО КОДА (мина AW, 19.08.2026).
+                # Весь хвост handle_simple_subscription_purchase лежит за безусловным `return`
+                # в начале обработчика: он сразу отвечает «устаревший способ покупки отключён»
+                # и выходит, до этих строк не доходя никогда. Вместе с ними мёртв и
+                # _extend_existing_subscription — он зовётся только отсюда. Всё это выносится
+                # этапом 5 «вынести мусор» — пункт 5.8 плана восстановления. Строка в плане заведена
+                # отдельно, а не только здесь: комментарий-обоснование живёт дольше кода и врёт
+                # следующему убедительнее (грабли 18.08). Глушим ровно ОДНУ строку, чтобы ворота
+                # F821 остались включёнными для всего остального кода.
+                [types.InlineKeyboardButton(text=texts.BACK, callback_data='subscription_purchase')],  # noqa: F821
             ]
         )
     else:

@@ -1639,6 +1639,33 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
     - Если подписки нет — создать новую с дефолтными параметрами
     Выбирает максимальный период, который можно оплатить из баланса.
     """
+    # 🔴 ЗАСЛОНКА (мина BA, 19.08.2026) — ПЕРВОЙ строкой тела, до чтения баланса и до любого
+    # запроса в базу. Ниже идёт прямое списание с баланса и выдача подписки МИМО device-first,
+    # то есть мимо всех защит этапа 4: без снимка заказа, без очереди повторов при сбое выдачи
+    # и без уведомления владельцу о продаже. Флаг ACTIVATE_BUTTON_VISIBLE до сих пор управлял
+    # только ОТРИСОВКОЙ кнопки, а обработчик зарегистрирован безусловно — значит callback
+    # долетал сюда из админской рассылки с произвольной кнопкой и из любого старого сообщения.
+    # Тот же приём, которым закрыли мину AA: заслонка в обработчике, а не в отрисовке.
+    # ⚠️ Это НЕ починка мины BA: включат флаг осознанно — все четыре денежных дефекта оживут.
+    if not settings.ACTIVATE_BUTTON_VISIBLE:
+        logger.warning(
+            'Нажата отключённая кнопка активации: покупка не выполнена, деньги не тронуты',
+            user_id=db_user.id,
+            telegram_id=db_user.telegram_id,
+        )
+        # Текст НЕ называет соседнюю кнопку намеренно. Нажатие прилетает из рассылки или из
+        # старого сообщения, значит человек может быть в любом состоянии воронки, а «Тарифы»
+        # есть только у новичка и триальщика: у того, чья подписка кончилась, такой кнопки нет
+        # (`build_funnel_menu_keyboard`), и совет вёл бы в никуда. `/start` работает всегда.
+        await callback.answer(
+            get_texts(db_user.language).t(
+                'ACTIVATE_BUTTON_DISABLED',
+                '⚠️ Эта кнопка больше не работает. Откройте меню командой /start.',
+            ),
+            show_alert=True,
+        )
+        return
+
     texts = get_texts(db_user.language)
 
     from app.database.crud.server_squad import get_available_server_squads
@@ -1648,6 +1675,7 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
     from app.database.models import PaymentMethod, TransactionType
     from app.services.subscription_renewal_service import SubscriptionRenewalService
     from app.services.subscription_service import SubscriptionService
+    from app.utils.promo_offer import get_user_active_promo_discount_percent
 
     if settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import get_active_subscriptions_by_user_id
