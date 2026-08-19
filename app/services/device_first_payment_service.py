@@ -80,6 +80,22 @@ logger = structlog.get_logger(__name__)
 PENDING_ATTEMPT_STATUSES = frozenset({'creating', 'pending', 'paid_processing', 'reconciliation'})
 PROVIDER_TERMINAL_STATUSES = frozenset({'FAILED', 'CANCELED', 'EXPIRED'})
 POST_PAID_REVERSAL_STATUSES = frozenset({'CHARGEBACKED'})
+# Мины R и AD (пункт 4.5). Закрытый провайдером счёт остаётся под опросом НАВСЕГДА, и это
+# намеренно: контракта финальности провайдер не даёт, а поздняя оплата обязана вернуться
+# клиенту на баланс. Выключать опрос нельзя. Но интервал был плоский — «+6 часов» без
+# потолка и без конца, то есть на каждую брошенную корзину четыре обращения к Platega в
+# сутки и четыре транзакции с пятью блокировками строк, вечно и с накоплением
+# (на боевом 19.08.2026 таких попыток 16). Счётчик наблюдений при этом уже писался и не
+# читался нигде — читаем его: интервал удваивается от 6 часов до недели и там остаётся.
+_TERMINAL_RECONCILE_BASE_HOURS = 6
+_TERMINAL_RECONCILE_MAX_HOURS = 24 * 7
+
+
+def terminal_reconcile_delay(observations: int | None) -> timedelta:
+    """6 ч → 12 → 24 → 48 → … → неделя, и не реже раза в неделю. Никогда не «хватит»."""
+    steps = max(int(observations or 0) - 1, 0)
+    hours = min(_TERMINAL_RECONCILE_BASE_HOURS * 2 ** min(steps, 10), _TERMINAL_RECONCILE_MAX_HOURS)
+    return timedelta(hours=hours)
 
 
 def _has_durable_direct_payment_binding(
@@ -451,7 +467,8 @@ async def _release_direct_terminal_invoice(
     # not documented by the provider.
     if source == 'poll' and checkout.lifecycle_state == 'cancelled':
         attempt.terminal_observations += 1
-    attempt.next_reconcile_at = datetime.now(UTC) + timedelta(hours=6)
+    # Мины R и AD: интервал растёт по числу наблюдений, а не стоит плоским (см. константы).
+    attempt.next_reconcile_at = datetime.now(UTC) + terminal_reconcile_delay(attempt.terminal_observations)
     payment.status = normalized_status
     checkout.lifecycle_state = 'cancelled'
     checkout.quote_state = 'expired'
