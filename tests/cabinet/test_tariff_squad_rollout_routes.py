@@ -167,3 +167,114 @@ def test_migration_0104_is_additive() -> None:
     assert 'op.create_table(' in upgrade
     for forbidden in ('op.drop_table(', 'op.alter_column(', 'op.execute('):
         assert forbidden not in upgrade, forbidden
+
+
+# 🔴 Ниже — сторожа на четыре мутации, которые пережили набор в волне 2 ревью.
+# Каждая из них тихо снимала защиту, добавленную как починка предыдущей волны.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('route_name', ['run_squad_rollout', 'restore_squad_rollout'])
+async def test_route_passes_the_fence_recheck_into_the_service(monkeypatch, route_name) -> None:
+    """Перепроверку забора мало написать в сервисе — её надо ДОВЕСТИ до него.
+
+    Мутация «убрать recheck_fence= из вызова» проходила все тесты: маршрутные
+    проверяли только факт вызова забора, сервисный бил в сервис напрямую.
+    """
+
+    monkeypatch.setattr(admin_tariffs, 'get_tariff_by_id', AsyncMock(return_value=_rollout_tariff()))
+    monkeypatch.setattr(admin_tariffs, 'assert_tariff_squad_rollout_allowed', AsyncMock())
+    monkeypatch.setattr(admin_tariffs, 'AuditLogCRUD', SimpleNamespace(create=AsyncMock()))
+    result = PropagateSquadsResult(total=1, synced=1, rollout_id='r-1')
+    calls: dict = {}
+
+    async def _capture(*args, **kwargs):
+        calls.update(kwargs)
+        return result
+
+    service = SimpleNamespace(propagate_tariff_squads=_capture, restore_tariff_squads=_capture)
+    monkeypatch.setattr(admin_tariffs, 'SubscriptionService', lambda: service)
+
+    route = getattr(admin_tariffs, route_name)
+    kwargs = {'admin': SimpleNamespace(id=1), 'db': AsyncMock()}
+    if route_name == 'run_squad_rollout':
+        kwargs['request'] = SquadRolloutRequest()
+    await route(3, **kwargs)
+
+    assert callable(calls.get('recheck_fence')), f'{route_name} не передал перепроверку забора'
+
+
+@pytest.mark.asyncio
+async def test_fence_recheck_also_refuses_when_the_tariff_servers_changed(monkeypatch) -> None:
+    """Тариф могли отредактировать между порциями — оставшиеся не должны разносить старое."""
+
+    tariff = _rollout_tariff()
+    monkeypatch.setattr(admin_tariffs, 'get_tariff_by_id', AsyncMock(return_value=tariff))
+    monkeypatch.setattr(admin_tariffs, 'assert_tariff_squad_rollout_allowed', AsyncMock())
+    monkeypatch.setattr(admin_tariffs, 'AuditLogCRUD', SimpleNamespace(create=AsyncMock()))
+    captured: dict = {}
+
+    async def _capture(*args, **kwargs):
+        captured.update(kwargs)
+        return PropagateSquadsResult(total=1, synced=1, rollout_id='r-1')
+
+    monkeypatch.setattr(admin_tariffs, 'SubscriptionService', lambda: SimpleNamespace(propagate_tariff_squads=_capture))
+    db = AsyncMock()
+    # тариф «переехал» на другой набор серверов, пока шла раскатка
+    db.get = AsyncMock(return_value=SimpleNamespace(id=3, allowed_squads=['squad-b']))
+
+    await admin_tariffs.run_squad_rollout(3, SquadRolloutRequest(), admin=SimpleNamespace(id=1), db=db)
+
+    with pytest.raises(ValueError, match='Серверы тарифа изменились'):
+        await captured['recheck_fence']()
+
+
+def test_audit_status_is_success_only_when_nothing_was_left_behind() -> None:
+    """Мутация «смотреть только на упавшие» проходила набор: возврат, не вернувший
+    никого, записывался в аудит как полный успех."""
+
+    assert admin_tariffs._rollout_audit_status(PropagateSquadsResult(total=2, synced=2)) == 'success'
+    for partial in (
+        PropagateSquadsResult(total=2, synced=1, failed_ids=[1]),
+        PropagateSquadsResult(total=2, synced=1, stopped_early=True),
+        PropagateSquadsResult(total=2, synced=0, unrestorable_ids=[1, 2]),
+        PropagateSquadsResult(total=2, synced=1, skipped_traffic_risk_ids=[2]),
+        PropagateSquadsResult(total=2, synced=1, shared_account_ids=[2]),
+        PropagateSquadsResult(total=2, synced=1, moved_on_ids=[2]),
+        PropagateSquadsResult(total=2, synced=2, remaining=5),
+    ):
+        assert admin_tariffs._rollout_audit_status(partial) == 'partial', partial
+
+
+@pytest.mark.asyncio
+async def test_public_fence_really_raises_from_the_canonical_one(monkeypatch) -> None:
+    """Обёртку забора проверяли только чтением исходника — она могла бы стать пустой."""
+
+    from app.database.crud import tariff as tariff_crud
+
+    called = AsyncMock(side_effect=ValueError('live checkout'))
+    monkeypatch.setattr(tariff_crud, '_assert_tariff_squad_change_has_no_live_checkout', called)
+
+    with pytest.raises(ValueError, match='live checkout'):
+        await tariff_crud.assert_tariff_squad_rollout_allowed(AsyncMock(), _rollout_tariff())
+
+    called.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_live_checkout_refusal_is_explained_in_russian(monkeypatch) -> None:
+    """Владелец упрётся в этот отказ рутинно — он не должен быть английским жаргоном."""
+
+    monkeypatch.setattr(admin_tariffs, 'get_tariff_by_id', AsyncMock(return_value=_rollout_tariff()))
+    monkeypatch.setattr(
+        admin_tariffs,
+        'assert_tariff_squad_rollout_allowed',
+        AsyncMock(side_effect=ValueError('Cannot change Internal Squads while this tariff has a live checkout')),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_tariffs.run_squad_rollout(3, SquadRolloutRequest(), admin=SimpleNamespace(id=1), db=AsyncMock())
+
+    detail = str(exc_info.value.detail)
+    assert 'Internal Squads' not in detail and 'checkout' not in detail
+    assert 'незакрытый заказ' in detail and 'нажмите снова' in detail

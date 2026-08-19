@@ -36,6 +36,35 @@ def _sub(sub_id: int, *, squads=None, used=0.0, limit=100, url='https://vpn/sub/
     )
 
 
+def _compiled(statement) -> str:
+    return str(statement.compile(compile_kwargs={'literal_binds': True}))
+
+
+def _ids_in_sql(statement) -> list[int]:
+    """Настоящие id из скомпилированного запроса, а не наша догадка о них."""
+
+    sql = _compiled(statement)
+    if 'subscription_id IN' not in sql:
+        return []
+    inside = sql.split('subscription_id IN', 1)[1].split('(', 1)[1].split(')', 1)[0]
+    return [int(part) for part in inside.replace(' ', '').split(',') if part.strip().isdigit()]
+
+
+def _subscription_ids_in_sql(statement) -> set[int] | None:
+    sql = _compiled(statement)
+    if 'subscriptions.id IN' not in sql:
+        return None
+    inside = sql.split('subscriptions.id IN', 1)[1].split('(', 1)[1].split(')', 1)[0]
+    return {int(part) for part in inside.replace(' ', '').split(',') if part.strip().isdigit()}
+
+
+def _rollout_id_in_sql(statement) -> str | None:
+    sql = _compiled(statement)
+    if 'rollout_id = ' not in sql:
+        return None
+    return sql.split('rollout_id = ', 1)[1].split('\n', 1)[0].strip().strip("'").rstrip(' AND').strip()
+
+
 class _FakeSession:
     """Сессия, помнящая ПОРЯДОК событий: что добавлено и когда зафиксировано."""
 
@@ -65,10 +94,32 @@ class _FakeSession:
                 # (грабли 17.08). Ниже тест читает скомпилированный SQL.
                 self.events.append('mark-restored')
                 self.update_statements.append(statement)
+                # И ИСПОЛНЯЕМ его, как это сделала бы база: иначе следующий запрос
+                # снимков увидит их непогашенными, и многопортионный сценарий
+                # (ради которого всё и чинилось) в тесте не воспроизведётся.
+                limited_to = _rollout_id_in_sql(statement)
+                for sub_id in _ids_in_sql(statement):
+                    for row in self.snapshots:
+                        if row.subscription_id != sub_id or row.restored_at is not None:
+                            continue
+                        if limited_to is not None and row.rollout_id != limited_to:
+                            continue
+                        row.restored_at = 'restored'
                 return SimpleNamespace()
             live = [row for row in self.snapshots if row.restored_at is None]
+            # SELECT снимков фильтруется по rollout_id, если он указан в запросе —
+            # без этого возврат «по последней раскатке» выглядел бы рабочим.
+            wanted = _rollout_id_in_sql(statement)
+            if wanted is not None:
+                live = [row for row in live if row.rollout_id == wanted]
             return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: live))
-        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: self.subscriptions))
+        # Фильтр по списку id обязателен: без него порционные и групповые вызовы
+        # получают ВСЕ подписки, и настоящие дефекты в них не воспроизводятся.
+        rows = self.subscriptions
+        wanted_ids = _subscription_ids_in_sql(statement)
+        if wanted_ids is not None:
+            rows = [sub for sub in rows if sub.id in wanted_ids]
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
 
     async def scalar(self, statement):
         if 'tariff_squad_rollout_snapshots' in str(statement):
@@ -371,7 +422,8 @@ async def test_client_with_a_second_live_subscription_is_left_alone():
 
     result = await service.propagate_tariff_squads(db, 4, ['new-a'])
 
-    assert 1 in result.skipped_traffic_risk_ids, 'подписку с общим аккаунтом не трогаем'
+    assert result.shared_account_ids == [1], 'причина названа своим именем, а не «трафик»'
+    assert 1 not in result.skipped_traffic_risk_ids, 'это не про трафик'
     assert result.synced_ids == [2]
     assert shared.connected_squads == ['old-a', 'old-b'], 'её серверы не изменились'
 
@@ -413,3 +465,123 @@ async def test_batch_reads_fresh_subscription_data_before_touching_the_panel():
 
     limits = {call['uuid']: call['traffic_limit_bytes'] for call in sent}
     assert limits['u2'] == 500 * 1024 * 1024 * 1024, 'в панель ушёл устаревший лимит'
+
+
+@pytest.mark.asyncio
+async def test_restore_reaches_every_portion_of_a_multi_press_rollout():
+    """🔴 P0 волны 2: раскатка в несколько нажатий — это несколько rollout_id.
+
+    Возврат «по последней раскатке» вернул бы только хвост и отчитался «Готово»,
+    а подписки первых порций остались бы на новых серверах без следа в интерфейсе
+    и без пути назад. Одно нажатие «Вернуть» обязано отменить раскатку ЦЕЛИКОМ.
+    """
+
+    first = _sub(1, squads=['new-a'])
+    second = _sub(2, squads=['new-a'])
+    snapshots = [
+        _snapshot(1),  # первое нажатие
+        _snapshot(2),  # второе нажатие, другой rollout_id
+    ]
+    snapshots[0].rollout_id = 'press-1'
+    snapshots[1].rollout_id = 'press-2'
+    db = _FakeSession([first, second], [_user(1), _user(2)], snapshots=snapshots)
+    service, _ = _service_with_panel()
+
+    result = await service.restore_tariff_squads(db, 4)
+
+    assert sorted(result.synced_ids) == [1, 2], 'вернулись обе порции, а не только последняя'
+    assert first.connected_squads == ['old-a', 'old-b']
+    assert second.connected_squads == ['old-a', 'old-b']
+
+    # Повторное нажатие уже ничего не откатывает назад.
+    again = await service.restore_tariff_squads(db, 4)
+    assert again.total == 0 and again.synced == 0
+
+
+@pytest.mark.asyncio
+async def test_restore_leaves_alone_a_client_who_changed_servers_himself():
+    """Клиент сам сменил страну после раскатки — это его выбор, не наш откат."""
+
+    moved = _sub(1, squads=['client-choice'])
+    untouched = _sub(2, squads=['new-a'])
+    db = _FakeSession([moved, untouched], [_user(1), _user(2)], snapshots=[_snapshot(1), _snapshot(2)])
+    service, _ = _service_with_panel()
+
+    result = await service.restore_tariff_squads(db, 4)
+
+    assert result.moved_on_ids == [1]
+    assert moved.connected_squads == ['client-choice'], 'его выбор не тронут'
+    assert result.synced_ids == [2]
+
+
+@pytest.mark.asyncio
+async def test_preview_skips_exactly_what_the_real_rollout_skips():
+    """Сухой прогон обещает показать, кого пропустит. Он обязан видеть все причины."""
+
+    shared = _sub(1)
+    alone = _sub(2)
+    db = _FakeSession([shared, alone], [_user(1), _user(2)])
+    db.extra_user_tariffs = [(shared.user_id, 99)]
+    service, _ = _service_with_panel()
+
+    plan = await service.plan_tariff_squad_rollout(db, 4, ['new-a'])
+
+    assert plan['shared_account_ids'] == [1]
+    assert plan['would_change'] == 1, 'обещанное число должно совпасть с тем, что реально уедет'
+    assert plan['would_change_ids'] == [2]
+
+
+@pytest.mark.asyncio
+async def test_limited_subscription_counts_as_a_live_one_for_the_shared_account_guard():
+    """LIMITED — это «трафик кончился», а не «подписки нет».
+
+    Панельный аккаунт такая подписка делит наравне с активной, и раскатка чужого
+    тарифа затёрла бы ей доступ так же.
+    """
+
+    shared = _sub(1)
+    db = _FakeSession([shared], [_user(1)])
+    db.extra_user_tariffs = [(shared.user_id, 99)]
+    service, _ = _service_with_panel()
+
+    statements: list[object] = []
+    original_execute = db.execute
+
+    async def _spy(statement):
+        statements.append(statement)
+        return await original_execute(statement)
+
+    db.execute = _spy
+    await service.propagate_tariff_squads(db, 4, ['new-a'])
+
+    # Читаем СКОМПИЛИРОВАННЫЙ запрос со значениями: без них статусы не видны вовсе,
+    # и сторож был бы зелёным при любом наборе.
+    guard_sql = [_compiled(st) for st in statements if 'subscriptions.user_id, subscriptions.tariff_id' in str(st)]
+    assert guard_sql, 'забор общего аккаунта вообще не спрашивал базу'
+    assert 'limited' in guard_sql[0].lower(), guard_sql[0]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_failure_is_explained_and_nothing_is_sent():
+    """Без снимка порцию отправлять нельзя — и владелец должен узнать причину."""
+
+    subs = [_sub(1)]
+    db = _FakeSession(subs, [_user(1)])
+    service, api = _service_with_panel()
+    sent: list[dict] = []
+
+    async def _capture(**kwargs):
+        sent.append(kwargs)
+        return SimpleNamespace(subscription_url='https://vpn/sub/x', happ_crypto_link=None)
+
+    api.update_user = _capture
+
+    async def _boom():
+        raise RuntimeError('соединение с базой потеряно')
+
+    db.commit = _boom
+
+    with pytest.raises(ValueError, match='снимок раскатки'):
+        await service.propagate_tariff_squads(db, 4, ['new-a'])
+
+    assert sent == [], 'порция не должна была уйти в панель без снимка'

@@ -641,6 +641,26 @@ async def get_tariff_stats(
     )
 
 
+async def _assert_rollout_allowed_in_russian(db: AsyncSession, tariff: Tariff) -> None:
+    """Тот же забор, но с причиной, понятной владельцу.
+
+    Канонический текст — английский и с внутренним жаргоном («Internal Squads»,
+    «Platega invoice», «reconciliation»). Владелец будет упираться в этот отказ
+    рутинно: забор срабатывает от ЛЮБОЙ живой корзины клиента, даже шестиминутной.
+    """
+
+    try:
+        await assert_tariff_squad_rollout_allowed(db, tariff)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                'Сейчас нельзя: у тарифа есть незакрытый заказ клиента. '
+                'Это нормально — подождите, пока он оплатится или отменится, и нажмите снова.'
+            ),
+        ) from exc
+
+
 async def _load_rollout_tariff(db: AsyncSession, tariff_id: int) -> Tariff:
     """Тариф, пригодный для раскатки, либо понятный отказ."""
 
@@ -697,18 +717,26 @@ async def run_squad_rollout(
     забор живых заказов — она трогает захваченные права ещё жёстче.
     """
     tariff = await _load_rollout_tariff(db, tariff_id)
-    try:
-        await assert_tariff_squad_rollout_allowed(db, tariff)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    await _assert_rollout_allowed_in_russian(db, tariff)
+
+    planned_squads = list(tariff.allowed_squads or [])
 
     async def _recheck_fence() -> None:
         await assert_tariff_squad_rollout_allowed(db, tariff)
+        # Тариф могли отредактировать между порциями — из кабинета или из
+        # чат-админки бота, это два независимых пути. Тогда оставшиеся порции
+        # разнесли бы уже устаревший набор, молча и без единой ошибки.
+        fresh = await db.get(Tariff, tariff_id, populate_existing=True)
+        if fresh is None or sorted(fresh.allowed_squads or []) != sorted(planned_squads):
+            raise ValueError(
+                'Серверы тарифа изменились, пока шла раскатка. Раскатка остановлена — '
+                'откройте тариф, проверьте список серверов и запустите раскатку заново.'
+            )
 
     result = await SubscriptionService().propagate_tariff_squads(
         db,
         tariff_id,
-        list(tariff.allowed_squads or []),
+        planned_squads,
         subscription_ids=request.subscription_ids,
         limit=request.limit,
         batch_size=request.batch_size,
@@ -746,10 +774,7 @@ async def restore_squad_rollout(
     """Возвращает подписки к снимку последней раскатки этого тарифа."""
 
     tariff = await _load_rollout_tariff(db, tariff_id)
-    try:
-        await assert_tariff_squad_rollout_allowed(db, tariff)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    await _assert_rollout_allowed_in_russian(db, tariff)
 
     async def _recheck_fence() -> None:
         await assert_tariff_squad_rollout_allowed(db, tariff)
@@ -792,6 +817,8 @@ def _rollout_audit_status(result) -> str:
         or result.stopped_early
         or result.unrestorable_ids
         or result.skipped_traffic_risk_ids
+        or result.shared_account_ids
+        or result.moved_on_ids
         or result.remaining
     )
     return 'partial' if incomplete else 'success'
@@ -800,19 +827,26 @@ def _rollout_audit_status(result) -> str:
 def _rollout_response(tariff_id: int, result) -> SquadRolloutResponse:
     # Никаких отсылок к «отчёту ниже» — его нет.  Всё, что владельцу нужно знать,
     # должно уместиться в саму строку: она приходит всплывающим уведомлением.
-    parts = [f'Готово: {result.synced} из {result.total}.']
+    # В Telegram успех и ошибка выглядят ОДИНАКОВО — одно нейтральное окно с «OK».
+    # Значит тревога обязана стоять первым словом, а не прятаться за «Готово».
+    parts: list[str] = []
+    if result.url_mismatch_ids:
+        parts.append(f'ОСТАНОВЛЕНО: у {len(result.url_mismatch_ids)} изменилась ссылка подключения.')
+    elif result.stopped_early:
+        parts.append('ОСТАНОВЛЕНО на полпути, снимок сохранён.')
+    parts.append(f'Готово: {result.synced} из {result.total}.')
     if result.remaining:
         parts.append(f'Осталось {result.remaining} — нажмите ещё раз.')
     if result.failed_ids:
         parts.append(f'Не удалось: {len(result.failed_ids)}.')
     if result.skipped_traffic_risk_ids:
         parts.append(f'Пропущено (трафик исчерпан): {len(result.skipped_traffic_risk_ids)}.')
+    if result.shared_account_ids:
+        parts.append(f'Пропущено (вторая подписка у клиента): {len(result.shared_account_ids)}.')
+    if result.moved_on_ids:
+        parts.append(f'Не тронуто (клиент сам сменил серверы): {len(result.moved_on_ids)}.')
     if result.unrestorable_ids:
         parts.append(f'Нельзя вернуть (пустой снимок): {len(result.unrestorable_ids)}.')
-    if result.url_mismatch_ids:
-        parts.append(f'Остановлено: у {len(result.url_mismatch_ids)} изменилась ссылка подключения.')
-    elif result.stopped_early:
-        parts.append('Остановлено на полпути, снимок сохранён.')
     message = ' '.join(parts)
     return SquadRolloutResponse(
         tariff_id=tariff_id,
@@ -825,6 +859,8 @@ def _rollout_response(tariff_id: int, result) -> SquadRolloutResponse:
         url_mismatch_ids=result.url_mismatch_ids,
         stopped_early=result.stopped_early,
         unrestorable_ids=result.unrestorable_ids,
+        shared_account_ids=result.shared_account_ids,
+        moved_on_ids=result.moved_on_ids,
         remaining=result.remaining,
         message=message,
     )

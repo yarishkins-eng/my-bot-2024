@@ -287,6 +287,7 @@ class SquadRolloutPreviewResponse(BaseModel):
     would_change: int
     would_change_ids: list[int] = Field(default_factory=list)
     skipped_traffic_risk_ids: list[int] = Field(default_factory=list)
+    shared_account_ids: list[int] = Field(default_factory=list)
 
 
 class SquadRolloutResponse(BaseModel):
@@ -303,6 +304,9 @@ class SquadRolloutResponse(BaseModel):
     stopped_early: bool = False
     # Возврат: пред-образ пуст, вернуть по нему нельзя — считаем отдельно от трафика.
     unrestorable_ids: list[int] = Field(default_factory=list)
+    # Каждая причина пропуска — своё поле: одно на всех врёт владельцу о причине.
+    shared_account_ids: list[int] = Field(default_factory=list)
+    moved_on_ids: list[int] = Field(default_factory=list)
     # Сколько подписок ещё ждут раскатки: кнопка идёт порциями.
     remaining: int = 0
     message: str

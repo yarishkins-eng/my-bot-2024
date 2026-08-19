@@ -145,6 +145,12 @@ class PropagateSquadsResult:
     synced_ids: list[int] = field(default_factory=list)
     # Возврат: пред-образ пуст, вернуть по нему нельзя (пустой набор запирает тариф).
     unrestorable_ids: list[int] = field(default_factory=list)
+    # У клиента есть вторая живая подписка: панельный аккаунт общий, трогать нельзя.
+    # Причина НЕ в трафике — смешивать их в одном поле значит врать владельцу.
+    shared_account_ids: list[int] = field(default_factory=list)
+    # Возврат: серверы у подписки уже не те, что поставила раскатка — клиент сам
+    # сменил страну после неё. Его выбор не наш, чтобы его откатывать.
+    moved_on_ids: list[int] = field(default_factory=list)
     # Сколько подписок ещё ждут раскатки после этой порции.
     remaining: int = 0
 
@@ -1514,7 +1520,15 @@ class SubscriptionService:
         rows = await db.execute(
             select(Subscription.user_id, Subscription.tariff_id).where(
                 Subscription.user_id.in_(user_ids),
-                Subscription.status.in_([SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value]),
+                Subscription.status.in_(
+                    [
+                        SubscriptionStatus.ACTIVE.value,
+                        SubscriptionStatus.TRIAL.value,
+                        # LIMITED — это «трафик кончился», а не «подписки нет»:
+                        # панельный аккаунт она делит наравне с активной.
+                        SubscriptionStatus.LIMITED.value,
+                    ]
+                ),
             )
         )
         tariffs_by_user: dict[int, set[int]] = {}
@@ -1547,7 +1561,14 @@ class SubscriptionService:
                     batch_no=batch_no,
                 )
             )
-        await db.commit()
+        try:
+            await db.commit()
+        except Exception as snapshot_error:
+            # Без снимка порцию отправлять НЕЛЬЗЯ: вернуть будет не по чему.
+            # Понятная ошибка вместо голого 500 — владелец должен увидеть причину.
+            await db.rollback()
+            logger.error('Не удалось сохранить снимок раскатки', error=snapshot_error, batch_no=batch_no)
+            raise ValueError('Не удалось сохранить снимок раскатки — порция не отправлена, ничего не изменилось.')
 
     async def propagate_tariff_squads(
         self,
@@ -1601,10 +1622,10 @@ class SubscriptionService:
         # (user.remnawave_uuid). Если у человека живёт вторая подписка другого
         # тарифа, раскатка затрёт ей доступ, за который он заплатил. Сегодня таких
         # на боевом ноль, но включение мультитарифа это меняет — не трогаем их.
+        shared_ids: set[int] = set()
         if not settings.is_multi_tariff_enabled() and subscriptions:
             shared_ids = await self._subscriptions_sharing_a_panel_account(db, subscriptions)
             if shared_ids:
-                stranded_ids = sorted(set(stranded_ids) | shared_ids)
                 subscriptions = [sub for sub in subscriptions if sub.id not in shared_ids]
         if not subscriptions:
             return PropagateSquadsResult(total=0, synced=0, rollout_id=rollout, skipped_traffic_risk_ids=stranded_ids)
@@ -1809,6 +1830,7 @@ class SubscriptionService:
             rollout_id=rollout,
             batches_done=batches_done,
             skipped_traffic_risk_ids=stranded_ids,
+            shared_account_ids=sorted(shared_ids),
             url_mismatch_ids=url_mismatch_ids,
             stopped_early=stopped_early,
             synced_ids=synced_ids,
@@ -1857,10 +1879,15 @@ class SubscriptionService:
             db, tariff_id, subscription_ids=subscription_ids, limit=limit
         )
         stranded_ids = sorted(sub.id for sub in subscriptions if _traffic_limit_would_strand(sub))
-        stranded = set(stranded_ids)
+        # Сухой прогон обязан пропускать ровно то же, что пропустит настоящая раскатка,
+        # иначе показанное число окажется больше, чем реально изменится.
+        shared_ids: set[int] = set()
+        if not settings.is_multi_tariff_enabled() and subscriptions:
+            shared_ids = await self._subscriptions_sharing_a_panel_account(db, subscriptions)
+        skipped = set(stranded_ids) | shared_ids
         target = sorted(squads_to_set)
         changing = [
-            sub.id for sub in subscriptions if sub.id not in stranded and sorted(sub.connected_squads or []) != target
+            sub.id for sub in subscriptions if sub.id not in skipped and sorted(sub.connected_squads or []) != target
         ]
         return {
             'tariff_id': tariff_id,
@@ -1869,6 +1896,7 @@ class SubscriptionService:
             'would_change': len(changing),
             'would_change_ids': changing,
             'skipped_traffic_risk_ids': stranded_ids,
+            'shared_account_ids': sorted(shared_ids),
         }
 
     async def restore_tariff_squads(
@@ -1889,33 +1917,39 @@ class SubscriptionService:
         отвечает «возвращать нечего».
         """
 
-        if rollout_id is None:
-            rollout_id = await db.scalar(
-                select(TariffSquadRolloutSnapshot.rollout_id)
-                .where(TariffSquadRolloutSnapshot.tariff_id == tariff_id)
-                .order_by(TariffSquadRolloutSnapshot.created_at.desc(), TariffSquadRolloutSnapshot.id.desc())
-                .limit(1)
-            )
-        if not rollout_id:
-            return PropagateSquadsResult(total=0, synced=0)
-
-        rows = (
+        # 🔴 Берём ВСЕ непогашенные снимки тарифа, а не только последнюю раскатку.
+        # Кнопка идёт порциями, поэтому переезд в 33 подписки — это несколько
+        # нажатий и несколько rollout_id. Возврат «по последнему» вернул бы только
+        # хвост и отчитался «Готово», бросив остальных без следа в интерфейсе.
+        conditions = [
+            TariffSquadRolloutSnapshot.tariff_id == tariff_id,
+            TariffSquadRolloutSnapshot.restored_at.is_(None),
+            TariffSquadRolloutSnapshot.subscription_id.is_not(None),
+        ]
+        if rollout_id is not None:
+            conditions.append(TariffSquadRolloutSnapshot.rollout_id == rollout_id)
+        all_rows = (
             (
                 await db.execute(
-                    select(TariffSquadRolloutSnapshot)
-                    .where(
-                        TariffSquadRolloutSnapshot.rollout_id == rollout_id,
-                        TariffSquadRolloutSnapshot.restored_at.is_(None),
-                        TariffSquadRolloutSnapshot.subscription_id.is_not(None),
-                    )
-                    .order_by(TariffSquadRolloutSnapshot.id)
+                    select(TariffSquadRolloutSnapshot).where(*conditions).order_by(TariffSquadRolloutSnapshot.id)
                 )
             )
             .scalars()
             .all()
         )
-        if not rows:
-            return PropagateSquadsResult(total=0, synced=0, rollout_id=rollout_id)
+        if not all_rows:
+            return PropagateSquadsResult(total=0, synced=0, rollout_id=rollout_id or '')
+
+        # У подписки может быть несколько снимков (её раскатывали не раз). Истинное
+        # «как было» — САМЫЙ РАННИЙ из непогашенных, к нему и возвращаем.
+        rows = []
+        seen_subscriptions: set[int] = set()
+        for row in all_rows:
+            if row.subscription_id in seen_subscriptions:
+                continue
+            seen_subscriptions.add(row.subscription_id)
+            rows.append(row)
+        rollout_id = rows[-1].rollout_id
 
         # Пустой пред-образ означал бы «все доступные серверы», а не «эти» — вернуть
         # по нему нельзя: пустой набор запирает тариф (мина A). Такие строки НЕ
@@ -1929,10 +1963,28 @@ class SubscriptionService:
                 continue
             groups.setdefault(squads, []).append(row.subscription_id)
 
+        # Клиент мог сам сменить страну после раскатки (или админ поменял ему сервер).
+        # Это законное более позднее решение, и возврат не вправе его стирать: трогаем
+        # только тех, у кого набор всё ещё ровно тот, что поставила раскатка.
+        moved_on_ids: list[int] = []
+        if groups:
+            watched = [sub_id for ids in groups.values() for sub_id in ids]
+            applied_by_subscription = {row.subscription_id: sorted(row.applied_squads or []) for row in rows}
+            current = (await db.execute(select(Subscription).where(Subscription.id.in_(watched)))).scalars().all()
+            for sub in current:
+                expected = applied_by_subscription.get(sub.id)
+                if expected is not None and sorted(sub.connected_squads or []) != expected:
+                    moved_on_ids.append(sub.id)
+            if moved_on_ids:
+                moved = set(moved_on_ids)
+                groups = {squads: [sub_id for sub_id in ids if sub_id not in moved] for squads, ids in groups.items()}
+                groups = {squads: ids for squads, ids in groups.items() if ids}
+
         combined = PropagateSquadsResult(
             rollout_id=rollout_id,
             total=len(rows),
             unrestorable_ids=sorted(unrestorable_ids),
+            moved_on_ids=sorted(moved_on_ids),
         )
         for squads, sub_ids in groups.items():
             part = await self.propagate_tariff_squads(
@@ -1951,6 +2003,7 @@ class SubscriptionService:
             combined.failed_ids.extend(part.failed_ids)
             combined.url_mismatch_ids.extend(part.url_mismatch_ids)
             combined.skipped_traffic_risk_ids.extend(part.skipped_traffic_risk_ids)
+            combined.shared_account_ids.extend(part.shared_account_ids)
             combined.batches_done += part.batches_done
             combined.stopped_early = combined.stopped_early or part.stopped_early
 
@@ -1958,10 +2011,13 @@ class SubscriptionService:
         # упавшие» сжигала пред-образ подпискам, которых раскатка вовсе не касалась:
         # истёкшим, пропущенным по трафику и всем порциям после обрыва.
         if combined.synced_ids:
+            # Гасим ВСЕ непогашенные снимки вернувшихся подписок этого тарифа:
+            # иначе следующее нажатие «Вернуть» откатило бы их ещё раз, к более
+            # раннему состоянию, которого владелец уже не ожидает.
             await db.execute(
                 update(TariffSquadRolloutSnapshot)
                 .where(
-                    TariffSquadRolloutSnapshot.rollout_id == rollout_id,
+                    TariffSquadRolloutSnapshot.tariff_id == tariff_id,
                     TariffSquadRolloutSnapshot.subscription_id.in_(combined.synced_ids),
                     TariffSquadRolloutSnapshot.restored_at.is_(None),
                 )
