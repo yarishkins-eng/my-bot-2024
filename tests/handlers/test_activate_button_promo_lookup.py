@@ -326,10 +326,16 @@ async def test_activate_button_is_fail_closed_when_the_flag_is_off(
 
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False, raising=False)
     monkeypatch.setattr('app.database.crud.subscription.get_subscription_by_user_id', _mark)
+    warnings.clear()
     with contextlib.suppress(RuntimeError):
         await menu.handle_activate_button(callback, user, MagicMock())
 
     assert passed_through, (
         'При включённом флаге заслонка всё равно не пропустила — значит она читает НЕ '
         '`ACTIVATE_BUTTON_VISIBLE`, а что-то другое, тоже выключенное по умолчанию.'
+    )
+    assert not warnings, (
+        'Предупреждение написано и на РАЗРЕШЁННОМ проходе. Значит оно вынесено из заслонки '
+        'наверх обработчика и кричит на каждую нормальную покупку — сигнал, на который '
+        'жалуются каждый раз, перестают читать (грабли 18.08 про порог тревоги).'
     )
