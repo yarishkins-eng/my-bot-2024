@@ -278,3 +278,35 @@ async def test_live_checkout_refusal_is_explained_in_russian(monkeypatch) -> Non
     detail = str(exc_info.value.detail)
     assert 'Internal Squads' not in detail and 'checkout' not in detail
     assert 'незакрытый заказ' in detail and 'нажмите снова' in detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('route_name', ['run_squad_rollout', 'restore_squad_rollout'])
+async def test_service_failure_becomes_a_readable_refusal_not_a_bare_500(monkeypatch, route_name) -> None:
+    """Сбой снимка и обрыв по изменившимся серверам обязаны доехать до владельца.
+
+    Без обёртки ValueError уходит голым 500 с телом text/plain — перехватчик
+    кабинета достаёт причину только из JSON с detail, поэтому владелец увидел бы
+    «Request failed with status code 500» и ничего больше.
+    """
+
+    monkeypatch.setattr(admin_tariffs, 'get_tariff_by_id', AsyncMock(return_value=_rollout_tariff()))
+    monkeypatch.setattr(admin_tariffs, 'assert_tariff_squad_rollout_allowed', AsyncMock())
+    monkeypatch.setattr(admin_tariffs, 'AuditLogCRUD', SimpleNamespace(create=AsyncMock()))
+    boom = AsyncMock(side_effect=ValueError('Не удалось сохранить снимок раскатки — порция не отправлена.'))
+    monkeypatch.setattr(
+        admin_tariffs,
+        'SubscriptionService',
+        lambda: SimpleNamespace(propagate_tariff_squads=boom, restore_tariff_squads=boom),
+    )
+
+    route = getattr(admin_tariffs, route_name)
+    kwargs = {'admin': SimpleNamespace(id=1), 'db': AsyncMock()}
+    if route_name == 'run_squad_rollout':
+        kwargs['request'] = SquadRolloutRequest()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await route(3, **kwargs)
+
+    assert exc_info.value.status_code == 409
+    assert 'снимок раскатки' in str(exc_info.value.detail)
