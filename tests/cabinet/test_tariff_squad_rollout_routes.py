@@ -338,8 +338,10 @@ class _RefusalSession:
             raise self._boom
         sql = str(statement.compile(compile_kwargs={'literal_binds': True}))
         self.compiled.append(sql)
-        # Запрос со связкой users — тот, что повторяет замок видимости списка.
-        return self._visible if ' JOIN users' in sql or ' users ' in sql else self._any
+        # Различаем запросы по СМЫСЛУ, а не по форме: «видимый» — тот, в котором стоит
+        # замок PII. Прежняя эвристика смотрела на подстроку с `users` и принимала за
+        # связку декартово произведение — мутация «снять JOIN» проезжала мимо неё.
+        return self._visible if 'account_erasure_requested_at' in sql else self._any
 
 
 def _blocked_route_kwargs(route_name, session):
@@ -373,6 +375,13 @@ async def test_refusal_names_a_stuck_order_the_owner_can_actually_find(monkeypat
     assert 'Заказы на разборе' in detail
     assert 'ничего не изменилось' in detail
     assert 'подождите' not in detail.lower()
+    # M12: заказ ВИДЕН — значит про заявку на удаление тут писать нельзя, это выдумка
+    # про живого клиента. Обе ветки называют «Заказы на разборе», поэтому подстрока
+    # с названием кнопки эту подмену не ловит.
+    assert 'удаление аккаунта' not in detail
+    assert 'не показывают' not in detail
+    # M11: восемь знаков, ровно как подписан заказ в списке чат-админки.
+    assert 'dead-beef' not in detail and '7f3a91c4-' not in detail
 
 
 @pytest.mark.asyncio
@@ -409,6 +418,10 @@ async def test_refusal_for_an_ordinary_cart_promises_nothing_it_cannot_keep(monk
     assert 'ничего не изменилось' in detail
     assert 'дольше суток' in detail
     assert 'разборе' not in detail
+    # M14: ровно та фраза, ради снятия которой сделан этот пункт. Запрет живёт ЗДЕСЬ,
+    # в ветке, куда она может вернуться, а не в тесте соседней ветки.
+    assert 'подождите' not in detail.lower()
+    assert 'оплатится или отменится' not in detail
 
 
 @pytest.mark.asyncio
@@ -422,8 +435,14 @@ async def test_a_broken_probe_never_turns_the_409_into_a_bare_500(monkeypatch, r
     with pytest.raises(HTTPException) as exc_info:
         await getattr(admin_tariffs, route_name)(3, **_blocked_route_kwargs(route_name, session))
 
+    detail = str(exc_info.value.detail)
     assert exc_info.value.status_code == 409
-    assert 'ничего не изменилось' in str(exc_info.value.detail)
+    assert 'ничего не изменилось' in detail
+    # Мы ничего не узнали о заказах — значит не имеем права ни называть номер, ни
+    # посылать в список. Прежний сторож стерёг только код ответа и начало фразы.
+    assert '№' not in detail
+    assert 'разборе' not in detail
+    assert 'Разберите его в боте' not in detail
 
 
 @pytest.mark.asyncio
@@ -445,11 +464,21 @@ async def test_stuck_order_lookup_repeats_the_visibility_lock_of_the_chat_list()
     # Замок PII: клиент с неоконченной заявкой на удаление в списке не показывается.
     assert 'account_erasure_requested_at IS NULL' in visible_sql
     assert 'account_erased_at IS NOT NULL' in visible_sql
+    # 🔴 M1: замок PII обязан быть СВЯЗАН с заказом. Снятый JOIN превращает запрос в
+    # декартово произведение, и условие выполняется, если ему удовлетворяет хоть один
+    # пользователь таблицы — то есть замок исчезает при зелёном наборе. Стережём форму
+    # отказа (запятая между таблицами), а не форму связки: и JOIN, и EXISTS годятся.
+    assert 'subscription_checkouts, users' not in visible_sql
+    assert 'JOIN users' in visible_sql or 'EXISTS' in visible_sql
     # Порядок — тот же, что у списка в чат-админке, иначе назовём последнюю строку.
     assert 'updated_at DESC' in visible_sql
-    # Второй запрос спрашивает ШИРЕ: есть ли такой заказ вообще.
+    # Второй запрос спрашивает ШИРЕ: есть ли такой заказ вообще. Но «шире» — только по
+    # замку видимости: тариф и порядок обязаны остаться, иначе назовём чужой заказ
+    # (M9) или не тот из своих (M3b, M6b).
     assert 'account_erasure_requested_at' not in any_sql
     assert "lifecycle_state = 'operator_review'" in any_sql
+    assert 'subscription_checkouts.tariff_id = 3' in any_sql
+    assert 'updated_at DESC' in any_sql
 
 
 @pytest.mark.asyncio
