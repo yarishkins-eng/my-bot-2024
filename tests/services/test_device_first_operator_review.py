@@ -38,6 +38,19 @@ def _checkout(**overrides):
     return base
 
 
+def _get_by_model(checkout):
+    """`db.get(SubscriptionCheckout, …)` → заказ, `db.get(User, …)` → живой клиент.
+
+    Забор возврата спрашивает обоих, и общий `return_value` отдавал бы заказ вместо
+    клиента — тест падал бы на несуществующем поле, а не на проверяемом поведении.
+    """
+
+    async def _get(model, _ident, **_kwargs):
+        return checkout if getattr(model, '__name__', '') == 'SubscriptionCheckout' else _healthy_owner()
+
+    return AsyncMock(side_effect=_get)
+
+
 def _healthy_owner():
     """Клиент, аккаунт которого никто не удаляет."""
     return SimpleNamespace(id=186, balance_kopeks=0, account_erased_at=None, account_erasure_requested_at=None)
@@ -452,7 +465,10 @@ def test_the_close_question_promises_exactly_what_closing_gives():
     """🔴 Три случая, а не два. Обещание одно на всех было бы ложью в двух из трёх."""
     assert service.operator_close_unblocks(_checkout()) == 'Клиент снова сможет оформить покупку.'
     stopped = service.operator_close_unblocks(_checkout(lifecycle_state='conflict', terminal_reason='quote_expired'))
-    assert stopped == 'Клиент снова сможет взять пробный период.'
+    # 🔴 Оговорка обязательна: забор триала отбивает КАЖДОГО, у кого когда-либо была
+    # подписка, раньше, чем доходит до заказов. Безусловное обещание было бы ложью для
+    # всех, кто уже пользовался триалом, а не только для тех, чей заказ об него споткнулся.
+    assert stopped == 'Клиент снова сможет взять пробный период, если ещё им не пользовался.'
     for reason in REASONS_WITH_A_LIVE_SUBSCRIPTION:
         nothing = service.operator_close_unblocks(_checkout(lifecycle_state='conflict', terminal_reason=reason))
         assert 'ничего не даст' in nothing
@@ -481,6 +497,36 @@ def test_the_card_of_a_stopped_order_stops_lying(state):
     assert 'клиент не возьмёт пробный период' in text
     # И не зовёт выдавать подписку заново: заказ бывает продлевающим, VPN у клиента жив.
     assert 'VPN клиенту не выдан' not in text
+
+
+@pytest.mark.parametrize(
+    'reason',
+    [
+        # 🔴 Половина `operator_review` — та, где висят деньги живого клиента. Первая
+        # правка её пропустила, и сторож не мог это поймать: он перечислял ровно те же
+        # ключи, что и словарь. Здесь имена взяты из МЕСТ ПРИСВОЕНИЯ, а не из словаря.
+        'subscription_appeared_after_payment',
+        'target_subscription_changed_after_payment',
+        'captured_entitlement_changed_after_payment',
+        'invalid_sale_snapshot',
+        'invalid_entitlement_snapshot',
+        'entitlement_snapshot_hash_mismatch',
+        'tariff_missing_after_quote',
+        'provider_terminal_identity_mismatch',
+        'provider_terminal_status_regressed',
+        'provider_invoice_verification_mismatch',
+        'provider_identity_binding_conflict',
+        'direct_payment_attempt_mode_or_binding_mismatch',
+        'no_entitlements_to_provision',
+        'provider_invoice_missing_or_elapsed_expiry',
+    ],
+)
+def test_every_reason_of_a_money_order_has_a_russian_name(reason):
+    """🔴 На заказе с деньгами карточка обязана называть причину словами. Двенадцать из
+    пятнадцати причин этой ветки остались без перевода после первой правки."""
+    text = _card(_checkout(lifecycle_state='operator_review', terminal_reason=reason))
+    assert 'причину видно только по коду' not in text, reason
+    assert service._TERMINAL_REASON_RU[reason] in text
 
 
 def test_every_reason_of_a_stopped_order_has_a_russian_name():
@@ -554,7 +600,7 @@ async def test_a_stale_confirmation_button_refuses_before_asking_anything():
         answer=AsyncMock(),
     )
     db = _db()
-    db.get = AsyncMock(return_value=checkout)
+    db.get = _get_by_model(checkout)
 
     await orders_review.ask_confirmation.__wrapped__.__wrapped__(callback, SimpleNamespace(id=1), db)
 
@@ -583,7 +629,7 @@ async def test_the_whole_path_works_for_a_stopped_order_through_the_real_buttons
         return SimpleNamespace(data=data, message=message, answer=AsyncMock(), from_user=SimpleNamespace(id=1))
 
     db = _db(scalars=[1, 0, 0])
-    db.get = AsyncMock(return_value=checkout)
+    db.get = _get_by_model(checkout)
 
     with (
         patch.object(orders_review, 'list_operator_review_checkouts', AsyncMock(return_value=[checkout])),
@@ -603,7 +649,6 @@ async def test_the_whole_path_works_for_a_stopped_order_through_the_real_buttons
 
     # Заказ дошёл до списка — до пункта 4.5 он туда не попадал вовсе — и отличим от денежного.
     assert 'Заказы на разборе: 1' in screens[0]
-    assert '⏸' in screens[0]
     # Карточка открылась, а не отбилась «этот заказ уже разобран».
     assert screens[1] == 'карточка заказа'
     # Вопрос обещает ровно то, что закрытие даёт ИМЕННО ЭТОМУ заказу.
@@ -613,3 +658,145 @@ async def test_the_whole_path_works_for_a_stopped_order_through_the_real_buttons
     assert screens[3].startswith('✅')
     assert checkout.lifecycle_state == 'cancelled'
     assert checkout.terminal_reason == 'cancelled_by_operator_review'
+
+
+# ---------------------------------------------------------------------------
+# Сторожа на мутации, пережившие набор во второй волне ревью.
+# Каждый ниже проверен так: сломать код → убедиться, что покраснел → починить.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_counter_and_the_list_ask_the_same_question():
+    """🔴 Мутация 30 скептика пережила ВЕСЬ набор: счётчик можно было сузить до
+    `operator_review`, и экран написал бы «Заказы на разборе: 0» над непустым списком.
+
+    Это ровно тот P0, который закрывал пункт 4.4, и комментарий над константой утверждал,
+    что он сторожится. Не сторожился: прежний тест строил запрос из функции условий сам,
+    а не проверял, с каким набором её зовут список и счётчик.
+    """
+    from app.database.models import SubscriptionCheckout, User
+
+    seen = []
+
+    def _capture(stmt):
+        seen.append(str(stmt.compile(compile_kwargs={'literal_binds': True})))
+        rows = MagicMock()
+        rows.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))
+        return rows
+
+    db = MagicMock()
+    db.execute = AsyncMock(side_effect=_capture)
+    db.scalar = AsyncMock(
+        side_effect=lambda stmt: seen.append(str(stmt.compile(compile_kwargs={'literal_binds': True})))
+    )
+
+    await service.list_operator_review_checkouts(db, limit=20)
+    await service.count_operator_review_checkouts(db)
+
+    assert len(seen) == 2
+    for state in ('operator_review', 'conflict', 'failed', 'reprice_required'):
+        assert f"'{state}'" in seen[0], f'список потерял {state}'
+        assert f"'{state}'" in seen[1], f'счётчик потерял {state}'
+    del SubscriptionCheckout, User
+
+
+@pytest.mark.asyncio
+async def test_the_answer_after_closing_is_a_whole_sentence_not_a_glued_one():
+    """🔴 Регрессия починки первой волны, нашли скептик и прогон сценария.
+
+    Вспомогательная функция стала возвращать законченные предложения, а шаблон ответа
+    остался прежним — владелец читал «…не мешает клиенту Клиент снова сможет…».
+    """
+    for state, reason in (('operator_review', 'no_entitlements_to_provision'), ('conflict', 'quote_expired')):
+        checkout = _checkout(lifecycle_state=state, terminal_reason=reason)
+        _done, message = await service.close_operator_review_checkout(_db(), checkout=checkout, admin_user_id=1)
+        assert 'клиенту Клиент' not in message
+        assert 'клиенту Клиенту' not in message
+        assert '..' not in message
+        # И заказ, закрытие которого клиенту ничего не даёт, не утверждает обратного.
+        assert not (message.count('не мешает') and 'ничего не даст' in message)
+
+
+@pytest.mark.asyncio
+async def test_the_promise_is_computed_before_the_order_is_changed():
+    """🔴 Мутация 14 пережила набор: перенос строки под мутацию состояния проходил молча.
+
+    Ущерб денежный: заказ на разборе после закрытия становится `cancelled`, и ответ
+    оператору обещал бы пробный период вместо снятой блокировки покупки.
+    """
+    checkout = _checkout(lifecycle_state='operator_review')
+    _done, message = await service.close_operator_review_checkout(_db(), checkout=checkout, admin_user_id=1)
+    assert 'оформить покупку' in message
+    assert 'пробный период' not in message
+
+
+@pytest.mark.asyncio
+async def test_the_close_screen_names_the_money_before_the_irreversible_press():
+    """🔴 P0 критика полноты. Пункт 4.5 сделал «Закрыть» рутинной кнопкой, а вопрос про
+    деньги она не задавала — при том что соседняя кнопка эту цифру уже считает."""
+    from app.handlers.admin import orders_review
+
+    checkout = _checkout()
+    screens = []
+
+    def _callback():
+        return SimpleNamespace(
+            data=f'{orders_review.ASK_PREFIX}close:{checkout.id}',
+            message=SimpleNamespace(edit_text=AsyncMock(side_effect=lambda text, **_: screens.append(text))),
+            answer=AsyncMock(),
+        )
+
+    # Забор отвечает «удержано 649 ₽»: решённых строк сверки нет, деньги на попытке есть.
+    db = _db(scalars=[0, 64900])
+    db.get = _get_by_model(checkout)
+    await orders_review.ask_confirmation.__wrapped__.__wrapped__(_callback(), SimpleNamespace(id=1), db)
+    assert '649' in screens[0]
+    assert 'верните их ДО закрытия' in screens[0]
+
+    # А на заказе без денег — прямой ответ вместо прежнего «верните, если они были».
+    screens.clear()
+    empty = _checkout(lifecycle_state='conflict', terminal_reason='quote_expired')
+    db = _db(scalars=[0, None, None])
+    db.get = _get_by_model(empty)
+    await orders_review.ask_confirmation.__wrapped__.__wrapped__(_callback(), SimpleNamespace(id=1), db)
+    assert 'Возвращать по нему нечего' in screens[0]
+    assert 'верните' not in screens[0].lower()
+
+
+def test_the_list_row_marks_money_orders_apart():
+    """🔴 Мутации 13 и 13b пережили набор: значок можно было убрать целиком ИЛИ поменять
+    местами. Прежний сторож смотрел на текст сообщения, а значок живёт в подписи кнопки."""
+    import asyncio
+
+    from app.handlers.admin import orders_review
+
+    money = _checkout(lifecycle_state='operator_review')
+    routine = _checkout(lifecycle_state='conflict', terminal_reason='quote_expired')
+    routine.id = 102
+    captured = {}
+
+    callback = SimpleNamespace(
+        data='x',
+        message=SimpleNamespace(edit_text=AsyncMock(side_effect=lambda text, **kw: captured.update(kw))),
+        answer=AsyncMock(),
+    )
+    with (
+        patch.object(orders_review, 'list_operator_review_checkouts', AsyncMock(return_value=[money, routine])),
+        patch.object(orders_review, 'count_operator_review_checkouts', AsyncMock(return_value=2)),
+    ):
+        asyncio.run(
+            orders_review.show_orders_review_list.__wrapped__.__wrapped__(callback, SimpleNamespace(id=1), _db())
+        )
+
+    labels = [row[0].text for row in captured['reply_markup'].inline_keyboard]
+    assert labels[0].startswith('💰'), labels
+    assert labels[1].startswith('⏸'), labels
+
+
+def test_the_refund_hint_promises_no_lock_that_does_not_exist():
+    """🔴 Мутация 20 пережила набор: возврат прежней фразы «это снимет замок с клиента»
+    проходил молча, хотя у остановившихся заказов никакого замка на покупку нет."""
+    from app.handlers.admin import orders_review
+
+    assert 'замок' not in orders_review.ACTIONS['refund']['after']

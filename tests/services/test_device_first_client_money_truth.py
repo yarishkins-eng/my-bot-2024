@@ -654,3 +654,14 @@ async def test_the_closed_by_support_screen_still_says_nothing_was_charged_when_
     caption = await _cancelled_screen('cancelled_by_operator_review', money_state='no_money')
     assert 'Списаний по нему не было' in caption
     assert 'напишите в поддержку' not in caption
+
+
+@pytest.mark.asyncio
+async def test_the_english_half_of_the_support_closed_screen_says_the_same():
+    """🔴 Мутация 28 пережила набор: русскую правку сторожил тест, английскую — ничто,
+    и возврат к «support will return the amount» проходил молча. У соседней ветки
+    (`provider_terminal`) английский сторож есть — асимметрия была случайной."""
+    caption = await _cancelled_screen('cancelled_by_operator_review', money_state='money_in_flight', language='en')
+    assert 'support will return' not in caption.lower()
+    assert 'balance' in caption.lower()
+    assert 'contact support' in caption.lower()

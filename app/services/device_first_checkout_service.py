@@ -2829,6 +2829,23 @@ _TERMINAL_REASON_RU = {
     'non_positive_quote': 'расчёт вышел нулевым или отрицательным',
     'entitlement_quote_missing_or_invalid': 'расчёт прав доступа не сошёлся',
     'payment_amount_mismatch': 'платёжная система вернула сумму, отличную от счёта',
+    # 🔴 Критик полноты: первая правка добавила названия только остановившимся заказам —
+    # то есть той половине, где денег нет. А на заказе с деньгами живого клиента карточка
+    # по-прежнему писала «причину видно только по коду». Здесь двенадцать причин ветки
+    # `operator_review`, каждая проверена грепом. Наглядно: `subscription_appeared` был
+    # переведён, а его платный близнец `subscription_appeared_after_payment` — нет.
+    'subscription_appeared_after_payment': 'подписка у клиента появилась уже после оплаты',
+    'target_subscription_changed_after_payment': 'подписка клиента изменилась уже после оплаты',
+    'captured_entitlement_changed_after_payment': 'набор серверов изменился уже после оплаты',
+    'invalid_sale_snapshot': 'слепок заказа испорчен',
+    'invalid_entitlement_snapshot': 'слепок прав доступа испорчен',
+    'entitlement_snapshot_hash_mismatch': 'слепок прав доступа не сошёлся с подписью',
+    'tariff_missing_after_quote': 'тариф исчез после расчёта',
+    'provider_terminal_identity_mismatch': 'платёжная система вернула чужой платёж',
+    'provider_terminal_status_regressed': 'платёжная система передумала: счёт снова в ожидании',
+    'provider_invoice_verification_mismatch': 'платёж не сошёлся при проверке',
+    'provider_identity_binding_conflict': 'платёж привязан к другому заказу',
+    'direct_payment_attempt_mode_or_binding_mismatch': 'платёж не сошёлся с попыткой оплаты',
 }
 _PROVISIONING_RU = {
     'not_started': 'не начиналась',
@@ -2963,7 +2980,11 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
     reason_code = str(checkout.terminal_reason or '')
     reason_ru = _TERMINAL_REASON_RU.get(reason_code)
     provisioning_ru = _PROVISIONING_RU.get(str(checkout.provisioning_state), str(checkout.provisioning_state))
-    paid_by = 'с баланса' if checkout.funding_mode == 'wallet' else 'через платёжную систему'
+    # 🔴 `funding_mode` у остановившегося заказа бывает NULL: способ оплаты ещё не
+    # выбирался. Прежняя развилка «не wallet — значит платёжка» его выдумывала.
+    paid_by = {'wallet': 'с баланса', 'platega': 'через платёжную систему'}.get(
+        str(checkout.funding_mode or ''), 'способ ещё не выбран'
+    )
 
     lines = ['🔴 <b>ЗАКАЗ ЗАВИС</b>', '']
     if user is not None:
@@ -2996,11 +3017,12 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
         # Пункт 4.5. Эти заказы карточка раньше не показывала вовсе, а текст ниже про них
         # врал: «бот продолжает пробовать сам» — не пробует. Свип их не выбирает
         # (`get_open_checkout_for_user`), очереди выдачи у них не бывает: строка
-        # `DeviceFirstOutbox` заводится одним блоком с `lifecycle_state='fulfilling'`
-        # (`:1582`, `:2147`), а все переходы в `conflict`/`reprice_required` живут ДО него.
-        # 🔴 Если эта пара всё-таки станет достижимой, здесь появится вредный совет —
-        # сторожить её отдельным `if` нельзя (спящая ветка врёт следующему агенту так же
-        # уверенно, как код), поэтому причина недостижимости записана прямо тут.
+        # 🔴 Доказательство недостижимости (первая версия этого комментария была НЕВЕРНА,
+        # опровергнута скептиком: переходы из вебхука случаются когда угодно, «до» тут ни
+        # при чём). Настоящая причина: `provisioning_state ∈ {pending, retry}` бывает
+        # только при `fulfillment_state == 'fulfilled'`, а `fulfill_checkout` на таком
+        # заказе выходит сразу и в `conflict` его не уводит. На исторических legacy-строках
+        # пара достижима — там этот совет будет неточен, и это записано честно.
         lines.append(f'⚠️ Заказ остановился: {reason_ru or "причину видно только по коду"}. Сам он не продолжится.')
         # Карточка называет ТЕКУЩИЙ вред, а `operator_close_unblocks` — что даст закрытие.
         # Это разные утверждения, и склеивать их в одно нельзя: у заказов, остановленных
@@ -3379,7 +3401,9 @@ OPERATOR_REFUND_RECONCILIATION_REASON = 'operator_refund_wallet_credit'
 OPERATOR_REFUND_LEDGER_PREFIX = 'operator_review_refund'
 # Пункт 4.5. Какие заказы попадают на экран «🧾 Заказы на разборе». ОДИН набор на всё:
 # видимость списка, счётчик, карточка, возврат и закрытие. Разойдутся — экран покажет
-# заказ, по которому кнопки откажут, и это уже случалось (P0 пункта 4.4).
+# заказ, по которому кнопки откажут, и это уже случалось (P0 пункта 4.4). Сторож на само
+# согласие списка и счётчика — `test_the_counter_and_the_list_ask_the_same_question`:
+# без него подмена набора у счётчика проходила весь набор тестов молча.
 #
 # 🔴 НЕ сводить ни с `TERMINAL_STATES` (`:46`), ни с `_CHECKOUT_TERMINAL_STATES`
 # (`crud/tariff.py:52`). У них другой вопрос. Здесь вопрос один: «этот заказ сам никуда
@@ -3387,10 +3411,12 @@ OPERATOR_REFUND_LEDGER_PREFIX = 'operator_review_refund'
 #
 # 🔴 И НЕ подставлять этот набор в `find_tariff_operator_review_order` (`:3378`), хотя
 # план 4.5 это и предписывал. Та функция объясняет, ПОЧЕМУ забор тарифа отказал, а забор
-# (`crud/tariff.py:_assert_tariff_squad_change_has_no_live_checkout`) три новых состояния
-# не видит вовсе — они входят в его терминальный набор. Расширить её значит назвать
-# владельцу заказ, закрытие которого замок с тарифа не снимет, и увести его от настоящей
-# причины отказа.
+# (`crud/tariff.py:_assert_tariff_squad_change_has_no_live_checkout`) устроен из ДВУХ
+# дизъюнктов: первый эти три состояния не видит (они в его терминальном наборе), второй —
+# `live_provider_attempt` — смотрит на статус попытки и состояние заказа не спрашивает
+# вовсе. Значит `conflict` с живой попыткой тариф всё-таки держит, но закрытие статус
+# попытки не меняет, то есть замок не снимет. Расширить функцию значит назвать владельцу
+# заказ, закрытие которого ему не поможет, и увести от настоящей причины отказа.
 # ⚠️ `failed` в наборе — про исторические строки: `lifecycle_state = 'failed'` сегодня не
 # присваивается нигде в `app/` (проверено грепом). Живых состояний тут три, не четыре.
 OPERATOR_REVIEWABLE_STATES = frozenset({'operator_review', 'conflict', 'failed', 'reprice_required'})
@@ -3417,7 +3443,7 @@ def operator_close_unblocks(checkout: SubscriptionCheckout) -> str:
         return 'Клиент снова сможет оформить покупку.'
     if str(checkout.terminal_reason or '') in _REASONS_PROVING_CLIENT_ALREADY_HAS_SUBSCRIPTION:
         return 'Клиенту это ничего не даст: подписка у него уже есть. Заказ просто уйдёт из списка.'
-    return 'Клиент снова сможет взять пробный период.'
+    return 'Клиент снова сможет взять пробный период, если ещё им не пользовался.'
 
 
 async def list_operator_review_checkouts(
@@ -3543,6 +3569,8 @@ async def operator_review_card(db: AsyncSession, checkout: SubscriptionCheckout)
     """Карточка заказа для оператора.
 
     🔴 Намеренно ТОТ ЖЕ текст, что уходит тревогой владельцу (`_owner_order_stuck_text`).
+    ⚠️ С пункта 4.5 это верно лишь наполовину: тревога рассылается только по
+    `operator_review`, поэтому у трёх новых состояний этот текст живёт ТОЛЬКО как карточка.
     Две причины: во-первых, один текст — одно место правки; во-вторых, тревога в чате —
     это снимок момента (мина M), а карточка собирается заново при каждом открытии, то
     есть оператор всегда видит живое состояние заказа, даже если тревоге неделя.
@@ -3739,4 +3767,4 @@ async def close_operator_review_checkout(
     )
     # 🔴 Обещать «и тариф разблокирован» здесь нельзя. Забор тарифа снимается, только
     # когда по нему не осталось НИ ОДНОГО неразобранного заказа, а их бывает несколько.
-    return True, f'Заказ закрыт. Он больше не мешает клиенту {unblocks}.'
+    return True, f'Заказ закрыт. {unblocks}'
