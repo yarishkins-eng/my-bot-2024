@@ -32,7 +32,35 @@ _SEARCH_ROOTS = ('app', 'tests', 'migrations')
 # из `app/services/nalogo_service.py`. Проверяем их отдельным прогоном в обход конфига.
 _RUFF_BLIND_SPOTS = ('app/lib', 'migrations')
 
-_EXPECTED_EXCLUDES = {'.venv', 'venv', '.tox', '.nox', 'build', 'dist', 'node_modules', 'migrations'}
+# Снимок `[tool.ruff] exclude` на 19.08.2026: стандартный список ruff плюс `migrations`.
+# Заморожен намеренно — внести сюда файл с поломкой значит выключить для него ВСЕ правила,
+# и это ровно тот обход, которым скептик прошёл мимо первой версии сторожа.
+_EXPECTED_EXCLUDES = frozenset(
+    {
+        '.bzr',
+        '.direnv',
+        '.eggs',
+        '.git',
+        '.git-rewrite',
+        '.hg',
+        '.mypy_cache',
+        '.nox',
+        '.pants.d',
+        '.pytype',
+        '.ruff_cache',
+        '.svn',
+        '.tox',
+        '.venv',
+        '__pypackages__',
+        '_build',
+        'buck-out',
+        'build',
+        'dist',
+        'migrations',
+        'node_modules',
+        'venv',
+    }
+)
 
 
 def _ruff(*args: str) -> subprocess.CompletedProcess[str]:
@@ -106,8 +134,10 @@ def test_f821_is_not_silenced_anywhere_in_the_config() -> None:
         for pattern, rules in lint.get('per-file-ignores', {}).items()
         if 'F821' in rules or 'F' in rules or 'ALL' in rules
     }
-    # `app/lib/**` заглушён целиком исторически — его стережёт отдельный прогон выше.
-    silenced_per_file.pop('app/lib/**/*.py', None)
+    # Эти две зоны заглушены целиком исторически, и обе стережёт отдельный прогон выше
+    # (`_RUFF_BLIND_SPOTS`). Любая НОВАЯ запись здесь — обход ворот, и сторож её поймает.
+    for known in ('app/lib/**/*.py', '**/migrations/**/*.py'):
+        silenced_per_file.pop(known, None)
     assert not silenced_per_file, (
         f'F821 заглушён через `per-file-ignores`: {silenced_per_file}. Это обход ворот мимо '
         '`ignore`; скептик прошёл им насквозь, оставив NameError в боевом коде при зелёном CI.'
@@ -137,7 +167,9 @@ def test_f821_is_not_silenced_by_comments_in_the_code() -> None:
     found: dict[str, int] = {}
     for root in _SEARCH_ROOTS:
         for path in (PROJECT_ROOT / root).rglob('*.py'):
-            if '__pycache__' in path.parts:
+            # Пропускаем сам этот файл: в его докстринге обе формы заглушки названы дословно,
+            # иначе сторож находит себя же (наступал на это дважды).
+            if '__pycache__' in path.parts or path == Path(__file__).resolve():
                 continue
             text = path.read_text(encoding='utf-8', errors='replace')
             hits = len(per_line.findall(text)) + len(whole_file.findall(text))
