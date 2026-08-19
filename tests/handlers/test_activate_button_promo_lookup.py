@@ -272,6 +272,12 @@ async def test_activate_button_is_fail_closed_when_the_flag_is_off(
 
     monkeypatch.setattr(settings, 'ACTIVATE_BUTTON_VISIBLE', False, raising=False)
 
+    # Срабатывание заслонки обязано оставлять след: если она когда-нибудь сработает на боевом,
+    # значит нажатие дошло туда, куда не должно было, и владелец захочет об этом узнать.
+    # Уровень проверяем явно — понижение до debug утопит запись в общем шуме и прошло бы молча.
+    warnings: list[str] = []
+    monkeypatch.setattr(menu.logger, 'warning', lambda event, **_kw: warnings.append(event))
+
     # Любое обращение к деньгам или к базе — провал теста, а не «неважная деталь».
     def _forbidden(name):
         async def _boom(*_args, **_kwargs):
@@ -303,6 +309,10 @@ async def test_activate_button_is_fail_closed_when_the_flag_is_off(
     assert callback.answer.await_args.kwargs.get('show_alert') is True, 'ответ показан не заметно'
     # db.execute/commit — MagicMock, так что факт обращения виден по счётчику вызовов.
     assert not db.method_calls, f'заслонка всё-таки сходила в базу: {db.method_calls}'
+    assert warnings, (
+        'Заслонка сработала молча. Тогда о нажатиях по мёртвой кнопке — из рассылки или из '
+        'старого сообщения — не узнает никто, а это единственный способ их заметить.'
+    )
 
     # Вторая половина, без которой сторож не самодостаточен: при ВКЛЮЧЁННОМ флаге заслонка
     # обязана пропускать. Иначе «заслонка», читающая любой другой выключенный флаг, прошла бы.
