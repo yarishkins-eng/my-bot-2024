@@ -362,6 +362,18 @@ async def _assert_tariff_squad_change_has_no_live_checkout(db: AsyncSession, tar
         )
 
 
+async def assert_tariff_squad_rollout_allowed(db: AsyncSession, tariff: Tariff) -> None:
+    """Тот же забор живых заказов, что стоит на смене серверов тарифа.
+
+    Раскатка переписывает ``connected_squads`` уже ВЫДАННЫМ подпискам, то есть
+    трогает захваченные права ещё жёстче, чем правка самого тарифа.  Публичное
+    имя нужно, чтобы маршрут раскатки брал ровно этот забор и не заводил свой
+    (мина AE: собственный забор рядом с каноническим спрашивает меньше).
+    """
+
+    await _assert_tariff_squad_change_has_no_live_checkout(db, tariff)
+
+
 def _normalize_period_prices(period_prices: dict[int, int] | None) -> dict[str, int]:
     """Нормализует цены периодов в формат {str: int}."""
     if not period_prices:

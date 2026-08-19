@@ -25,6 +25,9 @@ from ..schemas.tariffs import (
     PromoGroupInfo,
     ServerInfo,
     ServerTrafficLimit,
+    SquadRolloutPreviewResponse,
+    SquadRolloutRequest,
+    SquadRolloutResponse,
     TariffCreateRequest,
     TariffDetailResponse,
     TariffListItem,
@@ -632,4 +635,153 @@ async def get_tariff_stats(
         trial_subscriptions=trial_count,
         revenue_kopeks=revenue_kopeks,
         revenue_rubles=revenue_kopeks / 100,
+    )
+
+
+async def _load_rollout_tariff(db: AsyncSession, tariff_id: int) -> Tariff:
+    """Тариф, пригодный для раскатки, либо понятный отказ."""
+
+    tariff = await get_tariff_by_id(db, tariff_id)
+    if not tariff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Тариф не найден')
+    # Раскатка разносит ИМЕННО allowed_squads. У наследованного режима этот набор
+    # не является действующим правом, и раскатка по нему выдала бы подпискам не то,
+    # за что человек платил.  Сначала сохранение серверов (оно же переводит тариф
+    # в native_squads через update_tariff и его забор), только потом раскатка.
+    if getattr(tariff, 'entitlement_mode', None) != 'native_squads':
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                'Тариф ещё не переведён на собственный выбор серверов. Сначала сохраните серверы '
+                'на экране тарифа, потом раскатывайте их на выданные подписки.'
+            ),
+        )
+    if not tariff.allowed_squads:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='У тарифа не выбрано ни одного сервера — раскатывать нечего.',
+        )
+    return tariff
+
+
+@router.post('/{tariff_id}/squad-rollout/preview', response_model=SquadRolloutPreviewResponse)
+async def preview_squad_rollout(
+    tariff_id: int,
+    admin: User = Depends(require_permission('tariffs:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Сухой прогон раскатки: сколько подписок затронет и какие пропустит.
+
+    Ничего не пишет и не обращается к панели — это безопасный предпросмотр.
+    """
+    tariff = await _load_rollout_tariff(db, tariff_id)
+    plan = await SubscriptionService().plan_tariff_squad_rollout(db, tariff_id, list(tariff.allowed_squads or []))
+    logger.info('Сухой прогон раскатки серверов', admin_id=admin.id, tariff_id=tariff_id, plan=plan)
+    return SquadRolloutPreviewResponse(**plan)
+
+
+@router.post('/{tariff_id}/squad-rollout', response_model=SquadRolloutResponse)
+async def run_squad_rollout(
+    tariff_id: int,
+    request: SquadRolloutRequest,
+    admin: User = Depends(require_permission('tariffs:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Раскатывает серверы тарифа на выданные подписки порциями.
+
+    Серверы САМОГО тарифа здесь не меняются: их правит только ``update_tariff``
+    со своим забором.  Раскатка разносит уже сохранённый набор и берёт ТОТ ЖЕ
+    забор живых заказов — она трогает захваченные права ещё жёстче.
+    """
+    tariff = await _load_rollout_tariff(db, tariff_id)
+    try:
+        await assert_tariff_squad_rollout_allowed(db, tariff)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    result = await SubscriptionService().propagate_tariff_squads(
+        db,
+        tariff_id,
+        list(tariff.allowed_squads or []),
+        subscription_ids=request.subscription_ids,
+        limit=request.limit,
+        batch_size=request.batch_size,
+    )
+    await AuditLogCRUD.create(
+        db,
+        user_id=admin.id,
+        action='tariff_squads_rolled_out',
+        resource_type='tariff',
+        resource_id=str(tariff_id),
+        details={
+            'rollout_id': result.rollout_id,
+            'total': result.total,
+            'synced': result.synced,
+            'failed_ids': result.failed_ids,
+            'skipped_traffic_risk_ids': result.skipped_traffic_risk_ids,
+            'url_mismatch_ids': result.url_mismatch_ids,
+            'stopped_early': result.stopped_early,
+        },
+        status='partial' if (result.failed_ids or result.stopped_early) else 'success',
+    )
+    await db.commit()
+    return _rollout_response(tariff_id, result)
+
+
+@router.post('/{tariff_id}/squad-rollout/restore', response_model=SquadRolloutResponse)
+async def restore_squad_rollout(
+    tariff_id: int,
+    admin: User = Depends(require_permission('tariffs:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Возвращает подписки к снимку последней раскатки этого тарифа."""
+
+    tariff = await _load_rollout_tariff(db, tariff_id)
+    try:
+        await assert_tariff_squad_rollout_allowed(db, tariff)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    result = await SubscriptionService().restore_tariff_squads(db, tariff_id)
+    if not result.rollout_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Для этого тарифа нет ни одного снимка раскатки — возвращать не по чему.',
+        )
+    await AuditLogCRUD.create(
+        db,
+        user_id=admin.id,
+        action='tariff_squads_rollout_restored',
+        resource_type='tariff',
+        resource_id=str(tariff_id),
+        details={
+            'rollout_id': result.rollout_id,
+            'total': result.total,
+            'synced': result.synced,
+            'failed_ids': result.failed_ids,
+        },
+        status='partial' if result.failed_ids else 'success',
+    )
+    await db.commit()
+    return _rollout_response(tariff_id, result)
+
+
+def _rollout_response(tariff_id: int, result) -> SquadRolloutResponse:
+    if result.stopped_early:
+        message = 'Раскатка остановлена на полпути — проверьте отчёт ниже, снимок сохранён.'
+    elif result.failed_ids:
+        message = f'Готово частично: {result.synced} из {result.total}.'
+    else:
+        message = f'Готово: {result.synced} из {result.total}.'
+    return SquadRolloutResponse(
+        tariff_id=tariff_id,
+        rollout_id=result.rollout_id,
+        total=result.total,
+        synced=result.synced,
+        batches_done=result.batches_done,
+        failed_ids=result.failed_ids,
+        skipped_traffic_risk_ids=result.skipped_traffic_risk_ids,
+        url_mismatch_ids=result.url_mismatch_ids,
+        stopped_early=result.stopped_early,
+        message=message,
     )
