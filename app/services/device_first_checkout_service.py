@@ -3375,6 +3375,45 @@ def _operator_review_visible_conditions() -> tuple[Any, ...]:
     )
 
 
+async def find_tariff_operator_review_order(db: AsyncSession, *, tariff_id: int) -> tuple[str, bool] | None:
+    """Заказ тарифа, ждущий человека: (первые 8 знаков номера, найдёт ли его владелец).
+
+    Живёт здесь, а не у маршрута раскатки, ровно по той же причине, по которой список
+    и счётчик берут условия из одной функции: «какие заказы владелец видит глазами» —
+    это один вопрос, и отвечать на него в двух местах по-разному нельзя.
+
+    Второй элемент — не украшение. Заказы клиентов с неоконченной заявкой на удаление
+    из списка вырезаны намеренно (PII ещё не вычищено), и послать владельца в
+    «🧾 Заказы на разборе» за таким заказом — значит послать его в пустой экран.
+    Порядок ТОТ ЖЕ, что у списка: иначе названный заказ окажется его последней
+    строкой, а при двадцати с лишним застрявших — вообще за пределами экрана.
+    """
+
+    visible = await db.scalar(
+        select(SubscriptionCheckout.public_id)
+        .join(User, User.id == SubscriptionCheckout.user_id)
+        .where(SubscriptionCheckout.tariff_id == tariff_id, *_operator_review_visible_conditions())
+        .order_by(SubscriptionCheckout.updated_at.desc(), SubscriptionCheckout.id.desc())
+        .limit(1)
+    )
+    if isinstance(visible, str) and visible:
+        return visible[:8], True
+
+    # Тот же вопрос без замка видимости: заказ есть, но его не показывают.
+    hidden = await db.scalar(
+        select(SubscriptionCheckout.public_id)
+        .where(
+            SubscriptionCheckout.tariff_id == tariff_id,
+            SubscriptionCheckout.lifecycle_state == 'operator_review',
+        )
+        .order_by(SubscriptionCheckout.updated_at.desc(), SubscriptionCheckout.id.desc())
+        .limit(1)
+    )
+    if isinstance(hidden, str) and hidden:
+        return hidden[:8], False
+    return None
+
+
 async def count_operator_review_checkouts(db: AsyncSession) -> int:
     """Сколько ждёт разбора. Считается ТЕМ ЖЕ условием, что и список."""
     return int(

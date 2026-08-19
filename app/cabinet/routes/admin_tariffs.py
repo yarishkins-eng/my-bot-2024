@@ -19,15 +19,8 @@ from app.database.crud.tariff import (
     set_tariff_promo_groups,
     update_tariff,
 )
-from app.database.models import (
-    PromoGroup,
-    Subscription,
-    SubscriptionCheckout,
-    Tariff,
-    Transaction,
-    TransactionType,
-    User,
-)
+from app.database.models import PromoGroup, Subscription, Tariff, Transaction, TransactionType, User
+from app.services.device_first_checkout_service import find_tariff_operator_review_order
 from app.services.subscription_service import SubscriptionService
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -649,29 +642,51 @@ async def get_tariff_stats(
     )
 
 
-async def _stuck_order_public_head(db: AsyncSession, tariff: Tariff) -> str | None:
-    """Начало номера заказа тарифа, ждущего человека, либо None.
+# Отказ показывается ДО первой записи, поэтому каждый текст начинается с того, что
+# ничего не изменилось: владелец видит его уже после страшного «да, менять N подписок».
+_ROLLOUT_BLOCKED_PREFIX = 'Сейчас нельзя, ничего не изменилось: '
 
-    Ровно те же восемь знаков `public_id`, которыми заказ подписан в чат-админке
-    (`handlers/admin/orders_review.py`) — иначе владелец не найдёт в списке тот
-    заказ, про который ему написали. Забор этот запрос НЕ дублирует и ничего не
-    решает: отказ уже вынесен каноническим забором, здесь выбирается только текст.
-    """
+# Заказ ждёт человека и виден в списке чат-админки — единственный случай, когда
+# владельцу есть куда пойти. «Нажмите снова» не обещаем: заказов может быть несколько.
+_ROLLOUT_BLOCKED_STUCK_VISIBLE = (
+    _ROLLOUT_BLOCKED_PREFIX + 'у тарифа есть заказ №{head} на разборе, сам он не закроется. '
+    'Разберите его в боте: админ-панель → «🧾 Заказы на разборе». '
+    'Если отказ повторится — значит заказ был не один.'
+)
 
-    public_id = await db.scalar(
-        select(SubscriptionCheckout.public_id)
-        .where(
-            SubscriptionCheckout.tariff_id == tariff.id,
-            SubscriptionCheckout.lifecycle_state == 'operator_review',
-        )
-        .order_by(SubscriptionCheckout.id)
-        .limit(1)
-    )
-    # Только настоящая строка: всё прочее — это «номера нет», а не заказ с именем
-    # из чужого repr. Текст уходит человеку, который пойдёт искать этот номер глазами.
-    if not isinstance(public_id, str):
-        return None
-    return public_id[:8] or None
+# Заказ ждёт человека, но в списке его НЕТ: клиент попросил себя удалить, и до конца
+# удаления заказ прячут вместе с его личными данными. Послать в список — тупик.
+_ROLLOUT_BLOCKED_STUCK_HIDDEN = (
+    _ROLLOUT_BLOCKED_PREFIX + 'заказ №{head} ждёт разбора, но в списке «🧾 Заказы на разборе» '
+    'его не показывают: клиент подал заявку на удаление аккаунта. Сначала доведите её до конца.'
+)
+
+# Обычная корзина. Прежний текст обещал, что она «оплатится или отменится» — для
+# брошенной корзины это неправда: срок ей проставляют лениво, когда клиент сам вернётся,
+# а фонового чистильщика в проекте пока нет (этап 4.5). Поэтому обещания нет, есть срок,
+# после которого пора смотреть руками.
+_ROLLOUT_BLOCKED_WAIT = (
+    _ROLLOUT_BLOCKED_PREFIX + 'у тарифа есть незакрытый заказ клиента. Обычно он закрывается сам, '
+    'когда клиент оплатит или бросит корзину. Если отказ держится дольше суток — '
+    'заказ завис, загляните в админ-панель бота.'
+)
+
+
+async def _rollout_refusal_text(db: AsyncSession, tariff: Tariff) -> str:
+    """Причина отказа словами владельца. Ничего не решает — отказ уже вынесен."""
+
+    try:
+        stuck = await find_tariff_operator_review_order(db, tariff_id=tariff.id)
+    except Exception as error:
+        # Вердикт уже вынесен забором; сбой этого запроса не имеет права превратить
+        # понятный 409 в голый 500 — из него перехватчик кабинета причину не достанет.
+        logger.warning('Не удалось уточнить причину отказа раскатки', tariff_id=tariff.id, error=error)
+        return _ROLLOUT_BLOCKED_WAIT
+    if stuck is None:
+        return _ROLLOUT_BLOCKED_WAIT
+    head, visible = stuck
+    template = _ROLLOUT_BLOCKED_STUCK_VISIBLE if visible else _ROLLOUT_BLOCKED_STUCK_HIDDEN
+    return template.format(head=head)
 
 
 async def _assert_rollout_allowed_in_russian(db: AsyncSession, tariff: Tariff) -> None:
@@ -685,22 +700,10 @@ async def _assert_rollout_allowed_in_russian(db: AsyncSession, tariff: Tariff) -
     try:
         await assert_tariff_squad_rollout_allowed(db, tariff)
     except ValueError as exc:
-        # «Подождите» — правда для корзины клиента и ЛОЖЬ для заказа на разборе:
-        # тот ждёт человека и сам не закроется никогда. Про остальные заказы тарифа
-        # ничего не обещаем: их может быть несколько, и разбор одного не обязан
-        # снять замок.
-        stuck_head = await _stuck_order_public_head(db, tariff)
-        if stuck_head:
-            detail = (
-                f'Сейчас нельзя: у тарифа есть заказ {stuck_head} на разборе. Сам он не закроется — '
-                'разберите его в боте: админ-панель → «🧾 Заказы на разборе», потом нажмите снова.'
-            )
-        else:
-            detail = (
-                'Сейчас нельзя: у тарифа есть незакрытый заказ клиента. '
-                'Это нормально — подождите, пока он оплатится или отменится, и нажмите снова.'
-            )
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=await _rollout_refusal_text(db, tariff),
+        ) from exc
 
 
 async def _load_rollout_tariff(db: AsyncSession, tariff_id: int) -> Tariff:
