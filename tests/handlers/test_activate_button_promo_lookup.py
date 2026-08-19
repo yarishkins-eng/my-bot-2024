@@ -2,9 +2,10 @@
 
 `handle_activate_button` звала `get_user_active_promo_discount_percent`, не импортировав её.
 Живой симптом был не «красный линтер», а вот какой: имя не разрешается → `NameError` →
-его подхватывает широкий `except Exception` в конце обработчика → клиент КАЖДЫЙ раз видит
-«❌ Ошибка активации. Попробуйте позже.» и не получает подписку никогда, а в логах лежит
-одна строка. Сломал внесла централизация расчёта цен (`8d3cd500`), и ни линтер, ни набор
+его подхватывает широкий `except Exception` в конце обработчика → клиент видит
+«❌ Ошибка активации. Попробуйте позже.» и не получает подписку, а в логах лежит одна строка.
+🔴 Точность: имя стоит в ветке «подписки нет → создать новую», поэтому ломалась ТОЛЬКО первая
+покупка. Ветка продления (у кого подписка уже есть) этого имени не касается и работала всегда. Сломал внесла централизация расчёта цен (`8d3cd500`), и ни линтер, ни набор
 тестов её не заметили: `F821` был заглушён в pyproject.toml.
 
 Тест ВЫЗЫВАЕТ обработчик, а не читает его исходник (грабли 19.08: сторож, ищущий подстроку,
@@ -56,7 +57,9 @@ async def test_activate_button_reaches_the_purchase_and_does_not_fail_silently(
     callback = MagicMock()
     callback.answer = AsyncMock()
 
-    monkeypatch.setattr(type(settings), 'DEFAULT_DEVICE_LIMIT', 3, raising=False)
+    # Поле pydantic живёт на ЭКЗЕМПЛЯРЕ: подмена на классе молча не применяется
+    # (проверено). Для методов ниже — наоборот, нужна именно классовая.
+    monkeypatch.setattr(settings, 'DEFAULT_DEVICE_LIMIT', 3, raising=False)
     # is_multi_tariff_enabled / get_available_subscription_periods — методы pydantic-модели Settings,
     # подменяются на классе, а не на объекте (иначе pydantic отвергает присваивание).
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False, raising=False)
@@ -129,7 +132,9 @@ async def test_activate_button_consumes_the_promo_offer_it_looked_up(
     callback = MagicMock()
     callback.answer = AsyncMock()
 
-    monkeypatch.setattr(type(settings), 'DEFAULT_DEVICE_LIMIT', 3, raising=False)
+    # Поле pydantic живёт на ЭКЗЕМПЛЯРЕ: подмена на классе молча не применяется
+    # (проверено). Для методов ниже — наоборот, нужна именно классовая.
+    monkeypatch.setattr(settings, 'DEFAULT_DEVICE_LIMIT', 3, raising=False)
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False, raising=False)
     monkeypatch.setattr(type(settings), 'get_available_subscription_periods', lambda self: [30], raising=False)
     monkeypatch.setattr(
@@ -167,4 +172,63 @@ async def test_activate_button_consumes_the_promo_offer_it_looked_up(
     assert subtract_balance.await_args.kwargs.get('consume_promo_offer') is True, (
         'Скидка найдена, но до списания не доехала: подписка спишется по полной цене, '
         'а начисленное предложение останется висеть неиспользованным.'
+    )
+
+
+@pytest.mark.anyio('asyncio')
+async def test_activate_button_does_not_burn_a_promo_offer_that_does_not_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """У человека БЕЗ предложения гашение не запрашивается.
+
+    Парный к предыдущему, и без него сторож дырявый. Скептик доказал мутацией: замена
+    `> 0` на `>= 0` — один символ — заставляет гасить скидку у КАЖДОГО, у кого её нет,
+    и пять прежних тестов вместе с линтером оставались зелёными. Тест на человека СО
+    скидкой такую подмену пропускает by design: у него ответ и так True.
+    """
+    user = _make_user(promo_percent=0)  # предложения нет
+    db = MagicMock()
+    db.rollback = AsyncMock()
+    callback = MagicMock()
+    callback.answer = AsyncMock()
+
+    monkeypatch.setattr(settings, 'DEFAULT_DEVICE_LIMIT', 3, raising=False)
+    monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False, raising=False)
+    monkeypatch.setattr(type(settings), 'get_available_subscription_periods', lambda self: [30], raising=False)
+    monkeypatch.setattr(
+        'app.database.crud.subscription.get_subscription_by_user_id', AsyncMock(return_value=None), raising=False
+    )
+    free_server = MagicMock()
+    free_server.squad_uuid = 'squad-free'
+    free_server.is_available = True
+    free_server.price_kopeks = 0
+    monkeypatch.setattr(
+        'app.database.crud.server_squad.get_available_server_squads',
+        AsyncMock(return_value=[free_server]),
+        raising=False,
+    )
+    monkeypatch.setattr('app.database.crud.user.lock_user_for_pricing', AsyncMock(return_value=user), raising=False)
+    monkeypatch.setattr(
+        'app.services.pricing_engine.pricing_engine.calculate_classic_new_subscription_price',
+        AsyncMock(return_value=_Pricing(100_00)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        'app.database.crud.subscription.create_paid_subscription', AsyncMock(return_value=MagicMock()), raising=False
+    )
+    monkeypatch.setattr('app.database.crud.transaction.create_transaction', AsyncMock(), raising=False)
+    monkeypatch.setattr(
+        'app.services.subscription_service.SubscriptionService.create_remnawave_user', AsyncMock(), raising=False
+    )
+
+    subtract_balance = AsyncMock(return_value=True)
+    monkeypatch.setattr('app.database.crud.user.subtract_user_balance', subtract_balance, raising=False)
+
+    await menu.handle_activate_button(callback, user, db)
+
+    subtract_balance.assert_awaited_once()
+    assert subtract_balance.await_args.kwargs.get('consume_promo_offer') is False, (
+        'Гашение запрошено у человека без предложения — значит значение зашито или условие '
+        'ослаблено, а не взято из настоящей проверки. Так одноразовая скидка сгорает у тех, '
+        'кому её не давали, и человек теряет её, ничего не получив взамен.'
     )
