@@ -301,4 +301,8 @@ class SquadRolloutResponse(BaseModel):
     skipped_traffic_risk_ids: list[int] = Field(default_factory=list)
     url_mismatch_ids: list[int] = Field(default_factory=list)
     stopped_early: bool = False
+    # Возврат: пред-образ пуст, вернуть по нему нельзя — считаем отдельно от трафика.
+    unrestorable_ids: list[int] = Field(default_factory=list)
+    # Сколько подписок ещё ждут раскатки: кнопка идёт порциями.
+    remaining: int = 0
     message: str

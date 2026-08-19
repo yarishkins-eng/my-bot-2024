@@ -3070,11 +3070,15 @@ class TariffSquadRolloutSnapshot(Base):
     id = Column(Integer, primary_key=True)
     rollout_id = Column(String(64), nullable=False)
     tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='CASCADE'), nullable=False)
-    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), nullable=False)
-    previous_squads = Column(JSON, nullable=False, default=list)
+    # SET NULL, а не CASCADE: подписку можно удалить штатно (клиент сам удаляет
+    # истёкшую из кабинета), и CASCADE унёс бы вместе с ней единственную улику
+    # того, что у человека было до раскатки.  Строка без подписки уже не
+    # восстанавливается, но остаётся историей — как сделано в миграции 0103.
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='SET NULL'), nullable=True)
+    previous_squads = Column(JSON, nullable=False, default=list, server_default=text("'[]'"))
     previous_subscription_url = Column(Text, nullable=True)
-    applied_squads = Column(JSON, nullable=False, default=list)
-    batch_no = Column(Integer, nullable=False, default=0)
+    applied_squads = Column(JSON, nullable=False, default=list, server_default=text("'[]'"))
+    batch_no = Column(Integer, nullable=False, default=0, server_default='0')
     restored_at = Column(AwareDateTime(), nullable=True)
     created_at = Column(AwareDateTime(), nullable=False, default=func.now())
 

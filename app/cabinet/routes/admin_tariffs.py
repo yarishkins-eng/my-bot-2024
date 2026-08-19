@@ -702,6 +702,9 @@ async def run_squad_rollout(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
+    async def _recheck_fence() -> None:
+        await assert_tariff_squad_rollout_allowed(db, tariff)
+
     result = await SubscriptionService().propagate_tariff_squads(
         db,
         tariff_id,
@@ -709,6 +712,7 @@ async def run_squad_rollout(
         subscription_ids=request.subscription_ids,
         limit=request.limit,
         batch_size=request.batch_size,
+        recheck_fence=_recheck_fence,
     )
     await AuditLogCRUD.create(
         db,
@@ -724,8 +728,10 @@ async def run_squad_rollout(
             'skipped_traffic_risk_ids': result.skipped_traffic_risk_ids,
             'url_mismatch_ids': result.url_mismatch_ids,
             'stopped_early': result.stopped_early,
+            'squads_applied': list(tariff.allowed_squads or []),
+            'remaining': result.remaining,
         },
-        status='partial' if (result.failed_ids or result.stopped_early) else 'success',
+        status=_rollout_audit_status(result),
     )
     await db.commit()
     return _rollout_response(tariff_id, result)
@@ -745,7 +751,10 @@ async def restore_squad_rollout(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
-    result = await SubscriptionService().restore_tariff_squads(db, tariff_id)
+    async def _recheck_fence() -> None:
+        await assert_tariff_squad_rollout_allowed(db, tariff)
+
+    result = await SubscriptionService().restore_tariff_squads(db, tariff_id, recheck_fence=_recheck_fence)
     if not result.rollout_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -762,20 +771,49 @@ async def restore_squad_rollout(
             'total': result.total,
             'synced': result.synced,
             'failed_ids': result.failed_ids,
+            'unrestorable_ids': result.unrestorable_ids,
+            'stopped_early': result.stopped_early,
         },
-        status='partial' if result.failed_ids else 'success',
+        status=_rollout_audit_status(result),
     )
     await db.commit()
     return _rollout_response(tariff_id, result)
 
 
+def _rollout_audit_status(result) -> str:
+    """`success` только если ничего не осталось за бортом.
+
+    Прежняя формула смотрела лишь на упавшие, поэтому возврат, который не вернул
+    НИКОГО (все пред-образы пустые), записывался в аудит как полный успех.
+    """
+
+    incomplete = (
+        result.failed_ids
+        or result.stopped_early
+        or result.unrestorable_ids
+        or result.skipped_traffic_risk_ids
+        or result.remaining
+    )
+    return 'partial' if incomplete else 'success'
+
+
 def _rollout_response(tariff_id: int, result) -> SquadRolloutResponse:
-    if result.stopped_early:
-        message = 'Раскатка остановлена на полпути — проверьте отчёт ниже, снимок сохранён.'
-    elif result.failed_ids:
-        message = f'Готово частично: {result.synced} из {result.total}.'
-    else:
-        message = f'Готово: {result.synced} из {result.total}.'
+    # Никаких отсылок к «отчёту ниже» — его нет.  Всё, что владельцу нужно знать,
+    # должно уместиться в саму строку: она приходит всплывающим уведомлением.
+    parts = [f'Готово: {result.synced} из {result.total}.']
+    if result.remaining:
+        parts.append(f'Осталось {result.remaining} — нажмите ещё раз.')
+    if result.failed_ids:
+        parts.append(f'Не удалось: {len(result.failed_ids)}.')
+    if result.skipped_traffic_risk_ids:
+        parts.append(f'Пропущено (трафик исчерпан): {len(result.skipped_traffic_risk_ids)}.')
+    if result.unrestorable_ids:
+        parts.append(f'Нельзя вернуть (пустой снимок): {len(result.unrestorable_ids)}.')
+    if result.url_mismatch_ids:
+        parts.append(f'Остановлено: у {len(result.url_mismatch_ids)} изменилась ссылка подключения.')
+    elif result.stopped_early:
+        parts.append('Остановлено на полпути, снимок сохранён.')
+    message = ' '.join(parts)
     return SquadRolloutResponse(
         tariff_id=tariff_id,
         rollout_id=result.rollout_id,
@@ -786,5 +824,7 @@ def _rollout_response(tariff_id: int, result) -> SquadRolloutResponse:
         skipped_traffic_risk_ids=result.skipped_traffic_risk_ids,
         url_mismatch_ids=result.url_mismatch_ids,
         stopped_early=result.stopped_early,
+        unrestorable_ids=result.unrestorable_ids,
+        remaining=result.remaining,
         message=message,
     )

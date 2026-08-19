@@ -139,10 +139,28 @@ class PropagateSquadsResult:
     # Ссылка подключения разошлась после первой порции: дальше не идём.
     url_mismatch_ids: list[int] = field(default_factory=list)
     stopped_early: bool = False
+    # Кого панель реально приняла.  По нему, и только по нему, возврат помечает
+    # снимок использованным: «все минус упавшие» сжигает пред-образ тем, кого
+    # раскатка вообще не трогала (истёкшие, пропущенные, порции после обрыва).
+    synced_ids: list[int] = field(default_factory=list)
+    # Возврат: пред-образ пуст, вернуть по нему нельзя (пустой набор запирает тариф).
+    unrestorable_ids: list[int] = field(default_factory=list)
+    # Сколько подписок ещё ждут раскатки после этой порции.
+    remaining: int = 0
 
 
 def _iter_batches(items: list[Subscription], size: int):
-    for start in range(0, len(items), size):
+    """Первая порция — ОДНА подписка, дальше по ``size``.
+
+    Сверка ссылки подключения возможна только ПОСЛЕ того, как порция ушла в панель
+    и зафиксирована. Значит цена ошибки равна размеру первой порции — и план (3.4)
+    прямо требует начинать с одной подписки, а не с двадцати пяти.
+    """
+
+    if not items:
+        return
+    yield items[:1]
+    for start in range(1, len(items), size):
         yield items[start : start + size]
 
 
@@ -1460,18 +1478,50 @@ class SubscriptionService:
         *,
         subscription_ids: list[int] | None,
         limit: int | None,
-    ) -> list[Subscription]:
+        target_squads: list[str] | None = None,
+    ) -> tuple[list[Subscription], int]:
+        """Подписки под раскатку и сколько их ВСЕГО ждёт (для «осталось N»).
+
+        ``target_squads`` отбрасывает тех, у кого набор уже совпадает: иначе
+        порционная кнопка каждый раз брала бы одних и тех же первых по id и
+        никогда не доезжала бы до конца.
+        """
+
         query = select(Subscription).where(
             Subscription.tariff_id == tariff_id,
             Subscription.status.in_([SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value]),
         )
         if subscription_ids is not None:
             query = query.where(Subscription.id.in_(subscription_ids))
-        query = query.order_by(Subscription.id)
+        result = await db.execute(query.order_by(Subscription.id))
+        rows = list(result.scalars().all())
+        if target_squads is not None:
+            target = sorted(target_squads)
+            rows = [sub for sub in rows if sorted(sub.connected_squads or []) != target]
+        pending = len(rows)
         if limit is not None:
-            query = query.limit(limit)
-        result = await db.execute(query)
-        return list(result.scalars().all())
+            rows = rows[:limit]
+        return rows, pending
+
+    async def _subscriptions_sharing_a_panel_account(
+        self, db: AsyncSession, subscriptions: list[Subscription]
+    ) -> set[int]:
+        """Подписки тех, у кого есть ещё одна живая подписка ДРУГОГО тарифа."""
+
+        user_ids = {sub.user_id for sub in subscriptions}
+        if not user_ids:
+            return set()
+        rows = await db.execute(
+            select(Subscription.user_id, Subscription.tariff_id).where(
+                Subscription.user_id.in_(user_ids),
+                Subscription.status.in_([SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value]),
+            )
+        )
+        tariffs_by_user: dict[int, set[int]] = {}
+        for user_id, tariff_id in rows.all():
+            tariffs_by_user.setdefault(user_id, set()).add(tariff_id)
+        shared_users = {user_id for user_id, tariffs in tariffs_by_user.items() if len(tariffs) > 1}
+        return {sub.id for sub in subscriptions if sub.user_id in shared_users}
 
     async def _record_rollout_snapshots(
         self,
@@ -1510,6 +1560,9 @@ class SubscriptionService:
         limit: int | None = None,
         batch_size: int = 25,
         rollout_id: str | None = None,
+        record_snapshots: bool = True,
+        only_changed: bool = True,
+        recheck_fence: Callable[[], Awaitable[None]] | None = None,
     ) -> PropagateSquadsResult:
         """Применяет серверы тарифа к выданным подпискам ПОРЦИЯМИ, со снимком в базе.
 
@@ -1526,8 +1579,12 @@ class SubscriptionService:
             raise ValueError('tariff propagation requires at least one available Internal Squad')
 
         rollout = rollout_id or uuid4().hex
-        subscriptions = await self._select_rollout_subscriptions(
-            db, tariff_id, subscription_ids=subscription_ids, limit=limit
+        subscriptions, pending = await self._select_rollout_subscriptions(
+            db,
+            tariff_id,
+            subscription_ids=subscription_ids,
+            limit=limit,
+            target_squads=squads_to_set if only_changed else None,
         )
         if not subscriptions:
             return PropagateSquadsResult(total=0, synced=0, rollout_id=rollout)
@@ -1539,6 +1596,16 @@ class SubscriptionService:
         stranded_ids = sorted(sub.id for sub in subscriptions if _traffic_limit_would_strand(sub))
         stranded = set(stranded_ids)
         subscriptions = [sub for sub in subscriptions if sub.id not in stranded]
+
+        # Вне мультитарифного режима панельный аккаунт ОБЩИЙ на пользователя
+        # (user.remnawave_uuid). Если у человека живёт вторая подписка другого
+        # тарифа, раскатка затрёт ей доступ, за который он заплатил. Сегодня таких
+        # на боевом ноль, но включение мультитарифа это меняет — не трогаем их.
+        if not settings.is_multi_tariff_enabled() and subscriptions:
+            shared_ids = await self._subscriptions_sharing_a_panel_account(db, subscriptions)
+            if shared_ids:
+                stranded_ids = sorted(set(stranded_ids) | shared_ids)
+                subscriptions = [sub for sub in subscriptions if sub.id not in shared_ids]
         if not subscriptions:
             return PropagateSquadsResult(total=0, synced=0, rollout_id=rollout, skipped_traffic_risk_ids=stranded_ids)
 
@@ -1561,6 +1628,7 @@ class SubscriptionService:
 
         failed_ids: list[int] = []
         url_mismatch_ids: list[int] = []
+        synced_ids: list[int] = []
         synced = 0
         batches_done = 0
         stopped_early = False
@@ -1644,14 +1712,37 @@ class SubscriptionService:
                         return False
 
             for batch_no, batch in enumerate(_iter_batches(subscriptions, batch_size), start=1):
-                await self._record_rollout_snapshots(
-                    db,
-                    rollout_id=rollout,
-                    tariff_id=tariff_id,
-                    batch=batch,
-                    applied_squads=squads_to_set,
-                    batch_no=batch_no,
-                )
+                # Забор проверяется ПЕРЕД КАЖДОЙ порцией, а не один раз в начале:
+                # раскатка длится минутами, и заказ клиента может родиться посреди неё.
+                if recheck_fence is not None:
+                    try:
+                        await recheck_fence()
+                    except ValueError as fence_error:
+                        logger.warning(
+                            'Раскатка остановлена: у тарифа появился живой заказ',
+                            tariff_id=tariff_id,
+                            rollout_id=rollout,
+                            batch_no=batch_no,
+                            error=fence_error,
+                        )
+                        stopped_early = True
+                        break
+
+                # Свежие значения подписок: объекты загружены до цикла, а клиент мог
+                # за это время продлиться. Отправить старый end_date = отключить того,
+                # кто только что заплатил.
+                for sub in batch:
+                    await db.refresh(sub)
+
+                if record_snapshots:
+                    await self._record_rollout_snapshots(
+                        db,
+                        rollout_id=rollout,
+                        tariff_id=tariff_id,
+                        batch=batch,
+                        applied_squads=squads_to_set,
+                        batch_no=batch_no,
+                    )
                 urls_before = {sub.id: sub.subscription_url for sub in batch}
                 for sub in batch:
                     sub.connected_squads = squads_to_set
@@ -1659,9 +1750,11 @@ class SubscriptionService:
                 results = await asyncio.gather(*[_sync_one(sub) for sub in batch])
 
                 batch_synced = 0
+                batch_synced_ids: list[int] = []
                 for sub, success in zip(batch, results, strict=True):
                     if success:
                         batch_synced += 1
+                        batch_synced_ids.append(sub.id)
                     else:
                         failed_ids.append(sub.id)
                         # Do not claim locally that a Panel change which failed was
@@ -1685,6 +1778,7 @@ class SubscriptionService:
                     break
 
                 synced += batch_synced
+                synced_ids.extend(batch_synced_ids)
                 batches_done = batch_no
 
                 # Смена серверов не должна менять ссылку подключения.  Сверяем сразу
@@ -1693,7 +1787,9 @@ class SubscriptionService:
                 mismatched = [
                     sub.id
                     for sub in batch
-                    if urls_before[sub.id] and sub.subscription_url and sub.subscription_url != urls_before[sub.id]
+                    # Пустая ссылка от панели — ХУДШИЙ случай, а не «нет данных»:
+                    # клиент остаётся без подключения. Ловим её тоже.
+                    if urls_before[sub.id] and sub.subscription_url != urls_before[sub.id]
                 ]
                 if mismatched:
                     url_mismatch_ids.extend(mismatched)
@@ -1715,6 +1811,8 @@ class SubscriptionService:
             skipped_traffic_risk_ids=stranded_ids,
             url_mismatch_ids=url_mismatch_ids,
             stopped_early=stopped_early,
+            synced_ids=synced_ids,
+            remaining=max(0, pending - len(synced_ids)),
         )
 
         if failed_ids or stopped_early:
@@ -1755,7 +1853,7 @@ class SubscriptionService:
             all_servers, _ = await get_all_server_squads(db, available_only=True, limit=10000)
             squads_to_set = [srv.squad_uuid for srv in all_servers if srv.squad_uuid]
 
-        subscriptions = await self._select_rollout_subscriptions(
+        subscriptions, _pending = await self._select_rollout_subscriptions(
             db, tariff_id, subscription_ids=subscription_ids, limit=limit
         )
         stranded_ids = sorted(sub.id for sub in subscriptions if _traffic_limit_would_strand(sub))
@@ -1781,12 +1879,14 @@ class SubscriptionService:
         rollout_id: str | None = None,
         concurrency: int = 5,
         batch_size: int = 25,
+        recheck_fence: Callable[[], Awaitable[None]] | None = None,
     ) -> PropagateSquadsResult:
         """Возвращает подписки к пред-образу раскатки (по умолчанию — последней).
 
-        Пред-образы группируются по своему набору серверов и возвращаются той же
-        порционной машинерией, что и прямая раскатка, поэтому сам возврат тоже
-        снимается и тоже обратим.
+        Возврат СВОИХ снимков не пишет (``record_snapshots=False``): иначе он сам
+        станет «последней раскаткой», и второе нажатие «Вернуть» накатило бы всё
+        обратно. Отработавшие строки гасятся, поэтому повторный возврат честно
+        отвечает «возвращать нечего».
         """
 
         if rollout_id is None:
@@ -1806,6 +1906,7 @@ class SubscriptionService:
                     .where(
                         TariffSquadRolloutSnapshot.rollout_id == rollout_id,
                         TariffSquadRolloutSnapshot.restored_at.is_(None),
+                        TariffSquadRolloutSnapshot.subscription_id.is_not(None),
                     )
                     .order_by(TariffSquadRolloutSnapshot.id)
                 )
@@ -1816,19 +1917,23 @@ class SubscriptionService:
         if not rows:
             return PropagateSquadsResult(total=0, synced=0, rollout_id=rollout_id)
 
-        # Пустой пред-образ означал бы «все доступные серверы», а не «эти» — возвращать
-        # по нему вслепую нельзя: пустой набор запирает тариф (мина A).  Пропускаем.
+        # Пустой пред-образ означал бы «все доступные серверы», а не «эти» — вернуть
+        # по нему нельзя: пустой набор запирает тариф (мина A). Такие строки НЕ
+        # гасим и честно показываем отдельным числом, а не прячем в «успех».
         groups: dict[tuple[str, ...], list[int]] = {}
-        empty_preimage_ids: list[int] = []
+        unrestorable_ids: list[int] = []
         for row in rows:
             squads = tuple(row.previous_squads or [])
             if not squads:
-                empty_preimage_ids.append(row.subscription_id)
+                unrestorable_ids.append(row.subscription_id)
                 continue
             groups.setdefault(squads, []).append(row.subscription_id)
 
-        combined = PropagateSquadsResult(rollout_id=rollout_id, skipped_traffic_risk_ids=list(empty_preimage_ids))
-        restored_ids: list[int] = []
+        combined = PropagateSquadsResult(
+            rollout_id=rollout_id,
+            total=len(rows),
+            unrestorable_ids=sorted(unrestorable_ids),
+        )
         for squads, sub_ids in groups.items():
             part = await self.propagate_tariff_squads(
                 db,
@@ -1837,35 +1942,42 @@ class SubscriptionService:
                 concurrency=concurrency,
                 subscription_ids=sub_ids,
                 batch_size=batch_size,
+                record_snapshots=False,
+                only_changed=False,
+                recheck_fence=recheck_fence,
             )
-            combined.total += part.total
             combined.synced += part.synced
+            combined.synced_ids.extend(part.synced_ids)
             combined.failed_ids.extend(part.failed_ids)
             combined.url_mismatch_ids.extend(part.url_mismatch_ids)
+            combined.skipped_traffic_risk_ids.extend(part.skipped_traffic_risk_ids)
             combined.batches_done += part.batches_done
             combined.stopped_early = combined.stopped_early or part.stopped_early
-            failed = set(part.failed_ids)
-            restored_ids.extend(sub_id for sub_id in sub_ids if sub_id not in failed)
 
-        if restored_ids:
+        # Гасим ТОЛЬКО тех, кого панель реально приняла. Прежняя формула «все минус
+        # упавшие» сжигала пред-образ подпискам, которых раскатка вовсе не касалась:
+        # истёкшим, пропущенным по трафику и всем порциям после обрыва.
+        if combined.synced_ids:
             await db.execute(
                 update(TariffSquadRolloutSnapshot)
                 .where(
                     TariffSquadRolloutSnapshot.rollout_id == rollout_id,
-                    TariffSquadRolloutSnapshot.subscription_id.in_(restored_ids),
+                    TariffSquadRolloutSnapshot.subscription_id.in_(combined.synced_ids),
                     TariffSquadRolloutSnapshot.restored_at.is_(None),
                 )
                 .values(restored_at=datetime.now(UTC))
             )
             await db.commit()
 
+        combined.remaining = combined.total - combined.synced - len(combined.unrestorable_ids)
         logger.info(
             'Возврат серверов подписок по снимку раскатки',
             tariff_id=tariff_id,
             rollout_id=rollout_id,
             total=combined.total,
             synced=combined.synced,
-            empty_preimage_ids=empty_preimage_ids,
+            unrestorable_ids=combined.unrestorable_ids,
+            stopped_early=combined.stopped_early,
         )
         return combined
 
