@@ -12,6 +12,7 @@
 не ловит ничего). Мутация «убрать импорт из `handle_activate_button`» роняет его.
 """
 
+import contextlib
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
@@ -252,7 +253,17 @@ async def test_activate_button_is_fail_closed_when_the_flag_is_off(
     на мине AA: заслонка обязана стоять в обработчике, а не в отрисовке.
 
     Проверяем не «кнопка не нарисовалась», а «нажатие ничего не сделало»: ни одного похода
-    в базу, ни одного списания.
+    в базу, ни одного списания. Формулировку ответа НЕ проверяем: сторож на дословный текст
+    протухает вместе с текстом, и добавление ключа `ACTIVATE_BUTTON_DISABLED` в локаль сделало
+    бы его ложно-красным при исправно работающей заслонке.
+
+    🔴 Тест самодостаточен намеренно: он проверяет ОБА положения флага. Мутация «читать в
+    заслонке другой флаг, тоже выключенный по умолчанию» оставляла прежнюю версию зелёной —
+    её держали только три соседних теста, а их придётся переписать при починке мины BA.
+
+    🔴 Запретный список ниже работает, потому что обработчик импортирует crud ВНУТРИ тела
+    функции. Обычная уборка «поднять импорты наверх» ослепит эти подмены — тогда сторожа
+    надо переписать на подмену самих модулей, иначе он молча перестанет что-либо ловить.
     """
     user = _make_user()
     db = MagicMock()
@@ -274,6 +285,11 @@ async def test_activate_button_is_fail_closed_when_the_flag_is_off(
         'app.database.crud.subscription.get_subscription_by_user_id', _forbidden('get_subscription_by_user_id')
     )
     monkeypatch.setattr(
+        'app.database.crud.subscription.get_active_subscriptions_by_user_id',
+        _forbidden('get_active_subscriptions_by_user_id'),  # мультитарифная ветка
+        raising=False,
+    )
+    monkeypatch.setattr(
         'app.database.crud.subscription.create_paid_subscription', _forbidden('create_paid_subscription')
     )
     monkeypatch.setattr(
@@ -283,7 +299,27 @@ async def test_activate_button_is_fail_closed_when_the_flag_is_off(
     await menu.handle_activate_button(callback, user, db)
 
     callback.answer.assert_awaited_once()
-    answer = callback.answer.await_args.args[0]
-    assert 'отключена' in answer, f'человеку не сказали, что кнопка отключена: {answer!r}'
+    assert callback.answer.await_args.args[0].strip(), 'человек не получил вообще никакого ответа'
+    assert callback.answer.await_args.kwargs.get('show_alert') is True, 'ответ показан не заметно'
     # db.execute/commit — MagicMock, так что факт обращения виден по счётчику вызовов.
     assert not db.method_calls, f'заслонка всё-таки сходила в базу: {db.method_calls}'
+
+    # Вторая половина, без которой сторож не самодостаточен: при ВКЛЮЧЁННОМ флаге заслонка
+    # обязана пропускать. Иначе «заслонка», читающая любой другой выключенный флаг, прошла бы.
+    monkeypatch.setattr(settings, 'ACTIVATE_BUTTON_VISIBLE', True, raising=False)
+    passed_through = False
+
+    async def _mark(*_args, **_kwargs):
+        nonlocal passed_through
+        passed_through = True
+        raise RuntimeError('дальше не идём: нам достаточно факта прохода')
+
+    monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False, raising=False)
+    monkeypatch.setattr('app.database.crud.subscription.get_subscription_by_user_id', _mark)
+    with contextlib.suppress(RuntimeError):
+        await menu.handle_activate_button(callback, user, MagicMock())
+
+    assert passed_through, (
+        'При включённом флаге заслонка всё равно не пропустила — значит она читает НЕ '
+        '`ACTIVATE_BUTTON_VISIBLE`, а что-то другое, тоже выключенное по умолчанию.'
+    )

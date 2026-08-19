@@ -1653,10 +1653,14 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
             user_id=db_user.id,
             telegram_id=db_user.telegram_id,
         )
+        # Текст НЕ называет соседнюю кнопку намеренно. Нажатие прилетает из рассылки или из
+        # старого сообщения, значит человек может быть в любом состоянии воронки, а «Тарифы»
+        # есть только у новичка и триальщика: у того, чья подписка кончилась, такой кнопки нет
+        # (`build_funnel_menu_keyboard`), и совет вёл бы в никуда. `/start` работает всегда.
         await callback.answer(
             get_texts(db_user.language).t(
                 'ACTIVATE_BUTTON_DISABLED',
-                '⚠️ Эта кнопка отключена. Оформить подписку можно через «Тарифы» в меню.',
+                '⚠️ Эта кнопка больше не работает. Откройте меню командой /start.',
             ),
             show_alert=True,
         )
