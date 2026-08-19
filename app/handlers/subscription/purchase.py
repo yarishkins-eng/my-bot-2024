@@ -4703,7 +4703,11 @@ async def handle_simple_subscription_purchase(
                         text='💳 Другие способы оплаты', callback_data='simple_subscription_other_payment_methods'
                     )
                 ],
-                [types.InlineKeyboardButton(text=texts.BACK, callback_data='subscription_purchase')],
+                # лежит за безусловным `return` на :4601, обработчик до этих строк не доходит
+                # никогда. Выносится этапом 5 «вынести мусор» вместе с _extend_existing_subscription
+                # (:4742, зовётся только отсюда). Глушим ровно одну строку, чтобы ворота F821
+                # (мина AW) остались включёнными для всего остального кода.
+                [types.InlineKeyboardButton(text=texts.BACK, callback_data='subscription_purchase')],  # noqa: F821
             ]
         )
     else:

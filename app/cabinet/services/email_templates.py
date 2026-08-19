@@ -5,9 +5,13 @@ Supports multiple languages: ru, en, zh, ua, fa
 """
 
 import html
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.config import settings
+
+
+if TYPE_CHECKING:  # pragma: no cover — только для подсказок типов
+    from app.services.notification_delivery_service import NotificationType
 
 
 class EmailNotificationTemplates:

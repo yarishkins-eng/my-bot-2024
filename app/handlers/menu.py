@@ -1648,6 +1648,7 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
     from app.database.models import PaymentMethod, TransactionType
     from app.services.subscription_renewal_service import SubscriptionRenewalService
     from app.services.subscription_service import SubscriptionService
+    from app.utils.promo_offer import get_user_active_promo_discount_percent
 
     if settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import get_active_subscriptions_by_user_id

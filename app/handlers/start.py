@@ -24,7 +24,14 @@ from app.database.crud.user import (
     get_user_by_telegram_id,
 )
 from app.database.crud.user_message import get_random_active_message
-from app.database.models import GuestPurchase, GuestPurchaseStatus, PinnedMessage, SubscriptionStatus, UserStatus
+from app.database.models import (
+    GuestPurchase,
+    GuestPurchaseStatus,
+    PinnedMessage,
+    SubscriptionStatus,
+    User,
+    UserStatus,
+)
 from app.keyboards.inline import (
     get_back_keyboard,
     get_language_selection_keyboard,
@@ -221,89 +228,6 @@ async def _activate_pending_gift_after_registration(
             )
         except Exception:
             pass
-
-
-async def _claim_phantom_user(
-    db: AsyncSession,
-    phantom: 'User',
-    *,
-    telegram_id: int,
-    username: str | None,
-    first_name: str | None,
-    last_name: str | None,
-    language: str,
-    referrer_id: int | None,
-) -> tuple[bool, 'User | None']:
-    """Claim a phantom user by backfilling Telegram profile data.
-
-    Returns (success, user). On IntegrityError falls back to existing user lookup.
-
-    Note: Phantom users created when Bot.get_chat() fails at purchase time are matched
-    by username only. Since Telegram usernames are changeable and reassignable, this is
-    inherently vulnerable to username change attacks. When Bot.get_chat() succeeds at
-    purchase time, telegram_id is stored on the user and the phantom path is not used.
-    """
-    from app.utils.validators import sanitize_telegram_name
-
-    phantom.telegram_id = telegram_id
-    phantom.username = username
-    phantom.first_name = sanitize_telegram_name(first_name)
-    phantom.last_name = sanitize_telegram_name(last_name)
-    phantom.language = language
-    phantom.status = UserStatus.ACTIVE.value
-    if referrer_id and referrer_id != phantom.id:
-        phantom.referred_by_id = referrer_id
-    if not phantom.referral_code:
-        phantom.referral_code = await generate_unique_referral_code(db, telegram_id)
-    phantom.updated_at = datetime.now(UTC)
-    phantom.last_activity = datetime.now(UTC)
-    try:
-        await db.commit()
-    except IntegrityError:
-        await db.rollback()
-        logger.warning(
-            'IntegrityError claiming phantom user, falling back to existing user lookup',
-            phantom_user_id=phantom.id,
-            telegram_id=telegram_id,
-        )
-        existing = await get_user_by_telegram_id(db, telegram_id)
-        return False, existing
-    await db.refresh(phantom, ['subscriptions'])
-    # SECURITY NOTE: Phantom matched by username only (telegram_id was unknown at purchase time).
-    # Telegram usernames are changeable/reassignable, so the claimer may not be the intended
-    # recipient. This is logged at WARNING for admin audit. A confirmation flow would be needed
-    # to fully prevent username spoofing attacks on phantom claims.
-    logger.warning(
-        'Phantom user claimed by username match (verify intended recipient)',
-        phantom_user_id=phantom.id,
-        telegram_id=telegram_id,
-        username=username,
-        has_subscription=phantom.subscription is not None,
-    )
-
-    # Sync Remnawave panel with updated user data (telegram_id, username, etc.)
-    phantom_subs = getattr(phantom, 'subscriptions', None) or []
-    for phantom_sub in phantom_subs:
-        try:
-            subscription_service = SubscriptionService()
-            await subscription_service.update_remnawave_user(db, phantom_sub)
-        except Exception as exc:
-            logger.warning(
-                'Failed to update Remnawave panel after phantom claim',
-                phantom_user_id=phantom.id,
-                subscription_id=phantom_sub.id,
-                error=str(exc),
-            )
-            from app.services.remnawave_retry_queue import remnawave_retry_queue
-
-            if hasattr(phantom_sub, 'id') and hasattr(phantom_sub, 'user_id'):
-                remnawave_retry_queue.enqueue(
-                    subscription_id=phantom_sub.id,
-                    user_id=phantom_sub.user_id,
-                    action='update',
-                )
-
-    return True, phantom
 
 
 async def _merge_phantom_into_active_user(
