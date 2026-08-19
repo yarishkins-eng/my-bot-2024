@@ -460,7 +460,15 @@ async def test_stuck_order_lookup_repeats_the_visibility_lock_of_the_chat_list()
 
     visible_sql, any_sql = session.compiled
     assert 'subscription_checkouts.tariff_id = 3' in visible_sql
-    assert "lifecycle_state = 'operator_review'" in visible_sql
+    assert "'operator_review'" in visible_sql
+    # 🔴 Пункт 4.5 расширил РАЗБОР на три состояния, а этот запрос — намеренно НЕТ.
+    # Здесь отвечают «что держит замок на тарифе», а забор (`crud/tariff.py`) эти три
+    # состояния считает терминальными и не видит вовсе. Пустить их сюда значит назвать
+    # владельцу заказ, закрытие которого отказ не снимет. Имена литералами: сторож,
+    # читающий ту же константу, что и код, доказывал бы равенство константы самой себе.
+    for foreign in ("'conflict'", "'failed'", "'reprice_required'"):
+        assert foreign not in visible_sql
+        assert foreign not in any_sql
     # Замок PII: клиент с неоконченной заявкой на удаление в списке не показывается.
     assert 'account_erasure_requested_at IS NULL' in visible_sql
     assert 'account_erased_at IS NOT NULL' in visible_sql
@@ -476,7 +484,7 @@ async def test_stuck_order_lookup_repeats_the_visibility_lock_of_the_chat_list()
     # замку видимости: тариф и порядок обязаны остаться, иначе назовём чужой заказ
     # (M9) или не тот из своих (M3b, M6b).
     assert 'account_erasure_requested_at' not in any_sql
-    assert "lifecycle_state = 'operator_review'" in any_sql
+    assert "lifecycle_state = 'operator_review'" in any_sql  # второй запрос равенство сохранил
     assert 'subscription_checkouts.tariff_id = 3' in any_sql
     assert 'updated_at DESC' in any_sql
 

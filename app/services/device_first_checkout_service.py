@@ -2977,6 +2977,18 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
         # У клиента теперь три разных экрана по факту денег; владельцу же нужен один вход
         # в разбор, а точный ответ про деньги стоит строкой выше (`_money_verdict`).
         lines.append(f'⚠️ Оплату нужно проверить: {reason_ru or "причину видно только по коду"}.')
+    elif checkout.lifecycle_state in OPERATOR_REVIEWABLE_STATES:
+        # Пункт 4.5. Эти заказы карточка раньше не показывала вовсе, а текст ниже про них
+        # врал: «бот продолжает пробовать сам» — не пробует, свип их не выбирает, повторов
+        # у них нет. 🔴 Кроме одного случая: очередь выдачи (`DeviceFirstOutbox`) живёт
+        # отдельно от состояния заказа и может ещё крутиться. Тогда «сам не поедет» стало
+        # бы новой ложью, а совет закрыть — вредным. Поэтому обещание условное.
+        still_trying = str(checkout.provisioning_state) in {'pending', 'retry'}
+        tail = '' if still_trying else ' Сам он дальше не поедет.'
+        lines.append(f'⚠️ Заказ остановился: {reason_ru or "причину видно только по коду"}.{tail}')
+        if still_trying:
+            lines.append(f'⏳ Выдача {provisioning_ru}: бот ещё пробует сам, закрывать заказ пока не нужно.')
+        lines.append('🎁 Пробный период бот клиенту не выдаст, пока этот заказ висит.')
     else:
         # Настоящая ошибка панели лежит не в заказе, а в строке очереди выдачи. Без неё
         # владелец видел «выдача застряла» вообще без причины.
@@ -3012,6 +3024,14 @@ async def _owner_order_stuck_text(db: AsyncSession, checkout: SubscriptionChecko
             '⛔ Возврат руками в кабинете Platega база НЕ увидит: клиент останется заперт, '
             'а кнопка возврата предложит вернуть те же деньги второй раз.',
         ]
+    elif checkout.lifecycle_state in OPERATOR_REVIEWABLE_STATES:
+        # Ключ здесь — только состояние заказа, потому что видимость в разделе тоже
+        # решается только им. Совет «закрыть» не даём: выше стоит либо «сам не поедет»,
+        # либо «бот ещё пробует», и решение принимает человек, глядя на обе строки.
+        lines.append(
+            '🛠️ Разобрать: админ-панель → «🧾 Заказы на разборе» → этот заказ. '
+            'Про деньги смотрите строку выше: она считается по базе, а не по состоянию заказа.'
+        )
     else:
         lines.append(
             '🛠️ Разбирать руками не нужно и нечем: бот продолжает пробовать выдачу сам. '
@@ -3334,6 +3354,35 @@ OPERATOR_REFUND_RECONCILIATION_REASON = 'operator_refund_wallet_credit'
 # Ключ книги для возврата. Идемпотентность строится на нём, а не на статусах: повторное
 # нажатие кнопки обязано быть безопасным, а Telegram доставляет колбэки не по разу.
 OPERATOR_REFUND_LEDGER_PREFIX = 'operator_review_refund'
+# Пункт 4.5. Какие заказы попадают на экран «🧾 Заказы на разборе». ОДИН набор на всё:
+# видимость списка, счётчик, карточка, возврат и закрытие. Разойдутся — экран покажет
+# заказ, по которому кнопки откажут, и это уже случалось (P0 пункта 4.4).
+#
+# 🔴 НЕ сводить ни с `TERMINAL_STATES` (`:46`), ни с `_CHECKOUT_TERMINAL_STATES`
+# (`crud/tariff.py:52`). У них другой вопрос. Здесь вопрос один: «этот заказ сам никуда
+# не поедет, и его надо закрыть руками?»
+#
+# 🔴 И НЕ подставлять этот набор в `find_tariff_operator_review_order` (`:3378`), хотя
+# план 4.5 это и предписывал. Та функция объясняет, ПОЧЕМУ забор тарифа отказал, а забор
+# (`crud/tariff.py:_assert_tariff_squad_change_has_no_live_checkout`) три новых состояния
+# не видит вовсе — они входят в его терминальный набор. Расширить её значит назвать
+# владельцу заказ, закрытие которого замок с тарифа не снимет, и увести его от настоящей
+# причины отказа.
+OPERATOR_REVIEWABLE_STATES = frozenset({'operator_review', 'conflict', 'failed', 'reprice_required'})
+
+
+def operator_close_unblocks(checkout: SubscriptionCheckout) -> str:
+    """Что именно даёт закрытие ЭТОГО заказа. Для разных состояний это разные вещи.
+
+    Заказ на разборе держит клиенту новую покупку (`operator_hold` отбивает её напрямую).
+    Остановившийся заказ (`conflict`/`failed`/`reprice_required`) покупку не держит вовсе —
+    он держит **пробный период**: забор триала пропускает только `cancelled`, `expired` и
+    `ready` (`trial_activation_service.py:400`, `:677`). Обещать оператору одно на все
+    состояния — соврать ему в половине случаев.
+    """
+    if checkout.lifecycle_state == 'operator_review':
+        return 'оформить новую покупку'
+    return 'получить пробный период'
 
 
 async def list_operator_review_checkouts(
@@ -3352,16 +3401,22 @@ async def list_operator_review_checkouts(
     return list(rows.scalars().all())
 
 
-def _operator_review_visible_conditions() -> tuple[Any, ...]:
+def _operator_review_visible_conditions(states: frozenset[str] = OPERATOR_REVIEWABLE_STATES) -> tuple[Any, ...]:
     """Условия видимости заказа на разборе. ОДИН источник для списка и счётчика.
 
     🔴 Раньше замок стоял только на списке, а счётчик считал всё. Расхождение читалось
     как страничная навигация («Показаны свежие 5» из 6), которой нет, а в худшем случае
     экран писал «разбирать нечего» при удержанных деньгах живого клиента. Прогон
     сценария нашёл оба исхода.
+
+    Набор состояний параметром, а замок PII — общий и всегда. Единственный, кто сужает
+    набор, — `find_tariff_operator_review_order`: у него другой вопрос (см. там же).
     """
     return (
-        SubscriptionCheckout.lifecycle_state == 'operator_review',
+        # Пункт 4.5 добавил сюда `conflict`/`failed`/`reprice_required`. Их не выбирает
+        # свип (`get_open_checkout_for_user`), они не истекают и никем не закрываются —
+        # то есть остаются навечно и навсегда лишают клиента пробного периода.
+        SubscriptionCheckout.lifecycle_state.in_(sorted(states)),
         # 🔴 Тот же замок, что стоит на тревоге владельцу, и по той же причине:
         # человек подал заявку на удаление, но PII ещё НЕ вычищено (чистка идёт
         # только при финализации). Карточка показала бы оператору имя, @username и
@@ -3387,12 +3442,23 @@ async def find_tariff_operator_review_order(db: AsyncSession, *, tariff_id: int)
     «🧾 Заказы на разборе» за таким заказом — значит послать его в пустой экран.
     Порядок ТОТ ЖЕ, что у списка: иначе названный заказ окажется его последней
     строкой, а при двадцати с лишним застрявших — вообще за пределами экрана.
+
+    🔴 Пункт 4.5 расширил разбор на `conflict`/`failed`/`reprice_required`, а сюда их
+    НЕ пускает — намеренно, вопреки букве плана. Здесь отвечают не «кому нужен человек»,
+    а «что именно держит замок на тарифе», и держит его только `operator_review`: три
+    новых состояния входят в терминальный набор забора (`crud/tariff.py:52`), то есть
+    забор их не видит. Пустив их сюда, мы назвали бы владельцу свежий остановившийся
+    заказ (сортировка по `updated_at`) вместо настоящего блокировщика — и он закрыл бы
+    не тот заказ, а отказ бы остался.
     """
 
     visible = await db.scalar(
         select(SubscriptionCheckout.public_id)
         .join(User, User.id == SubscriptionCheckout.user_id)
-        .where(SubscriptionCheckout.tariff_id == tariff_id, *_operator_review_visible_conditions())
+        .where(
+            SubscriptionCheckout.tariff_id == tariff_id,
+            *_operator_review_visible_conditions(frozenset({'operator_review'})),
+        )
         .order_by(SubscriptionCheckout.updated_at.desc(), SubscriptionCheckout.id.desc())
         .limit(1)
     )
@@ -3513,7 +3579,9 @@ async def refund_operator_review_checkout(
     # Сторож состояния — такой же, как у закрытия. Инлайн-кнопка живёт в переписке
     # Telegram вечно, поэтому старая карточка остаётся рабочей кнопкой возврата ещё
     # долго после того, как заказ уехал из разбора.
-    if checkout.lifecycle_state != 'operator_review':
+    # 🔴 Набор ТОТ ЖЕ, что у видимости: план 4.5 про этот сторож забыл, а без него кнопка
+    # возврата рисовалась бы на новых состояниях и отказывала — ровно мёртвая кнопка.
+    if checkout.lifecycle_state not in OPERATOR_REVIEWABLE_STATES:
         return False, f'Заказ уже не на разборе (сейчас «{checkout.lifecycle_state}») — возврат не сделан.'
     ledger_key = f'{OPERATOR_REFUND_LEDGER_PREFIX}:{checkout.id}'
     existing = (
@@ -3604,9 +3672,12 @@ async def close_operator_review_checkout(
     checkout: SubscriptionCheckout,
     admin_user_id: int,
 ) -> tuple[bool, str]:
-    """Закрыть заказ. Это снимает с клиента запрет на новую покупку."""
-    if checkout.lifecycle_state != 'operator_review':
+    """Закрыть заказ. Это снимает с клиента замок — какой именно, зависит от состояния."""
+    if checkout.lifecycle_state not in OPERATOR_REVIEWABLE_STATES:
         return False, f'Заказ уже не на разборе (сейчас «{checkout.lifecycle_state}»).'
+    # 🔴 Спросить ДО мутации: сразу после неё состояние станет `cancelled`, и ответ
+    # оператору был бы про закрытый заказ, а не про тот, который он закрывал.
+    unblocks = operator_close_unblocks(checkout)
     # Исходную причину затирать нельзя молча: по ней потом восстанавливают, что вообще
     # произошло, а в поле останется только «закрыл оператор». Пишем её в лог перед заменой.
     previous_reason = str(checkout.terminal_reason or '')
@@ -3621,4 +3692,4 @@ async def close_operator_review_checkout(
     )
     # 🔴 Обещать «и тариф разблокирован» здесь нельзя. Забор тарифа снимается, только
     # когда по нему не осталось НИ ОДНОГО неразобранного заказа, а их бывает несколько.
-    return True, 'Заказ закрыт. Этот заказ больше не мешает клиенту оформить новую покупку.'
+    return True, f'Заказ закрыт. Он больше не мешает клиенту {unblocks}.'

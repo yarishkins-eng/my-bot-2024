@@ -7,7 +7,7 @@
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -335,8 +335,15 @@ async def test_the_list_and_the_counter_agree_on_what_is_visible():
         .where(*conditions)
         .compile(compile_kwargs={'literal_binds': True})
     )
-    # Замок 1: берём только то, что ждёт человека.
-    assert "lifecycle_state = 'operator_review'" in sql
+    # Замок 1: берём только то, что ждёт человека. Пункт 4.5 расширил набор с одного
+    # состояния до четырёх — имена зашиты литералами, потому что сторож, читающий ту же
+    # константу, что и код, доказывает лишь равенство константы самой себе.
+    for state in ('operator_review', 'conflict', 'failed', 'reprice_required'):
+        assert f"'{state}'" in sql
+    # И ничего сверх этих четырёх: `cancelled`/`expired`/`ready` — уже разобранные заказы,
+    # им в списке делать нечего, а `draft`/`awaiting_funds` — живые корзины клиентов.
+    for alien in ('cancelled', 'expired', 'ready', 'draft', 'awaiting_funds', 'armed', 'fulfilling'):
+        assert f"'{alien}'" not in sql
     # Замок 2: PII людей, подавших заявку на удаление, в админ-чат не уходит.
     assert 'account_erasure_requested_at IS NULL' in sql
     # ...но финализированные удаления остаются: их заказы надо закрывать.
@@ -371,3 +378,159 @@ def test_the_alert_stops_promising_a_section_that_will_not_have_the_order():
     )
     assert 'этого заказа не будет' in stuck
     assert 'Разбирать руками не нужно' in stuck
+
+
+# ---------------------------------------------------------------------------
+# Пункт 4.5. Тот же экран принимает ещё три состояния
+#
+# 🔴 Второй панели «закрыть заказ» не заводили намеренно (мина AK). Значит все проверки
+# ниже — про ОДИН набор состояний, который спрашивают и видимость, и обе кнопки, и текст.
+# ---------------------------------------------------------------------------
+
+STOPPED_STATES = ('conflict', 'failed', 'reprice_required')
+# Состояния, которых на экране быть НЕ должно. Литералами: сторож, читающий ту же
+# константу, что и код, доказывает лишь равенство константы самой себе.
+NOT_ON_THE_SCREEN = ('ready', 'cancelled', 'expired', 'draft', 'confirmed', 'awaiting_funds', 'armed', 'fulfilling')
+
+
+@pytest.mark.parametrize('state', STOPPED_STATES)
+@pytest.mark.asyncio
+async def test_a_stopped_order_can_now_be_closed(state):
+    checkout = _checkout(lifecycle_state=state)
+    done, message = await service.close_operator_review_checkout(_db(), checkout=checkout, admin_user_id=1)
+    assert done is True
+    assert checkout.lifecycle_state == 'cancelled'
+    assert checkout.terminal_reason == 'cancelled_by_operator_review'
+    # 🔴 Обещание считается ДО мутации. После неё состояние уже `cancelled`, и ответ был
+    # бы про закрытый заказ, а не про тот, который оператор закрывал.
+    assert 'пробный период' in message
+
+
+@pytest.mark.parametrize('state', NOT_ON_THE_SCREEN)
+@pytest.mark.asyncio
+async def test_nothing_else_can_be_closed_by_this_button(state):
+    checkout = _checkout(lifecycle_state=state)
+    done, message = await service.close_operator_review_checkout(_db(), checkout=checkout, admin_user_id=1)
+    assert done is False
+    assert 'уже не на разборе' in message
+    assert checkout.lifecycle_state == state
+
+
+@pytest.mark.parametrize('state', NOT_ON_THE_SCREEN)
+@pytest.mark.asyncio
+async def test_the_refund_button_has_the_same_lock_as_closing(state):
+    """🔴 План 4.5 про этот сторож забыл. Без него кнопка возврата рисовалась бы на новых
+    состояниях и отказывала — ровно мёртвая кнопка, о которую проект спотыкался дважды."""
+    checkout = _checkout(lifecycle_state=state)
+    done, message = await service.refund_operator_review_checkout(_db(), checkout=checkout, admin_user_id=1)
+    assert done is False
+    assert 'уже не на разборе' in message
+
+
+@pytest.mark.parametrize('state', STOPPED_STATES)
+@pytest.mark.asyncio
+async def test_a_stopped_order_reaches_the_money_question_instead_of_a_flat_refusal(state):
+    """На новых состояниях возврат обязан ДОЙТИ до вопроса про деньги и ответить по базе."""
+    checkout = _checkout(lifecycle_state=state)
+    db = _db(scalars=[0, 0, 0])
+    done, message = await service.refund_operator_review_checkout(db, checkout=checkout, admin_user_id=1)
+    assert done is False
+    assert 'уже не на разборе' not in message
+    assert 'нет подтверждённого списания' in message
+
+
+@pytest.mark.parametrize('state', STOPPED_STATES)
+def test_the_close_question_promises_the_right_thing(state):
+    """Заказ на разборе держит покупку, остановившийся — пробный период. Одно обещание
+    на оба случая было бы ложью ровно в половине нажатий."""
+    assert service.operator_close_unblocks(_checkout()) == 'оформить новую покупку'
+    assert service.operator_close_unblocks(_checkout(lifecycle_state=state)) == 'получить пробный период'
+
+
+@pytest.mark.parametrize('state', STOPPED_STATES)
+def test_the_card_of_a_stopped_order_stops_lying(state):
+    """🔴 До пункта 4.5 карточка этих заказов уходила в ветку «застряла выдача» и печатала
+    две неправды: «бот продолжает пробовать сам» и «в разделе разбора этого заказа не
+    будет» — про заказ, открытый из этого самого раздела."""
+    import asyncio
+
+    def _card_db():
+        db = MagicMock()
+        db.get = AsyncMock(return_value=SimpleNamespace(id=186, telegram_id=1, username=None, full_name='Tiger'))
+        db.scalar = AsyncMock(return_value=None)
+        return db
+
+    text = asyncio.run(service._owner_order_stuck_text(_card_db(), _checkout(lifecycle_state=state)))
+    assert 'Бот продолжает пробовать сам' not in text
+    assert 'этого заказа не будет' not in text
+    assert 'Заказы на разборе' in text
+    # И называет настоящий вред, ради которого пункт делался.
+    assert 'Пробный период' in text
+    assert 'Сам он дальше не поедет' in text
+
+
+def test_the_card_never_tells_the_operator_to_close_an_order_still_being_provisioned():
+    """🔴 Очередь выдачи живёт отдельно от состояния заказа и может ещё крутиться.
+    Тогда «сам не поедет» — новая ложь, а совет закрыть — вредный совет."""
+    import asyncio
+
+    db = MagicMock()
+    db.get = AsyncMock(return_value=SimpleNamespace(id=186, telegram_id=1, username=None, full_name='Tiger'))
+    db.scalar = AsyncMock(return_value=None)
+
+    text = asyncio.run(
+        service._owner_order_stuck_text(db, _checkout(lifecycle_state='conflict', provisioning_state='retry'))
+    )
+    assert 'Сам он дальше не поедет' not in text
+    assert 'закрывать заказ пока не нужно' in text
+
+
+@pytest.mark.asyncio
+async def test_the_whole_path_works_for_a_stopped_order_through_the_real_buttons():
+    """🔴 Приёмка пункта 4.5, собранная руками: на боевом таких заказов НОЛЬ.
+
+    Счётчик «залипших» и так равен нулю, поэтому «стало ноль» не доказывает ничего.
+    Собираем случай сами и ведём его теми же обработчиками, что и живой оператор:
+    список → карточка → вопрос → закрытие. Урок 4.1: тест на функцию не доказывает,
+    что функция ПОДКЛЮЧЕНА.
+    """
+    from app.handlers.admin import orders_review
+
+    checkout = _checkout(lifecycle_state='conflict', terminal_reason='payment_amount_mismatch')
+    admin = SimpleNamespace(id=1)
+    screens = []
+
+    def _callback(data):
+        message = SimpleNamespace(edit_text=AsyncMock(side_effect=lambda text, **_: screens.append(text)))
+        return SimpleNamespace(data=data, message=message, answer=AsyncMock(), from_user=SimpleNamespace(id=1))
+
+    db = _db(scalars=[1, 0, 0])
+    db.get = AsyncMock(return_value=checkout)
+
+    with (
+        patch.object(orders_review, 'list_operator_review_checkouts', AsyncMock(return_value=[checkout])),
+        patch.object(orders_review, 'count_operator_review_checkouts', AsyncMock(return_value=1)),
+        patch.object(orders_review, 'operator_review_card', AsyncMock(return_value='карточка заказа')),
+    ):
+        await orders_review.show_orders_review_list.__wrapped__.__wrapped__(_callback('x'), admin, db)
+        await orders_review.show_order_card.__wrapped__.__wrapped__(
+            _callback(f'{orders_review.CARD_PREFIX}{checkout.id}'), admin, db
+        )
+        await orders_review.ask_confirmation.__wrapped__.__wrapped__(
+            _callback(f'{orders_review.ASK_PREFIX}close:{checkout.id}'), admin, db
+        )
+        await orders_review.do_action.__wrapped__.__wrapped__(
+            _callback(f'{orders_review.GO_PREFIX}close:{checkout.id}'), admin, db
+        )
+
+    # Заказ дошёл до списка — до пункта 4.5 он туда не попадал вовсе.
+    assert 'Заказы на разборе: 1' in screens[0]
+    # Карточка открылась, а не отбилась «этот заказ уже разобран».
+    assert screens[1] == 'карточка заказа'
+    # Вопрос обещает ровно то, что закрытие даёт ИМЕННО ЭТОМУ заказу.
+    assert 'получить пробный период' in screens[2]
+    assert 'оформить новую покупку' not in screens[2]
+    # И заказ действительно закрыт — существующей причиной, без новой (мины K, AM, Y).
+    assert screens[3].startswith('✅')
+    assert checkout.lifecycle_state == 'cancelled'
+    assert checkout.terminal_reason == 'cancelled_by_operator_review'

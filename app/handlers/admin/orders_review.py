@@ -1,8 +1,14 @@
-"""Пункт 4.4. Разбор заказов, застрявших на `operator_review`.
+"""Пункт 4.4. Разбор заказов, которые сами никуда не поедут.
+
+Пункт 4.5 расширил экран с одного состояния (`operator_review`) до четырёх: сюда же
+попали `conflict`, `failed` и `reprice_required`. Второй панели «закрыть заказ» не
+заводили намеренно (мина AK) — набор состояний живёт одной константой
+`OPERATOR_REVIEWABLE_STATES`, и её же спрашивают обе кнопки.
 
 До этого модуля разобрать такой заказ было НЕЧЕМ: списка не существовало ни в
-чат-админке, ни в веб-админке, ни в кабинете. Заказ при этом держит клиента
-(`operator_hold` отбивает новую покупку) и запирает смену серверов тарифа.
+чат-админке, ни в веб-админке, ни в кабинете. Заказ на разборе при этом держит клиента
+(`operator_hold` отбивает новую покупку) и запирает смену серверов тарифа; остановившийся
+заказ не держит ни того, ни другого — он навсегда лишает клиента пробного периода.
 
 Здесь ровно три действия: показать список, вернуть деньги на баланс, закрыть заказ.
 🔴 Выдачи подписки тут НЕТ и она сюда не просится (решение владельца 18.08.2026):
@@ -21,9 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import SubscriptionCheckout, User
 from app.services.device_first_checkout_service import (
+    OPERATOR_REVIEWABLE_STATES,
     close_operator_review_checkout,
     count_operator_review_checkouts,
     list_operator_review_checkouts,
+    operator_close_unblocks,
     operator_review_card,
     refund_operator_review_checkout,
     refundable_amount_kopeks,
@@ -65,9 +73,12 @@ ACTIONS = {
         # сценария: разблокировка тарифа зависит от ДРУГИХ заказов на нём, а «найти будет
         # труднее» — на самом деле «этой кнопкой уже никогда»: список берёт только
         # `operator_review`, а поиска заказа по номеру в проекте нет нигде.
+        # 🔴 Пункт 4.5 сделал обещание переменной. Заказ на разборе держит новую покупку,
+        # а остановившийся (`conflict`/`failed`/`reprice_required`) её не держит вовсе —
+        # он держит пробный период. Одно обещание на оба случая было бы ложью в половине.
         'question': (
             '✅ <b>Закрыть заказ {order}?</b>\n\n'
-            'Этот заказ перестанет мешать клиенту оформить новую покупку.\n\n'
+            'Этот заказ перестанет мешать клиенту {unblocks}.\n\n'
             '🔴 <b>Сначала верните деньги, если они были.</b> После закрытия заказ уйдёт из '
             'списка навсегда, и вернуть по нему деньги этой кнопкой будет уже нельзя — '
             'останется только Platega и правка баланса вручную.'
@@ -124,7 +135,9 @@ async def show_orders_review_list(callback: types.CallbackQuery, db_user: User, 
         # Листалки нет намеренно: если заказов больше двадцати, это инцидент, а не разбор.
         # Но и молчать нельзя — иначе экран выглядит полным списком, которым не является.
         lines += [f'Показаны {len(checkouts)} самых свежих. Остальные появятся, когда разберёте эти.', '']
-    lines.append('Пока такой заказ висит, клиент чаще всего не может оформить новый.')
+    # Список — свалка состояний, и обещать про все одно нельзя: заказ на разборе держит
+    # новую покупку, остановившийся держит пробный период. Общая строка называет оба.
+    lines.append('Пока такой заказ висит, клиент чаще всего не может оформить новый и не получит пробный период.')
     buttons = []
     for item in checkouts:
         snapshot = item.sale_snapshot if isinstance(item.sale_snapshot, dict) else {}
@@ -157,7 +170,7 @@ async def show_order_card(callback: types.CallbackQuery, db_user: User, db: Asyn
     # сам… разбирать руками не нужно и нечем» — про заказ, который никто не пробует и
     # деньги по которому не возвращены. Плюс рисовались обе кнопки, и обе отказывали
     # только после подтверждения. Такой заказ карточкой не показываем вовсе.
-    if checkout.lifecycle_state != 'operator_review':
+    if checkout.lifecycle_state not in OPERATOR_REVIEWABLE_STATES:
         await _edit(
             callback,
             f'✅ <b>Этот заказ уже разобран</b>\n\nСостояние: «{html.escape(str(checkout.lifecycle_state))}». '
@@ -205,7 +218,11 @@ async def ask_confirmation(callback: types.CallbackQuery, db_user: User, db: Asy
         amount = settings.format_price(kopeks)
     await _edit(
         callback,
-        action['question'].format(order=html.escape(str(checkout.public_id)), amount=amount),
+        action['question'].format(
+            order=html.escape(str(checkout.public_id)),
+            amount=amount,
+            unblocks=operator_close_unblocks(checkout),
+        ),
         _rows(
             (action['confirm'], f'{GO_PREFIX}{parsed[0]}:{checkout.id}'),
             ('⬅️ Отмена', f'{CARD_PREFIX}{checkout.id}'),
