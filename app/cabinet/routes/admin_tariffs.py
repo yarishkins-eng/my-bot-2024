@@ -733,15 +733,21 @@ async def run_squad_rollout(
                 'откройте тариф, проверьте список серверов и запустите раскатку заново.'
             )
 
-    result = await SubscriptionService().propagate_tariff_squads(
-        db,
-        tariff_id,
-        planned_squads,
-        subscription_ids=request.subscription_ids,
-        limit=request.limit,
-        batch_size=request.batch_size,
-        recheck_fence=_recheck_fence,
-    )
+    try:
+        result = await SubscriptionService().propagate_tariff_squads(
+            db,
+            tariff_id,
+            planned_squads,
+            subscription_ids=request.subscription_ids,
+            limit=request.limit,
+            batch_size=request.batch_size,
+            recheck_fence=_recheck_fence,
+        )
+    except ValueError as exc:
+        # Сбой записи снимка и обрыв по изменившимся серверам приходят сюда. Без
+        # этого владелец получил бы голый 500 текстом, из которого перехватчик
+        # кабинета не достанет причину вовсе — она есть только в JSON с detail.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await AuditLogCRUD.create(
         db,
         user_id=admin.id,
@@ -756,7 +762,11 @@ async def run_squad_rollout(
             'skipped_traffic_risk_ids': result.skipped_traffic_risk_ids,
             'url_mismatch_ids': result.url_mismatch_ids,
             'stopped_early': result.stopped_early,
-            'squads_applied': list(tariff.allowed_squads or []),
+            # Именно planned_squads: перепроверка забора перечитывает тариф с
+            # populate_existing и переписывает tariff.allowed_squads НА МЕСТЕ, поэтому
+            # после прерванной раскатки поле показало бы уже новый набор, а не тот,
+            # что реально ушёл подпискам.
+            'squads_applied': planned_squads,
             'remaining': result.remaining,
         },
         status=_rollout_audit_status(result),
@@ -779,7 +789,10 @@ async def restore_squad_rollout(
     async def _recheck_fence() -> None:
         await assert_tariff_squad_rollout_allowed(db, tariff)
 
-    result = await SubscriptionService().restore_tariff_squads(db, tariff_id, recheck_fence=_recheck_fence)
+    try:
+        result = await SubscriptionService().restore_tariff_squads(db, tariff_id, recheck_fence=_recheck_fence)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if not result.rollout_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

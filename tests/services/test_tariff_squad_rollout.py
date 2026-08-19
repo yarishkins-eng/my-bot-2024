@@ -50,6 +50,19 @@ def _ids_in_sql(statement) -> list[int]:
     return [int(part) for part in inside.replace(' ', '').split(',') if part.strip().isdigit()]
 
 
+def _tariff_id_in_sql(statement) -> int | None:
+    sql = _compiled(statement)
+    if 'tariff_squad_rollout_snapshots.tariff_id = ' not in sql:
+        return None
+    tail = sql.split('tariff_squad_rollout_snapshots.tariff_id = ', 1)[1]
+    digits = ''
+    for char in tail.strip():
+        if not char.isdigit():
+            break
+        digits += char
+    return int(digits) if digits else None
+
+
 def _subscription_ids_in_sql(statement) -> set[int] | None:
     sql = _compiled(statement)
     if 'subscriptions.id IN' not in sql:
@@ -98,15 +111,23 @@ class _FakeSession:
                 # снимков увидит их непогашенными, и многопортионный сценарий
                 # (ради которого всё и чинилось) в тесте не воспроизведётся.
                 limited_to = _rollout_id_in_sql(statement)
+                limited_tariff = _tariff_id_in_sql(statement)
                 for sub_id in _ids_in_sql(statement):
                     for row in self.snapshots:
                         if row.subscription_id != sub_id or row.restored_at is not None:
                             continue
                         if limited_to is not None and row.rollout_id != limited_to:
                             continue
+                        if limited_tariff is not None and row.tariff_id != limited_tariff:
+                            continue
                         row.restored_at = 'restored'
                 return SimpleNamespace()
             live = [row for row in self.snapshots if row.restored_at is None]
+            # Граница по тарифу: без неё «Вернуть» для одного тарифа молча откатил бы
+            # подписки ЧУЖИХ тарифов. Мутация показала, что фейк этого не замечал.
+            wanted_tariff = _tariff_id_in_sql(statement)
+            if wanted_tariff is not None:
+                live = [row for row in live if row.tariff_id == wanted_tariff]
             # SELECT снимков фильтруется по rollout_id, если он указан в запросе —
             # без этого возврат «по последней раскатке» выглядел бы рабочим.
             wanted = _rollout_id_in_sql(statement)
@@ -585,3 +606,74 @@ async def test_snapshot_failure_is_explained_and_nothing_is_sent():
         await service.propagate_tariff_squads(db, 4, ['new-a'])
 
     assert sent == [], 'порция не должна была уйти в панель без снимка'
+
+
+@pytest.mark.asyncio
+async def test_restore_never_crosses_into_another_tariff():
+    """🔴 Мутация волны 2: снятие границы по тарифу пережило все 2752 теста.
+
+    Без неё «Вернуть» на тарифе 4 молча откатил бы подписки тарифов 5, 6 и 7.
+    """
+
+    ours = _sub(1, squads=['new-a'])
+    foreign = _sub(2, squads=['new-a'])
+    foreign.tariff_id = 99
+    mine = _snapshot(1)
+    alien = _snapshot(2)
+    alien.tariff_id = 99
+    db = _FakeSession([ours, foreign], [_user(1), _user(2)], snapshots=[mine, alien])
+    service, _ = _service_with_panel()
+
+    result = await service.restore_tariff_squads(db, 4)
+
+    assert result.synced_ids == [1], 'чужой тариф трогать нельзя'
+    assert foreign.connected_squads == ['new-a'], 'подписка чужого тарифа не изменилась'
+    assert alien.restored_at is None, 'снимок чужого тарифа не должен гаситься'
+
+
+@pytest.mark.asyncio
+async def test_restore_compares_with_the_latest_applied_set_not_the_first():
+    """🔴 P1 волны 2: раскатывали дважды — и возврат клеймил подписку «клиент сам сменил».
+
+    Пред-образ берётся из самого раннего снимка, но текущее состояние подписки —
+    результат ПОСЛЕДНЕЙ раскатки. Сверка с первой давала ложное клеймо, снимок не
+    гасился, и подписка застревала навсегда.
+    """
+
+    sub = _sub(1, squads=['v2'])
+    first = _snapshot(1, previous=('v0',))
+    first.rollout_id, first.applied_squads = 'gen-1', ['v1']
+    second = _snapshot(1, previous=('v1',))
+    second.id, second.rollout_id, second.applied_squads = 2, 'gen-2', ['v2']
+    db = _FakeSession([sub], [_user(1)], snapshots=[first, second])
+    service, _ = _service_with_panel()
+
+    result = await service.restore_tariff_squads(db, 4)
+
+    assert result.moved_on_ids == [], 'клиент ничего не менял — клеймо ложное'
+    assert result.synced_ids == [1]
+    assert sub.connected_squads == ['v0'], 'вернули к истинному «как было», к самому раннему'
+
+
+@pytest.mark.asyncio
+async def test_restore_extinguishes_only_snapshots_of_its_own_tariff():
+    """У подписки могут быть снимки ДВУХ тарифов — её переводили между ними.
+
+    Возврат по тарифу 4 не вправе гасить историю тарифа 99: она понадобится, если
+    подписку вернут туда. Мутация «снять границу по тарифу в гашении» пережила весь
+    набор из 2752 тестов, потому что такого случая никто не строил.
+    """
+
+    sub = _sub(1, squads=['new-a'])
+    ours = _snapshot(1)
+    ours.rollout_id = 'tariff-4-run'
+    old_tariff = _snapshot(1, previous=('legacy',))
+    old_tariff.id, old_tariff.tariff_id, old_tariff.rollout_id = 2, 99, 'tariff-99-run'
+    db = _FakeSession([sub], [_user(1)], snapshots=[ours, old_tariff])
+    service, _ = _service_with_panel()
+
+    result = await service.restore_tariff_squads(db, 4)
+
+    assert result.synced_ids == [1]
+    assert ours.restored_at is not None, 'свой снимок погашен'
+    assert old_tariff.restored_at is None, 'снимок другого тарифа гасить нельзя'

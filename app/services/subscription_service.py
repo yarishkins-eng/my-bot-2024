@@ -1969,7 +1969,14 @@ class SubscriptionService:
         moved_on_ids: list[int] = []
         if groups:
             watched = [sub_id for ids in groups.values() for sub_id in ids]
-            applied_by_subscription = {row.subscription_id: sorted(row.applied_squads or []) for row in rows}
+            # 🔴 previous_squads берём из САМОГО РАННЕГО снимка (истинное «как было»),
+            # а сверяем «не сменил ли клиент сам» с САМЫМ ПОЗДНИМ применённым набором:
+            # подписку могли раскатать дважды, и текущее её состояние — результат
+            # последней раскатки, а не первой. Сверка с первым клеймила бы ложно, и
+            # подписка застревала бы навсегда: её снимок никогда не гасится.
+            applied_by_subscription: dict[int, list[str]] = {}
+            for row in all_rows:
+                applied_by_subscription[row.subscription_id] = sorted(row.applied_squads or [])
             current = (await db.execute(select(Subscription).where(Subscription.id.in_(watched)))).scalars().all()
             for sub in current:
                 expected = applied_by_subscription.get(sub.id)
