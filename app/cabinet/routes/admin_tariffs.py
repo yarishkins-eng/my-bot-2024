@@ -19,7 +19,15 @@ from app.database.crud.tariff import (
     set_tariff_promo_groups,
     update_tariff,
 )
-from app.database.models import PromoGroup, Subscription, Tariff, Transaction, TransactionType, User
+from app.database.models import (
+    PromoGroup,
+    Subscription,
+    SubscriptionCheckout,
+    Tariff,
+    Transaction,
+    TransactionType,
+    User,
+)
 from app.services.subscription_service import SubscriptionService
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -641,6 +649,31 @@ async def get_tariff_stats(
     )
 
 
+async def _stuck_order_public_head(db: AsyncSession, tariff: Tariff) -> str | None:
+    """Начало номера заказа тарифа, ждущего человека, либо None.
+
+    Ровно те же восемь знаков `public_id`, которыми заказ подписан в чат-админке
+    (`handlers/admin/orders_review.py`) — иначе владелец не найдёт в списке тот
+    заказ, про который ему написали. Забор этот запрос НЕ дублирует и ничего не
+    решает: отказ уже вынесен каноническим забором, здесь выбирается только текст.
+    """
+
+    public_id = await db.scalar(
+        select(SubscriptionCheckout.public_id)
+        .where(
+            SubscriptionCheckout.tariff_id == tariff.id,
+            SubscriptionCheckout.lifecycle_state == 'operator_review',
+        )
+        .order_by(SubscriptionCheckout.id)
+        .limit(1)
+    )
+    # Только настоящая строка: всё прочее — это «номера нет», а не заказ с именем
+    # из чужого repr. Текст уходит человеку, который пойдёт искать этот номер глазами.
+    if not isinstance(public_id, str):
+        return None
+    return public_id[:8] or None
+
+
 async def _assert_rollout_allowed_in_russian(db: AsyncSession, tariff: Tariff) -> None:
     """Тот же забор, но с причиной, понятной владельцу.
 
@@ -652,13 +685,22 @@ async def _assert_rollout_allowed_in_russian(db: AsyncSession, tariff: Tariff) -
     try:
         await assert_tariff_squad_rollout_allowed(db, tariff)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
+        # «Подождите» — правда для корзины клиента и ЛОЖЬ для заказа на разборе:
+        # тот ждёт человека и сам не закроется никогда. Про остальные заказы тарифа
+        # ничего не обещаем: их может быть несколько, и разбор одного не обязан
+        # снять замок.
+        stuck_head = await _stuck_order_public_head(db, tariff)
+        if stuck_head:
+            detail = (
+                f'Сейчас нельзя: у тарифа есть заказ {stuck_head} на разборе. Сам он не закроется — '
+                'разберите его в боте: админ-панель → «🧾 Заказы на разборе», потом нажмите снова.'
+            )
+        else:
+            detail = (
                 'Сейчас нельзя: у тарифа есть незакрытый заказ клиента. '
                 'Это нормально — подождите, пока он оплатится или отменится, и нажмите снова.'
-            ),
-        ) from exc
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
 
 
 async def _load_rollout_tariff(db: AsyncSession, tariff_id: int) -> Tariff:

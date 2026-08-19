@@ -272,8 +272,11 @@ async def test_live_checkout_refusal_is_explained_in_russian(monkeypatch) -> Non
         AsyncMock(side_effect=ValueError('Cannot change Internal Squads while this tariff has a live checkout')),
     )
 
+    # Сессия отвечает так же, как боевая: заказа на разборе у тарифа нет.
     with pytest.raises(HTTPException) as exc_info:
-        await admin_tariffs.run_squad_rollout(3, SquadRolloutRequest(), admin=SimpleNamespace(id=1), db=AsyncMock())
+        await admin_tariffs.run_squad_rollout(
+            3, SquadRolloutRequest(), admin=SimpleNamespace(id=1), db=_FenceProbeSession(None)
+        )
 
     detail = str(exc_info.value.detail)
     assert 'Internal Squads' not in detail and 'checkout' not in detail
@@ -310,3 +313,114 @@ async def test_service_failure_becomes_a_readable_refusal_not_a_bare_500(monkeyp
 
     assert exc_info.value.status_code == 409
     assert 'снимок раскатки' in str(exc_info.value.detail)
+
+
+# --- Этап 3: текст отказа при заказе «на разборе» ---------------------------
+#
+# «Подождите, пока он оплатится или отменится» — правда для корзины клиента и
+# ложь для заказа на разборе: тот ждёт человека и сам не закроется никогда.
+# Сторожа ниже ВЫЗЫВАЮТ отказ и читают то, что реально увидит владелец.
+
+
+class _FenceProbeSession:
+    """Сессия, которая ИСПОЛНЯЕТ запрос про заказ на разборе, а не изображает его."""
+
+    def __init__(self, public_id: str | None):
+        self._public_id = public_id
+        self.compiled_sql: str | None = None
+
+    async def scalar(self, statement):
+        self.compiled_sql = str(statement.compile(compile_kwargs={'literal_binds': True}))
+        return self._public_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('route_name', ['run_squad_rollout', 'restore_squad_rollout'])
+async def test_refusal_names_the_stuck_order_and_where_to_close_it(monkeypatch, route_name) -> None:
+    monkeypatch.setattr(admin_tariffs, 'get_tariff_by_id', AsyncMock(return_value=_rollout_tariff()))
+    monkeypatch.setattr(
+        admin_tariffs,
+        'assert_tariff_squad_rollout_allowed',
+        AsyncMock(side_effect=ValueError('this tariff has a live checkout')),
+    )
+    session = _FenceProbeSession('7f3a91c4-dead-beef-0000-000000000001')
+
+    route = getattr(admin_tariffs, route_name)
+    kwargs = {'admin': SimpleNamespace(id=1), 'db': session}
+    if route_name == 'run_squad_rollout':
+        kwargs['request'] = SquadRolloutRequest()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await route(3, **kwargs)
+
+    detail = str(exc_info.value.detail)
+    assert exc_info.value.status_code == 409
+    # Те же восемь знаков, которыми заказ подписан в списке чат-админки.
+    assert '7f3a91c4' in detail
+    assert 'на разборе' in detail
+    assert 'Заказы на разборе' in detail
+    # Лживого совета «подождите» в этой ветке быть не должно.
+    assert 'подождите' not in detail.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('route_name', ['run_squad_rollout', 'restore_squad_rollout'])
+async def test_refusal_for_an_ordinary_live_cart_still_says_wait(monkeypatch, route_name) -> None:
+    """Обратная ветка: обычная корзина действительно рассосётся сама."""
+
+    monkeypatch.setattr(admin_tariffs, 'get_tariff_by_id', AsyncMock(return_value=_rollout_tariff()))
+    monkeypatch.setattr(
+        admin_tariffs,
+        'assert_tariff_squad_rollout_allowed',
+        AsyncMock(side_effect=ValueError('this tariff has a live checkout')),
+    )
+    session = _FenceProbeSession(None)
+
+    route = getattr(admin_tariffs, route_name)
+    kwargs = {'admin': SimpleNamespace(id=1), 'db': session}
+    if route_name == 'run_squad_rollout':
+        kwargs['request'] = SquadRolloutRequest()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await route(3, **kwargs)
+
+    detail = str(exc_info.value.detail)
+    assert 'подождите' in detail.lower()
+    assert 'разборе' not in detail
+
+
+@pytest.mark.asyncio
+async def test_stuck_order_lookup_asks_about_this_tariff_and_operator_review() -> None:
+    """Запрос обязан спрашивать ИМЕННО про этот тариф и ИМЕННО про разбор.
+
+    Имена зашиты литералами намеренно: сторож, читающий ту же константу, что и
+    код, доказывает лишь равенство константы самой себе.
+    """
+
+    session = _FenceProbeSession(None)
+    await admin_tariffs._stuck_order_public_head(session, SimpleNamespace(id=3))
+
+    sql = session.compiled_sql
+    assert 'subscription_checkouts.tariff_id = 3' in sql
+    assert "lifecycle_state = 'operator_review'" in sql
+
+
+@pytest.mark.asyncio
+async def test_blank_public_id_does_not_produce_a_nameless_order() -> None:
+    """Пустой номер — это «имени нет», а не заказ с пустым именем."""
+
+    session = _FenceProbeSession('')
+    assert await admin_tariffs._stuck_order_public_head(session, SimpleNamespace(id=3)) is None
+
+
+@pytest.mark.asyncio
+async def test_non_string_answer_never_reaches_the_owner_as_an_order_number() -> None:
+    """Текст читает человек и пойдёт искать этот номер глазами.
+
+    Любой не-строковый ответ — это «номера нет». Иначе в отказ попадёт кусок
+    чужого repr, и владелец будет искать в списке заказ, которого не существует.
+    """
+
+    for answer in (12345, object(), AsyncMock()):
+        session = _FenceProbeSession(answer)
+        assert await admin_tariffs._stuck_order_public_head(session, SimpleNamespace(id=3)) is None
