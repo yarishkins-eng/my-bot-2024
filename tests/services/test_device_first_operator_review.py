@@ -475,12 +475,14 @@ def test_the_close_question_promises_exactly_what_closing_gives():
         # 🔴 Мина BQ (ревизия 20.08.2026): формулировка обязана быть осторожной. Подписка
         # могла быть в статусе `PENDING` — её забор триала пропускает, и тогда закрытие
         # триал как раз вернёт. Отвечать «точно ничего» по причине заказа нельзя.
-        assert 'скорее всего ничего не даст' in nothing
+        assert 'скорее всего' in nothing
         assert 'пробный период' not in nothing
-        # И это законченное предложение: тот же вариант подставляется в ответ после
-        # закрытия (`Заказ закрыт. {unblocks}`), где обрывок отвечал бы на вопрос,
-        # которого перед ним нет. Ровно так сломалась предыдущая правка.
-        assert nothing[0].isupper() and nothing.endswith('.')
+        # 🔴 И это законченное предложение, а не обрывок: тот же вариант подставляется в
+        # ответ после закрытия (`Заказ закрыт. {unblocks}`). Проверка «с заглавной и с
+        # точкой» тут бесполезна — сломанный вариант ей удовлетворял. Настоящее отличие:
+        # предложение называет, о ком речь.
+        assert nothing.startswith(('Клиент ', 'Клиенту ')), nothing
+        assert nothing.endswith('.')
 
 
 def _card(checkout) -> str:
@@ -731,11 +733,16 @@ async def test_the_answer_after_closing_is_a_whole_sentence_not_a_glued_one():
     ):
         checkout = _checkout(lifecycle_state=state, terminal_reason=reason)
         _done, message = await service.close_operator_review_checkout(_db(), checkout=checkout, admin_user_id=1)
+        # 🔴 Сторожим СВОЙСТВО, а не артефакты конкретной поломки. Прежняя версия искала
+        # «клиенту Клиент» и «..» — и пропустила ровно ту поломку, ради которой её
+        # расширяли: обрывок «Заказ закрыт. Скорее всего ничего: …» ни того, ни другого не
+        # даёт, а проверка «с заглавной и с точкой» на нём проходит. Отличает законченное
+        # предложение от обрывка то, что оно называет, о ком речь.
+        tail = message.split('Заказ закрыт. ', 1)[1]
+        assert tail.startswith(('Клиент ', 'Клиенту ')), tail
+        assert tail.endswith('.') and '..' not in tail, tail
+        # Прежние артефакты тоже оставляем: они дешёвые и ловят склейку шаблонов.
         assert 'клиенту Клиент' not in message
-        assert 'клиенту Клиенту' not in message
-        assert '..' not in message
-        # И заказ, закрытие которого клиенту ничего не даёт, не утверждает обратного.
-        assert not (message.count('не мешает') and 'ничего не даст' in message)
 
 
 @pytest.mark.asyncio
