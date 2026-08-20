@@ -211,7 +211,12 @@ def _safe_terminal_attempt(attempt: CheckoutPaymentAttempt) -> bool:
     A locally cancelled UI or a fixed polling count is intentionally not
     considered final: Platega may still send an exact CONFIRMED callback.
     """
-    return attempt.status == 'failed' and str(attempt.reconciliation_reason or '').startswith('provider_terminal:')
+    # Тот же признак, что держит строку в пуле сверки: берём его оттуда, а не своей копией.
+    # Пока причина затёрта (мина BO), эта проверка даёт False, и заявка на удаление
+    # аккаунта висит в `awaiting_reconciliation`, ожидая сверки, которой уже не будет.
+    from app.services.device_first_payment_service import POOL_KEY_TERMINAL_PREFIX
+
+    return attempt.status == 'failed' and str(attempt.reconciliation_reason or '').startswith(POOL_KEY_TERMINAL_PREFIX)
 
 
 def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
