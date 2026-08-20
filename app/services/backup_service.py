@@ -566,6 +566,35 @@ class BackupService:
             next_run += interval
         return next_run
 
+    def _covered_tables(self, include_logs: bool) -> set[str]:
+        """Таблицы, которые бекап обязан содержать, плюс намеренные исключения.
+
+        Исключения именно намеренные: журнал мониторинга выключается настройкой
+        `BACKUP_INCLUDE_LOGS`, а `alembic_version` — служебная таблица Alembic,
+        модели у неё нет. Всё, что не здесь, — забытая таблица, а не решение.
+        """
+        covered = {model.__tablename__ for model in self._get_models_for_backup(include_logs)}
+        covered |= set(self.association_tables)
+        covered.add('alembic_version')
+        if not include_logs:
+            covered.add(MonitoringLog.__tablename__)
+        return covered
+
+    def _unsaved_tables(self, overview: dict[str, Any], include_logs: bool) -> list[str]:
+        """Таблицы с данными, о которых бекап не знает вовсе.
+
+        🔴 Тревога поднимается ТОЛЬКО на них. Первая версия этой проверки считала
+        разницу «строк в базе минус строк в файле» и потому горела бы каждую ночь:
+        в разницу всегда попадают намеренные исключения. Сигнал, который горит
+        всегда, перестают читать — а это ровно то, из-за чего дыра прожила месяц.
+        """
+        covered = self._covered_tables(include_logs)
+        return sorted(
+            table.get('name')
+            for table in overview.get('tables', [])
+            if table.get('name') not in covered and table.get('rows')
+        )
+
     def _get_models_for_backup(self, include_logs: bool) -> list[Any]:
         models = self._base_backup_models.copy()
 
@@ -622,7 +651,7 @@ class BackupService:
                 # прожила месяц именно потому, что отчёт про неё не мог рассказать.
                 tables_count = database_info.get('tables_count', 0)
                 total_records = database_info.get('total_records', 0)
-                skipped_records = max(overview.get('total_records', 0) - total_records, 0)
+                unsaved_tables = self._unsaved_tables(overview, include_logs)
                 files_info = await self._collect_files(staging_dir, include_logs=include_logs)
                 data_snapshot_info = await self._collect_data_snapshot(staging_dir)
 
@@ -666,12 +695,13 @@ class BackupService:
             message = (
                 f'✅ Бекап успешно создан!\n'
                 f'📁 Файл: {filename}\n'
-                f'📊 Таблиц в файле: {tables_count} из {overview.get("tables_count", 0)}\n'
+                f'📊 Таблиц в файле: {tables_count}\n'
                 f'📈 Записей в файле: {total_records:,}\n'
                 f'💾 Размер: {size_mb:.2f} MB'
             )
-            if skipped_records:
-                message += f'\n⚠️ Не сохранено записей: {skipped_records:,}'
+            if unsaved_tables:
+                names = ', '.join(unsaved_tables)
+                message += f'\n⚠️ Вне копии осталось таблиц с данными: {len(unsaved_tables)} — {names}'
 
             logger.info(message)
 
@@ -1905,11 +1935,38 @@ class BackupService:
             'system_settings',
             'web_api_tokens',
             'monitoring_logs',
+            # Ниже — таблицы, до которых `TRUNCATE ... CASCADE` не дотягивается: они ни на
+            # что не ссылаются, поэтому каскад от `users`/`tariffs` их не задевает. Пока их
+            # не было в копии, они просто оставались грязными. С 20.08.2026 они в копии, и
+            # без явной очистки «Очистить и восстановить» давало бы смесь двух состояний:
+            # строка из файла падала бы на глобальном уникальном ключе (`iso_code`,
+            # `panel_host_key`, `internal_squad_uuid`), а живая — оставалась (пункт 4.15).
+            'public_location_squad_mappings',
+            'public_locations',
+            'public_access_point_squad_mappings',
+            'public_access_points',
+            'entitlement_cleanup_tombstones',
+            'apple_notifications',
         ]
 
         # Таблицы, которые не нужно очищать если в бекапе нет данных для них
-        # (чтобы сохранить существующие настройки)
-        preserve_if_no_backup = {'tariffs', 'promo_groups', 'server_squads', 'squads'}
+        # (чтобы сохранить существующие настройки).
+        # 🔴 Шесть таблиц выше добавлены сюда же намеренно: семь архивов, лежащих на сервере,
+        # сняты кодом ДО 20.08.2026 и этих таблиц не содержат. Без оговорки восстановление
+        # из старого файла стирало бы их насухо — то есть правка ухудшила бы поведение
+        # задним числом для уже существующих копий.
+        preserve_if_no_backup = {
+            'tariffs',
+            'promo_groups',
+            'server_squads',
+            'squads',
+            'public_location_squad_mappings',
+            'public_locations',
+            'public_access_point_squad_mappings',
+            'public_access_points',
+            'entitlement_cleanup_tombstones',
+            'apple_notifications',
+        }
 
         # Фильтруем таблицы, которые нужно сохранить
         tables_to_truncate = []

@@ -14,7 +14,9 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
+import re
 import tarfile
 
 import pytest
@@ -140,12 +142,18 @@ def test_backup_list_has_no_duplicates() -> None:
 
 
 @pytest.mark.asyncio
-async def test_backup_report_counts_the_file_not_the_live_database(tmp_path, monkeypatch) -> None:
-    """Отчёт обязан называть содержимое ФАЙЛА.
+async def test_backup_report_counts_the_file_and_warns_only_about_forgotten_tables(tmp_path, monkeypatch) -> None:
+    """Отчёт называет содержимое ФАЙЛА и тревожит только о забытой таблице.
 
     До 20.08.2026 он печатал пересчёт живой базы: каждую ночь «142 таблицы,
-    14 246 записей» при 95 таблицах в файле. Дыра в списке моделей прожила
-    месяц именно потому, что отчёт про неё рассказать не мог.
+    14 246 записей» при 95 таблицах в файле. Дыра прожила месяц именно потому,
+    что отчёт про неё рассказать не мог.
+
+    🔴 Первая версия этой проверки поднимала тревогу на разнице «база минус файл»
+    и потому горела бы КАЖДУЮ ночь: в разницу всегда попадают журнал мониторинга
+    (выключен настройкой) и служебная `alembic_version`. Тревога без порога —
+    это молчание. Поэтому тест кормит функцию и намеренными исключениями, и
+    настоящей забытой таблицей, и требует, чтобы названа была только вторая.
     """
     from app.services.backup_service import BackupService
 
@@ -156,9 +164,20 @@ async def test_backup_report_counts_the_file_not_the_live_database(tmp_path, mon
     service.data_dir = tmp_path
     service.archive_format_version = '2.0'
     service._settings = backup_service._settings
+    service._base_backup_models = backup_service._base_backup_models
+    service.association_tables = backup_service.association_tables
 
     async def fake_overview():
-        return {'tables_count': 142, 'total_records': 14246, 'tables': []}
+        return {
+            'tables_count': 143,
+            'total_records': 14246,
+            'tables': [
+                {'name': 'users', 'rows': 180},
+                {'name': 'monitoring_logs', 'rows': 2385},  # исключён настройкой — молчать
+                {'name': 'alembic_version', 'rows': 1},  # служебная — молчать
+                {'name': 'forgotten_table', 'rows': 7},  # вот про эту обязан сказать
+            ],
+        }
 
     async def fake_dump(staging_dir, include_logs):
         (staging_dir / 'database.json').write_text('{}', encoding='utf-8')
@@ -167,7 +186,7 @@ async def test_backup_report_counts_the_file_not_the_live_database(tmp_path, mon
             'path': 'database.json',
             'format': 'json',
             'tool': 'orm',
-            'tables_count': 98,
+            'tables_count': 140,
             'total_records': 11470,
         }
 
@@ -189,16 +208,75 @@ async def test_backup_report_counts_the_file_not_the_live_database(tmp_path, mon
     ok, message, path = await service.create_backup(compress=True, include_logs=False)
 
     assert ok, message
-    assert '98 из 142' in message, message
+    assert 'Таблиц в файле: 140' in message, message
     assert '11,470' in message or '11 470' in message, message
-    assert '2,776' in message or '2 776' in message, f'Отчёт молчит о несохранённых записях: {message}'
+    assert 'forgotten_table' in message, f'Забытая таблица не названа: {message}'
+    assert 'monitoring_logs' not in message, f'Тревога на намеренном исключении: {message}'
+    assert 'alembic_version' not in message, f'Тревога на служебной таблице: {message}'
+    assert '14,246' not in message and '14 246' not in message, f'Отчёт снова считает живую базу: {message}'
 
     with tarfile.open(path, 'r:gz') as archive:
         metadata = json.loads(archive.extractfile('metadata.json').read())
 
-    assert metadata['tables_count'] == 98
+    assert metadata['tables_count'] == 140
     assert metadata['total_records'] == 11470
-    assert metadata['database_tables_count'] == 142
+    assert metadata['database_tables_count'] == 143
+
+
+@pytest.mark.asyncio
+async def test_backup_report_is_silent_when_nothing_is_forgotten(tmp_path, monkeypatch) -> None:
+    """Обратная сторона: на здоровой базе тревоги быть не должно ни одной ночи."""
+    from app.services.backup_service import BackupService
+
+    service = BackupService.__new__(BackupService)
+    service.bot = None
+    service.backup_dir = tmp_path / 'backups'
+    service.backup_dir.mkdir(parents=True)
+    service.data_dir = tmp_path
+    service.archive_format_version = '2.0'
+    service._settings = backup_service._settings
+    service._base_backup_models = backup_service._base_backup_models
+    service.association_tables = backup_service.association_tables
+
+    async def fake_overview():
+        # ровно то, что на боевом: все таблицы базы, журнал выключен настройкой
+        return {
+            'tables_count': 142,
+            'total_records': 14246,
+            'tables': [{'name': name, 'rows': 1} for name in sorted(Base.metadata.tables)]
+            + [{'name': 'alembic_version', 'rows': 1}],
+        }
+
+    async def fake_dump(staging_dir, include_logs):
+        (staging_dir / 'database.json').write_text('{}', encoding='utf-8')
+        return {
+            'type': 'postgresql',
+            'path': 'database.json',
+            'format': 'json',
+            'tool': 'orm',
+            'tables_count': 140,
+            'total_records': 11470,
+        }
+
+    async def noop_files(staging_dir, include_logs):
+        return []
+
+    async def noop_snapshot(staging_dir):
+        return {'path': str(tmp_path), 'items': 0}
+
+    async def noop_cleanup():
+        return None
+
+    monkeypatch.setattr(service, '_collect_database_overview', fake_overview)
+    monkeypatch.setattr(service, '_dump_database', fake_dump)
+    monkeypatch.setattr(service, '_collect_files', noop_files)
+    monkeypatch.setattr(service, '_collect_data_snapshot', noop_snapshot)
+    monkeypatch.setattr(service, '_cleanup_old_backups', noop_cleanup)
+
+    ok, message, _ = await service.create_backup(compress=True, include_logs=False)
+
+    assert ok, message
+    assert 'Вне копии' not in message, f'Тревога горит на здоровой базе: {message}'
 
 
 @pytest.mark.asyncio
@@ -235,3 +313,41 @@ async def test_dump_serialises_binary_values(monkeypatch) -> None:
     assert isinstance(dumped, str), f'Двоичное поле ушло в дамп как {type(dumped)!r} — json.dumps на нём упадёт'
     json.dumps(data)  # то, что делает `_dump_postgres_json`: обязано не бросать
     assert base64.b64decode(dumped) == b'\x01\x02\x03'
+
+
+def test_clear_before_restore_reaches_every_backed_up_table() -> None:
+    """«Очистить и восстановить» обязано доставать до всех таблиц копии.
+
+    У очистки СВОЙ список (`_clear_database_tables`), отдельный и от списка копии,
+    и от `Base.metadata`. До 20.08.2026 шесть таблиц не чистились ни по имени, ни
+    каскадом — они ни на что не ссылаются. Пока их не было в копии, это оставалось
+    незаметным; с появлением в копии получилась бы смесь двух состояний.
+
+    🔴 Замыкание каскада считается ЗДЕСЬ по `Base.metadata`, а не берётся из кода —
+    иначе сторож повторял бы ту же константу, что и проверяет.
+    """
+    source = inspect.getsource(backup_service._clear_database_tables)
+    named = set(re.findall(r"'([a-z0-9_]+)'", source.split('all_tables = [', 1)[1].split('\n        ]', 1)[0]))
+
+    references = {
+        name: {fk.column.table.name for fk in table.foreign_keys} for name, table in Base.metadata.tables.items()
+    }
+
+    # TRUNCATE ... CASCADE опустошает и тех, кто ССЫЛАЕТСЯ на очищаемую таблицу.
+    cleared = set(named)
+    grew = True
+    while grew:
+        grew = False
+        for name, targets in references.items():
+            if name not in cleared and targets & cleared:
+                cleared.add(name)
+                grew = True
+
+    unreachable = sorted(set(_backup_tables()) | set(backup_service.association_tables) - cleared)
+    unreachable = [name for name in unreachable if name not in cleared]
+
+    assert not unreachable, (
+        f'«Очистить и восстановить» не опустошит эти таблицы: {unreachable}. '
+        'Строка из копии упадёт на уникальном ключе поверх живой, и восстановление '
+        'молча смешает два состояния. Добавьте их в `all_tables` и в `preserve_if_no_backup`.'
+    )
