@@ -80,6 +80,28 @@ logger = structlog.get_logger(__name__)
 PENDING_ATTEMPT_STATUSES = frozenset({'creating', 'pending', 'paid_processing', 'reconciliation'})
 PROVIDER_TERMINAL_STATUSES = frozenset({'FAILED', 'CANCELED', 'EXPIRED'})
 POST_PAID_REVERSAL_STATUSES = frozenset({'CHARGEBACKED'})
+
+# 🔴 Мина BO. Две из четырёх ветвей отбора воркера находят строку не по статусу, а по
+# ПРИЧИНЕ: архивную — по префиксу, операторскую — по точному значению. То есть причина
+# здесь не комментарий, а ключ, по которому строка возвращается в следующий проход.
+# Воркер же писал в это поле исход опроса — и строка выпадала из пула навсегда.
+# На боевом так выпало 8 попыток (id 11, 12, 14, 16, 17, 19, 21, 34), самая старая —
+# просрочена на 5 суток; ни одну не трогали после наступления срока.
+POOL_KEY_TERMINAL_PREFIX = 'provider_terminal:'
+POOL_KEY_OPERATOR_REASON = 'provider_invoice_missing_or_elapsed_expiry'
+
+
+def reason_keeps_attempt_in_pool(reason: str | None) -> bool:
+    """Держит ли эта причина строку в пуле вечной сверки.
+
+    🔴 Строго `startswith`, не `in`: `post_paid_provider_terminal:` — ДРУГАЯ причина
+    (заморозка по чарджбэку, `payment/platega.py`), и принимать её за ключ пула значит
+    запретить записать откат постоплаты.
+    """
+    text = str(reason or '')
+    return text.startswith(POOL_KEY_TERMINAL_PREFIX) or text == POOL_KEY_OPERATOR_REASON
+
+
 # Мины R и AD (пункт 4.5). Закрытый провайдером счёт остаётся под опросом НАВСЕГДА, и это
 # намеренно: контракта финальности провайдер не даёт, а поздняя оплата обязана вернуться
 # клиенту на баланс. Выключать опрос нельзя. Но интервал был плоский — «+6 часов» без
@@ -89,6 +111,52 @@ POST_PAID_REVERSAL_STATUSES = frozenset({'CHARGEBACKED'})
 # читался нигде — читаем его: интервал удваивается от 6 часов до недели и там остаётся.
 _TERMINAL_RECONCILE_BASE_HOURS = 6
 _TERMINAL_RECONCILE_MAX_HOURS = 24 * 7
+
+
+def note_provider_lookup_outcome(attempt: CheckoutPaymentAttempt, outcome: str) -> None:
+    """Записать исход опроса, не разрушив ключ, по которому строка вернётся в пул.
+
+    Для строки, которая держится в пуле причиной, исход в это поле не пишется — иначе
+    следующий проход её не найдёт (мина BO). Вместо этого гасится частота.
+
+    🔴 Гашение обязательно, и это не украшение. Общий откат воркера упирается в потолок
+    60 минут, а выборка сортируется по сроку с `limit=20`: архивная строка, просроченная
+    на часы, встаёт в очередь ВПЕРЕДИ живого счёта. Без гашения архив занимал бы все
+    двадцать мест (на 20.08 в пуле 12 строк плюс 8 возвращаемых — ровно двадцать).
+    ⚠️ Не «часами»: быстрый воркер (`device_first_recovery_service`) ходит раз в десять
+    секунд, медленный (`monitoring_service`) — раз в час; задержка живого счёта
+    измерялась бы секундами, а цена — сотнями лишних обращений к провайдеру в сутки.
+    Здесь ставится тот же затухающий срок (6 ч → неделя), которым живут закрытые счета.
+
+    🔴 Гасится ТОЛЬКО архив. Операторская причина держит строку в пуле, но это не архив,
+    а холд по, возможно, ещё живому счёту: пока он длится, клиент не может оформить новую
+    покупку, а выход из него даёт только опрос. Отодвинуть такую строку на шесть часов
+    из-за одного таймаута значит запереть человека на шесть часов. Ей ключ сохраняем,
+    частоту оставляем общую.
+
+    🔴 Счётчик молчаний растёт ЗДЕСЬ, и это единственная рабочая форма. Две неверные,
+    обе пойманы ревью 20.08.2026: читать `terminal_observations`, не увеличивая его, —
+    он растёт только при настоящем терминальном ответе, значит на молчании стоит, и
+    затухание вырождается в плоские шесть часов. Читать `reconcile_attempts` — он копит
+    за всю жизнь строки и доходит до шести за первый же час, значит архивная строка
+    прыгает СРАЗУ на недельный потолок (замер на боевом: у восьми выпавших он от 7 до
+    401). Верно — считать сами молчания: тогда 6 ч → 12 → 24 → … → неделя честно.
+    """
+    if not reason_keeps_attempt_in_pool(attempt.reconciliation_reason):
+        attempt.reconciliation_reason = outcome
+        return
+
+    if str(attempt.reconciliation_reason or '').startswith(POOL_KEY_TERMINAL_PREFIX):
+        attempt.terminal_observations = int(attempt.terminal_observations or 0) + 1
+        attempt.next_reconcile_at = datetime.now(UTC) + terminal_reconcile_delay(attempt.terminal_observations)
+    logger.warning(
+        'direct_provider_lookup_unresolved_pool_key_preserved',
+        attempt_id=attempt.id,
+        outcome=outcome,
+        reconciliation_reason=attempt.reconciliation_reason,
+        reconcile_attempts=attempt.reconcile_attempts,
+        terminal_observations=attempt.terminal_observations,
+    )
 
 
 def terminal_reconcile_delay(observations: int | None) -> timedelta:
@@ -655,7 +723,7 @@ async def _apply_direct_pending_provider_observation(
 
     # If the canonical provider still says PENDING *after* our own terminal
     # transition, that is a real contradiction, not a stale poll response.
-    if attempt.status == 'failed' and str(attempt.reconciliation_reason or '').startswith('provider_terminal:'):
+    if attempt.status == 'failed' and str(attempt.reconciliation_reason or '').startswith(POOL_KEY_TERMINAL_PREFIX):
         payment.status = 'OPERATOR_REVIEW'
         attempt.status = 'operator_review'
         attempt.reconciliation_reason = 'provider_terminal_status_regressed'
@@ -672,7 +740,7 @@ async def _apply_direct_pending_provider_observation(
     # other operator review remains fail-closed.
     recovering_missing_deadline = (
         attempt.status == 'operator_review'
-        and attempt.reconciliation_reason == 'provider_invoice_missing_or_elapsed_expiry'
+        and attempt.reconciliation_reason == POOL_KEY_OPERATOR_REASON
         and checkout.lifecycle_state == 'operator_review'
         and checkout.terminal_reason == 'provider_invoice_missing_or_elapsed_expiry'
     )
@@ -2198,7 +2266,7 @@ async def reconcile_device_first_payments(
             and_(
                 CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
                 CheckoutPaymentAttempt.status == 'failed',
-                CheckoutPaymentAttempt.reconciliation_reason.like('provider_terminal:%'),
+                CheckoutPaymentAttempt.reconciliation_reason.like(f'{POOL_KEY_TERMINAL_PREFIX}%'),
                 CheckoutPaymentAttempt.provider_payment_id.is_not(None),
                 CheckoutPaymentAttempt.platega_payment_id.is_not(None),
             ),
@@ -2208,7 +2276,7 @@ async def reconcile_device_first_payments(
             and_(
                 CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
                 CheckoutPaymentAttempt.status == 'operator_review',
-                CheckoutPaymentAttempt.reconciliation_reason == 'provider_invoice_missing_or_elapsed_expiry',
+                CheckoutPaymentAttempt.reconciliation_reason == POOL_KEY_OPERATOR_REASON,
                 CheckoutPaymentAttempt.provider_payment_id.is_not(None),
                 CheckoutPaymentAttempt.platega_payment_id.is_not(None),
             ),
@@ -2338,7 +2406,7 @@ async def reconcile_device_first_payments(
                     )
                     if attempt is None:
                         continue
-                attempt.reconciliation_reason = f'status_lookup:{type(error).__name__}'
+                note_provider_lookup_outcome(attempt, f'status_lookup:{type(error).__name__}')
                 await db.commit()
                 continue
             if not payload:
@@ -2351,7 +2419,7 @@ async def reconcile_device_first_payments(
                     )
                     if attempt is None:
                         continue
-                attempt.reconciliation_reason = 'status_lookup:empty'
+                note_provider_lookup_outcome(attempt, 'status_lookup:empty')
                 await db.commit()
                 continue
             status = str(payload.get('status') or '').upper()
@@ -2455,7 +2523,7 @@ async def reconcile_device_first_payments(
                             .execution_options(populate_existing=True)
                         )
                     ).scalar_one()
-                attempt.reconciliation_reason = f'provider_pending:{status or "unknown"}'
+                note_provider_lookup_outcome(attempt, f'provider_pending:{status or "unknown"}')
                 await db.commit()
         finally:
             await _release_direct_attempt_lease(

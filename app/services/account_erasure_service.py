@@ -205,13 +205,40 @@ def _has_live_subscription(subscriptions: list[Subscription]) -> bool:
     )
 
 
-def _safe_terminal_attempt(attempt: CheckoutPaymentAttempt) -> bool:
+_PROVIDER_TERMINAL_PAYMENT_STATUSES = frozenset({'FAILED', 'CANCELED', 'EXPIRED'})
+
+
+def _safe_terminal_attempt(attempt: CheckoutPaymentAttempt, payment=None) -> bool:
     """Only a canonical, exact provider terminal result releases PII.
 
     A locally cancelled UI or a fixed polling count is intentionally not
     considered final: Platega may still send an exact CONFIRMED callback.
+
+    🔴 ЧЕСТНО О ГРАНИЦАХ ВТОРОЙ УЛИКИ (скептик, 20.08.2026). Проверка статуса платежа
+    добавлена как страховка от рассинхрона и НЕ закрывает сценарий, ради которого
+    задумывалась. До 20.08 исход опроса затирал причину, и это СЛУЧАЙНО удерживало
+    персональные данные, когда провайдер отвечает живым, но неузнанным статусом (всё
+    вне `PENDING`/`INPROGRESS`). Сняв затирание вместе с миной BO, мы сняли и эту
+    случайную защиту — а вернуть её статусом платежа нельзя: он записан в момент
+    архивации и на молчании провайдера никем не переписывается, то есть остаётся
+    терминальным. **Дыра открыта и записана миной, а не закрыта этой строкой.**
+    Закрыть её можно только долговечным следом «последний опрос не разрешился»,
+    а поля под него в схеме нет.
+
+    Что вторая улика всё-таки даёт: попытка с терминальной причиной и нетерминальным
+    статусом платежа персональные данные не отпустит. Сегодня такую пару код не
+    производит — значит это забор на будущий рассинхрон, а не на сегодняшний сценарий.
     """
-    return attempt.status == 'failed' and str(attempt.reconciliation_reason or '').startswith('provider_terminal:')
+    # Тот же признак, что держит строку в пуле сверки: берём его оттуда, а не своей копией.
+    from app.services.device_first_payment_service import POOL_KEY_TERMINAL_PREFIX
+
+    if attempt.status != 'failed':
+        return False
+    if not str(attempt.reconciliation_reason or '').startswith(POOL_KEY_TERMINAL_PREFIX):
+        return False
+    if payment is None:
+        return True
+    return str(getattr(payment, 'status', '') or '').upper() in _PROVIDER_TERMINAL_PAYMENT_STATUSES
 
 
 def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
@@ -230,7 +257,7 @@ def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
             )
         ):
             return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
-        if not _safe_terminal_attempt(attempt):
+        if not _safe_terminal_attempt(attempt, payment):
             return ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved'
     return ERASURE_READY, None
 
