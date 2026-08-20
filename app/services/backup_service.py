@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import gzip
 import html as html_lib
 import json as json_lib
@@ -28,10 +29,12 @@ from app.config import settings
 from app.database.database import AsyncSessionLocal, engine, sync_postgres_sequences
 from app.database.models import (
     AccessPolicy,
+    AccountErasureRequest,
     AdminAuditLog,
     AdminRole,
     AdvertisingCampaign,
     AdvertisingCampaignRegistration,
+    AntilopayPayment,
     AppleIAPAbuseEvent,
     AppleIAPAccount,
     AppleNotification,
@@ -40,21 +43,46 @@ from app.database.models import (
     BroadcastHistory,
     ButtonClickLog,
     CabinetRefreshToken,
+    CheckoutPaymentAttempt,
     CloudPaymentsPayment,
     ContestAttempt,
     ContestRound,
     ContestTemplate,
     CryptoBotPayment,
+    DeviceFirstDepositOutbox,
+    DeviceFirstMutation,
+    DeviceFirstNotificationOutbox,
+    DeviceFirstOutbox,
+    DeviceFirstProviderEvent,
+    DeviceFirstReconciliationCredit,
     DiscountOffer,
+    DonutPayment,
     EmailTemplate,
+    EntitlementChangePlan,
+    EntitlementCleanupCommand,
+    EntitlementCleanupTombstone,
+    EntitlementIdentity,
+    EntitlementNotificationIntent,
+    EntitlementObservation,
+    EntitlementOverlay,
+    EntitlementPlanApproval,
+    EntitlementPlanCheckpoint,
+    EntitlementPlanJob,
+    EntitlementPlanOutbox,
+    EntitlementProjectionCommand,
+    EntitlementSourceRevision,
+    EntitlementWebhookInbox,
+    EtoplatezhiPayment,
     FaqPage,
     FaqSetting,
     FreekassaPayment,
     GuestPurchase,
     HeleketPayment,
     InfoPage,
+    JupiterPayment,
     KassaAiPayment,
     LandingPage,
+    LavaPayment,
     MainMenuButton,
     MenuLayoutHistory,
     MonitoringLog,
@@ -80,6 +108,10 @@ from app.database.models import (
     PromoGroup,
     PromoOfferLog,
     PromoOfferTemplate,
+    PublicAccessPoint,
+    PublicAccessPointSquadMapping,
+    PublicLocation,
+    PublicLocationSquadMapping,
     PublicOffer,
     ReferralContest,
     ReferralContestEvent,
@@ -95,13 +127,23 @@ from app.database.models import (
     SeverPayPayment,
     Squad,
     Subscription,
+    SubscriptionCheckout,
     SubscriptionConversion,
+    SubscriptionEntitlementSnapshot,
+    SubscriptionEntitlementTerm,
+    SubscriptionEntitlementTermProjectionOutbox,
     SubscriptionEvent,
     SubscriptionServer,
     SubscriptionTemporaryAccess,
     SupportAuditLog,
     SystemSetting,
     Tariff,
+    TariffAccessPointConversion,
+    TariffAccessPointPolicyItem,
+    TariffAccessPointPolicyRevision,
+    TariffLegacyEntitlementManifest,
+    TariffLocationEntitlement,
+    TariffSquadRolloutSnapshot,
     Ticket,
     TicketMessage,
     TicketNotification,
@@ -109,6 +151,7 @@ from app.database.models import (
     Transaction,
     User,
     UserChannelSubscription,
+    UserDeviceAlias,
     UserMessage,
     UserPromoGroup,
     UserRole,
@@ -223,12 +266,15 @@ class BackupService:
             MulenPayPayment,
             Pal24Payment,
             PromoCodeUse,
-            ReferralEarning,
             SentNotification,
             DiscountOffer,
             BroadcastHistory,
             AdvertisingCampaign,
             AdvertisingCampaignRegistration,
+            # ReferralEarning ссылается на advertising_campaigns и поэтому обязан идти
+            # ПОСЛЕ них: до 20.08.2026 он стоял выше, и начисление, привязанное к
+            # рекламной кампании, при восстановлении молча выпадало (пункт 4.15).
+            ReferralEarning,
             Ticket,
             TicketMessage,
             SupportAuditLog,
@@ -312,6 +358,60 @@ class BackupService:
             UserChannelSubscription,
             PartnerApplication,
             CabinetRefreshToken,
+            # Всё ниже добавлено 20.08.2026 (пункт 4.15). До этого список знал 95 моделей
+            # из 138: вне копии оставались заказы, платёжные попытки, снимки прав и снимки
+            # раскатки — почти треть базы. Порядок внутри блоков — по внешним ключам:
+            # цель ключа обязана стоять ВЫШЕ, иначе строка молча отбрасывается при
+            # восстановлении (`_restore_table_records` глотает IntegrityError).
+            # --- Публичные локации и точки доступа (FK: между собой) ---
+            PublicLocation,
+            PublicLocationSquadMapping,
+            PublicAccessPoint,
+            PublicAccessPointSquadMapping,
+            # --- Права тарифа (FK: tariffs, users, public_*) ---
+            TariffLocationEntitlement,
+            TariffAccessPointPolicyRevision,
+            TariffAccessPointPolicyItem,
+            TariffAccessPointConversion,
+            TariffLegacyEntitlementManifest,
+            # --- Данные пользователя (FK: users) ---
+            AccountErasureRequest,
+            UserDeviceAlias,
+            # --- Платёжные провайдеры (FK: users, transactions) ---
+            AntilopayPayment,
+            DonutPayment,
+            EtoplatezhiPayment,
+            JupiterPayment,
+            LavaPayment,
+            # --- Снимки прав и раскатки (FK: subscriptions, tariffs) ---
+            SubscriptionEntitlementSnapshot,
+            SubscriptionEntitlementTerm,
+            SubscriptionEntitlementTermProjectionOutbox,
+            TariffSquadRolloutSnapshot,
+            # --- Заказы device-first (FK: users, tariffs, subscriptions, transactions) ---
+            SubscriptionCheckout,
+            CheckoutPaymentAttempt,
+            DeviceFirstOutbox,
+            DeviceFirstNotificationOutbox,
+            DeviceFirstDepositOutbox,
+            DeviceFirstMutation,
+            DeviceFirstProviderEvent,
+            DeviceFirstReconciliationCredit,
+            # --- Машинерия прав доступа (FK: users, между собой) ---
+            EntitlementIdentity,
+            EntitlementSourceRevision,
+            EntitlementOverlay,
+            EntitlementObservation,
+            EntitlementProjectionCommand,
+            EntitlementWebhookInbox,
+            EntitlementNotificationIntent,
+            EntitlementCleanupCommand,
+            EntitlementCleanupTombstone,
+            EntitlementChangePlan,
+            EntitlementPlanApproval,
+            EntitlementPlanJob,
+            EntitlementPlanCheckpoint,
+            EntitlementPlanOutbox,
         ]
 
         self.backup_models_ordered = self._base_backup_models.copy()
@@ -466,6 +566,71 @@ class BackupService:
             next_run += interval
         return next_run
 
+    # Что именно не кладём в копию намеренно — и как это назвать человеку.
+    # Журнал мониторинга выключается настройкой `BACKUP_INCLUDE_LOGS`,
+    # `alembic_version` — служебная таблица Alembic, модели у неё нет.
+    _DELIBERATE_EXCLUSIONS = {
+        'monitoring_logs': 'журнал мониторинга (настройка «Включать логи»)',
+        'alembic_version': 'служебная таблица миграций',
+    }
+
+    def _deliberate_exclusions(self, include_logs: bool) -> set[str]:
+        excluded = {'alembic_version'}
+        if not include_logs:
+            excluded.add(MonitoringLog.__tablename__)
+        return excluded
+
+    def _covered_tables(self, include_logs: bool) -> set[str]:
+        """Таблицы, которые бекап обязан содержать, плюс намеренные исключения.
+
+        Всё, чего здесь нет, — забытая таблица, а не решение.
+        """
+        covered = {model.__tablename__ for model in self._get_models_for_backup(include_logs)}
+        covered |= set(self.association_tables)
+        return covered | self._deliberate_exclusions(include_logs)
+
+    def _excluded_on_purpose(self, overview: dict[str, Any], include_logs: bool) -> list[str]:
+        """Намеренные исключения, в которых есть данные — словами, для человека.
+
+        Без этой строки владелец видит «140 таблиц» вместо вчерашних «142» и
+        читает это как потерю: объяснение существует только в комментарии кода.
+        """
+        excluded = self._deliberate_exclusions(include_logs)
+        return [
+            f'{self._DELIBERATE_EXCLUSIONS.get(table["name"], table["name"])} — {table["rows"]:,}'
+            for table in overview.get('tables', [])
+            if table.get('name') in excluded and table.get('rows')
+        ]
+
+    def _missing_records(self, overview: dict[str, Any], include_logs: bool, saved_records: int) -> int:
+        """Сколько строк НЕ доехало до файла сверх намеренных исключений.
+
+        Ловит то, чего не поймает ни один тест на CI: экспорт таблицы упал в рантайме
+        (`_export_database_via_orm` глушит ошибку, кладёт пустой список и идёт дальше),
+        а число таблиц в отчёте берётся из длины списка и остаётся прежним. Отчёт
+        выглядел бы здоровым при копии без денег.
+        """
+        excluded = self._deliberate_exclusions(include_logs)
+        expected = overview.get('total_records', 0) - sum(
+            table.get('rows', 0) for table in overview.get('tables', []) if table.get('name') in excluded
+        )
+        return max(expected - saved_records, 0)
+
+    def _unsaved_tables(self, overview: dict[str, Any], include_logs: bool) -> list[str]:
+        """Таблицы с данными, о которых бекап не знает вовсе.
+
+        🔴 Тревога поднимается ТОЛЬКО на них. Первая версия этой проверки считала
+        разницу «строк в базе минус строк в файле» и потому горела бы каждую ночь:
+        в разницу всегда попадают намеренные исключения. Сигнал, который горит
+        всегда, перестают читать — а это ровно то, из-за чего дыра прожила месяц.
+        """
+        covered = self._covered_tables(include_logs)
+        return sorted(
+            table.get('name')
+            for table in overview.get('tables', [])
+            if table.get('name') not in covered and table.get('rows')
+        )
+
     def _get_models_for_backup(self, include_logs: bool) -> list[Any]:
         models = self._base_backup_models.copy()
 
@@ -515,6 +680,16 @@ class BackupService:
                 database_info = await self._dump_database(staging_dir, include_logs=include_logs)
                 database_info.setdefault('tables_count', overview.get('tables_count', 0))
                 database_info.setdefault('total_records', overview.get('total_records', 0))
+
+                # 🔴 Числа берём из ФАЙЛА, а не из живой базы. До 20.08.2026 отчёт печатал
+                # `overview` — пересчёт всей базы — и каждую ночь сообщал «142 таблицы,
+                # 14 246 записей», хотя в файл ложилось 95 таблиц. Дыра в списке моделей
+                # прожила месяц именно потому, что отчёт про неё не мог рассказать.
+                tables_count = database_info.get('tables_count', 0)
+                total_records = database_info.get('total_records', 0)
+                unsaved_tables = self._unsaved_tables(overview, include_logs)
+                excluded_on_purpose = self._excluded_on_purpose(overview, include_logs)
+                missing_records = self._missing_records(overview, include_logs, total_records)
                 files_info = await self._collect_files(staging_dir, include_logs=include_logs)
                 data_snapshot_info = await self._collect_data_snapshot(staging_dir)
 
@@ -523,8 +698,10 @@ class BackupService:
                     'timestamp': datetime.now(UTC).isoformat(),
                     'database_type': 'postgresql' if settings.is_postgresql() else 'sqlite',
                     'backup_type': 'full',
-                    'tables_count': overview.get('tables_count', 0),
-                    'total_records': overview.get('total_records', 0),
+                    'tables_count': tables_count,
+                    'total_records': total_records,
+                    'database_tables_count': overview.get('tables_count', 0),
+                    'database_total_records': overview.get('total_records', 0),
                     'compressed': True,
                     'created_by': created_by,
                     'database': database_info,
@@ -556,10 +733,17 @@ class BackupService:
             message = (
                 f'✅ Бекап успешно создан!\n'
                 f'📁 Файл: {filename}\n'
-                f'📊 Таблиц: {overview.get("tables_count", 0)}\n'
-                f'📈 Записей: {overview.get("total_records", 0):,}\n'
+                f'📊 Таблиц в файле: {tables_count}\n'
+                f'📈 Записей в файле: {total_records:,}\n'
                 f'💾 Размер: {size_mb:.2f} MB'
             )
+            if excluded_on_purpose:
+                message += '\nℹ️ Намеренно вне копии: ' + '; '.join(excluded_on_purpose)
+            if unsaved_tables:
+                names = ', '.join(unsaved_tables)
+                message += f'\n⚠️ Вне копии осталось таблиц с данными: {len(unsaved_tables)} — {names}'
+            if missing_records:
+                message += f'\n⚠️ Не доехало до файла записей: {missing_records:,} — копия НЕПОЛНАЯ'
 
             logger.info(message)
 
@@ -804,6 +988,11 @@ class BackupService:
                                 record_dict[column.name] = float(value)
                             elif isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
                                 record_dict[column.name] = 0.0
+                            elif isinstance(value, (bytes, bytearray, memoryview)):
+                                # json.dumps на bytes падает TypeError, а он не ловится ниже
+                                # по стеку — упал бы ВЕСЬ бекап, а не одна таблица. Двоичные
+                                # колонки сегодня есть только у entitlement_cleanup_commands.
+                                record_dict[column.name] = base64.b64encode(bytes(value)).decode('ascii')
                             elif isinstance(value, (list, dict)):
                                 try:
                                     record_dict[column.name] = json_lib.dumps(value) if value is not None else None
@@ -923,6 +1112,7 @@ class BackupService:
             database_info = metadata.get('database', {})
             metadata.get('data_snapshot', {})
             files_info = metadata.get('files', [])
+            restored: tuple[int, int] | None = None
 
             if database_info.get('type') == 'postgresql':
                 db_format = database_info.get('format', 'sql')
@@ -930,7 +1120,7 @@ class BackupService:
                 dump_file = temp_path / database_info.get('path', default_name)
 
                 if db_format == 'json':
-                    await self._restore_postgres_json(dump_file, clear_existing)
+                    restored = await self._restore_postgres_json(dump_file, clear_existing)
                 else:
                     await self._restore_postgres(dump_file, clear_existing)
             else:
@@ -944,10 +1134,24 @@ class BackupService:
             if files_info:
                 await self._restore_files(files_info, temp_path)
 
+            # Числа — те, что РЕАЛЬНО легли в базу. Прежде печаталось содержимое
+            # metadata, то есть обещание файла: строки, отбитые внешним ключом,
+            # `_restore_table_records` глушит, и оператор видел успех вместо потери.
+            # 🔴 Одно ЧИСЛО, которое можно проверить: записей легло против записей в файле.
+            # Прежняя пара «таблиц восстановлено / таблиц в файле» несравнима — пустая
+            # таблица в счёт восстановленных не идёт, и на боевом отчёт читался бы как
+            # «потеряно 93 таблицы» (найдено прогоном сценария 20.08.2026).
+            in_file = metadata.get('total_records', 0)
+            if restored is None:
+                records_text = f'{in_file:,} — по описи файла, фактическое число неизвестно'
+            elif restored[1] >= in_file:
+                records_text = f'{restored[1]:,} из {in_file:,} — всё'
+            else:
+                records_text = f'{restored[1]:,} из {in_file:,} — 🔴 НЕ ВСЁ, разница {in_file - restored[1]:,}'
+
             message = (
                 f'✅ Восстановление завершено!\n'
-                f'📊 Таблиц: {metadata.get("tables_count", 0)}\n'
-                f'📈 Записей: {metadata.get("total_records", 0):,}\n'
+                f'📈 Записей восстановлено: {records_text}\n'
                 f'📅 Дата бекапа: {metadata.get("timestamp", "неизвестно")}'
             )
 
@@ -1012,7 +1216,7 @@ class BackupService:
 
         logger.info('✅ PostgreSQL восстановлен', dump_path=dump_path)
 
-    async def _restore_postgres_json(self, dump_path: Path, clear_existing: bool):
+    async def _restore_postgres_json(self, dump_path: Path, clear_existing: bool) -> tuple[int, int]:
         if not await asyncio.to_thread(dump_path.exists):
             raise FileNotFoundError(f'JSON дамп PostgreSQL не найден: {dump_path}')
 
@@ -1023,7 +1227,7 @@ class BackupService:
         backup_data = dump_data.get('data', {})
         association_data = dump_data.get('associations', {})
 
-        await self._restore_database_payload(
+        restored = await self._restore_database_payload(
             backup_data,
             association_data,
             metadata,
@@ -1031,6 +1235,7 @@ class BackupService:
         )
 
         logger.info('✅ PostgreSQL восстановлен из ORM JSON', dump_path=dump_path)
+        return restored
 
     async def _restore_sqlite(self, dump_path: Path, clear_existing: bool):
         if not await asyncio.to_thread(dump_path.exists):
@@ -1155,11 +1360,18 @@ class BackupService:
                         restored_tables += 1
                         logger.info('✅ Таблица восстановлена', table_name=table_name)
 
-                await self._restore_users_without_referrals(
+                # Пользователи восстанавливаются отдельной функцией из-за самоссылки
+                # `referred_by_id`. Их счёт обязан войти в общий: иначе отчёт «записей
+                # восстановлено» молча меньше файла ровно на число пользователей, и это
+                # читается как потеря (найдено прогоном сценария 20.08.2026).
+                restored_users = await self._restore_users_without_referrals(
                     db,
                     backup_data,
                     models_by_table,
                 )
+                restored_records += restored_users
+                if restored_users:
+                    restored_tables += 1
 
                 for model in models_for_restore:
                     table_name = model.__tablename__
@@ -1191,6 +1403,7 @@ class BackupService:
                 await db.flush()
 
                 await self._update_user_referrals(db, backup_data)
+                await self._relink_checkout_transactions(db, backup_data)
 
                 assoc_tables, assoc_records = await self._restore_association_tables(
                     db,
@@ -1262,14 +1475,15 @@ class BackupService:
         logger.info(message)
         return True, message
 
-    async def _restore_users_without_referrals(self, db: AsyncSession, backup_data: dict, models_by_table: dict):
+    async def _restore_users_without_referrals(self, db: AsyncSession, backup_data: dict, models_by_table: dict) -> int:
         users_data = backup_data.get('users', [])
         if not users_data:
-            return
+            return 0
 
         logger.info('👥 Восстанавливаем пользователей без реферальных связей', users_data_count=len(users_data))
 
         User = models_by_table['users']
+        restored_users = 0
 
         for user_data in users_data:
             try:
@@ -1321,6 +1535,8 @@ class BackupService:
                         )
                         continue
 
+                restored_users += 1
+
             except Exception as e:
                 logger.error('Ошибка при восстановлении пользователя', error=e)
                 raise
@@ -1330,7 +1546,8 @@ class BackupService:
                 await db.flush()
         except IntegrityError as e:
             logger.warning('IntegrityError при flush пользователей, savepoint откачен', e=e)
-        logger.info('✅ Пользователи без реферальных связей восстановлены')
+        logger.info('✅ Пользователи без реферальных связей восстановлены', restored_users=restored_users)
+        return restored_users
 
     async def _update_user_referrals(self, db: AsyncSession, backup_data: dict):
         users_data = backup_data.get('users', [])
@@ -1367,6 +1584,44 @@ class BackupService:
 
         await db.flush()
         logger.info('✅ Реферальные связи обновлены')
+
+    async def _relink_checkout_transactions(self, db: AsyncSession, backup_data: dict):
+        """Проставляет `transactions.device_first_checkout_id` после восстановления заказов.
+
+        Ссылка откладывается в `_restore_table_records`, потому что заказ восстанавливается
+        позже транзакции: вставить её сразу — значит нарушить внешний ключ, а такую ошибку
+        `_restore_table_records` глушит и молча теряет ВСЮ строку. До 20.08.2026 заказы в
+        бекап не попадали вовсе, и на боевом под это подпадали 17 денежных записей из 226.
+        """
+        records = backup_data.get('transactions', [])
+        if not records:
+            return
+
+        relinked = 0
+        for record in records:
+            checkout_id = record.get('device_first_checkout_id')
+            transaction_id = record.get('id')
+            if not checkout_id or not transaction_id:
+                continue
+
+            transaction = await db.get(Transaction, transaction_id)
+            if transaction is None:
+                logger.warning('Транзакция не найдена для связи с заказом', transaction_id=transaction_id)
+                continue
+
+            if await db.get(SubscriptionCheckout, checkout_id) is None:
+                logger.warning(
+                    'Заказ не найден, транзакция восстановлена без ссылки на него',
+                    transaction_id=transaction_id,
+                    checkout_id=checkout_id,
+                )
+                continue
+
+            transaction.device_first_checkout_id = checkout_id
+            relinked += 1
+
+        await db.flush()
+        logger.info('🔗 Связи транзакций с заказами восстановлены', relinked=relinked)
 
     def _process_record_data(self, record_data: dict, model, table_name: str) -> dict:
         processed_data = {}
@@ -1420,6 +1675,12 @@ class BackupService:
                     processed_data[key] = float(value)
                 except ValueError:
                     processed_data[key] = 0.0
+            elif ('BLOB' in column_type_str or 'BYTEA' in column_type_str) and isinstance(value, str):
+                try:
+                    processed_data[key] = base64.b64decode(value.encode('ascii'), validate=True)
+                except (ValueError, UnicodeEncodeError) as e:
+                    logger.warning('Не удалось разобрать двоичное поле', key=key, table_name=table_name, error=e)
+                    processed_data[key] = None
             elif 'JSON' in column_type_str:
                 if isinstance(value, str) and value.strip():
                     try:
@@ -1545,6 +1806,12 @@ class BackupService:
         for record_data in records:
             try:
                 processed_data = self._process_record_data(record_data, model, table_name)
+
+                # transactions и subscription_checkouts ссылаются друг на друга, поэтому одну
+                # из двух ссылок приходится отложить: заказ восстанавливается позже транзакции.
+                # Проставляет её `_relink_checkout_transactions` после того, как заказы легли.
+                if table_name == 'transactions':
+                    processed_data.pop('device_first_checkout_id', None)
 
                 # Валидация FK для subscriptions.tariff_id
                 if table_name == 'subscriptions' and 'tariff_id' in processed_data:
@@ -1726,11 +1993,38 @@ class BackupService:
             'system_settings',
             'web_api_tokens',
             'monitoring_logs',
+            # Ниже — таблицы, до которых `TRUNCATE ... CASCADE` не дотягивается: они ни на
+            # что не ссылаются, поэтому каскад от `users`/`tariffs` их не задевает. Пока их
+            # не было в копии, они просто оставались грязными. С 20.08.2026 они в копии, и
+            # без явной очистки «Очистить и восстановить» давало бы смесь двух состояний:
+            # строка из файла падала бы на глобальном уникальном ключе (`iso_code`,
+            # `panel_host_key`, `internal_squad_uuid`), а живая — оставалась (пункт 4.15).
+            'public_location_squad_mappings',
+            'public_locations',
+            'public_access_point_squad_mappings',
+            'public_access_points',
+            'entitlement_cleanup_tombstones',
+            'apple_notifications',
         ]
 
         # Таблицы, которые не нужно очищать если в бекапе нет данных для них
-        # (чтобы сохранить существующие настройки)
-        preserve_if_no_backup = {'tariffs', 'promo_groups', 'server_squads', 'squads'}
+        # (чтобы сохранить существующие настройки).
+        # 🔴 Шесть таблиц выше добавлены сюда же намеренно: семь архивов, лежащих на сервере,
+        # сняты кодом ДО 20.08.2026 и этих таблиц не содержат. Без оговорки восстановление
+        # из старого файла стирало бы их насухо — то есть правка ухудшила бы поведение
+        # задним числом для уже существующих копий.
+        preserve_if_no_backup = {
+            'tariffs',
+            'promo_groups',
+            'server_squads',
+            'squads',
+            'public_location_squad_mappings',
+            'public_locations',
+            'public_access_point_squad_mappings',
+            'public_access_points',
+            'entitlement_cleanup_tombstones',
+            'apple_notifications',
+        }
 
         # Фильтруем таблицы, которые нужно сохранить
         tables_to_truncate = []
