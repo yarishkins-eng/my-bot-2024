@@ -1244,6 +1244,22 @@ async def update_user_subscription(
         subscription = next((s for s in subs if s.is_active), subs[0] if subs else None)
 
     if request.action == 'create':
+        # Пункт 2.2б. Без тарифа права на серверы не резолвит НИКТО: ниже
+        # connected_squads остаётся [], а create_paid_subscription включает свой
+        # забор ('tariff entitlement resolution produced no squads') только при
+        # tariff_id is not None. Итог — подписка с нулём серверов: VPN не работает,
+        # ошибки нет, кабинет молчит (мина A). Это единственный живой путь выдачи
+        # подписки руками — обе кнопки чат-админки заглушены (users.py: return False).
+        # 🔴 Триал сюда попадает ТЕМ ЖЕ маршрутом: ветка create зовёт
+        # create_paid_subscription независимо от is_trial, а create_trial_subscription
+        # со своим источником прав (squad_uuid) здесь не вызывается вовсе. Значит
+        # без тарифа отравлен и триал, и забор обязан быть общим, а не сужённым.
+        if request.tariff_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='tariff_id parameter is required: without a tariff the subscription gets no servers',
+            )
+
         # In multi-tariff mode, allow creating additional subscriptions
         if subscription and not is_multi_tariff:
             raise HTTPException(
