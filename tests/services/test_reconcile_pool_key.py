@@ -326,51 +326,88 @@ async def test_operator_hold_is_not_slowed_down(swept) -> None:
 
 
 @pytest.mark.asyncio
-async def test_archived_row_decay_grows_with_polls(swept) -> None:
-    """Затухание обязано РАСТИ с числом опросов, а не стоять плоским.
+async def test_archived_row_decay_grows_step_by_step_not_straight_to_the_cap(swept) -> None:
+    """Затухание обязано РАСТИ по шагам, а не прыгать сразу на недельный потолок.
 
-    🔴 Первая версия считала затухание по `terminal_observations`, а он растёт
-    только когда провайдер реально вернул терминальный статус: на молчании он
-    стоит на нуле вечно, и «6 ч → неделя» вырождалось в плоские шесть часов —
-    ровно тот интервал, который правка убирает. Найдено линзой денег.
+    🔴 Две неверные версии, обе пойманы ревью 20.08.2026, и этот тест отличает их
+    от верной. Считать по `terminal_observations`, не увеличивая его — затухание
+    стоит плоским на шести часах. Считать по `reconcile_attempts` — он копит за всю
+    жизнь строки и доходит до шести за первый час, значит АРХИВ ПРЫГАЕТ СРАЗУ НА
+    ПОТОЛОК (замер на боевом: у восьми выпавших этот счётчик от 7 до 401).
+    Проверяем оба конца: первое молчание — часы, многократное — неделя.
     """
     sync_db, run = swept
     _seed(sync_db, attempt_id=49, status='failed', reason='provider_terminal:canceled')
     row = sync_db.get(CheckoutPaymentAttempt, 49)
-    row.reconcile_attempts = 40  # строка, которую опрашивали долго
+    row.reconcile_attempts = 40  # строка прожила долго — но молчали по ней впервые
     sync_db.commit()
 
     before = datetime.now(UTC)
     await run()
 
     sync_db.expire_all()
-    due = sync_db.get(CheckoutPaymentAttempt, 49).next_reconcile_at
+    row = sync_db.get(CheckoutPaymentAttempt, 49)
+    due = row.next_reconcile_at
     if due.tzinfo is None:
         due = due.replace(tzinfo=UTC)
-    assert due - before >= timedelta(days=6), (
-        f'долго опрашиваемая строка получила всего {due - before} — затухание стоит плоским'
+    assert due - before >= timedelta(hours=6), f'первое молчание дало всего {due - before}'
+    assert due - before < timedelta(days=2), (
+        f'первое же молчание отправило строку на {due - before} — затухание прыгнуло на потолок, '
+        'а поздняя оплата столько ждать не должна'
     )
+    assert row.terminal_observations >= 1, 'счётчик молчаний не растёт — затухание встанет плоским'
 
 
-def test_releasing_personal_data_needs_two_pieces_of_evidence() -> None:
-    """Замок отпускания персональных данных не должен держаться на побочном эффекте.
+@pytest.mark.asyncio
+async def test_archived_row_reaches_the_weekly_cap_after_many_silences(swept) -> None:
+    """Другой конец той же шкалы: строка, по которой молчат давно, ждёт неделю."""
+    sync_db, run = swept
+    _seed(sync_db, attempt_id=50, status='failed', reason='provider_terminal:canceled')
+    row = sync_db.get(CheckoutPaymentAttempt, 50)
+    row.terminal_observations = 30
+    sync_db.commit()
 
-    🔴 Найдено линзой необратимых операций 20.08.2026 — обратный риск ЭТОЙ правки.
-    До неё исход опроса затирал причину, и это СЛУЧАЙНО удерживало данные там, где
-    провайдер отвечает живым, но неузнанным статусом (всё вне PENDING/INPROGRESS).
-    Перестав затирать причину, мы сняли бы и эту случайную защиту. Теперь спрашиваются
-    две улики, и обе ставятся одной транзакцией при настоящем терминальном ответе.
+    before = datetime.now(UTC)
+    await run()
+
+    sync_db.expire_all()
+    due = sync_db.get(CheckoutPaymentAttempt, 50).next_reconcile_at
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=UTC)
+    assert due - before >= timedelta(days=6), f'долгое молчание дало всего {due - before}'
+
+
+def test_releasing_personal_data_is_wired_through_the_payment_row() -> None:
+    """Забор отпускания ПДн обязан спрашивать и статус платежа — через НАСТОЯЩИЙ вход.
+
+    🔴 Найдено критиком полноты: мутация «вернуть проверку к одной улике» переживала
+    весь набор, потому что прежний тест звал хелпер напрямую, мимо `_target_state`.
+    Здесь идём через `_target_state` — то место, которое реально решает судьбу данных.
+
+    ⚠️ И честно о границе: сегодняшний код пару «терминальная причина + нетерминальный
+    статус платежа» не производит, все писатели меняют оба поля одной транзакцией.
+    Это забор на будущий рассинхрон. Сценарий «провайдер отвечает живым неузнанным
+    статусом» им НЕ закрывается — записано миной, а не спрятано.
     """
     from app.services import account_erasure_service as erasure
 
-    attempt = SimpleNamespace(status='failed', reconciliation_reason='provider_terminal:canceled')
+    def verdict(payment_status: str) -> tuple:
+        attempt = SimpleNamespace(
+            status='failed', reconciliation_reason='provider_terminal:canceled', platega_payment_id=1
+        )
+        payment = SimpleNamespace(id=1, is_paid=False, status=payment_status)
+        context = SimpleNamespace(
+            user=SimpleNamespace(balance_kopeks=0, has_legacy_financial_history=False, financial_resolution_at=None),
+            subscriptions=[],
+            payments=[payment],
+            attempts=[attempt],
+        )
+        return erasure._target_state(context)
 
-    assert erasure._safe_terminal_attempt(attempt, SimpleNamespace(status='CANCELED')) is True
-    assert erasure._safe_terminal_attempt(attempt, SimpleNamespace(status='HOLD')) is False, (
-        'провайдер отвечает живым статусом, а персональные данные уже отпускаются'
+    assert verdict('CANCELED')[0] == erasure.ERASURE_READY, 'штатный путь удаления сломан'
+    assert verdict('HOLD')[0] == erasure.ERASURE_AWAITING_RECONCILIATION, (
+        'статус платежа не спрашивается — забор держится на одной улике'
     )
-    assert erasure._safe_terminal_attempt(attempt, SimpleNamespace(status='PENDING')) is False
-    assert erasure._safe_terminal_attempt(SimpleNamespace(status='pending', reconciliation_reason=None), None) is False
 
 
 def test_operator_reason_is_matched_exactly_not_by_prefix() -> None:
