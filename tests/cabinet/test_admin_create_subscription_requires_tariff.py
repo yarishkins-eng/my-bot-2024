@@ -34,6 +34,16 @@ def _healthy_user() -> SimpleNamespace:
     )
 
 
+def _single_tariff_mode(monkeypatch) -> None:
+    """Мультитариф выключен явно, а не «по умолчанию в репозитории нет .env».
+
+    Без этого тесты зеленели случайно: при включённом мультитарифе ветка уходит
+    в get_subscription_by_user_and_tariff и падает на подставной сессии.
+    Подмена МЕТОДА pydantic-настроек делается на классе (мина AW).
+    """
+    monkeypatch.setattr(type(admin_users.settings), 'is_multi_tariff_enabled', lambda self: False)
+
+
 @pytest.mark.asyncio
 async def test_create_without_tariff_is_rejected_and_never_reaches_creation(monkeypatch) -> None:
     monkeypatch.setattr(admin_users, 'get_user_by_id', AsyncMock(return_value=_healthy_user()))
@@ -79,12 +89,62 @@ async def test_trial_without_tariff_is_rejected_too(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_zero_tariff_id_is_rejected_too(monkeypatch) -> None:
+    """`tariff_id=0` — не «тариф передан».
+
+    У поля нет `ge=1`, а вся ветка ниже читает `tariff_id` через истинность.
+    Проверка через `is None` пропустила бы ноль до самого низа и дала бы 500.
+    """
+    _single_tariff_mode(monkeypatch)
+    monkeypatch.setattr(admin_users, 'get_user_by_id', AsyncMock(return_value=_healthy_user()))
+    creator = AsyncMock()
+    monkeypatch.setattr(subscription_crud, 'create_paid_subscription', creator)
+
+    with pytest.raises(HTTPException) as error:
+        await admin_users.update_user_subscription(
+            user_id=78,
+            request=UpdateSubscriptionRequest(action='create', days=30, tariff_id=0),
+            admin=SimpleNamespace(id=1),
+            db=SimpleNamespace(),
+        )
+
+    assert error.value.status_code == 400
+    creator.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_tariff_is_refused_with_a_reason_not_a_crash(monkeypatch) -> None:
+    """Тариф, которого нет в базе, — внятный отказ, а не голый 500.
+
+    Раньше такой запрос доезжал до `create_paid_subscription`, та бросала
+    `ValueError`, и владелец получал 500 без причины.
+    """
+    _single_tariff_mode(monkeypatch)
+    monkeypatch.setattr(admin_users, 'get_user_by_id', AsyncMock(return_value=_healthy_user()))
+    monkeypatch.setattr(admin_users, 'get_tariff_by_id', AsyncMock(return_value=None))
+    creator = AsyncMock()
+    monkeypatch.setattr(subscription_crud, 'create_paid_subscription', creator)
+
+    with pytest.raises(HTTPException) as error:
+        await admin_users.update_user_subscription(
+            user_id=78,
+            request=UpdateSubscriptionRequest(action='create', days=30, tariff_id=999999),
+            admin=SimpleNamespace(id=1),
+            db=SimpleNamespace(),
+        )
+
+    assert error.value.status_code == 404
+    creator.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_with_tariff_forwards_tariff_id_to_creation(monkeypatch) -> None:
     """Забор не должен перекрывать нормальную выдачу — и обязан донести тариф.
 
     Именно переданный `tariff_id` включает в `create_paid_subscription` рельс
     «прав ноль → строку не создаём», который проверяет тест ниже.
     """
+    _single_tariff_mode(monkeypatch)
     monkeypatch.setattr(admin_users, 'get_user_by_id', AsyncMock(return_value=_healthy_user()))
     monkeypatch.setattr(
         admin_users,
@@ -112,13 +172,17 @@ async def test_create_with_tariff_forwards_tariff_id_to_creation(monkeypatch) ->
 
 @pytest.mark.asyncio
 async def test_zero_entitlement_never_produces_a_subscription_row(monkeypatch) -> None:
-    """Рельс самой выдачи: прав ноль — строки нет.
+    """Рельс самой выдачи на пути ВСТАВКИ: прав ноль — новой строки нет.
 
     Проверяется настоящая `create_paid_subscription`, а не её копия: вместе с
-    забором маршрута выше это и означает «подписку с нулём серверов этим путём
-    больше создать нельзя».
+    забором маршрута выше это и означает «новую подписку с нулём серверов этим
+    путём создать нельзя».
+
+    🔴 Границу утверждения держим честно: доказан путь вставки. Ветка оживления
+    истёкшей подписки (`_revive_paid_subscription`, только при включённом
+    мультитарифе) такого рельса не имеет — это отдельная мина, не этот пункт.
     """
-    monkeypatch.setattr(type(subscription_crud.settings), 'is_multi_tariff_enabled', lambda self: False, raising=False)
+    monkeypatch.setattr(type(subscription_crud.settings), 'is_multi_tariff_enabled', lambda self: False)
 
     db = MagicMock()
     db.scalar = MagicMock(return_value=None)  # синхронный дубль → забор закрытия инертен

@@ -1248,13 +1248,16 @@ async def update_user_subscription(
         # connected_squads остаётся [], а create_paid_subscription включает свой
         # забор ('tariff entitlement resolution produced no squads') только при
         # tariff_id is not None. Итог — подписка с нулём серверов: VPN не работает,
-        # ошибки нет, кабинет молчит (мина A). Это единственный живой путь выдачи
-        # подписки руками — обе кнопки чат-админки заглушены (users.py: return False).
+        # ошибки нет, кабинет молчит (мина A). Это единственный НЕЗАЩИЩЁННЫЙ путь
+        # ручной выдачи: кнопки чат-админки заглушены (users.py: return False), а
+        # массовая выдача (admin_bulk_actions.py: _require_tariff_id) тариф уже требует.
         # 🔴 Триал сюда попадает ТЕМ ЖЕ маршрутом: ветка create зовёт
         # create_paid_subscription независимо от is_trial, а create_trial_subscription
         # со своим источником прав (squad_uuid) здесь не вызывается вовсе. Значит
         # без тарифа отравлен и триал, и забор обязан быть общим, а не сужённым.
-        if request.tariff_id is None:
+        # Проверка через truthiness, а не `is None`: остальная ветка ниже читает
+        # tariff_id так же, а у поля нет ge=1 — иначе tariff_id=0 прошёл бы забор.
+        if not request.tariff_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='tariff_id parameter is required: without a tariff the subscription gets no servers',
@@ -1284,22 +1287,27 @@ async def update_user_subscription(
         is_trial = request.is_trial or False
         traffic_limit = request.traffic_limit_gb or 100
         device_limit = request.device_limit or 1
-        connected_squads = []
 
-        # Get tariff for settings if provided
-        if request.tariff_id:
-            tariff = await get_tariff_by_id(db, request.tariff_id)
-            if tariff:
-                if tariff.entitlement_mode == 'access_point_managed':
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail='access-point subscriptions require the tariff checkout flow',
-                    )
-                if not request.traffic_limit_gb:
-                    traffic_limit = tariff.traffic_limit_gb
-                if not request.device_limit:
-                    device_limit = tariff.device_limit
-                connected_squads = None
+        # Тариф обязателен (забор выше), поэтому «тарифа нет в базе» — это отказ, а
+        # не тихий проход дальше: раньше такой запрос доезжал до create_paid_subscription
+        # с пустым connected_squads и падал голым ValueError → 500 без причины.
+        # Отказ 404 — тот же, что в соседней ветке change_tariff.
+        tariff = await get_tariff_by_id(db, request.tariff_id)
+        if not tariff:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail='Tariff not found',
+            )
+        if tariff.entitlement_mode == 'access_point_managed':
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='access-point subscriptions require the tariff checkout flow',
+            )
+        if not request.traffic_limit_gb:
+            traffic_limit = tariff.traffic_limit_gb
+        if not request.device_limit:
+            device_limit = tariff.device_limit
+        connected_squads = None
 
         from sqlalchemy.exc import IntegrityError
 
