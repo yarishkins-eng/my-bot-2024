@@ -125,12 +125,24 @@ def note_provider_lookup_outcome(attempt: CheckoutPaymentAttempt, outcome: str) 
     такую строку на часовом опросе значит поменять тихую потерю строк на вытеснение живых
     платежей из сверки, как только архив перевалит за двадцать. Здесь ставится тот же
     затухающий срок (6 ч → неделя), которым уже живут честно закрытые счета.
+
+    🔴 Гасится ТОЛЬКО архив. Операторская причина держит строку в пуле, но это не архив,
+    а холд по, возможно, ещё живому счёту: пока он длится, клиент не может оформить новую
+    покупку, а выход из него даёт только опрос. Отодвинуть такую строку на шесть часов
+    из-за одного таймаута значит запереть человека на шесть часов. Ей ключ сохраняем,
+    частоту оставляем общую.
+
+    🔴 Счётчик затухания — `reconcile_attempts`, а не `terminal_observations`. Второй
+    растёт только когда провайдер РЕАЛЬНО вернул терминальный статус, то есть на молчании
+    он стоит на нуле вечно, и «затухание» выродилось бы в плоские шесть часов — ровно тот
+    плоский интервал, который эта правка и убирает. Найдено линзой денег 20.08.2026.
     """
     if not reason_keeps_attempt_in_pool(attempt.reconciliation_reason):
         attempt.reconciliation_reason = outcome
         return
 
-    attempt.next_reconcile_at = datetime.now(UTC) + terminal_reconcile_delay(attempt.terminal_observations)
+    if str(attempt.reconciliation_reason or '').startswith(POOL_KEY_TERMINAL_PREFIX):
+        attempt.next_reconcile_at = datetime.now(UTC) + terminal_reconcile_delay(attempt.reconcile_attempts)
     logger.warning(
         'direct_provider_lookup_unresolved_pool_key_preserved',
         attempt_id=attempt.id,

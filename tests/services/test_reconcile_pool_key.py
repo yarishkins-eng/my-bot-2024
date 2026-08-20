@@ -296,3 +296,88 @@ async def test_unknown_provider_status_does_not_evict_the_row(swept) -> None:
     row.next_reconcile_at = PAST
     sync_db.commit()
     assert await run({'id': 'provider-47', 'error': 'gone'}) == ['provider-47'], 'строка выпала из следующего прохода'
+
+
+@pytest.mark.asyncio
+async def test_operator_hold_is_not_slowed_down(swept) -> None:
+    """Гасить надо АРХИВ, а не операторский холд.
+
+    🔴 Найдено линзой денег 20.08.2026 — дефект был в первой версии этой правки.
+    Операторская причина держит строку в пуле, но это не архив: пока холд длится,
+    заказ в `operator_review` и клиент не может оформить новую покупку, а выход
+    даёт только опрос. Отодвинуть такую строку на шесть часов из-за одного
+    таймаута значит запереть человека на шесть часов.
+    """
+    sync_db, run = swept
+    _seed(sync_db, attempt_id=48, status='operator_review', reason='provider_invoice_missing_or_elapsed_expiry')
+    sync_db.commit()
+
+    before = datetime.now(UTC)
+    await run()
+
+    row = sync_db.get(CheckoutPaymentAttempt, 48)
+    due = row.next_reconcile_at
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=UTC)
+    assert row.reconciliation_reason == 'provider_invoice_missing_or_elapsed_expiry', 'ключ отбора затёрт'
+    assert due - before < timedelta(hours=6), (
+        f'операторский холд отодвинут на {due - before} — клиент заперт всё это время'
+    )
+
+
+@pytest.mark.asyncio
+async def test_archived_row_decay_grows_with_polls(swept) -> None:
+    """Затухание обязано РАСТИ с числом опросов, а не стоять плоским.
+
+    🔴 Первая версия считала затухание по `terminal_observations`, а он растёт
+    только когда провайдер реально вернул терминальный статус: на молчании он
+    стоит на нуле вечно, и «6 ч → неделя» вырождалось в плоские шесть часов —
+    ровно тот интервал, который правка убирает. Найдено линзой денег.
+    """
+    sync_db, run = swept
+    _seed(sync_db, attempt_id=49, status='failed', reason='provider_terminal:canceled')
+    row = sync_db.get(CheckoutPaymentAttempt, 49)
+    row.reconcile_attempts = 40  # строка, которую опрашивали долго
+    sync_db.commit()
+
+    before = datetime.now(UTC)
+    await run()
+
+    sync_db.expire_all()
+    due = sync_db.get(CheckoutPaymentAttempt, 49).next_reconcile_at
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=UTC)
+    assert due - before >= timedelta(days=6), (
+        f'долго опрашиваемая строка получила всего {due - before} — затухание стоит плоским'
+    )
+
+
+def test_releasing_personal_data_needs_two_pieces_of_evidence() -> None:
+    """Замок отпускания персональных данных не должен держаться на побочном эффекте.
+
+    🔴 Найдено линзой необратимых операций 20.08.2026 — обратный риск ЭТОЙ правки.
+    До неё исход опроса затирал причину, и это СЛУЧАЙНО удерживало данные там, где
+    провайдер отвечает живым, но неузнанным статусом (всё вне PENDING/INPROGRESS).
+    Перестав затирать причину, мы сняли бы и эту случайную защиту. Теперь спрашиваются
+    две улики, и обе ставятся одной транзакцией при настоящем терминальном ответе.
+    """
+    from app.services import account_erasure_service as erasure
+
+    attempt = SimpleNamespace(status='failed', reconciliation_reason='provider_terminal:canceled')
+
+    assert erasure._safe_terminal_attempt(attempt, SimpleNamespace(status='CANCELED')) is True
+    assert erasure._safe_terminal_attempt(attempt, SimpleNamespace(status='HOLD')) is False, (
+        'провайдер отвечает живым статусом, а персональные данные уже отпускаются'
+    )
+    assert erasure._safe_terminal_attempt(attempt, SimpleNamespace(status='PENDING')) is False
+    assert erasure._safe_terminal_attempt(SimpleNamespace(status='pending', reconciliation_reason=None), None) is False
+
+
+def test_operator_reason_is_matched_exactly_not_by_prefix() -> None:
+    """Операторская причина сверяется на РАВЕНСТВО — так же, как в запросе воркера.
+
+    Мутация показала тихую потерю: замени `==` на `startswith`, и предикат в Python
+    скажет «строка в пуле», а SQL-выборка её не вернёт. Строка выпадет молча.
+    """
+    assert service.reason_keeps_attempt_in_pool('provider_invoice_missing_or_elapsed_expiry') is True
+    assert service.reason_keeps_attempt_in_pool('provider_invoice_missing_or_elapsed_expiry_and_more') is False

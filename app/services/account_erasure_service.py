@@ -205,18 +205,33 @@ def _has_live_subscription(subscriptions: list[Subscription]) -> bool:
     )
 
 
-def _safe_terminal_attempt(attempt: CheckoutPaymentAttempt) -> bool:
+_PROVIDER_TERMINAL_PAYMENT_STATUSES = frozenset({'FAILED', 'CANCELED', 'EXPIRED'})
+
+
+def _safe_terminal_attempt(attempt: CheckoutPaymentAttempt, payment=None) -> bool:
     """Only a canonical, exact provider terminal result releases PII.
 
     A locally cancelled UI or a fixed polling count is intentionally not
     considered final: Platega may still send an exact CONFIRMED callback.
+
+    🔴 Спрашиваются ДВЕ улики, а не одна, и обе ставятся одной транзакцией при
+    настоящем терминальном ответе провайдера: причина у попытки и статус у платежа.
+    Одной причины мало с 20.08.2026: до этой даты её затирал исход опроса, и это
+    случайно удерживало персональные данные там, где провайдер отвечает живым, но
+    неузнанным статусом (всё, что вне `PENDING`/`INPROGRESS`). Мы перестали затирать
+    причину — и вместе с миной BO сняли бы эту случайную защиту. Здесь она сделана
+    намеренной: замок отпускания ПДн не должен держаться на побочном эффекте.
     """
     # Тот же признак, что держит строку в пуле сверки: берём его оттуда, а не своей копией.
-    # Пока причина затёрта (мина BO), эта проверка даёт False, и заявка на удаление
-    # аккаунта висит в `awaiting_reconciliation`, ожидая сверки, которой уже не будет.
     from app.services.device_first_payment_service import POOL_KEY_TERMINAL_PREFIX
 
-    return attempt.status == 'failed' and str(attempt.reconciliation_reason or '').startswith(POOL_KEY_TERMINAL_PREFIX)
+    if attempt.status != 'failed':
+        return False
+    if not str(attempt.reconciliation_reason or '').startswith(POOL_KEY_TERMINAL_PREFIX):
+        return False
+    if payment is None:
+        return True
+    return str(getattr(payment, 'status', '') or '').upper() in _PROVIDER_TERMINAL_PAYMENT_STATUSES
 
 
 def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
@@ -235,7 +250,7 @@ def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
             )
         ):
             return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
-        if not _safe_terminal_attempt(attempt):
+        if not _safe_terminal_attempt(attempt, payment):
             return ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved'
     return ERASURE_READY, None
 
