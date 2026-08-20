@@ -1255,8 +1255,11 @@ async def update_user_subscription(
         # create_paid_subscription независимо от is_trial, а create_trial_subscription
         # со своим источником прав (squad_uuid) здесь не вызывается вовсе. Значит
         # без тарифа отравлен и триал, и забор обязан быть общим, а не сужённым.
-        # Проверка через truthiness, а не `is None`: остальная ветка ниже читает
-        # tariff_id так же, а у поля нет ge=1 — иначе tariff_id=0 прошёл бы забор.
+        # Проверка через truthiness, а не `is None`: у поля нет ge=1, а остальная
+        # ветка ниже читает tariff_id так же. Честная граница: `tariff_id=0` и без
+        # этого не создал бы отравленную подписку — поиск тарифа ниже вернул бы
+        # None и дал 404. Truthiness покупает ВЕРНЫЙ отказ (400 «тариф не передан»
+        # вместо 404 «тариф не найден»), а не защиту от мины.
         if not request.tariff_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1311,6 +1314,8 @@ async def update_user_subscription(
 
         from sqlalchemy.exc import IntegrityError
 
+        from app.services.public_location_entitlement_service import EntitlementResolutionError
+
         try:
             new_sub = await create_paid_subscription(
                 db=db,
@@ -1328,6 +1333,16 @@ async def update_user_subscription(
                 status_code=status.HTTP_409_CONFLICT,
                 detail='User already has an active subscription for this tariff. Extend it instead.',
             )
+        except EntitlementResolutionError as exc:
+            # Тариф в базе есть, но продавать его нечем: локация недоступна, сквады
+            # сняты, сопоставление не подтверждено. Это ВЕРОЯТНЫЙ отказ (старые группы
+            # GE/NL сняты с доступности намеренно), и он единственный на этом маршруте
+            # выходил голым 500. Соседние маршруты кабинета его уже переводят.
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f'Tariff has no verified entitlement policy: {exc}',
+            ) from exc
 
         # Sync to Remnawave panel
         await _sync_subscription_to_panel(db, user, new_sub)

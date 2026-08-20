@@ -5,10 +5,17 @@
 права на серверы не резолвит никто, и получается подписка с нулём серверов:
 VPN не работает, ошибки нет, кабинет молчит (мина A).
 
-Сторожа здесь три и они разные:
+Сторожа здесь разные и каждый про своё:
 1. маршрут отбивает запрос без тарифа и НЕ доходит до создания;
 2. то же для триала — он идёт этим же маршрутом и отравляется так же;
-3. `create_paid_subscription` физически не создаёт строку, если прав ноль.
+3. забор безусловный, а не только для одно-тарифного режима;
+4. отказы внятны: неизвестный тариф — 404, непродаваемый — 409, а не голый 500;
+5. `create_paid_subscription` не вставляет строку, если прав ноль.
+
+🔴 Граница пункта 5: это рельс запаса, а не общее свойство функции. Он
+срабатывает только при переданном `tariff_id`, и настоящий резолвер прав пустой
+список вернуть не может — он бросает исключение. Пункт 4 стережёт как раз тот
+отказ, который случается в жизни.
 """
 
 from __future__ import annotations
@@ -92,8 +99,9 @@ async def test_trial_without_tariff_is_rejected_too(monkeypatch) -> None:
 async def test_zero_tariff_id_is_rejected_too(monkeypatch) -> None:
     """`tariff_id=0` — не «тариф передан».
 
-    У поля нет `ge=1`, а вся ветка ниже читает `tariff_id` через истинность.
-    Проверка через `is None` пропустила бы ноль до самого низа и дала бы 500.
+    Честная граница: ноль и без этого не создал бы отравленную подписку — поиск
+    тарифа ниже вернул бы None и дал 404. Сторож пиннит ВЕРНЫЙ отказ: «тариф не
+    передан», а не «тариф не найден».
     """
     _single_tariff_mode(monkeypatch)
     monkeypatch.setattr(admin_users, 'get_user_by_id', AsyncMock(return_value=_healthy_user()))
@@ -204,3 +212,93 @@ async def test_zero_entitlement_never_produces_a_subscription_row(monkeypatch) -
         )
 
     db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guard_applies_in_multi_tariff_mode_too(monkeypatch) -> None:
+    """Забор безусловный, а не «только для одно-тарифного режима».
+
+    Мутация «сузить забор до `not is_multi_tariff and not tariff_id`» пережила
+    весь набор: все остальные тесты пиннят мультитариф выключенным, и сужение
+    в них не проявлялось. Здесь он ВКЛЮЧЁН.
+    """
+    monkeypatch.setattr(type(admin_users.settings), 'is_multi_tariff_enabled', lambda self: True)
+    monkeypatch.setattr(admin_users, 'get_user_by_id', AsyncMock(return_value=_healthy_user()))
+    creator = AsyncMock()
+    monkeypatch.setattr(subscription_crud, 'create_paid_subscription', creator)
+
+    with pytest.raises(HTTPException) as error:
+        await admin_users.update_user_subscription(
+            user_id=78,
+            request=UpdateSubscriptionRequest(action='create', days=30),
+            admin=SimpleNamespace(id=1),
+            db=SimpleNamespace(),
+        )
+
+    assert error.value.status_code == 400
+    creator.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_access_point_tariff_is_refused(monkeypatch) -> None:
+    """Тариф access-point выдаётся только через оплаченный расчёт, не отсюда.
+
+    Строка забора переехала в этом же пункте, а покрытия у неё не было вовсе:
+    её удаление не замечал ни один тест.
+    """
+    _single_tariff_mode(monkeypatch)
+    monkeypatch.setattr(admin_users, 'get_user_by_id', AsyncMock(return_value=_healthy_user()))
+    monkeypatch.setattr(
+        admin_users,
+        'get_tariff_by_id',
+        AsyncMock(return_value=SimpleNamespace(entitlement_mode='access_point_managed')),
+    )
+    creator = AsyncMock()
+    monkeypatch.setattr(subscription_crud, 'create_paid_subscription', creator)
+
+    with pytest.raises(HTTPException) as error:
+        await admin_users.update_user_subscription(
+            user_id=78,
+            request=UpdateSubscriptionRequest(action='create', days=30, tariff_id=7),
+            admin=SimpleNamespace(id=1),
+            db=SimpleNamespace(),
+        )
+
+    assert error.value.status_code == 409
+    creator.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unsellable_tariff_gives_a_reason_not_a_bare_500(monkeypatch) -> None:
+    """Тариф есть, но продавать нечем — самый вероятный отказ на этом маршруте.
+
+    Старые группы серверов сняты с доступности намеренно, поэтому такой отказ
+    живой. Раньше он выходил голым 500 без причины.
+    """
+    from app.services.public_location_entitlement_service import EntitlementResolutionError
+
+    _single_tariff_mode(monkeypatch)
+    monkeypatch.setattr(admin_users, 'get_user_by_id', AsyncMock(return_value=_healthy_user()))
+    monkeypatch.setattr(
+        admin_users,
+        'get_tariff_by_id',
+        AsyncMock(return_value=SimpleNamespace(entitlement_mode='native_squads', traffic_limit_gb=50, device_limit=2)),
+    )
+    monkeypatch.setattr(
+        subscription_crud,
+        'create_paid_subscription',
+        AsyncMock(side_effect=EntitlementResolutionError('tariff references unavailable Internal Squads')),
+    )
+    db = MagicMock()
+    db.rollback = AsyncMock()
+
+    with pytest.raises(HTTPException) as error:
+        await admin_users.update_user_subscription(
+            user_id=78,
+            request=UpdateSubscriptionRequest(action='create', days=30, tariff_id=3),
+            admin=SimpleNamespace(id=1),
+            db=db,
+        )
+
+    assert error.value.status_code == 409
+    assert 'unavailable Internal Squads' in error.value.detail
