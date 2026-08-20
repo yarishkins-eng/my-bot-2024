@@ -103,14 +103,24 @@ def _seed(sync_db, *, attempt_id: int, status: str, reason: str | None) -> None:
     )
 
 
-class _SilentProvider:
-    """Провайдер, который отвечает пустотой — ровно то, что случилось на боевом."""
+class _Provider:
+    """Провайдер, который отвечает так, как отвечал боевой.
 
-    def __init__(self, polled: list[str]):
+    🔴 Не ответить по-настоящему можно ТРЕМЯ способами, и каждый затирал ключ
+    отбора своей строкой кода: пустота, исключение и тело с неузнанным статусом.
+    Мутационный прогон 20.08 показал, что сторож на одной пустоте пропускает
+    два других — мутация переживала набор.
+    """
+
+    def __init__(self, polled: list[str], answer):
         self._polled = polled
+        self._answer = answer
 
     async def get_transaction(self, transaction_id):
         self._polled.append(transaction_id)
+        if isinstance(self._answer, Exception):
+            raise self._answer
+        return self._answer
 
 
 @pytest.fixture
@@ -118,9 +128,11 @@ def swept(monkeypatch):
     """Гоняет настоящий воркер и возвращает, кого он опросил."""
     sync_db, db = _make_db()
     polled: list[str] = []
-    monkeypatch.setattr(service, 'PlategaService', lambda: _SilentProvider(polled))
+    holder: dict = {'answer': None}
+    monkeypatch.setattr(service, 'PlategaService', lambda: _Provider(polled, holder['answer']))
 
-    async def run() -> list[str]:
+    async def run(answer=None) -> list[str]:
+        holder['answer'] = answer
         polled.clear()
         await service.reconcile_device_first_payments(db, limit=20)
         sync_db.expire_all()
@@ -207,20 +219,28 @@ async def test_ordinary_row_still_records_why_the_provider_was_silent(swept) -> 
     )
 
 
-def test_the_pool_key_matches_what_the_producer_actually_writes() -> None:
-    """Причина в сторожах — литерал, и он обязан совпадать с тем, что пишет код.
+def test_the_producer_writes_exactly_the_reason_the_predicate_expects() -> None:
+    """Производитель причины и предикат отбора обязаны сходиться.
 
-    🔴 Найдено вторым агентом: без этой проверки правка ОДНОГО производителя
-    (`_release_direct_terminal_invoice`) оставила бы все сторожа зелёными, а боевую
-    сверку сломала бы — потому что seed выше набран строкой, а не получен у кода.
-    Читателей у этого литерала пять, включая забор заявок на удаление аккаунта.
+    🔴 ЧЕСТНО О ГРАНИЦАХ. Эта проверка читает ИСХОДНИК, а такие сторожа в проекте
+    признаны слабыми. Поведенческую версию я писал дважды: через SQLite она падает
+    на таблице `users` (там JSONB, на SQLite не поднимается), через заглушки —
+    путь закрытия счёта не отрабатывает. По правилу двух попыток третьего захода
+    нет; пробел записан, а не замолчан.
+
+    Что она всё-таки ловит (проверено мутацией): переименование причины у ПОПЫТКИ.
+    Первая версия и этого не ловила — искала строку, которая встречается в функции
+    дважды, у попытки и у заказа, и переименование одной из них проходило мимо.
+    Чего не ловит: согласованное переименование производителя и константы разом.
+    Это и не поймать тестом — в боевой базе уже лежат строки со старым текстом.
     """
     produced = inspect.getsource(service._release_direct_terminal_invoice)
+    expected = f"attempt.reconciliation_reason = f'{service.POOL_KEY_TERMINAL_PREFIX}{{normalized_status.lower()}}'"
 
-    assert "f'provider_terminal:{normalized_status.lower()}'" in produced, (
-        'производитель причины изменился — сверьте seed сторожей и 8 строк, уже лежащих в боевой базе'
+    assert expected in produced, (
+        'производитель причины разошёлся с ключом отбора: строка, которую пишет код, '
+        'больше не признаётся предикатом воркера — и восемь строк, уже лежащих в боевой базе, осиротеют'
     )
-    assert service.reason_keeps_attempt_in_pool('provider_terminal:canceled') is True
 
 
 def test_a_chargeback_freeze_is_not_a_pool_key() -> None:
@@ -235,3 +255,44 @@ def test_a_chargeback_freeze_is_not_a_pool_key() -> None:
     assert service.reason_keeps_attempt_in_pool('status_lookup:empty') is False
     assert service.reason_keeps_attempt_in_pool(None) is False
     assert service.reason_keeps_attempt_in_pool('provider_invoice_missing_or_elapsed_expiry') is True
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_does_not_evict_the_row(swept) -> None:
+    """Не ответить можно и исключением — это второй затиратель ключа.
+
+    Найдено мутацией: сторож, проверяющий только пустой ответ, эту строку кода
+    не исполняет вовсе и потому переживает её поломку.
+    """
+    sync_db, run = swept
+    _seed(sync_db, attempt_id=46, status='failed', reason='provider_terminal:canceled')
+    sync_db.commit()
+
+    assert await run(TimeoutError('провайдер не ответил')) == ['provider-46']
+    row = sync_db.get(CheckoutPaymentAttempt, 46)
+    assert row.reconciliation_reason == 'provider_terminal:canceled', 'исключение при опросе затёрло ключ отбора'
+
+    row.next_reconcile_at = PAST
+    sync_db.commit()
+    assert await run(TimeoutError('снова')) == ['provider-46'], 'после исключения строка выпала из следующего прохода'
+
+
+@pytest.mark.asyncio
+async def test_unknown_provider_status_does_not_evict_the_row(swept) -> None:
+    """Третий затиратель: тело есть, статус неузнан.
+
+    Его не заметил ни я, ни первый разбор — нашла атака на замысел. Тот же сбой
+    провайдера, что отдаёт пустоту, отдаёт и частичные тела, поэтому вторая волна
+    выпавших пришла бы с другой причиной и выглядела бы как новый баг.
+    """
+    sync_db, run = swept
+    _seed(sync_db, attempt_id=47, status='failed', reason='provider_terminal:canceled')
+    sync_db.commit()
+
+    assert await run({'id': 'provider-47', 'error': 'gone'}) == ['provider-47']
+    row = sync_db.get(CheckoutPaymentAttempt, 47)
+    assert row.reconciliation_reason == 'provider_terminal:canceled', 'неузнанный статус затёр ключ отбора'
+
+    row.next_reconcile_at = PAST
+    sync_db.commit()
+    assert await run({'id': 'provider-47', 'error': 'gone'}) == ['provider-47'], 'строка выпала из следующего прохода'
