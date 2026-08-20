@@ -1244,6 +1244,28 @@ async def update_user_subscription(
         subscription = next((s for s in subs if s.is_active), subs[0] if subs else None)
 
     if request.action == 'create':
+        # Пункт 2.2б. Без тарифа права на серверы не резолвит НИКТО: ниже
+        # connected_squads остаётся [], а create_paid_subscription включает свой
+        # забор ('tariff entitlement resolution produced no squads') только при
+        # tariff_id is not None. Итог — подписка с нулём серверов: VPN не работает,
+        # ошибки нет, кабинет молчит (мина A). Это единственный НЕЗАЩИЩЁННЫЙ путь
+        # ручной выдачи: кнопки чат-админки заглушены (users.py: return False), а
+        # массовая выдача (admin_bulk_actions.py: _require_tariff_id) тариф уже требует.
+        # 🔴 Триал сюда попадает ТЕМ ЖЕ маршрутом: ветка create зовёт
+        # create_paid_subscription независимо от is_trial, а create_trial_subscription
+        # со своим источником прав (squad_uuid) здесь не вызывается вовсе. Значит
+        # без тарифа отравлен и триал, и забор обязан быть общим, а не сужённым.
+        # Проверка через truthiness, а не `is None`: у поля нет ge=1, а остальная
+        # ветка ниже читает tariff_id так же. Честная граница: `tariff_id=0` и без
+        # этого не создал бы отравленную подписку — поиск тарифа ниже вернул бы
+        # None и дал 404. Truthiness покупает ВЕРНЫЙ отказ (400 «тариф не передан»
+        # вместо 404 «тариф не найден»), а не защиту от мины.
+        if not request.tariff_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='tariff_id parameter is required: without a tariff the subscription gets no servers',
+            )
+
         # In multi-tariff mode, allow creating additional subscriptions
         if subscription and not is_multi_tariff:
             raise HTTPException(
@@ -1268,24 +1290,31 @@ async def update_user_subscription(
         is_trial = request.is_trial or False
         traffic_limit = request.traffic_limit_gb or 100
         device_limit = request.device_limit or 1
-        connected_squads = []
 
-        # Get tariff for settings if provided
-        if request.tariff_id:
-            tariff = await get_tariff_by_id(db, request.tariff_id)
-            if tariff:
-                if tariff.entitlement_mode == 'access_point_managed':
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail='access-point subscriptions require the tariff checkout flow',
-                    )
-                if not request.traffic_limit_gb:
-                    traffic_limit = tariff.traffic_limit_gb
-                if not request.device_limit:
-                    device_limit = tariff.device_limit
-                connected_squads = None
+        # Тариф обязателен (забор выше), поэтому «тарифа нет в базе» — это отказ, а
+        # не тихий проход дальше: раньше такой запрос доезжал до create_paid_subscription
+        # с пустым connected_squads и падал голым ValueError → 500 без причины.
+        # Отказ 404 — тот же, что в соседней ветке change_tariff.
+        tariff = await get_tariff_by_id(db, request.tariff_id)
+        if not tariff:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail='Tariff not found',
+            )
+        if tariff.entitlement_mode == 'access_point_managed':
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='access-point subscriptions require the tariff checkout flow',
+            )
+        if not request.traffic_limit_gb:
+            traffic_limit = tariff.traffic_limit_gb
+        if not request.device_limit:
+            device_limit = tariff.device_limit
+        connected_squads = None
 
         from sqlalchemy.exc import IntegrityError
+
+        from app.services.public_location_entitlement_service import EntitlementResolutionError
 
         try:
             new_sub = await create_paid_subscription(
@@ -1304,6 +1333,16 @@ async def update_user_subscription(
                 status_code=status.HTTP_409_CONFLICT,
                 detail='User already has an active subscription for this tariff. Extend it instead.',
             )
+        except EntitlementResolutionError as exc:
+            # Тариф в базе есть, но продавать его нечем: локация недоступна, сквады
+            # сняты, сопоставление не подтверждено. Это ВЕРОЯТНЫЙ отказ (старые группы
+            # GE/NL сняты с доступности намеренно), и он единственный на этом маршруте
+            # выходил голым 500. Соседние маршруты кабинета его уже переводят.
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f'Tariff has no verified entitlement policy: {exc}',
+            ) from exc
 
         # Sync to Remnawave panel
         await _sync_subscription_to_panel(db, user, new_sub)
