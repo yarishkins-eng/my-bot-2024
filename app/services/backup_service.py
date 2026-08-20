@@ -566,19 +566,55 @@ class BackupService:
             next_run += interval
         return next_run
 
+    # Что именно не кладём в копию намеренно — и как это назвать человеку.
+    # Журнал мониторинга выключается настройкой `BACKUP_INCLUDE_LOGS`,
+    # `alembic_version` — служебная таблица Alembic, модели у неё нет.
+    _DELIBERATE_EXCLUSIONS = {
+        'monitoring_logs': 'журнал мониторинга (настройка «Включать логи»)',
+        'alembic_version': 'служебная таблица миграций',
+    }
+
+    def _deliberate_exclusions(self, include_logs: bool) -> set[str]:
+        excluded = {'alembic_version'}
+        if not include_logs:
+            excluded.add(MonitoringLog.__tablename__)
+        return excluded
+
     def _covered_tables(self, include_logs: bool) -> set[str]:
         """Таблицы, которые бекап обязан содержать, плюс намеренные исключения.
 
-        Исключения именно намеренные: журнал мониторинга выключается настройкой
-        `BACKUP_INCLUDE_LOGS`, а `alembic_version` — служебная таблица Alembic,
-        модели у неё нет. Всё, что не здесь, — забытая таблица, а не решение.
+        Всё, чего здесь нет, — забытая таблица, а не решение.
         """
         covered = {model.__tablename__ for model in self._get_models_for_backup(include_logs)}
         covered |= set(self.association_tables)
-        covered.add('alembic_version')
-        if not include_logs:
-            covered.add(MonitoringLog.__tablename__)
-        return covered
+        return covered | self._deliberate_exclusions(include_logs)
+
+    def _excluded_on_purpose(self, overview: dict[str, Any], include_logs: bool) -> list[str]:
+        """Намеренные исключения, в которых есть данные — словами, для человека.
+
+        Без этой строки владелец видит «140 таблиц» вместо вчерашних «142» и
+        читает это как потерю: объяснение существует только в комментарии кода.
+        """
+        excluded = self._deliberate_exclusions(include_logs)
+        return [
+            f'{self._DELIBERATE_EXCLUSIONS.get(table["name"], table["name"])} — {table["rows"]:,}'
+            for table in overview.get('tables', [])
+            if table.get('name') in excluded and table.get('rows')
+        ]
+
+    def _missing_records(self, overview: dict[str, Any], include_logs: bool, saved_records: int) -> int:
+        """Сколько строк НЕ доехало до файла сверх намеренных исключений.
+
+        Ловит то, чего не поймает ни один тест на CI: экспорт таблицы упал в рантайме
+        (`_export_database_via_orm` глушит ошибку, кладёт пустой список и идёт дальше),
+        а число таблиц в отчёте берётся из длины списка и остаётся прежним. Отчёт
+        выглядел бы здоровым при копии без денег.
+        """
+        excluded = self._deliberate_exclusions(include_logs)
+        expected = overview.get('total_records', 0) - sum(
+            table.get('rows', 0) for table in overview.get('tables', []) if table.get('name') in excluded
+        )
+        return max(expected - saved_records, 0)
 
     def _unsaved_tables(self, overview: dict[str, Any], include_logs: bool) -> list[str]:
         """Таблицы с данными, о которых бекап не знает вовсе.
@@ -652,6 +688,8 @@ class BackupService:
                 tables_count = database_info.get('tables_count', 0)
                 total_records = database_info.get('total_records', 0)
                 unsaved_tables = self._unsaved_tables(overview, include_logs)
+                excluded_on_purpose = self._excluded_on_purpose(overview, include_logs)
+                missing_records = self._missing_records(overview, include_logs, total_records)
                 files_info = await self._collect_files(staging_dir, include_logs=include_logs)
                 data_snapshot_info = await self._collect_data_snapshot(staging_dir)
 
@@ -699,9 +737,13 @@ class BackupService:
                 f'📈 Записей в файле: {total_records:,}\n'
                 f'💾 Размер: {size_mb:.2f} MB'
             )
+            if excluded_on_purpose:
+                message += '\nℹ️ Намеренно вне копии: ' + '; '.join(excluded_on_purpose)
             if unsaved_tables:
                 names = ', '.join(unsaved_tables)
                 message += f'\n⚠️ Вне копии осталось таблиц с данными: {len(unsaved_tables)} — {names}'
+            if missing_records:
+                message += f'\n⚠️ Не доехало до файла записей: {missing_records:,} — копия НЕПОЛНАЯ'
 
             logger.info(message)
 
@@ -1095,15 +1137,20 @@ class BackupService:
             # Числа — те, что РЕАЛЬНО легли в базу. Прежде печаталось содержимое
             # metadata, то есть обещание файла: строки, отбитые внешним ключом,
             # `_restore_table_records` глушит, и оператор видел успех вместо потери.
-            if restored is not None:
-                tables_text, records_text = str(restored[0]), f'{restored[1]:,}'
+            # 🔴 Одно ЧИСЛО, которое можно проверить: записей легло против записей в файле.
+            # Прежняя пара «таблиц восстановлено / таблиц в файле» несравнима — пустая
+            # таблица в счёт восстановленных не идёт, и на боевом отчёт читался бы как
+            # «потеряно 93 таблицы» (найдено прогоном сценария 20.08.2026).
+            in_file = metadata.get('total_records', 0)
+            if restored is None:
+                records_text = f'{in_file:,} — по описи файла, фактическое число неизвестно'
+            elif restored[1] >= in_file:
+                records_text = f'{restored[1]:,} из {in_file:,} — всё'
             else:
-                tables_text = f'{metadata.get("tables_count", 0)} (по описи файла)'
-                records_text = f'{metadata.get("total_records", 0):,} (по описи файла)'
+                records_text = f'{restored[1]:,} из {in_file:,} — 🔴 НЕ ВСЁ, разница {in_file - restored[1]:,}'
 
             message = (
                 f'✅ Восстановление завершено!\n'
-                f'📊 Таблиц восстановлено: {tables_text}\n'
                 f'📈 Записей восстановлено: {records_text}\n'
                 f'📅 Дата бекапа: {metadata.get("timestamp", "неизвестно")}'
             )
@@ -1313,11 +1360,18 @@ class BackupService:
                         restored_tables += 1
                         logger.info('✅ Таблица восстановлена', table_name=table_name)
 
-                await self._restore_users_without_referrals(
+                # Пользователи восстанавливаются отдельной функцией из-за самоссылки
+                # `referred_by_id`. Их счёт обязан войти в общий: иначе отчёт «записей
+                # восстановлено» молча меньше файла ровно на число пользователей, и это
+                # читается как потеря (найдено прогоном сценария 20.08.2026).
+                restored_users = await self._restore_users_without_referrals(
                     db,
                     backup_data,
                     models_by_table,
                 )
+                restored_records += restored_users
+                if restored_users:
+                    restored_tables += 1
 
                 for model in models_for_restore:
                     table_name = model.__tablename__
@@ -1421,14 +1475,15 @@ class BackupService:
         logger.info(message)
         return True, message
 
-    async def _restore_users_without_referrals(self, db: AsyncSession, backup_data: dict, models_by_table: dict):
+    async def _restore_users_without_referrals(self, db: AsyncSession, backup_data: dict, models_by_table: dict) -> int:
         users_data = backup_data.get('users', [])
         if not users_data:
-            return
+            return 0
 
         logger.info('👥 Восстанавливаем пользователей без реферальных связей', users_data_count=len(users_data))
 
         User = models_by_table['users']
+        restored_users = 0
 
         for user_data in users_data:
             try:
@@ -1480,6 +1535,8 @@ class BackupService:
                         )
                         continue
 
+                restored_users += 1
+
             except Exception as e:
                 logger.error('Ошибка при восстановлении пользователя', error=e)
                 raise
@@ -1489,7 +1546,8 @@ class BackupService:
                 await db.flush()
         except IntegrityError as e:
             logger.warning('IntegrityError при flush пользователей, savepoint откачен', e=e)
-        logger.info('✅ Пользователи без реферальных связей восстановлены')
+        logger.info('✅ Пользователи без реферальных связей восстановлены', restored_users=restored_users)
+        return restored_users
 
     async def _update_user_referrals(self, db: AsyncSession, backup_data: dict):
         users_data = backup_data.get('users', [])

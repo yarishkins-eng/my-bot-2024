@@ -55,6 +55,11 @@ SERIALIZABLE_TYPE_FAMILIES = (
 )
 
 
+def _live_table_names() -> list[str]:
+    """Как таблицы видит сама база: модели + таблицы связей + служебная alembic_version."""
+    return sorted(set(Base.metadata.tables) | {'alembic_version'})
+
+
 def _backup_tables() -> list[str]:
     """Таблицы в том порядке, в каком их пишет и читает бекап."""
     models = backup_service._get_models_for_backup(include_logs=True)
@@ -243,8 +248,10 @@ async def test_backup_report_is_silent_when_nothing_is_forgotten(tmp_path, monke
         return {
             'tables_count': 142,
             'total_records': 14246,
-            'tables': [{'name': name, 'rows': 1} for name in sorted(Base.metadata.tables)]
-            + [{'name': 'alembic_version', 'rows': 1}],
+            # 🔴 Список берётся из ЖИВОЙ базы (как его отдаёт `inspect().get_table_names()`),
+            # а не из `Base.metadata`: собранный из того же источника, что и проверяемое
+            # множество, он делал тест тавтологией — покраснеть он не мог никогда.
+            'tables': [{'name': name, 'rows': 1} for name in _live_table_names()],
         }
 
     async def fake_dump(staging_dir, include_logs):
@@ -343,11 +350,123 @@ def test_clear_before_restore_reaches_every_backed_up_table() -> None:
                 cleared.add(name)
                 grew = True
 
-    unreachable = sorted(set(_backup_tables()) | set(backup_service.association_tables) - cleared)
-    unreachable = [name for name in unreachable if name not in cleared]
+    expected = set(_backup_tables()) | set(backup_service.association_tables)
+    unreachable = sorted(expected - cleared)
 
     assert not unreachable, (
         f'«Очистить и восстановить» не опустошит эти таблицы: {unreachable}. '
         'Строка из копии упадёт на уникальном ключе поверх живой, и восстановление '
         'молча смешает два состояния. Добавьте их в `all_tables` и в `preserve_if_no_backup`.'
     )
+
+
+def _fake_session():
+    """Сессия, достаточная для `_restore_table_records`: savepoint + flush + пустой select."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    db.execute.return_value = result
+
+    savepoint = MagicMock()
+    savepoint.__aenter__ = AsyncMock(return_value=savepoint)
+    savepoint.__aexit__ = AsyncMock(return_value=False)
+    db.begin_nested = MagicMock(return_value=savepoint)
+    db.add = MagicMock()
+    return db
+
+
+@pytest.mark.asyncio
+async def test_transaction_is_inserted_without_the_checkout_link() -> None:
+    """Ссылка на заказ обязана быть ОТЛОЖЕНА при вставке транзакции.
+
+    `transactions` и `subscription_checkouts` ссылаются друг на друга, и заказ
+    восстанавливается позже. Вставить ссылку сразу — значит нарушить внешний ключ,
+    а `_restore_table_records` глушит такую ошибку и теряет ВСЮ строку: на боевом
+    под это подпадали 17 денежных записей из 226.
+    """
+    from app.database.models import Transaction
+
+    db = _fake_session()
+    record = {'id': 500, 'user_id': 1, 'type': 'deposit', 'amount_kopeks': 1000, 'device_first_checkout_id': 77}
+
+    restored = await backup_service._restore_table_records(db, Transaction, 'transactions', [record], False)
+
+    assert restored == 1
+    assert db.add.call_count == 1
+    instance = db.add.call_args[0][0]
+    assert instance.device_first_checkout_id is None, 'Ссылка на заказ вставлена сразу — строка упадёт на внешнем ключе'
+    assert instance.amount_kopeks == 1000, 'Отложить надо ТОЛЬКО ссылку, остальные поля обязаны доехать'
+
+
+@pytest.mark.asyncio
+async def test_deferred_checkout_link_is_restored_afterwards() -> None:
+    """Отложенная ссылка обязана быть проставлена после восстановления заказов."""
+    from unittest.mock import AsyncMock
+
+    from app.database.models import SubscriptionCheckout, Transaction
+
+    transaction = Transaction(id=500, user_id=1, type='deposit', amount_kopeks=1000)
+    checkout = SubscriptionCheckout(id=77)
+
+    db = AsyncMock()
+
+    async def fake_get(model, pk):
+        if model is Transaction:
+            return transaction if pk == 500 else None
+        return checkout if pk == 77 else None
+
+    db.get = fake_get
+
+    await backup_service._relink_checkout_transactions(
+        db, {'transactions': [{'id': 500, 'device_first_checkout_id': 77}]}
+    )
+
+    assert transaction.device_first_checkout_id == 77, 'Отложенная ссылка так и не проставлена'
+
+
+@pytest.mark.asyncio
+async def test_deferred_link_is_not_forced_onto_a_missing_checkout() -> None:
+    """Если заказ не восстановился — ссылку ставить нельзя, иначе внешний ключ упадёт."""
+    from unittest.mock import AsyncMock
+
+    from app.database.models import Transaction
+
+    transaction = Transaction(id=500, user_id=1, type='deposit', amount_kopeks=1000)
+    db = AsyncMock()
+
+    async def fake_get(model, pk):
+        return transaction if model is Transaction else None
+
+    db.get = fake_get
+
+    await backup_service._relink_checkout_transactions(
+        db, {'transactions': [{'id': 500, 'device_first_checkout_id': 77}]}
+    )
+
+    assert transaction.device_first_checkout_id is None
+
+
+def test_orphan_tables_are_preserved_when_an_old_archive_lacks_them() -> None:
+    """Шесть «сиротских» таблиц обязаны быть и в очистке, и в списке сохранения.
+
+    Семь архивов на сервере сняты кодом до 20.08.2026 и этих таблиц не содержат.
+    Без записи в `preserve_if_no_backup` восстановление из них стирало бы данные
+    насухо — то есть правка ухудшила бы поведение задним числом.
+    """
+    source = inspect.getsource(backup_service._clear_database_tables)
+    preserved = set(re.findall(r"'([a-z0-9_]+)'", source.split('preserve_if_no_backup = {', 1)[1].split('}', 1)[0]))
+    truncated = set(re.findall(r"'([a-z0-9_]+)'", source.split('all_tables = [', 1)[1].split('\n        ]', 1)[0]))
+
+    orphans = {
+        'public_locations',
+        'public_location_squad_mappings',
+        'public_access_points',
+        'public_access_point_squad_mappings',
+        'entitlement_cleanup_tombstones',
+        'apple_notifications',
+    }
+
+    assert orphans <= truncated, f'Не очищаются: {sorted(orphans - truncated)}'
+    assert orphans <= preserved, f'Старый архив сотрёт их насухо: {sorted(orphans - preserved)}'
