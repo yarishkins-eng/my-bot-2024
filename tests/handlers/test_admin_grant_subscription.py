@@ -57,7 +57,9 @@ class _Tariff:
         self.show_in_gift = show_in_gift
         self.is_trial_available = is_trial_available
         self.entitlement_mode = entitlement_mode
-        self.traffic_limit_gb = 100
+        # 🔴 НЕ 100: столько же в `settings.DEFAULT_TRAFFIC_LIMIT_GB`, и снятый этим этапом
+        # код писал именно его — проверка «трафик из тарифа» проходила бы по совпадению.
+        self.traffic_limit_gb = 77
         self.device_limit = 3
 
     @property
@@ -183,7 +185,7 @@ async def test_paid_grant_never_picks_servers_itself():
     kwargs = created.await_args.kwargs
     assert kwargs['tariff_id'] == 3, 'без тарифа сторож прав не включается вовсе'
     assert kwargs['connected_squads'] is None, 'серверы подставлены руками — это обход сторожа прав'
-    assert kwargs['traffic_limit_gb'] == 100, 'трафик обязан приходить из тарифа'
+    assert kwargs['traffic_limit_gb'] == 77, 'трафик обязан приходить из тарифа, а не из настроек'
     assert kwargs['device_limit'] == 3, 'устройства обязаны приходить из тарифа'
     assert kwargs['duration_days'] == 90
     assert 'Базовый' in detail
@@ -201,6 +203,14 @@ async def test_a_gift_never_arms_autopay_against_its_recipient():
     assert subscription.autopay_enabled is True, 'дубль обязан начинать с включённого — иначе тест пустой'
 
     db = AsyncMock()
+    seen = {}
+
+    async def _panel_call(*args, **kwargs):
+        # Снимок В МОМЕНТ синхронизации: именно внутри неё лежит ветка с откатом,
+        # которая теряет гашение, если оно ещё не закоммичено.
+        seen['commits_before_panel'] = db.commit.await_count
+        seen['autopay_before_panel'] = subscription.autopay_enabled
+        return _panel_user()
 
     with (
         patch.object(admin_users, '_resolve_admin_subscription', AsyncMock(return_value=None)),
@@ -208,16 +218,17 @@ async def test_a_gift_never_arms_autopay_against_its_recipient():
         patch('app.database.crud.subscription.create_paid_subscription', AsyncMock(return_value=subscription)),
         patch(
             'app.services.subscription_service.SubscriptionService.create_remnawave_user',
-            AsyncMock(return_value=_panel_user()),
+            AsyncMock(side_effect=_panel_call),
         ),
     ):
         success, _ = await admin_users._grant_paid_subscription(db, 196, 90, 1)
 
     assert success is True
     assert subscription.autopay_enabled is False, 'подарок взвёл автосписание с получателя'
-    # Гашение обязано быть ЗАКОММИЧЕНО: строка подписки уже создана отдельным коммитом,
-    # а ниже идёт синхронизация с панелью, внутри которой есть ветка с откатом.
-    db.commit.assert_awaited()
+    # 🔴 Порядок, а не факт: `assert_awaited()` останется зелёным и если коммит уехал
+    # ПОСЛЕ синхронизации — то есть ровно при мине CM, ради которой правка делалась.
+    assert seen['autopay_before_panel'] is False, 'гашение не успело до синхронизации с панелью'
+    assert seen['commits_before_panel'] >= 1, 'гашение не закоммичено до ветки с откатом — мина CM жива'
 
 
 @pytest.mark.asyncio
