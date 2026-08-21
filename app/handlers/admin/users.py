@@ -3559,7 +3559,11 @@ async def activate_user_subscription(callback: types.CallbackQuery, db_user: Use
 
 @admin_required
 @error_handler
-async def grant_trial_subscription(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def grant_trial_subscription(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    # Четвёртая дыра того же залипания: со старого сообщения «введите количество дней»
+    # можно уйти сюда, и ожидание текста пережило бы выдачу триала.
+    await _clear_granting_state(state)
+
     user_id = int(callback.data.split('_')[-1])
 
     success, detail = await _grant_trial_subscription(db, user_id, db_user.id)
@@ -4951,7 +4955,13 @@ async def _grant_paid_subscription(
         # (`monitoring_service`) отбирает по `autopay_enabled AND NOT is_trial` БЕЗ
         # проверки «человек когда-либо платил»: за три дня до конца подарка он
         # попытался бы списать продление с баланса получателя. Гасим явно.
+        #
+        # 🔴 И коммитим ТУТ ЖЕ. `create_paid_subscription` уже закоммитила строку, то есть
+        # гашение живёт пока только в памяти сессии. Ниже идёт синхронизация с панелью, а
+        # внутри неё есть ветка с `db.rollback()` — она бы это гашение потеряла, и подарок
+        # дожил бы до конца срока с заряженным автосписанием.
         subscription.autopay_enabled = False
+        await db.commit()
 
         subscription_service = SubscriptionService()
         panel_user = await subscription_service.create_remnawave_user(db, subscription)

@@ -200,6 +200,8 @@ async def test_a_gift_never_arms_autopay_against_its_recipient():
     subscription = _subscription(['squad-de'])
     assert subscription.autopay_enabled is True, 'дубль обязан начинать с включённого — иначе тест пустой'
 
+    db = AsyncMock()
+
     with (
         patch.object(admin_users, '_resolve_admin_subscription', AsyncMock(return_value=None)),
         patch.object(admin_users, '_resolve_grantable_tariff', AsyncMock(return_value=_Tariff(3, 'Базовый'))),
@@ -209,10 +211,13 @@ async def test_a_gift_never_arms_autopay_against_its_recipient():
             AsyncMock(return_value=_panel_user()),
         ),
     ):
-        success, _ = await admin_users._grant_paid_subscription(AsyncMock(), 196, 90, 1)
+        success, _ = await admin_users._grant_paid_subscription(db, 196, 90, 1)
 
     assert success is True
     assert subscription.autopay_enabled is False, 'подарок взвёл автосписание с получателя'
+    # Гашение обязано быть ЗАКОММИЧЕНО: строка подписки уже создана отдельным коммитом,
+    # а ниже идёт синхронизация с панелью, внутри которой есть ветка с откатом.
+    db.commit.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -379,5 +384,5 @@ async def test_cancel_command_does_what_the_screen_promises():
         await handler(message, SimpleNamespace(id=1), state, AsyncMock())
 
     assert state.cleared is True
-    grant.assert_not_awaited(), 'по /cancel подписку выдавать нельзя'
+    grant.assert_not_awaited()
     assert 'отменена' in message.answer.await_args[0][0]
