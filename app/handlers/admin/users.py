@@ -3553,7 +3553,7 @@ async def activate_user_subscription(callback: types.CallbackQuery, db_user: Use
 async def grant_trial_subscription(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     user_id = int(callback.data.split('_')[-1])
 
-    success = await _grant_trial_subscription(db, user_id, db_user.id)
+    success, detail = await _grant_trial_subscription(db, user_id, db_user.id)
 
     if success:
         # Авто-обновление меню у пользователя в Telegram (без /start), best-effort:
@@ -3565,7 +3565,7 @@ async def grant_trial_subscription(callback: types.CallbackQuery, db_user: User,
             await notify_trial_menu(db, _target)
 
         await callback.message.edit_text(
-            '✅ Пользователю выдан триальный период',
+            _grant_outcome_text('✅ Пользователю выдан триальный период', detail),
             reply_markup=types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -3578,7 +3578,7 @@ async def grant_trial_subscription(callback: types.CallbackQuery, db_user: User,
         )
     else:
         await callback.message.edit_text(
-            '❌ Ошибка выдачи триального периода',
+            _grant_outcome_text('❌ Ошибка выдачи триального периода', detail),
             reply_markup=types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -3632,7 +3632,7 @@ async def process_subscription_grant_days(callback: types.CallbackQuery, db_user
     user_id = int(parts[-2])
     days = int(parts[-1])
 
-    success = await _grant_paid_subscription(db, user_id, days, db_user.id)
+    success, detail = await _grant_paid_subscription(db, user_id, days, db_user.id)
 
     if success:
         # Авто-обновление меню подписчика у пользователя в Telegram (без /start), best-effort.
@@ -3644,7 +3644,7 @@ async def process_subscription_grant_days(callback: types.CallbackQuery, db_user
 
     if success:
         await callback.message.edit_text(
-            f'✅ Пользователю выдана подписка на {days} дней',
+            _grant_outcome_text(f'✅ Пользователю выдана подписка на {days} дней', detail),
             reply_markup=types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -3657,7 +3657,7 @@ async def process_subscription_grant_days(callback: types.CallbackQuery, db_user
         )
     else:
         await callback.message.edit_text(
-            '❌ Ошибка выдачи подписки',
+            _grant_outcome_text('❌ Ошибка выдачи подписки', detail),
             reply_markup=types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -3690,7 +3690,7 @@ async def process_subscription_grant_text(message: types.Message, db_user: User,
             await message.answer('❌ Количество дней должно быть от 1 до 730')
             return
 
-        success = await _grant_paid_subscription(db, user_id, days, db_user.id)
+        success, detail = await _grant_paid_subscription(db, user_id, days, db_user.id)
 
         if success:
             # Авто-обновление меню подписчика у пользователя в Telegram (без /start), best-effort.
@@ -3702,7 +3702,7 @@ async def process_subscription_grant_text(message: types.Message, db_user: User,
 
         if success:
             await message.answer(
-                f'✅ Пользователю выдана подписка на {days} дней',
+                _grant_outcome_text(f'✅ Пользователю выдана подписка на {days} дней', detail),
                 reply_markup=types.InlineKeyboardMarkup(
                     inline_keyboard=[
                         [
@@ -3714,7 +3714,7 @@ async def process_subscription_grant_text(message: types.Message, db_user: User,
                 ),
             )
         else:
-            await message.answer('❌ Ошибка выдачи подписки')
+            await message.answer(_grant_outcome_text('❌ Ошибка выдачи подписки', detail))
 
     except ValueError:
         await message.answer('❌ Введите корректное число дней')
@@ -4713,82 +4713,144 @@ async def _activate_user_subscription(
         return False
 
 
+def _grant_outcome_text(headline: str, detail: str | None) -> str:
+    """Собирает ответ админу на нажатие кнопки выдачи.
+
+    🔴 `detail` содержит ИМЯ ТАРИФА, а сообщения админки уходят в Телеграм с
+    разметкой HTML. Тариф со знаком «<» в названии (его правит сам владелец в
+    админке) сделал бы сообщение невалидным: Телеграм ответил бы 400, а
+    `@error_handler` подменил бы ответ общим «Произошла ошибка» — и админ не
+    узнал бы ни результата, ни причины. Экранируем здесь, в одном месте на все
+    три точки вызова.
+    """
+    if not detail:
+        return headline
+    return f'{headline}\n\n{html.escape(detail)}'
+
+
+async def _resolve_grantable_tariff(db: AsyncSession):
+    """Тариф для админского подарка платной подписки.
+
+    Оба ЖИВЫХ пути выдачи в кабинете тариф не выбирают за админа — они его
+    ТРЕБУЮТ и отказывают без него (`cabinet/routes/admin_users.py` ветка
+    `create`, пункт 2.2б; `cabinet/routes/admin_bulk_actions.py:_require_tariff_id`).
+    В чате номер тарифа прислать некому, поэтому здесь он резолвится, но по тому
+    же правилу: однозначно или никак. Догадка на этом месте молча подарит не тот
+    тариф, а «не тот тариф» — это не тот срок, не тот трафик и не те страны.
+
+    Отбор повторяет вопросы кабинета: тариф активен, не бесплатный (бесплатный
+    дарить нечего) и не `access_point_managed` — последний требует оплаченного
+    Device-First-расчёта, `create_paid_subscription` его всё равно отобьёт.
+    """
+    from app.database.crud.tariff import get_all_tariffs
+
+    tariffs = await get_all_tariffs(db, include_inactive=False)
+    grantable = [
+        tariff
+        for tariff in tariffs
+        if not bool(getattr(tariff, 'is_free', False))
+        and getattr(tariff, 'entitlement_mode', None) != 'access_point_managed'
+    ]
+
+    if not grantable:
+        raise ValueError('нет ни одного активного платного тарифа — выдавать нечего')
+    if len(grantable) > 1:
+        names = ', '.join(f'«{tariff.name}»' for tariff in grantable)
+        raise ValueError(f'подходит больше одного тарифа ({names}) — выберите его кнопкой «💳 Купить тариф»')
+
+    return grantable[0]
+
+
 async def _grant_trial_subscription(
     db: AsyncSession, user_id: int, admin_id: int, subscription_id: int | None = None
-) -> bool:
-    try:
-        logger.error('Legacy admin trial grant is retired; select a tariff location policy instead', admin_id=admin_id)
-        return False
+) -> tuple[bool, str | None]:
+    """Выдать триал из переписки. Возвращает (успех, что сказать админу).
 
+    🟢 Запор 8 августа (коммит `a27e681f`) снят. Тариф здесь НЕ выбирается и
+    серверы НЕ подставляются руками: берём ровно те параметры, по которым триал
+    получает живой клиент — `get_trial_offer_parameters` резолвит `get_trial_tariff`
+    и прогоняет его через `resolve_tariff_entitlement`.
+
+    🔴 Почему нельзя было просто снять запор: код под ним звал
+    `create_trial_subscription` БЕЗ `tariff_id`, а тогда список серверов остаётся
+    пустым — VPN не работает, ошибки нет, никто ничего не замечает (мина A).
+    """
+    try:
         from app.database.crud.subscription import create_trial_subscription
         from app.services.subscription_service import SubscriptionService
+        from app.services.trial_activation_service import (
+            TrialCheckoutResolutionError,
+            get_trial_offer_parameters,
+        )
 
         existing_subscription = await _resolve_admin_subscription(db, user_id, subscription_id)
         if existing_subscription and not settings.is_multi_tariff_enabled():
             logger.error('У пользователя уже есть подписка', user_id=user_id)
-            return False
+            return False, 'у пользователя уже есть подписка'
 
-        forced_devices = None
-        if not settings.is_devices_selection_enabled():
-            forced_devices = settings.get_disabled_mode_device_limit()
+        try:
+            parameters = await get_trial_offer_parameters(db)
+        except TrialCheckoutResolutionError as error:
+            logger.error('Триал не резолвится в тариф', admin_id=admin_id, user_id=user_id, error=error)
+            return False, f'тариф пробного периода не настроен ({error})'
 
-        subscription = await create_trial_subscription(
-            db,
-            user_id,
-            device_limit=forced_devices,
-        )
+        subscription = await create_trial_subscription(db, user_id, **parameters)
 
         subscription_service = SubscriptionService()
         await subscription_service.create_remnawave_user(db, subscription)
 
         logger.info('Админ выдал триальную подписку пользователю', admin_id=admin_id, user_id=user_id)
-        return True
+        return True, f'серверов подключено: {len(subscription.connected_squads or [])}'
 
+    except ValueError as error:
+        # Сюда попадает сторож `create_trial_subscription`: тариф есть, а прав на
+        # серверы он не даёт. Отказ громкий и намеренный — лучше, чем подписка
+        # без серверов.
+        logger.error('Отказ выдачи триала админом', admin_id=admin_id, user_id=user_id, error=error)
+        return False, f'тариф пробного периода не даёт серверов ({error})'
     except Exception as e:
         logger.error('Ошибка выдачи триальной подписки', error=e)
-        return False
+        return False, None
 
 
 async def _grant_paid_subscription(
     db: AsyncSession, user_id: int, days: int, admin_id: int, subscription_id: int | None = None
-) -> bool:
-    try:
-        logger.error('Legacy admin paid grant is retired; select a tariff location policy instead', admin_id=admin_id)
-        return False
+) -> tuple[bool, str | None]:
+    """Подарить платную подписку из переписки. Возвращает (успех, что сказать админу).
 
-        from app.config import settings
+    🟢 Запор 8 августа (коммит `a27e681f`) снят. Список вопросов взят целиком с
+    двух ЖИВЫХ путей выдачи в кабинете — ветки `create` в
+    `cabinet/routes/admin_users.py` (пункт 2.2б) и массовой
+    `cabinet/routes/admin_bulk_actions.py:_do_grant_subscription`: тариф
+    обязателен, трафик и устройства берутся ИЗ ТАРИФА, а серверы не выбираются
+    вовсе — `connected_squads=None` вместе с `tariff_id` оставляет решение
+    сторожу `resolve_tariff_entitlement`.
+
+    🔴 Поэтому запор снят не в одиночку. Код под ним звал
+    `get_effective_tariff_squad_uuids(db, None)`, а тот при пустом тарифе отдаёт
+    ВСЕ доступные сквады (`crud/server_squad.py:181`): подписка получала все
+    страны мимо тарифа и с `tariff_id=None`. Этот вызов убран вместе с запором —
+    снимать одно без другого нельзя.
+    """
+    try:
         from app.database.crud.subscription import create_paid_subscription
         from app.services.subscription_service import SubscriptionService
 
         existing_subscription = await _resolve_admin_subscription(db, user_id, subscription_id)
         if existing_subscription and not settings.is_multi_tariff_enabled():
             logger.error('У пользователя уже есть подписка', user_id=user_id)
-            return False
+            return False, 'у пользователя уже есть подписка'
 
-        trial_squads: list[str] = []
-
-        try:
-            from app.database.crud.server_squad import get_effective_tariff_squad_uuids
-
-            trial_squads = await get_effective_tariff_squad_uuids(db, None)
-        except Exception as error:
-            logger.error('Не удалось подобрать сквад при выдаче подписки админом', admin_id=admin_id, error=error)
-
-        forced_devices = None
-        if not settings.is_devices_selection_enabled():
-            forced_devices = settings.get_disabled_mode_device_limit()
-
-        device_limit = settings.DEFAULT_DEVICE_LIMIT
-        if forced_devices is not None:
-            device_limit = forced_devices
+        tariff = await _resolve_grantable_tariff(db)
 
         subscription = await create_paid_subscription(
             db=db,
             user_id=user_id,
             duration_days=days,
-            traffic_limit_gb=settings.DEFAULT_TRAFFIC_LIMIT_GB,
-            device_limit=device_limit,
-            connected_squads=trial_squads,
+            traffic_limit_gb=tariff.traffic_limit_gb,
+            device_limit=tariff.device_limit,
+            connected_squads=None,
+            tariff_id=tariff.id,
             update_server_counters=True,
         )
 
@@ -4796,11 +4858,17 @@ async def _grant_paid_subscription(
         await subscription_service.create_remnawave_user(db, subscription)
 
         logger.info('Админ выдал платную подписку на дней пользователю', admin_id=admin_id, days=days, user_id=user_id)
-        return True
+        return True, f'тариф «{tariff.name}», серверов: {len(subscription.connected_squads or [])}'
 
+    except ValueError as error:
+        # Два источника: неоднозначный тариф (`_resolve_grantable_tariff`) и сторож
+        # `create_paid_subscription`, когда тариф не даёт ни одного сервера. Оба —
+        # намеренный громкий отказ вместо отравленной подписки.
+        logger.error('Отказ выдачи платной подписки админом', admin_id=admin_id, user_id=user_id, error=error)
+        return False, str(error)
     except Exception as e:
         logger.error('Ошибка выдачи платной подписки', error=e)
-        return False
+        return False, None
 
 
 async def _calculate_subscription_period_price(
