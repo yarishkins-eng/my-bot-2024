@@ -386,3 +386,25 @@ async def test_cancel_command_does_what_the_screen_promises():
     assert state.cleared is True
     grant.assert_not_awaited()
     assert 'отменена' in message.answer.await_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_granting_a_trial_also_leaves_the_period_state():
+    """Четвёртая дыра залипания: со старого экрана «введите дни» уходят в «Выдать триал».
+
+    Найдена мутацией: остальные три выхода были закрыты, этот — нет.
+    """
+    from app.states import AdminStates
+
+    state = _State(AdminStates.granting_subscription.state)
+    callback = SimpleNamespace(
+        data='admin_sub_grant_trial_196',
+        answer=AsyncMock(),
+        message=SimpleNamespace(edit_text=AsyncMock()),
+    )
+    handler = admin_users.grant_trial_subscription.__wrapped__.__wrapped__
+
+    with patch.object(admin_users, '_grant_trial_subscription', AsyncMock(return_value=(False, 'нет тарифа'))):
+        await handler(callback, SimpleNamespace(id=1), AsyncMock(), state)
+
+    assert state.cleared is True, 'ожидание числа пережило выдачу триала'
