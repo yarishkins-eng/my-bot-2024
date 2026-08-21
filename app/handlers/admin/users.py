@@ -4728,6 +4728,33 @@ def _grant_outcome_text(headline: str, detail: str | None) -> str:
     return f'{headline}\n\n{html.escape(detail)}'
 
 
+def _panel_sync_note(subscription, panel_user, *, admin_id: int, user_id: int) -> str:
+    """Говорит правду о том, доехала ли подписка до панели RemnaWave.
+
+    🔴 `create_remnawave_user` НЕ бросает исключение при сбое — он возвращает
+    `None` (`services/subscription_service.py`, ветки `return None` на
+    `RemnaWaveAPIError` и на любом `Exception`). Поэтому «не было исключения»
+    здесь не значит «получилось»: подписка уже закоммичена, а профиля в панели
+    может не быть — это ровно та подпись мины A, «VPN не работает, ошибки нет».
+
+    Число серверов берётся из строки базы и НЕ является подтверждением панели,
+    поэтому называть его без оговорки нельзя.
+    """
+    squads = len(getattr(subscription, 'connected_squads', None) or [])
+    if panel_user is None:
+        logger.error(
+            'Подписка выдана админом, но в панель не ушла',
+            admin_id=admin_id,
+            user_id=user_id,
+            subscription_id=getattr(subscription, 'id', None),
+        )
+        return (
+            f'⚠️ Подписка создана (серверов в ней: {squads}), но в панель она НЕ ушла — '
+            'VPN у человека пока не заработает. Проверьте панель и синхронизацию.'
+        )
+    return f'Серверов подключено: {squads}, в панель ушло.'
+
+
 async def _resolve_grantable_tariff(db: AsyncSession):
     """Тариф для админского подарка платной подписки.
 
@@ -4797,10 +4824,10 @@ async def _grant_trial_subscription(
         subscription = await create_trial_subscription(db, user_id, **parameters)
 
         subscription_service = SubscriptionService()
-        await subscription_service.create_remnawave_user(db, subscription)
+        panel_user = await subscription_service.create_remnawave_user(db, subscription)
 
         logger.info('Админ выдал триальную подписку пользователю', admin_id=admin_id, user_id=user_id)
-        return True, f'серверов подключено: {len(subscription.connected_squads or [])}'
+        return True, _panel_sync_note(subscription, panel_user, admin_id=admin_id, user_id=user_id)
 
     except ValueError as error:
         # Сюда попадает сторож `create_trial_subscription`: тариф есть, а прав на
@@ -4855,10 +4882,11 @@ async def _grant_paid_subscription(
         )
 
         subscription_service = SubscriptionService()
-        await subscription_service.create_remnawave_user(db, subscription)
+        panel_user = await subscription_service.create_remnawave_user(db, subscription)
 
         logger.info('Админ выдал платную подписку на дней пользователю', admin_id=admin_id, days=days, user_id=user_id)
-        return True, f'тариф «{tariff.name}», серверов: {len(subscription.connected_squads or [])}'
+        note = _panel_sync_note(subscription, panel_user, admin_id=admin_id, user_id=user_id)
+        return True, f'тариф «{tariff.name}». {note}'
 
     except ValueError as error:
         # Два источника: неоднозначный тариф (`_resolve_grantable_tariff`) и сторож
