@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -4765,25 +4766,46 @@ async def _resolve_grantable_tariff(db: AsyncSession):
     же правилу: однозначно или никак. Догадка на этом месте молча подарит не тот
     тариф, а «не тот тариф» — это не тот срок, не тот трафик и не те страны.
 
-    Отбор повторяет вопросы кабинета: тариф активен, не бесплатный (бесплатный
-    дарить нечего) и не `access_point_managed` — последний требует оплаченного
-    Device-First-расчёта, `create_paid_subscription` его всё равно отобьёт.
+    Отбор:
+    · активен (`include_inactive=False`);
+    · `show_in_gift` — ГОТОВОЕ поле проекта, ровно этим фильтруют живые
+      подарочные маршруты (`cabinet/routes/gift.py:87`, `:264`). Своих критериев
+      «можно ли дарить» изобретать не надо, оно уже есть и правится в админке;
+    · не бесплатный — дарить нечего;
+    · не `is_daily` — суточный тариф не «срок на N дней», а ежедневное списание
+      с баланса ПОЛУЧАТЕЛЯ (`daily_subscription_service`, прогон раз в 30 минут).
+      Подарок, который начинает списывать деньги, подарком не является;
+    · не `is_trial_available` — это тариф пробного периода со своими лимитами,
+      его выдаёт соседняя кнопка;
+    · не `access_point_managed` — требует оплаченного Device-First-расчёта.
     """
-    from app.database.crud.tariff import get_all_tariffs
-
     tariffs = await get_all_tariffs(db, include_inactive=False)
     grantable = [
         tariff
         for tariff in tariffs
-        if not bool(getattr(tariff, 'is_free', False))
+        if bool(getattr(tariff, 'show_in_gift', False))
+        and not bool(getattr(tariff, 'is_free', False))
+        and not bool(getattr(tariff, 'is_daily', False))
+        and not bool(getattr(tariff, 'is_trial_available', False))
         and getattr(tariff, 'entitlement_mode', None) != 'access_point_managed'
     ]
 
     if not grantable:
-        raise ValueError('нет ни одного активного платного тарифа — выдавать нечего')
+        raise ValueError(
+            'ни один тариф не годится в подарок. Нужен активный платный тариф '
+            'с включённой галочкой «показывать в подарках»'
+        )
     if len(grantable) > 1:
+        # ⛔ Здесь НЕЛЬЗЯ отправлять админа к кнопке «💳 Купить тариф»: на этом
+        # экране её нет (она рисуется в ветке «подписка есть»), она заперта тем же
+        # запором 8 августа, и она СПИСЫВАЕТ деньги с баланса клиента — то есть не
+        # подарок. Называем то, что есть, и не обещаем пути, которого нет.
         names = ', '.join(f'«{tariff.name}»' for tariff in grantable)
-        raise ValueError(f'подходит больше одного тарифа ({names}) — выберите его кнопкой «💳 Купить тариф»')
+        raise ValueError(
+            f'в подарок годится больше одного тарифа ({names}), и выбрать за вас нельзя. '
+            'Оставьте в подарках один из них — снимите галочку «показывать в подарках» '
+            'у остальных в разделе тарифов'
+        )
 
     return grantable[0]
 
@@ -4835,6 +4857,11 @@ async def _grant_trial_subscription(
         # без серверов.
         logger.error('Отказ выдачи триала админом', admin_id=admin_id, user_id=user_id, error=error)
         return False, f'тариф пробного периода не даёт серверов ({error})'
+    except RuntimeError as error:
+        # `AccountErasureClosureError` — RuntimeError, а не ValueError. Без этой ветки
+        # отказ по закрывающемуся аккаунту оставался бы немым.
+        logger.error('Отказ выдачи триала: аккаунт закрывается', admin_id=admin_id, user_id=user_id, error=error)
+        return False, f'аккаунт пользователя закрывается ({error})'
     except Exception as e:
         logger.error('Ошибка выдачи триальной подписки', error=e)
         return False, None
@@ -4881,6 +4908,13 @@ async def _grant_paid_subscription(
             update_server_counters=True,
         )
 
+        # 🔴 Подарок — не покупка, и согласия на списание никто не давал. Умолчание
+        # `autopay_enabled` приходит из настройки, а регулярный автоплатёж
+        # (`monitoring_service`) отбирает по `autopay_enabled AND NOT is_trial` БЕЗ
+        # проверки «человек когда-либо платил»: за три дня до конца подарка он
+        # попытался бы списать продление с баланса получателя. Гасим явно.
+        subscription.autopay_enabled = False
+
         subscription_service = SubscriptionService()
         panel_user = await subscription_service.create_remnawave_user(db, subscription)
 
@@ -4888,12 +4922,23 @@ async def _grant_paid_subscription(
         note = _panel_sync_note(subscription, panel_user, admin_id=admin_id, user_id=user_id)
         return True, f'тариф «{tariff.name}». {note}'
 
+    except IntegrityError as error:
+        # Ровно как оба кабинетных образца: откатить и назвать причину. Без
+        # `rollback` сессия остаётся сломанной до конца запроса.
+        await db.rollback()
+        logger.error('Дубль подписки при выдаче админом', admin_id=admin_id, user_id=user_id, error=error)
+        return False, 'подписка на этот тариф у пользователя уже есть'
     except ValueError as error:
         # Два источника: неоднозначный тариф (`_resolve_grantable_tariff`) и сторож
         # `create_paid_subscription`, когда тариф не даёт ни одного сервера. Оба —
         # намеренный громкий отказ вместо отравленной подписки.
         logger.error('Отказ выдачи платной подписки админом', admin_id=admin_id, user_id=user_id, error=error)
         return False, str(error)
+    except RuntimeError as error:
+        # `AccountErasureClosureError` — это RuntimeError, а не ValueError. Единственный
+        # отказ, связанный с закрытием аккаунта и деньгами, иначе остался бы немым.
+        logger.error('Отказ выдачи: аккаунт закрывается', admin_id=admin_id, user_id=user_id, error=error)
+        return False, f'аккаунт пользователя закрывается ({error})'
     except Exception as e:
         logger.error('Ошибка выдачи платной подписки', error=e)
         return False, None
