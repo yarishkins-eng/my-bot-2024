@@ -1059,7 +1059,15 @@ def _extract_admin_sub_context(callback_data: str) -> tuple[int, int | None]:
 
 @admin_required
 @error_handler
-async def show_user_subscription(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def show_user_subscription(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    # 🔴 Сюда ведёт кнопка «❌ Отмена» экрана выдачи подписки, а она — единственный
+    # выход из состояния «жду количество дней». Пока выдача была заглушена, залипшее
+    # состояние было безобидным: любое следующее число админа упиралось в отказ.
+    # После снятия запора оно перестало быть безобидным — число дарит подписку тому,
+    # кого админ выбрал полчаса назад. Снимаем ТОЛЬКО своё состояние, чтобы не сбить
+    # чужой сценарий, идущий через этот же экран.
+    await _clear_granting_state(state)
+
     user_id = int(callback.data.split('_')[-1])
 
     if await _render_user_subscription_overview(callback, db, user_id):
@@ -3628,10 +3636,16 @@ async def grant_paid_subscription(callback: types.CallbackQuery, db_user: User, 
 
 @admin_required
 @error_handler
-async def process_subscription_grant_days(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def process_subscription_grant_days(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext
+):
     parts = callback.data.split('_')
     user_id = int(parts[-2])
     days = int(parts[-1])
+
+    # Срок выбран кнопкой — ждать текст больше незачем. Без этого состояние
+    # переживало даже УСПЕШНУЮ выдачу.
+    await _clear_granting_state(state)
 
     success, detail = await _grant_paid_subscription(db, user_id, days, db_user.id)
 
@@ -3682,6 +3696,15 @@ async def process_subscription_grant_text(message: types.Message, db_user: User,
     if not user_id:
         await message.answer('❌ Ошибка: пользователь не найден')
         await state.clear()
+        return
+
+    # Экран обещает `/cancel`, а обработчик зарегистрирован голым фильтром состояния,
+    # поэтому команда прилетает СЮДА и до этой правки уходила в `int('/cancel')` →
+    # «введите корректное число» и `return` БЕЗ снятия состояния. Обещание экрана
+    # исполняем буквально.
+    if (message.text or '').strip().lower() == '/cancel':
+        await state.clear()
+        await message.answer('❌ Выдача подписки отменена')
         return
 
     try:
@@ -4712,6 +4735,21 @@ async def _activate_user_subscription(
     except Exception as e:
         logger.error('Ошибка активации подписки', error=e)
         return False
+
+
+async def _clear_granting_state(state: FSMContext) -> None:
+    """Снимает состояние «жду количество дней», и только его.
+
+    Обработчик текста зарегистрирован голым фильтром состояния
+    (`dp.message.register(process_subscription_grant_text, AdminStates.granting_subscription)`),
+    поэтому пока состояние висит, ЛЮБОЕ сообщение админа, читающееся как число
+    1–730, выдаёт подписку сохранённому `granting_user_id`. Выходов из состояния
+    было три, и ни один его не снимал: «Отмена», `/cancel` и **успешная выдача
+    кнопкой срока**. До снятия запора это гасила заглушка — то есть заглушка
+    работала предохранителем, и сняв её, предохранитель надо было заменить.
+    """
+    if await state.get_state() == AdminStates.granting_subscription.state:
+        await state.clear()
 
 
 def _grant_outcome_text(headline: str, detail: str | None) -> str:

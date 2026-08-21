@@ -296,3 +296,88 @@ def test_the_tariff_name_cannot_break_the_message_to_the_admin():
     assert '&lt;b&gt;' in text
     assert text.startswith('✅ Выдано')
     assert admin_users._grant_outcome_text('❌ Отказ', None) == '❌ Отказ'
+
+
+class _State:
+    """Дубль FSM: помнит, что состояние снимали, и по какому имени его спрашивали."""
+
+    def __init__(self, current):
+        self.current = current
+        self.cleared = False
+
+    async def get_state(self):
+        return self.current
+
+    async def clear(self):
+        self.cleared = True
+        self.current = None
+
+    async def get_data(self):
+        return {'granting_user_id': 196}
+
+    async def update_data(self, **kwargs):
+        return None
+
+    async def set_state(self, value):
+        self.current = value
+
+
+@pytest.mark.asyncio
+async def test_the_grant_state_never_outlives_its_screen():
+    """🔴 P0: пока висит состояние «жду число дней», ЛЮБОЕ число дарит подписку.
+
+    Заглушка 8 августа гасила это побочно — снимая её, предохранитель надо было
+    заменить. Выходов из состояния три, и до правки его не снимал ни один,
+    включая УСПЕШНУЮ выдачу кнопкой срока.
+    """
+    from app.states import AdminStates
+
+    live = AdminStates.granting_subscription.state
+
+    for name, current, must_clear in (
+        ('состояние наше — снять', live, True),
+        ('состояния нет — не трогать', None, False),
+        ('состояние чужое — не трогать', 'SomeOther:state', False),
+    ):
+        state = _State(current)
+        await admin_users._clear_granting_state(state)
+        assert state.cleared is must_clear, name
+
+
+@pytest.mark.asyncio
+async def test_choosing_a_period_by_button_also_leaves_the_state():
+    """Успешная выдача кнопкой обязана закрывать состояние, а не только отказ."""
+    from app.states import AdminStates
+
+    state = _State(AdminStates.granting_subscription.state)
+    callback = SimpleNamespace(
+        data='admin_sub_grant_days_196_90',
+        answer=AsyncMock(),
+        message=SimpleNamespace(edit_text=AsyncMock()),
+    )
+    handler = admin_users.process_subscription_grant_days.__wrapped__.__wrapped__
+
+    with (
+        patch.object(admin_users, '_grant_paid_subscription', AsyncMock(return_value=(False, 'нет тарифа'))),
+        patch.object(admin_users, 'get_user_by_id', AsyncMock(return_value=None)),
+    ):
+        await handler(callback, SimpleNamespace(id=1), AsyncMock(), state)
+
+    assert state.cleared is True, 'состояние пережило выбор срока — следующее число выдаст ещё подписку'
+
+
+@pytest.mark.asyncio
+async def test_cancel_command_does_what_the_screen_promises():
+    """Экран обещает `/cancel`. До правки команда уходила в int() и состояние не снимала."""
+    from app.states import AdminStates
+
+    state = _State(AdminStates.granting_subscription.state)
+    message = SimpleNamespace(text='/cancel', answer=AsyncMock())
+    handler = admin_users.process_subscription_grant_text.__wrapped__.__wrapped__
+
+    with patch.object(admin_users, '_grant_paid_subscription', AsyncMock()) as grant:
+        await handler(message, SimpleNamespace(id=1), state, AsyncMock())
+
+    assert state.cleared is True
+    grant.assert_not_awaited(), 'по /cancel подписку выдавать нельзя'
+    assert 'отменена' in message.answer.await_args[0][0]
