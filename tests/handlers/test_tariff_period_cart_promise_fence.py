@@ -103,6 +103,54 @@ async def test_own_tariff_still_saves_the_cart_and_keeps_the_promise(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_foreign_tariff_is_refused_even_when_the_balance_is_enough(monkeypatch):
+    """Пинает ПОЗИЦИЮ забора: он выше развилки по балансу, а не внутри ветки «не хватает».
+
+    Без этого сторожа забор можно переставить внутрь `else`, и человеку с деньгами
+    снова покажут экран подтверждения на чужой тариф — а все остальные тесты
+    останутся зелёными, потому что гоняют баланс 0.
+    """
+    saved, db_user = _arrange(monkeypatch, existing_tariff_id=5, price=24900, balance=99900)
+    callback = _callback()
+
+    await _raw_handler()(callback, db_user, MagicMock(), AsyncMock())
+
+    saved.assert_not_awaited()
+    callback.message.edit_text.assert_not_awaited()  # экран подтверждения не показан
+    callback.answer.assert_awaited_once_with(REFUSAL, show_alert=True)
+
+
+@pytest.mark.asyncio
+async def test_multi_tariff_mode_is_not_touched_by_the_fence(monkeypatch):
+    """Пинает вторую развилку: забор живёт в ветке БЕЗ мультитарифа, как у всех соседей.
+
+    Поднимут его выше `if settings.is_multi_tariff_enabled()` — сломается покупка
+    в мультитарифе, а прочие тесты этого не заметят.
+    """
+    from app.services import pricing_engine as pricing_module
+
+    monkeypatch.setattr(type(tariff_purchase.settings), 'is_multi_tariff_enabled', lambda self: True)
+    monkeypatch.setattr(tariff_purchase, 'get_tariff_by_id', AsyncMock(return_value=_tariff()))
+    monkeypatch.setattr(
+        'app.database.crud.subscription.get_subscription_by_user_and_tariff',
+        AsyncMock(return_value=SimpleNamespace(id=77, tariff_id=5, device_limit=2)),
+    )
+    monkeypatch.setattr(
+        pricing_module.pricing_engine,
+        'calculate_tariff_purchase_price',
+        AsyncMock(return_value=SimpleNamespace(final_total=24900, original_total=24900)),
+    )
+    saved = AsyncMock(return_value=True)
+    monkeypatch.setattr(tariff_purchase.user_cart_service, 'save_user_cart', saved)
+    callback = _callback()
+
+    await _raw_handler()(callback, SimpleNamespace(id=42, balance_kopeks=0, language='ru'), MagicMock(), AsyncMock())
+
+    saved.assert_awaited_once()  # забор не сработал — режим не его
+    assert REFUSAL not in str(callback.answer.await_args_list)
+
+
+@pytest.mark.asyncio
 async def test_user_without_any_subscription_is_not_refused(monkeypatch):
     """У новичка подписки нет — забор не про него."""
     saved, db_user = _arrange(monkeypatch, existing_tariff_id=None, price=24900, balance=0)
