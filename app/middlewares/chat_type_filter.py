@@ -17,6 +17,8 @@ from aiogram import BaseMiddleware
 from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
+from app.handlers.manager_alerts import is_manager_alert_setup_command
+
 
 logger = structlog.get_logger(__name__)
 
@@ -42,7 +44,7 @@ class ChatTypeFilterMiddleware(BaseMiddleware):
         is_manager_alert_setup = (
             isinstance(event, Message)
             and event.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
-            and _is_manager_alert_setup_command(event.text)
+            and is_manager_alert_setup_command(event.text)
         )
 
         if chat is not None and chat.type != ChatType.PRIVATE and not is_manager_alert_setup:
@@ -54,8 +56,3 @@ class ChatTypeFilterMiddleware(BaseMiddleware):
             return None
 
         return await handler(event, data)
-
-
-def _is_manager_alert_setup_command(text: str | None) -> bool:
-    command = (text or '').strip().split(maxsplit=1)[0].lower().split('@', maxsplit=1)[0]
-    return command in {'/manager_alert_bind', '/manager_alert_status'}

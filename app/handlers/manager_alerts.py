@@ -14,11 +14,19 @@ _TOPIC_BY_ARGUMENT: dict[str, ManagerAlertTopic] = {
     'payments': ManagerAlertTopic.PAYMENTS,
     'reports': ManagerAlertTopic.REPORTS,
     'service': ManagerAlertTopic.SERVICE_STATUS,
+    'marketing': ManagerAlertTopic.MARKETING,
 }
 
 
 def is_manager_alert_setup_command(text: str | None) -> bool:
-    command = (text or '').strip().split(maxsplit=1)[0].lower().split('@', maxsplit=1)[0]
+    # `split()` на пустой строке отдаёт пустой список, поэтому `[0]` нельзя брать
+    # вслепую: в группу приходят и сообщения без текста (фото, стикер, служебное
+    # событие форума — например «создана тема»). До 22.08.2026 каждое такое
+    # сообщение роняло трейсбек в лог боевого бота.
+    words = (text or '').strip().split(maxsplit=1)
+    if not words:
+        return False
+    command = words[0].lower().split('@', maxsplit=1)[0]
     return command in {'/manager_alert_bind', '/manager_alert_status'}
 
 
@@ -40,9 +48,10 @@ async def bind_manager_alert_topic(message: types.Message) -> None:
     parts = (message.text or '').split(maxsplit=1)
     topic = _TOPIC_BY_ARGUMENT.get(parts[1].strip().lower() if len(parts) == 2 else '')
     if not topic:
-        await message.answer(
-            'Укажи категорию: tickets, subscriptions, payments, reports или service.',
-        )
+        # Список собирается из самого маршрута: подсказка не может разойтись с
+        # тем, что команда реально принимает (owner уже упёрся в это однажды).
+        known = ', '.join(_TOPIC_BY_ARGUMENT)
+        await message.answer(f'Укажи категорию: {known}.')
         return
 
     saved = ManagerAlertSettingsService.bind_topic(
