@@ -1,0 +1,151 @@
+"""Сторож: «📣 ПЕРЕХОД ПО РК» уходит владельцу ОДИН раз на человека и кампанию.
+
+Человек, бросивший регистрацию на выборе языка, в БД не появляется (`create_user`
+вызывается ниже по потоку), поэтому при каждом возврате он снова `user is None` —
+и до этой правки владелец получал нового «лида» за того же человека. Пометка живёт
+в FSM-состоянии, которое между заходами не чистится.
+
+Тесты гоняют настоящий `cmd_start` с настоящим `FSMContext` поверх `MemoryStorage`:
+пометка обязана пережить возврат так же, как переживает его боевой Redis.
+Что именно закреплено (каждый пункт краснеет от своей мутации):
+
+* повторный `/start` по той же рекламе второго уведомления не шлёт;
+* пометка ставится ТОЛЬКО когда отправка вернула успех — иначе лид пропал бы навсегда;
+* клик по ДРУГОЙ живой кампании уведомление всё-таки шлёт (на боевом их четыре);
+* `True`, оставленный сторожем канала (`middlewares/channel_checker.py:443`), гасит всё.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from aiogram import types
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
+
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from app.handlers import start as start_module
+
+
+TELEGRAM_ID = 5214767561
+
+
+def _campaign(campaign_id: int, start_parameter: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=campaign_id,
+        name=f'Кампания {campaign_id}',
+        start_parameter=start_parameter,
+        partner_user_id=None,
+        is_none_bonus=False,
+        is_active=True,
+    )
+
+
+def _message(start_parameter: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        text=f'/start {start_parameter}',
+        from_user=types.User(id=TELEGRAM_ID, is_bot=False, first_name='Гость', username='guest'),
+        bot=MagicMock(),
+        answer=AsyncMock(),
+    )
+
+
+def _state() -> FSMContext:
+    return FSMContext(
+        storage=MemoryStorage(),
+        key=StorageKey(bot_id=1, chat_id=TELEGRAM_ID, user_id=TELEGRAM_ID),
+    )
+
+
+def _patch_start(monkeypatch: pytest.MonkeyPatch, campaigns: dict[str, SimpleNamespace], *, sent: bool) -> AsyncMock:
+    """Обвязка вокруг `cmd_start`: человека в БД нет, кампания находится по параметру.
+
+    Возвращает мок отправки уведомления — на нём и считаем, сколько лидов ушло владельцу.
+    """
+
+    send_mock = AsyncMock(return_value=sent)
+
+    async def _get_campaign(_db, start_parameter, only_active=True):
+        return campaigns.get(start_parameter)
+
+    monkeypatch.setattr(start_module, 'get_pending_payload_from_redis', AsyncMock(return_value=None))
+    monkeypatch.setattr(start_module, 'get_campaign_by_start_parameter', _get_campaign)
+    monkeypatch.setattr(start_module, 'save_pending_campaign', AsyncMock(return_value=None))
+    monkeypatch.setattr(start_module, 'get_user_by_telegram_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        start_module,
+        'AdminNotificationService',
+        MagicMock(return_value=SimpleNamespace(send_campaign_link_visit_notification=send_mock)),
+    )
+    # Новичок упирается в выбор языка и уходит — ровно та точка, где он бросает регистрацию.
+    # `settings` — pydantic-модель, метод подменяется на классе, а не на экземпляре.
+    monkeypatch.setattr(type(start_module.settings), 'is_language_selection_enabled', lambda _self: True)
+    monkeypatch.setattr(start_module, '_prompt_language_selection', AsyncMock(return_value=None))
+    return send_mock
+
+
+@pytest.mark.asyncio
+async def test_second_start_by_same_campaign_sends_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Кликнул рекламу, бросил язык, вернулся — владелец получает ОДНО уведомление."""
+
+    send_mock = _patch_start(monkeypatch, {'teplo2': _campaign(4, 'teplo2')}, sent=True)
+    state = _state()
+
+    await start_module.cmd_start(_message('teplo2'), state, MagicMock())
+    await start_module.cmd_start(_message('teplo2'), state, MagicMock())
+
+    assert send_mock.await_count == 1
+    assert (await state.get_data())['campaign_notification_sent'] == 4
+
+
+@pytest.mark.asyncio
+async def test_flag_not_set_when_notification_was_not_delivered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Отправка вернула False (чат не настроен, категория выключена, Telegram отказал) —
+    пометки нет, лид не потерян: следующий заход попробует снова."""
+
+    send_mock = _patch_start(monkeypatch, {'teplo2': _campaign(4, 'teplo2')}, sent=False)
+    state = _state()
+
+    await start_module.cmd_start(_message('teplo2'), state, MagicMock())
+    await start_module.cmd_start(_message('teplo2'), state, MagicMock())
+
+    assert send_mock.await_count == 2
+    assert 'campaign_notification_sent' not in await state.get_data()
+
+
+@pytest.mark.asyncio
+async def test_click_on_other_campaign_still_notifies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Вторая живая реклама — отдельный оплаченный клик, он обязан дойти до владельца."""
+
+    campaigns = {'teplo2': _campaign(4, 'teplo2'), 'teplovpn1': _campaign(3, 'teplovpn1')}
+    send_mock = _patch_start(monkeypatch, campaigns, sent=True)
+    state = _state()
+
+    await start_module.cmd_start(_message('teplo2'), state, MagicMock())
+    await start_module.cmd_start(_message('teplovpn1'), state, MagicMock())
+
+    assert send_mock.await_count == 2
+    assert (await state.get_data())['campaign_notification_sent'] == 3
+
+
+@pytest.mark.asyncio
+async def test_flag_from_channel_guard_suppresses_any_campaign(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`True` ставит сторож канала (`middlewares/channel_checker.py:443`) — он не знает
+    про номера кампаний, поэтому его пометка гасит всё. Совместимость обязана сохраниться."""
+
+    send_mock = _patch_start(monkeypatch, {'teplo2': _campaign(4, 'teplo2')}, sent=True)
+    state = _state()
+    await state.update_data(campaign_notification_sent=True)
+
+    await start_module.cmd_start(_message('teplo2'), state, MagicMock())
+
+    send_mock.assert_not_awaited()

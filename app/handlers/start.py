@@ -903,15 +903,35 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
     # отдельное «РЕГИСТРАЦИЯ ПО РК» позже, в _apply_campaign_bonus_if_needed, ровно
     # при создании записи в advertising_campaign_registrations. Это даёт паритет
     # между числом сообщений в чате и числом регистраций в кабинете.
-    if campaign and not campaign_notification_sent and user is None:
+    #
+    # Повторный «ПЕРЕХОД» гасится пометкой в FSM: бросивший регистрацию на выборе языка
+    # в БД не появляется (create_user ниже), поэтому при каждом возврате он снова
+    # user is None и владелец получал нового «лида» за того же человека. Значение
+    # пометки — id кампании (ставим здесь) либо True (ставит сторож канала,
+    # middlewares/channel_checker.py:443): True гасит любую кампанию, id — только свою,
+    # чтобы клик по ДРУГОЙ живой рекламе остался виден владельцу.
+    already_notified = campaign is not None and (
+        campaign_notification_sent is True or campaign_notification_sent == campaign.id
+    )
+    if campaign and not already_notified and user is None:
         try:
             notification_service = AdminNotificationService(message.bot)
-            await notification_service.send_campaign_link_visit_notification(
+            sent = await notification_service.send_campaign_link_visit_notification(
                 db,
                 message.from_user,
                 campaign,
                 user,
             )
+            if sent:
+                # Пометка ставится ТОЛЬКО по возврату: функция отдаёт False и без
+                # исключения (чат не настроен, категория выключена, Telegram отказал),
+                # а помеченный без доставки человек стоил бы владельцу лида навсегда.
+                await state.update_data(campaign_notification_sent=campaign.id)
+                logger.info(
+                    'Отправлено уведомление о переходе по кампании',
+                    campaign_id=campaign.id,
+                    telegram_id=message.from_user.id,
+                )
         except Exception as notify_error:
             logger.error(
                 'Ошибка отправки админ уведомления о переходе по кампании',
