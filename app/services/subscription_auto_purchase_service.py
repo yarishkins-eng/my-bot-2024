@@ -3325,11 +3325,15 @@ async def _notify_auto_purchase_failure(
                 missing=texts.format_price(cart_total - balance, round_kopeks=False),
             )
         else:
+            # ⛔ Не обещать «списания не было»: в ветке ошибки создания подписки
+            # баланс уже списан, и возврат может не пройти (там logger.critical).
+            # Называем ПРОВЕРЯЕМОЕ — баланс, только что перечитанный из базы.
             text = texts.t(
                 'AUTO_PURCHASE_FAILED',
                 '⚠️ <b>Не удалось оформить подписку автоматически</b>\n\n'
-                '💰 Деньги остались на вашем балансе: {balance}\n\n'
-                'Откройте раздел подписки и оформите её вручную — списания не было.',
+                '💰 Ваш баланс сейчас: {balance}\n\n'
+                'Откройте раздел подписки и оформите её вручную. '
+                'Если сумма на балансе выглядит неверной — напишите в поддержку.',
             ).format(balance=texts.format_price(balance))
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[

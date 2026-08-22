@@ -91,7 +91,10 @@ async def test_real_failure_tells_both_the_client_and_the_owner(monkeypatch):
 
     client_text = bot.send_message.await_args.kwargs['text']
     assert 'Не удалось оформить подписку автоматически' in client_text
-    assert 'списания не было' in client_text
+    assert '1000 ₽' in client_text  # баланс назван цифрой, перечитанной из базы
+    # ⛔ Обещать «списания не было» нельзя: в ветке ошибки создания подписки баланс
+    # уже списан, а компенсирующий возврат может не пройти. Сторожим отсутствие лжи.
+    assert 'списания не было' not in client_text
     assert len(owner_alerts) == 1
     assert 'Автопокупка после пополнения не прошла' in owner_alerts[0]
 
