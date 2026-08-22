@@ -14,10 +14,20 @@ Two opt-in routes exist, and neither is a default:
   alerts reach MARKETING that way, while the rest of the `promo` category stays
   admin-only.
 
-The second route is deliberately narrow, so it is not self-limiting the way the
-allow-list is: every call site is pinned by name in
-`tests/services/test_manager_alert_service.py`, and a new one fails that test
-until it is added there on purpose.
+Only the first route is self-limiting: a category absent from the allow-list
+cannot be copied however it is called. The other two are limited by tests that
+pin their call sites by name in `tests/services/test_manager_alert_service.py`,
+so an accidental new one fails the suite until it is added there on purpose.
+
+What those tests do NOT catch, stated plainly so nobody trusts them further
+than they reach: they read the call as it is written, so building the argument
+elsewhere and unpacking it (`**routing`) reaches this module unpinned. They are
+a guard against absent-mindedness, not against someone routing around them.
+
+Delivery here is best-effort and always secondary. A copy is attempted only
+after the admin chat already accepted the message, it inherits that category's
+on/off switch, and under Telegram flood control it is dropped rather than
+retried (see `send`) — deliberately, because retrying would make a client wait.
 """
 
 import json
@@ -26,7 +36,13 @@ from pathlib import Path
 
 import structlog
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramServerError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 
 
 logger = structlog.get_logger(__name__)
@@ -148,6 +164,20 @@ class ManagerAlertService:
             )
             logger.info('Manager alert sent', topic=topic.value)
             return True
+        except TelegramRetryAfter as exc:
+            # Копия менеджеру намеренно НЕ ретраится: `send` вызывается внутри
+            # обработки клиентского /start, и сон здесь задержал бы ответ живому
+            # человеку. Отдельная ветка нужна, чтобы потеря была видна в логах
+            # как известное поведение, а не как «Unexpected»: без неё
+            # TelegramRetryAfter (наследник TelegramAPIError, а не перечисленных
+            # ниже) молча уходил в общий except. Копия остаётся best-effort —
+            # надёжной её сделает только очередь, а это отдельная работа.
+            logger.warning(
+                'Manager alert dropped by flood control (no retry by design)',
+                topic=topic.value,
+                retry_after=getattr(exc, 'retry_after', None),
+            )
+            return False
         except (TelegramForbiddenError, TelegramBadRequest, TelegramNetworkError, TelegramServerError) as exc:
             logger.warning('Failed to send manager alert', topic=topic.value, error=str(exc)[:200])
             return False

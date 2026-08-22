@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiogram import types
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramRetryAfter
 
 from app.config import settings
 from app.handlers.manager_alerts import (
@@ -59,6 +60,11 @@ async def test_mirror_admin_category_uses_allow_list_without_keyboard() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize('category', ['infrastructure', 'errors', 'partners', 'promo', None])
 async def test_mirror_never_sends_excluded_admin_categories(category: str | None) -> None:
+    # Привязываем ВСЕ темы: иначе тест зелен по случайности — у запрещённой
+    # категории просто нет получателя. С привязанными темами он ловит и подмену
+    # `.get(category)` на `.get(category, какая-нибудь-тема-по-умолчанию)`.
+    for index, topic in enumerate(ManagerAlertTopic, start=1):
+        assert ManagerAlertSettingsService.bind_topic(chat_id=-100123456, topic=topic, thread_id=index)
     bot = MagicMock()
     bot.send_message = AsyncMock()
 
@@ -222,27 +228,62 @@ async def test_bind_hint_lists_every_accepted_category(monkeypatch: pytest.Monke
     assert ManagerAlertSettingsService.get_recipient(ManagerAlertTopic.MARKETING) is None
 
 
-def test_narrow_manager_route_has_exactly_the_declared_call_sites() -> None:
-    """Второй маршрут в группу менеджера не самоограничен — перечисляем его поимённо.
-
-    `mirror_admin_category` защищён тем, что категории нет в белом списке. У
-    `manager_topic=` такой защиты нет: любой из десятков вызовов `_send_message`
-    может подписать менеджера на что угодно одним аргументом. Этот тест краснеет
-    на КАЖДОМ новом месте вызова — добавлять сюда придётся руками и осознанно.
-    """
-    call_sites: set[tuple[str, str]] = set()
+def _call_sites(matches) -> set[tuple[str, str]]:
+    """Собирает пары «файл, объемлющая функция» для вызовов, прошедших `matches`."""
+    found: set[tuple[str, str]] = set()
     for path in sorted(Path('app').rglob('*.py')):
+        if path.name == 'manager_alert_service.py':
+            continue  # свои внутренние вызовы сервис делает по определению
         tree = ast.parse(path.read_text(encoding='utf-8'))
         for enclosing in ast.walk(tree):
             if not isinstance(enclosing, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
             for node in ast.walk(enclosing):
-                if isinstance(node, ast.Call) and any(kw.arg == 'manager_topic' for kw in node.keywords):
-                    call_sites.add((str(path), enclosing.name))
+                if isinstance(node, ast.Call) and matches(node):
+                    found.add((str(path), enclosing.name))
+    return found
+
+
+def test_narrow_manager_route_has_exactly_the_declared_call_sites() -> None:
+    """Маршрут `manager_topic=` не самоограничен — перечисляем его поимённо.
+
+    `mirror_admin_category` защищён тем, что категории нет в белом списке. У
+    `manager_topic=` такой защиты нет: любой из десятков вызовов `_send_message`
+    может подписать менеджера на что угодно одним аргументом. Этот тест краснеет
+    на КАЖДОМ новом месте вызова — добавлять сюда придётся руками и осознанно.
+
+    Граница сторожа: он читает вызов таким, как тот написан. Собрать аргумент в
+    словарь и раскрыть его (`**routing`) — обойдёт. Это защита от рассеянности,
+    а не от обхода; так и записано в докстринге самого сервиса.
+    """
+    call_sites = _call_sites(lambda node: any(kw.arg == 'manager_topic' for kw in node.keywords))
 
     assert call_sites == {
         ('app/services/admin_notification_service.py', 'send_campaign_link_visit_notification'),
         ('app/services/admin_notification_service.py', 'send_campaign_registration_notification'),
+    }
+
+
+def test_direct_manager_send_has_exactly_the_declared_call_sites() -> None:
+    """Самый широкий маршрут — прямой `manager_alert_service.send(тема, текст)`.
+
+    У него нет ни белого списка, ни ключевого аргумента: он берёт произвольный
+    текст и произвольную тему. Ровно им уедет менеджеру чужой трейсбек, если
+    кто-нибудь однажды напишет строку не думая.
+    """
+
+    def is_direct_send(node: ast.Call) -> bool:
+        func = node.func
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr == 'send'
+            and isinstance(func.value, ast.Name)
+            and func.value.id == 'manager_alert_service'
+        )
+
+    assert _call_sites(is_direct_send) == {
+        ('app/services/admin_notification_service.py', '_send_message'),
+        ('app/services/reporting_service.py', '_deliver_report'),
     }
 
 
@@ -266,3 +307,19 @@ def test_group_filter_survives_messages_without_text(text: str | None) -> None:
     это видели два раза за час, когда владелец заводил тему «Маркетинг».
     """
     assert is_manager_alert_setup_command(text) is False
+
+
+@pytest.mark.asyncio
+async def test_flood_control_drops_manager_copy_as_known_behaviour() -> None:
+    """Потеря копии под flood control — известное поведение, а не «Unexpected».
+
+    TelegramRetryAfter наследуется от TelegramAPIError, поэтому в перечисленный
+    кортеж исключений он не попадал и уходил в общий except. Ретрая тут нет
+    намеренно: `send` зовётся внутри обработки клиентского /start.
+    """
+    assert ManagerAlertSettingsService.bind_topic(chat_id=-100123456, topic=ManagerAlertTopic.MARKETING, thread_id=40)
+    bot = MagicMock()
+    bot.send_message = AsyncMock(side_effect=TelegramRetryAfter(method=MagicMock(), message='flood', retry_after=7))
+
+    assert await manager_alert_service.send(bot, ManagerAlertTopic.MARKETING, '<b>ПЕРЕХОД ПО РК</b>') is False
+    assert bot.send_message.await_count == 1
