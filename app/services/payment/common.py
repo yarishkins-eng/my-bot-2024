@@ -428,12 +428,8 @@ async def send_cart_notification_after_topup(
         # оно дублировало «Пополнение успешно!», а его клавиатура не учитывала
         # MAIN_MENU_MODE=cabinet и уводила из миниаппа в полное меню бота.
         try:
-            purchased = await auto_purchase_saved_cart_after_topup(db, user, topped_up_kopeks=amount_kopeks, bot=bot)
-            # Раньше возврат не читался вовсе, а меню обновлялось всегда, хотя рядом
-            # было написано «только при успехе»: при отказе клиент видел шевеление
-            # меню и ни слова о том, что подписки нет. Теперь как у соседа ниже.
-            if purchased:
-                await notify_subscriber_menu(db, user)  # меню подписчика без /start
+            await auto_purchase_saved_cart_after_topup(db, user, bot=bot)
+            await notify_subscriber_menu(db, user)  # меню подписчика без /start (только при успехе)
         except Exception as auto_error:
             logger.error(
                 'Ошибка автоматической покупки подписки для пользователя',
