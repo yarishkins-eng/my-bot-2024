@@ -19,7 +19,14 @@ _TOPIC_BY_ARGUMENT: dict[str, ManagerAlertTopic] = {
 
 
 def is_manager_alert_setup_command(text: str | None) -> bool:
-    command = (text or '').strip().split(maxsplit=1)[0].lower().split('@', maxsplit=1)[0]
+    # `split()` на пустой строке отдаёт пустой список, поэтому `[0]` нельзя брать
+    # вслепую: в группу приходят и сообщения без текста (фото, стикер, служебное
+    # событие форума — например «создана тема»). До 22.08.2026 каждое такое
+    # сообщение роняло трейсбек в лог боевого бота.
+    words = (text or '').strip().split(maxsplit=1)
+    if not words:
+        return False
+    command = words[0].lower().split('@', maxsplit=1)[0]
     return command in {'/manager_alert_bind', '/manager_alert_status'}
 
 

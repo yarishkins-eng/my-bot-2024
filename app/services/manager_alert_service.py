@@ -1,15 +1,23 @@
 """Safe, opt-in alert delivery for the manager Telegram forum group.
 
 The manager group is deliberately isolated from the full administrator alerts:
-only an explicit allow-list of business/support events can be mirrored there.
-Backups, error reports, raw infrastructure webhooks and their attachments are
-never routed through this service.
+nothing reaches it unless it was named manager-safe on purpose. Backups, error
+reports, raw infrastructure webhooks and their attachments are never routed
+through this service.
 
-Two routes exist, both opt-in. `mirror_admin_category` copies whole admin
-categories named in the allow-list below. A single notification may instead
-name its own topic (see `_send_message(manager_topic=...)`) when only part of
-an admin category is manager-safe: advertising campaign alerts go to MARKETING
-that way, while the rest of the `promo` category stays admin-only.
+Two opt-in routes exist, and neither is a default:
+
+* `mirror_admin_category` copies whole admin categories named in the allow-list
+  below. Categories missing from it can never be copied this way.
+* a single notification may name its own topic (`_send_message(manager_topic=)`)
+  when only part of an admin category is manager-safe. Advertising campaign
+  alerts reach MARKETING that way, while the rest of the `promo` category stays
+  admin-only.
+
+The second route is deliberately narrow, so it is not self-limiting the way the
+allow-list is: every call site is pinned by name in
+`tests/services/test_manager_alert_service.py`, and a new one fails that test
+until it is added there on purpose.
 """
 
 import json

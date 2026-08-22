@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -6,9 +7,14 @@ from aiogram import types
 from aiogram.enums import ChatType
 
 from app.config import settings
-from app.handlers.manager_alerts import bind_manager_alert_topic, is_manager_alert_setup_command
+from app.handlers.manager_alerts import (
+    _TOPIC_BY_ARGUMENT,
+    bind_manager_alert_topic,
+    is_manager_alert_setup_command,
+)
 from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
 from app.services.manager_alert_service import (
+    _ADMIN_CATEGORY_TO_MANAGER_TOPIC,
     ManagerAlertSettingsService,
     ManagerAlertTopic,
     manager_alert_service,
@@ -207,6 +213,56 @@ async def test_bind_hint_lists_every_accepted_category(monkeypatch: pytest.Monke
     await bind_manager_alert_topic(message)
 
     hint = message.answer.await_args.args[0]
+    # Оба утверждения нужны: перебор маршрута ловит новую категорию, забытую в
+    # подсказке, а жёсткий список — подсказку, отставшую от маршрута целиком.
+    for argument in _TOPIC_BY_ARGUMENT:
+        assert argument in hint
     for argument in ('tickets', 'subscriptions', 'payments', 'reports', 'service', 'marketing'):
         assert argument in hint
     assert ManagerAlertSettingsService.get_recipient(ManagerAlertTopic.MARKETING) is None
+
+
+def test_narrow_manager_route_has_exactly_the_declared_call_sites() -> None:
+    """Второй маршрут в группу менеджера не самоограничен — перечисляем его поимённо.
+
+    `mirror_admin_category` защищён тем, что категории нет в белом списке. У
+    `manager_topic=` такой защиты нет: любой из десятков вызовов `_send_message`
+    может подписать менеджера на что угодно одним аргументом. Этот тест краснеет
+    на КАЖДОМ новом месте вызова — добавлять сюда придётся руками и осознанно.
+    """
+    call_sites: set[tuple[str, str]] = set()
+    for path in sorted(Path('app').rglob('*.py')):
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        for enclosing in ast.walk(tree):
+            if not isinstance(enclosing, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for node in ast.walk(enclosing):
+                if isinstance(node, ast.Call) and any(kw.arg == 'manager_topic' for kw in node.keywords):
+                    call_sites.add((str(path), enclosing.name))
+
+    assert call_sites == {
+        ('app/services/admin_notification_service.py', 'send_campaign_link_visit_notification'),
+        ('app/services/admin_notification_service.py', 'send_campaign_registration_notification'),
+    }
+
+
+def test_admin_category_allow_list_has_exactly_the_declared_categories() -> None:
+    """Первый маршрут — тоже поимённо: `promo`, `partners`, `errors` сюда не попадают."""
+    assert set(_ADMIN_CATEGORY_TO_MANAGER_TOPIC) == {
+        'tickets',
+        'trials',
+        'purchases',
+        'renewals',
+        'balance',
+        'addons',
+    }
+
+
+@pytest.mark.parametrize('text', [None, '', '   ', '\n'])
+def test_group_filter_survives_messages_without_text(text: str | None) -> None:
+    """Фото, стикер и служебное «создана тема» приходят с text=None.
+
+    До 22.08.2026 такое сообщение роняло IndexError прямо в мидлваре — на боевом
+    это видели два раза за час, когда владелец заводил тему «Маркетинг».
+    """
+    assert is_manager_alert_setup_command(text) is False
