@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 
 import structlog
+from aiogram.types import InlineKeyboardMarkup
 from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +42,7 @@ from app.database.models import (
 from app.services.device_first_deposit_outbox_service import ensure_deposit_outbox
 from app.services.device_first_eligibility import resolve_single_eligible_tariff, tariff_eligibility
 from app.services.pricing_engine import pricing_engine
+from app.utils.miniapp_buttons import build_miniapp_or_callback_button
 
 
 OPEN_STATES = {'draft', 'confirmed', 'awaiting_funds', 'armed', 'fulfilling'}
@@ -2436,7 +2438,7 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
                             if user.language == 'en'
                             else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
                         )
-                        await bot.send_message(user.telegram_id, text)
+                        await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
                     except Exception as delivery_error:
                         logger.warning(
                             'Device-first notification delivery failed',
@@ -3227,6 +3229,36 @@ async def _send_owner_checkout_drift_alert(
         raise RuntimeError('admin_notification_not_delivered')
 
 
+def _client_ready_keyboard(user: User) -> InlineKeyboardMarkup:
+    """Кнопка «подключиться» под сообщением о готовой подписке.
+
+    Пункт 1 реза 22.08.2026. Сообщение уходило голым текстом «откройте кабинет», не давая
+    ничего, чем его открыть. Это половина той же беды, что и уход на оплату: человек уже
+    заплатил, а дальше должен догадаться сам.
+
+    Второй повод, ради которого кнопка идёт ТЕМ ЖЕ пунктом, что и `openLink`. Адрес
+    возврата после оплаты — https-кабинет, а не `t.me` (`_direct_checkout_return_url`,
+    `device_first_payment_service.py:1160`), и в браузере он приземляется на экран входа.
+    Мини-приложение при этом остаётся живым за спиной у браузера, но человеку, который его
+    закрыл, нужна дверь обратно — вот она.
+
+    Берём общий строитель (`miniapp_buttons.py:188`), а не свой `WebAppInfo`: он сам решает,
+    открыть кабинет или уйти в callback, если кабинетный режим выключен. Запасной callback
+    `subscription_connect` живой и зарегистрирован (`subscription/purchase.py:4536`).
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                build_miniapp_or_callback_button(
+                    text='\U0001f517 Connect' if user.language == 'en' else '\U0001f517 Подключиться',
+                    callback_data='subscription_connect',
+                    cabinet_path='/subscription',
+                )
+            ]
+        ]
+    )
+
+
 async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
     user = await db.get(User, checkout.user_id)
     if user is None or not user.telegram_id:
@@ -3236,7 +3268,7 @@ async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: Subscri
         if user.language == 'en'
         else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
     )
-    await bot.send_message(user.telegram_id, text)
+    await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
 
 
 async def process_device_first_notification_outbox(db: AsyncSession, *, bot, limit: int = 20) -> int:

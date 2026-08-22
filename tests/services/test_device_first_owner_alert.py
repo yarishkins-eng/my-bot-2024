@@ -558,3 +558,28 @@ async def test_the_stuck_alert_goes_to_the_errors_category():
         await service_module._send_owner_order_stuck_alert(_money_db(), bot=MagicMock(), checkout=_checkout())
 
     assert admin.send_admin_notification.await_args.kwargs['category'] is NotificationCategory.ERRORS
+
+
+@pytest.mark.asyncio
+async def test_the_ready_message_carries_a_way_into_the_cabinet():
+    """🔴 Пункт 1 реза. Сообщение «подписка готова» звало открыть кабинет и не давало чем.
+
+    Человек к этому моменту уже ЗАПЛАТИЛ, и адрес возврата после оплаты — https-кабинет,
+    а не `t.me`: в браузере он приземляется на экран входа. Дверь обратно — эта кнопка.
+    Сторож смотрит на фактически переданную клавиатуру, а не на исходник: проверка по
+    тексту файла в этом проекте уже дважды оказывалась пустой.
+    """
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    db = MagicMock()
+    db.get = AsyncMock(return_value=SimpleNamespace(id=5, telegram_id=777, language='ru'))
+
+    await service_module._send_client_ready_message(db, bot=bot, checkout=_checkout())
+
+    markup = bot.send_message.await_args.kwargs['reply_markup']
+    assert markup is not None, 'сообщение снова ушло голым текстом'
+    buttons = [button for row in markup.inline_keyboard for button in row]
+    assert len(buttons) == 1
+    # Кнопка обязана куда-то вести: либо в кабинет (web_app), либо в живой обработчик.
+    only = buttons[0]
+    assert only.web_app is not None or only.callback_data == 'subscription_connect'
