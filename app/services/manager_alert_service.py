@@ -4,6 +4,12 @@ The manager group is deliberately isolated from the full administrator alerts:
 only an explicit allow-list of business/support events can be mirrored there.
 Backups, error reports, raw infrastructure webhooks and their attachments are
 never routed through this service.
+
+Two routes exist, both opt-in. `mirror_admin_category` copies whole admin
+categories named in the allow-list below. A single notification may instead
+name its own topic (see `_send_message(manager_topic=...)`) when only part of
+an admin category is manager-safe: advertising campaign alerts go to MARKETING
+that way, while the rest of the `promo` category stays admin-only.
 """
 
 import json
@@ -24,6 +30,7 @@ class ManagerAlertTopic(StrEnum):
     PAYMENTS = 'payments'
     REPORTS = 'reports'
     SERVICE_STATUS = 'service_status'
+    MARKETING = 'marketing'
 
 
 class ManagerAlertSettingsService:
@@ -100,6 +107,10 @@ class ManagerAlertSettingsService:
         return {topic for topic in ManagerAlertTopic if cls.get_recipient(topic) is not None}
 
 
+# `promo`, `partners`, `infrastructure` and `errors` are absent on purpose: a
+# whole-category copy of them would leak admin-only events. Where a single
+# notification inside such a category is manager-safe, it names its own topic
+# instead of being added here.
 _ADMIN_CATEGORY_TO_MANAGER_TOPIC: dict[str, ManagerAlertTopic] = {
     'tickets': ManagerAlertTopic.TICKETS,
     'trials': ManagerAlertTopic.SUBSCRIPTIONS,

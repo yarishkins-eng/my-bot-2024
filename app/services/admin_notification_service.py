@@ -33,6 +33,7 @@ from app.database.models import (
     Transaction,
     User,
 )
+from app.services.manager_alert_service import ManagerAlertTopic, manager_alert_service
 from app.utils.message_patch import caption_exceeds_telegram_limit
 from app.utils.timezone import format_local_datetime
 
@@ -1222,7 +1223,11 @@ class AdminNotificationService:
                 ]
             )
 
-            return await self._send_message('\n'.join(message_lines), category=NotificationCategory.PROMO)
+            return await self._send_message(
+                '\n'.join(message_lines),
+                category=NotificationCategory.PROMO,
+                manager_topic=ManagerAlertTopic.MARKETING,
+            )
 
         except Exception as e:
             logger.error('Ошибка отправки уведомления о переходе по кампании', error=e)
@@ -1305,7 +1310,11 @@ class AdminNotificationService:
                 ]
             )
 
-            return await self._send_message('\n'.join(message_lines), category=NotificationCategory.PROMO)
+            return await self._send_message(
+                '\n'.join(message_lines),
+                category=NotificationCategory.PROMO,
+                manager_topic=ManagerAlertTopic.MARKETING,
+            )
 
         except Exception as e:
             logger.error(
@@ -1462,6 +1471,7 @@ class AdminNotificationService:
         reply_markup: types.InlineKeyboardMarkup | None = None,
         *,
         category: NotificationCategory | None = None,
+        manager_topic: ManagerAlertTopic | None = None,
     ) -> bool:
         if not self.chat_id:
             logger.warning('ADMIN_NOTIFICATIONS_CHAT_ID не настроен')
@@ -1496,13 +1506,17 @@ class AdminNotificationService:
                 # The manager copy has a strict allow-list and intentionally
                 # drops inline keyboards: a group member must not receive admin
                 # actions just because they can see the alert.
-                from app.services.manager_alert_service import manager_alert_service
-
-                await manager_alert_service.mirror_admin_category(
-                    self.bot,
-                    category.value if category else None,
-                    text,
-                )
+                #
+                # `manager_topic` is the narrow route: one notification opts in
+                # by name when its whole admin category must stay admin-only.
+                if manager_topic is not None:
+                    await manager_alert_service.send(self.bot, manager_topic, text)
+                else:
+                    await manager_alert_service.mirror_admin_category(
+                        self.bot,
+                        category.value if category else None,
+                        text,
+                    )
                 return True
 
             except TelegramForbiddenError:

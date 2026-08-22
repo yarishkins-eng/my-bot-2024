@@ -2,8 +2,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiogram import types
+from aiogram.enums import ChatType
 
-from app.handlers.manager_alerts import is_manager_alert_setup_command
+from app.config import settings
+from app.handlers.manager_alerts import bind_manager_alert_topic, is_manager_alert_setup_command
 from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
 from app.services.manager_alert_service import (
     ManagerAlertSettingsService,
@@ -95,3 +98,115 @@ def test_only_exact_manager_setup_commands_pass_group_filter() -> None:
     assert is_manager_alert_setup_command('/manager_alert_status@teplo_VPN_bot')
     assert not is_manager_alert_setup_command('/admin_help')
     assert not is_manager_alert_setup_command('/manager_alert_bindings')
+
+
+def _campaign_stub() -> MagicMock:
+    campaign = MagicMock()
+    campaign.name = 'Кувалда 7000₽'
+    campaign.start_parameter = 'teplo2'
+    campaign.is_balance_bonus = True
+    campaign.balance_bonus_kopeks = 5000
+    return campaign
+
+
+def _marketing_service(bot: MagicMock) -> AdminNotificationService:
+    assert ManagerAlertSettingsService.bind_topic(chat_id=-100123456, topic=ManagerAlertTopic.MARKETING, thread_id=40)
+    service = AdminNotificationService(bot)
+    service.chat_id = -100999999
+    service.enabled = True
+    return service
+
+
+@pytest.mark.asyncio
+async def test_campaign_visit_alert_reaches_manager_marketing_topic() -> None:
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    service = _marketing_service(bot)
+    telegram_user = types.User(id=6533655760, is_bot=False, first_name='SMOKY', username='SmokyPkr')
+
+    assert await service.send_campaign_link_visit_notification(MagicMock(), telegram_user, _campaign_stub(), user=None)
+
+    assert bot.send_message.await_count == 2
+    admin_call, manager_call = bot.send_message.await_args_list
+    assert manager_call.kwargs['chat_id'] == -100123456
+    assert manager_call.kwargs['message_thread_id'] == 40
+    assert manager_call.kwargs['text'] == admin_call.kwargs['text']
+    assert 'ПЕРЕХОД ПО РК' in manager_call.kwargs['text']
+    assert 'reply_markup' not in manager_call.kwargs
+
+
+@pytest.mark.asyncio
+async def test_campaign_registration_alert_reaches_manager_marketing_topic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    service = _marketing_service(bot)
+    monkeypatch.setattr(service, '_record_subscription_event', AsyncMock())
+    user = MagicMock(id=7, promo_group=None, promo_group_id=None)
+
+    assert await service.send_campaign_registration_notification(
+        MagicMock(),
+        6533655760,
+        'SMOKY',
+        'SmokyPkr',
+        _campaign_stub(),
+        user,
+        bonus_type='balance',
+        balance_kopeks=5000,
+    )
+
+    assert bot.send_message.await_count == 2
+    admin_call, manager_call = bot.send_message.await_args_list
+    assert manager_call.kwargs['message_thread_id'] == 40
+    assert manager_call.kwargs['text'] == admin_call.kwargs['text']
+    assert 'РЕГИСТРАЦИЯ ПО РК' in manager_call.kwargs['text']
+
+
+@pytest.mark.asyncio
+async def test_promo_category_alone_never_reaches_manager_even_with_marketing_bound() -> None:
+    """Промокоды и смена промогруппы идут той же категорией `promo` — и остаются у админа."""
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    service = _marketing_service(bot)
+
+    assert await service._send_message('<b>Активирован промокод</b>', category=NotificationCategory.PROMO)
+
+    assert bot.send_message.await_count == 1
+    assert bot.send_message.await_args.kwargs['chat_id'] == -100999999
+
+
+def _owner_topic_message(text: str, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    monkeypatch.setattr(type(settings), 'is_admin', lambda self, telegram_id: True)
+    message = MagicMock()
+    message.text = text
+    message.chat.id = -100123456
+    message.chat.type = ChatType.SUPERGROUP
+    message.is_topic_message = True
+    message.message_thread_id = 40
+    message.from_user = types.User(id=1, is_bot=False, first_name='owner')
+    message.answer = AsyncMock()
+    return message
+
+
+@pytest.mark.asyncio
+async def test_bind_accepts_marketing_topic(monkeypatch: pytest.MonkeyPatch) -> None:
+    message = _owner_topic_message('/manager_alert_bind marketing', monkeypatch)
+
+    await bind_manager_alert_topic(message)
+
+    assert ManagerAlertSettingsService.get_recipient(ManagerAlertTopic.MARKETING) == (-100123456, 40)
+    assert 'подключена' in message.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_bind_hint_lists_every_accepted_category(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Подсказка собирается из маршрута — владелец не должен получить список, которого нет."""
+    message = _owner_topic_message('/manager_alert_bind нет-такой', monkeypatch)
+
+    await bind_manager_alert_topic(message)
+
+    hint = message.answer.await_args.args[0]
+    for argument in ('tickets', 'subscriptions', 'payments', 'reports', 'service', 'marketing'):
+        assert argument in hint
+    assert ManagerAlertSettingsService.get_recipient(ManagerAlertTopic.MARKETING) is None

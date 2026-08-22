@@ -14,6 +14,7 @@ _TOPIC_BY_ARGUMENT: dict[str, ManagerAlertTopic] = {
     'payments': ManagerAlertTopic.PAYMENTS,
     'reports': ManagerAlertTopic.REPORTS,
     'service': ManagerAlertTopic.SERVICE_STATUS,
+    'marketing': ManagerAlertTopic.MARKETING,
 }
 
 
@@ -40,9 +41,10 @@ async def bind_manager_alert_topic(message: types.Message) -> None:
     parts = (message.text or '').split(maxsplit=1)
     topic = _TOPIC_BY_ARGUMENT.get(parts[1].strip().lower() if len(parts) == 2 else '')
     if not topic:
-        await message.answer(
-            'Укажи категорию: tickets, subscriptions, payments, reports или service.',
-        )
+        # Список собирается из самого маршрута: подсказка не может разойтись с
+        # тем, что команда реально принимает (owner уже упёрся в это однажды).
+        known = ', '.join(_TOPIC_BY_ARGUMENT)
+        await message.answer(f'Укажи категорию: {known}.')
         return
 
     saved = ManagerAlertSettingsService.bind_topic(
