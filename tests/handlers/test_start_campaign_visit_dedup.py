@@ -99,6 +99,41 @@ def _patch_start(monkeypatch: pytest.MonkeyPatch, campaigns: dict[str, SimpleNam
     return send_mock
 
 
+def _patch_existing_user(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Человек УЖЕ есть в базе: `cmd_start` уходит в ветку «показать меню».
+
+    Ветка длинная и до уведомления отношения не имеет — глушим её целиком, чтобы
+    тест говорил ровно об одном: владельцу не шлют «ПЕРЕХОД» за существующего клиента.
+    """
+
+    user = SimpleNamespace(
+        id=777,
+        telegram_id=TELEGRAM_ID,
+        username=None,
+        first_name='Гость',
+        last_name=None,
+        language='ru',
+        status='active',
+        balance_kopeks=0,
+        referred_by_id=1,
+        has_had_paid_subscription=False,
+        subscriptions=[],
+        last_activity=None,
+        updated_at=None,
+    )
+
+    monkeypatch.setattr(start_module, 'get_user_by_telegram_id', AsyncMock(return_value=user))
+    monkeypatch.setattr(start_module, 'find_phantom_user_by_username', AsyncMock(return_value=None))
+    monkeypatch.setattr(start_module, '_activate_pending_gift_after_registration', AsyncMock(return_value=None))
+    monkeypatch.setattr(start_module, '_persist_pending_subid_after_registration', AsyncMock(return_value=None))
+    monkeypatch.setattr(start_module, 'get_active_pinned_message', AsyncMock(return_value=None))
+    monkeypatch.setattr(start_module, 'get_main_menu_text', AsyncMock(return_value='меню'))
+    monkeypatch.setattr(start_module, 'get_main_menu_keyboard_async', AsyncMock(return_value=None))
+    monkeypatch.setattr(type(start_module.settings), 'is_text_main_menu_mode', lambda _self: True)
+    monkeypatch.setattr('app.utils.funnel_notify.remember_funnel_menu_message', AsyncMock(return_value=None))
+    return user
+
+
 @pytest.mark.asyncio
 async def test_second_start_by_same_campaign_sends_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Кликнул рекламу, бросил язык, вернулся — владелец получает ОДНО уведомление."""
@@ -159,6 +194,25 @@ async def test_flag_from_channel_guard_suppresses_any_campaign(monkeypatch: pyte
     await state.update_data(campaign_notification_sent=True)
 
     await start_module.cmd_start(_message('teplo2'), state, MagicMock())
+
+    send_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_existing_user_gets_no_visit_notification(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Человек УЖЕ в базе — «ПЕРЕХОД» ему не полагается вовсе (`user is None` в условии).
+
+    Без этого теста проверку `user is None` можно выбросить, не покраснив ни один тест
+    во всём проекте: тогда каждый существующий клиент, кликнувший рекламу повторно,
+    приходил бы владельцу как новый лид.
+    """
+
+    send_mock = _patch_start(monkeypatch, {'teplo2': _campaign(4, 'teplo2')}, sent=True)
+    _patch_existing_user(monkeypatch)
+    state = _state()
+    db = MagicMock(commit=AsyncMock(), refresh=AsyncMock(), rollback=AsyncMock())
+
+    await start_module.cmd_start(_message('teplo2'), state, db)
 
     send_mock.assert_not_awaited()
 
