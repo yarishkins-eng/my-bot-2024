@@ -1,4 +1,4 @@
-"""Сторож: «📣 ПЕРЕХОД ПО РК» уходит владельцу ОДИН раз на человека и кампанию.
+"""Сторож: «📣 ПЕРЕХОД ПО РК» не повторяется по той же рекламе.
 
 Человек, бросивший регистрацию на выборе языка, в БД не появляется (`create_user`
 вызывается ниже по потоку), поэтому при каждом возврате он снова `user is None` —
@@ -11,8 +11,14 @@
 
 * повторный `/start` по той же рекламе второго уведомления не шлёт;
 * пометка ставится ТОЛЬКО когда отправка вернула успех — иначе лид пропал бы навсегда;
+* пометка ДОПИСЫВАЕТСЯ в состояние, а не заменяет его: рядом лежит атрибуция;
 * клик по ДРУГОЙ живой кампании уведомление всё-таки шлёт (на боевом их четыре);
-* `True`, оставленный сторожем канала (`middlewares/channel_checker.py:443`), гасит всё.
+* `True`, оставленный сторожем канала (`middlewares/channel_checker.py:443`), гасит всё;
+* обычный `/start` без рекламной ссылки проходит мимо и не падает.
+
+⚠️ Пометка помнит ОДНУ, последнюю кампанию. Человек, который ходит между двумя живыми
+объявлениями, даёт по уведомлению на каждое переключение — это осознанный предел правки,
+а не недосмотр: каждое такое переключение всё-таки отдельный оплаченный клик.
 """
 
 from __future__ import annotations
@@ -50,9 +56,9 @@ def _campaign(campaign_id: int, start_parameter: str) -> SimpleNamespace:
     )
 
 
-def _message(start_parameter: str) -> SimpleNamespace:
+def _message(start_parameter: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
-        text=f'/start {start_parameter}',
+        text='/start' if start_parameter is None else f'/start {start_parameter}',
         from_user=types.User(id=TELEGRAM_ID, is_bot=False, first_name='Гость', username='guest'),
         bot=MagicMock(),
         answer=AsyncMock(),
@@ -101,10 +107,16 @@ async def test_second_start_by_same_campaign_sends_nothing(monkeypatch: pytest.M
     state = _state()
 
     await start_module.cmd_start(_message('teplo2'), state, MagicMock())
+    # Снимок делается сразу после ПЕРВОГО захода: второй заход заново кладёт метку
+    # кампании (`start.py:817`) и замаскировал бы запись состояния «поверх».
+    after_first_visit = await state.get_data()
     await start_module.cmd_start(_message('teplo2'), state, MagicMock())
 
     assert send_mock.await_count == 1
-    assert (await state.get_data())['campaign_notification_sent'] == 4
+    assert after_first_visit['campaign_notification_sent'] == 4
+    # Пометка дописана, а не записана поверх: рядом обязана уцелеть метка кампании,
+    # из которой потом соберётся «РЕГИСТРАЦИЯ ПО РК».
+    assert after_first_visit['campaign_id'] == 4
 
 
 @pytest.mark.asyncio
@@ -147,5 +159,22 @@ async def test_flag_from_channel_guard_suppresses_any_campaign(monkeypatch: pyte
     await state.update_data(campaign_notification_sent=True)
 
     await start_module.cmd_start(_message('teplo2'), state, MagicMock())
+
+    send_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_plain_start_without_campaign_does_not_break(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Обычный `/start` без рекламной ссылки — самый горячий путь бота.
+
+    Проверка «пометка чья» вычисляется ДО `if campaign`, поэтому без защиты
+    `campaign is not None` она уронила бы каждый такой заход.
+    """
+
+    send_mock = _patch_start(monkeypatch, {'teplo2': _campaign(4, 'teplo2')}, sent=True)
+    state = _state()
+    await state.update_data(campaign_notification_sent=4)
+
+    await start_module.cmd_start(_message(), state, MagicMock())
 
     send_mock.assert_not_awaited()

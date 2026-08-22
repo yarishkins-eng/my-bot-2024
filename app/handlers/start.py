@@ -926,12 +926,14 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
                 # Пометка ставится ТОЛЬКО по возврату: функция отдаёт False и без
                 # исключения (чат не настроен, категория выключена, Telegram отказал),
                 # а помеченный без доставки человек стоил бы владельцу лида навсегда.
-                await state.update_data(campaign_notification_sent=campaign.id)
+                # Строка журнала идёт ПЕРВОЙ: она единственный след отправки, и падение
+                # записи пометки не должно уносить её с собой.
                 logger.info(
                     'Отправлено уведомление о переходе по кампании',
                     campaign_id=campaign.id,
                     telegram_id=message.from_user.id,
                 )
+                await state.update_data(campaign_notification_sent=campaign.id)
         except Exception as notify_error:
             logger.error(
                 'Ошибка отправки админ уведомления о переходе по кампании',
