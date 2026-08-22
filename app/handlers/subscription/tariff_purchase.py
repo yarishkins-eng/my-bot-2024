@@ -1567,6 +1567,15 @@ async def select_tariff_period(
         existing_subscription = await get_subscription_by_user_and_tariff(db, db_user.id, tariff_id)
     else:
         existing_subscription = await get_subscription_by_user_id(db, db_user.id)
+        # Отказ по смене тарифа наступит в любом случае: и в ручном подтверждении
+        # (confirm_tariff_purchase), и в автопокупке после пополнения
+        # (_auto_purchase_tariff). Раньше он наступал ПОСЛЕ обещания «корзина
+        # сохранена» — человек шёл пополнять баланс ради покупки, которая не могла
+        # состояться, и не узнавал об этом ни от бота, ни потом. Отказываем до
+        # обещания и до денег, тем же текстом, что соседние экраны.
+        if existing_subscription and existing_subscription.tariff_id != tariff.id:
+            await callback.answer('Смена тарифа через этот сценарий недоступна', show_alert=True)
+            return
 
     effective_device_limit = (
         existing_subscription.device_limit
