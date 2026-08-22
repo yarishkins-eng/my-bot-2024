@@ -6,6 +6,7 @@ import pytest
 from aiogram import types
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramRetryAfter
+from structlog.testing import capture_logs
 
 from app.config import settings
 from app.handlers.manager_alerts import (
@@ -232,8 +233,6 @@ def _call_sites(matches) -> set[tuple[str, str]]:
     """Собирает пары «файл, объемлющая функция» для вызовов, прошедших `matches`."""
     found: set[tuple[str, str]] = set()
     for path in sorted(Path('app').rglob('*.py')):
-        if path.name == 'manager_alert_service.py':
-            continue  # свои внутренние вызовы сервис делает по определению
         tree = ast.parse(path.read_text(encoding='utf-8'))
         for enclosing in ast.walk(tree):
             if not isinstance(enclosing, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -270,6 +269,10 @@ def test_direct_manager_send_has_exactly_the_declared_call_sites() -> None:
     У него нет ни белого списка, ни ключевого аргумента: он берёт произвольный
     текст и произвольную тему. Ровно им уедет менеджеру чужой трейсбек, если
     кто-нибудь однажды напишет строку не думая.
+
+    Граница сторожа (проверена мутацией, а не предположена): он узнаёт вызов по
+    имени `manager_alert_service`. Присвоить сервис другой переменной и звать
+    через неё — обойдёт, ровно как `**routing` обходит соседний сторож.
     """
 
     def is_direct_send(node: ast.Call) -> bool:
@@ -321,5 +324,16 @@ async def test_flood_control_drops_manager_copy_as_known_behaviour() -> None:
     bot = MagicMock()
     bot.send_message = AsyncMock(side_effect=TelegramRetryAfter(method=MagicMock(), message='flood', retry_after=7))
 
-    assert await manager_alert_service.send(bot, ManagerAlertTopic.MARKETING, '<b>ПЕРЕХОД ПО РК</b>') is False
+    with capture_logs() as logs:
+        assert await manager_alert_service.send(bot, ManagerAlertTopic.MARKETING, '<b>ПЕРЕХОД ПО РК</b>') is False
+
     assert bot.send_message.await_count == 1
+    # Сама ветка ради лога и заведена: без этой проверки её можно было убрать
+    # целиком, и тест остался бы зелёным — общий except даёт тот же неретрай.
+    # Нашла мутация, не ревью.
+    dropped = [
+        entry for entry in logs if entry['event'] == 'Manager alert dropped by flood control (no retry by design)'
+    ]
+    assert len(dropped) == 1
+    assert dropped[0]['retry_after'] == 7
+    assert dropped[0]['topic'] == 'marketing'
