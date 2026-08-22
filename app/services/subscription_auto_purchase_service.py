@@ -3284,10 +3284,100 @@ async def _process_single_cart(
     return False
 
 
+async def _notify_auto_purchase_failure(
+    db: AsyncSession,
+    user: User,
+    carts: list[dict],
+    *,
+    topped_up_kopeks: int = 0,
+    bot: Bot | None = None,
+) -> None:
+    """Отказ автопокупки перестаёт быть немым.
+
+    Десять веток `_auto_purchase_tariff` возвращают False, и ни одна ничего не
+    говорит. Деньги легли на баланс, подписки нет: клиент об этом не узнаёт, а
+    владелец не может узнать в принципе — журнал уровня warning в админ-чат не
+    пересылается. Поэтому уведомление висит на ОБЩЕМ выходе, а не на одной ветке.
+
+    Частичное пополнение (на балансе всё ещё меньше корзины) — это не беда:
+    клиенту говорим, сколько ещё нужно, владельца НЕ тревожим. Иначе каждое
+    доливание баланса становится ложной тревогой.
+    """
+    cart_total = max((_safe_int(cart.get('total_price')) for cart in carts), default=0)
+    if cart_total <= 0:
+        return  # пустая или битая корзина — это не «человек заплатил и не получил»
+
+    # Баланс перечитываем из базы: объект пользователя мог протухнуть.
+    balance = _safe_int(await db.scalar(select(User.balance_kopeks).where(User.id == user.id)))
+    not_enough = balance < cart_total
+    texts = get_texts(getattr(user, 'language', 'ru'))
+
+    if bot is not None and getattr(user, 'telegram_id', None):
+        if not_enough:
+            text = texts.t(
+                'BALANCE_TOPPED_UP_CART_INSUFFICIENT',
+                '✅ Баланс пополнен на {amount}!\n\n💰 Текущий баланс: {balance}\n\n'
+                '🛒 У вас есть сохранённая корзина на {cart_total}\nНе хватает: {missing}',
+            ).format(
+                amount=texts.format_price(topped_up_kopeks),
+                balance=texts.format_price(balance),
+                cart_total=texts.format_price(cart_total),
+                missing=texts.format_price(cart_total - balance, round_kopeks=False),
+            )
+        else:
+            text = texts.t(
+                'AUTO_PURCHASE_FAILED',
+                '⚠️ <b>Не удалось оформить подписку автоматически</b>\n\n'
+                '💰 Деньги остались на вашем балансе: {balance}\n\n'
+                'Откройте раздел подписки и оформите её вручную — списания не было.',
+            ).format(balance=texts.format_price(balance))
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=texts.t('MY_SUBSCRIPTION_BUTTON', '📱 Моя подписка'),
+                        callback_data='menu_subscription',
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=texts.t('BACK_TO_MAIN_MENU_BUTTON', '🏠 Главное меню'),
+                        callback_data='back_to_menu',
+                    )
+                ],
+            ]
+        )
+        try:
+            await bot.send_message(
+                chat_id=user.telegram_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode='HTML',
+            )
+        except Exception as error:
+            logger.warning('Не удалось сообщить клиенту об отказе автопокупки', user_id=user.id, error=error)
+
+    if not_enough:
+        return
+
+    from app.services.subscription_renewal_service import with_admin_notification_service
+
+    await with_admin_notification_service(
+        lambda service: service.send_admin_notification(
+            '⚠️ <b>Автопокупка после пополнения не прошла</b>\n\n'
+            f'Пользователь: <code>{user.id}</code>\n'
+            f'Корзина: {texts.format_price(cart_total)}\n'
+            f'Баланс после пополнения: {texts.format_price(balance)}\n\n'
+            'Деньги у клиента на балансе, подписки нет. Причина — в журнале бота.'
+        )
+    )
+
+
 async def auto_purchase_saved_cart_after_topup(
     db: AsyncSession,
     user: User,
     *,
+    topped_up_kopeks: int = 0,
     bot: Bot | None = None,
 ) -> bool:
     """Attempts to automatically purchase subscriptions from saved carts.
@@ -3373,6 +3463,17 @@ async def auto_purchase_saved_cart_after_topup(
     # в пределах TTL, чтобы следующее пополнение могло до-завершить покупку.
     if any_succeeded:
         await user_cart_service.clear_topup_intent(user.id)
+    else:
+        # Единственное место, где отказ становится слышным. Ветка «нет корзин» и
+        # ветка «нет свежего намерения» сюда не доходят намеренно: там пополняли
+        # не ради корзины, и сообщение было бы спамом.
+        await _notify_auto_purchase_failure(
+            db,
+            user,
+            carts_to_process,
+            topped_up_kopeks=topped_up_kopeks,
+            bot=bot,
+        )
 
     return any_succeeded
 

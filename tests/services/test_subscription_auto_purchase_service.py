@@ -40,7 +40,9 @@ class DummyTexts:
     def t(self, key: str, default: str):
         return default
 
-    def format_price(self, value: int) -> str:
+    def format_price(self, value: int, round_kopeks: bool | None = None) -> str:
+        # Настоящий texts.format_price принимает round_kopeks (localization/texts.py:204).
+        # Заглушка без него молча расходилась с боевым объектом.
         return f'{value / 100:.0f} ₽'
 
 
