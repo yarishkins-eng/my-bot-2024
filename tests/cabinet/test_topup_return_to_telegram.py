@@ -146,3 +146,58 @@ def test_method_name_cannot_smuggle_characters_into_the_start_param(monkeypatch)
 
     for junk in ('plate ga', 'platega&x=1', 'platega/../evil', 'платега', ''):
         assert balance_route._telegram_top_up_return_url(junk, failed=False) == ''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔴 Спящий путь, который будит следующий этап (Б-3).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_legacy_checkout_never_builds_a_link_into_nowhere(monkeypatch) -> None:
+    """`_checkout_return_url` берёт из настройки только ХОСТ и приклеивает свой путь.
+
+    На боевом в настройке стоит `https://t.me/teplo_VPN_bot`, поэтому раньше собиралось
+    `https://t.me/subscription/purchase?checkout=…` — ссылка, которая не ведёт никуда.
+    Теперь функция отдаёт None, и платёжная система подставляет настройку целиком: человек
+    попадает хотя бы в чат с ботом.
+
+    ⚠️ Путь СПИТ (`create_checkout` жёстко ставит прямой режим), но его будит этап Б-3.
+    """
+    from app.services import device_first_payment_service as dfps
+
+    monkeypatch.setattr(settings, 'PLATEGA_RETURN_URL', 'https://t.me/teplo_VPN_bot', raising=False)
+    monkeypatch.setattr(settings, 'PLATEGA_FAILED_URL', 'https://t.me/teplo_VPN_bot', raising=False)
+
+    assert dfps._checkout_return_url('abc123') is None
+    assert dfps._checkout_return_url('abc123', failed=True) is None
+
+
+def test_legacy_checkout_still_works_with_a_real_website(monkeypatch) -> None:
+    """Второй конец шкалы: с обычным адресом сайта функция обязана собирать адрес как прежде.
+
+    Проверка «вернул None на t.me» одна прошла бы и у кода, который возвращает None ВСЕГДА, —
+    то есть у кода, который молча выключил бы возврат для всех.
+    """
+    from app.services import device_first_payment_service as dfps
+
+    monkeypatch.setattr(settings, 'PLATEGA_RETURN_URL', 'https://shop.example.test/paid', raising=False)
+
+    assert dfps._checkout_return_url('abc123') == 'https://shop.example.test/subscription/purchase?checkout=abc123'
+
+
+def test_direct_card_payment_return_url_is_untouched(monkeypatch) -> None:
+    """⛔ Прямая оплата картой обязана остаться на адресе САЙТА кабинета.
+
+    `_direct_checkout_return_url` намеренно отказывается от t.me-адресов — на этом держится
+    оплата полной ценой. Этап В-1 её не трогал, и сторож обязан покраснеть, если тронут.
+    """
+    from app.services import device_first_payment_service as dfps
+
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test', raising=False)
+    assert dfps._direct_checkout_return_url('abc123') == (
+        'https://cabinet.example.test/subscription/purchase?checkout=abc123'
+    )
+
+    # А t.me в этой настройке обязан её ОТКЛЮЧИТЬ, а не породить ссылку в никуда.
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://t.me/teplo_VPN_bot', raising=False)
+    assert dfps._direct_checkout_return_url('abc123') is None
