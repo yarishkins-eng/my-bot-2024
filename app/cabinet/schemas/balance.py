@@ -74,6 +74,12 @@ class TopUpRequest(BaseModel):
     amount_kopeks: int = Field(..., ge=1, le=2_000_000_000, description='Amount in kopeks')
     payment_method: str = Field(..., description='Payment method ID')
     payment_option: str | None = Field(None, description='Payment option (e.g. Platega method code)')
+    # 🔴 Этап В-1. Где человек находится, когда уходит платить: 'telegram' — внутри
+    # мини-приложения, 'web' — в обычном браузере. Определяет, куда платёжная система вернёт
+    # его кнопкой «Вернуться в магазин»: в Телеграм или на сайт кабинета. Спросить сервер
+    # об этом нельзя — оба запроса выглядят одинаково, знает только сам кабинет.
+    # Пусто → прежнее поведение (сайт): старая сборка кабинета поля не шлёт.
+    return_surface: str | None = Field(None, description="Where to send the payer back: 'telegram' or 'web'")
 
 
 class TopUpResponse(BaseModel):

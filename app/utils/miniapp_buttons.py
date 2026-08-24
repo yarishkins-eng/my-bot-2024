@@ -259,6 +259,45 @@ def build_miniapp_or_callback_button(
 ADMIN_TICKET_DEEPLINK_PREFIX = 'admin_ticket_'
 
 
+# Telegram допускает в startapp только эти символы (1–512).
+# ⚠️ Сверяется `fullmatch`, а НЕ `match`: `match` проверяет только начало строки, поэтому
+# 'tup-platega-ok\n' прошло бы забор и дало ссылку с переносом внутри. Якорей в самом узоре
+# намеренно нет: с `$` тот же перевод строки проскочил бы и через `fullmatch`-независимую
+# проверку, потому что в Python `$` совпадает и ПЕРЕД завершающим `\n`.
+_START_PARAM_RE = re.compile(r'[A-Za-z0-9_-]{1,512}')
+# Имя бота уходит в ХОСТ ссылки, и его тоже надо проверять. Обычно оно приходит из `get_me()`,
+# но при сбое сети остаётся значение настройки, которую правит человек, — пробел или слэш в нём
+# дали бы битый адрес возврата, а платёжная система на таком может отказаться выставить счёт.
+_BOT_USERNAME_RE = re.compile(r'[A-Za-z0-9_]{4,64}')
+
+
+def build_main_miniapp_startapp_url(start_param: str) -> str:
+    """Собрать t.me-диплинк на ГЛАВНОЕ мини-приложение бота (Main Mini App).
+
+    ``https://t.me/<bot>?startapp=<start_param>`` — в отличие от
+    ``build_miniapp_startapp_url`` короткое имя приложения НЕ нужно: у главного
+    мини-приложения его нет, Telegram открывает то, что задано в BotFather.
+
+    🟢 Проверено владельцем живьём 24.08.2026 на iPhone: ссылка открывает кабинет
+    сразу, без промежуточного чата. ``getMe`` на боевом подтверждает
+    ``has_main_web_app: true``.
+
+    Имя бота берётся из ``settings.BOT_USERNAME``. В ``.env`` его нет, и это НЕ помеха:
+    ``sync_bot_username`` проставляет его при старте из ``get_me()`` (``app/bot.py``),
+    а бот и кабинет живут в одном процессе. 🟢 Проверено на боевом вызовом кабинетного
+    ``/cabinet/branding/telegram-widget``: он отдаёт ``teplo_VPN_bot``.
+
+    Возвращает '' если имени бота нет или метка не проходит по символам — вызывающий
+    обязан в этом случае остаться на прежнем поведении, а не отправлять человека в никуда.
+    """
+    bot_username = settings.get_bot_username()
+    if not bot_username or not _BOT_USERNAME_RE.fullmatch(bot_username):
+        return ''
+    if not _START_PARAM_RE.fullmatch(start_param):
+        return ''
+    return f'https://t.me/{bot_username}?startapp={start_param}'
+
+
 def build_miniapp_startapp_url(start_param: str) -> str:
     """Собрать t.me Mini App deep link, открывающий кабинет в ЛЮБОМ типе чата.
 
