@@ -265,6 +265,10 @@ ADMIN_TICKET_DEEPLINK_PREFIX = 'admin_ticket_'
 # намеренно нет: с `$` тот же перевод строки проскочил бы и через `fullmatch`-независимую
 # проверку, потому что в Python `$` совпадает и ПЕРЕД завершающим `\n`.
 _START_PARAM_RE = re.compile(r'[A-Za-z0-9_-]{1,512}')
+# Имя бота уходит в ХОСТ ссылки, и его тоже надо проверять. Обычно оно приходит из `get_me()`,
+# но при сбое сети остаётся значение настройки, которую правит человек, — пробел или слэш в нём
+# дали бы битый адрес возврата, а платёжная система на таком может отказаться выставить счёт.
+_BOT_USERNAME_RE = re.compile(r'[A-Za-z0-9_]{4,64}')
 
 
 def build_main_miniapp_startapp_url(start_param: str) -> str:
@@ -287,7 +291,9 @@ def build_main_miniapp_startapp_url(start_param: str) -> str:
     обязан в этом случае остаться на прежнем поведении, а не отправлять человека в никуда.
     """
     bot_username = settings.get_bot_username()
-    if not bot_username or not _START_PARAM_RE.fullmatch(start_param):
+    if not bot_username or not _BOT_USERNAME_RE.fullmatch(bot_username):
+        return ''
+    if not _START_PARAM_RE.fullmatch(start_param):
         return ''
     return f'https://t.me/{bot_username}?startapp={start_param}'
 

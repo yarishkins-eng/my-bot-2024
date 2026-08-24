@@ -1215,9 +1215,20 @@ def _direct_checkout_return_url(checkout_public_id: str, *, failed: bool = False
     Возврат `None` (адрес собрать нечем) вызывающий трактует как отказ создать счёт — поэтому
     запасным путём остаётся прежний адрес сайта, а не пустота.
     """
-    deep_link = _telegram_direct_checkout_return_url(checkout_public_id, failed=failed)
-    if deep_link:
-        return deep_link
+    # 🔴 В ТЕЛЕГРАМ УВОДИМ ТОЛЬКО УСПЕХ. Отказ остаётся на прежнем адресе сайта, и это
+    # решение ревью, а не недоделка.
+    # Причина названа критиком полноты и проверена мной по коду: экран заказа, пока грузит
+    # строку заказа, пишет «Настраиваем VPN. Оплата учтена» (`deviceFirst.processing`,
+    # `processingText`). Человеку, которому банк ОТКАЗАЛ, это прямая ложь — и она мешает ему
+    # заплатить ещё раз. До этапа он сюда не доезжал вовсе (упирался в форму входа), значит
+    # ложь внёс бы именно этот этап.
+    # Научить экран говорить после отказа банка — это мина AR, дом следующего этапа. Там же
+    # уместно перевести на диплинк и отказ: `payment=failed` в кабинете сегодня не читает никто.
+    # ⛔ Пока экран не умеет — не приводим к нему того, кому он соврёт.
+    if not failed:
+        deep_link = _telegram_direct_checkout_return_url(checkout_public_id)
+        if deep_link:
+            return deep_link
 
     configured = (settings.CABINET_URL or '').strip()
     parsed = urlsplit(configured)

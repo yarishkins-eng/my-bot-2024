@@ -170,9 +170,27 @@ def test_direct_card_payer_is_sent_back_into_telegram(monkeypatch) -> None:
 
     order = '550e8400-e29b-41d4-a716-446655440000'
     assert dfps._direct_checkout_return_url(order) == (f'https://t.me/teplo_VPN_bot?startapp=co_{order}_ok')
-    assert dfps._direct_checkout_return_url(order, failed=True) == (
-        f'https://t.me/teplo_VPN_bot?startapp=co_{order}_fail'
-    )
+
+
+def test_failed_direct_payment_is_not_led_to_a_screen_that_would_lie(monkeypatch) -> None:
+    """🔴 Отказ в Телеграм НЕ уводим, и это решение ревью, а не недоделка.
+
+    Экран заказа, пока грузит строку заказа, пишет «Настраиваем VPN. Оплата учтена»
+    (`deviceFirst.processing` / `processingText`). Человеку, которому банк отказал, это прямая
+    ложь — и она мешает ему заплатить ещё раз. До этапа он туда не доезжал вовсе (упирался в
+    форму входа), значит ложь внёс бы именно этот этап.
+
+    Научить экран говорить после отказа банка — мина AR, дом следующего этапа; там же уместно
+    перевести на диплинк и отказ. Пока не умеет — не приводим к нему того, кому он соврёт.
+    """
+    from app.services import device_first_payment_service as dfps
+
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test', raising=False)
+    monkeypatch.setattr(settings, 'BOT_USERNAME', 'teplo_VPN_bot', raising=False)
+
+    failed_url = dfps._direct_checkout_return_url('abc123', failed=True)
+    assert failed_url == 'https://cabinet.example.test/subscription/purchase?checkout=abc123&payment=failed'
+    assert 't.me' not in failed_url
 
 
 def test_direct_card_payment_falls_back_to_the_website_not_to_nothing(monkeypatch) -> None:
