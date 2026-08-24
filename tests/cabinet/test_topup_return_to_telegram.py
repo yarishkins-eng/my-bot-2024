@@ -153,43 +153,85 @@ def test_method_name_cannot_smuggle_characters_into_the_start_param(monkeypatch)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_direct_card_payment_return_url_is_untouched(monkeypatch) -> None:
-    """⛔ Прямая оплата картой обязана остаться на адресе САЙТА кабинета.
+def test_direct_card_payer_is_sent_back_into_telegram(monkeypatch) -> None:
+    """🔴 Пётр: баланс ноль, кнопки «Доплатить» он не видит и платит полную цену картой.
 
-    `_direct_checkout_return_url` намеренно отказывается от t.me-адресов — на этом держится
-    оплата полной ценой. Этап В-1 её не трогал, и сторож обязан покраснеть, если тронут.
+    До этапа его возвращали на адрес САЙТА кабинета — то есть на форму входа, потому что во
+    внешнем браузере он не авторизован. Замер 24.08.2026: таких **140 из 285** живых людей.
+    Расширение этапа на эту дорогу — прямое решение владельца 24.08.2026.
+
+    ⚠️ Сторож переписан в том же коммите: прежний закреплял старый договор («всегда адрес
+    сайта») и обязан был покраснеть.
     """
     from app.services import device_first_payment_service as dfps
 
     monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test', raising=False)
+    monkeypatch.setattr(settings, 'BOT_USERNAME', 'teplo_VPN_bot', raising=False)
+
+    order = '550e8400-e29b-41d4-a716-446655440000'
+    assert dfps._direct_checkout_return_url(order) == (f'https://t.me/teplo_VPN_bot?startapp=co_{order}_ok')
+    assert dfps._direct_checkout_return_url(order, failed=True) == (
+        f'https://t.me/teplo_VPN_bot?startapp=co_{order}_fail'
+    )
+
+
+def test_direct_card_payment_falls_back_to_the_website_not_to_nothing(monkeypatch) -> None:
+    """Второй конец шкалы. Диплинк собрать нечем — остаётся прежний адрес сайта.
+
+    Пустоту возвращать НЕЛЬЗЯ: вызывающий трактует её как отказ создать счёт, то есть человек
+    не сможет заплатить вовсе. Это дороже плохого возврата.
+    """
+    from app.services import device_first_payment_service as dfps
+
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test', raising=False)
+    monkeypatch.setattr(settings, 'BOT_USERNAME', None, raising=False)
+
     assert dfps._direct_checkout_return_url('abc123') == (
         'https://cabinet.example.test/subscription/purchase?checkout=abc123'
     )
 
-    # А t.me в этой настройке обязан её ОТКЛЮЧИТЬ, а не породить ссылку в никуда.
+
+def test_direct_card_payment_still_refuses_a_telegram_cabinet_url(monkeypatch) -> None:
+    """⛔ Прежний запрет остаётся: приклеивать свой путь к чужому хосту нельзя.
+
+    Если `CABINET_URL` окажется телеграмным, а имени бота нет, собрать нечего — и функция
+    обязана честно отдать None, а не `https://t.me/subscription/purchase?checkout=…`.
+    """
+    from app.services import device_first_payment_service as dfps
+
     monkeypatch.setattr(settings, 'CABINET_URL', 'https://t.me/teplo_VPN_bot', raising=False)
+    monkeypatch.setattr(settings, 'BOT_USERNAME', None, raising=False)
+
     assert dfps._direct_checkout_return_url('abc123') is None
 
 
-def test_startapp_builder_refuses_anything_telegram_would_not_accept(monkeypatch) -> None:
-    """Второй забор, ниже списка способов.
-
-    Telegram принимает в `startapp` только `A-Za-z0-9_-` (1–512). Собранная мимо этого ссылка
-    — это ссылка, по которой человек никуда не попадёт. Забор проверяется отдельно, потому что
-    сверху его прикрывает список способов, и через него сюда мусор не доходит.
-    """
-    from app.utils.miniapp_buttons import build_main_miniapp_startapp_url
+def test_checkout_label_cannot_smuggle_characters(monkeypatch) -> None:
+    """Номер заказа уходит в адрес. Всё, что не похоже на номер, обязано дать запасной путь."""
+    from app.services import device_first_payment_service as dfps
 
     monkeypatch.setattr(settings, 'BOT_USERNAME', 'teplo_VPN_bot', raising=False)
 
-    assert build_main_miniapp_startapp_url('tup-platega-ok') == TELEGRAM_SUCCESS_URL
-    # 🔴 Перевод строки в конце — НЕ мелочь: в Python `$` совпадает и перед ним, поэтому
-    # забор на `match` пропустил бы 'tup-platega-ok\n' и собрал ссылку с переносом внутри.
-    # Этот вход добавлен после мутационного прогона: без него подмена `fullmatch` на
-    # `match` переживала весь набор.
-    for junk in ('tup platega ok', 'tup/platega', 'tup&x=1', 'туп', '', 'a' * 513, 'tup-platega-ok\n'):
-        assert build_main_miniapp_startapp_url(junk) == ''
+    for junk in ('', 'abc def', 'abc/../evil', 'abc&x=1', 'заказ', 'abc\n', 'a' * 65):
+        assert dfps._telegram_direct_checkout_return_url(junk) == ''
 
-    # Нет имени бота — нет ссылки. Обрубка `https://t.me/?startapp=…` быть не должно никогда.
-    monkeypatch.setattr(settings, 'BOT_USERNAME', None, raising=False)
-    assert build_main_miniapp_startapp_url('tup-platega-ok') == ''
+
+def test_two_labels_use_separators_that_cannot_appear_inside_them(monkeypatch) -> None:
+    """🔴 Договор двух меток. Разделители разные НАМЕРЕННО.
+
+    Номер заказа — `uuid4`: дефисы есть, подчёркиваний нет, поэтому его метка на `_`.
+    Имя способа оплаты — наоборот, поэтому его метка на `-`. Один разделитель на обе сделал
+    бы разбор двусмысленным. Сторож ловит попытку сложить их одинаково.
+    """
+    from app.services import device_first_payment_service as dfps
+
+    monkeypatch.setattr(settings, 'BOT_USERNAME', 'teplo_VPN_bot', raising=False)
+
+    order_label = dfps._telegram_direct_checkout_return_url('550e8400-e29b-41d4-a716-446655440000')
+    assert '?startapp=co_' in order_label
+    assert '?startapp=tup-' in balance_route._telegram_top_up_return_url('platega', failed=False)
+
+    # И ни один способ из списка проверенных не смеет содержать дефис: иначе метка пополнения
+    # станет двусмысленной, а кабинет вернёт `null` и приземлит человека на Главную.
+    for method in balance_route._TELEGRAM_RETURN_METHODS:
+        assert '-' not in method, method
+        assert method == method.lower()

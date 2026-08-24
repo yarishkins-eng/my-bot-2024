@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -1169,8 +1170,55 @@ def _checkout_return_url(checkout_public_id: str, *, failed: bool = False) -> st
     return urlunsplit((parsed.scheme, parsed.netloc, '/subscription/purchase', urlencode(query), ''))
 
 
+# 🔴 Этап В-1. Метка возврата ПРЯМОЙ оплаты картой: `co_<номер заказа>_<ok|fail>`.
+# Грамматику читает кабинет (`src/utils/telegramStartParam.ts`) — менять только ПАРОЙ.
+#
+# ⚠️ Разделитель здесь `_`, а у метки пополнения `-`, и это не небрежность. Разделитель
+# выбран так, чтобы он НЕ встречался внутри своей же начинки: номер заказа — это `uuid4`,
+# в нём есть дефисы и нет подчёркиваний; имя способа оплаты — наоборот. Один разделитель
+# на обе метки сделал бы разбор двусмысленным.
+_CHECKOUT_PUBLIC_ID_RE = re.compile(r'[A-Za-z0-9-]{1,64}')
+
+
+def _telegram_direct_checkout_return_url(checkout_public_id: str, *, failed: bool = False) -> str:
+    """Диплинк, возвращающий плательщика картой В ТЕЛЕГРАМ, к его же заказу.
+
+    Пустая строка означает «диплинк собрать нечем» — вызывающий обязан остаться на прежнем
+    адресе сайта, а не отправлять человека в никуда.
+    """
+    from app.utils.miniapp_buttons import build_main_miniapp_startapp_url
+
+    # ⛔ Без `.strip()` намеренно: номер заказа приходит из НАШЕЙ же строки в базе (`uuid4`).
+    # Молча подчистить его — значит спрятать порчу данных и отправить человека по адресу,
+    # который мы сами придумали. Не похоже на номер — уходим на запасной путь.
+    public_id = checkout_public_id or ''
+    if not _CHECKOUT_PUBLIC_ID_RE.fullmatch(public_id):
+        return ''
+    outcome = 'fail' if failed else 'ok'
+    return build_main_miniapp_startapp_url(f'co_{public_id}_{outcome}')
+
+
 def _direct_checkout_return_url(checkout_public_id: str, *, failed: bool = False) -> str | None:
-    """Never inherit the generic top-up redirect (it may be a Telegram URL)."""
+    """Куда провайдер вернёт того, кто платит картой ПОЛНУЮ цену заказа.
+
+    🔴 Этап В-1 (по прямому решению владельца 24.08.2026) добавил сюда телеграмный диплинк.
+    До него функция отдавала адрес САЙТА кабинета — и человек, заплативший во внешнем браузере,
+    видел форму входа вместо своей покупки. Это ровно та беда, которую владелец поймал живым
+    проходом 23.08; этап чинил её для доплаты с баланса, а прямая оплата оставалась открытой.
+    Замер 24.08: кнопки «Доплатить» не видит тот, у кого баланс ноль, — таких **140 из 285**.
+
+    ⛔ Прежний докстринг гласил «Never inherit the generic top-up redirect (it may be a Telegram
+    URL)», и запрет остаётся в силе: адрес пополнения сюда по-прежнему НЕ наследуется. Разница
+    в том, что диплинк собирается ЗДЕСЬ и по своей метке, а не берётся хостом из чужой настройки.
+    Отказ от `t.me` в `CABINET_URL` тоже сохранён: приклеивать свой путь к чужому хосту нельзя.
+
+    Возврат `None` (адрес собрать нечем) вызывающий трактует как отказ создать счёт — поэтому
+    запасным путём остаётся прежний адрес сайта, а не пустота.
+    """
+    deep_link = _telegram_direct_checkout_return_url(checkout_public_id, failed=failed)
+    if deep_link:
+        return deep_link
+
     configured = (settings.CABINET_URL or '').strip()
     parsed = urlsplit(configured)
     if parsed.scheme != 'https' or not parsed.netloc or parsed.netloc.lower() == 't.me':
