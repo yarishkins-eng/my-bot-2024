@@ -183,7 +183,11 @@ def test_startapp_builder_refuses_anything_telegram_would_not_accept(monkeypatch
     monkeypatch.setattr(settings, 'BOT_USERNAME', 'teplo_VPN_bot', raising=False)
 
     assert build_main_miniapp_startapp_url('tup-platega-ok') == TELEGRAM_SUCCESS_URL
-    for junk in ('tup platega ok', 'tup/platega', 'tup&x=1', 'туп', '', 'a' * 513):
+    # 🔴 Перевод строки в конце — НЕ мелочь: в Python `$` совпадает и перед ним, поэтому
+    # забор на `match` пропустил бы 'tup-platega-ok\n' и собрал ссылку с переносом внутри.
+    # Этот вход добавлен после мутационного прогона: без него подмена `fullmatch` на
+    # `match` переживала весь набор.
+    for junk in ('tup platega ok', 'tup/platega', 'tup&x=1', 'туп', '', 'a' * 513, 'tup-platega-ok\n'):
         assert build_main_miniapp_startapp_url(junk) == ''
 
     # Нет имени бота — нет ссылки. Обрубка `https://t.me/?startapp=…` быть не должно никогда.
