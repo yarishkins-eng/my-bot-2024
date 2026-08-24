@@ -201,3 +201,23 @@ def test_direct_card_payment_return_url_is_untouched(monkeypatch) -> None:
     # А t.me в этой настройке обязан её ОТКЛЮЧИТЬ, а не породить ссылку в никуда.
     monkeypatch.setattr(settings, 'CABINET_URL', 'https://t.me/teplo_VPN_bot', raising=False)
     assert dfps._direct_checkout_return_url('abc123') is None
+
+
+def test_startapp_builder_refuses_anything_telegram_would_not_accept(monkeypatch) -> None:
+    """Второй забор, ниже списка способов.
+
+    Telegram принимает в `startapp` только `A-Za-z0-9_-` (1–512). Собранная мимо этого ссылка
+    — это ссылка, по которой человек никуда не попадёт. Забор проверяется отдельно, потому что
+    сверху его прикрывает список способов, и через него сюда мусор не доходит.
+    """
+    from app.utils.miniapp_buttons import build_main_miniapp_startapp_url
+
+    monkeypatch.setattr(settings, 'BOT_USERNAME', 'teplo_VPN_bot', raising=False)
+
+    assert build_main_miniapp_startapp_url('tup-platega-ok') == TELEGRAM_SUCCESS_URL
+    for junk in ('tup platega ok', 'tup/platega', 'tup&x=1', 'туп', '', 'a' * 513):
+        assert build_main_miniapp_startapp_url(junk) == ''
+
+    # Нет имени бота — нет ссылки. Обрубка `https://t.me/?startapp=…` быть не должно никогда.
+    monkeypatch.setattr(settings, 'BOT_USERNAME', None, raising=False)
+    assert build_main_miniapp_startapp_url('tup-platega-ok') == ''
