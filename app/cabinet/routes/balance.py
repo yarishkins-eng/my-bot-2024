@@ -1,6 +1,7 @@
 """Balance and payment routes for cabinet."""
 
 import math
+import re
 import time
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
@@ -28,6 +29,7 @@ from app.services.payment_verification_service import (
     run_manual_check,
 )
 from app.utils.currency_converter import currency_converter
+from app.utils.miniapp_buttons import build_main_miniapp_startapp_url
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 from ..schemas.balance import (
@@ -305,6 +307,34 @@ async def create_stars_invoice(
         )
 
 
+# 🔴 Этап В-1 (мина EA). Метка возврата с пополнения для Telegram-диплинка.
+# Грамматику `tup-<способ>-<ok|fail>` читает кабинет (`src/utils/telegramStartParam.ts`) —
+# менять только ПАРОЙ, иначе человек вернётся в мини-приложение и приземлится на Главную.
+_TOP_UP_METHOD_RE = re.compile(r'^[a-z0-9_]{1,32}$')
+
+# Платёжные системы, про которые ДОКАЗАНО, что они принимают t.me-адрес возврата.
+# Platega доказана боевым кодом: пополнение из БОТА (`app/handlers/balance/platega.py`)
+# адрес возврата не передаёт вовсе и уже сегодня уезжает на `PLATEGA_RETURN_URL`,
+# а он на боевом равен `https://t.me/teplo_VPN_bot`.
+# ⚠️ Добавлять сюда способ можно ТОЛЬКО после такой же проверки. Часть шлюзов сверяет адрес
+# возврата при СОЗДАНИИ счёта, и отказ там означает не «плохой возврат», а «человек вообще
+# не может заплатить» — цена ошибки здесь выше, чем выигрыш.
+_TELEGRAM_RETURN_METHODS = frozenset({'platega'})
+
+
+def _telegram_top_up_return_url(method_id: str, *, failed: bool) -> str:
+    """Адрес, по которому платёжная система вернёт человека В ТЕЛЕГРАМ, а не на сайт кабинета.
+
+    Пустая строка означает «оставить прежний адрес»: способ не проверен, имя бота неизвестно
+    или метка не прошла по символам. Тихо отправлять человека в никуда нельзя.
+    """
+    method = (method_id or '').strip().lower()
+    if method not in _TELEGRAM_RETURN_METHODS or not _TOP_UP_METHOD_RE.match(method):
+        return ''
+    outcome = 'fail' if failed else 'ok'
+    return build_main_miniapp_startapp_url(f'tup-{method}-{outcome}')
+
+
 @router.post('/topup', response_model=TopUpResponse)
 async def create_topup(
     request: TopUpRequest,
@@ -347,6 +377,20 @@ async def create_topup(
     cabinet_return_url = f'{settings.CABINET_URL.rstrip("/")}/balance/top-up/result?method={request.payment_method}'
     cabinet_success_url = f'{cabinet_return_url}&status=success'
     cabinet_failed_url = f'{cabinet_return_url}&status=failed'
+
+    # 🔴 Этап В-1 (мина EA). Кнопка платёжной системы «Вернуться в магазин» вела на адрес САЙТА
+    # кабинета. Человек в этот момент во ВНЕШНЕМ браузере, где сессии мини-приложения нет, —
+    # и вместо своей покупки видел форму входа. Поймано живым проходом владельца 23.08.2026.
+    # Теперь для тех, кто ушёл платить из мини-приложения, возврат ведёт в Телеграм.
+    # ⛔ `cabinet_return_url` (без исхода) НЕ трогаем: его берут способы, у которых один адрес
+    # на успех и на отказ, а метка обязана называть исход честно.
+    if (request.return_surface or '').strip().lower() == 'telegram':
+        telegram_success_url = _telegram_top_up_return_url(request.payment_method, failed=False)
+        telegram_failed_url = _telegram_top_up_return_url(request.payment_method, failed=True)
+        # Обе или ни одной: половина замены оставила бы отказ на сайте, а успех в Телеграме.
+        if telegram_success_url and telegram_failed_url:
+            cabinet_success_url = telegram_success_url
+            cabinet_failed_url = telegram_failed_url
 
     try:
         if request.payment_method == 'yookassa':

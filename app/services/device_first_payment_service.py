@@ -1151,6 +1151,15 @@ def _checkout_return_url(checkout_public_id: str, *, failed: bool = False) -> st
     parsed = urlsplit(configured)
     if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
         return None
+    # 🔴 Этап В-1. У этой функции ЕСТЬ настройка, из которой она берёт только хост, — и на боевом
+    # там стоит `https://t.me/teplo_VPN_bot`. Приклеив к нему свой путь, она собирала
+    # `https://t.me/subscription/purchase?checkout=…` — ссылку, которая не ведёт никуда.
+    # Возвращаем None: тогда платёжная система подставит настройку целиком (`create_platega_payment`
+    # делает `return_url or get_platega_return_url()`), и человек попадёт хотя бы в чат с ботом.
+    # ⚠️ Путь СПИТ: `create_checkout` жёстко ставит прямой режим, а все шесть точек вызова
+    # `create_platega_attempt` пропускают только НЕ прямой. Разбудит его этап Б-3.
+    if parsed.netloc.lower() == 't.me':
+        return None
     query = {'checkout': checkout_public_id}
     if failed:
         query['payment'] = 'failed'
