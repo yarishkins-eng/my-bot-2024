@@ -149,40 +149,8 @@ def test_method_name_cannot_smuggle_characters_into_the_start_param(monkeypatch)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔴 Спящий путь, который будит следующий этап (Б-3).
+# 🔴 Граница этапа: прямая оплата картой обязана остаться нетронутой.
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_legacy_checkout_never_builds_a_link_into_nowhere(monkeypatch) -> None:
-    """`_checkout_return_url` берёт из настройки только ХОСТ и приклеивает свой путь.
-
-    На боевом в настройке стоит `https://t.me/teplo_VPN_bot`, поэтому раньше собиралось
-    `https://t.me/subscription/purchase?checkout=…` — ссылка, которая не ведёт никуда.
-    Теперь функция отдаёт None, и платёжная система подставляет настройку целиком: человек
-    попадает хотя бы в чат с ботом.
-
-    ⚠️ Путь СПИТ (`create_checkout` жёстко ставит прямой режим), но его будит этап Б-3.
-    """
-    from app.services import device_first_payment_service as dfps
-
-    monkeypatch.setattr(settings, 'PLATEGA_RETURN_URL', 'https://t.me/teplo_VPN_bot', raising=False)
-    monkeypatch.setattr(settings, 'PLATEGA_FAILED_URL', 'https://t.me/teplo_VPN_bot', raising=False)
-
-    assert dfps._checkout_return_url('abc123') is None
-    assert dfps._checkout_return_url('abc123', failed=True) is None
-
-
-def test_legacy_checkout_still_works_with_a_real_website(monkeypatch) -> None:
-    """Второй конец шкалы: с обычным адресом сайта функция обязана собирать адрес как прежде.
-
-    Проверка «вернул None на t.me» одна прошла бы и у кода, который возвращает None ВСЕГДА, —
-    то есть у кода, который молча выключил бы возврат для всех.
-    """
-    from app.services import device_first_payment_service as dfps
-
-    monkeypatch.setattr(settings, 'PLATEGA_RETURN_URL', 'https://shop.example.test/paid', raising=False)
-
-    assert dfps._checkout_return_url('abc123') == 'https://shop.example.test/subscription/purchase?checkout=abc123'
 
 
 def test_direct_card_payment_return_url_is_untouched(monkeypatch) -> None:

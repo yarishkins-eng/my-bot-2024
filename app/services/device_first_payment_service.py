@@ -1151,15 +1151,18 @@ def _checkout_return_url(checkout_public_id: str, *, failed: bool = False) -> st
     parsed = urlsplit(configured)
     if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
         return None
-    # 🔴 Этап В-1. У этой функции ЕСТЬ настройка, из которой она берёт только хост, — и на боевом
-    # там стоит `https://t.me/teplo_VPN_bot`. Приклеив к нему свой путь, она собирала
-    # `https://t.me/subscription/purchase?checkout=…` — ссылку, которая не ведёт никуда.
-    # Возвращаем None: тогда платёжная система подставит настройку целиком (`create_platega_payment`
-    # делает `return_url or get_platega_return_url()`), и человек попадёт хотя бы в чат с ботом.
-    # ⚠️ Путь СПИТ: `create_checkout` жёстко ставит прямой режим, а все шесть точек вызова
-    # `create_platega_attempt` пропускают только НЕ прямой. Разбудит его этап Б-3.
-    if parsed.netloc.lower() == 't.me':
-        return None
+    # 🔴 Этап В-1 ЗДЕСЬ НИЧЕГО НЕ ЧИНИТ — и это решение, а не недосмотр.
+    # Дефект настоящий: функция берёт из настройки только ХОСТ и приклеивает свой путь, а на
+    # боевом в настройке стоит `https://t.me/teplo_VPN_bot` — то есть собирается
+    # `https://t.me/subscription/purchase?checkout=…`, ссылка в никуда.
+    # Я написал было заслонку «хост t.me → None» и откатил: ревью показало, что моё
+    # обоснование неверно. Запасной путь `return_url or get_platega_return_url()` живёт в
+    # ДРУГОЙ функции (`payment/platega.py`), а эта точка зовёт `PlategaService.create_payment`
+    # напрямую — при None поле просто не уходит, и счёт создаётся БЕЗ адреса возврата вовсе.
+    # Чем это кончится у провайдера, я не проверял, а чинить денежный путь наугад нельзя.
+    # ⚠️ Путь СПИТ: `create_checkout` жёстко ставит прямой режим, и все шесть точек вызова
+    # `create_platega_attempt` пропускают только НЕ прямой. Разбудит его этап Б-3 —
+    # и он обязан решить, какой адрес возврата нужен этому режиму. Мина заведена.
     query = {'checkout': checkout_public_id}
     if failed:
         query['payment'] = 'failed'

@@ -1,7 +1,6 @@
 """Balance and payment routes for cabinet."""
 
 import math
-import re
 import time
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
@@ -310,8 +309,9 @@ async def create_stars_invoice(
 # 🔴 Этап В-1 (мина EA). Метка возврата с пополнения для Telegram-диплинка.
 # Грамматику `tup-<способ>-<ok|fail>` читает кабинет (`src/utils/telegramStartParam.ts`) —
 # менять только ПАРОЙ, иначе человек вернётся в мини-приложение и приземлится на Главную.
-_TOP_UP_METHOD_RE = re.compile(r'^[a-z0-9_]{1,32}$')
-
+# ⚠️ Третьего забора «имя способа из допустимых символов» здесь НЕТ намеренно: мутационный
+# прогон показал, что он недостижим — сверху стоит список способов, снизу проверка символов
+# в самом сборщике диплинка. Дублирующий забор, который нельзя проверить, — не защита.
 # Платёжные системы, про которые ДОКАЗАНО, что они принимают t.me-адрес возврата.
 # Platega доказана боевым кодом: пополнение из БОТА (`app/handlers/balance/platega.py`)
 # адрес возврата не передаёт вовсе и уже сегодня уезжает на `PLATEGA_RETURN_URL`,
@@ -329,7 +329,7 @@ def _telegram_top_up_return_url(method_id: str, *, failed: bool) -> str:
     или метка не прошла по символам. Тихо отправлять человека в никуда нельзя.
     """
     method = (method_id or '').strip().lower()
-    if method not in _TELEGRAM_RETURN_METHODS or not _TOP_UP_METHOD_RE.match(method):
+    if method not in _TELEGRAM_RETURN_METHODS:
         return ''
     outcome = 'fail' if failed else 'ok'
     return build_main_miniapp_startapp_url(f'tup-{method}-{outcome}')

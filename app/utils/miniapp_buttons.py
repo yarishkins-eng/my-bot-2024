@@ -260,7 +260,9 @@ ADMIN_TICKET_DEEPLINK_PREFIX = 'admin_ticket_'
 
 
 # Telegram допускает в startapp только эти символы (1–512).
-_START_PARAM_RE = re.compile(r'^[A-Za-z0-9_-]{1,512}$')
+# ⚠️ `fullmatch`, а не `match`: в Python `$` совпадает И ПЕРЕД завершающим переводом строки,
+# то есть 'tup-platega-ok\n' прошло бы забор и дало ссылку с переносом внутри.
+_START_PARAM_RE = re.compile(r'[A-Za-z0-9_-]{1,512}')
 
 
 def build_main_miniapp_startapp_url(start_param: str) -> str:
@@ -283,7 +285,7 @@ def build_main_miniapp_startapp_url(start_param: str) -> str:
     обязан в этом случае остаться на прежнем поведении, а не отправлять человека в никуда.
     """
     bot_username = settings.get_bot_username()
-    if not bot_username or not _START_PARAM_RE.match(start_param):
+    if not bot_username or not _START_PARAM_RE.fullmatch(start_param):
         return ''
     return f'https://t.me/{bot_username}?startapp={start_param}'
 
