@@ -1061,6 +1061,12 @@ async def _render_fused_confirmation(
         # просто скопирует чужой дефект. Формулировка — та же, что у кабинета.
         tail_ru = 'Выберите способ оплаты: деньги с баланса при этом не спишутся.'
         tail_en = 'Choose a payment method: your balance stays untouched.'
+        if not methods:
+            # Способов оплаты нет — ниже экран сам скажет «Оплата временно недоступна».
+            # Звать выбрать способ и рассуждать про списание, которого не может быть, значит
+            # спорить с собой на глазах у человека, чьи деньги мы строкой выше назвали. Молчать
+            # честнее: строки «Баланс» и «Не хватает» остаются, они верны и здесь.
+            tail_ru = tail_en = ''
         logger.info(
             'Экран заказа показал баланс и недостачу',
             user_id=user.id,
@@ -1102,13 +1108,13 @@ async def _render_fused_confirmation(
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
             f'К оплате: <b>{total} ₽</b>\n\n' + wallet_ru + tail_ru
-        ),
+        ).rstrip(),
         (
             '💳 <b>Your order</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
             f'To pay: <b>₽{total}</b>\n\n' + wallet_en + tail_en
-        ),
+        ).rstrip(),
     )
     if notice:
         caption = f'{notice}\n\n{caption}'

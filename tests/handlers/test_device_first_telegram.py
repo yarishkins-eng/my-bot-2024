@@ -1691,6 +1691,51 @@ async def test_fused_confirmation_speaks_english_to_an_english_customer() -> Non
     assert keyboard[0][0].text == '💰 Top up ₽199'
 
 
+@pytest.mark.asyncio
+async def test_fused_confirmation_does_not_argue_with_itself_when_payment_is_unavailable() -> None:
+    """Единственное состояние, где деньги на балансе видны, а потратить их нечем.
+
+    Экран не должен звать выбрать способ оплаты и обсуждать списание, которого не может
+    быть, а строкой ниже сообщать, что оплата недоступна. Строки про деньги остаются:
+    они верны и здесь.
+    """
+    callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=5_000)
+    options = {
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 24_900}]}],
+    }
+    db = _db()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[]),
+        ),
+        patch('app.utils.miniapp_buttons.build_cabinet_url', return_value='https://cabinet.example/safe'),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_fused_confirmation(callback, user, db, options, days=30, devices=2)
+
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert caption == (
+        '💳 <b>Ваш заказ</b>\n\n'
+        '<b>Базовый</b>\n'
+        '2 устройства · 1 месяц\n'
+        'К оплате: <b>249 ₽</b>\n\n'
+        '💳 Баланс: 50 ₽\n'
+        '⚠️ Не хватает: 199 ₽\n\n'
+        'Оплата временно недоступна. Обратитесь в поддержку.'
+    )
+    # Дверь доплаты сюда не ставится: она ведёт к тому же провайдеру, которого сейчас нет.
+    db.scalar.assert_not_awaited()
+    callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
+    assert callbacks == ['menu_support', 'df:e2', 'df:x2']
+
+
 def test_fused_pay_callbacks_fit_the_telegram_byte_budget() -> None:
     from app.services.device_first_payment_service import PLATEGA_METHODS
 
