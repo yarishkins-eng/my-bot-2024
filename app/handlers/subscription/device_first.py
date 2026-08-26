@@ -8,13 +8,14 @@ from html import escape
 from itertools import islice
 from urllib.parse import urlencode
 
+import structlog
 from aiogram import F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import CheckoutPaymentAttempt, PlategaPayment, Tariff, User
+from app.database.models import CheckoutPaymentAttempt, PlategaPayment, SubscriptionCheckout, Tariff, User
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
     OPEN_STATES,
@@ -44,6 +45,20 @@ from app.services.device_first_payment_service import (
 )
 from app.utils.photo_message import edit_or_answer_photo
 from app.utils.timezone import format_local_datetime
+
+
+# 🔴 Первая запись в журнал во всём файле нативной кассы. До этапа БК серверного следа не
+# оставлял ни один её экран, и отличить «люди увидели и пошли доплачивать» от «экрана никто
+# не открывал» было нечем: кнопки оплаты — web_app, боту при нажатии не приходит ничего.
+logger = structlog.get_logger(__name__)
+
+
+# Кошелёк кабинета, к которому ведёт доплата с экрана заказа. То же значение зашито
+# у кабинета (`CHECKOUT_TOP_UP_METHOD_ID` в `DeviceFirstConfigurator.tsx`): оба экрана
+# обязаны приводить человека к одному и тому же провайдеру, иначе минимум суммы, которым
+# сервер отобьёт запрос, окажется чужим.
+CHECKOUT_TOP_UP_METHOD_ID = 'platega'
+KOPEKS_PER_RUBLE = 100
 
 
 def _en(user: User) -> bool:
@@ -266,6 +281,72 @@ def _fused_native_payment_button(
     if cabinet_url:
         return InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=cabinet_url))
     return InlineKeyboardButton(text=text, callback_data=f'df:y2:{method_key}:{days}:{devices}:{kopeks}')
+
+
+async def _fused_top_up_button(
+    user: User,
+    db: AsyncSession,
+    *,
+    days: int,
+    devices: int,
+    price: int,
+) -> InlineKeyboardButton | None:
+    """Open the Cabinet top-up screen already filled with this order's shortfall.
+
+    The address is the one the Cabinet builds for itself beside its own top-up
+    action, so both screens ask for the same amount and return the customer to
+    his own order: ``from=checkout`` is the only marker that reseeds the period
+    and the device count, and the Cabinet validates the return address by it.
+    Auto-submit is deliberately not requested — the bot reads the raw provider
+    minimum while the Cabinet reads the admin-narrowed one, so a diverging
+    amount must stay editable instead of dying on a refusal.
+
+    Returns ``None`` whenever the top-up road is not the honest one to offer.
+    """
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    top_up = device_first_top_up_kopeks(price_kopeks=price, balance_kopeks=user.balance_kopeks)
+    # The provider minimum can lift a small shortfall up to the full price (it
+    # happens to anyone holding only kopeks).  Paying the same money by a road
+    # five screens longer is not an offer, so the button stays away — the very
+    # same comparison the Cabinet makes before promoting its own top-up action.
+    if not 0 < top_up < price:
+        return None
+    # A live invoice pins the funding mode to the provider.  Topping up in that
+    # state ends on ``funding_mode_locked`` and on the old invoice screen, whose
+    # primary button is to pay a second time.  The balance lines stay: they are
+    # true there as well.
+    # ⛔ Deliberately a plain read instead of ``get_open_checkout_for_user``:
+    # that helper expires a stale quote and ``db.commit()``s it, and it calls
+    # ``settlement_mode()``, which RAISES on a corrupted discriminator.  Neither
+    # belongs on a rendering path — least of all one reached right after a failed
+    # debit, where a commit would land on somebody else's unit of work.  The
+    # broader question this asks («is any order in flight at all?») errs toward
+    # hiding the door, which is the honest answer for an order we cannot classify.
+    if (
+        await db.scalar(
+            select(SubscriptionCheckout.id)
+            .where(
+                SubscriptionCheckout.user_id == user.id,
+                SubscriptionCheckout.lifecycle_state.in_(OPEN_STATES),
+            )
+            .limit(1)
+        )
+        is not None
+    ):
+        return None
+    return_to = f'/subscription/purchase?{urlencode({"from": "checkout", "period": days, "devices": devices})}'
+    cabinet_url = build_cabinet_url(
+        f'/balance/top-up/{CHECKOUT_TOP_UP_METHOD_ID}?'
+        f'{urlencode({"returnTo": return_to, "amount": top_up // KOPEKS_PER_RUBLE})}'
+    )
+    if not cabinet_url:
+        return None
+    amount = _money(user, top_up)
+    return InlineKeyboardButton(
+        text=_text(user, f'💰 Доплатить {amount} ₽', f'💰 Top up ₽{amount}'),
+        web_app=types.WebAppInfo(url=cabinet_url),
+    )
 
 
 async def _answer_stale(callback: types.CallbackQuery, user: User) -> None:
@@ -921,6 +1002,19 @@ async def _render_fused_confirmation(
     total = _money(user, price)
     tariff_name = options['tariff']['name']
     has_full_wallet_balance = user.balance_kopeks >= price
+    # Три состояния кошелька, а не два. Прежний признак был двусторонним, и его ветка «иначе»
+    # обслуживала И человека с нулём на балансе, И человека, у которого часть суммы есть:
+    # любая строка про баланс, написанная в общей ветке, врала бы 141 человеку с нулём.
+    # Структура разводится ДО того, как в неё вписывается текст.
+    has_partial_wallet = 0 < user.balance_kopeks < price
+    # Дверь строится только тому, кому она нужна: у человека с нулём и у человека, которому
+    # хватает на всё, лишнего запроса к базе не случается вовсе. Без способов оплаты доплата
+    # тоже некуда не ведёт — она идёт к тому же провайдеру.
+    top_up_button = (
+        await _fused_top_up_button(user, db, days=days, devices=devices, price=price)
+        if has_partial_wallet and methods
+        else None
+    )
     rows: list[list[InlineKeyboardButton]]
     if has_full_wallet_balance:
         rows = [
@@ -949,22 +1043,78 @@ async def _render_fused_confirmation(
             ]
             for item in methods
         ]
+    wallet_ru = wallet_en = ''
+    if has_full_wallet_balance:
+        tail_ru, tail_en = 'Оплатите с баланса.', 'Pay from your balance.'
+    elif has_partial_wallet:
+        # Слова взяты у самого бота — ими он уже называет эти два факта на экране подтверждения
+        # заказа (`_render_arm_confirmation`). Заводить рядом вторую редакцию одного и того же
+        # значило бы построить новую путаницу вместо того, чтобы снять старую.
+        # Недостача — честная разность, без провайдерских минимумов: её же печатает и кабинет.
+        shortage = price - user.balance_kopeks
+        wallet_ru = f'💳 Баланс: {_money(user, user.balance_kopeks)} ₽\n⚠️ Не хватает: {_money(user, shortage)} ₽\n\n'
+        wallet_en = f'💳 Balance: ₽{_money(user, user.balance_kopeks)}\n⚠️ Shortage: ₽{_money(user, shortage)}\n\n'
+        # Урок мины DE, а не её остаток: сам остаток DE живёт в СВОДКЕ КАБИНЕТА и этим диффом
+        # не тронут. Урок в том, что строка про баланс рядом с ценой читается как «зачтётся»,
+        # а он не зачитывается — человек платит полную цену, а деньги остаются лежать. Значит
+        # бот, заводя у себя такую строку, обязан завести и оговорку, вплотную к ней, иначе он
+        # просто скопирует чужой дефект. Формулировка — та же, что у кабинета.
+        tail_ru = 'Выберите способ оплаты: деньги с баланса при этом не спишутся.'
+        tail_en = 'Choose a payment method: your balance stays untouched.'
+        if not methods:
+            # Способов оплаты нет — ниже экран сам скажет «Оплата временно недоступна».
+            # Звать выбрать способ и рассуждать про списание, которого не может быть, значит
+            # спорить с собой на глазах у человека, чьи деньги мы строкой выше назвали. Молчать
+            # честнее: строки «Баланс» и «Не хватает» остаются, они верны и здесь.
+            tail_ru = tail_en = ''
+        logger.info(
+            'Экран заказа показал баланс и недостачу',
+            user_id=user.id,
+            balance_kopeks=user.balance_kopeks,
+            price_kopeks=price,
+            top_up_offered=top_up_button is not None,
+        )
+        if top_up_button is not None:
+            # 🔴 Сказать про обратную дорогу НАДО ДО того, как человек ушёл платить. Доплата
+            # заказ не оформляет: у device-first нет корзины, и довести покупку должен он сам.
+            # Если об этом промолчать, он оплатит недостачу, получит в чат «✅ Пополнение
+            # успешно!» и останется без подписки, считая покупку завершённой.
+            # 🔴 И вторая строка обязательна: «вернитесь» без указания КУДА посылает человека
+            # ровно в этот чат — а здесь его ждёт ЭТО ЖЕ сообщение с двумя числами, которые
+            # доплата только что сделала ложными, и с кнопками полной цены. Перерисовать его
+            # нечем: дверь и кнопки оплаты — web_app, боту при нажатии не приходит ничего, а
+            # деньги зачисляет вебхук. Дорога домой одна — то окно, которое уже открыто.
+            hint_ru = 'Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.'
+            hint_en = 'Top up and finish the purchase in the same window — we keep your choice.'
+            stale_ru = 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.'
+            stale_en = 'After the top-up this chat screen will not refresh: its buttons still charge the full price.'
+            # Второе число на экране появляется, только когда провайдерский минимум больше
+            # недостачи: тогда в сводке одна сумма, а на кнопке другая, и без объяснения это
+            # читается как ошибка. Ключ не сочинён — кабинет объясняет остаток теми же словами.
+            surplus = device_first_top_up_surplus_kopeks(price_kopeks=price, balance_kopeks=user.balance_kopeks)
+            if surplus > 0:
+                hint_ru += f'\nПосле оформления {_money(user, surplus)} ₽ останется на балансе.'
+                hint_en += f'\n₽{_money(user, surplus)} will remain on your balance after the order.'
+            # Порядок именно такой: в Телеграме подпись всегда ВЫШЕ кнопок, поэтому доплата
+            # называется первой, а «или» встаёт после того, чему противопоставлено.
+            tail_ru = f'{hint_ru}\n{stale_ru}\nИли оплатите полной суммой: деньги с баланса при этом не спишутся.'
+            tail_en = f'{hint_en}\n{stale_en}\nOr pay the full amount: your balance stays untouched.'
+    else:
+        tail_ru, tail_en = 'Выберите способ оплаты.', 'Choose a payment method.'
     caption = _text(
         user,
         (
             '💳 <b>Ваш заказ</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
-            f'К оплате: <b>{total} ₽</b>\n\n'
-            + ('Оплатите с баланса.' if has_full_wallet_balance else 'Выберите способ оплаты.')
-        ),
+            f'К оплате: <b>{total} ₽</b>\n\n' + wallet_ru + tail_ru
+        ).rstrip(),
         (
             '💳 <b>Your order</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
-            f'To pay: <b>₽{total}</b>\n\n'
-            + ('Pay from your balance.' if has_full_wallet_balance else 'Choose a payment method.')
-        ),
+            f'To pay: <b>₽{total}</b>\n\n' + wallet_en + tail_en
+        ).rstrip(),
     )
     if notice:
         caption = f'{notice}\n\n{caption}'
@@ -981,6 +1131,12 @@ async def _render_fused_confirmation(
                 )
             ]
         ]
+    elif top_up_button is not None:
+        # Первой — это решение, а не копия: у 114 человек рекламный полтинник снимает пятую
+        # часть цены, и ради этого этап и делается. Вставляем ПОСЛЕ ветки «платить нечем»:
+        # там клавиатура заменяется целиком, и доплате в ней места нет — она идёт к тому же
+        # провайдеру, которого в тот момент нет.
+        rows.insert(0, [top_up_button])
     rows.append([_change_selection_fused(user), _cancel_order_fused(user)])
     await edit_or_answer_photo(
         callback=callback,
@@ -1964,10 +2120,13 @@ async def _render_fused_refresh(
             '⚠️ Цена обновилась. Проверьте заказ ещё раз.',
             '⚠️ The price changed. Review the order again.',
         ),
+        # Вторая фраза убрана этапом БК: тело экрана теперь само говорит, что делать, и у
+        # человека с частью суммы говорит ДРУГОЕ («доплатите и вернитесь»). Предупреждение,
+        # спорящее с телом под собой, читается как сбой, а не как предупреждение.
         'wallet_insufficient': _text(
             user,
-            '⚠️ Баланс больше не покрывает заказ. Выберите способ оплаты.',
-            '⚠️ Your balance no longer covers the order. Choose a payment method.',
+            '⚠️ Баланс больше не покрывает заказ.',
+            '⚠️ Your balance no longer covers the order.',
         ),
     }
     notice = notices.get(

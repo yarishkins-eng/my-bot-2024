@@ -12,6 +12,7 @@ from app.handlers.subscription.device_first import (
     _render_arm_confirmation,
     _render_checkout,
     _render_confirmation,
+    _render_direct_payment_methods,
     _render_error,
     _render_fused_confirmation,
     _render_new_checkout,
@@ -31,6 +32,22 @@ from app.handlers.subscription.device_first import (
     show_device_first_entry,
 )
 from app.services.device_first_checkout_service import DeviceFirstError
+
+
+# Адрес двери доплаты, которую этап БК ставит на экран заказа.
+TOP_UP_PREFIX = '/balance/top-up/'
+
+
+def _db(*, open_order: bool = False):
+    """База для экрана заказа: он спрашивает про открытые заказы ЧИСТЫМ чтением.
+
+    Служебный `get_open_checkout_for_user` здесь не годится и не используется кодом: он
+    гасит просроченный заказ и делает `db.commit()`, а экран отрисовки достижим сразу
+    после неудачного списания — коммит там лёг бы на чужую единицу работы.
+    """
+    db = AsyncMock()
+    db.scalar = AsyncMock(return_value=77 if open_order else None)
+    return db
 
 
 def _user(language: str = 'ru'):
@@ -410,10 +427,9 @@ async def test_choose_devices_renders_a_checkout_free_pay_confirmation() -> None
         'df_options': options,
     }
     user = SimpleNamespace(id=17, language='ru', balance_kopeks=50000)
-    db = AsyncMock()
+    db = _db()
 
     with (
-        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock()) as get_open,
         patch('app.handlers.subscription.device_first.create_or_resume_direct_checkout', AsyncMock()) as create,
         patch(
             'app.handlers.subscription.device_first.available_platega_methods_for_db',
@@ -427,8 +443,13 @@ async def test_choose_devices_renders_a_checkout_free_pay_confirmation() -> None
     ):
         await choose_devices(callback, user, db, state)
 
-    get_open.assert_not_awaited()
+    # Инвариант этого сторожа — «выбор устройств не заводит заказ», и его держит ИМЕННО эта
+    # строка. Прежде рядом стояла ещё проверка «мы в базу даже не смотрим»: она закрепляла
+    # не инвариант, а побочное свойство. Этап БК смотрит намеренно — живой счёт закрепляет
+    # способ оплаты, и предлагать доплату поверх него значит вести человека в отказ.
+    # Чтение осталось чтением: заказ по-прежнему рождается только на кнопке оплаты.
     create.assert_not_awaited()
+    db.scalar.assert_awaited_once()
     caption = render.await_args.kwargs['caption']
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert 'Ваш заказ' in caption
@@ -436,7 +457,14 @@ async def test_choose_devices_renders_a_checkout_free_pay_confirmation() -> None
     assert '5 устройств · 3 месяца' in caption
     assert '1 090 ₽' in caption
     assert keyboard[0][0].web_app.url == 'https://cabinet.example/subscription/purchase?safe'
+    assert keyboard[1][0].web_app.url == 'https://cabinet.example/subscription/purchase?safe'
+    # Адреса проверяются оба и по порядку: первой стоит дверь доплаты, за ней — прежняя
+    # кнопка способа оплаты, у которой метка `autostart=1` не тронута ни на знак.
     assert build_cabinet_url.call_args_list[0].args[0] == (
+        '/balance/top-up/platega?returnTo=%2Fsubscription%2Fpurchase'
+        '%3Ffrom%3Dcheckout%26period%3D90%26devices%3D5&amount=590'
+    )
+    assert build_cabinet_url.call_args_list[1].args[0] == (
         '/subscription/purchase?period=90&devices=5&method=sbp&autostart=1'
     )
     callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
@@ -1370,6 +1398,344 @@ async def test_fused_confirmation_offers_the_wallet_button_when_balance_covers()
     assert callbacks == ['df:a2:30:2:36900', 'df:e2', 'df:x2']
 
 
+@pytest.mark.asyncio
+async def test_fused_confirmation_says_nothing_new_to_a_customer_without_money() -> None:
+    """Этап БК обещал: у кого на балансе ноль — экран не меняется ни на знак.
+
+    Сторож стоит ПЕРВЫМ среди сторожей этапа намеренно: это единственный его критерий
+    приёмки, который до сих пор не проверял никто, и ломается он тише всех — ветка
+    «иначе» одна обслуживала и человека с нулём, и человека с частью суммы, поэтому
+    любая строка про деньги, написанная не в свою ветку, уходила бы 141 человеку,
+    у которого этих денег нет.
+    """
+    callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    options = {
+        'tariff': {'name': 'Базовый'},
+        'device_options': [2],
+        'period_options': [30],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 36_900}]}],
+    }
+    db = _db()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch('app.utils.miniapp_buttons.build_cabinet_url', return_value=None),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_fused_confirmation(callback, user, db, options, days=30, devices=2)
+
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert caption == (
+        '💳 <b>Ваш заказ</b>\n\n'
+        '<b>Базовый</b>\n'
+        '2 устройства · 1 месяц\n'
+        'К оплате: <b>369 ₽</b>\n\n'
+        'Выберите способ оплаты.'
+    )
+    # Ни одного слова про деньги, которых у него нет, и ни одного лишнего запроса к базе.
+    assert 'Баланс' not in caption
+    assert 'Не хватает' not in caption
+    db.scalar.assert_not_awaited()
+    callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
+    assert callbacks == ['df:y2:sbp:30:2:36900', 'df:e2', 'df:x2']
+
+
+@pytest.mark.asyncio
+async def test_fused_confirmation_shows_the_wallet_and_a_top_up_door_on_a_partial_balance() -> None:
+    """Сердце этапа: 114 человек держат по 50 ₽, и касса их не показывала."""
+    callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=5_000)
+    options = {
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 24_900}]}],
+    }
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch(
+            'app.utils.miniapp_buttons.build_cabinet_url',
+            return_value='https://cabinet.example/top-up?safe',
+        ) as build_cabinet_url,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_fused_confirmation(callback, user, _db(), options, days=30, devices=2)
+
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert '💳 Баланс: 50 ₽' in caption
+    assert '⚠️ Не хватает: 199 ₽' in caption
+    # Обратная дорога названа ДО того, как человек ушёл платить: доплата заказ не оформляет.
+    assert 'Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.' in caption
+    # Вторая строка обязательна: без неё «продолжите» посылает человека в этот же чат, где
+    # висит ЭТО ЖЕ сообщение с числами, которые доплата только что сделала ложными.
+    assert 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.' in caption
+    # Остаток мины DE: строка про баланс без этой оговорки читается как «зачтётся».
+    assert 'Или оплатите полной суммой: деньги с баланса при этом не спишутся.' in caption
+    # Провайдерский минимум здесь меньше недостачи, значит второго числа на экране нет.
+    assert 'останется на балансе' not in caption
+    assert keyboard[0][0].text == '💰 Доплатить 199 ₽'
+    assert build_cabinet_url.call_args_list[0].args[0] == (
+        '/balance/top-up/platega?returnTo=%2Fsubscription%2Fpurchase'
+        '%3Ffrom%3Dcheckout%26period%3D30%26devices%3D2&amount=199'
+    )
+    callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
+    assert callbacks == ['df:e2', 'df:x2']
+
+
+@pytest.mark.asyncio
+async def test_fused_confirmation_hides_the_top_up_door_while_an_order_is_open() -> None:
+    """Живой счёт закрепляет способ оплаты: доплата поверх него кончится отказом.
+
+    Человек доплатил бы, вернулся, нажал «Списать с баланса» — и получил
+    ``funding_mode_locked`` вместе с экраном старого счёта, где главная кнопка
+    предлагает заплатить второй раз. Строки про его деньги при этом остаются:
+    там они верны ровно так же.
+
+    ⚠️ Прежняя редакция сторожа проверяла ещё и испорченную строку заказа: служебный
+    поиск бросал на ней исключение. Этого случая больше нет ПО ПОСТРОЕНИЮ — экран
+    спрашивает базу чистым чтением и про признак строки не спрашивает вовсе.
+    """
+    callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=5_000)
+    options = {
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 24_900}]}],
+    }
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch(
+            'app.utils.miniapp_buttons.build_cabinet_url',
+            return_value='https://cabinet.example/safe',
+        ) as build_cabinet_url,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_fused_confirmation(callback, user, _db(open_order=True), options, days=30, devices=2)
+
+    caption = render.await_args.kwargs['caption']
+    assert '💳 Баланс: 50 ₽' in caption
+    assert '⚠️ Не хватает: 199 ₽' in caption
+    assert 'Доплатите и продолжите' not in caption
+    # Проверяем ЗАПРОШЕННЫЙ адрес, а не готовую ссылку: подменённый `build_cabinet_url`
+    # отдаёт одно и то же всем, и по ссылке дверь доплаты от кнопки оплаты не отличить.
+    assert not any(call.args[0].startswith(TOP_UP_PREFIX) for call in build_cabinet_url.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_fused_confirmation_hides_the_top_up_door_when_it_would_cost_the_full_price() -> None:
+    """У кого на балансе одни копейки, минимум провайдера поднимает доплату до полной цены.
+
+    Тогда это те же деньги дорогой в пять кадров, и предлагать её нечестно. Тот же
+    выбор кабинет делает у себя тем же сравнением.
+    """
+    callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=50)
+    options = {
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 24_900}]}],
+    }
+    db = _db()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch(
+            'app.utils.miniapp_buttons.build_cabinet_url',
+            return_value='https://cabinet.example/safe',
+        ) as build_cabinet_url,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_fused_confirmation(callback, user, db, options, days=30, devices=2)
+
+    caption = render.await_args.kwargs['caption']
+    assert '💳 Баланс: 0,50 ₽' in caption
+    assert '⚠️ Не хватает: 248,50 ₽' in caption
+    assert 'Доплатите и продолжите' not in caption
+    # Отказ наступает ДО обращения к базе: сравнение сумм дешевле запроса.
+    db.scalar.assert_not_awaited()
+    # Проверяем ЗАПРОШЕННЫЙ адрес, а не готовую ссылку: подменённый `build_cabinet_url`
+    # отдаёт одно и то же всем, и по ссылке дверь доплаты от кнопки оплаты не отличить.
+    assert not any(call.args[0].startswith(TOP_UP_PREFIX) for call in build_cabinet_url.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_direct_payment_methods_screen_is_not_touched_by_the_balance_block() -> None:
+    """Экран-двойник «Ваш заказ» этап БК намеренно НЕ трогает — и это проверяется.
+
+    Он показывается со второго захода, когда строка заказа уже заведена, и слеп к
+    балансу ровно так же. Пока он вне объёма, сторож обязан ловить попытку «заодно»
+    вписать туда те же строки: сделать это надо осознанным этапом, а не походя.
+    """
+    callback = SimpleNamespace(answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=5_000)
+    checkout = SimpleNamespace(
+        public_id='co-1',
+        tariff_id=3,
+        tariff_total_kopeks=24_900,
+        selected_device_limit=2,
+        period_days=30,
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=SimpleNamespace(name='Базовый'))
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch('app.utils.miniapp_buttons.build_cabinet_url', return_value=None),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_direct_payment_methods(callback, user, db, checkout)
+
+    caption = render.await_args.kwargs['caption']
+    assert caption == (
+        '💳 <b>Ваш заказ</b>\n\n'
+        '<b>Базовый</b>\n'
+        '2 устройства · 1 месяц\n'
+        'К оплате: <b>249 ₽</b>\n\n'
+        'Выберите способ оплаты.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_fused_confirmation_explains_the_change_when_the_provider_minimum_exceeds_the_shortfall() -> None:
+    """Второе число на экране появляется, только когда минимум провайдера больше недостачи.
+
+    Тогда в сводке одна сумма, а на кнопке другая, и без объяснения это читается как ошибка.
+    Ветка была единственным новым вычислением этапа, не закрытым ничем: мутация её переживала.
+    """
+    callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=20_000)
+    options = {
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 24_900}]}],
+    }
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch(
+            'app.utils.miniapp_buttons.build_cabinet_url',
+            return_value='https://cabinet.example/safe',
+        ) as build_cabinet_url,
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_fused_confirmation(callback, user, _db(), options, days=30, devices=2)
+
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    # Недостача честная (49 ₽), а счёт выставят на минимум провайдера (100 ₽) — и разницу
+    # экран называет сам, теми же словами, что и кабинет.
+    assert '⚠️ Не хватает: 49 ₽' in caption
+    assert 'После оформления 51 ₽ останется на балансе.' in caption
+    assert keyboard[0][0].text == '💰 Доплатить 100 ₽'
+    assert build_cabinet_url.call_args_list[0].args[0].endswith('&amount=100')
+
+
+@pytest.mark.asyncio
+async def test_fused_confirmation_speaks_english_to_an_english_customer() -> None:
+    """Весь английский экран этапа не сторожил никто: любую строку можно было заменить молча."""
+    callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='en', balance_kopeks=5_000)
+    options = {
+        'tariff': {'name': 'Basic'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 24_900}]}],
+    }
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
+        ),
+        patch(
+            'app.utils.miniapp_buttons.build_cabinet_url',
+            return_value='https://cabinet.example/safe',
+        ),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_fused_confirmation(callback, user, _db(), options, days=30, devices=2)
+
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert '💳 Balance: ₽50' in caption
+    assert '⚠️ Shortage: ₽199' in caption
+    assert 'Top up and finish the purchase in the same window — we keep your choice.' in caption
+    assert 'After the top-up this chat screen will not refresh: its buttons still charge the full price.' in caption
+    assert 'Or pay the full amount: your balance stays untouched.' in caption
+    assert keyboard[0][0].text == '💰 Top up ₽199'
+
+
+@pytest.mark.asyncio
+async def test_fused_confirmation_does_not_argue_with_itself_when_payment_is_unavailable() -> None:
+    """Единственное состояние, где деньги на балансе видны, а потратить их нечем.
+
+    Экран не должен звать выбрать способ оплаты и обсуждать списание, которого не может
+    быть, а строкой ниже сообщать, что оплата недоступна. Строки про деньги остаются:
+    они верны и здесь.
+    """
+    callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=5_000)
+    options = {
+        'tariff': {'name': 'Базовый'},
+        'period_options': [30],
+        'device_options': [2],
+        'price_matrix': [{'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 24_900}]}],
+    }
+    db = _db()
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.available_platega_methods_for_db',
+            AsyncMock(return_value=[]),
+        ),
+        patch('app.utils.miniapp_buttons.build_cabinet_url', return_value='https://cabinet.example/safe'),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await _render_fused_confirmation(callback, user, db, options, days=30, devices=2)
+
+    caption = render.await_args.kwargs['caption']
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert caption == (
+        '💳 <b>Ваш заказ</b>\n\n'
+        '<b>Базовый</b>\n'
+        '2 устройства · 1 месяц\n'
+        'К оплате: <b>249 ₽</b>\n\n'
+        '💳 Баланс: 50 ₽\n'
+        '⚠️ Не хватает: 199 ₽\n\n'
+        'Оплата временно недоступна. Обратитесь в поддержку.'
+    )
+    # Дверь доплаты сюда не ставится: она ведёт к тому же провайдеру, которого сейчас нет.
+    db.scalar.assert_not_awaited()
+    callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
+    assert callbacks == ['menu_support', 'df:e2', 'df:x2']
+
+
 def test_fused_pay_callbacks_fit_the_telegram_byte_budget() -> None:
     from app.services.device_first_payment_service import PLATEGA_METHODS
 
@@ -1585,7 +1951,10 @@ async def test_pay_wallet_fused_insufficient_balance_rerenders_the_confirmation(
 
     caption = render.await_args.kwargs['caption']
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    assert 'Баланс больше не покрывает заказ' in caption
+    # Точное равенство, а не вхождение: этап БК убрал из предупреждения вторую фразу
+    # («Выберите способ оплаты»), потому что тело экрана под ним теперь говорит другое.
+    # Проверка на вхождение зеленела бы при обеих редакциях и пункт не сторожила бы вовсе.
+    assert caption.startswith('⚠️ Баланс больше не покрывает заказ.\n\n')
     assert keyboard[0][0].callback_data == 'df:y2:sbp:30:2:36900'
 
 
