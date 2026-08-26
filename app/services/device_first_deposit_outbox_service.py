@@ -42,8 +42,21 @@ async def ensure_deposit_outbox(
     *,
     transaction_id: int,
     checkout_id: int,
+    emit_deposit_event: bool = True,
+    pay_referral: bool = True,
 ) -> DeviceFirstDepositOutbox:
-    """Create the unique durable job before the provider settlement commit."""
+    """Create the unique durable job before the provider settlement commit.
+
+    `emit_deposit_event=False` — для прихода от банка по прямой продаже: событие
+    «баланс пополнен» жёстко подписано типом DEPOSIT и способом PLATEGA (`_apply_event_step`),
+    а при прямой оплате кошелёк не пополнялся вовсе. Выпустить его значило бы соврать о
+    пополнении, которого не было, — вопреки комментарию у самого `PROVIDER_RECEIPT` в модели.
+
+    `pay_referral=False` — аварийный выключатель (РФ-1 п.1.1). Проверяется ЗДЕСЬ, где
+    обязательство перед партнёром возникает, а не в `_apply_referral_step`, где оно
+    исполняется: выход из шага не помешает внешнему циклу пометить работу выполненной, и
+    обратное включение программы ничего бы не доплатило.
+    """
     existing = (
         await db.execute(
             select(DeviceFirstDepositOutbox).where(DeviceFirstDepositOutbox.transaction_id == transaction_id)
@@ -54,6 +67,8 @@ async def ensure_deposit_outbox(
     row = DeviceFirstDepositOutbox(
         transaction_id=transaction_id,
         checkout_id=checkout_id,
+        event_status='pending' if emit_deposit_event else 'done',
+        referral_status='pending' if pay_referral else 'done',
     )
     db.add(row)
     await db.flush()
@@ -144,7 +159,12 @@ async def _apply_referral_step(
             select(Transaction)
             .where(
                 Transaction.id == job.transaction_id,
-                Transaction.type == TransactionType.DEPOSIT.value,
+                # РФ-1 п.1.2: источником комиссии стал не только кошельковый депозит, но и
+                # приход от банка по прямой продаже (`PROVIDER_RECEIPT`). Это ЕДИНСТВЕННОЕ
+                # место, где тип источника проверяется, — всё остальное в шаге универсально.
+                # ⛔ Списание за подписку (`SUBSCRIPTION_PAYMENT`) сюда попасть не может и не
+                # должно: оно отрицательное и относится к тем же деньгам, что и приход.
+                Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.PROVIDER_RECEIPT.value)),
                 Transaction.is_completed.is_(True),
             )
             .with_for_update()
