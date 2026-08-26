@@ -954,10 +954,22 @@ async def _render_fused_confirmation(
             ]
             for item in methods
         ]
+    wallet_ru = wallet_en = ''
     if has_full_wallet_balance:
         tail_ru, tail_en = 'Оплатите с баланса.', 'Pay from your balance.'
     elif has_partial_wallet:
-        tail_ru, tail_en = 'Выберите способ оплаты.', 'Choose a payment method.'
+        # Слова взяты у самого бота — ими он уже называет эти два факта на экране подтверждения
+        # заказа (`_render_arm_confirmation`). Заводить рядом вторую редакцию одного и того же
+        # значило бы построить новую путаницу вместо того, чтобы снять старую.
+        # Недостача — честная разность, без провайдерских минимумов: её же печатает и кабинет.
+        shortage = price - user.balance_kopeks
+        wallet_ru = f'💳 Баланс: {_money(user, user.balance_kopeks)} ₽\n⚠️ Не хватает: {_money(user, shortage)} ₽\n\n'
+        wallet_en = f'💳 Balance: ₽{_money(user, user.balance_kopeks)}\n⚠️ Shortage: ₽{_money(user, shortage)}\n\n'
+        # Остаток мины DE: строка про баланс рядом с ценой читается как «зачтётся», а он не
+        # зачитывается — человек платит полную цену, а деньги остаются лежать. Оговорка обязана
+        # стоять там же, где строка, иначе строка врёт. Формулировка — та же, что у кабинета.
+        tail_ru = 'Выберите способ оплаты: деньги с баланса при этом не спишутся.'
+        tail_en = 'Choose a payment method: your balance stays untouched.'
     else:
         tail_ru, tail_en = 'Выберите способ оплаты.', 'Choose a payment method.'
     caption = _text(
@@ -966,13 +978,13 @@ async def _render_fused_confirmation(
             '💳 <b>Ваш заказ</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
-            f'К оплате: <b>{total} ₽</b>\n\n' + tail_ru
+            f'К оплате: <b>{total} ₽</b>\n\n' + wallet_ru + tail_ru
         ),
         (
             '💳 <b>Your order</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
-            f'To pay: <b>₽{total}</b>\n\n' + tail_en
+            f'To pay: <b>₽{total}</b>\n\n' + wallet_en + tail_en
         ),
     )
     if notice:
