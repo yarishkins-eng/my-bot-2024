@@ -232,7 +232,7 @@ async def _apply_referral_step(
             source=source,
             amount_kopeks=settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS,
             ledger_suffix='referred-first-bonus',
-            description='Бонус за первое пополнение по реферальной программе',
+            description='Бонус новичка за первую оплату',
         )
         inviter_bonus = settings.REFERRAL_INVITER_BONUS_KOPEKS + commission_amount
         await _add_reward(
@@ -241,7 +241,11 @@ async def _apply_referral_step(
             source=source,
             amount_kopeks=inviter_bonus,
             ledger_suffix='inviter-first-reward',
-            description=f'Бонус за первое пополнение реферала {user.full_name}',
+            description=(
+                f'Награда за первую оплату реферала {user.full_name}: '
+                f'{settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)} фикс'
+                f' + {commission_percent}% от {settings.format_price(source.amount_kopeks)}'
+            ),
         )
         if inviter_bonus > 0:
             await _add_referral_earning(
@@ -260,7 +264,10 @@ async def _apply_referral_step(
             source=source,
             amount_kopeks=commission_amount,
             ledger_suffix='inviter-recurring-commission',
-            description=f'Комиссия {commission_percent}% с пополнения {user.full_name}',
+            description=(
+                f'Комиссия {commission_percent}% с оплаты реферала {user.full_name}'
+                f' ({settings.format_price(source.amount_kopeks)})'
+            ),
         )
         await _add_referral_earning(
             db,
