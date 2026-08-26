@@ -921,6 +921,11 @@ async def _render_fused_confirmation(
     total = _money(user, price)
     tariff_name = options['tariff']['name']
     has_full_wallet_balance = user.balance_kopeks >= price
+    # Три состояния кошелька, а не два. Прежний признак был двусторонним, и его ветка «иначе»
+    # обслуживала И человека с нулём на балансе, И человека, у которого часть суммы есть:
+    # любая строка про баланс, написанная в общей ветке, врала бы 141 человеку с нулём.
+    # Структура разводится ДО того, как в неё вписывается текст.
+    has_partial_wallet = 0 < user.balance_kopeks < price
     rows: list[list[InlineKeyboardButton]]
     if has_full_wallet_balance:
         rows = [
@@ -949,21 +954,25 @@ async def _render_fused_confirmation(
             ]
             for item in methods
         ]
+    if has_full_wallet_balance:
+        tail_ru, tail_en = 'Оплатите с баланса.', 'Pay from your balance.'
+    elif has_partial_wallet:
+        tail_ru, tail_en = 'Выберите способ оплаты.', 'Choose a payment method.'
+    else:
+        tail_ru, tail_en = 'Выберите способ оплаты.', 'Choose a payment method.'
     caption = _text(
         user,
         (
             '💳 <b>Ваш заказ</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
-            f'К оплате: <b>{total} ₽</b>\n\n'
-            + ('Оплатите с баланса.' if has_full_wallet_balance else 'Выберите способ оплаты.')
+            f'К оплате: <b>{total} ₽</b>\n\n' + tail_ru
         ),
         (
             '💳 <b>Your order</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
-            f'To pay: <b>₽{total}</b>\n\n'
-            + ('Pay from your balance.' if has_full_wallet_balance else 'Choose a payment method.')
+            f'To pay: <b>₽{total}</b>\n\n' + tail_en
         ),
     )
     if notice:
