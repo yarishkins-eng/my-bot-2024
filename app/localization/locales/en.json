@@ -1335,7 +1335,7 @@
   "REFERRAL_EARNING_REASON_COMMISSION_TOPUP": "💰 Top-up commission",
   "REFERRAL_EARNING_REASON_FIRST_TOPUP": "🎉 First top-up",
   "REFERRAL_INFO": "\n🤝 <b>Referral program</b>\n\n👥 <b>Invited:</b> {referrals_count} friends\n💰 <b>Earned:</b> {earned_amount}\n\n🔗 <b>Your referral link:</b>\n<code>{referral_link}</code>\n\n🎫 <b>Your promo code:</b>\n<code>{referral_code}</code>\n\n💰 <b>Terms:</b>\n• Per friend: {registration_bonus}\n• Top-up commission: {commission_percent}%\n",
-  "REFERRAL_INVITE_BONUS": "💸 Top up from {minimum} and get {bonus} extra as a bonus!",
+  "REFERRAL_INVITE_BONUS": "💸 Pay from {minimum} and get {bonus} extra as a bonus!",
   "REFERRAL_INVITE_CREATED_INSTRUCTION": "Tap the text below to copy:",
   "REFERRAL_INVITE_CREATED_TITLE": "📝 <b>Invitation created!</b>",
   "REFERRAL_INVITE_FEATURE_FAST": "🚀 Fast connection",

@@ -274,7 +274,7 @@ async def show_referral_settings(callback: types.CallbackQuery, db_user: User, d
 • Процент с каждой оплаты реферала: {settings.REFERRAL_COMMISSION_PERCENT}%
 
 <b>Уведомления:</b>
-• Статус: {'✅ Включены' if settings.REFERRAL_NOTIFICATIONS_ENABLED else '❌ Отключены'}
+• Статус: ✅ шлются всегда (переключатель не подключён к коду)
 • Попытки отправки: {getattr(settings, 'REFERRAL_NOTIFICATION_RETRY_ATTEMPTS', 3)}
 
 <i>💡 Выключить программу: «⚙️ Настройки бота» → «👥 Реферальная программа». Остальные значения — в файле .env, с перезапуском бота</i>

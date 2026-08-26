@@ -1357,7 +1357,7 @@
   "REFERRAL_EARNING_REASON_COMMISSION_TOPUP": "💰 Комиссия с пополнения",
   "REFERRAL_EARNING_REASON_FIRST_TOPUP": "🎉 Первое пополнение",
   "REFERRAL_INFO": "\n🤝 <b>Реферальная программа</b>\n\n👥 <b>Приглашено:</b> {referrals_count} друзей\n💰 <b>Заработано:</b> {earned_amount}\n\n🔗 <b>Ваша реферальная ссылка:</b>\n<code>{referral_link}</code>\n\n🎫 <b>Ваш промокод:</b>\n<code>{referral_code}</code>\n\n💰 <b>Условия:</b>\n• За каждого друга: {registration_bonus}\n• Процент с пополнений: {commission_percent}%\n",
-  "REFERRAL_INVITE_BONUS": "💸 При пополнении баланса от {minimum} тебе ещё {bonus} бонусом сверху!",
+  "REFERRAL_INVITE_BONUS": "💸 При первой оплате от {minimum} тебе ещё {bonus} бонусом сверху!",
   "REFERRAL_INVITE_CREATED_INSTRUCTION": "Нажми на текст ниже — скопируется:",
   "REFERRAL_INVITE_CREATED_TITLE": "📝 <b>Приглашение создано!</b>",
   "REFERRAL_INVITE_FEATURE_FAST": "🚀 Быстрое подключение",
