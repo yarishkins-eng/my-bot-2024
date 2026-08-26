@@ -5947,7 +5947,7 @@ async def change_subscription_type_confirm(callback: types.CallbackQuery, db_use
     # (:5793) и `has_had_paid_subscription=True` (:5799) напрямую, минуя `extend_subscription`
     # и его гард `convert_trial` (`crud/subscription.py:1274`), но НЕ трогает срок: у
     # трёхдневного триала он и остаётся трёхдневным. Получается «фантомная платная», на
-    # которой `try_auto_extend_expired_after_topub` (`subscription_auto_purchase_service.py:2356`,
+    # которой `try_auto_extend_expired_after_topup` (`subscription_auto_purchase_service.py:2356`,
     # `:2375`) больше не срабатывает — и следующее пополнение баланса, сделанное совсем для
     # другого, спишет полный период. Третий сторож (`autopay_enabled`) эта же кнопка отпирает:
     # переключатель автоплатежа отказывает триалу (`handlers/subscription/autopay.py:113`,

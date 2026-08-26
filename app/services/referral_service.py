@@ -971,12 +971,19 @@ async def process_referral_purchase(
 ):
     """Process referral commission for balance-based subscription purchases.
 
-    INTENTIONALLY UNUSED. This function is NOT called from subscription purchase flows.
-    Commission is only earned when referred users make actual payments through payment
-    providers (via process_referral_topup). Balance-based subscription purchases
-    (from admin credits, campaign bonuses, or promo codes) do NOT trigger commission,
-    because the partner already received commission at the time the user topped up
-    their balance. Calling this would cause double-commission.
+    INTENTIONALLY UNUSED, и это по-прежнему верно — но записка ниже была написана 02.03.2026,
+    ДО появления прямых продаж (01.08.2026), и потому описывала мир, которого больше нет.
+    Переписана 26.08.2026 этапом РФ-1.
+
+    Комиссия зарабатывается в ДВУХ случаях, а не в одном:
+      * пополнение кошелька через провайдера  -> process_referral_topup;
+      * прямая оплата подписки картой         -> приход provider_receipt заводит работу
+        в очереди device-first (device_first_checkout_service.py:2132), и платит её
+        тот же _apply_referral_step.
+    Покупка ЗА БАЛАНС комиссию не платит и платить не должна: партнёр уже получил её
+    в момент пополнения. Вызов этой функции оттуда дал бы вторую выплату с тех же денег.
+    Ровно это стережёт tests/database/test_money_in_pays_referral.py — он держит вердикт
+    по каждому месту, где в проекте появляются деньги.
 
     Kept for potential future use cases where balance-independent purchase tracking
     is needed (e.g. audit trail records with zero commission).
