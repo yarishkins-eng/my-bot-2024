@@ -679,6 +679,19 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
 
 async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_kopeks: int, bot: Bot = None):
     try:
+        # 🔴 Аварийный выключатель (РФ-1, пункт 1.1). До этого этапа
+        # `is_referral_program_enabled` проверялся в восьми местах, и ВСЕ восемь были
+        # визуальными: флаг прятал кнопки меню, а деньги продолжали начисляться. Выключить
+        # программу было нечем, кроме отката кода.
+        # ⛔ Не убирать: это единственный тормоз на пути 24 платёжных провайдеров.
+        # Второй платящий путь (device-first) гасится не здесь, а в месте, где ВОЗНИКАЕТ
+        # обязательство — `_complete_direct_sale_locked` не заводит работу очереди при
+        # выключенной программе. Проверять при исполнении там нельзя: внешний цикл всё равно
+        # пометит работу выполненной, и обратное включение ничего не доплатит.
+        if not settings.is_referral_program_enabled():
+            logger.info('Реферальная программа выключена, начисление пропущено', user_id=user_id)
+            return True
+
         user = await get_user_by_id(db, user_id)
         if not user or not user.referred_by_id:
             logger.debug('Пользователь не является рефералом, пропуск комиссии', user_id=user_id)
