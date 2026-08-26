@@ -54,6 +54,11 @@ LEGACY_SETTLEMENT_MODE = 'legacy_deposit'
 DIRECT_SETTLEMENT_MODE = 'direct_purchase_v2'
 KOPEKS_PER_RUBLE = 100
 READY_NOTIFICATION_TYPE = 'ready'
+# РФ-1 п.1.3: device-first платил реферальную комиссию МОЛЧА — `_add_reward` кладёт деньги на
+# баланс, и обращения к боту в том файле нет вовсе. Партнёру при регистрации обещают процент,
+# и он его получал, не зная об этом. Тип идёт через ту же очередь сообщений: у неё уже есть
+# бот и защита «ровно один раз» уникальным ключом (заказ, тип).
+REFERRAL_REWARD_NOTIFICATION_TYPE = 'referral_reward'
 OWNER_ALERT_NOTIFICATION_TYPE = 'order_stuck'
 # Пункт 4.1-Б. Права тарифа изменились между расчётом и оплатой. Заказ при этом выдаётся
 # захваченным набором — расхождение только СООБЩАЕТСЯ. Колонка `notification_type` —
@@ -3323,6 +3328,59 @@ async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: Subscri
     await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
 
 
+async def _send_referral_reward_message(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
+    """Партнёр узнаёт о комиссии, а новичок — о своём бонусе (РФ-1 п.1.3).
+
+    Кому и сколько — из уже созданных наградных строк: их описание с п.1.4 само объясняет,
+    из чего сложилась сумма, поэтому текст не сочиняется заново и не может разойтись с деньгами.
+    """
+    rewards = list(
+        (
+            await db.execute(
+                select(Transaction)
+                .where(
+                    Transaction.device_first_checkout_id == checkout.id,
+                    Transaction.type == TransactionType.REFERRAL_REWARD.value,
+                )
+                .order_by(Transaction.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rewards:
+        # Начисления не было: у покупателя нет пригласившего, программа выключена или сумма
+        # ниже порога. Сообщать нечего — строка закрывается выполненной, а не падает.
+        return
+    for reward in rewards:
+        recipient = await db.get(User, reward.user_id)
+        if recipient is None or not recipient.telegram_id:
+            continue
+        is_friend_bonus = (reward.device_first_ledger_key or '').endswith('referred-first-bonus')
+        amount = settings.format_price(reward.amount_kopeks)
+        if is_friend_bonus:
+            text = (
+                f'🎁 <b>Welcome bonus credited</b>\n\n'
+                f"We've credited <b>{amount}</b> to your balance for your first payment "
+                f'with Teplo VPN — you can spend it on a renewal.'
+                if recipient.language == 'en'
+                else f'🎁 <b>Бонус новичка зачислен</b>\n\n'
+                f'За вашу первую оплату в Teplo VPN мы начислили <b>{amount}</b> на баланс — '
+                f'их можно потратить на продление.'
+            )
+        else:
+            text = (
+                f'💰 <b>Referral reward credited</b>\n\n'
+                f'Your friend paid for a subscription — your reward is <b>{amount}</b>.\n\n'
+                f'The money is already on your balance.'
+                if recipient.language == 'en'
+                else f'💰 <b>Начислена реферальная награда</b>\n\n'
+                f'Ваш друг оплатил подписку — ваша награда <b>{amount}</b>.\n\n'
+                f'Деньги уже на вашем балансе. Спасибо, что приводите друзей в Teplo VPN!'
+            )
+        await bot.send_message(recipient.telegram_id, text, parse_mode='HTML')
+
+
 async def process_device_first_notification_outbox(db: AsyncSession, *, bot, limit: int = 20) -> int:
     """Клиенту — не более одного раза: крах после передачи в Telegram оставляет ``sending``.
 
@@ -3396,6 +3454,11 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
                 await _send_owner_checkout_drift_alert(
                     db, bot=bot, checkout=checkout, notification_type=row.notification_type
                 )
+            elif row.notification_type == REFERRAL_REWARD_NOTIFICATION_TYPE:
+                # 🔴 Ветка обязана стоять ДО `else`: иначе строка о реферальной награде
+                # уйдёт покупателю текстом «✅ Подписка готова» — вторым сообщением про
+                # тот же заказ, а партнёр так и не узнает о деньгах.
+                await _send_referral_reward_message(db, bot=bot, checkout=checkout)
             elif row.notification_type == READY_NOTIFICATION_TYPE:
                 await _send_client_ready_message(db, bot=bot, checkout=checkout)
             else:

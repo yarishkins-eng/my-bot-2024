@@ -20,6 +20,7 @@ from app.database.crud.referral import get_user_campaign_id
 from app.database.crud.transaction import emit_transaction_side_effects
 from app.database.models import (
     DeviceFirstDepositOutbox,
+    DeviceFirstNotificationOutbox,
     PaymentMethod,
     ReferralEarning,
     SubscriptionCheckout,
@@ -279,9 +280,52 @@ async def _apply_referral_step(
             campaign_id=campaign_id,
         )
 
+    # РФ-1 п.1.3: сказать партнёру о деньгах. Ставим строку в ту же очередь сообщений, что
+    # обслуживает клиентские уведомления: у неё уже есть бот и защита «ровно один раз».
+    # ⛔ Слать прямо отсюда нельзя: бота в этой цепочке нет ни в одном из трёх мест вызова —
+    # отправка вернула бы «не вышло» молча, и партнёр снова остался бы без сообщения.
+    # Строка ставится ВНУТРИ той же транзакции, что и деньги: не заплатили — не обещаем.
+    await _queue_referral_reward_notification(db, checkout_id=job.checkout_id)
+
     job.referral_status = 'done'
     job.updated_at = datetime.now(UTC)
     await db.commit()
+
+
+async def _queue_referral_reward_notification(db: AsyncSession, *, checkout_id: int) -> None:
+    """Поставить сообщение о награде, если по этому заказу действительно платили."""
+    from app.services.device_first_checkout_service import REFERRAL_REWARD_NOTIFICATION_TYPE
+
+    paid = (
+        await db.execute(
+            select(Transaction.id)
+            .where(
+                Transaction.device_first_checkout_id == checkout_id,
+                Transaction.type == TransactionType.REFERRAL_REWARD.value,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if paid is None:
+        return
+    existing = (
+        await db.execute(
+            select(DeviceFirstNotificationOutbox.id)
+            .where(
+                DeviceFirstNotificationOutbox.checkout_id == checkout_id,
+                DeviceFirstNotificationOutbox.notification_type == REFERRAL_REWARD_NOTIFICATION_TYPE,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    db.add(
+        DeviceFirstNotificationOutbox(
+            checkout_id=checkout_id,
+            notification_type=REFERRAL_REWARD_NOTIFICATION_TYPE,
+        )
+    )
 
 
 async def _apply_fulfillment_step(db: AsyncSession, *, job_id: int) -> None:

@@ -67,7 +67,7 @@ async def test_reward_ledger_key_prevents_duplicate_balance_credit():
 
 @pytest.mark.asyncio
 async def test_first_referral_payment_financial_steps_finish_in_one_commit(monkeypatch):
-    job = SimpleNamespace(id=4, transaction_id=55, referral_status='pending', updated_at=None)
+    job = SimpleNamespace(id=4, transaction_id=55, checkout_id=13, referral_status='pending', updated_at=None)
     source = SimpleNamespace(
         id=55,
         user_id=1,
@@ -88,6 +88,9 @@ async def test_first_referral_payment_financial_steps_finish_in_one_commit(monke
                 Result(job),
                 Result(source),
                 Result(values=[user, referrer]),
+                Result(),
+                # Постановка сообщения о награде (РФ-1 п.1.3) спрашивает, платили ли по заказу.
+                # Здесь `_add_reward` подменён, наградных строк нет — сообщение не ставится.
                 Result(),
             ]
         ),
@@ -120,7 +123,7 @@ async def test_first_referral_payment_financial_steps_finish_in_one_commit(monke
 
 @pytest.mark.asyncio
 async def test_referral_step_failure_does_not_mark_job_done(monkeypatch):
-    job = SimpleNamespace(id=4, transaction_id=55, referral_status='pending', updated_at=None)
+    job = SimpleNamespace(id=4, transaction_id=55, checkout_id=13, referral_status='pending', updated_at=None)
     source = SimpleNamespace(
         id=55,
         user_id=1,
@@ -141,6 +144,9 @@ async def test_referral_step_failure_does_not_mark_job_done(monkeypatch):
                 Result(job),
                 Result(source),
                 Result(values=[user, referrer]),
+                Result(),
+                # Постановка сообщения о награде (РФ-1 п.1.3) спрашивает, платили ли по заказу.
+                # Здесь `_add_reward` подменён, наградных строк нет — сообщение не ставится.
                 Result(),
             ]
         ),
@@ -164,7 +170,7 @@ async def test_referral_step_failure_does_not_mark_job_done(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_non_referral_first_topup_marker_is_durable_and_idempotent():
-    job = SimpleNamespace(id=4, transaction_id=55, referral_status='pending', updated_at=None)
+    job = SimpleNamespace(id=4, transaction_id=55, checkout_id=13, referral_status='pending', updated_at=None)
     source = SimpleNamespace(
         id=55,
         user_id=1,
@@ -221,3 +227,49 @@ async def test_fulfillment_step_recovers_after_credit_commit(monkeypatch):
     fulfill.assert_awaited_once_with(db, 'checkout-1', 7)
     assert job.fulfillment_status == 'done'
     assert db.commit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_paid_referral_queues_a_message_so_the_partner_learns_about_it():
+    """РФ-1 п.1.3: партнёр обязан УЗНАТЬ о комиссии, а не только получить её.
+
+    До этапа device-first платил молча: бота в этой цепочке нет ни в одном из трёх мест
+    вызова, поэтому сообщение ставится в очередь, у которой бот уже есть.
+    """
+    from app.database.models import DeviceFirstNotificationOutbox
+
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Result(value=777),  # наградная строка по заказу есть — платили
+                Result(value=None),  # сообщение по этому заказу ещё не ставили
+            ]
+        ),
+        add=MagicMock(side_effect=added.append),
+    )
+
+    await service._queue_referral_reward_notification(db, checkout_id=13)
+
+    assert len(added) == 1, 'сообщение обязано быть поставлено ровно один раз'
+    assert isinstance(added[0], DeviceFirstNotificationOutbox)
+    assert added[0].checkout_id == 13
+    assert added[0].notification_type == 'referral_reward'
+
+
+@pytest.mark.asyncio
+async def test_no_message_is_queued_when_nobody_was_paid():
+    """Улика против совпадения: без наградной строки сообщение не ставится.
+
+    Иначе тест выше проходил бы и на коде, который ставит сообщение всегда, — а это обещание
+    денег тому, кому их не начислили.
+    """
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(value=None)]),
+        add=MagicMock(side_effect=added.append),
+    )
+
+    await service._queue_referral_reward_notification(db, checkout_id=13)
+
+    assert added == []
