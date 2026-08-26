@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import (
     CheckoutPaymentAttempt,
+    DeviceFirstDepositOutbox,
     DeviceFirstOutbox,
     PaymentMethod,
     SubscriptionCheckout,
@@ -136,6 +137,27 @@ class PlategaPaymentMixin:
             for outbox in outboxes:
                 outbox.status = 'operator_review'
                 outbox.last_error = reason
+            # 🔴 РФ-1, найдено ревью денег. Заморозить выдачу мало: с этого этапа прямая
+            # продажа заводит ещё и работу выплаты партнёру. Провайдер деньги забрал, а
+            # очередь через считаные минуты заплатила бы 100 ₽ + процент с денег, которых
+            # у нас уже нет — на заказе 1 990 ₽ это почти 700 ₽ из своего кармана.
+            # Гасим тем же приёмом, что и возврат оператором: помечаем шаг выполненным.
+            # ⛔ Уже выплаченную комиссию это не отзывает — отзыва в проекте нет вовсе.
+            referral_jobs = list(
+                (
+                    await db.execute(
+                        select(DeviceFirstDepositOutbox)
+                        .where(
+                            DeviceFirstDepositOutbox.checkout_id == checkout.id,
+                            DeviceFirstDepositOutbox.referral_status != 'done',
+                        )
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            for job in referral_jobs:
+                job.referral_status = 'done'
+                job.updated_at = datetime.now(UTC)
         await db.commit()
         logger.warning('direct_device_first_post_paid_reversal', payment_id=payment.id, status=provider_status)
 

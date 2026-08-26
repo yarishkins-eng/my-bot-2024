@@ -39,7 +39,10 @@ from app.database.models import (
     TransactionType,
     User,
 )
-from app.services.device_first_deposit_outbox_service import ensure_deposit_outbox
+from app.services.device_first_deposit_outbox_service import (
+    ensure_deposit_outbox,
+    process_device_first_deposit_outbox,
+)
 from app.services.device_first_eligibility import resolve_single_eligible_tariff, tariff_eligibility
 from app.services.pricing_engine import pricing_engine
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
@@ -51,6 +54,11 @@ LEGACY_SETTLEMENT_MODE = 'legacy_deposit'
 DIRECT_SETTLEMENT_MODE = 'direct_purchase_v2'
 KOPEKS_PER_RUBLE = 100
 READY_NOTIFICATION_TYPE = 'ready'
+# РФ-1 п.1.3: device-first платил реферальную комиссию МОЛЧА — `_add_reward` кладёт деньги на
+# баланс, и обращения к боту в том файле нет вовсе. Партнёру при регистрации обещают процент,
+# и он его получал, не зная об этом. Тип идёт через ту же очередь сообщений: у неё уже есть
+# бот и защита «ровно один раз» уникальным ключом (заказ, тип).
+REFERRAL_REWARD_NOTIFICATION_TYPE = 'referral_reward'
 OWNER_ALERT_NOTIFICATION_TYPE = 'order_stuck'
 # Пункт 4.1-Б. Права тарифа изменились между расчётом и оплатой. Заказ при этом выдаётся
 # захваченным набором — расхождение только СООБЩАЕТСЯ. Колонка `notification_type` —
@@ -68,6 +76,13 @@ OWNER_NOTIFICATION_TYPES = (
     ENTITLEMENT_DRIFT_NOTIFICATION_TYPE,
     TARGET_DRIFT_NOTIFICATION_TYPE,
 )
+# 🔴 РФ-1, найдено критиком полноты. Оживление было ограничено строками владельцу, и
+# обоснование верное: для «✅ Подписка готова» отказ означает НЕИЗВЕСТНЫЙ исход, повтор дал бы
+# клиенту дубль. Для строки о реферальной награде расклад обратный: у повторной комиссии
+# получатель ровно ОДИН, и единственный отказ Телеграма хоронил бы деньги молча навсегда —
+# то есть отменял бы весь смысл пункта «партнёр получает комиссию И УЗНАЁТ о ней». Дубль
+# «вам начислено» безобиден, молчание — нет.
+RETRYABLE_NOTIFICATION_TYPES = (*OWNER_NOTIFICATION_TYPES, REFERRAL_REWARD_NOTIFICATION_TYPE)
 # Окно свежести для строки владельцу. Оно же — второй замок от смертельной ловушки:
 # пять архивных заказов тарифа 3 не обновлялись с 03.08.2026, в окно они не попадают.
 OWNER_ALERT_LOOKBACK = timedelta(hours=24)
@@ -2090,20 +2105,42 @@ async def _complete_direct_sale_locked(
             await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == receipt_key))
         ).scalar_one_or_none()
         if receipt is None:
-            db.add(
-                Transaction(
-                    user_id=user.id,
-                    type=TransactionType.PROVIDER_RECEIPT.value,
-                    amount_kopeks=total,
-                    description=f'Device-first provider receipt for checkout {checkout.public_id}',
-                    payment_method='platega',
-                    external_id=provider_payment_id,
-                    device_first_checkout_id=checkout.id,
-                    device_first_ledger_key=receipt_key,
-                    is_completed=True,
-                    completed_at=now,
-                )
+            receipt = Transaction(
+                user_id=user.id,
+                type=TransactionType.PROVIDER_RECEIPT.value,
+                amount_kopeks=total,
+                description=f'Device-first provider receipt for checkout {checkout.public_id}',
+                payment_method='platega',
+                external_id=provider_payment_id,
+                device_first_checkout_id=checkout.id,
+                device_first_ledger_key=receipt_key,
+                is_completed=True,
+                completed_at=now,
             )
+            db.add(receipt)
+            # 🔴 Номер прихода нужен строкой ниже, а `db.add` его не присваивает.
+            await db.flush()
+        # 🔴 РФ-1 п.1.2б. До этого этапа прямая оплата не платила реферальную комиссию ВООБЩЕ:
+        # приход создавался и на этом всё заканчивалось. Это главный путь продаж с 02.08.2026,
+        # и через него уже прошло 6 197 ₽ от приглашённых, с которых партнёрам не досталось
+        # ничего. Заводим ту же durable-работу, что и кошельковый депозит: она атомарна одним
+        # коммитом и защищена двумя уникальными ключами (`transaction_id` работы и
+        # `device_first_ledger_key` наградной строки), то есть повтор вебхука или рестарт
+        # контейнера её не удвоят.
+        # ⛔ Заводить надо ровно на ПРИХОД. Списание за подписку — те же деньги с обратным
+        # знаком, и вторая работа на него означала бы вторую выплату с одной покупки.
+        await ensure_deposit_outbox(
+            db,
+            transaction_id=receipt.id,
+            checkout_id=checkout.id,
+            # Приход — не пополнение кошелька: событие о пополнении здесь было бы ложью.
+            emit_deposit_event=False,
+            # Выключатель спрашиваем ЗДЕСЬ, где обязательство возникает (РФ-1 п.1.1).
+            pay_referral=settings.is_referral_program_enabled(),
+            # Иначе работа легла бы в базу с меткой «легаси-депозит», и будущий разбор
+            # «откуда пришли деньги» соврал бы про главный путь продаж.
+            settlement_mode=DIRECT_SETTLEMENT_MODE,
+        )
 
     sale_key = f'direct-sale:{checkout.id}'
     sale = (
@@ -2286,8 +2323,41 @@ async def fulfill_direct_external_checkout(
         raise
     await db.commit()
     await _kick_direct_provisioning_post_commit(db, checkout_id=result.id)
+    await _kick_direct_referral_post_commit(db, checkout_id=result.id)
     await db.refresh(result)
     return result
+
+
+async def _kick_direct_referral_post_commit(db: AsyncSession, *, checkout_id: int) -> None:
+    """Разбудить очередь выплат сразу, а не ждать фонового обхода (РФ-1 п.1.2б).
+
+    🔴 Без этого партнёр ждал бы комиссию и уведомление до ЧАСА: депозитную очередь сливает
+    только петля `monitoring_service`, а её период `MONITORING_INTERVAL` на боевом не задан —
+    значит действует умолчание 60 минут. Легаси-путь пополнения будит себя сам
+    (`device_first_payment_service`), прямая продажа этого не делала.
+
+    Best-effort и строго после коммита, по образцу соседней побудки выдачи: отказ здесь не
+    может отменить уже состоявшийся приход, а работа останется в очереди и будет доведена
+    фоновым обходом со своей выдержкой.
+    """
+    receipt_key = f'provider-receipt:{checkout_id}'
+    try:
+        receipt_id = (
+            await db.execute(select(Transaction.id).where(Transaction.device_first_ledger_key == receipt_key))
+        ).scalar_one_or_none()
+        if receipt_id is None:
+            return
+        await process_device_first_deposit_outbox(db, transaction_id=receipt_id, limit=1)
+    except Exception as error:
+        # 🔴 Найдено ревью. Без этого отката отказ здесь оставлял сессию отравленной, и
+        # следующая же строка вызывающего (`db.refresh`) падала с PendingRollbackError —
+        # то есть вебхук провайдера получал ошибку ПОСЛЕ того, как деньги взяты, а подписка
+        # выдана. Соседняя побудка выдачи делает ровно это же и по той же причине.
+        logger.warning('device_first_direct_referral_kick_failed', checkout_id=checkout_id, error=str(error))
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
 
 async def _kick_direct_provisioning_post_commit(db: AsyncSession, *, checkout_id: int) -> None:
@@ -2778,7 +2848,7 @@ async def revive_stale_notifications(db: AsyncSession) -> tuple[int, int]:
     revived = await db.execute(
         update(DeviceFirstNotificationOutbox)
         .where(
-            DeviceFirstNotificationOutbox.notification_type.in_(OWNER_NOTIFICATION_TYPES),
+            DeviceFirstNotificationOutbox.notification_type.in_(RETRYABLE_NOTIFICATION_TYPES),
             or_(
                 and_(
                     DeviceFirstNotificationOutbox.status == 'failed',
@@ -3271,6 +3341,119 @@ async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: Subscri
     await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
 
 
+async def _send_referral_reward_message(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
+    """Партнёр узнаёт о комиссии, а новичок — о своём бонусе (РФ-1 п.1.3).
+
+    Кому и сколько — из уже созданных наградных строк. Текст различает три случая, потому что
+    они значат разное: первая награда (фикс + процент), повторная комиссия (только процент) и
+    бонус новичка. Без имени друга сообщение бесполезно тому, у кого приглашённых несколько.
+    """
+    rewards = list(
+        (
+            await db.execute(
+                select(Transaction)
+                .where(
+                    Transaction.device_first_checkout_id == checkout.id,
+                    Transaction.type == TransactionType.REFERRAL_REWARD.value,
+                )
+                .order_by(Transaction.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rewards:
+        # Начисления не было: у покупателя нет пригласившего, программа выключена или сумма
+        # ниже порога. Сообщать нечего — строка закрывается выполненной, а не падает.
+        return
+
+    friend = await db.get(User, checkout.user_id)
+    friend_name = html.escape(friend.full_name) if friend is not None else ''
+    source = (
+        await db.execute(
+            select(Transaction)
+            .where(
+                Transaction.device_first_checkout_id == checkout.id,
+                Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.PROVIDER_RECEIPT.value)),
+            )
+            # 🔴 Найдено ревью: без порядка по номеру операторский возврат создаёт по тому же
+            # заказу второй приход, и в письмо попала бы произвольная сумма. Берём первый —
+            # он и есть та оплата, с которой посчитана награда.
+            .order_by(Transaction.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    paid = settings.format_price(source.amount_kopeks) if source is not None else ''
+
+    delivered = 0
+    failures: list[str] = []
+    for reward in rewards:
+        recipient = await db.get(User, reward.user_id)
+        if recipient is None or not recipient.telegram_id:
+            continue
+        english = recipient.language == 'en'
+        suffix = (reward.device_first_ledger_key or '').rsplit(':', 1)[-1]
+        amount = settings.format_price(reward.amount_kopeks)
+
+        if suffix == 'referred-first-bonus':
+            text = (
+                f'🎁 <b>Welcome bonus</b>\n\n'
+                f"Thanks for your first payment. We've added <b>{amount}</b> to your balance, "
+                f'and you can put it toward your next renewal.\n\n'
+                f'Glad to have you with us!'
+                if english
+                else f'🎁 <b>Бонус новичка зачислен</b>\n\n'
+                f'За вашу первую оплату мы начислили <b>{amount}</b> на баланс. '
+                f'Эти деньги можно потратить на продление.\n\n'
+                f'Спасибо, что вы с нами!'
+            )
+        else:
+            # 🔴 Найдено ревью: процент НЕЛЬЗЯ вычислять заново в момент отправки. Платит его
+            # `calculate_referral_commission_percent` — со ступенями и отдельной ставкой первой
+            # оплаты, — а базовая ставка может от неё отличаться. Письмо тогда назвало бы
+            # процент, которого не было в расчёте. Берём расшифровку из описания наградной
+            # строки: п.1.4 положил туда ровно те числа, по которым посчитаны деньги.
+            # rsplit, а не split: имя из Телеграма может содержать «: » и утащить свой кусок
+            # в денежную строку письма. Расшифровка всегда идёт последней.
+            breakdown = (reward.description or '').rsplit(': ', 1)
+            details = breakdown[1] if len(breakdown) == 2 else ''
+            first = suffix == 'inviter-first-reward'
+            head = 'Реферальная награда!' if first else 'Реферальная комиссия!'
+            head_en = 'Referral reward!' if first else 'Referral commission!'
+            if english:
+                text = (
+                    f'💰 <b>{head_en}</b>\n\n'
+                    f'Your friend <b>{friend_name}</b> paid {paid} for a subscription.\n\n'
+                    f'🎁 Your reward: <b>{amount}</b>\n\n'
+                    f"It's already in your balance — see Balance → History for the breakdown."
+                )
+            else:
+                text = (
+                    f'💰 <b>{head}</b>\n\n'
+                    f'Ваш друг <b>{friend_name}</b> оплатил подписку на {paid}.\n\n'
+                    f'🎁 Ваша награда: <b>{amount}</b>'
+                    + (f'\n<i>{html.escape(details)}</i>' if details else '')
+                    + '\n\nДеньги уже на балансе.'
+                )
+        # 🔴 Найдено ревью: без своего перехвата один заблокировавший бота получатель уносил
+        # сообщение второго. Награды идут по возрастанию номера, бонус другу создаётся первым —
+        # то есть покупатель, закрывший бота, лишал партнёра уведомления НАВСЕГДА: строка ушла бы
+        # в `failed`, а оживляет `revive_stale_notifications` только строки владельцу.
+        # Деньги при этом уже начислены, так что отказ доставки не повод считать шаг несделанным.
+        try:
+            await bot.send_message(recipient.telegram_id, text, parse_mode='HTML')
+            delivered += 1
+        except Exception as error:
+            failures.append(f'{recipient.id}:{type(error).__name__}')
+
+    if failures and not delivered:
+        # Не дошло НИ ОДНО — это уже похоже на общий отказ, а не на закрытого клиента:
+        # пусть строка попадёт в `failed` и останется следом в логе.
+        raise RuntimeError(f'referral_reward_delivery_failed: {", ".join(failures)}')
+    if failures:
+        logger.warning('device_first_referral_reward_partially_delivered', checkout_id=checkout.id, failed=failures)
+
+
 async def process_device_first_notification_outbox(db: AsyncSession, *, bot, limit: int = 20) -> int:
     """Клиенту — не более одного раза: крах после передачи в Telegram оставляет ``sending``.
 
@@ -3344,6 +3527,11 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
                 await _send_owner_checkout_drift_alert(
                     db, bot=bot, checkout=checkout, notification_type=row.notification_type
                 )
+            elif row.notification_type == REFERRAL_REWARD_NOTIFICATION_TYPE:
+                # 🔴 Ветка обязана стоять ДО `else`: иначе строка о реферальной награде
+                # уйдёт покупателю текстом «✅ Подписка готова» — вторым сообщением про
+                # тот же заказ, а партнёр так и не узнает о деньгах.
+                await _send_referral_reward_message(db, bot=bot, checkout=checkout)
             elif row.notification_type == READY_NOTIFICATION_TYPE:
                 await _send_client_ready_message(db, bot=bot, checkout=checkout)
             else:

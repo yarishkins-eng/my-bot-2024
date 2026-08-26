@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import app.services.device_first_checkout_service as service
 import app.services.device_first_recovery_service as recovery_module
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
@@ -170,7 +171,11 @@ async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliat
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
     )
 
     result = await fulfill_direct_external_checkout(
@@ -202,7 +207,11 @@ async def test_paid_pre_release_direct_checkout_is_held_if_a_legacy_trial_is_sti
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
         commit=AsyncMock(),
     )
     monkeypatch.setattr(
@@ -240,7 +249,11 @@ async def test_direct_fulfilment_uses_the_same_user_attempt_checkout_lock_order_
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
     )
 
     await fulfill_direct_external_checkout(
@@ -272,7 +285,11 @@ async def test_direct_fulfilment_kicks_only_its_own_post_commit_outbox_when_gene
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
         commit=AsyncMock(),
         refresh=AsyncMock(),
         rollback=AsyncMock(),
@@ -315,7 +332,11 @@ async def test_direct_fulfilment_keeps_durable_sale_when_immediate_outbox_kick_f
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
         commit=AsyncMock(),
         refresh=AsyncMock(),
         rollback=AsyncMock(),
@@ -457,6 +478,11 @@ async def test_dedicated_recovery_worker_is_direct_only_and_independent_from_gen
     monkeypatch.setattr(recovery_module, 'reconcile_device_first_payments', reconciler)
     monkeypatch.setattr(recovery_module, 'process_direct_provisioning_outbox', provisioner)
     monkeypatch.setattr(recovery_module, 'process_device_first_notification_outbox', notifier)
+    # РФ-1: быстрый обработчик сливает и очередь ВЫПЛАТ. Без неё «комиссия за минуты» держалась
+    # на единственной побудке после продажи, а фоновый слив есть только в цикле мониторинга
+    # с периодом 60 минут — любой сбой отбрасывал партнёра к часовому ожиданию.
+    payouts = AsyncMock(return_value=0)
+    monkeypatch.setattr(recovery_module, 'process_device_first_deposit_outbox', payouts)
     monkeypatch.setattr(recovery_module.settings, 'PAYMENT_VERIFICATION_AUTO_CHECK_ENABLED', False)
 
     result = await DeviceFirstRecoveryService().run_once(bot='bot')
@@ -464,4 +490,100 @@ async def test_dedicated_recovery_worker_is_direct_only_and_independent_from_gen
     assert result == (2, 3, 1)
     reconciler.assert_awaited_once_with(db, limit=20, direct_only=True)
     provisioner.assert_awaited_once_with(db, limit=20)
+    payouts.assert_awaited_once_with(db, limit=20)
     notifier.assert_awaited_once_with(db, bot='bot', limit=20)
+
+
+# --- РФ-1: цепочка «партнёр узнаёт о комиссии» держится на трёх строках.
+# Найдено ревью: все три мутации переживали полный прогон.
+
+
+@pytest.mark.asyncio
+async def test_direct_fulfilment_wakes_the_referral_queue_and_does_not_leave_it_for_an_hour():
+    """Без побудки комиссия и сообщение придут через час — фоновый обход ходит раз в 60 минут.
+
+    Живая проверка дня выкладки прочитала бы это как «не сработало».
+    """
+    user = SimpleNamespace(id=7)
+    attempt = SimpleNamespace(id=41, status='paid_processing')
+    checkout = SimpleNamespace(
+        id=9,
+        user_id=7,
+        target_subscription_id=None,
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='fulfilling',
+        funding_state='paid',
+        fulfillment_state='not_started',
+    )
+    db = SimpleNamespace(
+        scalar=AsyncMock(return_value=7),
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+    kick_referral = AsyncMock()
+
+    with (
+        patch(
+            'app.services.device_first_checkout_service._complete_direct_sale_locked',
+            AsyncMock(return_value=checkout),
+        ),
+        patch('app.services.device_first_checkout_service.process_direct_provisioning_outbox', AsyncMock()),
+        patch('app.services.device_first_checkout_service._kick_direct_referral_post_commit', kick_referral),
+    ):
+        await fulfill_direct_external_checkout(
+            db,
+            checkout_id=checkout.id,
+            provider_payment_id='provider-1',
+            payment_attempt_id=attempt.id,
+        )
+
+    kick_referral.assert_awaited_once_with(db, checkout_id=checkout.id)
+
+
+@pytest.mark.asyncio
+async def test_the_reward_message_reaches_its_own_sender_and_not_the_client_ready_text():
+    """Ветка развилки по типу — несущая: без неё строка о награде падает в общий `else`.
+
+    Там она получила бы клиентский текст «✅ Подписка готова» либо ушла бы в `failed`
+    без повтора, и партнёр не узнал бы о деньгах никогда.
+    """
+    row = SimpleNamespace(
+        id=1,
+        checkout_id=9,
+        notification_type=service.REFERRAL_REWARD_NOTIFICATION_TYPE,
+        status='pending',
+        lease_token=None,
+        lease_expires_at=None,
+        sending_at=None,
+        sent_at=None,
+        last_error=None,
+        updated_at=None,
+    )
+    checkout = SimpleNamespace(id=9, user_id=7, lifecycle_state='ready')
+    calls = {'n': 0}
+
+    async def _execute(*_args, **_kwargs):
+        # Первый запрос — набор строк очереди, все следующие — перечитывание заказа.
+        calls['n'] += 1
+        return Result([row]) if calls['n'] == 1 else Result(checkout)
+
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=_execute),
+        get=AsyncMock(return_value=row),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+    sender = AsyncMock()
+
+    with (
+        patch('app.services.device_first_checkout_service.queue_owner_order_stuck_alerts', AsyncMock()),
+        patch('app.services.device_first_checkout_service.revive_stale_notifications', AsyncMock()),
+        patch('app.services.device_first_checkout_service._send_referral_reward_message', sender),
+        patch('app.services.device_first_checkout_service._send_client_ready_message', AsyncMock()) as ready,
+    ):
+        await service.process_device_first_notification_outbox(db, bot=object(), limit=5)
+
+    sender.assert_awaited_once()
+    ready.assert_not_awaited()

@@ -1867,6 +1867,10 @@ async def settle_device_first_platega_payment(
             db,
             transaction_id=existing.id,
             checkout_id=checkout.id,
+            # РФ-1 п.1.1, найдено критиком полноты: это ТРЕТЬЯ точка, где возникает
+            # обязательство перед партнёром, и без этой строки она платила бы при
+            # выключенной программе.
+            pay_referral=settings.is_referral_program_enabled(),
         )
         await db.commit()
         await process_device_first_deposit_outbox(
@@ -1897,6 +1901,8 @@ async def settle_device_first_platega_payment(
         db,
         transaction_id=transaction.id,
         checkout_id=checkout.id,
+        # РФ-1 п.1.1: та же третья точка, вторая её половина.
+        pay_referral=settings.is_referral_program_enabled(),
     )
     payment.status = 'CONFIRMED'
     payment.is_paid = True

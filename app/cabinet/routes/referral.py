@@ -18,6 +18,7 @@ from app.database.models import (
     WithdrawalRequest,
     WithdrawalRequestStatus,
 )
+from app.utils.user_utils import paid_referral_ids
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 from ..schemas.referral import (
@@ -137,6 +138,13 @@ async def get_referral_list(
     result = await db.execute(query)
     referrals = result.scalars().all()
 
+    # 🔴 РФ-1 п.1.7: единый с ботом признак «человек занёс деньги», считанный ПО КНИГЕ.
+    # Было `has_had_paid_subscription` — оно расходилось с ботом на четырёх живых людях и
+    # вдобавок ставится бесплатным промокодом на дни. Перевести на `has_made_first_topup`
+    # тоже нельзя: у тех же четверых он снят, и кабинет начал бы писать «Ожидание»
+    # человеку, заплатившему 1 990 ₽. Обе метки отвечают не на тот вопрос.
+    paid_ids = await paid_referral_ids(db, [r.id for r in referrals])
+
     items = [
         ReferralItemResponse(
             id=r.id,
@@ -144,7 +152,7 @@ async def get_referral_list(
             first_name=r.first_name,
             created_at=r.created_at,
             has_subscription=bool(getattr(r, 'subscriptions', None)),
-            has_paid=r.has_had_paid_subscription,
+            has_paid=r.id in paid_ids,
         )
         for r in referrals
     ]

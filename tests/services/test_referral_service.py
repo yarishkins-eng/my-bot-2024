@@ -267,3 +267,66 @@ async def test_calculate_recurring_commission_tier_boundary(paid_count, expected
 
     percent = await referral_service.calculate_referral_commission_percent(db, referrer, is_first_payment=False)
     assert percent == expected_percent
+
+
+def _switch_fixture(monkeypatch, *, program_enabled: bool):
+    """Пара «реферал платит рефереру» — та же для обеих половин сторожа РФ-1.
+
+    Числа намеренно НЕ совпадают с умолчаниями кода (100 ₽ / 25 %): совпадение превратило бы
+    сторож в проверку совпадения — грабля 26.08.
+    """
+    user = SimpleNamespace(
+        id=71,
+        telegram_id=7101,
+        full_name='Реферал',
+        referred_by_id=72,
+        has_made_first_topup=True,
+    )
+    referrer = SimpleNamespace(id=72, telegram_id=7202, full_name='Реферер', email=None)
+
+    db = SimpleNamespace(commit=AsyncMock(), execute=AsyncMock())
+
+    monkeypatch.setattr(referral_service, 'get_user_by_id', AsyncMock(side_effect=[user, referrer]))
+    add_user_balance_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(referral_service, 'add_user_balance', add_user_balance_mock)
+    monkeypatch.setattr(referral_service, 'create_referral_earning', AsyncMock())
+    monkeypatch.setattr(referral_service, 'get_user_campaign_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(referral_service, 'get_referral_reward_payment_count', AsyncMock(return_value=3))
+    monkeypatch.setattr(referral_service, 'get_commission_payment_count', AsyncMock(return_value=3))
+
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_PROGRAM_ENABLED', program_enabled)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 30000)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 7000)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_INVITER_BONUS_KOPEKS', 9000)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_COMMISSION_PERCENT', 40)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_PAYMENT_COMMISSION_PERCENT', None)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_RECURRING_COMMISSION_TIERS', '')
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_MAX_COMMISSION_PAYMENTS', 0)
+
+    return db, user, add_user_balance_mock
+
+
+async def test_referral_switch_off_stops_the_money(monkeypatch):
+    """Выключенная программа обязана останавливать ДЕНЬГИ, а не только прятать кнопки.
+
+    Улика, а не совпадение: та же фикстура с включённой программой платит (тест ниже).
+    Значит красный тут означает «выключатель не держит», а не «фикстура не доехала».
+    """
+    db, user, add_user_balance_mock = _switch_fixture(monkeypatch, program_enabled=False)
+
+    result = await referral_service.process_referral_topup(db, user.id, 50000)
+
+    assert result is True
+    add_user_balance_mock.assert_not_awaited()
+
+
+async def test_referral_switch_on_still_pays(monkeypatch):
+    """Вторая половина сторожа: та же пара при включённой программе платит комиссию."""
+    db, user, add_user_balance_mock = _switch_fixture(monkeypatch, program_enabled=True)
+
+    result = await referral_service.process_referral_topup(db, user.id, 50000)
+
+    assert result is True
+    add_user_balance_mock.assert_awaited_once()
+    # 40 % от 500 ₽ — ставка и сумма взяты из фикстуры, а не из умолчаний кода.
+    assert add_user_balance_mock.await_args.args[2] == 20000

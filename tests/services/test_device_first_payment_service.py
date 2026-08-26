@@ -1746,13 +1746,22 @@ async def test_direct_post_paid_provider_reversal_stays_in_operator_review():
     attempt = SimpleNamespace(id=41, checkout_id=9, settlement_mode='direct_purchase_v2', status='paid_processing')
     checkout = SimpleNamespace(id=9, lifecycle_state='fulfilling', terminal_reason=None)
     outbox = SimpleNamespace(status='processing', last_error=None)
+    # 🔴 РФ-1: работа выплаты партнёру. Скептик показал, что без явной проверки ниже правку
+    # чарджбэка можно вырезать целиком, и тест останется зелёным.
+    referral_job = SimpleNamespace(referral_status='pending', updated_at=None)
 
     class OutboxResult:
         def scalars(self):
             return iter([outbox])
 
+    class ReferralJobResult:
+        def scalars(self):
+            return iter([referral_job])
+
     db = SimpleNamespace(
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), OutboxResult()]),
+        execute=AsyncMock(
+            side_effect=[Result(user), Result(attempt), Result(checkout), OutboxResult(), ReferralJobResult()]
+        ),
         commit=AsyncMock(),
     )
 
@@ -1765,6 +1774,9 @@ async def test_direct_post_paid_provider_reversal_stays_in_operator_review():
     assert payment.is_paid is True
     assert payment.status == 'OPERATOR_REVIEW'
     assert attempt.status == 'operator_review'
+    # 🔴 Провайдер деньги забрал — выплата партнёру обязана быть погашена ДО того, как очередь
+    # её исполнит. Иначе на заказе 1 990 ₽ уходит почти 700 ₽ с денег, которых уже нет.
+    assert referral_job.referral_status == 'done', 'чарджбэк обязан гасить невыплаченную комиссию'
     assert checkout.lifecycle_state == 'operator_review'
     assert outbox.status == 'operator_review'
     db.commit.assert_awaited_once()
@@ -2003,7 +2015,8 @@ async def test_duplicate_webhook_credits_balance_once_and_reuses_durable_outbox(
     assert user.balance_kopeks == 10000
     db.add.assert_not_called()
     assert payment.transaction_id == 88
-    ensure.assert_awaited_once_with(db, transaction_id=88, checkout_id=9)
+    # РФ-1: третья точка возникновения обязательства теперь спрашивает выключатель.
+    ensure.assert_awaited_once_with(db, transaction_id=88, checkout_id=9, pay_referral=True)
     side_effects.assert_awaited_once_with(db, transaction_id=88, limit=1)
 
 

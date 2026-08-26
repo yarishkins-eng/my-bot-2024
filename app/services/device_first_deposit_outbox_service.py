@@ -20,6 +20,7 @@ from app.database.crud.referral import get_user_campaign_id
 from app.database.crud.transaction import emit_transaction_side_effects
 from app.database.models import (
     DeviceFirstDepositOutbox,
+    DeviceFirstNotificationOutbox,
     PaymentMethod,
     ReferralEarning,
     SubscriptionCheckout,
@@ -42,8 +43,22 @@ async def ensure_deposit_outbox(
     *,
     transaction_id: int,
     checkout_id: int,
+    emit_deposit_event: bool = True,
+    pay_referral: bool = True,
+    settlement_mode: str | None = None,
 ) -> DeviceFirstDepositOutbox:
-    """Create the unique durable job before the provider settlement commit."""
+    """Create the unique durable job before the provider settlement commit.
+
+    `emit_deposit_event=False` — для прихода от банка по прямой продаже: событие
+    «баланс пополнен» жёстко подписано типом DEPOSIT и способом PLATEGA (`_apply_event_step`),
+    а при прямой оплате кошелёк не пополнялся вовсе. Выпустить его значило бы соврать о
+    пополнении, которого не было, — вопреки комментарию у самого `PROVIDER_RECEIPT` в модели.
+
+    `pay_referral=False` — аварийный выключатель (РФ-1 п.1.1). Проверяется ЗДЕСЬ, где
+    обязательство перед партнёром возникает, а не в `_apply_referral_step`, где оно
+    исполняется: выход из шага не помешает внешнему циклу пометить работу выполненной, и
+    обратное включение программы ничего бы не доплатило.
+    """
     existing = (
         await db.execute(
             select(DeviceFirstDepositOutbox).where(DeviceFirstDepositOutbox.transaction_id == transaction_id)
@@ -54,6 +69,9 @@ async def ensure_deposit_outbox(
     row = DeviceFirstDepositOutbox(
         transaction_id=transaction_id,
         checkout_id=checkout_id,
+        event_status='pending' if emit_deposit_event else 'done',
+        referral_status='pending' if pay_referral else 'done',
+        **({'settlement_mode': settlement_mode} if settlement_mode else {}),
     )
     db.add(row)
     await db.flush()
@@ -144,7 +162,12 @@ async def _apply_referral_step(
             select(Transaction)
             .where(
                 Transaction.id == job.transaction_id,
-                Transaction.type == TransactionType.DEPOSIT.value,
+                # РФ-1 п.1.2: источником комиссии стал не только кошельковый депозит, но и
+                # приход от банка по прямой продаже (`PROVIDER_RECEIPT`). Это ЕДИНСТВЕННОЕ
+                # место, где тип источника проверяется, — всё остальное в шаге универсально.
+                # ⛔ Списание за подписку (`SUBSCRIPTION_PAYMENT`) сюда попасть не может и не
+                # должно: оно отрицательное и относится к тем же деньгам, что и приход.
+                Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.PROVIDER_RECEIPT.value)),
                 Transaction.is_completed.is_(True),
             )
             .with_for_update()
@@ -212,7 +235,7 @@ async def _apply_referral_step(
             source=source,
             amount_kopeks=settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS,
             ledger_suffix='referred-first-bonus',
-            description='Бонус за первое пополнение по реферальной программе',
+            description='Бонус новичка за первую оплату',
         )
         inviter_bonus = settings.REFERRAL_INVITER_BONUS_KOPEKS + commission_amount
         await _add_reward(
@@ -221,7 +244,11 @@ async def _apply_referral_step(
             source=source,
             amount_kopeks=inviter_bonus,
             ledger_suffix='inviter-first-reward',
-            description=f'Бонус за первое пополнение реферала {user.full_name}',
+            description=(
+                f'Награда за первую оплату реферала {user.full_name}: '
+                f'{settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)} фикс'
+                f' + {commission_percent}% от {settings.format_price(source.amount_kopeks)}'
+            ),
         )
         if inviter_bonus > 0:
             await _add_referral_earning(
@@ -240,7 +267,12 @@ async def _apply_referral_step(
             source=source,
             amount_kopeks=commission_amount,
             ledger_suffix='inviter-recurring-commission',
-            description=f'Комиссия {commission_percent}% с пополнения {user.full_name}',
+            description=(
+                # Двоеточие несущее: письмо партнёру берёт расшифровку тем, что стоит после
+                # него (найдено скептиком — без двоеточия расшифровка была пуста всегда).
+                f'Комиссия с оплаты реферала {user.full_name}: '
+                f'{commission_percent}% от {settings.format_price(source.amount_kopeks)}'
+            ),
         )
         await _add_referral_earning(
             db,
@@ -252,9 +284,52 @@ async def _apply_referral_step(
             campaign_id=campaign_id,
         )
 
+    # РФ-1 п.1.3: сказать партнёру о деньгах. Ставим строку в ту же очередь сообщений, что
+    # обслуживает клиентские уведомления: у неё уже есть бот и защита «ровно один раз».
+    # ⛔ Слать прямо отсюда нельзя: бота в этой цепочке нет ни в одном из трёх мест вызова —
+    # отправка вернула бы «не вышло» молча, и партнёр снова остался бы без сообщения.
+    # Строка ставится ВНУТРИ той же транзакции, что и деньги: не заплатили — не обещаем.
+    await _queue_referral_reward_notification(db, checkout_id=job.checkout_id)
+
     job.referral_status = 'done'
     job.updated_at = datetime.now(UTC)
     await db.commit()
+
+
+async def _queue_referral_reward_notification(db: AsyncSession, *, checkout_id: int) -> None:
+    """Поставить сообщение о награде, если по этому заказу действительно платили."""
+    from app.services.device_first_checkout_service import REFERRAL_REWARD_NOTIFICATION_TYPE
+
+    paid = (
+        await db.execute(
+            select(Transaction.id)
+            .where(
+                Transaction.device_first_checkout_id == checkout_id,
+                Transaction.type == TransactionType.REFERRAL_REWARD.value,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if paid is None:
+        return
+    existing = (
+        await db.execute(
+            select(DeviceFirstNotificationOutbox.id)
+            .where(
+                DeviceFirstNotificationOutbox.checkout_id == checkout_id,
+                DeviceFirstNotificationOutbox.notification_type == REFERRAL_REWARD_NOTIFICATION_TYPE,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    db.add(
+        DeviceFirstNotificationOutbox(
+            checkout_id=checkout_id,
+            notification_type=REFERRAL_REWARD_NOTIFICATION_TYPE,
+        )
+    )
 
 
 async def _apply_fulfillment_step(db: AsyncSession, *, job_id: int) -> None:
