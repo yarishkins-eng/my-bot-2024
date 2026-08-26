@@ -413,7 +413,10 @@ async def test_choose_devices_renders_a_checkout_free_pay_confirmation() -> None
     db = AsyncMock()
 
     with (
-        patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock()) as get_open,
+        patch(
+            'app.handlers.subscription.device_first.get_open_checkout_for_user',
+            AsyncMock(return_value=None),
+        ) as get_open,
         patch('app.handlers.subscription.device_first.create_or_resume_direct_checkout', AsyncMock()) as create,
         patch(
             'app.handlers.subscription.device_first.available_platega_methods_for_db',
@@ -427,8 +430,13 @@ async def test_choose_devices_renders_a_checkout_free_pay_confirmation() -> None
     ):
         await choose_devices(callback, user, db, state)
 
-    get_open.assert_not_awaited()
+    # Инвариант этого сторожа — «выбор устройств не заводит заказ», и его держит ИМЕННО эта
+    # строка. Прежде рядом стояла ещё `get_open.assert_not_awaited()`: она закрепляла не
+    # инвариант, а побочное свойство «мы даже не смотрим». Этап БК смотрит намеренно — живой
+    # счёт закрепляет способ оплаты, и предлагать доплату поверх него значит вести человека
+    # в отказ. Чтение осталось чтением: заказ по-прежнему рождается только на кнопке оплаты.
     create.assert_not_awaited()
+    get_open.assert_awaited_once()
     caption = render.await_args.kwargs['caption']
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert 'Ваш заказ' in caption
@@ -436,7 +444,14 @@ async def test_choose_devices_renders_a_checkout_free_pay_confirmation() -> None
     assert '5 устройств · 3 месяца' in caption
     assert '1 090 ₽' in caption
     assert keyboard[0][0].web_app.url == 'https://cabinet.example/subscription/purchase?safe'
+    assert keyboard[1][0].web_app.url == 'https://cabinet.example/subscription/purchase?safe'
+    # Адреса проверяются оба и по порядку: первой стоит дверь доплаты, за ней — прежняя
+    # кнопка способа оплаты, у которой метка `autostart=1` не тронута ни на знак.
     assert build_cabinet_url.call_args_list[0].args[0] == (
+        '/balance/top-up/platega?returnTo=%2Fsubscription%2Fpurchase'
+        '%3Ffrom%3Dcheckout%26period%3D90%26devices%3D5&amount=590'
+    )
+    assert build_cabinet_url.call_args_list[1].args[0] == (
         '/subscription/purchase?period=90&devices=5&method=sbp&autostart=1'
     )
     callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
