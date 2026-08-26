@@ -18,6 +18,7 @@ from app.services.device_first_checkout_service import (
     process_device_first_notification_outbox,
     process_direct_provisioning_outbox,
 )
+from app.services.device_first_deposit_outbox_service import process_device_first_deposit_outbox
 from app.services.device_first_payment_service import reconcile_device_first_payments
 
 
@@ -39,6 +40,11 @@ class DeviceFirstRecoveryService:
         async with AsyncSessionLocal() as db:
             reconciled = await reconcile_device_first_payments(db, limit=20, direct_only=True)
             provisioned = await process_direct_provisioning_outbox(db, limit=20)
+            # 🔴 РФ-1, найдено критиком полноты: без этой строки «комиссия в минуты»
+            # держалась на ЕДИНСТВЕННОЙ побудке после продажи. Любой её отказ или
+            # повтор работы отбрасывал партнёра к часовому ожиданию — фоновый слив
+            # депозитной очереди есть только в цикле мониторинга с периодом 60 минут.
+            await process_device_first_deposit_outbox(db, limit=20)
             notified = await process_device_first_notification_outbox(db, bot=bot, limit=20)
         return reconciled, provisioned, notified
 

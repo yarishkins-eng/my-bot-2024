@@ -76,6 +76,13 @@ OWNER_NOTIFICATION_TYPES = (
     ENTITLEMENT_DRIFT_NOTIFICATION_TYPE,
     TARGET_DRIFT_NOTIFICATION_TYPE,
 )
+# 🔴 РФ-1, найдено критиком полноты. Оживление было ограничено строками владельцу, и
+# обоснование верное: для «✅ Подписка готова» отказ означает НЕИЗВЕСТНЫЙ исход, повтор дал бы
+# клиенту дубль. Для строки о реферальной награде расклад обратный: у повторной комиссии
+# получатель ровно ОДИН, и единственный отказ Телеграма хоронил бы деньги молча навсегда —
+# то есть отменял бы весь смысл пункта «партнёр получает комиссию И УЗНАЁТ о ней». Дубль
+# «вам начислено» безобиден, молчание — нет.
+RETRYABLE_NOTIFICATION_TYPES = (*OWNER_NOTIFICATION_TYPES, REFERRAL_REWARD_NOTIFICATION_TYPE)
 # Окно свежести для строки владельцу. Оно же — второй замок от смертельной ловушки:
 # пять архивных заказов тарифа 3 не обновлялись с 03.08.2026, в окно они не попадают.
 OWNER_ALERT_LOOKBACK = timedelta(hours=24)
@@ -2841,7 +2848,7 @@ async def revive_stale_notifications(db: AsyncSession) -> tuple[int, int]:
     revived = await db.execute(
         update(DeviceFirstNotificationOutbox)
         .where(
-            DeviceFirstNotificationOutbox.notification_type.in_(OWNER_NOTIFICATION_TYPES),
+            DeviceFirstNotificationOutbox.notification_type.in_(RETRYABLE_NOTIFICATION_TYPES),
             or_(
                 and_(
                     DeviceFirstNotificationOutbox.status == 'failed',

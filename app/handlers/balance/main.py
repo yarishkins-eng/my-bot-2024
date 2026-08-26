@@ -35,6 +35,13 @@ CREDIT_TRANSACTION_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# 🔴 Найдено прогоном сценария (РФ-1). Приход от банка по прямой оплате — учётная запись о
+# том, что провайдер принял деньги; КОШЕЛЬКА он не касается. В истории операций он рисовался
+# минусом рядом со списанием за ту же подписку, и человек, заплативший 249 ₽, видел «−249 ₽»
+# дважды. Ни плюсом, ни минусом он здесь не верен — на баланс не влиял вовсе, поэтому в
+# истории кошелька ему не место. Живой пример: два «−1990 ₽» у покупателя 194.
+HIDDEN_FROM_WALLET_HISTORY: frozenset[str] = frozenset({TransactionType.PROVIDER_RECEIPT.value})
+
 
 async def route_payment_by_method(
     message: types.Message, db_user: User, amount_kopeks: int, state: FSMContext, payment_method: str
@@ -260,6 +267,8 @@ async def show_balance_history(callback: types.CallbackQuery, db_user: User, db:
     unique_transactions = []
 
     for transaction in raw_transactions:
+        if transaction.type in HIDDEN_FROM_WALLET_HISTORY:
+            continue
         rounded_time = transaction.created_at.replace(second=0, microsecond=0)
         transaction_key = (transaction.amount_kopeks, transaction.description, rounded_time)
 
@@ -275,6 +284,8 @@ async def show_balance_history(callback: types.CallbackQuery, db_user: User, db:
     total_unique = 0
 
     for transaction in all_transactions:
+        if transaction.type in HIDDEN_FROM_WALLET_HISTORY:
+            continue
         rounded_time = transaction.created_at.replace(second=0, microsecond=0)
         transaction_key = (transaction.amount_kopeks, transaction.description, rounded_time)
         if transaction_key not in seen_all:

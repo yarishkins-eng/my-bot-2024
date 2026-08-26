@@ -268,8 +268,10 @@ async def _apply_referral_step(
             amount_kopeks=commission_amount,
             ledger_suffix='inviter-recurring-commission',
             description=(
-                f'Комиссия {commission_percent}% с оплаты реферала {user.full_name}'
-                f' ({settings.format_price(source.amount_kopeks)})'
+                # Двоеточие несущее: письмо партнёру берёт расшифровку тем, что стоит после
+                # него (найдено скептиком — без двоеточия расшифровка была пуста всегда).
+                f'Комиссия с оплаты реферала {user.full_name}: '
+                f'{commission_percent}% от {settings.format_price(source.amount_kopeks)}'
             ),
         )
         await _add_referral_earning(

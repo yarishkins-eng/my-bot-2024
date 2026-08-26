@@ -336,6 +336,11 @@ async def test_the_payout_step_looks_for_the_bank_receipt_and_not_only_for_a_top
     compiled = str(source_query.compile(compile_kwargs={'literal_binds': True}))
     assert 'provider_receipt' in compiled, 'шаг выплаты обязан видеть приход от банка'
     assert 'deposit' in compiled, 'и не должен потерять кошельковое пополнение'
+    # 🔴 Найдено скептиком: проверка НАЛИЧИЯ пропускала добавление лишнего типа. Списание за
+    # подписку — те же деньги с обратным знаком; попади оно в фильтр, комиссия ушла бы дважды
+    # с одной покупки, и весь набор остался бы зелёным.
+    assert 'subscription_payment' not in compiled, 'списание в источник выплаты попасть не может'
+    assert 'referral_reward' not in compiled, 'и сама награда тоже'
 
 
 @pytest.mark.asyncio

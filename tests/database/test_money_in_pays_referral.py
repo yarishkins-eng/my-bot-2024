@@ -85,6 +85,37 @@ KNOWN_MONEY_IN = {
     ('app/services/device_first_payment_service.py', '_settle_direct_platega_payment_locked'): (
         'НЕ платит: поздний платёж мимо очереди — мины U и BU, 0 ₽, отдельный этап'
     ),
+    # --- зачисление без явного типа: умолчание помощника = «приход» ---
+    # 🔴 Эти одиннадцать мест сторож не видел вовсе, пока не научился читать умолчание.
+    # Ровно так выглядит самый обычный способ зачислить деньги в этом проекте.
+    ('app/services/campaign_service.py', '_apply_balance_bonus'): (
+        'НЕ платит: бонус рекламной кампании — подарок, денег клиента нет'
+    ),
+    ('app/services/promocode_service.py', '_apply_promocode_effects'): (
+        'НЕ платит: промокод — подарок, денег клиента нет'
+    ),
+    ('app/services/wheel_service.py', '_apply_prize'): 'НЕ платит: выигрыш в колесе — подарок, денег клиента нет',
+    ('app/services/user_service.py', 'update_user_balance'): (
+        'НЕ платит: ручное начисление админом — подарок или компенсация, решение владельца'
+    ),
+    ('app/webapi/routes/users.py', 'update_balance'): 'НЕ платит: ручная правка баланса через API — не деньги клиента',
+    ('app/handlers/simple_subscription.py', 'confirm_simple_subscription_purchase'): (
+        'НЕ платит: возврат за несостоявшуюся выдачу — деньги возвращаются, а не приходят'
+    ),
+    ('app/handlers/simple_subscription.py', 'handle_simple_subscription_pay_with_balance'): (
+        'НЕ платит: оплата с баланса — комиссия уже взята на входе денег'
+    ),
+    ('app/services/apple_iap.py', '_handle_refund_reversed'): (
+        'НЕ платит: отмена возврата Apple — восстановление, отдельный этап; 0 ₽, шлюз выключен'
+    ),
+    ('app/services/payment_service.py', 'add_user_balance'): (
+        'ОБЁРТКА: тип задаёт вызывающий. 🔴 Новый шлюз, написанный против неё, обязан звать '
+        'process_referral_topup сам — обёртка за него этого не делает'
+    ),
+    ('app/services/payment_service.py', 'create_transaction'): 'ОБЁРТКА: то же, тип задаёт вызывающий',
+    ('app/services/referral_service.py', 'process_referral_purchase'): (
+        'МЁРТВАЯ функция: вызовов ноль, помечена «INTENTIONALLY UNUSED». Сама и есть выплата, а не приход денег'
+    ),
     # --- фундамент базы: править эти файлы запрещает предохранитель выкладки ---
     ('app/database/crud/transaction.py', 'create_unique_tribute_transaction'): (
         'app/database/** — правка запрещена предохранителем deploy.yml, разбирается отдельно'
@@ -120,6 +151,14 @@ def _scan() -> tuple[dict, list]:
                     return value.value.attr
                 return value.attr
             return '<переменная>'
+        # 🔴 Найдено критиком полноты: без этой ветки сторож был слеп к САМОМУ обычному
+        # способу зачислить деньги в этом проекте. У `add_user_balance` и `create_transaction`
+        # умолчание параметра — DEPOSIT, поэтому вызов без явного типа означает «приход», а
+        # обход возвращал `None` и молча пропускал такое место. Проверено мутацией: новая
+        # функция с `add_user_balance(...)` без типа проходила сторожа насквозь.
+        name = call.func.id if isinstance(call.func, ast.Name) else getattr(call.func, 'attr', None)
+        if name in ('add_user_balance', 'create_transaction', 'create_trans'):
+            return 'DEPOSIT'
         return None
 
     for path in sorted(APP.rglob('*.py')):

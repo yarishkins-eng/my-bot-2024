@@ -478,6 +478,11 @@ async def test_dedicated_recovery_worker_is_direct_only_and_independent_from_gen
     monkeypatch.setattr(recovery_module, 'reconcile_device_first_payments', reconciler)
     monkeypatch.setattr(recovery_module, 'process_direct_provisioning_outbox', provisioner)
     monkeypatch.setattr(recovery_module, 'process_device_first_notification_outbox', notifier)
+    # РФ-1: быстрый обработчик сливает и очередь ВЫПЛАТ. Без неё «комиссия за минуты» держалась
+    # на единственной побудке после продажи, а фоновый слив есть только в цикле мониторинга
+    # с периодом 60 минут — любой сбой отбрасывал партнёра к часовому ожиданию.
+    payouts = AsyncMock(return_value=0)
+    monkeypatch.setattr(recovery_module, 'process_device_first_deposit_outbox', payouts)
     monkeypatch.setattr(recovery_module.settings, 'PAYMENT_VERIFICATION_AUTO_CHECK_ENABLED', False)
 
     result = await DeviceFirstRecoveryService().run_once(bot='bot')
@@ -485,6 +490,7 @@ async def test_dedicated_recovery_worker_is_direct_only_and_independent_from_gen
     assert result == (2, 3, 1)
     reconciler.assert_awaited_once_with(db, limit=20, direct_only=True)
     provisioner.assert_awaited_once_with(db, limit=20)
+    payouts.assert_awaited_once_with(db, limit=20)
     notifier.assert_awaited_once_with(db, bot='bot', limit=20)
 
 
