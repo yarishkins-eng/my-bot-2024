@@ -159,15 +159,11 @@ async def create_transaction(
             except Exception as exc:
                 logger.debug('Не удалось записать событие конкурса для пользователя', user_id=user_id, exc=exc)
 
-            # Yandex.Metrika offline conversion.
-            # 🔴 Уточнено 26.08.2026 (этап РФ-1): это НЕ единственная дверь.
-            # Прямая продажа (device_first_checkout_service._complete_direct_sale_locked)
-            # собирает Transaction(...) конструктором напрямую и сюда не заходит —
-            # значит по ней событие покупки не отправляется вовсе. Мимо этой же двери
-            # проходит и автовыдача промо-группы по сумме трат (мина FS).
-            # Для остальных путей (кабинет, обработчики бота, гость, звёзды,
-            # переход триал→платная, автоплатёж, IAP, вебхуки) верно как написано:
-            # событие уходит ровно один раз на оплаченную покупку. Background task with its own DB session; no-ops when
+            # Yandex.Metrika offline conversion — central chokepoint.
+            # Every completed SUBSCRIPTION_PAYMENT (cabinet, bot handlers, guest,
+            # stars, trial→paid conversion, autopay/recurring, IAP, webhooks)
+            # passes through here, so the purchase event fires exactly once per
+            # paid purchase. Background task with its own DB session; no-ops when
             # the service is disabled or no CID is stored.
             try:
                 from app.services import yandex_offline_conv_service as yandex_conv
@@ -242,10 +238,9 @@ async def emit_transaction_side_effects(
             logger.debug('Не удалось записать событие конкурса для пользователя', user_id=user_id, exc=exc)
             errors.append(exc)
 
-        # Yandex.Metrika offline conversion — отложенный путь для тех, кто зовёт
-        # create_transaction(commit=False). Событие уходит ровно один раз на
-        # оплаченную покупку. 🔴 Та же оговорка, что и выше: прямая продажа сюда
-        # не заходит, она строит Transaction конструктором (этап РФ-1, 26.08.2026). Background task with
+        # Yandex.Metrika offline conversion — central chokepoint (deferred path
+        # for create_transaction(commit=False) callers). Fires the purchase event
+        # exactly once per completed SUBSCRIPTION_PAYMENT. Background task with
         # its own DB session; no-ops when disabled or no CID stored.
         try:
             from app.services import yandex_offline_conv_service as yandex_conv
