@@ -45,6 +45,7 @@ async def ensure_deposit_outbox(
     checkout_id: int,
     emit_deposit_event: bool = True,
     pay_referral: bool = True,
+    settlement_mode: str | None = None,
 ) -> DeviceFirstDepositOutbox:
     """Create the unique durable job before the provider settlement commit.
 
@@ -70,6 +71,7 @@ async def ensure_deposit_outbox(
         checkout_id=checkout_id,
         event_status='pending' if emit_deposit_event else 'done',
         referral_status='pending' if pay_referral else 'done',
+        **({'settlement_mode': settlement_mode} if settlement_mode else {}),
     )
     db.add(row)
     await db.flush()

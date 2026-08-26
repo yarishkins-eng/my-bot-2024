@@ -2130,6 +2130,9 @@ async def _complete_direct_sale_locked(
             emit_deposit_event=False,
             # Выключатель спрашиваем ЗДЕСЬ, где обязательство возникает (РФ-1 п.1.1).
             pay_referral=settings.is_referral_program_enabled(),
+            # Иначе работа легла бы в базу с меткой «легаси-депозит», и будущий разбор
+            # «откуда пришли деньги» соврал бы про главный путь продаж.
+            settlement_mode=DIRECT_SETTLEMENT_MODE,
         )
 
     sale_key = f'direct-sale:{checkout.id}'
@@ -2331,20 +2334,23 @@ async def _kick_direct_referral_post_commit(db: AsyncSession, *, checkout_id: in
     фоновым обходом со своей выдержкой.
     """
     receipt_key = f'provider-receipt:{checkout_id}'
-    receipt_id = (
-        await db.execute(select(Transaction.id).where(Transaction.device_first_ledger_key == receipt_key))
-    ).scalar_one_or_none()
-    if receipt_id is None:
-        return
     try:
+        receipt_id = (
+            await db.execute(select(Transaction.id).where(Transaction.device_first_ledger_key == receipt_key))
+        ).scalar_one_or_none()
+        if receipt_id is None:
+            return
         await process_device_first_deposit_outbox(db, transaction_id=receipt_id, limit=1)
     except Exception as error:
-        logger.warning(
-            'device_first_direct_referral_kick_failed',
-            checkout_id=checkout_id,
-            transaction_id=receipt_id,
-            error=str(error),
-        )
+        # 🔴 Найдено ревью. Без этого отката отказ здесь оставлял сессию отравленной, и
+        # следующая же строка вызывающего (`db.refresh`) падала с PendingRollbackError —
+        # то есть вебхук провайдера получал ошибку ПОСЛЕ того, как деньги взяты, а подписка
+        # выдана. Соседняя побудка выдачи делает ровно это же и по той же причине.
+        logger.warning('device_first_direct_referral_kick_failed', checkout_id=checkout_id, error=str(error))
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
 
 async def _kick_direct_provisioning_post_commit(db: AsyncSession, *, checkout_id: int) -> None:
@@ -3331,8 +3337,9 @@ async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: Subscri
 async def _send_referral_reward_message(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
     """Партнёр узнаёт о комиссии, а новичок — о своём бонусе (РФ-1 п.1.3).
 
-    Кому и сколько — из уже созданных наградных строк: их описание с п.1.4 само объясняет,
-    из чего сложилась сумма, поэтому текст не сочиняется заново и не может разойтись с деньгами.
+    Кому и сколько — из уже созданных наградных строк. Текст различает три случая, потому что
+    они значат разное: первая награда (фикс + процент), повторная комиссия (только процент) и
+    бонус новичка. Без имени друга сообщение бесполезно тому, у кого приглашённых несколько.
     """
     rewards = list(
         (
@@ -3352,33 +3359,92 @@ async def _send_referral_reward_message(db: AsyncSession, *, bot, checkout: Subs
         # Начисления не было: у покупателя нет пригласившего, программа выключена или сумма
         # ниже порога. Сообщать нечего — строка закрывается выполненной, а не падает.
         return
+
+    friend = await db.get(User, checkout.user_id)
+    friend_name = html.escape(friend.full_name) if friend is not None else ''
+    source = (
+        await db.execute(
+            select(Transaction)
+            .where(
+                Transaction.device_first_checkout_id == checkout.id,
+                Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.PROVIDER_RECEIPT.value)),
+            )
+            # 🔴 Найдено ревью: без порядка по номеру операторский возврат создаёт по тому же
+            # заказу второй приход, и в письмо попала бы произвольная сумма. Берём первый —
+            # он и есть та оплата, с которой посчитана награда.
+            .order_by(Transaction.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    paid = settings.format_price(source.amount_kopeks) if source is not None else ''
+
+    delivered = 0
+    failures: list[str] = []
     for reward in rewards:
         recipient = await db.get(User, reward.user_id)
         if recipient is None or not recipient.telegram_id:
             continue
-        is_friend_bonus = (reward.device_first_ledger_key or '').endswith('referred-first-bonus')
+        english = recipient.language == 'en'
+        suffix = (reward.device_first_ledger_key or '').rsplit(':', 1)[-1]
         amount = settings.format_price(reward.amount_kopeks)
-        if is_friend_bonus:
+
+        if suffix == 'referred-first-bonus':
             text = (
-                f'🎁 <b>Welcome bonus credited</b>\n\n'
-                f"We've credited <b>{amount}</b> to your balance for your first payment "
-                f'with Teplo VPN — you can spend it on a renewal.'
-                if recipient.language == 'en'
+                f'🎁 <b>Welcome bonus</b>\n\n'
+                f"Thanks for your first payment. We've added <b>{amount}</b> to your balance, "
+                f'and you can put it toward your next renewal.\n\n'
+                f'Glad to have you with us!'
+                if english
                 else f'🎁 <b>Бонус новичка зачислен</b>\n\n'
-                f'За вашу первую оплату в Teplo VPN мы начислили <b>{amount}</b> на баланс — '
-                f'их можно потратить на продление.'
+                f'За вашу первую оплату мы начислили <b>{amount}</b> на баланс. '
+                f'Эти деньги можно потратить на продление.\n\n'
+                f'Спасибо, что вы с нами!'
             )
         else:
-            text = (
-                f'💰 <b>Referral reward credited</b>\n\n'
-                f'Your friend paid for a subscription — your reward is <b>{amount}</b>.\n\n'
-                f'The money is already on your balance.'
-                if recipient.language == 'en'
-                else f'💰 <b>Начислена реферальная награда</b>\n\n'
-                f'Ваш друг оплатил подписку — ваша награда <b>{amount}</b>.\n\n'
-                f'Деньги уже на вашем балансе. Спасибо, что приводите друзей в Teplo VPN!'
-            )
-        await bot.send_message(recipient.telegram_id, text, parse_mode='HTML')
+            # 🔴 Найдено ревью: процент НЕЛЬЗЯ вычислять заново в момент отправки. Платит его
+            # `calculate_referral_commission_percent` — со ступенями и отдельной ставкой первой
+            # оплаты, — а базовая ставка может от неё отличаться. Письмо тогда назвало бы
+            # процент, которого не было в расчёте. Берём расшифровку из описания наградной
+            # строки: п.1.4 положил туда ровно те числа, по которым посчитаны деньги.
+            # rsplit, а не split: имя из Телеграма может содержать «: » и утащить свой кусок
+            # в денежную строку письма. Расшифровка всегда идёт последней.
+            breakdown = (reward.description or '').rsplit(': ', 1)
+            details = breakdown[1] if len(breakdown) == 2 else ''
+            first = suffix == 'inviter-first-reward'
+            head = 'Реферальная награда!' if first else 'Реферальная комиссия!'
+            head_en = 'Referral reward!' if first else 'Referral commission!'
+            if english:
+                text = (
+                    f'💰 <b>{head_en}</b>\n\n'
+                    f'Your friend <b>{friend_name}</b> paid {paid} for a subscription.\n\n'
+                    f'🎁 Your reward: <b>{amount}</b>\n\n'
+                    f"It's already in your balance — see Balance → History for the breakdown."
+                )
+            else:
+                text = (
+                    f'💰 <b>{head}</b>\n\n'
+                    f'Ваш друг <b>{friend_name}</b> оплатил подписку на {paid}.\n\n'
+                    f'🎁 Ваша награда: <b>{amount}</b>'
+                    + (f'\n<i>{html.escape(details)}</i>' if details else '')
+                    + '\n\nДеньги уже на балансе.'
+                )
+        # 🔴 Найдено ревью: без своего перехвата один заблокировавший бота получатель уносил
+        # сообщение второго. Награды идут по возрастанию номера, бонус другу создаётся первым —
+        # то есть покупатель, закрывший бота, лишал партнёра уведомления НАВСЕГДА: строка ушла бы
+        # в `failed`, а оживляет `revive_stale_notifications` только строки владельцу.
+        # Деньги при этом уже начислены, так что отказ доставки не повод считать шаг несделанным.
+        try:
+            await bot.send_message(recipient.telegram_id, text, parse_mode='HTML')
+            delivered += 1
+        except Exception as error:
+            failures.append(f'{recipient.id}:{type(error).__name__}')
+
+    if failures and not delivered:
+        # Не дошло НИ ОДНО — это уже похоже на общий отказ, а не на закрытого клиента:
+        # пусть строка попадёт в `failed` и останется следом в логе.
+        raise RuntimeError(f'referral_reward_delivery_failed: {", ".join(failures)}')
+    if failures:
+        logger.warning('device_first_referral_reward_partially_delivered', checkout_id=checkout.id, failed=failures)
 
 
 async def process_device_first_notification_outbox(db: AsyncSession, *, bot, limit: int = 20) -> int:

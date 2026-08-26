@@ -1752,7 +1752,10 @@ async def test_direct_post_paid_provider_reversal_stays_in_operator_review():
             return iter([outbox])
 
     db = SimpleNamespace(
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), OutboxResult()]),
+        # Пятый ответ — гашение работы выплаты партнёру при чарджбэке (РФ-1, находка ревью).
+        execute=AsyncMock(
+            side_effect=[Result(user), Result(attempt), Result(checkout), OutboxResult(), OutboxResult()]
+        ),
         commit=AsyncMock(),
     )
 

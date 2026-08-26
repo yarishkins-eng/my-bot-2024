@@ -273,3 +273,66 @@ async def test_no_message_is_queued_when_nobody_was_paid():
     await service._queue_referral_reward_notification(db, checkout_id=13)
 
     assert added == []
+
+
+# --- РФ-1: сторожа на НЕСУЩИЕ строки. Найдено ревью: прежние проверяли kwarg на моке,
+# то есть договорённость, а не поведение. Четыре мутации переживали полный прогон.
+
+
+@pytest.mark.asyncio
+async def test_switch_off_closes_the_referral_step_at_creation_time():
+    """`pay_referral=False` обязан закрыть шаг выплаты СРАЗУ, а не оставить его ждать.
+
+    Мутация «игнорировать kwarg» переживала весь набор: работа заводилась `pending`, и
+    выключатель не останавливал ничего.
+    """
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=Result(value=None)),
+        add=MagicMock(side_effect=added.append),
+        flush=AsyncMock(),
+    )
+
+    row = await service.ensure_deposit_outbox(db, transaction_id=55, checkout_id=13, pay_referral=False)
+
+    assert row.referral_status == 'done', 'выключенная программа обязана закрывать шаг выплаты'
+    assert row.event_status == 'pending', 'событие о пополнении выключателя не касается'
+
+
+@pytest.mark.asyncio
+async def test_receipt_job_never_announces_a_wallet_top_up():
+    """`emit_deposit_event=False` обязан закрыть шаг события.
+
+    Иначе на приход от банка уходит событие «баланс пополнен» с жёстко зашитыми типом и
+    способом — ложь о пополнении, которого не было.
+    """
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=Result(value=None)),
+        add=MagicMock(),
+        flush=AsyncMock(),
+    )
+
+    row = await service.ensure_deposit_outbox(db, transaction_id=56, checkout_id=14, emit_deposit_event=False)
+
+    assert row.event_status == 'done', 'приход — не пополнение кошелька'
+    assert row.referral_status == 'pending', 'выплату это не отменяет'
+
+
+@pytest.mark.asyncio
+async def test_the_payout_step_looks_for_the_bank_receipt_and_not_only_for_a_top_up(monkeypatch):
+    """Сторож на САМ ЗАПРОС: сузишь тип обратно до пополнения — покраснеет.
+
+    Мок не исполняет `WHERE`, поэтому проверяем скомпилированный запрос — приём уже
+    применяется в проекте. Без этого сторожа мутация «вернуть == DEPOSIT» проходила весь
+    набор из 3096 тестов, а на боевом означала бы, что комиссия не платится НИКОГДА.
+    """
+    job = SimpleNamespace(id=4, transaction_id=55, checkout_id=13, referral_status='pending', updated_at=None)
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[Result(job), RuntimeError('стоп')]), commit=AsyncMock())
+
+    with pytest.raises(RuntimeError):
+        await service._apply_referral_step(db, job_id=job.id)
+
+    source_query = db.execute.await_args_list[1].args[0]
+    compiled = str(source_query.compile(compile_kwargs={'literal_binds': True}))
+    assert 'provider_receipt' in compiled, 'шаг выплаты обязан видеть приход от банка'
+    assert 'deposit' in compiled, 'и не должен потерять кошельковое пополнение'

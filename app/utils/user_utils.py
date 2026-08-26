@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.database.crud.transaction import REAL_PAYMENT_METHODS
 from app.database.models import ReferralEarning, Subscription, SubscriptionStatus, Transaction, TransactionType, User
 
 
@@ -107,6 +108,40 @@ async def mark_user_as_had_paid_subscription(db: AsyncSession, user: User) -> bo
         return False
 
 
+async def paid_referral_ids(db: AsyncSession, referral_ids) -> set[int]:
+    """Кто из этих людей ДЕЙСТВИТЕЛЬНО занёс деньги — по книге, а не по флагу.
+
+    🔴 РФ-1 п.1.7, переписан после ревью. Ни один из двух флагов на этот вопрос не отвечает:
+
+    * `has_made_first_topup` поднимает только очередь выплат, а до РФ-1 она прямые оплаты не
+      обрабатывала — у четверых живых людей, заплативших картой (172, 182, 194, 321), флаг
+      снят до сих пор. Перевести экраны на него значило бы написать «Ожидание» человеку,
+      заплатившему 1 990 ₽, то есть УХУДШИТЬ кабинет, а не починить.
+    * `has_had_paid_subscription` ставит бесплатный промокод на дни, то есть он означает
+      «есть подписка», а не «принёс деньги».
+
+    Считаем по транзакциям: приход от банка или пополнение **настоящим** платёжным способом.
+    Гейт положительный (`в списке шлюзов`), а не отрицательный: подарки кампаний
+    записываются с пустым способом и мимо отрицательного гейта прошли бы как оплата.
+
+    Один запрос на весь список — списки рефералов доходят до 100 человек на странице.
+    """
+    ids = list(referral_ids)
+    if not ids:
+        return set()
+    rows = await db.execute(
+        select(Transaction.user_id)
+        .where(
+            Transaction.user_id.in_(ids),
+            Transaction.is_completed.is_(True),
+            Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.PROVIDER_RECEIPT.value)),
+            Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
+        )
+        .distinct()
+    )
+    return set(rows.scalars().all())
+
+
 async def get_user_referral_summary(db: AsyncSession, user_id: int) -> dict:
     try:
         invited_count_result = await db.execute(select(func.count(User.id)).where(User.referred_by_id == user_id))
@@ -115,7 +150,9 @@ async def get_user_referral_summary(db: AsyncSession, user_id: int) -> dict:
         referrals_result = await db.execute(select(User).where(User.referred_by_id == user_id))
         referrals = referrals_result.scalars().all()
 
-        paid_referrals_count = sum(1 for ref in referrals if ref.has_made_first_topup)
+        # РФ-1 п.1.7: по книге, а не по флагу — иначе заплативший картой не считается.
+        paid_ids = await paid_referral_ids(db, [ref.id for ref in referrals])
+        paid_referrals_count = len(paid_ids)
 
         total_earnings_result = await db.execute(
             select(func.coalesce(func.sum(ReferralEarning.amount_kopeks), 0)).where(ReferralEarning.user_id == user_id)
@@ -215,6 +252,9 @@ async def get_detailed_referral_list(db: AsyncSession, user_id: int, limit: int 
         total_count_result = await db.execute(select(func.count(User.id)).where(User.referred_by_id == user_id))
         total_count = total_count_result.scalar() or 0
 
+        # РФ-1 п.1.7: один запрос на всю страницу, а не по запросу на человека.
+        paid_ids_for_list = await paid_referral_ids(db, [referral.id for referral in referrals])
+
         detailed_referrals = []
         for referral in referrals:
             earnings_result = await db.execute(
@@ -233,6 +273,12 @@ async def get_detailed_referral_list(db: AsyncSession, user_id: int, limit: int 
                         # бы «💰 Максим · Оплат: 0 · с него заработал 262 ₽», то есть спорил бы
                         # сам с собой сразу после выплаты.
                         Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.PROVIDER_RECEIPT.value)),
+                        # 🔴 Найдено ревью текстов. Строка называется «Оплат», а без этого
+                        # условия считались бы и подарки: промокод, колесо удачи, бонус
+                        # кампании, ручное начисление админом — все пишутся типом «пополнение».
+                        # Гейт положительный: подарки идут с пустым способом оплаты и мимо
+                        # отрицательного условия прошли бы как настоящие деньги.
+                        Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
                         Transaction.is_completed.is_(True),
                     )
                 )
@@ -253,7 +299,7 @@ async def get_detailed_referral_list(db: AsyncSession, user_id: int, limit: int 
                     'username': referral.username,
                     'created_at': referral.created_at,
                     'last_activity': referral.last_activity,
-                    'has_made_first_topup': referral.has_made_first_topup,
+                    'has_made_first_topup': referral.id in paid_ids_for_list,
                     'balance_kopeks': referral.balance_kopeks,
                     'total_earned_kopeks': total_earned_from_referral,
                     'topups_count': topups_count,
