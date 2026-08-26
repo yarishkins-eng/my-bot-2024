@@ -336,3 +336,37 @@ async def test_the_payout_step_looks_for_the_bank_receipt_and_not_only_for_a_top
     compiled = str(source_query.compile(compile_kwargs={'literal_binds': True}))
     assert 'provider_receipt' in compiled, 'шаг выплаты обязан видеть приход от банка'
     assert 'deposit' in compiled, 'и не должен потерять кошельковое пополнение'
+
+
+@pytest.mark.asyncio
+async def test_the_payout_step_always_queues_the_message_before_closing_itself(monkeypatch):
+    """Третья несущая строка цепочки: постановка сообщения из самого шага выплаты.
+
+    Мутация «убрать вызов» переживала полный прогон — партнёр снова получал бы деньги молча.
+    Проверяем ПЛАТЯЩИЙ случай: без пригласившего сообщение и не должно ставиться, и такой
+    тест мутацию бы не поймал.
+    """
+    job = SimpleNamespace(id=4, transaction_id=55, checkout_id=13, referral_status='pending', updated_at=None)
+    source = SimpleNamespace(id=55, user_id=1, amount_kopeks=64900, device_first_checkout_id=13)
+    user = SimpleNamespace(id=1, referred_by_id=2, has_made_first_topup=False, full_name='Друг')
+    referrer = SimpleNamespace(id=2, balance_kopeks=0, full_name='Пригласивший')
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(job), Result(source), Result(values=[user, referrer]), Result()]),
+        get=AsyncMock(return_value=user),
+        commit=AsyncMock(),
+    )
+    queued = AsyncMock()
+    monkeypatch.setattr(service, '_queue_referral_reward_notification', queued)
+    monkeypatch.setattr(service, '_add_reward', AsyncMock())
+    monkeypatch.setattr(service, '_add_referral_earning', AsyncMock())
+    monkeypatch.setattr(service, 'get_user_campaign_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(service, 'get_referral_reward_payment_count', AsyncMock(return_value=0))
+    monkeypatch.setattr(service, 'calculate_referral_commission_percent', AsyncMock(return_value=25))
+    monkeypatch.setattr(service.settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 10000)
+    monkeypatch.setattr(service.settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 10000)
+    monkeypatch.setattr(service.settings, 'REFERRAL_INVITER_BONUS_KOPEKS', 10000)
+
+    await service._apply_referral_step(db, job_id=job.id)
+
+    queued.assert_awaited_once_with(db, checkout_id=13)
+    assert job.referral_status == 'done'
