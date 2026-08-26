@@ -76,8 +76,8 @@ async def show_referral_statistics(callback: types.CallbackQuery, db_user: User,
 - Минимальное пополнение: {settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS)}
 - Бонус за первое пополнение: {settings.format_price(settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS)}
 - Бонус пригласившему: {settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)}
-- Комиссия с покупок: {settings.REFERRAL_COMMISSION_PERCENT}%
-- Уведомления: {'✅ Включены' if settings.REFERRAL_NOTIFICATIONS_ENABLED else '❌ Отключены'}
+- Комиссия с оплат реферала: {settings.REFERRAL_COMMISSION_PERCENT}%
+- Уведомления: ✅ шлются всегда (переключатель не подключён к коду)
 
 <i>🕐 Обновлено: {current_time}</i>
 """
@@ -126,7 +126,7 @@ async def show_referral_statistics(callback: types.CallbackQuery, db_user: User,
 - Минимальное пополнение: {settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS)}
 - Бонус за первое пополнение: {settings.format_price(settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS)}
 - Бонус пригласившему: {settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)}
-- Комиссия с покупок: {settings.REFERRAL_COMMISSION_PERCENT}%
+- Комиссия с оплат реферала: {settings.REFERRAL_COMMISSION_PERCENT}%
 
 <i>🕐 Время: {current_time}</i>
 """
@@ -271,13 +271,13 @@ async def show_referral_settings(callback: types.CallbackQuery, db_user: User, d
 • Бонус пригласившему за первое пополнение: {settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)}
 
 <b>Комиссионные:</b>
-• Процент с каждой покупки реферала: {settings.REFERRAL_COMMISSION_PERCENT}%
+• Процент с каждой оплаты реферала: {settings.REFERRAL_COMMISSION_PERCENT}%
 
 <b>Уведомления:</b>
 • Статус: {'✅ Включены' if settings.REFERRAL_NOTIFICATIONS_ENABLED else '❌ Отключены'}
 • Попытки отправки: {getattr(settings, 'REFERRAL_NOTIFICATION_RETRY_ATTEMPTS', 3)}
 
-<i>💡 Для изменения настроек отредактируйте файл .env и перезапустите бота</i>
+<i>💡 Выключить программу: «⚙️ Настройки бота» → «👥 Реферальная программа». Остальные значения — в файле .env, с перезапуском бота</i>
 """
 
     keyboard = types.InlineKeyboardMarkup(

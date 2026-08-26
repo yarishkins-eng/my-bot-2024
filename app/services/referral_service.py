@@ -634,7 +634,7 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
             )
             if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
                 referral_notification += (
-                    f'\n\n💰 При первом пополнении от {settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS)} '
+                    f'\n\n💰 При первой оплате от {settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS)} '
                     f'вы получите бонус {settings.format_price(settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS)}!'
                 )
             await send_referral_notification(bot, new_user.telegram_id, referral_notification, user=new_user)
@@ -647,7 +647,7 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
             if settings.REFERRAL_INVITER_BONUS_KOPEKS > 0 and commission_percent > 0:
                 inviter_notification += (
                     f'вы получите {settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)} + '
-                    f'{commission_percent}% от суммы пополнения.\n\n'
+                    f'{commission_percent}% от суммы оплаты.\n\n'
                 )
             elif settings.REFERRAL_INVITER_BONUS_KOPEKS > 0:
                 inviter_notification += (
@@ -658,9 +658,7 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
             else:
                 inviter_notification += 'вы получите уведомление.\n\n'
             if commission_percent > 0:
-                inviter_notification += (
-                    f'📈 С каждого последующего пополнения вы будете получать {commission_percent}% комиссии.'
-                )
+                inviter_notification += f'📈 С каждой следующей его оплаты вы будете получать {commission_percent}%.'
             await send_referral_notification(
                 bot, referrer.telegram_id, inviter_notification, user=referrer, referral_name=new_user.full_name
             )
@@ -742,7 +740,7 @@ async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_ko
                         db,
                         referrer,
                         commission_amount,
-                        f'Комиссия {commission_percent}% с пополнения {user.full_name}',
+                        f'Комиссия {commission_percent}% с оплаты реферала {user.full_name}',
                         transaction_type=TransactionType.REFERRAL_REWARD,
                         bot=bot,
                     )
@@ -766,7 +764,7 @@ async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_ko
                         if bot:
                             commission_notification = (
                                 f'💰 <b>Реферальная комиссия!</b>\n\n'
-                                f'Ваш реферал <b>{html.escape(user.full_name)}</b> пополнил баланс на '
+                                f'Ваш друг <b>{html.escape(user.full_name)}</b> оплатил на '
                                 f'{settings.format_price(topup_amount_kopeks)}\n\n'
                                 f'🎁 Ваша комиссия ({commission_percent}%): '
                                 f'{settings.format_price(commission_amount)}\n\n'
@@ -810,7 +808,7 @@ async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_ko
                     db,
                     user,
                     settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS,
-                    'Бонус за первое пополнение по реферальной программе',
+                    'Бонус новичка за первую оплату',
                     transaction_type=TransactionType.REFERRAL_REWARD,
                     bot=bot,
                 )
@@ -824,7 +822,7 @@ async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_ko
                     if bot:
                         bonus_notification = (
                             f'🎉 <b>Бонус получен!</b>\n\n'
-                            f'За первое пополнение вы получили бонус '
+                            f'За первую оплату вы получили бонус '
                             f'{settings.format_price(settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS)}!\n\n'
                             f'💎 Средства зачислены на ваш баланс.'
                         )
@@ -850,7 +848,7 @@ async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_ko
                     db,
                     referrer,
                     inviter_bonus,
-                    f'Бонус за первое пополнение реферала {user.full_name}',
+                    f'Награда за первую оплату реферала {user.full_name}',
                     transaction_type=TransactionType.REFERRAL_REWARD,
                     bot=bot,
                 )
@@ -883,15 +881,14 @@ async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_ko
                         bonus_breakdown = ' + '.join(bonus_parts)
                         inviter_bonus_notification = (
                             f'💰 <b>Реферальная награда!</b>\n\n'
-                            f'Ваш реферал <b>{html.escape(user.full_name)}</b> сделал первое пополнение '
+                            f'Ваш друг <b>{html.escape(user.full_name)}</b> сделал первую оплату '
                             f'на {settings.format_price(topup_amount_kopeks)}!\n\n'
                             f'🎁 Ваша награда: {settings.format_price(inviter_bonus)}'
                             f' ({bonus_breakdown})'
                         )
                         if commission_percent > 0:
                             inviter_bonus_notification += (
-                                f'\n\n📈 Теперь с каждого его пополнения вы будете получать '
-                                f'{commission_percent}% комиссии.'
+                                f'\n\n📈 Дальше с каждой его оплаты вы будете получать {commission_percent}% комиссии.'
                             )
                         await send_referral_notification(
                             bot,
@@ -916,7 +913,7 @@ async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_ko
                 db,
                 referrer,
                 commission_amount,
-                f'Комиссия {commission_percent}% с пополнения {user.full_name}',
+                f'Комиссия {commission_percent}% с оплаты реферала {user.full_name}',
                 transaction_type=TransactionType.REFERRAL_REWARD,
                 bot=bot,
             )
@@ -941,7 +938,7 @@ async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_ko
                 if bot:
                     commission_notification = (
                         f'💰 <b>Реферальная комиссия!</b>\n\n'
-                        f'Ваш реферал <b>{html.escape(user.full_name)}</b> пополнил баланс на '
+                        f'Ваш друг <b>{html.escape(user.full_name)}</b> оплатил на '
                         f'{settings.format_price(topup_amount_kopeks)}\n\n'
                         f'🎁 Ваша комиссия ({commission_percent}%): '
                         f'{settings.format_price(commission_amount)}\n\n'
