@@ -39,7 +39,10 @@ from app.database.models import (
     TransactionType,
     User,
 )
-from app.services.device_first_deposit_outbox_service import ensure_deposit_outbox
+from app.services.device_first_deposit_outbox_service import (
+    ensure_deposit_outbox,
+    process_device_first_deposit_outbox,
+)
 from app.services.device_first_eligibility import resolve_single_eligible_tariff, tariff_eligibility
 from app.services.pricing_engine import pricing_engine
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
@@ -2090,20 +2093,39 @@ async def _complete_direct_sale_locked(
             await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == receipt_key))
         ).scalar_one_or_none()
         if receipt is None:
-            db.add(
-                Transaction(
-                    user_id=user.id,
-                    type=TransactionType.PROVIDER_RECEIPT.value,
-                    amount_kopeks=total,
-                    description=f'Device-first provider receipt for checkout {checkout.public_id}',
-                    payment_method='platega',
-                    external_id=provider_payment_id,
-                    device_first_checkout_id=checkout.id,
-                    device_first_ledger_key=receipt_key,
-                    is_completed=True,
-                    completed_at=now,
-                )
+            receipt = Transaction(
+                user_id=user.id,
+                type=TransactionType.PROVIDER_RECEIPT.value,
+                amount_kopeks=total,
+                description=f'Device-first provider receipt for checkout {checkout.public_id}',
+                payment_method='platega',
+                external_id=provider_payment_id,
+                device_first_checkout_id=checkout.id,
+                device_first_ledger_key=receipt_key,
+                is_completed=True,
+                completed_at=now,
             )
+            db.add(receipt)
+            # 🔴 Номер прихода нужен строкой ниже, а `db.add` его не присваивает.
+            await db.flush()
+        # 🔴 РФ-1 п.1.2б. До этого этапа прямая оплата не платила реферальную комиссию ВООБЩЕ:
+        # приход создавался и на этом всё заканчивалось. Это главный путь продаж с 02.08.2026,
+        # и через него уже прошло 6 197 ₽ от приглашённых, с которых партнёрам не досталось
+        # ничего. Заводим ту же durable-работу, что и кошельковый депозит: она атомарна одним
+        # коммитом и защищена двумя уникальными ключами (`transaction_id` работы и
+        # `device_first_ledger_key` наградной строки), то есть повтор вебхука или рестарт
+        # контейнера её не удвоят.
+        # ⛔ Заводить надо ровно на ПРИХОД. Списание за подписку — те же деньги с обратным
+        # знаком, и вторая работа на него означала бы вторую выплату с одной покупки.
+        await ensure_deposit_outbox(
+            db,
+            transaction_id=receipt.id,
+            checkout_id=checkout.id,
+            # Приход — не пополнение кошелька: событие о пополнении здесь было бы ложью.
+            emit_deposit_event=False,
+            # Выключатель спрашиваем ЗДЕСЬ, где обязательство возникает (РФ-1 п.1.1).
+            pay_referral=settings.is_referral_program_enabled(),
+        )
 
     sale_key = f'direct-sale:{checkout.id}'
     sale = (
@@ -2286,8 +2308,38 @@ async def fulfill_direct_external_checkout(
         raise
     await db.commit()
     await _kick_direct_provisioning_post_commit(db, checkout_id=result.id)
+    await _kick_direct_referral_post_commit(db, checkout_id=result.id)
     await db.refresh(result)
     return result
+
+
+async def _kick_direct_referral_post_commit(db: AsyncSession, *, checkout_id: int) -> None:
+    """Разбудить очередь выплат сразу, а не ждать фонового обхода (РФ-1 п.1.2б).
+
+    🔴 Без этого партнёр ждал бы комиссию и уведомление до ЧАСА: депозитную очередь сливает
+    только петля `monitoring_service`, а её период `MONITORING_INTERVAL` на боевом не задан —
+    значит действует умолчание 60 минут. Легаси-путь пополнения будит себя сам
+    (`device_first_payment_service`), прямая продажа этого не делала.
+
+    Best-effort и строго после коммита, по образцу соседней побудки выдачи: отказ здесь не
+    может отменить уже состоявшийся приход, а работа останется в очереди и будет доведена
+    фоновым обходом со своей выдержкой.
+    """
+    receipt_key = f'provider-receipt:{checkout_id}'
+    receipt_id = (
+        await db.execute(select(Transaction.id).where(Transaction.device_first_ledger_key == receipt_key))
+    ).scalar_one_or_none()
+    if receipt_id is None:
+        return
+    try:
+        await process_device_first_deposit_outbox(db, transaction_id=receipt_id, limit=1)
+    except Exception as error:
+        logger.warning(
+            'device_first_direct_referral_kick_failed',
+            checkout_id=checkout_id,
+            transaction_id=receipt_id,
+            error=str(error),
+        )
 
 
 async def _kick_direct_provisioning_post_commit(db: AsyncSession, *, checkout_id: int) -> None:

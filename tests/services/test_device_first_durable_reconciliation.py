@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.database.models import TransactionType
 from app.services import device_first_checkout_service as service
 from app.services.device_first_checkout_service import (
     ENTITLEMENT_DRIFT_NOTIFICATION_TYPE,
@@ -1171,3 +1172,95 @@ async def test_the_alert_never_names_a_path_that_does_not_exist(drift_type):
     text = admin.send_admin_notification.await_args.args[0]
     for dead_path in ('Сменить сервер', 'на карточке клиента', 'Чат-админка', 'Переезд сквада'):
         assert dead_path not in text, f'снова мёртвый путь в тексте владельцу: {dead_path}'
+
+
+# --- РФ-1 п.1.2б: прямая оплата обязана платить реферальную комиссию ---
+
+
+def _direct_sale_db(*, tariff, user):
+    """Обвязка прямой продажи: `flush` присваивает номера, как настоящая база.
+
+    Штатный `_sale_db` этого не умеет, а без номера прихода работу очереди завести не на что —
+    ровно поэтому до РФ-1 приход и создавался без привязки.
+    """
+    db = _sale_db(tariff=tariff, user=user)
+    added = []
+    db.add = MagicMock(side_effect=added.append)
+
+    async def _flush():
+        for number, obj in enumerate(added, start=500):
+            if getattr(obj, 'id', None) is None:
+                obj.id = number
+
+    db.flush = AsyncMock(side_effect=_flush)
+    return db, added
+
+
+def _bank_paid_sale(target):
+    """Тот же заказ, но оплаченный БАНКОМ, а не кошельком — иначе прихода не возникает вовсе."""
+    checkout, entitlement = _paid_sale(target)
+    checkout.funding_mode = 'platega'
+    checkout.wallet_applied_kopeks = 0
+    checkout.external_payable_kopeks = 36_900
+    checkout.sale_snapshot['funding_mode'] = 'platega'
+    return checkout, entitlement
+
+
+async def _run_bank_sale(monkeypatch, *, program_enabled):
+    target = live_trial(id=134, is_trial=False, device_limit=5, status='active')
+    checkout, entitlement = _bank_paid_sale(target)
+    user = live_user(balance_kopeks=0)
+    db, added = _direct_sale_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), user=user)
+
+    monkeypatch.setattr(service, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service, 'extend_subscription', AsyncMock(return_value=target))
+    monkeypatch.setattr(service, '_resolve_checkout_entitlement', AsyncMock(return_value=entitlement))
+    monkeypatch.setattr(service, '_owner_alerts_enabled', lambda: True)
+    monkeypatch.setattr(service.settings, 'REFERRAL_PROGRAM_ENABLED', program_enabled)
+    ensure = AsyncMock()
+    monkeypatch.setattr(service, 'ensure_deposit_outbox', ensure)
+
+    # Продажа идёт дальше по денежному пути и упирается в неполные моки — нам важно
+    # только то, что случилось ДО этого места.
+    with suppress(Exception):
+        await service._complete_direct_sale_locked(
+            db,
+            checkout=checkout,
+            user=user,
+            target=target,
+            # Без номера платежа продажа справедливо отказывается: банк ничего не подтвердил.
+            provider_payment_id='provider-1',
+        )
+    return ensure, added
+
+
+@pytest.mark.asyncio
+async def test_bank_paid_sale_puts_the_referral_job_on_the_receipt_and_not_on_the_debit(monkeypatch):
+    """🔴 Ядро РФ-1: до этого этапа прямая оплата не платила комиссию ВООБЩЕ.
+
+    Проверяем три вещи разом, потому что ошибка в каждой стоит денег:
+    работа заводится (иначе партнёру не платят), ровно ОДНА (иначе платят дважды),
+    и на ПРИХОД, а не на списание (списание — те же деньги с обратным знаком).
+    """
+    ensure, added = await _run_bank_sale(monkeypatch, program_enabled=True)
+
+    ensure.assert_awaited_once()
+    receipts = [o for o in added if getattr(o, 'type', None) == TransactionType.PROVIDER_RECEIPT.value]
+    assert len(receipts) == 1, 'приход обязан быть ровно один'
+    assert ensure.await_args.kwargs['transaction_id'] == receipts[0].id, 'работа должна висеть на приходе'
+    assert receipts[0].amount_kopeks > 0, 'приход положителен — с минуса комиссию считать нельзя'
+    assert ensure.await_args.kwargs['emit_deposit_event'] is False, 'приход — не пополнение кошелька'
+    assert ensure.await_args.kwargs['pay_referral'] is True
+
+
+@pytest.mark.asyncio
+async def test_switch_off_stops_the_referral_job_at_the_moment_the_debt_appears(monkeypatch):
+    """Выключатель спрашивается там, где обязательство ВОЗНИКАЕТ.
+
+    Улика, а не совпадение: та же продажа при включённой программе ставит `pay_referral=True`
+    (тест выше). Значит красный тут означает «выключатель не держит», а не «продажа не доехала».
+    """
+    ensure, _added = await _run_bank_sale(monkeypatch, program_enabled=False)
+
+    ensure.assert_awaited_once()
+    assert ensure.await_args.kwargs['pay_referral'] is False

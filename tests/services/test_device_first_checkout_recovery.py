@@ -170,7 +170,11 @@ async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliat
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
     )
 
     result = await fulfill_direct_external_checkout(
@@ -202,7 +206,11 @@ async def test_paid_pre_release_direct_checkout_is_held_if_a_legacy_trial_is_sti
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
         commit=AsyncMock(),
     )
     monkeypatch.setattr(
@@ -240,7 +248,11 @@ async def test_direct_fulfilment_uses_the_same_user_attempt_checkout_lock_order_
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
     )
 
     await fulfill_direct_external_checkout(
@@ -272,7 +284,11 @@ async def test_direct_fulfilment_kicks_only_its_own_post_commit_outbox_when_gene
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
         commit=AsyncMock(),
         refresh=AsyncMock(),
         rollback=AsyncMock(),
@@ -315,7 +331,11 @@ async def test_direct_fulfilment_keeps_durable_sale_when_immediate_outbox_kick_f
     )
     db = SimpleNamespace(
         scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout)]),
+        # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
+        # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
+        # выплаты обязана тихо выйти. Список ответов фиксирован по числу обращений, поэтому
+        # новое обращение приходится дописывать — сами утверждения теста это не задевает.
+        execute=AsyncMock(side_effect=[Result(user), Result(attempt), Result(checkout), Result(None)]),
         commit=AsyncMock(),
         refresh=AsyncMock(),
         rollback=AsyncMock(),
