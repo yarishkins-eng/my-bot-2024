@@ -8,6 +8,7 @@ from html import escape
 from itertools import islice
 from urllib.parse import urlencode
 
+import structlog
 from aiogram import F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -44,6 +45,12 @@ from app.services.device_first_payment_service import (
 )
 from app.utils.photo_message import edit_or_answer_photo
 from app.utils.timezone import format_local_datetime
+
+
+# 🔴 Первая запись в журнал во всём файле нативной кассы. До этапа БК серверного следа не
+# оставлял ни один её экран, и отличить «люди увидели и пошли доплачивать» от «экрана никто
+# не открывал» было нечем: кнопки оплаты — web_app, боту при нажатии не приходит ничего.
+logger = structlog.get_logger(__name__)
 
 
 # Кошелёк кабинета, к которому ведёт доплата с экрана заказа. То же значение зашито
@@ -1043,6 +1050,13 @@ async def _render_fused_confirmation(
         # стоять там же, где строка, иначе строка врёт. Формулировка — та же, что у кабинета.
         tail_ru = 'Выберите способ оплаты: деньги с баланса при этом не спишутся.'
         tail_en = 'Choose a payment method: your balance stays untouched.'
+        logger.info(
+            'Экран заказа показал баланс и недостачу',
+            user_id=user.id,
+            balance_kopeks=user.balance_kopeks,
+            price_kopeks=price,
+            top_up_offered=top_up_button is not None,
+        )
         if top_up_button is not None:
             # 🔴 Сказать про обратную дорогу НАДО ДО того, как человек ушёл платить. Доплата
             # заказ не оформляет: у device-first нет корзины, и вернуться должен он сам. Если
@@ -2083,10 +2097,13 @@ async def _render_fused_refresh(
             '⚠️ Цена обновилась. Проверьте заказ ещё раз.',
             '⚠️ The price changed. Review the order again.',
         ),
+        # Вторая фраза убрана этапом БК: тело экрана теперь само говорит, что делать, и у
+        # человека с частью суммы говорит ДРУГОЕ («доплатите и вернитесь»). Предупреждение,
+        # спорящее с телом под собой, читается как сбой, а не как предупреждение.
         'wallet_insufficient': _text(
             user,
-            '⚠️ Баланс больше не покрывает заказ. Выберите способ оплаты.',
-            '⚠️ Your balance no longer covers the order. Choose a payment method.',
+            '⚠️ Баланс больше не покрывает заказ.',
+            '⚠️ Your balance no longer covers the order.',
         ),
     }
     notice = notices.get(
