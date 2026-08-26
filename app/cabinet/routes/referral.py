@@ -144,7 +144,11 @@ async def get_referral_list(
             first_name=r.first_name,
             created_at=r.created_at,
             has_subscription=bool(getattr(r, 'subscriptions', None)),
-            has_paid=r.has_had_paid_subscription,
+            # РФ-1 п.1.7: единый признак с ботом — «человек занёс деньги любым способом».
+            # Было `has_had_paid_subscription`, и оно расходилось с ботом на четырёх живых
+            # людях: кабинет писал «Оплачено», бот — «ожидание». Плюс эту метку ставит
+            # бесплатный промокод на дни, то есть она означала не деньги, а наличие подписки.
+            has_paid=r.has_made_first_topup,
         )
         for r in referrals
     ]

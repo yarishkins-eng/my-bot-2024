@@ -228,7 +228,11 @@ async def get_detailed_referral_list(db: AsyncSession, user_id: int, limit: int 
                 select(func.count(Transaction.id)).where(
                     and_(
                         Transaction.user_id == referral.id,
-                        Transaction.type == TransactionType.DEPOSIT.value,
+                        # РФ-1 п.1.7: считать только пополнения кошелька больше нельзя. Человек,
+                        # заплативший картой напрямую, не создаёт депозита вовсе — экран показывал
+                        # бы «💰 Максим · Оплат: 0 · с него заработал 262 ₽», то есть спорил бы
+                        # сам с собой сразу после выплаты.
+                        Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.PROVIDER_RECEIPT.value)),
                         Transaction.is_completed.is_(True),
                     )
                 )
