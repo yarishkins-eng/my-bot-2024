@@ -1538,6 +1538,9 @@ async def test_fused_confirmation_hides_the_top_up_door_while_an_order_is_open()
     # дешёвые признаки считаются раньше запроса к базе.
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert not any(TOP_UP_LABEL in button.text for row in keyboard for button in row)
+    # ⚠️ Адресной проверки здесь быть НЕ МОЖЕТ, и это следствие порядка вычислений:
+    # забор «есть заказ в работе» стоит ПОСЛЕ дешёвых признаков, поэтому адрес доплаты
+    # успевает собраться и выбрасывается. Проверять нечего — кнопки на экране нет.
 
 
 @pytest.mark.asyncio
@@ -1565,7 +1568,7 @@ async def test_fused_confirmation_hides_the_top_up_door_when_it_would_cost_the_f
         patch(
             'app.utils.miniapp_buttons.build_cabinet_url',
             return_value='https://cabinet.example/safe',
-        ),
+        ) as build_cabinet_url,
         patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
     ):
         await _render_fused_confirmation(callback, user, db, options, days=30, devices=2)
@@ -1582,6 +1585,9 @@ async def test_fused_confirmation_hides_the_top_up_door_when_it_would_cost_the_f
     # дешёвые признаки считаются раньше запроса к базе.
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert not any(TOP_UP_LABEL in button.text for row in keyboard for button in row)
+    # Слова на кнопке мало: та же дверь под другой надписью прошла бы мимо. Здесь забор
+    # срабатывает ДО сборки адреса, поэтому адрес можно проверить — и он не запрашивался.
+    assert not any(call.args[0].startswith(TOP_UP_PREFIX) for call in build_cabinet_url.call_args_list)
 
 
 @pytest.mark.asyncio
@@ -1703,7 +1709,9 @@ async def test_direct_payment_methods_screen_hides_the_door_when_the_funding_mod
             'app.handlers.subscription.device_first.available_platega_methods_for_db',
             AsyncMock(return_value=[{'key': 'sbp', 'provider_code': 2}]),
         ),
-        patch('app.utils.miniapp_buttons.build_cabinet_url', return_value='https://cabinet.example/safe'),
+        patch(
+            'app.utils.miniapp_buttons.build_cabinet_url', return_value='https://cabinet.example/safe'
+        ) as build_cabinet_url,
         patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
     ):
         await _render_direct_payment_methods(callback, user, db, checkout)
@@ -1714,6 +1722,9 @@ async def test_direct_payment_methods_screen_hides_the_door_when_the_funding_mod
     assert '⚠️ Не хватает: 199 ₽' in caption
     assert 'Доплатите и продолжите' not in caption
     assert not any(TOP_UP_LABEL in button.text for row in keyboard for button in row)
+    # Слова на кнопке мало: та же дверь под другой надписью прошла бы мимо. Здесь забор
+    # срабатывает ДО сборки адреса, поэтому адрес можно проверить — и он не запрашивался.
+    assert not any(call.args[0].startswith(TOP_UP_PREFIX) for call in build_cabinet_url.call_args_list)
 
 
 @pytest.mark.asyncio
