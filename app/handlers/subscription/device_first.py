@@ -15,7 +15,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import CheckoutPaymentAttempt, PlategaPayment, Tariff, User
+from app.database.models import CheckoutPaymentAttempt, PlategaPayment, SubscriptionCheckout, Tariff, User
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
     OPEN_STATES,
@@ -316,15 +316,24 @@ async def _fused_top_up_button(
     # state ends on ``funding_mode_locked`` and on the old invoice screen, whose
     # primary button is to pay a second time.  The balance lines stay: they are
     # true there as well.
-    # ⛔ Any open order hides the door, and the lookup is fenced: the getter
-    # itself calls ``settlement_mode()``, which RAISES on a missing or corrupted
-    # discriminator.  A rendering path must never die on a row it only wanted to
-    # look at — an unclassifiable order is exactly the one not to offer a top-up
-    # against, so the refusal and the failure land on the same answer.
-    try:
-        if await get_open_checkout_for_user(db, user_id=user.id) is not None:
-            return None
-    except DeviceFirstError:
+    # ⛔ Deliberately a plain read instead of ``get_open_checkout_for_user``:
+    # that helper expires a stale quote and ``db.commit()``s it, and it calls
+    # ``settlement_mode()``, which RAISES on a corrupted discriminator.  Neither
+    # belongs on a rendering path — least of all one reached right after a failed
+    # debit, where a commit would land on somebody else's unit of work.  The
+    # broader question this asks («is any order in flight at all?») errs toward
+    # hiding the door, which is the honest answer for an order we cannot classify.
+    if (
+        await db.scalar(
+            select(SubscriptionCheckout.id)
+            .where(
+                SubscriptionCheckout.user_id == user.id,
+                SubscriptionCheckout.lifecycle_state.in_(OPEN_STATES),
+            )
+            .limit(1)
+        )
+        is not None
+    ):
         return None
     return_to = f'/subscription/purchase?{urlencode({"from": "checkout", "period": days, "devices": devices})}'
     cabinet_url = build_cabinet_url(
@@ -1045,9 +1054,11 @@ async def _render_fused_confirmation(
         shortage = price - user.balance_kopeks
         wallet_ru = f'💳 Баланс: {_money(user, user.balance_kopeks)} ₽\n⚠️ Не хватает: {_money(user, shortage)} ₽\n\n'
         wallet_en = f'💳 Balance: ₽{_money(user, user.balance_kopeks)}\n⚠️ Shortage: ₽{_money(user, shortage)}\n\n'
-        # Остаток мины DE: строка про баланс рядом с ценой читается как «зачтётся», а он не
-        # зачитывается — человек платит полную цену, а деньги остаются лежать. Оговорка обязана
-        # стоять там же, где строка, иначе строка врёт. Формулировка — та же, что у кабинета.
+        # Урок мины DE, а не её остаток: сам остаток DE живёт в СВОДКЕ КАБИНЕТА и этим диффом
+        # не тронут. Урок в том, что строка про баланс рядом с ценой читается как «зачтётся»,
+        # а он не зачитывается — человек платит полную цену, а деньги остаются лежать. Значит
+        # бот, заводя у себя такую строку, обязан завести и оговорку, вплотную к ней, иначе он
+        # просто скопирует чужой дефект. Формулировка — та же, что у кабинета.
         tail_ru = 'Выберите способ оплаты: деньги с баланса при этом не спишутся.'
         tail_en = 'Choose a payment method: your balance stays untouched.'
         logger.info(
@@ -1059,12 +1070,18 @@ async def _render_fused_confirmation(
         )
         if top_up_button is not None:
             # 🔴 Сказать про обратную дорогу НАДО ДО того, как человек ушёл платить. Доплата
-            # заказ не оформляет: у device-first нет корзины, и вернуться должен он сам. Если
-            # об этом промолчать, он оплатит недостачу, получит в чат «✅ Пополнение успешно!»
-            # и останется без подписки, считая покупку завершённой. Формулировка — слово в
-            # слово та, что кабинет говорит под своей такой же кнопкой.
-            hint_ru = 'Доплатите и вернитесь — ваш выбор сохранится, останется оформить заказ.'
-            hint_en = 'Pay it and come back — we keep your choice, you just place the order.'
+            # заказ не оформляет: у device-first нет корзины, и довести покупку должен он сам.
+            # Если об этом промолчать, он оплатит недостачу, получит в чат «✅ Пополнение
+            # успешно!» и останется без подписки, считая покупку завершённой.
+            # 🔴 И вторая строка обязательна: «вернитесь» без указания КУДА посылает человека
+            # ровно в этот чат — а здесь его ждёт ЭТО ЖЕ сообщение с двумя числами, которые
+            # доплата только что сделала ложными, и с кнопками полной цены. Перерисовать его
+            # нечем: дверь и кнопки оплаты — web_app, боту при нажатии не приходит ничего, а
+            # деньги зачисляет вебхук. Дорога домой одна — то окно, которое уже открыто.
+            hint_ru = 'Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.'
+            hint_en = 'Top up and finish the purchase in the same window — we keep your choice.'
+            stale_ru = 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.'
+            stale_en = 'After the top-up this chat screen will not refresh: its buttons still charge the full price.'
             # Второе число на экране появляется, только когда провайдерский минимум больше
             # недостачи: тогда в сводке одна сумма, а на кнопке другая, и без объяснения это
             # читается как ошибка. Ключ не сочинён — кабинет объясняет остаток теми же словами.
@@ -1074,8 +1091,8 @@ async def _render_fused_confirmation(
                 hint_en += f'\n₽{_money(user, surplus)} will remain on your balance after the order.'
             # Порядок именно такой: в Телеграме подпись всегда ВЫШЕ кнопок, поэтому доплата
             # называется первой, а «или» встаёт после того, чему противопоставлено.
-            tail_ru = f'{hint_ru}\nИли оплатите полной суммой: деньги с баланса при этом не спишутся.'
-            tail_en = f'{hint_en}\nOr pay the full amount: your balance stays untouched.'
+            tail_ru = f'{hint_ru}\n{stale_ru}\nИли оплатите полной суммой: деньги с баланса при этом не спишутся.'
+            tail_en = f'{hint_en}\n{stale_en}\nOr pay the full amount: your balance stays untouched.'
     else:
         tail_ru, tail_en = 'Выберите способ оплаты.', 'Choose a payment method.'
     caption = _text(
