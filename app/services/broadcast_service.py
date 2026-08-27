@@ -316,6 +316,10 @@ class BroadcastService:
             """Returns 'sent', 'blocked', or 'failed'."""
             nonlocal flood_wait_until
 
+            # Мина GA: что уже доставлено ЭТОМУ человеку, чтобы повтор не слал медиа заново.
+            # Своё на каждого получателя — иначе первый же успех погасил бы медиа всем.
+            delivery_state: dict[str, bool] = {}
+
             for attempt in range(_TG_MAX_RETRIES):
                 # Глобальная пауза при FloodWait
                 now = asyncio.get_event_loop().time()
@@ -326,7 +330,7 @@ class BroadcastService:
                     return 'failed'
 
                 try:
-                    await self._deliver_message(telegram_id, config, keyboard)
+                    await self._deliver_message(telegram_id, config, keyboard, delivery_state)
                     return 'sent'
 
                 except TelegramRetryAfter as e:
@@ -448,6 +452,7 @@ class BroadcastService:
         telegram_id: int,
         config: BroadcastConfig,
         keyboard: InlineKeyboardMarkup | None,
+        delivery_state: dict[str, bool] | None = None,
     ) -> None:
         """
         Отправляет одно сообщение.
@@ -480,10 +485,19 @@ class BroadcastService:
             # ⛔ Клавиатура переезжает на ВТОРОЕ сообщение: кнопки под медиа без подписи
             # выглядят оторванными, и в образце из чат-админки они тоже на тексте.
             if caption_exceeds_telegram_limit(caption):
-                await send_method(
-                    chat_id=telegram_id,
-                    **{kwarg_name: config.media.file_id},
-                )
+                # 🔴 Мина GA, наша, заведена РС-2 и найдена ревизией плана. Деление на два
+                # сообщения стоит ВНУТРИ цикла повторов (`send_single`): упадёт второй вызов
+                # на FloodWait или сети — повтор начнёт эту функцию заново, и медиа уйдёт
+                # человеку второй и третий раз. До деления вызов был один, и повтор был
+                # безвреден. Отметку ставим СРАЗУ после успеха медиа, а не по возврату
+                # функции: возврат при исключении теряется, а отметка обязана пережить его.
+                state = delivery_state if delivery_state is not None else {}
+                if not state.get('media_sent'):
+                    await send_method(
+                        chat_id=telegram_id,
+                        **{kwarg_name: config.media.file_id},
+                    )
+                    state['media_sent'] = True
                 await self._bot.send_message(
                     chat_id=telegram_id,
                     text=caption,

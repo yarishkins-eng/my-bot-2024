@@ -172,3 +172,32 @@ def test_finished_status_default_blocked_count_is_zero() -> None:
     почтовая кампания молча станет «Частично», ни один тест бы этого не заметил.
     """
     assert _finished_status(sent_count=31, failed_count=0) == 'completed'
+
+
+@pytest.mark.asyncio
+async def test_retry_does_not_send_media_twice() -> None:
+    """Мина GA: повтор после сбоя не шлёт картинку заново.
+
+    🔴 Дефект завела сама правка РС-2 и нашла ревизия плана. Деление на два сообщения
+    стоит ВНУТРИ цикла повторов `send_single`: упал второй вызов на FloodWait или сети —
+    повтор начинает доставку заново, и человек получает картинку второй и третий раз.
+    До деления вызов был один, и повтор был безвреден.
+
+    Здесь воспроизводим ровно это: первый заход роняет отправку ТЕКСТА, второй проходит.
+    Картинка обязана уйти один раз.
+    """
+    service, bot = _service_with_bot()
+    state: dict[str, bool] = {}
+    bot.send_message.side_effect = [RuntimeError('сеть моргнула'), None]
+
+    with pytest.raises(RuntimeError):
+        await service._deliver_message(_TELEGRAM_ID, _config(_LONG), None, state)
+
+    # Улика, что момент действительно наступил: медиа ушло и это записано.
+    assert state == {'media_sent': True}, 'без отметки повтор пошлёт картинку заново'
+
+    # Повтор — тот же вызов с тем же состоянием, как это делает send_single.
+    await service._deliver_message(_TELEGRAM_ID, _config(_LONG), None, state)
+
+    assert bot.send_photo.await_count == 1, 'картинка ушла дважды — мина GA вернулась'
+    assert bot.send_message.await_count == 2
