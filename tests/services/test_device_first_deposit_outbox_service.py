@@ -736,3 +736,30 @@ async def test_credited_split_counts_recurring_commission_as_partner_money():
     credited = await service._debt_credited_kopeks(db, transaction_id=237)
 
     assert credited == {'friend': 0, 'referrer': 9225}
+
+
+def test_result_header_never_claims_paid_before_the_ledger_says_so():
+    """Заголовок итога отвечает за КНИГУ, а не за факт заведения работ.
+
+    🔴 Проект трижды за август платил за экраны, которые ведут заголовком то, чего не
+    сделали (мины DA, EW, AR). Здесь цена выше: «✅ Долг выплачен» при нуле начисленного —
+    и владелец уходит с экрана, считая 2 349,25 ₽ доставленными.
+
+    Ветки различаются ровно наличием денег в книге, поэтому фикстуры дают разное.
+    """
+    from app.handlers.admin.referrals import _debt_result_text
+
+    empty = [{'credited_referrer': 0, 'credited_friend': 0, 'referrer': None, 'buyer': None}]
+    paid = [
+        {
+            'credited_referrer': 59750,
+            'credited_friend': 10000,
+            'referrer': SimpleNamespace(full_name='партнёр'),
+            'buyer': SimpleNamespace(full_name='новичок'),
+        }
+    ]
+
+    assert 'Начисление идёт' in _debt_result_text(empty, paid=True, reason='')
+    assert 'Долг выплачен' not in _debt_result_text(empty, paid=True, reason='')
+    assert 'Долг выплачен' in _debt_result_text(paid, paid=True, reason='')
+    assert 'Выплата остановлена' in _debt_result_text(empty, paid=False, reason='причина')

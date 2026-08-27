@@ -1599,8 +1599,9 @@ async def ask_referral_debt_payment(callback: types.CallbackQuery, db_user: User
 
     await callback.message.edit_text(
         f'⚠️ <b>Выплатить {_exact_money(total)}?</b>\n\n'
-        'Действие необратимо. Уйдут сообщения пяти партнёрам и четверым новичкам '
-        'про покупки от 02.08 — отозвать их нельзя.',
+        'Действие необратимо. Уйдут девять сообщений: четверым партнёрам (одному два письма, '
+        'у него две строки) и четверым новичкам, про покупки от 02.08 до 25.08. '
+        'Отозвать их нельзя.',
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
                 [types.InlineKeyboardButton(text='💰 Да, выплатить', callback_data='admin_ref_debt_go')],
@@ -1621,7 +1622,14 @@ def _debt_result_text(rows: list[dict], *, paid: bool, reason: str) -> str:
     """
     credited = [row for row in rows if row.get('credited_referrer') or row.get('credited_friend')]
     total = sum(row['credited_referrer'] + row['credited_friend'] for row in credited)
-    lines = ['✅ <b>Долг выплачен</b>'] if paid else ['⛔ <b>Выплата остановлена</b>', '', html.escape(reason)]
+    if not paid:
+        lines = ['⛔ <b>Выплата остановлена</b>', '', html.escape(reason)]
+    elif credited:
+        lines = ['✅ <b>Долг выплачен</b>']
+    else:
+        # 🔴 Заголовок не объявляет выплаченным то, чего ещё нет в книге. Проект уже
+        # трижды платил за экраны, которые ведут заголовком то, чего не сделали.
+        lines = ['⏳ <b>Начисление идёт</b>']
     if credited:
         lines.append('')
         lines.append('<b>Начислено:</b>')
