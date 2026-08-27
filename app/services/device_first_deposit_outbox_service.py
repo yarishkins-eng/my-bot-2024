@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -481,3 +481,161 @@ async def process_device_first_deposit_outbox(
                 error=row.last_error,
             )
     return processed
+
+
+# ---------------------------------------------------------------------------
+# РФ-2: возврат исторического долга 02.08–26.08.2026
+# ---------------------------------------------------------------------------
+
+# 🔴 ПЕРЕЧЕНЬ ЗАМОРОЖЕН, И ЭТО НЕСУЩЕЕ РЕШЕНИЕ, А НЕ ЛЕНЬ.
+# Запрос «приходы без наградной строки» подхватил бы ДВЕ лишние оплаты от 27.08: одна уже
+# оплачена этапом РФ-1, вторая прошла при намеренно ВЫКЛЮЧЕННОЙ программе и по правилу
+# владельца не оплачивается никогда (мина FO). Отличить их запросом нечем — в базе они
+# выглядят одинаково. Каждая строка ниже сверена с боевой базой 27.08.2026 поимённо:
+# приход, заказ, покупатель, пригласивший, сумма.
+REFERRAL_DEBT_2026_08: tuple[tuple[int, int, int, int, int], ...] = (
+    # (приход, заказ, покупатель, пригласивший, сумма прихода в копейках)
+    (193, 14, 172, 133, 199000),
+    (207, 30, 182, 131, 64900),
+    (232, 39, 194, 123, 199000),
+    (237, 43, 206, 142, 36900),
+    (370, 57, 321, 133, 119900),
+)
+
+# Пакет платит ровно эту сумму или не платит ничего. 40 000 бонусов друзьям + 194 925 партнёрам.
+REFERRAL_DEBT_2026_08_TOTAL_KOPEKS = 234925
+
+_DEBT_LEDGER_SUFFIXES = ('referred-first-bonus', 'inviter-first-reward', 'inviter-recurring-commission')
+
+
+async def _debt_paid_kopeks(db: AsyncSession, *, transaction_id: int) -> int:
+    """Сколько уже начислено по этому приходу — по КНИГЕ, а не по возврату воркера.
+
+    Возврат воркера читать нельзя: работу мог перехватить часовой цикл мониторинга, и тогда
+    `processed=0` означает «уже сделано», а не «не сделано».
+    """
+    keys = [f'deposit-side-effect:{transaction_id}:{suffix}' for suffix in _DEBT_LEDGER_SUFFIXES]
+    total = (
+        await db.execute(
+            select(func.sum(Transaction.amount_kopeks)).where(Transaction.device_first_ledger_key.in_(keys))
+        )
+    ).scalar()
+    return int(total or 0)
+
+
+async def plan_referral_debt(db: AsyncSession) -> list[dict]:
+    """Посчитать долг, НИЧЕГО не записывая.
+
+    Арифметика берётся из тех же функций, что зовёт `_apply_referral_step`. Иначе экран
+    показал бы одно, а движок заплатил другое — и разошлись бы они молча.
+    """
+    plan: list[dict] = []
+    for transaction_id, checkout_id, buyer_id, referrer_id, amount_kopeks in REFERRAL_DEBT_2026_08:
+        source = await db.get(Transaction, transaction_id)
+        buyer = await db.get(User, buyer_id)
+        referrer = await db.get(User, referrer_id)
+        job = (
+            await db.execute(
+                select(DeviceFirstDepositOutbox).where(DeviceFirstDepositOutbox.transaction_id == transaction_id)
+            )
+        ).scalar_one_or_none()
+
+        problems: list[str] = []
+        if source is None or source.type != TransactionType.PROVIDER_RECEIPT.value:
+            problems.append('приход исчез или сменил тип')
+        elif not source.is_completed or source.amount_kopeks != amount_kopeks:
+            problems.append('сумма или завершённость изменились')
+        elif source.device_first_checkout_id != checkout_id:
+            problems.append('у прихода другой заказ')
+        if buyer is None:
+            problems.append('покупатель исчез')
+        elif buyer.referred_by_id != referrer_id:
+            problems.append('пригласивший изменился')
+        if referrer is None:
+            problems.append('пригласивший исчез')
+        if job is not None:
+            # Второй заслон против мины FO: работа уже заведена — платить нечего и нельзя.
+            problems.append(f'работа уже заведена ({job.referral_status})')
+
+        to_friend = 0
+        to_referrer = 0
+        commission_percent = 0
+        if not problems:
+            prior_reward_payments = await get_referral_reward_payment_count(db, referrer.id, buyer.id)
+            commission_percent = await calculate_referral_commission_percent(
+                db,
+                referrer,
+                is_first_payment=prior_reward_payments == 0,
+            )
+            commission = int(amount_kopeks * commission_percent / 100) if commission_percent > 0 else 0
+            if not buyer.has_made_first_topup and amount_kopeks >= settings.REFERRAL_MINIMUM_TOPUP_KOPEKS:
+                to_friend = settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS
+                to_referrer = settings.REFERRAL_INVITER_BONUS_KOPEKS + commission
+            elif commission > 0 and not await _is_commission_limit_reached(db, referrer.id, buyer.id):
+                to_referrer = commission
+
+        plan.append(
+            {
+                'transaction_id': transaction_id,
+                'checkout_id': checkout_id,
+                'buyer': buyer,
+                'referrer': referrer,
+                'paid_kopeks': amount_kopeks,
+                'commission_percent': commission_percent,
+                'to_friend': to_friend,
+                'to_referrer': to_referrer,
+                'problems': problems,
+            }
+        )
+    return plan
+
+
+async def pay_referral_debt(db: AsyncSession) -> dict:
+    """Доплатить долг через тот же движок, что платит живые оплаты."""
+    from app.services.device_first_checkout_service import DIRECT_SETTLEMENT_MODE
+
+    # 🔴 Выключатель здесь — условие ОТКАЗА, а не параметр `pay_referral`.
+    # Передать его внутрь `ensure_deposit_outbox` нельзя: при выключенной программе работа
+    # завелась бы сразу со статусом 'done', и долг стал бы НЕОПЛАЧИВАЕМЫМ НАВСЕГДА —
+    # обратного перевода статуса в коде не существует ни одного (проверено grep по app/).
+    # Ровно так 27.08 умерла приёмочная оплата 387.
+    if not settings.is_referral_program_enabled():
+        return {'paid': False, 'reason': 'реферальная программа выключена', 'rows': []}
+
+    plan = await plan_referral_debt(db)
+    total = sum(row['to_friend'] + row['to_referrer'] for row in plan)
+    if any(row['problems'] for row in plan) or total != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
+        return {
+            'paid': False,
+            'reason': f'расчёт разошёлся: {total} ≠ {REFERRAL_DEBT_2026_08_TOTAL_KOPEKS}',
+            'rows': plan,
+        }
+
+    done: list[dict] = []
+    for row in plan:
+        transaction_id = row['transaction_id']
+        # Блокировка прихода сериализует два одновременных нажатия: второй ждёт здесь и
+        # дальше уже видит заведённую работу.
+        await db.execute(select(Transaction).where(Transaction.id == transaction_id).with_for_update())
+        await ensure_deposit_outbox(
+            db,
+            transaction_id=transaction_id,
+            checkout_id=row['checkout_id'],
+            emit_deposit_event=False,
+            settlement_mode=DIRECT_SETTLEMENT_MODE,
+        )
+        await db.commit()
+        # 🔴 Всегда адресно: без `transaction_id` воркер захватит ЧУЖИЕ живые работы.
+        await process_device_first_deposit_outbox(db, limit=1, transaction_id=transaction_id)
+
+        actual = await _debt_paid_kopeks(db, transaction_id=transaction_id)
+        done.append({**row, 'actual_kopeks': actual})
+        if actual != row['to_friend'] + row['to_referrer']:
+            logger.error(
+                'Доплата долга разошлась с расчётом, пакет остановлен',
+                transaction_id=transaction_id,
+                expected=row['to_friend'] + row['to_referrer'],
+                actual=actual,
+            )
+            return {'paid': False, 'reason': 'выплата разошлась с расчётом, остановлено', 'rows': done}
+    return {'paid': True, 'reason': '', 'rows': done}

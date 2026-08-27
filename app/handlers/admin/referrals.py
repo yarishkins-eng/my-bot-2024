@@ -17,6 +17,11 @@ from app.database.crud.referral import (
 from app.database.crud.user import get_user_by_id, get_user_by_telegram_id
 from app.database.models import ReferralEarning, User, WithdrawalRequest, WithdrawalRequestStatus
 from app.localization.texts import get_texts
+from app.services.device_first_deposit_outbox_service import (
+    REFERRAL_DEBT_2026_08_TOTAL_KOPEKS,
+    pay_referral_debt,
+    plan_referral_debt,
+)
 from app.services.referral_withdrawal_service import referral_withdrawal_service
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
@@ -86,6 +91,7 @@ async def show_referral_statistics(callback: types.CallbackQuery, db_user: User,
             [types.InlineKeyboardButton(text='🔄 Обновить', callback_data='admin_referrals')],
             [types.InlineKeyboardButton(text='👥 Топ рефереров', callback_data='admin_referrals_top')],
             [types.InlineKeyboardButton(text='🔍 Диагностика логов', callback_data='admin_referral_diagnostics')],
+            [types.InlineKeyboardButton(text='🧾 Долг по рефералке', callback_data='admin_ref_debt')],
         ]
 
         # Кнопка заявок на вывод (если функция включена)
@@ -1476,12 +1482,99 @@ async def receive_log_file(message: types.Message, db_user: User, db: AsyncSessi
                 logger.error('Ошибка удаления временного файла', error=e)
 
 
+def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
+    """Экран расчёта долга. Считается теми же функциями, что и выплата."""
+    lines = ['🧾 <b>Долг по рефералке</b>', '', 'Оплаты 02.08–26.08, по которым комиссия не начислялась.', '']
+    for row in plan:
+        buyer = row['buyer'].full_name if row['buyer'] else f'id {row["transaction_id"]}'
+        referrer = row['referrer'].full_name if row['referrer'] else '—'
+        lines.append(f'• {html.escape(buyer)} заплатил {settings.format_price(row["paid_kopeks"])}')
+        if row['problems']:
+            lines.append(f'  ⛔ {html.escape("; ".join(row["problems"]))}')
+            continue
+        lines.append(
+            f'  → {html.escape(referrer)}: {settings.format_price(row["to_referrer"])} ({row["commission_percent"]}%)'
+        )
+        if row['to_friend']:
+            lines.append(f'  → новичку: {settings.format_price(row["to_friend"])}')
+    lines.append('')
+    lines.append(f'<b>Итого: {settings.format_price(total_kopeks)}</b>')
+    if total_kopeks != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
+        lines.append('')
+        lines.append(
+            f'⛔ <b>Расходится с ожидаемым</b> ({settings.format_price(REFERRAL_DEBT_2026_08_TOTAL_KOPEKS)}). '
+            'Выплата откажет — так и задумано, разбирайтесь до нажатия.'
+        )
+    return '\n'.join(lines)
+
+
+async def show_referral_debt(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+    """Экран расчёта долга. Ничего не записывает."""
+    plan = await plan_referral_debt(db)
+    total = sum(row['to_friend'] + row['to_referrer'] for row in plan)
+    payable = total == REFERRAL_DEBT_2026_08_TOTAL_KOPEKS and not any(row['problems'] for row in plan)
+
+    rows = []
+    if payable and settings.is_referral_program_enabled():
+        rows.append([types.InlineKeyboardButton(text='💰 Выплатить', callback_data='admin_ref_debt_pay')])
+    rows.append([types.InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_referrals')])
+
+    text = _debt_screen_text(plan, total)
+    if payable and not settings.is_referral_program_enabled():
+        text += '\n\n⛔ <b>Реферальная программа выключена.</b> Включите её, иначе выплата откажет.'
+    elif payable:
+        text += '\n\n⚠️ После нажатия уйдут сообщения партнёрам и новичкам. Отозвать их нельзя.'
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode='HTML',
+    )
+    await callback.answer()
+
+
+async def pay_referral_debt_handler(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+    """Выплата долга. Необратимо."""
+    await callback.answer('Плачу…')
+    result = await pay_referral_debt(db)
+
+    if not result['paid']:
+        await callback.message.edit_text(
+            f'⛔ <b>Выплата не выполнена</b>\n\n{html.escape(result["reason"])}\n\nДеньги не тронуты.',
+            reply_markup=types.InlineKeyboardMarkup(
+                inline_keyboard=[[types.InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_referrals')]]
+            ),
+            parse_mode='HTML',
+        )
+        return
+
+    paid_total = sum(row['actual_kopeks'] for row in result['rows'])
+    lines = ['✅ <b>Долг выплачен</b>', '']
+    for row in result['rows']:
+        referrer = row['referrer'].full_name if row['referrer'] else '—'
+        lines.append(f'• {html.escape(referrer)}: {settings.format_price(row["actual_kopeks"])}')
+    lines.append('')
+    lines.append(f'<b>Всего начислено: {settings.format_price(paid_total)}</b>')
+    lines.append('')
+    lines.append('Суммы прочитаны из книги операций, а не из ответа очереди.')
+
+    await callback.message.edit_text(
+        '\n'.join(lines),
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=[[types.InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_referrals')]]
+        ),
+        parse_mode='HTML',
+    )
+
+
 def register_handlers(dp: Dispatcher):
     dp.callback_query.register(show_referral_statistics, F.data == 'admin_referrals')
     dp.callback_query.register(show_top_referrers, F.data == 'admin_referrals_top')
     dp.callback_query.register(show_top_referrers_filtered, F.data.startswith('admin_top_ref:'))
     dp.callback_query.register(show_referral_settings, F.data == 'admin_referrals_settings')
     dp.callback_query.register(show_referral_diagnostics, F.data == 'admin_referral_diagnostics')
+    dp.callback_query.register(show_referral_debt, F.data == 'admin_ref_debt')
+    dp.callback_query.register(pay_referral_debt_handler, F.data == 'admin_ref_debt_pay')
     dp.callback_query.register(show_referral_diagnostics, F.data.startswith('admin_ref_diag:'))
     dp.callback_query.register(preview_referral_fixes, F.data == 'admin_ref_fix_preview')
     dp.callback_query.register(apply_referral_fixes, F.data == 'admin_ref_fix_apply')
