@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import and_, delete, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -553,7 +554,24 @@ async def plan_referral_debt(db: AsyncSession) -> list[dict]:
     """
     plan: list[dict] = []
     for transaction_id, checkout_id, buyer_id, referrer_id, amount_kopeks in REFERRAL_DEBT_2026_08:
-        source = await db.get(Transaction, transaction_id)
+        # 🔴 Приход читаем СТОЛБЦАМИ, а не объектом. Объект осел бы в кэше сессии, и движок,
+        # берущий приход `select(...).with_for_update()` без `populate_existing`, получил бы
+        # нашу копию, не перечитав её под блокировкой.
+        # ⛔ Гасить кэш через `db.expire_all()` — тот способ, которым это чинилось сначала, —
+        # НЕЛЬЗЯ: сессия общая с промежуточным слоем, в ней лежит и сам админ, и обращение
+        # к нему сразу после выплаты падало бы, не показав владельцу вообще ничего.
+        source = (
+            await db.execute(
+                select(
+                    Transaction.id,
+                    Transaction.type,
+                    Transaction.is_completed,
+                    Transaction.amount_kopeks,
+                    Transaction.device_first_checkout_id,
+                    Transaction.created_at,
+                ).where(Transaction.id == transaction_id)
+            )
+        ).first()
         buyer = await db.get(User, buyer_id)
         referrer = await db.get(User, referrer_id)
         job = (
@@ -603,6 +621,7 @@ async def plan_referral_debt(db: AsyncSession) -> list[dict]:
                 'buyer': buyer,
                 'referrer': referrer,
                 'paid_kopeks': amount_kopeks,
+                'paid_at': source.created_at if source is not None else None,
                 'commission_percent': commission_percent,
                 'to_friend': to_friend,
                 'to_referrer': to_referrer,
@@ -644,27 +663,39 @@ async def pay_referral_debt(db: AsyncSession) -> dict:
     plan = await plan_referral_debt(db)
     total = sum(row['to_friend'] + row['to_referrer'] for row in plan)
     if any(row['problems'] for row in plan) or total != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
+        # 🔴 Отказ обязан говорить правду о деньгах. Самый частый путь сюда — ВТОРОЕ нажатие
+        # после успешной выплаты: работы уже заведены, расчёт даёт ноль. Вернуть голый план
+        # значило бы напечатать «ни одна строка не оплачена, деньги не тронуты» поверх уже
+        # выплаченных 2 349,25 ₽ — и владелец пошёл бы начислять партнёрам второй раз.
+        # Поэтому по каждой строке читаем книгу и отдаём фактически начисленное.
+        checked = []
+        for row in plan:
+            credited = await _debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+            checked.append({**row, 'credited_friend': credited['friend'], 'credited_referrer': credited['referrer']})
         return {
             'paid': False,
             'reason': f'расчёт разошёлся: {total} ≠ {REFERRAL_DEBT_2026_08_TOTAL_KOPEKS}',
-            'rows': plan,
+            'rows': checked,
         }
 
     # ── точка невозврата: одна транзакция на все пять работ ──────────────────────────
-    for row in plan:
-        await ensure_deposit_outbox(
-            db,
-            transaction_id=row['transaction_id'],
-            checkout_id=row['checkout_id'],
-            emit_deposit_event=False,
-            settlement_mode=DIRECT_SETTLEMENT_MODE,
-        )
-    await db.commit()
-    # 🔴 План читал приходы через `db.get`, и они осели в кэше сессии. Движок берёт приход
-    # `select(...).with_for_update()` БЕЗ `populate_existing` — то есть получил бы нашу
-    # копию из кэша, не перечитав её под блокировкой. До этого этапа такой копии в кэше
-    # не было вовсе; сбрасываем, чтобы не сломать чужую блокировку своим чтением.
-    db.expire_all()
+    try:
+        for row in plan:
+            await ensure_deposit_outbox(
+                db,
+                transaction_id=row['transaction_id'],
+                checkout_id=row['checkout_id'],
+                emit_deposit_event=False,
+                settlement_mode=DIRECT_SETTLEMENT_MODE,
+            )
+        await db.commit()
+    except IntegrityError:
+        # Два нажатия внахлёст: соседняя сессия успела вставить работу первой. Уникальный
+        # ключ по приходу держит деньги от повтора — нам остаётся не пугать владельца сырой
+        # ошибкой, а сказать по-человечески. Своих записей после отката не остаётся.
+        await db.rollback()
+        logger.warning('Доплата долга столкнулась со второй попыткой, откатились')
+        return {'paid': False, 'reason': 'выплата уже запущена в соседнем окне', 'rows': []}
 
     for row in plan:
         try:

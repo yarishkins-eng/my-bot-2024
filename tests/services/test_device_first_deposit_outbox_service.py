@@ -12,6 +12,9 @@ class Result:
         self.value = value
         self.values = values
 
+    def first(self):
+        return self.value
+
     def scalar_one(self):
         return self.value
 
@@ -459,11 +462,17 @@ async def test_debt_payment_is_all_or_nothing(monkeypatch):
         ),
     )
 
-    result = await service.pay_referral_debt(SimpleNamespace())
+    # 🔴 Отказ теперь читает КНИГУ по каждой строке — иначе второе нажатие печатало бы
+    # «деньги не тронуты» поверх уже выплаченных. Поэтому сессия нужна настоящая.
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result(values=[])))
+
+    result = await service.pay_referral_debt(db)
 
     assert result['paid'] is False
     assert 'расчёт разошёлся' in result['reason']
     ensure.assert_not_awaited()
+    # и отчёт всё равно содержит фактически начисленное, а не голый план
+    assert result['rows'][0]['credited_referrer'] == 0
 
 
 @pytest.mark.asyncio
@@ -608,15 +617,17 @@ async def test_debt_plan_refuses_row_that_already_has_a_job(monkeypatch):
         is_completed=True,
         amount_kopeks=24900,
         device_first_checkout_id=62,
+        created_at=None,
     )
     buyer = SimpleNamespace(id=175, referred_by_id=196, has_made_first_topup=True, full_name='друг')
     referrer = SimpleNamespace(id=196, full_name='партнёр')
     job = SimpleNamespace(referral_status='done')
 
     async def _get(model, pk):
-        return {387: source, 175: buyer, 196: referrer}.get(pk)
+        return {175: buyer, 196: referrer}.get(pk)
 
-    db = SimpleNamespace(get=AsyncMock(side_effect=_get), execute=AsyncMock(return_value=Result(job)))
+    # Приход теперь читается СТОЛБЦАМИ (`.first()`), работа — объектом (`scalar_one_or_none`).
+    db = SimpleNamespace(get=AsyncMock(side_effect=_get), execute=AsyncMock(side_effect=[Result(source), Result(job)]))
 
     plan = await service.plan_referral_debt(db)
 
@@ -656,14 +667,15 @@ async def test_debt_plan_sums_bonus_and_commission_not_max(monkeypatch):
         is_completed=True,
         amount_kopeks=20000,
         device_first_checkout_id=90,
+        created_at=None,
     )
     buyer = SimpleNamespace(id=700, referred_by_id=800, has_made_first_topup=False, full_name='друг')
     referrer = SimpleNamespace(id=800, full_name='партнёр')
 
     async def _get(model, pk):
-        return {900: source, 700: buyer, 800: referrer}.get(pk)
+        return {700: buyer, 800: referrer}.get(pk)
 
-    db = SimpleNamespace(get=AsyncMock(side_effect=_get), execute=AsyncMock(return_value=Result(None)))
+    db = SimpleNamespace(get=AsyncMock(side_effect=_get), execute=AsyncMock(side_effect=[Result(source), Result(None)]))
 
     plan = await service.plan_referral_debt(db)
 

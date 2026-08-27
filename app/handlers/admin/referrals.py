@@ -1495,11 +1495,21 @@ def _exact_money(kopeks: int) -> str:
 
 def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
     """Экран расчёта долга. Считается теми же функциями, что и выплата."""
-    lines = ['🧾 <b>Долг по рефералке</b>', '', 'Оплаты 02.08–26.08, по которым комиссия не начислялась.', '']
+    lines = [
+        '🧾 <b>Долг по рефералке</b>',
+        '',
+        'Оплаты 02.08–26.08, по которым комиссия не начислялась.',
+        'Деньги лягут на внутренние балансы партнёров — это скидка на их будущие продления, '
+        'а не перевод наружу: вывод средств выключен.',
+        '',
+    ]
     for row in plan:
         buyer = row['buyer'].full_name if row['buyer'] else f'покупатель по операции {row["transaction_id"]}'
-        referrer = row['referrer'].full_name if row['referrer'] else '—'
-        lines.append(f'• {html.escape(buyer)} заплатил {_exact_money(row["paid_kopeks"])}')
+        # id рядом с именем: у партнёра бывает две строки, а имена в Телеграме
+        # повторяются — без номера владелец их не различит.
+        referrer = f'{row["referrer"].full_name} (id {row["referrer"].id})' if row['referrer'] else '—'
+        when = row['paid_at'].strftime('%d.%m') if row.get('paid_at') else '—'
+        lines.append(f'• {when} · {html.escape(buyer)} заплатил {_exact_money(row["paid_kopeks"])}')
         if row['problems']:
             lines.append(f'  ⛔ {html.escape("; ".join(row["problems"]))}')
             continue
@@ -1519,13 +1529,22 @@ def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
             )
     lines.append('')
     lines.append(f'<b>Итого: {_exact_money(total_kopeks)}</b>')
-    if all(row['problems'] and row['problems'][0].startswith('работа уже заведена') for row in plan):
+    if all(row['problems'] and row['problems'][0] == 'работа уже заведена (done)' for row in plan):
         # Не авария, а нормальная жизнь после выплаты: иначе экран навсегда остался бы
         # похожим на поломку и владелец пошёл бы «чинить» уже оплаченное.
+        # 🔴 Условие требует именно `done`. Раньше оно смотрело только на НАЛИЧИЕ работы и
+        # говорило «начислена» с момента её создания — то есть и тогда, когда все пять работ
+        # умерли в повторах и не заплатили ни копейки.
         return (
             '🧾 <b>Долг по рефералке</b>\n\n'
-            '✅ Долг закрыт: по всем пяти оплатам комиссия начислена.\n\n'
+            '✅ Долг закрыт: по всем пяти оплатам работа очереди выполнена.\n\n'
             'Суммы видны в истории операций партнёров.'
+        )
+    if all(row['problems'] and row['problems'][0].startswith('работа уже заведена') for row in plan):
+        return (
+            '🧾 <b>Долг по рефералке</b>\n\n'
+            '⏳ Работы заведены, но очередь ещё не довела их до конца.\n\n'
+            'Она доплатит сама. Откройте экран через минуту-другую.'
         )
     if total_kopeks != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
         lines.append('')
@@ -1614,15 +1633,16 @@ def _debt_result_text(rows: list[dict], *, paid: bool, reason: str) -> str:
                 lines.append(f'  • {html.escape(buyer)}: {_exact_money(row["credited_friend"])} бонус новичка')
         lines.append('')
         lines.append(f'<b>Всего: {_exact_money(total)}</b>')
-    else:
+    elif not paid:
         lines.append('')
         lines.append('Ни одна строка не оплачена, деньги не тронуты.')
     missing = [row for row in rows if not (row.get('credited_referrer') or row.get('credited_friend'))]
     if paid and missing:
         lines.append('')
         lines.append(
-            f'⏳ Ещё не начислено строк: {len(missing)}. Работы заведены и очередь доплатит их '
-            'сама в течение минуты — откройте экран заново.'
+            f'⏳ Ещё не начислено строк: {len(missing)}. Работы заведены, очередь доплатит их '
+            'сама — обычно за секунды, при сбое повтор идёт с нарастающей паузой до часа. '
+            'Откройте экран заново, он покажет итог.'
         )
     lines.append('')
     lines.append('Суммы прочитаны из книги операций, а не из ответа очереди.')
