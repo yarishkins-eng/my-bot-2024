@@ -672,3 +672,22 @@ async def test_debt_plan_sums_bonus_and_commission_not_max(monkeypatch):
     assert plan[0]['to_referrer'] == service.settings.REFERRAL_INVITER_BONUS_KOPEKS + commission
     assert plan[0]['to_referrer'] != max(service.settings.REFERRAL_INVITER_BONUS_KOPEKS, commission)
     assert plan[0]['to_friend'] == service.settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS
+
+
+def test_first_payment_bonus_requires_the_minimum_amount():
+    """Порог минимальной оплаты — несущий, а не декоративный.
+
+    🔴 Заведён после мутации, пережившей весь набор: убрать сравнение с порогом было можно
+    молча. Без него оплата в 1 ₽ давала бы 100 ₽ бонуса новичку и 100 ₽ фикса партнёру —
+    то есть каждый рубль печатал бы двести.
+
+    Вход подобран так, что ветки дают РАЗНЫЙ ответ: сумма ниже порога и сумма ровно на нём.
+    """
+    minimum = service.settings.REFERRAL_MINIMUM_TOPUP_KOPEKS
+    assert minimum > 0, 'при нулевом пороге этот сторож ничего не проверяет'
+    fresh = SimpleNamespace(has_made_first_topup=False)
+
+    assert service._qualifies_for_first_payment_bonus(fresh, minimum) is True
+    assert service._qualifies_for_first_payment_bonus(fresh, minimum - 1) is False
+    # И вторая половина условия: заплативший раньше по этой ветке не идёт никогда.
+    assert service._qualifies_for_first_payment_bonus(SimpleNamespace(has_made_first_topup=True), minimum) is False
