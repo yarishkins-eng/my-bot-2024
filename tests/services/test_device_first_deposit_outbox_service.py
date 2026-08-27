@@ -703,3 +703,36 @@ def test_first_payment_bonus_requires_the_minimum_amount():
     assert service._qualifies_for_first_payment_bonus(fresh, minimum - 1) is False
     # И вторая половина условия: заплативший раньше по этой ветке не идёт никогда.
     assert service._qualifies_for_first_payment_bonus(SimpleNamespace(has_made_first_topup=True), minimum) is False
+
+
+@pytest.mark.asyncio
+async def test_credited_split_keeps_friend_bonus_off_the_partner():
+    """Начисленное разносится по получателям, а не сваливается в кучу.
+
+    🔴 Заведён после мутации, пережившей весь набор: перепутать получателя было можно молча.
+    Ровно этот дефект и нашло ревью — экран итога приписывал партнёру ещё и бонус новичка и
+    сказал бы «партнёру 697,50 ₽» вместо 597,50 ₽. Владелец, отвечая живому человеку
+    «сколько тебе начислили», завысил бы на сотню.
+
+    Суммы намеренно РАЗНЫЕ: совпади они — сторож проверял бы совпадение, а не разнесение.
+    """
+    ledger = [
+        ('deposit-side-effect:193:referred-first-bonus', 10000),
+        ('deposit-side-effect:193:inviter-first-reward', 59750),
+    ]
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result(values=ledger)))
+
+    credited = await service._debt_credited_kopeks(db, transaction_id=193)
+
+    assert credited == {'friend': 10000, 'referrer': 59750}
+
+
+@pytest.mark.asyncio
+async def test_credited_split_counts_recurring_commission_as_partner_money():
+    """Повторная комиссия — деньги партнёра, бонуса новичка в этой ветке нет вовсе."""
+    ledger = [('deposit-side-effect:237:inviter-recurring-commission', 9225)]
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result(values=ledger)))
+
+    credited = await service._debt_credited_kopeks(db, transaction_id=237)
+
+    assert credited == {'friend': 0, 'referrer': 9225}
