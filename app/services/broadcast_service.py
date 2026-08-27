@@ -25,6 +25,7 @@ from app.handlers.admin.messages import (
     get_custom_users,
     get_target_users,
 )
+from app.utils.message_patch import caption_exceeds_telegram_limit
 
 
 if TYPE_CHECKING:
@@ -47,6 +48,28 @@ _TG_MAX_RETRIES = 3  # retry при FloodWait / transient errors
 # Прогресс обновляется каждые ~500 сообщений ИЛИ раз в 5 секунд (что наступит раньше)
 _PROGRESS_UPDATE_MESSAGES = 500
 _PROGRESS_MIN_INTERVAL_SEC = 5.0
+
+
+def _finished_status(sent_count: int, failed_count: int, blocked_count: int = 0) -> str:
+    """Итоговый статус завершённой кампании.
+
+    🔴 РС-2. Прежнее правило смотрело ТОЛЬКО на число неудач, поэтому кампания, не
+    дошедшая ни до одного человека (длинная подпись к медиа, битый HTML), помечалась
+    «Частично» — тем же оранжевым, что и наполовину успешная. Вместе с молчавшей веткой
+    отказа Телеграма это давало полную потерю без единого следа: «0 доставлено» выглядело
+    как «часть ушла».
+
+    Ноль доставленных при наличии НЕУДАЧ — это провал, а не частичный успех.
+
+    ⛔ Заблокировавшие бота считаются отдельно и провалом НЕ являются: кампания отработала,
+    просто аудитория недостижима. Иначе рассылка по давно неактивным помечалась бы ошибкой.
+    """
+    if failed_count == 0 and blocked_count == 0:
+        return 'completed'
+    if sent_count == 0 and failed_count > 0:
+        return 'failed'
+    return 'partial'
+
 
 # Email broadcast rate limiting: max 8 emails per second
 EMAIL_RATE_LIMIT = 8
@@ -326,6 +349,20 @@ class BroadcastService:
                     err = str(e).lower()
                     if 'bot was blocked' in err or 'user is deactivated' in err or 'chat not found' in err:
                         return 'blocked'
+                    # 🔴 РС-2. До этого ветка молчала полностью: кампания, провалившаяся у ВСЕХ
+                    # получателей (длинная подпись к медиа, битый HTML), давала «0 доставлено»
+                    # и пустой лог — причину было взять неоткуда. Чат-админский близнец
+                    # (`handlers/admin/messages.py:~1336`) хотя бы пишет debug.
+                    # ⛔ Уровень строго `warning`, не `error`: `error` уходит владельцу в чат
+                    # через TelegramNotifierProcessor — на провалившейся кампании это 170
+                    # сообщений подряд. Причина та же, что у соседней транзиентной ветки ниже.
+                    logger.warning(
+                        'Телеграм отклонил сообщение рассылки',
+                        broadcast_id=broadcast_id,
+                        telegram_id=telegram_id,
+                        error=str(e)[:200],
+                        error_type=type(e).__name__,
+                    )
                     return 'failed'
 
                 except (TelegramNetworkError, TelegramServerError) as exc:
@@ -429,6 +466,32 @@ class BroadcastService:
                 'document': ('document', self._bot.send_document),
             }
             kwarg_name, send_method = media_methods[config.media.type]
+
+            # 🔴 РС-2. Телеграм принимает подпись к медиа не длиннее 1024 символов, а экран
+            # рассылок разрешает 4000 и про медиа не предупреждает. Раньше длинный текст
+            # уходил подписью и падал `TelegramBadRequest` на КАЖДОМ получателе: ошибка не
+            # транзиентная, повтора нет — кампания заканчивалась «0 доставлено».
+            # Делим так же, как это давно делает чат-админка (`handlers/admin/messages.py:1279-1298`):
+            # медиа без подписи, следом текст отдельным сообщением. Кампания доходит, а не
+            # отбивается на входе — экран кабинета показать отказ всё равно не умеет.
+            # ⛔ Длину меряет штатный помощник проекта, а не `len()`: Телеграм считает подпись
+            # ПОСЛЕ разбора разметки, а `parse_mode='HTML'` тут стоит безусловно. Голый `len()`
+            # отбивал бы законный текст со ссылкой и тегами.
+            # ⛔ Клавиатура переезжает на ВТОРОЕ сообщение: кнопки под медиа без подписи
+            # выглядят оторванными, и в образце из чат-админки они тоже на тексте.
+            if caption_exceeds_telegram_limit(caption):
+                await send_method(
+                    chat_id=telegram_id,
+                    **{kwarg_name: config.media.file_id},
+                )
+                await self._bot.send_message(
+                    chat_id=telegram_id,
+                    text=caption,
+                    parse_mode='HTML',
+                    reply_markup=keyboard,
+                )
+                return
+
             await send_method(
                 chat_id=telegram_id,
                 **{kwarg_name: config.media.file_id},
@@ -459,9 +522,7 @@ class BroadcastService:
             sent_count,
             failed_count,
             blocked_count,
-            status='cancelled'
-            if cancelled
-            else ('completed' if failed_count == 0 and blocked_count == 0 else 'partial'),
+            status='cancelled' if cancelled else _finished_status(sent_count, failed_count, blocked_count),
         )
 
     async def _mark_cancelled(
@@ -957,7 +1018,9 @@ class EmailBroadcastService:
         cancelled: bool,
     ) -> None:
         """Mark broadcast as finished."""
-        status = 'cancelled' if cancelled else ('completed' if failed_count == 0 else 'partial')
+        # РС-2: то же правило, что и у телеграм-ветки (`_finished_status`). У почты своего
+        # счётчика заблокированных нет, поэтому третий аргумент не передаётся.
+        status = 'cancelled' if cancelled else _finished_status(sent_count, failed_count)
         await self._safe_status_update(broadcast_id, sent_count, failed_count, status=status)
 
     async def _mark_cancelled(

@@ -1454,7 +1454,12 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
     if skipped_email_users > 0:
         logger.info('Пропущено email-only пользователей при рассылке', skipped_email_users=skipped_email_users)
 
-    status = 'completed' if failed_count == 0 and blocked_count == 0 else 'partial'
+    # РС-2: то же правило, что и у кабинетной рассылки. Обе двери пишут в ОДНУ таблицу
+    # `broadcast_history`, и без этого полностью провалившаяся кампания из чат-админки
+    # показывалась бы «Частично» рядом с кабинетной «Ошибка» — один список, два языка.
+    from app.services.broadcast_service import _finished_status
+
+    status = _finished_status(sent_count, failed_count, blocked_count)
 
     # Сохраняем результат в НОВОЙ сессии (старая уже мертва)
     await _persist_broadcast_result(
