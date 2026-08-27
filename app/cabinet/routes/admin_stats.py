@@ -6,16 +6,16 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.crud.campaign import get_campaign_statistics, get_campaigns_count, get_campaigns_list
 from app.database.crud.server_squad import get_server_statistics
 from app.database.crud.subscription import get_subscriptions_statistics
 from app.database.crud.transaction import REAL_PAYMENT_METHODS, get_revenue_by_period, get_transactions_statistics
 from app.database.models import (
+    AdvertisingCampaign,
     ReferralEarning,
     Subscription,
     SubscriptionStatus,
@@ -24,6 +24,7 @@ from app.database.models import (
     TransactionType,
     User,
 )
+from app.services.campaign_service import get_campaign_analytics
 from app.services.remnawave_service import RemnaWaveService
 from app.services.version_service import version_service
 
@@ -198,6 +199,11 @@ class TopCampaignItem(BaseModel):
     conversion_rate: float
     total_revenue_kopeks: int
     avg_revenue_per_user_kopeks: int
+    leads: int
+    paying_leads: int
+    payment_conversion_rate: float
+    confirmed_receipts_kopeks: int
+    avg_confirmed_receipts_per_lead_kopeks: int
     created_at: str | None = None
 
 
@@ -208,6 +214,10 @@ class TopCampaignsResponse(BaseModel):
     total_campaigns: int
     total_registrations: int
     total_revenue_kopeks: int
+    total_leads: int
+    total_paying_leads: int
+    payment_conversion_rate: float
+    confirmed_receipts_kopeks: int
 
 
 class RecentPaymentItem(BaseModel):
@@ -769,21 +779,26 @@ async def get_top_referrers(
 
 @router.get('/campaigns/top', response_model=TopCampaignsResponse)
 async def get_top_campaigns(
-    limit: int = 20,
+    limit: int = Query(20, ge=1, le=100),
     admin: User = Depends(require_permission('stats:read')),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get top advertising campaigns with statistics."""
     try:
-        # Get all campaigns
-        campaigns = await get_campaigns_list(db, offset=0, limit=100, include_inactive=True)
+        campaigns = (await db.execute(select(AdvertisingCampaign))).scalars().all()
+        analytics = await get_campaign_analytics(db)
 
         campaign_items = []
         total_registrations = 0
         total_revenue = 0
+        total_leads = 0
+        total_paying_leads = 0
+        confirmed_receipts = 0
 
         for campaign in campaigns:
-            stats = await get_campaign_statistics(db, campaign.id)
+            stats = analytics.get(campaign.id)
+            if stats is None:
+                continue
 
             campaign_items.append(
                 TopCampaignItem(
@@ -792,28 +807,40 @@ async def get_top_campaigns(
                     start_parameter=campaign.start_parameter,
                     bonus_type=campaign.bonus_type,
                     is_active=campaign.is_active,
-                    registrations=stats.get('registrations', 0),
-                    conversions=stats.get('conversion_count', 0),
-                    conversion_rate=stats.get('conversion_rate', 0.0),
-                    total_revenue_kopeks=stats.get('total_revenue_kopeks', 0),
-                    avg_revenue_per_user_kopeks=stats.get('avg_revenue_per_user_kopeks', 0),
+                    registrations=stats.registrations,
+                    conversions=stats.conversion_count,
+                    conversion_rate=stats.conversion_rate,
+                    total_revenue_kopeks=stats.total_revenue_kopeks,
+                    avg_revenue_per_user_kopeks=stats.avg_revenue_per_user_kopeks,
+                    leads=stats.leads,
+                    paying_leads=stats.paying_leads,
+                    payment_conversion_rate=stats.payment_conversion_rate,
+                    confirmed_receipts_kopeks=stats.confirmed_receipts_kopeks,
+                    avg_confirmed_receipts_per_lead_kopeks=stats.avg_confirmed_receipts_per_lead_kopeks,
                     created_at=campaign.created_at.isoformat() if campaign.created_at else None,
                 )
             )
 
-            total_registrations += stats.get('registrations', 0)
-            total_revenue += stats.get('total_revenue_kopeks', 0)
+            total_registrations += stats.registrations
+            total_revenue += stats.total_revenue_kopeks
+            total_leads += stats.leads
+            total_paying_leads += stats.paying_leads
+            confirmed_receipts += stats.confirmed_receipts_kopeks
 
-        # Sort by revenue
-        campaign_items.sort(key=lambda x: x.total_revenue_kopeks, reverse=True)
-
-        total_campaigns = await get_campaigns_count(db)
+        campaign_items.sort(
+            key=lambda item: (item.confirmed_receipts_kopeks, item.leads, -item.id),
+            reverse=True,
+        )
 
         return TopCampaignsResponse(
             campaigns=campaign_items[:limit],
-            total_campaigns=total_campaigns,
+            total_campaigns=len(campaign_items),
             total_registrations=total_registrations,
             total_revenue_kopeks=total_revenue,
+            total_leads=total_leads,
+            total_paying_leads=total_paying_leads,
+            payment_conversion_rate=(round((total_paying_leads / total_leads) * 100, 1) if total_leads else 0.0),
+            confirmed_receipts_kopeks=confirmed_receipts,
         )
 
     except Exception as e:

@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.crud.campaign import (
     create_campaign,
-    delete_campaign,
     get_campaign_by_id,
     get_campaign_by_start_parameter,
     get_campaign_statistics,
@@ -31,6 +30,7 @@ from app.keyboards.admin import (
     get_confirmation_keyboard,
 )
 from app.localization.texts import get_texts
+from app.services.campaign_service import delete_campaign_if_unattributed
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
 
@@ -1212,7 +1212,12 @@ async def delete_campaign_confirmed(
         await callback.answer('❌ Кампания не найдена', show_alert=True)
         return
 
-    await delete_campaign(db, campaign)
+    if not await delete_campaign_if_unattributed(db, campaign_id):
+        await callback.answer(
+            'Кампанию с зарегистрированными лидами удалить нельзя. Деактивируйте её.',
+            show_alert=True,
+        )
+        return
     await callback.message.edit_text(
         '✅ Кампания удалена.',
         reply_markup=get_admin_campaigns_keyboard(db_user.language),
