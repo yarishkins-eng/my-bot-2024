@@ -1380,33 +1380,42 @@ def get_broadcast_target_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
                     text=_t(texts, 'ADMIN_BROADCAST_TARGET_ALL', '👥 Всем'), callback_data='broadcast_all'
                 ),
                 InlineKeyboardButton(
-                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_ACTIVE', '📱 С подпиской'), callback_data='broadcast_active'
+                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_ACTIVE', '📱 Действующая, не пробная'),
+                    callback_data='broadcast_active',
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_TRIAL', '🎁 Триал'), callback_data='broadcast_trial'
+                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_TRIAL', '🎁 Числится пробной'),
+                    callback_data='broadcast_trial',
                 ),
                 InlineKeyboardButton(
-                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_NO_SUB', '❌ Без подписки'), callback_data='broadcast_no_sub'
+                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_NO_SUB', '❌ Сейчас без подписки'),
+                    callback_data='broadcast_no_sub',
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_EXPIRING', '⏰ Истекающие'),
+                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_EXPIRING', '⏰ Заканчивается ≤3 дней (+пробные)'),
                     callback_data='broadcast_expiring',
                 ),
+            ],
+            # По одной кнопке в ряд: оговорка «(+пробные)» стоит в конце строки, а
+            # полуширинная кнопка на телефоне режется многоточием — и съедает ровно то,
+            # ради чего правка делалась.
+            [
                 InlineKeyboardButton(
-                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_EXPIRED', '🔚 Истекшие'), callback_data='broadcast_expired'
+                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_EXPIRED', '🔚 Закончилась (+пробные)'),
+                    callback_data='broadcast_expired',
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_ACTIVE_ZERO', '🧊 Активна 0 ГБ'),
+                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_ACTIVE_ZERO', '🧊 Не пробная, 0 ГБ за период'),
                     callback_data='broadcast_active_zero',
                 ),
                 InlineKeyboardButton(
-                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_TRIAL_ZERO', '🥶 Триал 0 ГБ'),
+                    text=_t(texts, 'ADMIN_BROADCAST_TARGET_TRIAL_ZERO', '🥶 Пробная, 0 ГБ за период'),
                     callback_data='broadcast_trial_zero',
                 ),
             ],
