@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.cabinet.utils.links import get_campaign_deep_link, get_campaign_web_link
 from app.database.crud.campaign import (
     create_campaign,
-    delete_campaign,
     get_campaign_by_id,
     get_campaign_by_start_parameter,
     get_campaign_statistics,
@@ -29,6 +28,7 @@ from app.database.models import (
     Tariff,
     User,
 )
+from app.services.campaign_service import delete_campaign_if_unattributed, get_campaign_analytics
 from app.services.partner_stats_service import PartnerStatsService
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -186,9 +186,11 @@ async def list_campaigns(
     total = await get_campaigns_count(db, is_active=True if not include_inactive else None)
 
     items = []
+    analytics = await get_campaign_analytics(db, [campaign.id for campaign in campaigns])
     for campaign in campaigns:
-        # Get quick stats
-        stats = await get_campaign_statistics(db, campaign.id)
+        stats = analytics.get(campaign.id)
+        if stats is None:
+            continue
         items.append(
             CampaignListItem(
                 id=campaign.id,
@@ -196,9 +198,13 @@ async def list_campaigns(
                 start_parameter=campaign.start_parameter,
                 bonus_type=campaign.bonus_type,
                 is_active=campaign.is_active,
-                registrations_count=stats['registrations'],
-                total_revenue_kopeks=stats['total_revenue_kopeks'],
-                conversion_rate=stats['conversion_rate'],
+                registrations_count=stats.registrations,
+                total_revenue_kopeks=stats.total_revenue_kopeks,
+                conversion_rate=stats.conversion_rate,
+                leads=stats.leads,
+                paying_leads=stats.paying_leads,
+                payment_conversion_rate=stats.payment_conversion_rate,
+                confirmed_receipts_kopeks=stats.confirmed_receipts_kopeks,
                 partner_user_id=campaign.partner_user_id,
                 partner_name=_get_partner_name(campaign),
                 created_at=campaign.created_at,
@@ -297,6 +303,12 @@ async def get_campaign_stats(
             )
 
         stats = await get_campaign_statistics(db, campaign_id)
+        analytics = (await get_campaign_analytics(db, [campaign_id])).get(campaign_id)
+        if analytics is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail='Campaign not found',
+            )
 
         return CampaignStatisticsResponse(
             id=campaign.id,
@@ -315,6 +327,13 @@ async def get_campaign_stats(
             avg_revenue_per_user_rubles=_safe_div(stats['avg_revenue_per_user_kopeks']),
             avg_first_payment_kopeks=stats['avg_first_payment_kopeks'],
             avg_first_payment_rubles=_safe_div(stats['avg_first_payment_kopeks']),
+            leads=analytics.leads,
+            paying_leads=analytics.paying_leads,
+            payment_conversion_rate=analytics.payment_conversion_rate,
+            confirmed_receipts_kopeks=analytics.confirmed_receipts_kopeks,
+            confirmed_receipts_rubles=_safe_div(analytics.confirmed_receipts_kopeks),
+            avg_confirmed_receipts_per_lead_kopeks=analytics.avg_confirmed_receipts_per_lead_kopeks,
+            avg_confirmed_receipts_per_lead_rubles=_safe_div(analytics.avg_confirmed_receipts_per_lead_kopeks),
             trial_users_count=stats['trial_users_count'],
             active_trials_count=stats['active_trials_count'],
             conversion_count=stats['conversion_count'],
@@ -576,20 +595,12 @@ async def delete_existing_campaign(
             detail='Campaign not found',
         )
 
-    # Check if campaign has registrations (COUNT query instead of loading all)
-    reg_count_result = await db.execute(
-        select(func.count(AdvertisingCampaignRegistration.id)).where(
-            AdvertisingCampaignRegistration.campaign_id == campaign_id
-        )
-    )
-    reg_count = reg_count_result.scalar() or 0
-    if reg_count > 0:
+    if not await delete_campaign_if_unattributed(db, campaign_id):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Cannot delete campaign with {reg_count} registrations. Deactivate it instead.',
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Cannot delete a campaign with attribution history. Deactivate it instead.',
         )
 
-    await delete_campaign(db, campaign)
     logger.info('Admin deleted campaign', admin_id=admin.id, campaign_id=campaign_id, campaign_name=campaign.name)
 
     return {'message': 'Campaign deleted successfully'}

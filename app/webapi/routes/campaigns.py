@@ -8,12 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.crud.campaign import (
     create_campaign,
-    delete_campaign,
     get_campaign_by_id,
     get_campaigns_count,
     get_campaigns_list,
     update_campaign,
 )
+from app.services.campaign_service import delete_campaign_if_unattributed
 
 from ..dependencies import get_db_session, require_api_token
 from ..schemas.campaigns import (
@@ -142,7 +142,11 @@ async def delete_campaign_endpoint(
     if not campaign:
         raise HTTPException(status.HTTP_404_NOT_FOUND, 'Campaign not found')
 
-    await delete_campaign(db, campaign)
+    if not await delete_campaign_if_unattributed(db, campaign_id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            'Cannot delete a campaign with attribution history; deactivate it instead',
+        )
 
 
 @router.patch(

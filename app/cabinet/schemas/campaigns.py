@@ -27,6 +27,10 @@ class CampaignListItem(BaseModel):
     registrations_count: int
     total_revenue_kopeks: int = 0
     conversion_rate: float = 0.0
+    leads: int = 0
+    paying_leads: int = 0
+    payment_conversion_rate: float = 0.0
+    confirmed_receipts_kopeks: int = 0
     partner_user_id: int | None = None
     partner_name: str | None = None
     created_at: datetime
@@ -146,6 +150,14 @@ class CampaignStatisticsResponse(BaseModel):
     avg_revenue_per_user_rubles: float = 0.0
     avg_first_payment_kopeks: int = 0
     avg_first_payment_rubles: float = 0.0
+    # First-touch external receipt stats
+    leads: int = 0
+    paying_leads: int = 0
+    payment_conversion_rate: float = 0.0
+    confirmed_receipts_kopeks: int = 0
+    confirmed_receipts_rubles: float = 0.0
+    avg_confirmed_receipts_per_lead_kopeks: int = 0
+    avg_confirmed_receipts_per_lead_rubles: float = 0.0
     # Trial & Conversion stats
     trial_users_count: int = 0
     active_trials_count: int = 0
