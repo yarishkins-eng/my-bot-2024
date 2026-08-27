@@ -392,14 +392,23 @@ def test_debt_list_is_frozen_and_matches_declared_total():
     assert {row[0] for row in service.REFERRAL_DEBT_2026_08} == {193, 207, 232, 237, 370}
     assert 383 not in {row[0] for row in service.REFERRAL_DEBT_2026_08}
     assert 387 not in {row[0] for row in service.REFERRAL_DEBT_2026_08}
-    # Четыре первых оплаты: 100 ₽ фикс + 25% + 100 ₽ другу. Пятая (237) — только 25%.
+    # 🔴 Считаем из ЖИВЫХ настроек, а не из вшитых чисел: вшитые совпали бы с умолчаниями
+    # кода, и тест остался бы зелёным на сервере с другими настройками — там, где выплата
+    # как раз откажет навсегда с «расчёт разошёлся».
+    pct = service.settings.REFERRAL_COMMISSION_PERCENT
+    fixed = service.settings.REFERRAL_INVITER_BONUS_KOPEKS
+    friend = service.settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS
     expected = 0
     for _tx, _checkout, _buyer, _referrer, amount in service.REFERRAL_DEBT_2026_08:
-        if amount == 36900:
-            expected += amount * 25 // 100
-        else:
-            expected += 10000 + amount * 25 // 100 + 10000
-    assert expected == service.REFERRAL_DEBT_2026_08_TOTAL_KOPEKS == 234925
+        # 237 — единственная повторная: у покупателя 206 бонус новичка уже выдан 25.08
+        # по пополнению кошелька на 100 ₽.
+        expected += amount * pct // 100 if _tx == 237 else fixed + amount * pct // 100 + friend
+    assert expected == service.REFERRAL_DEBT_2026_08_TOTAL_KOPEKS, (
+        f'при нынешних настройках ({pct}%, фикс {fixed}, новичку {friend}) долг равен {expected}, '
+        f'а перечень заморожен на {service.REFERRAL_DEBT_2026_08_TOTAL_KOPEKS}. '
+        'Выплата откажет — сначала разберитесь с настройками.'
+    )
+    assert service.REFERRAL_DEBT_2026_08_TOTAL_KOPEKS == 234925
 
 
 @pytest.mark.asyncio
@@ -486,8 +495,8 @@ async def test_debt_payment_never_emits_wallet_topup_event(monkeypatch):
     monkeypatch.setattr(service, 'ensure_deposit_outbox', ensure)
     worker = AsyncMock(return_value=1)
     monkeypatch.setattr(service, 'process_device_first_deposit_outbox', worker)
-    monkeypatch.setattr(service, '_debt_paid_kopeks', AsyncMock(return_value=69750))
-    db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=AsyncMock())
+    monkeypatch.setattr(service, '_debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=AsyncMock(), expire_all=MagicMock())
 
     result = await service.pay_referral_debt(db)
 
@@ -501,8 +510,14 @@ async def test_debt_payment_never_emits_wallet_topup_event(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_debt_payment_stops_when_ledger_disagrees(monkeypatch):
-    """Заплатили не то, что посчитали, — останавливаем пакет на первой же строке."""
+async def test_debt_payment_commits_all_rows_once_before_draining(monkeypatch):
+    """Все пять работ заводятся ОДНОЙ транзакцией, одним коммитом.
+
+    🔴 Прошлая редакция коммитила построчно и обещала «стоп при расхождении». Обещание было
+    ложным: очередь дренирует фоновый цикл каждые 10 секунд без фильтра, поэтому любая
+    закоммиченная работа будет исполнена — остановка не останавливала ничего, а остаток
+    после неё не оплачивался уже никогда.
+    """
     monkeypatch.setattr(type(service.settings), 'is_referral_program_enabled', lambda self: True)
     rows = [
         {
@@ -522,16 +537,58 @@ async def test_debt_payment_stops_when_ledger_disagrees(monkeypatch):
     monkeypatch.setattr(service, 'REFERRAL_DEBT_2026_08_TOTAL_KOPEKS', 139500)
     ensure = AsyncMock()
     monkeypatch.setattr(service, 'ensure_deposit_outbox', ensure)
-    monkeypatch.setattr(service, 'process_device_first_deposit_outbox', AsyncMock(return_value=1))
-    monkeypatch.setattr(service, '_debt_paid_kopeks', AsyncMock(return_value=0))
-    db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=AsyncMock())
+    worker = AsyncMock(return_value=1)
+    monkeypatch.setattr(service, 'process_device_first_deposit_outbox', worker)
+    monkeypatch.setattr(service, '_debt_credited_kopeks', AsyncMock(return_value={'friend': 0, 'referrer': 0}))
+    commit = AsyncMock()
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=commit, expire_all=MagicMock())
 
     result = await service.pay_referral_debt(db)
 
-    assert result['paid'] is False
-    assert 'разошлась' in result['reason']
-    # Вторую строку не трогали.
-    assert ensure.await_count == 1
+    assert ensure.await_count == 2
+    # 🔴 Ровно один коммит на весь пакет: точка невозврата одна, а не пять.
+    assert commit.await_count == 1
+    # Отчёт честен: заплачено ноль, но работы заведены — очередь доведёт сама.
+    assert result['paid'] is True
+    assert all(row['credited_referrer'] == 0 for row in result['rows'])
+
+
+@pytest.mark.asyncio
+async def test_debt_payment_survives_a_failing_row_and_keeps_going(monkeypatch):
+    """Падение на одной строке не бросает остальные: работы уже заведены."""
+    monkeypatch.setattr(type(service.settings), 'is_referral_program_enabled', lambda self: True)
+    rows = [
+        {
+            'transaction_id': tx,
+            'checkout_id': 14,
+            'buyer': None,
+            'referrer': None,
+            'paid_kopeks': 199000,
+            'commission_percent': 25,
+            'to_friend': 10000,
+            'to_referrer': 59750,
+            'problems': [],
+        }
+        for tx in (193, 207)
+    ]
+    monkeypatch.setattr(service, 'plan_referral_debt', AsyncMock(return_value=rows))
+    monkeypatch.setattr(service, 'REFERRAL_DEBT_2026_08_TOTAL_KOPEKS', 139500)
+    monkeypatch.setattr(service, 'ensure_deposit_outbox', AsyncMock())
+    worker = AsyncMock(side_effect=[RuntimeError('обрыв'), 1])
+    monkeypatch.setattr(service, 'process_device_first_deposit_outbox', worker)
+    monkeypatch.setattr(service, '_debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=Result(None)),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+        expire_all=MagicMock(),
+    )
+
+    result = await service.pay_referral_debt(db)
+
+    assert worker.await_count == 2
+    assert result['paid'] is True
+    assert len(result['rows']) == 2
 
 
 @pytest.mark.asyncio
@@ -576,7 +633,8 @@ def test_repair_button_still_blind_to_provider_receipts():
     """
     from pathlib import Path
 
-    source = Path('app/services/referral_diagnostics_service.py').read_text(encoding='utf-8')
+    root = Path(__file__).resolve().parents[2]
+    source = (root / 'app/services/referral_diagnostics_service.py').read_text(encoding='utf-8')
     assert 'PROVIDER_RECEIPT' not in source
     assert 'TransactionType.DEPOSIT.value' in source
 

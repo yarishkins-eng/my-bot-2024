@@ -1482,32 +1482,62 @@ async def receive_log_file(message: types.Message, db_user: User, db: AsyncSessi
                 logger.error('Ошибка удаления временного файла', error=e)
 
 
+def _exact_money(kopeks: int) -> str:
+    """Точная сумма, без округления.
+
+    🔴 `settings.format_price` при включённом `PRICE_ROUNDING_ENABLED` отбрасывает копейки
+    и округляет вверх: 399,75 ₽ показал бы как «400 ₽». На экране, по которому принимают
+    решение о необратимой выплате, это недопустимо — тем более что банер расхождения
+    печатал бы два ОДИНАКОВЫХ числа и утверждал, что они разные.
+    """
+    return f'{kopeks // 100},{kopeks % 100:02d} ₽'
+
+
 def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
     """Экран расчёта долга. Считается теми же функциями, что и выплата."""
     lines = ['🧾 <b>Долг по рефералке</b>', '', 'Оплаты 02.08–26.08, по которым комиссия не начислялась.', '']
     for row in plan:
-        buyer = row['buyer'].full_name if row['buyer'] else f'id {row["transaction_id"]}'
+        buyer = row['buyer'].full_name if row['buyer'] else f'покупатель по операции {row["transaction_id"]}'
         referrer = row['referrer'].full_name if row['referrer'] else '—'
-        lines.append(f'• {html.escape(buyer)} заплатил {settings.format_price(row["paid_kopeks"])}')
+        lines.append(f'• {html.escape(buyer)} заплатил {_exact_money(row["paid_kopeks"])}')
         if row['problems']:
             lines.append(f'  ⛔ {html.escape("; ".join(row["problems"]))}')
             continue
-        lines.append(
-            f'  → {html.escape(referrer)}: {settings.format_price(row["to_referrer"])} ({row["commission_percent"]}%)'
-        )
         if row['to_friend']:
-            lines.append(f'  → новичку: {settings.format_price(row["to_friend"])}')
+            # Первая оплата: фикс + процент. Подпись «(25%)» тут врала бы — процент
+            # относится только к части суммы.
+            fixed = row['to_referrer'] - row['paid_kopeks'] * row['commission_percent'] // 100
+            lines.append(
+                f'  → {html.escape(referrer)}: {_exact_money(row["to_referrer"])}'
+                f' = {_exact_money(fixed)} фикс + {row["commission_percent"]}%'
+            )
+            lines.append(f'  → новичку: {_exact_money(row["to_friend"])}')
+        else:
+            lines.append(
+                f'  → {html.escape(referrer)}: {_exact_money(row["to_referrer"])}'
+                f' ({row["commission_percent"]}% с оплаты)'
+            )
     lines.append('')
-    lines.append(f'<b>Итого: {settings.format_price(total_kopeks)}</b>')
+    lines.append(f'<b>Итого: {_exact_money(total_kopeks)}</b>')
+    if all(row['problems'] and row['problems'][0].startswith('работа уже заведена') for row in plan):
+        # Не авария, а нормальная жизнь после выплаты: иначе экран навсегда остался бы
+        # похожим на поломку и владелец пошёл бы «чинить» уже оплаченное.
+        return (
+            '🧾 <b>Долг по рефералке</b>\n\n'
+            '✅ Долг закрыт: по всем пяти оплатам комиссия начислена.\n\n'
+            'Суммы видны в истории операций партнёров.'
+        )
     if total_kopeks != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
         lines.append('')
         lines.append(
-            f'⛔ <b>Расходится с ожидаемым</b> ({settings.format_price(REFERRAL_DEBT_2026_08_TOTAL_KOPEKS)}). '
+            f'⛔ <b>Расходится с ожидаемым</b> ({_exact_money(REFERRAL_DEBT_2026_08_TOTAL_KOPEKS)}). '
             'Выплата откажет — так и задумано, разбирайтесь до нажатия.'
         )
     return '\n'.join(lines)
 
 
+@admin_required
+@error_handler
 async def show_referral_debt(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Экран расчёта долга. Ничего не записывает."""
     plan = await plan_referral_debt(db)
@@ -1533,33 +1563,95 @@ async def show_referral_debt(callback: types.CallbackQuery, db_user: User, db: A
     await callback.answer()
 
 
+@admin_required
+@error_handler
+async def ask_referral_debt_payment(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+    """Отдельный шаг подтверждения: действие необратимо.
+
+    Дом-стандарт проекта (`orders_review.py`, самый свежий денежный экран): необратимое
+    действие спрашивают отдельно И перепроверяют состояние в момент подтверждения —
+    кнопка из переписки могла протухнуть.
+    """
+    plan = await plan_referral_debt(db)
+    total = sum(row['to_friend'] + row['to_referrer'] for row in plan)
+    if total != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS or any(row['problems'] for row in plan):
+        await callback.answer('Расчёт изменился, откройте экран заново', show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f'⚠️ <b>Выплатить {_exact_money(total)}?</b>\n\n'
+        'Действие необратимо. Уйдут сообщения пяти партнёрам и четверым новичкам '
+        'про покупки от 02.08 — отозвать их нельзя.',
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [types.InlineKeyboardButton(text='💰 Да, выплатить', callback_data='admin_ref_debt_go')],
+                [types.InlineKeyboardButton(text='⬅️ Отмена', callback_data='admin_ref_debt')],
+            ]
+        ),
+        parse_mode='HTML',
+    )
+    await callback.answer()
+
+
+def _debt_result_text(rows: list[dict], *, paid: bool, reason: str) -> str:
+    """Итог выплаты. Считаем по КНИГЕ и по факту, а не по флагу `paid`.
+
+    🔴 Писать «деньги не тронуты» на любой отказ нельзя: пакет платит построчно и
+    коммитит каждую строку, поэтому отказ на третьей означает, что первые две УЖЕ
+    оплачены. Админ, прочитав «не тронуты», пошёл бы доплачивать поверх выплаченного.
+    """
+    credited = [row for row in rows if row.get('credited_referrer') or row.get('credited_friend')]
+    total = sum(row['credited_referrer'] + row['credited_friend'] for row in credited)
+    lines = ['✅ <b>Долг выплачен</b>'] if paid else ['⛔ <b>Выплата остановлена</b>', '', html.escape(reason)]
+    if credited:
+        lines.append('')
+        lines.append('<b>Начислено:</b>')
+        for row in credited:
+            referrer = row['referrer'].full_name if row['referrer'] else '—'
+            lines.append(f'• {html.escape(referrer)}: {_exact_money(row["credited_referrer"])}')
+            if row['credited_friend']:
+                buyer = row['buyer'].full_name if row['buyer'] else 'новичку'
+                lines.append(f'  • {html.escape(buyer)}: {_exact_money(row["credited_friend"])} бонус новичка')
+        lines.append('')
+        lines.append(f'<b>Всего: {_exact_money(total)}</b>')
+    else:
+        lines.append('')
+        lines.append('Ни одна строка не оплачена, деньги не тронуты.')
+    missing = [row for row in rows if not (row.get('credited_referrer') or row.get('credited_friend'))]
+    if paid and missing:
+        lines.append('')
+        lines.append(
+            f'⏳ Ещё не начислено строк: {len(missing)}. Работы заведены и очередь доплатит их '
+            'сама в течение минуты — откройте экран заново.'
+        )
+    lines.append('')
+    lines.append('Суммы прочитаны из книги операций, а не из ответа очереди.')
+    return '\n'.join(lines)
+
+
+@admin_required
+@error_handler
 async def pay_referral_debt_handler(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Выплата долга. Необратимо."""
     await callback.answer('Плачу…')
+    logger.info(
+        'Запущена доплата реферального долга',
+        admin_id=db_user.id,
+        admin_telegram_id=db_user.telegram_id,
+    )
     result = await pay_referral_debt(db)
-
-    if not result['paid']:
-        await callback.message.edit_text(
-            f'⛔ <b>Выплата не выполнена</b>\n\n{html.escape(result["reason"])}\n\nДеньги не тронуты.',
-            reply_markup=types.InlineKeyboardMarkup(
-                inline_keyboard=[[types.InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_referrals')]]
-            ),
-            parse_mode='HTML',
-        )
-        return
-
-    paid_total = sum(row['actual_kopeks'] for row in result['rows'])
-    lines = ['✅ <b>Долг выплачен</b>', '']
-    for row in result['rows']:
-        referrer = row['referrer'].full_name if row['referrer'] else '—'
-        lines.append(f'• {html.escape(referrer)}: {settings.format_price(row["actual_kopeks"])}')
-    lines.append('')
-    lines.append(f'<b>Всего начислено: {settings.format_price(paid_total)}</b>')
-    lines.append('')
-    lines.append('Суммы прочитаны из книги операций, а не из ответа очереди.')
+    logger.info(
+        'Доплата реферального долга завершена',
+        admin_id=db_user.id,
+        paid=result['paid'],
+        reason=result['reason'],
+        credited_kopeks=sum(
+            (row.get('credited_referrer') or 0) + (row.get('credited_friend') or 0) for row in result['rows']
+        ),
+    )
 
     await callback.message.edit_text(
-        '\n'.join(lines),
+        _debt_result_text(result['rows'], paid=result['paid'], reason=result['reason']),
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[[types.InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_referrals')]]
         ),
@@ -1574,7 +1666,8 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(show_referral_settings, F.data == 'admin_referrals_settings')
     dp.callback_query.register(show_referral_diagnostics, F.data == 'admin_referral_diagnostics')
     dp.callback_query.register(show_referral_debt, F.data == 'admin_ref_debt')
-    dp.callback_query.register(pay_referral_debt_handler, F.data == 'admin_ref_debt_pay')
+    dp.callback_query.register(ask_referral_debt_payment, F.data == 'admin_ref_debt_pay')
+    dp.callback_query.register(pay_referral_debt_handler, F.data == 'admin_ref_debt_go')
     dp.callback_query.register(show_referral_diagnostics, F.data.startswith('admin_ref_diag:'))
     dp.callback_query.register(preview_referral_fixes, F.data == 'admin_ref_fix_preview')
     dp.callback_query.register(apply_referral_fixes, F.data == 'admin_ref_fix_apply')
