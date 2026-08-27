@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import and_, delete, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -76,6 +77,16 @@ async def ensure_deposit_outbox(
     db.add(row)
     await db.flush()
     return row
+
+
+def _qualifies_for_first_payment_bonus(user: User, amount_kopeks: int) -> bool:
+    """Идёт ли оплата по ветке «первая»: фикс другу и фикс+процент партнёру.
+
+    🔴 Вынесено в общее место после ревью: экран расчёта долга (`plan_referral_debt`)
+    повторял это условие своими словами, и разошлись бы они молча — экран показал бы одно,
+    движок заплатил другое, а владелец нажал бы, глядя на неверное число.
+    """
+    return not user.has_made_first_topup and amount_kopeks >= settings.REFERRAL_MINIMUM_TOPUP_KOPEKS
 
 
 async def _add_reward(
@@ -218,9 +229,7 @@ async def _apply_referral_step(
         is_first_payment=prior_reward_payments == 0,
     )
     commission_amount = int(source.amount_kopeks * commission_percent / 100) if commission_percent > 0 else 0
-    qualifies_for_first_bonus = source.amount_kopeks >= settings.REFERRAL_MINIMUM_TOPUP_KOPEKS
-
-    if not user.has_made_first_topup and qualifies_for_first_bonus:
+    if _qualifies_for_first_payment_bonus(user, source.amount_kopeks):
         user.has_made_first_topup = True
         await db.execute(
             delete(ReferralEarning).where(
@@ -481,3 +490,227 @@ async def process_device_first_deposit_outbox(
                 error=row.last_error,
             )
     return processed
+
+
+# ---------------------------------------------------------------------------
+# РФ-2: возврат исторического долга 02.08–26.08.2026
+# ---------------------------------------------------------------------------
+
+# 🔴 ПЕРЕЧЕНЬ ЗАМОРОЖЕН, И ЭТО НЕСУЩЕЕ РЕШЕНИЕ, А НЕ ЛЕНЬ.
+# Запрос «приходы без наградной строки» подхватил бы ОДНУ лишнюю оплату — 387 от 27.08:
+# она прошла при намеренно ВЫКЛЮЧЕННОЙ программе и по правилу владельца не оплачивается
+# никогда (мина FO), а от честного долга в базе неотличима. (Оплата 383 того же дня уже
+# оплачена и из такого запроса выпадает сама — проверено прогоном запроса на боевом,
+# первая редакция этого комментария завышала до «двух».) Каждая строка ниже сверена с боевой базой 27.08.2026 поимённо:
+# приход, заказ, покупатель, пригласивший, сумма.
+REFERRAL_DEBT_2026_08: tuple[tuple[int, int, int, int, int], ...] = (
+    # (приход, заказ, покупатель, пригласивший, сумма прихода в копейках)
+    (193, 14, 172, 133, 199000),
+    (207, 30, 182, 131, 64900),
+    (232, 39, 194, 123, 199000),
+    (237, 43, 206, 142, 36900),
+    (370, 57, 321, 133, 119900),
+)
+
+# Пакет платит ровно эту сумму или не платит ничего. 40 000 бонусов друзьям + 194 925 партнёрам.
+REFERRAL_DEBT_2026_08_TOTAL_KOPEKS = 234925
+
+_DEBT_LEDGER_SUFFIXES = ('referred-first-bonus', 'inviter-first-reward', 'inviter-recurring-commission')
+
+
+async def _debt_credited_kopeks(db: AsyncSession, *, transaction_id: int) -> dict[str, int]:
+    """Сколько начислено по этому приходу — по КНИГЕ, врозь получателям.
+
+    Возврат воркера читать нельзя: работу мог перехватить фоновый цикл, и тогда
+    `processed=0` означает «уже сделано», а не «не сделано».
+
+    Врозь — потому что общая сумма приписала бы партнёру ещё и бонус новичка: на оплате
+    1 990 ₽ экран сказал бы «партнёру 697,50 ₽» вместо 597,50 ₽, и владелец завысил бы
+    ответ живому человеку на сотню.
+    """
+    credited = {'friend': 0, 'referrer': 0}
+    keys = {
+        f'deposit-side-effect:{transaction_id}:referred-first-bonus': 'friend',
+        f'deposit-side-effect:{transaction_id}:inviter-first-reward': 'referrer',
+        f'deposit-side-effect:{transaction_id}:inviter-recurring-commission': 'referrer',
+    }
+    rows = (
+        await db.execute(
+            select(Transaction.device_first_ledger_key, Transaction.amount_kopeks).where(
+                Transaction.device_first_ledger_key.in_(list(keys))
+            )
+        )
+    ).all()
+    for key, amount in rows:
+        credited[keys[key]] += int(amount or 0)
+    return credited
+
+
+async def plan_referral_debt(db: AsyncSession) -> list[dict]:
+    """Посчитать долг, НИЧЕГО не записывая.
+
+    Арифметика берётся из тех же функций, что зовёт `_apply_referral_step`. Иначе экран
+    показал бы одно, а движок заплатил другое — и разошлись бы они молча.
+    """
+    plan: list[dict] = []
+    for transaction_id, checkout_id, buyer_id, referrer_id, amount_kopeks in REFERRAL_DEBT_2026_08:
+        # 🔴 Приход читаем СТОЛБЦАМИ, а не объектом. Объект осел бы в кэше сессии, и движок,
+        # берущий приход `select(...).with_for_update()` без `populate_existing`, получил бы
+        # нашу копию, не перечитав её под блокировкой.
+        # ⛔ Гасить кэш через `db.expire_all()` — тот способ, которым это чинилось сначала, —
+        # НЕЛЬЗЯ: сессия общая с промежуточным слоем, в ней лежит и сам админ, и обращение
+        # к нему сразу после выплаты падало бы, не показав владельцу вообще ничего.
+        source = (
+            await db.execute(
+                select(
+                    Transaction.id,
+                    Transaction.type,
+                    Transaction.is_completed,
+                    Transaction.amount_kopeks,
+                    Transaction.device_first_checkout_id,
+                    Transaction.created_at,
+                ).where(Transaction.id == transaction_id)
+            )
+        ).first()
+        buyer = await db.get(User, buyer_id)
+        referrer = await db.get(User, referrer_id)
+        job = (
+            await db.execute(
+                select(DeviceFirstDepositOutbox).where(DeviceFirstDepositOutbox.transaction_id == transaction_id)
+            )
+        ).scalar_one_or_none()
+
+        problems: list[str] = []
+        if source is None or source.type != TransactionType.PROVIDER_RECEIPT.value:
+            problems.append('приход исчез или сменил тип')
+        elif not source.is_completed or source.amount_kopeks != amount_kopeks:
+            problems.append('сумма или завершённость изменились')
+        elif source.device_first_checkout_id != checkout_id:
+            problems.append('у прихода другой заказ')
+        if buyer is None:
+            problems.append('покупатель исчез')
+        elif buyer.referred_by_id != referrer_id:
+            problems.append('пригласивший изменился')
+        if referrer is None:
+            problems.append('пригласивший исчез')
+        if job is not None:
+            # Второй заслон против мины FO: работа уже заведена — платить нечего и нельзя.
+            problems.append(f'работа уже заведена ({job.referral_status})')
+
+        to_friend = 0
+        to_referrer = 0
+        commission_percent = 0
+        if not problems:
+            prior_reward_payments = await get_referral_reward_payment_count(db, referrer.id, buyer.id)
+            commission_percent = await calculate_referral_commission_percent(
+                db,
+                referrer,
+                is_first_payment=prior_reward_payments == 0,
+            )
+            commission = int(amount_kopeks * commission_percent / 100) if commission_percent > 0 else 0
+            if _qualifies_for_first_payment_bonus(buyer, amount_kopeks):
+                to_friend = settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS
+                to_referrer = settings.REFERRAL_INVITER_BONUS_KOPEKS + commission
+            elif commission > 0 and not await _is_commission_limit_reached(db, referrer.id, buyer.id):
+                to_referrer = commission
+
+        plan.append(
+            {
+                'transaction_id': transaction_id,
+                'checkout_id': checkout_id,
+                'buyer': buyer,
+                'referrer': referrer,
+                'paid_kopeks': amount_kopeks,
+                'paid_at': source.created_at if source is not None else None,
+                'commission_percent': commission_percent,
+                'to_friend': to_friend,
+                'to_referrer': to_referrer,
+                'problems': problems,
+            }
+        )
+    return plan
+
+
+async def pay_referral_debt(db: AsyncSession) -> dict:
+    """Доплатить долг через тот же движок, что платит живые оплаты.
+
+    🔴 «Остановиться на середине» ЗДЕСЬ НЕВОЗМОЖНО, и делать вид, что можно, опаснее всего.
+    Очередь дренирует фоновый цикл каждые 10 секунд без всякого фильтра
+    (`device_first_recovery_service.py:47`, `monitoring_service.py:521`): любая
+    закоммиченная работа будет исполнена, нравится нам это или нет. Поэтому:
+
+      * единственные настоящие ворота — сверка расчёта ДО первой записи;
+      * все пять работ заводятся ОДНОЙ транзакцией, одним коммитом — это и есть точка
+        невозврата, одна на весь пакет, а не пять разных;
+      * дальше мы лишь доводим до конца сами, чтобы владелец увидел итог сразу. Не вышло —
+        доплатит фоновый цикл, и это ПРАВИЛЬНО: долг признан по всем пяти строкам разом.
+
+    Прошлая редакция коммитила построчно и обещала «стоп при расхождении». Обещание было
+    ложным дважды: остановка не мешала фону доплатить закоммиченное, а остаток после неё
+    не оплачивался уже никогда — у заведённых работ появлялся `problems`, и экран отказывал
+    навсегда.
+    """
+    from app.services.device_first_checkout_service import DIRECT_SETTLEMENT_MODE
+
+    # 🔴 Выключатель здесь — условие ОТКАЗА, а не параметр `pay_referral`.
+    # Передать его внутрь `ensure_deposit_outbox` нельзя: при выключенной программе работа
+    # завелась бы сразу со статусом 'done', и долг стал бы НЕОПЛАЧИВАЕМЫМ НАВСЕГДА —
+    # обратного перевода статуса в коде не существует ни одного (проверено grep по app/).
+    # Ровно так 27.08 умерла приёмочная оплата 387.
+    if not settings.is_referral_program_enabled():
+        return {'paid': False, 'reason': 'реферальная программа выключена', 'rows': []}
+
+    plan = await plan_referral_debt(db)
+    total = sum(row['to_friend'] + row['to_referrer'] for row in plan)
+    if any(row['problems'] for row in plan) or total != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
+        # 🔴 Отказ обязан говорить правду о деньгах. Самый частый путь сюда — ВТОРОЕ нажатие
+        # после успешной выплаты: работы уже заведены, расчёт даёт ноль. Вернуть голый план
+        # значило бы напечатать «ни одна строка не оплачена, деньги не тронуты» поверх уже
+        # выплаченных 2 349,25 ₽ — и владелец пошёл бы начислять партнёрам второй раз.
+        # Поэтому по каждой строке читаем книгу и отдаём фактически начисленное.
+        checked = []
+        for row in plan:
+            credited = await _debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+            checked.append({**row, 'credited_friend': credited['friend'], 'credited_referrer': credited['referrer']})
+        return {
+            'paid': False,
+            'reason': f'расчёт разошёлся: {total} ≠ {REFERRAL_DEBT_2026_08_TOTAL_KOPEKS}',
+            'rows': checked,
+        }
+
+    # ── точка невозврата: одна транзакция на все пять работ ──────────────────────────
+    try:
+        for row in plan:
+            await ensure_deposit_outbox(
+                db,
+                transaction_id=row['transaction_id'],
+                checkout_id=row['checkout_id'],
+                emit_deposit_event=False,
+                settlement_mode=DIRECT_SETTLEMENT_MODE,
+            )
+        await db.commit()
+    except IntegrityError:
+        # Два нажатия внахлёст: соседняя сессия успела вставить работу первой. Уникальный
+        # ключ по приходу держит деньги от повтора — нам остаётся не пугать владельца сырой
+        # ошибкой, а сказать по-человечески. Своих записей после отката не остаётся.
+        await db.rollback()
+        logger.warning('Доплата долга столкнулась со второй попыткой, откатились')
+        return {'paid': False, 'reason': 'выплата уже запущена в соседнем окне', 'rows': []}
+
+    for row in plan:
+        try:
+            # 🔴 Всегда адресно: без `transaction_id` воркер захватит ЧУЖИЕ живые работы.
+            await process_device_first_deposit_outbox(db, limit=1, transaction_id=row['transaction_id'])
+        except Exception as error:
+            await db.rollback()
+            logger.warning(
+                'Строка долга не доведена нами, останется фоновому циклу',
+                transaction_id=row['transaction_id'],
+                error=error,
+            )
+
+    done = []
+    for row in plan:
+        credited = await _debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+        done.append({**row, 'credited_friend': credited['friend'], 'credited_referrer': credited['referrer']})
+    return {'paid': True, 'reason': '', 'rows': done}

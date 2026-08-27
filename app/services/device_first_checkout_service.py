@@ -3393,7 +3393,11 @@ async def _send_referral_reward_message(db: AsyncSession, *, bot, checkout: Subs
             continue
         english = recipient.language == 'en'
         suffix = (reward.device_first_ledger_key or '').rsplit(':', 1)[-1]
-        amount = settings.format_price(reward.amount_kopeks)
+        # 🔴 Точная сумма, без округления. `format_price` при включённом
+        # PRICE_ROUNDING_ENABLED отбрасывает копейки и округляет ВВЕРХ: партнёру
+        # обещали бы 400 ₽, а на баланс легло бы 399,75 ₽. Число, которое человек
+        # сверяет со своим балансом, округлять нельзя.
+        amount = f'{reward.amount_kopeks // 100},{reward.amount_kopeks % 100:02d} ₽'
 
         if suffix == 'referred-first-bonus':
             text = (
