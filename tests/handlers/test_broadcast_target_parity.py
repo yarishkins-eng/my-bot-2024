@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.cabinet.routes import admin_broadcasts as broadcast_routes
-from app.cabinet.schemas.broadcasts import BroadcastPreviewRequest, EmailPreviewRequest
+from app.cabinet.schemas.broadcasts import (
+    BroadcastPreviewRequest,
+    CombinedBroadcastCreateRequest,
+    EmailPreviewRequest,
+)
 from app.database.crud import subscription as subscription_crud
 from app.database.crud.subscription import get_expiring_subscriptions
 from app.database.models import SubscriptionStatus
@@ -314,16 +318,20 @@ async def test_telegram_projection_is_unique_and_respects_channel_eligibility(mo
         SimpleNamespace(id=2, telegram_id=None, notification_settings={}),
         SimpleNamespace(id=3, telegram_id=300, notification_settings={'news_enabled': False}),
         SimpleNamespace(id=4, telegram_id=100, notification_settings={}),
+        SimpleNamespace(id=5, telegram_id=500, notification_settings={'promo_offers_enabled': False}),
     ]
+    calls: list[str] = []
 
     async def fake_get_target_users(db, target: str):
-        assert target == 'active'
+        calls.append(target)
         return users
 
     monkeypatch.setattr(broadcast_module, 'get_target_users', fake_get_target_users)
 
-    assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(object(), 'active', 'system') == [100, 300]
-    assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(object(), 'active', 'news') == [100]
+    assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(object(), 'active', 'system') == [100, 300, 500]
+    assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(object(), 'trial', 'news') == [100, 500]
+    assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(object(), 'expired', 'promo') == [100, 300]
+    assert calls == ['active', 'trial', 'expired']
 
 
 @pytest.mark.asyncio
@@ -337,13 +345,14 @@ async def test_telegram_projection_forwards_non_all_target_with_preloaded_users(
 
     monkeypatch.setattr(broadcast_module, 'get_target_users', fake_get_target_users)
 
-    assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(
-        object(),
-        'tariff_17',
-        'system',
-        preloaded_users=preloaded,
-    ) == [101]
-    assert calls == [('tariff_17', True)]
+    for target in ('tariff_17', 'active_zero'):
+        assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(
+            object(),
+            target,
+            'system',
+            preloaded_users=preloaded,
+        ) == [101]
+    assert calls == [('tariff_17', True), ('active_zero', True)]
 
 
 @pytest.mark.asyncio
@@ -364,6 +373,14 @@ async def test_email_projection_deduplicates_join_rows_and_respects_opt_out() ->
         last_name='User',
         notification_settings={'promo_offers_enabled': False},
     )
+    news_opted_out = SimpleNamespace(
+        id=3,
+        email='three@example.com',
+        username='three',
+        first_name=None,
+        last_name=None,
+        notification_settings={'news_enabled': False},
+    )
 
     class FakeScalars:
         def __init__(self):
@@ -375,7 +392,7 @@ async def test_email_projection_deduplicates_join_rows_and_respects_opt_out() ->
 
         def all(self):
             assert self.was_unique, 'join rows must be deduplicated before projection'
-            return [first, opted_out]
+            return [first, opted_out, news_opted_out]
 
     class FakeResult:
         def scalars(self):
@@ -385,14 +402,18 @@ async def test_email_projection_deduplicates_join_rows_and_respects_opt_out() ->
         async def execute(self, statement):
             return FakeResult()
 
-    recipients = await broadcast_module.resolve_email_broadcast_recipients(
-        FakeSession(),
-        'active_email',
-        'promo',
-    )
-    assert [(recipient.email, recipient.user_name) for recipient in recipients] == [
-        ('one@example.com', 'one')
-    ]
+    expected_by_category = {
+        'system': ['one@example.com', 'two@example.com', 'three@example.com'],
+        'news': ['one@example.com', 'two@example.com'],
+        'promo': ['one@example.com', 'three@example.com'],
+    }
+    for category, expected_emails in expected_by_category.items():
+        recipients = await broadcast_module.resolve_email_broadcast_recipients(
+            FakeSession(),
+            'active_email',
+            category,
+        )
+        assert [recipient.email for recipient in recipients] == expected_emails
 
 
 @pytest.mark.asyncio
@@ -473,20 +494,20 @@ async def test_preview_routes_use_channel_projection_with_current_category(monke
     monkeypatch.setattr(broadcast_routes, 'resolve_email_broadcast_recipients', fake_email)
 
     telegram = await broadcast_routes.preview_broadcast(
-        BroadcastPreviewRequest(target='all', category='news'),
+        BroadcastPreviewRequest(target='active_zero', category='news'),
         admin=object(),
         db=FakeSession(),
     )
     email = await broadcast_routes.preview_email_broadcast(
-        EmailPreviewRequest(target='all_email', category='promo'),
+        EmailPreviewRequest(target='expired_email', category='promo'),
         admin=object(),
         db=FakeSession(),
     )
 
     assert telegram.count == 2
     assert email.count == 1
-    assert telegram_calls == [('all', 'news')]
-    assert email_calls == [('all_email', 'promo')]
+    assert telegram_calls == [('active_zero', 'news')]
+    assert email_calls == [('expired_email', 'promo')]
 
 
 @pytest.mark.asyncio
@@ -674,6 +695,78 @@ def test_category_is_wired_from_create_route_through_both_workers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_route_forwards_exact_target_and_category_to_each_worker(monkeypatch) -> None:
+    """Selected non-default targets must survive the DB-record/config seam unchanged."""
+
+    started: list[tuple[str, str, str]] = []
+
+    async def fake_start_telegram(broadcast_id: int, config) -> None:
+        started.append(('telegram', config.target, config.category))
+
+    async def fake_start_email(broadcast_id: int, config) -> None:
+        started.append(('email', config.target, config.category))
+
+    class FakeRows:
+        def all(self):
+            return [(17,)]
+
+    class FakeSession:
+        def __init__(self):
+            self.next_id = 100
+
+        async def execute(self, statement):
+            return FakeRows()
+
+        def add(self, broadcast) -> None:
+            self.broadcast = broadcast
+
+        async def commit(self) -> None:
+            return None
+
+        async def refresh(self, broadcast) -> None:
+            if broadcast.id is None:
+                broadcast.id = self.next_id
+                self.next_id += 1
+            if broadcast.created_at is None:
+                broadcast.created_at = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+            broadcast.completed_at = None
+            broadcast.blocked_count = 0
+
+    monkeypatch.setattr(broadcast_routes.broadcast_service, 'start_broadcast', fake_start_telegram)
+    monkeypatch.setattr(broadcast_routes.email_broadcast_service, 'start_broadcast', fake_start_email)
+
+    admin = SimpleNamespace(id=7, username='owner')
+    session = FakeSession()
+    await broadcast_routes.create_combined_broadcast(
+        CombinedBroadcastCreateRequest(
+            channel='telegram',
+            target='tariff_17',
+            message_text='Telegram message',
+            selected_buttons=[],
+            category='news',
+        ),
+        admin=admin,
+        db=session,
+    )
+    await broadcast_routes.create_combined_broadcast(
+        CombinedBroadcastCreateRequest(
+            channel='email',
+            target='expired_email',
+            email_subject='Email subject',
+            email_html_content='<p>Email body</p>',
+            category='promo',
+        ),
+        admin=admin,
+        db=session,
+    )
+
+    assert started == [
+        ('telegram', 'tariff_17', 'news'),
+        ('email', 'expired_email', 'promo'),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_chat_broadcast_uses_same_system_telegram_projection(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
@@ -687,8 +780,9 @@ async def test_chat_broadcast_uses_same_system_telegram_projection(monkeypatch) 
         fake_projection,
     )
 
-    assert await admin_messages._get_telegram_target_recipient_ids(object(), 'expiring') == [101, 202]
-    assert calls == [('expiring', 'system')]
+    for target in ('expiring', 'trial_zero'):
+        assert await admin_messages._get_telegram_target_recipient_ids(object(), target) == [101, 202]
+    assert calls == [('expiring', 'system'), ('trial_zero', 'system')]
 
     for handler in (
         admin_messages.select_broadcast_target,
