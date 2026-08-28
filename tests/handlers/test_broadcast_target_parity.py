@@ -555,7 +555,8 @@ async def test_workers_delegate_to_the_same_channel_projections(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatch) -> None:
+@pytest.mark.parametrize('category', ['news', 'promo'])
+async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatch, category: str) -> None:
     """Parity не должна превращать один экран в N полных чтений users+subs."""
 
     base_users = [SimpleNamespace(id=1)]
@@ -576,8 +577,8 @@ async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatc
         projections.append((target, category, preloaded_users is base_users))
         return [100]
 
-    async def fake_tariff_counts(session, category: str, *, preloaded_users=None):
-        assert category == 'news'
+    async def fake_tariff_counts(session, actual_category: str, *, preloaded_users=None):
+        assert actual_category == category
         assert preloaded_users is base_users
         return {}
 
@@ -602,7 +603,7 @@ async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatc
     monkeypatch.setattr(broadcast_routes, '_get_tariff_user_counts', fake_tariff_counts)
 
     response = await broadcast_routes.get_filters(
-        category='news',
+        category=category,
         admin=object(),
         db=FakeSession(),
     )
@@ -612,8 +613,70 @@ async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatc
     assert len(response.custom_filters) == len(broadcast_routes.CUSTOM_FILTER_LABELS)
     standard_calls = [call for call in projections if not call[0].startswith('custom_')]
     custom_calls = [call for call in projections if call[0].startswith('custom_')]
-    assert standard_calls and all(category == 'news' and reused for _, category, reused in standard_calls)
-    assert custom_calls and all(category == 'news' and not reused for _, category, reused in custom_calls)
+    assert standard_calls and all(actual == category and reused for _, actual, reused in standard_calls)
+    assert custom_calls and all(actual == category and not reused for _, actual, reused in custom_calls)
+
+
+@pytest.mark.asyncio
+async def test_tariff_catalog_forwards_each_category_to_projection(monkeypatch) -> None:
+    preloaded = [SimpleNamespace(id=1)]
+    calls: list[tuple[str, str, bool]] = []
+
+    class FakeRows:
+        def all(self):
+            return [(17,), (23,)]
+
+    class FakeSession:
+        async def execute(self, statement):
+            return FakeRows()
+
+    async def fake_projection(session, target: str, category: str, *, preloaded_users=None):
+        calls.append((target, category, preloaded_users is preloaded))
+        return [101]
+
+    monkeypatch.setattr(
+        broadcast_routes,
+        'resolve_telegram_broadcast_recipient_ids',
+        fake_projection,
+    )
+
+    for category in ('system', 'promo'):
+        assert await broadcast_routes._get_tariff_user_counts(
+            FakeSession(),
+            category,
+            preloaded_users=preloaded,
+        ) == {17: 1, 23: 1}
+
+    assert calls == [
+        ('tariff_17', 'system', True),
+        ('tariff_23', 'system', True),
+        ('tariff_17', 'promo', True),
+        ('tariff_23', 'promo', True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_email_catalog_forwards_each_category_to_all_filters(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_count(session, target: str, category: str) -> int:
+        calls.append((target, category))
+        return 1
+
+    monkeypatch.setattr(broadcast_routes, '_get_email_filter_count', fake_count)
+
+    for category in ('system', 'news'):
+        response = await broadcast_routes.get_email_filters(
+            category=category,
+            admin=object(),
+            db=object(),
+        )
+        assert response.total_with_email == 1
+
+    assert calls == [
+        *((key, 'system') for key in broadcast_routes.EMAIL_FILTER_LABELS),
+        *((key, 'news') for key in broadcast_routes.EMAIL_FILTER_LABELS),
+    ]
 
 
 @pytest.mark.asyncio
