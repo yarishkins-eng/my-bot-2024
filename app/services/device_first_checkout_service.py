@@ -17,6 +17,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database.crud.discount_offer import get_latest_claimed_offer_for_user
+from app.database.crud.promo_offer_log import log_promo_offer_action
 from app.database.crud.subscription import (
     create_paid_subscription,
     extend_subscription,
@@ -1545,6 +1547,19 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
     checkout.quote_state = 'committed'
     user.balance_kopeks -= charge
     user.has_had_paid_subscription = True
+    # Скидку меряем ПЕРЕСЧИТАННОЙ ценой, а не замороженной разбивкой заказа: выше
+    # стоит забор `charge != checkout.quoted_price_kopeks`, но он сверяет ИТОГ, а не
+    # его состав. Именно `current_price` и дал ту сумму, которую сейчас списываем.
+    await _consume_promo_offer_for_sale(
+        db,
+        user=user,
+        checkout=checkout,
+        applied_discount_kopeks=int(current_price.promo_offer_discount or 0),
+        # Здесь цена пересчитана ПРЯМО СЕЙЧАС из текущего предложения человека, поэтому
+        # применённое и гасимое — одно и то же по построению, и сверка тождественна.
+        # Окна, в которое предложение могло смениться, у этой ветки нет.
+        expected_source=getattr(user, 'promo_offer_discount_source', None),
+    )
     ledger = Transaction(
         user_id=user.id,
         type=TransactionType.SUBSCRIPTION_PAYMENT.value,
@@ -1840,7 +1855,7 @@ def _load_checkout_quoted_entitlement(checkout: SubscriptionCheckout):
 
 
 def _direct_sale_snapshot(
-    checkout: SubscriptionCheckout, tariff: Tariff, *, funding_mode: str, entitlement
+    checkout: SubscriptionCheckout, tariff: Tariff, *, funding_mode: str, entitlement, user: User
 ) -> dict[str, Any]:
     """The post-confirmation source of truth; no later tariff repricing is allowed."""
     return {
@@ -1860,6 +1875,16 @@ def _direct_sale_snapshot(
         'pricing_revision': checkout.pricing_revision,
         'funding_mode': funding_mode,
         'target_snapshot': checkout.target_snapshot,
+        # 🔴 ЛИЧНОСТЬ предложения, а не только его сумма. Между заморозкой цены и приходом
+        # денег человек может забрать ДРУГОЕ предложение — оно в двух нажатиях в кабинете.
+        # ⚠️ Окно — ТРИДЦАТЬ МИНУТ (`quote_expires_at`, `:1028`), а не часы: оплату после
+        # истечения котировки уводит в «деньги только на баланс»
+        # (`device_first_payment_service.py:1925-1932`), до гашения она не доходит.
+        # Первая формулировка говорила «часами» — преувеличение, поймано критиком полноты:
+        # две линзы ревью разошлись в этом месте, разобрано по коду. Без этой строки гасилось
+        # бы то, что лежит на нём в момент вебхука, а не то, что вошло в цену, — и клиент
+        # терял бы неиспользованную скидку. Нашли две линзы ревью независимо.
+        'promo_offer_source': getattr(user, 'promo_offer_discount_source', None),
         'expires_at': checkout.quote_expires_at.isoformat(),
     }
 
@@ -1903,7 +1928,9 @@ async def prepare_direct_external_checkout(
     checkout.wallet_applied_kopeks = 0
     checkout.external_payable_kopeks = total
     checkout.funding_mode = 'platega'
-    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='platega', entitlement=entitlement)
+    checkout.sale_snapshot = _direct_sale_snapshot(
+        checkout, tariff, funding_mode='platega', entitlement=entitlement, user=user
+    )
     checkout.financial_committed_at = datetime.now(UTC)
     checkout.lifecycle_state = 'awaiting_funds'
     checkout.funding_state = 'invoice_pending'
@@ -1913,6 +1940,114 @@ async def prepare_direct_external_checkout(
     else:
         await db.flush()
     return checkout
+
+
+async def _consume_promo_offer_for_sale(
+    db: AsyncSession,
+    *,
+    user: User,
+    checkout: SubscriptionCheckout,
+    applied_discount_kopeks: int,
+    expected_source: str | None,
+) -> None:
+    """Погасить одноразовую скидку, которую эта продажа ДЕЙСТВИТЕЛЬНО применила.
+
+    🔴 Гасим по ФАКТУ применения (сколько копеек скидки ушло в цену), а не по праву
+    на скидку. Право бывает и тогда, когда скидка на эту покупку вышла нулевой, — и
+    тогда предложение сгорает впустую. Это мина **BC**, живой пример соседа, который
+    так делать не надо: `app/handlers/menu.py:1814`. Легаси-пути гасят правильно
+    (`handlers/subscription/purchase.py:2634`, `.../tariff_purchase.py:1263`).
+
+    🔴 Звать ТОЛЬКО из блока, который исполняется один раз на заказ: повтор вебхука
+    провайдера не должен гасить второе предложение. Сегодня таких мест два, и оба
+    прикрыты уникальным `device_first_ledger_key` на денежной строке.
+
+    ⚠️ Лог пишем В ТОЙ ЖЕ сессии (`commit=False`), а не в отдельной, как это делает
+    сосед `subtract_user_balance` (`app/database/crud/user.py:780-800`). У соседа
+    деньги к этому моменту уже закоммичены, и отдельная сессия защищает его от
+    `MissingGreenlet`. Здесь коммита ещё не было: запись в отдельной сессии
+    пережила бы откат продажи и соврала бы, что скидка потрачена.
+    """
+    if applied_discount_kopeks <= 0:
+        return
+    try:
+        percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0)
+    except (TypeError, ValueError):
+        percent = 0
+    if percent <= 0:
+        return
+
+    source = getattr(user, 'promo_offer_discount_source', None)
+    if source != expected_source:
+        # Предложение сменилось между расчётом цены и приходом денег. Гасить нельзя:
+        # человек потерял бы предложение, которого эта покупка не применяла. Несовпадение
+        # всегда решаем в пользу клиента — оставить скидку дешевле, чем сжечь чужую.
+        logger.info(
+            'Promo offer changed between the quote and the sale; leaving it untouched',
+            user_id=user.id,
+            checkout_id=checkout.id,
+            quoted_source=expected_source,
+            current_source=source,
+        )
+        return
+    try:
+        offer = await get_latest_claimed_offer_for_user(db, user.id, source)
+    except Exception as lookup_error:  # pragma: no cover - defensive logging
+        # Поиск предложения нужен только чтобы лог был подробнее. Продажу он не решает.
+        logger.warning(
+            'Failed to fetch claimed promo offer for device-first sale',
+            user_id=user.id,
+            checkout_id=checkout.id,
+            lookup_error=lookup_error,
+        )
+        offer = None
+
+    user.promo_offer_discount_percent = 0
+    user.promo_offer_discount_source = None
+    user.promo_offer_discount_expires_at = None
+
+    # 🔴 Журнал — ВСПОМОГАТЕЛЬНЫЙ, ронять им оплаченную продажу нельзя. Сосед прикрывает
+    # свою такую запись голым `try/except` (`app/database/crud/user.py:811-828`), и этого
+    # ЗДЕСЬ мало: упавший `flush()` отравляет транзакцию, и следующий `commit()` всё равно
+    # падает `PendingRollbackError` — на карточном пути это откат продажи, за которую
+    # провайдер уже взял деньги. Поэтому сейвпоинт, как это уже сделано в том же файле
+    # вокруг выдачи подписки: откатывается только журнал, продажа остаётся.
+    # ⛔ НЕ УБИРАТЬ сейвпоинт: тестом он не сторожится и снятие его набор переживает.
+    # С подделкой сессии сейвпоинт неотличим от голого `try/except` — разница видна
+    # только на настоящей транзакции. Пробел записан в плане, а не замолчан.
+    try:
+        async with db.begin_nested():
+            await log_promo_offer_action(
+                db,
+                user_id=user.id,
+                offer_id=offer.id if offer else None,
+                action='consumed',
+                source=source,
+                percent=percent,
+                effect_type=offer.effect_type if offer else None,
+                # ⚠️ Ключи именно эти: `description` и `amount_kopeks` экран журнала промо
+                # уже умеет рисовать (`handlers/admin/promo_offers.py:356-368`). Свои имена
+                # (`checkout_public_id`, `discount_kopeks`) не рисовались бы НИГДЕ — то есть
+                # владелец не увидел бы ровно того, ради чего их кладут.
+                details={
+                    'reason': 'device_first_checkout',
+                    # ⚠️ Сумму скидки кладём В ОПИСАНИЕ, а не в `amount_kopeks`. Экран
+                    # журнала рисует этот ключ как «💰 Сумма», и у соседних записей он
+                    # означает СПИСАННОЕ (`crud/user.py:803`). Владелец прочитал бы
+                    # «Сумма: 24,90 ₽» под покупкой за 224,10 ₽ как цену покупки.
+                    'description': (
+                        f'Покупка в кассе, заказ {checkout.public_id} · скидка {applied_discount_kopeks / 100:.2f} ₽'
+                    ),
+                },
+                commit=False,
+            )
+    except Exception as log_error:  # pragma: no cover - defensive logging
+        logger.warning(
+            'Failed to record promo offer consumption for a device-first sale',
+            user_id=user.id,
+            checkout_id=checkout.id,
+            log_error=log_error,
+        )
 
 
 async def _complete_direct_sale_locked(
@@ -2165,6 +2300,21 @@ async def _complete_direct_sale_locked(
         db.add(sale)
         await db.flush()
     user.has_had_paid_subscription = True
+    # Читаем из СНИМКА, а не из колонки заказа. Сегодня они совпадают (колонка пишется один
+    # раз при создании), но вся остальная функция построена на снимке именно потому, что
+    # колонка изменяемая, — а на неё нет забора расхождения. Нашла линза «деньги».
+    _frozen_breakdown = (checkout.sale_snapshot or {}).get('price_breakdown') or {}
+    await _consume_promo_offer_for_sale(
+        db,
+        user=user,
+        checkout=checkout,
+        applied_discount_kopeks=int(_frozen_breakdown.get('promo_offer_discount_kopeks') or 0),
+        # Заказы, заведённые ДО этой правки, личности предложения не несут. Для них
+        # запасное значение делает сверку тождественной — то есть прежнее правило «по сумме».
+        expected_source=(checkout.sale_snapshot or {}).get(
+            'promo_offer_source', getattr(user, 'promo_offer_discount_source', None)
+        ),
+    )
     checkout.created_subscription_id = target.id
     checkout.debit_transaction_id = sale.id
     checkout.lifecycle_state = 'fulfilling'
@@ -2215,7 +2365,9 @@ async def commit_direct_wallet_checkout(
     checkout.wallet_applied_kopeks = total
     checkout.external_payable_kopeks = 0
     checkout.funding_mode = 'wallet'
-    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='wallet', entitlement=entitlement)
+    checkout.sale_snapshot = _direct_sale_snapshot(
+        checkout, tariff, funding_mode='wallet', entitlement=entitlement, user=user
+    )
     checkout.financial_committed_at = datetime.now(UTC)
     await _complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
     await db.commit()

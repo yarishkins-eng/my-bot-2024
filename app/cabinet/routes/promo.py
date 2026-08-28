@@ -1,5 +1,7 @@
 """Promo offers routes for cabinet - personal discounts and offers."""
 
+import html as html_module
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,12 +19,27 @@ from app.database.crud.promo_group import get_auto_assign_promo_groups
 from app.database.crud.promo_offer_template import get_promo_offer_template_by_id
 from app.database.crud.transaction import get_user_total_spent_kopeks
 from app.database.models import DiscountOffer, User
+from app.handlers.subscription.common import _format_text_with_placeholders
+from app.localization.texts import get_texts
 from app.services.promo_offer_service import promo_offer_service
+from app.utils.timezone import format_local_datetime
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 
 
 logger = structlog.get_logger(__name__)
+
+# 🔴 Ответ этого маршрута экран показывает КАК ЕСТЬ, внутри `<span>{message}</span>`
+# (`cabinet-code/.../PromoOffersSection.tsx:241`). React экранирует разметку, поэтому
+# телеграмные `<b>` из общей локали приехали бы к человеку буквами, а двойные переносы
+# схлопнулись бы в пробел. Снимаем разметку и сводим текст в одну строку.
+# Поймано прогоном сценария волны 2 — как дефект В ПОЧИНКЕ предыдущей находки.
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _as_plain_line(text: str) -> str:
+    return ' '.join(html_module.unescape(_HTML_TAG_RE.sub('', text)).split())
+
 
 router = APIRouter(prefix='/promo', tags=['Cabinet Promo'])
 
@@ -392,13 +409,41 @@ async def claim_promo_offer(
     )
     await db.refresh(user)
 
-    expires_text = ''
+    # 🔴 Этот текст экран показывает клиенту КАК ЕСТЬ (`PromoOffersSection.tsx:109`,
+    # `setSuccessMessage(result.message)`). До этапа СК-1б хвост со сроком был
+    # недостижим — у волновых предложений срока не бывало вовсе, — и появление его
+    # в прежнем виде дало бы русскоязычному человеку английскую строку с временем
+    # в UTC. Берём те же ключи локали, что и бот, и время в часовом поясе проекта.
+    texts = get_texts(getattr(user, 'language', None))
     if discount_expires_at:
-        expires_text = f' Valid until {discount_expires_at.strftime("%Y-%m-%d %H:%M")}'
+        template = texts.get(
+            'DISCOUNT_CLAIM_SUCCESS_WITH_EXPIRY',
+            'Скидка {percent}% активирована! Она действует до {expires_at}.',
+        )
+        # ⛔ НЕ `str.format`: у текста может оказаться подстановка, которой мы не дали
+        # (в промо-шаблонах живут `{server_name}`, `{valid_hours}`), и голый `.format`
+        # уронил бы КЛИЕНТСКИЙ маршрут пятисоткой. Общий помощник неизвестную подстановку
+        # оставляет видимой и не падает — бот в этом же случае деградирует, а не умирает.
+        # Он же закрывает подстановку вида `{ключ.атрибут}`. Нашла ревизия плана.
+        message = _as_plain_line(
+            _format_text_with_placeholders(
+                template,
+                {
+                    'percent': discount_percent,
+                    'expires_at': format_local_datetime(discount_expires_at, '%d.%m.%Y %H:%M'),
+                },
+            )
+        )
+    else:
+        template = texts.get(
+            'DISCOUNT_CLAIM_SUCCESS',
+            'Скидка {percent}% активирована! Она применится к оплате автоматически.',
+        )
+        message = _as_plain_line(_format_text_with_placeholders(template, {'percent': discount_percent}))
 
     return ClaimOfferResponse(
         success=True,
-        message=f'Discount of {discount_percent}% activated!{expires_text}',
+        message=message,
         discount_percent=discount_percent,
         expires_at=discount_expires_at,
     )

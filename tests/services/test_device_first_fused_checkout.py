@@ -54,7 +54,7 @@ def _checkout(**overrides):
     return SimpleNamespace(**{**base, **overrides})
 
 
-def _access_point_sale_checkout(*, entitlement: ResolvedEntitlement):
+def _access_point_sale_checkout(*, entitlement: ResolvedEntitlement, user=None):
     checkout = _checkout(
         tariff_id=7,
         tariff_total_kopeks=36_900,
@@ -73,6 +73,7 @@ def _access_point_sale_checkout(*, entitlement: ResolvedEntitlement):
         tariff,
         funding_mode='platega',
         entitlement=entitlement,
+        user=user if user is not None else _user(),
     )
     return checkout, tariff
 
@@ -154,7 +155,7 @@ async def test_access_point_policy_drift_forces_requote_before_any_funding_trans
     monkeypatch.setattr(
         service.pricing_engine,
         'calculate_tariff_purchase_price',
-        AsyncMock(return_value=SimpleNamespace(final_total=36_900)),
+        AsyncMock(return_value=SimpleNamespace(final_total=36_900, promo_offer_discount=0)),
     )
     monkeypatch.setattr(
         'app.services.public_location_entitlement_service.resolve_tariff_entitlement',

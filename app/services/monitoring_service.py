@@ -1624,6 +1624,16 @@ class MonitoringService:
                             bonus_amount_kopeks=0,
                             valid_hours=valid_hours,
                             effect_type='percent_discount',
+                            # Срок скидки ПОСЛЕ нажатия «Получить скидку» = тот же valid_hours,
+                            # чтобы скидка не была бессрочной.
+                            # ⚠️ Это НЕ «совпадает с текстом «действует до …»»: в письме
+                            # {expires_at} — дедлайн ПОЛУЧЕНИЯ предложения, а этот срок
+                            # отсчитывается от НАЖАТИЯ. Забравший на последнем часу получит
+                            # скидку дольше обещанного — в щедрую сторону, и это осознанно.
+                            # Без него обработчик получения ставит expires_at=None, и уборщик
+                            # просроченных скидок такую строку не видит вовсе: он требует непустой срок
+                            # (app/database/crud/user.py:846-847).
+                            extra_data={'active_discount_hours': valid_hours},
                         )
                         success = await self._send_expired_discount_notification(
                             user,
@@ -1653,6 +1663,16 @@ class MonitoringService:
                                 bonus_amount_kopeks=0,
                                 valid_hours=valid_hours,
                                 effect_type='percent_discount',
+                                # Срок скидки ПОСЛЕ нажатия «Получить скидку» = тот же valid_hours,
+                                # чтобы скидка не была бессрочной.
+                                # ⚠️ Это НЕ «совпадает с текстом «действует до …»»: в письме
+                                # {expires_at} — дедлайн ПОЛУЧЕНИЯ предложения, а этот срок
+                                # отсчитывается от НАЖАТИЯ. Забравший на последнем часу получит
+                                # скидку дольше обещанного — в щедрую сторону, и это осознанно.
+                                # Без него обработчик получения ставит expires_at=None, и уборщик
+                                # просроченных скидок такую строку не видит вовсе: он требует непустой срок
+                                # (app/database/crud/user.py:846-847).
+                                extra_data={'active_discount_hours': valid_hours},
                             )
                             success = await self._send_expired_discount_notification(
                                 user,

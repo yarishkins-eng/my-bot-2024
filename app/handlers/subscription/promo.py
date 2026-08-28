@@ -21,6 +21,7 @@ from app.utils.pricing_utils import (
 from app.utils.promo_offer import (
     build_promo_offer_hint,
 )
+from app.utils.timezone import format_local_datetime
 
 from .common import _format_text_with_placeholders
 
@@ -261,12 +262,26 @@ async def claim_discount_offer(
     )
     await db.refresh(db_user)
 
-    success_template = texts.get(
-        'DISCOUNT_CLAIM_SUCCESS',
-        '🎉 Скидка {percent}% активирована! Она автоматически применится при следующей оплате.',
-    )
+    # 🔴 У скидки теперь бывает СРОК (этап СК-1б: волны «2-3 дня» и «5 дней» перестали
+    # выдавать вечную скидку). Обещание «применится при следующей оплате» стало правдой
+    # только внутри этого срока, поэтому у текста два варианта.
+    # ⛔ Не сводить их в один с `{expires_at}` внутри: при отсутствии ключа
+    # `_format_text_with_placeholders` печатает подстановку БУКВАЛЬНО, и человек без
+    # срока (например, предложение тестовых серверов) увидит фигурные скобки.
+    if discount_expires_at:
+        success_template = texts.get(
+            'DISCOUNT_CLAIM_SUCCESS_WITH_EXPIRY',
+            '🎉 Скидка {percent}% активирована! Она применится к оплате автоматически.\n\n'
+            '⏳ Скидка действует до {expires_at}.',
+        )
+    else:
+        success_template = texts.get(
+            'DISCOUNT_CLAIM_SUCCESS',
+            '🎉 Скидка {percent}% активирована! Она автоматически применится при следующей оплате.',
+        )
 
-    expires_text = discount_expires_at.strftime('%d.%m.%Y %H:%M') if discount_expires_at else ''
+    # Время показываем в часовом поясе проекта, а не в UTC: строка идёт человеку.
+    expires_text = format_local_datetime(discount_expires_at, '%d.%m.%Y %H:%M') if discount_expires_at else ''
 
     format_values: dict[str, Any] = {'percent': discount_percent}
 
