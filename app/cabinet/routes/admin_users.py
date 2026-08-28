@@ -3042,6 +3042,23 @@ async def get_user_referrals(
 
     items = [_build_user_list_item(r, spending_stats) for r in referrals]
 
+    if user_ids:
+        earnings_query = (
+            select(
+                ReferralEarning.referral_id,
+                func.sum(ReferralEarning.amount_kopeks).label('referral_earned_kopeks'),
+            )
+            .where(
+                ReferralEarning.user_id == user.id,
+                ReferralEarning.referral_id.in_(user_ids),
+            )
+            .group_by(ReferralEarning.referral_id)
+        )
+        earnings_result = await db.execute(earnings_query)
+        earnings_by_referral = {row.referral_id: int(row.referral_earned_kopeks or 0) for row in earnings_result.all()}
+        for item in items:
+            item.referral_earned_kopeks = earnings_by_referral.get(item.id, 0)
+
     return UsersListResponse(
         users=items,
         total=total,

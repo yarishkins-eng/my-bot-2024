@@ -133,6 +133,7 @@ class UserListItem(BaseModel):
 
     # Stats
     total_spent_kopeks: int = 0
+    referral_earned_kopeks: int = 0
     purchase_count: int = 0
 
     # Restrictions
