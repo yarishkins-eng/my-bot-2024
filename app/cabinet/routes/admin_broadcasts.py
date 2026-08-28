@@ -46,6 +46,10 @@ logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix='/admin/broadcasts', tags=['Cabinet Admin Broadcasts'])
 
+SAFE_CUSTOM_BROADCAST_CALLBACKS = frozenset(
+    {config['callback'] for config in BROADCAST_BUTTONS.values()} | {'menu_buy'}
+)
+
 
 # ============ Filter Labels ============
 
@@ -215,6 +219,24 @@ def _validate_buttons(buttons: list[str]) -> bool:
     return all(button in BROADCAST_BUTTONS for button in buttons)
 
 
+def _validate_custom_broadcast_callbacks(custom_buttons) -> None:
+    """Reject callbacks that are unsafe or have no stable public handler."""
+    invalid_callbacks = sorted(
+        {
+            button.action_value
+            for button in custom_buttons
+            if button.action_type == 'callback' and button.action_value not in SAFE_CUSTOM_BROADCAST_CALLBACKS
+        }
+    )
+    if invalid_callbacks:
+        allowed = ', '.join(sorted(SAFE_CUSTOM_BROADCAST_CALLBACKS))
+        invalid = ', '.join(invalid_callbacks)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Unknown callback action: {invalid}. Allowed actions: {allowed}',
+        )
+
+
 # ============ Endpoints ============
 
 
@@ -377,6 +399,8 @@ async def create_broadcast(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Invalid button key',
         )
+
+    _validate_custom_broadcast_callbacks(request.custom_buttons)
 
     message_text = request.message_text.strip()
     if not message_text:
@@ -563,6 +587,8 @@ async def create_combined_broadcast(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='Invalid button key',
             )
+
+        _validate_custom_broadcast_callbacks(request.custom_buttons)
 
     if request.channel in ('email', 'both'):
         # For email channel, target must be email filter or we use telegram target for 'both'

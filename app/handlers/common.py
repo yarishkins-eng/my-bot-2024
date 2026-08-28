@@ -1,5 +1,5 @@
 import structlog
-from aiogram import Dispatcher, F, types
+from aiogram import Dispatcher, F, Router, types
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,7 +48,7 @@ async def handle_unknown_callback(callback: types.CallbackQuery, db_user: User):
     await callback.answer(
         texts.t(
             'UNKNOWN_CALLBACK_ALERT',
-            '❓ Неизвестная команда. Попробуйте ещё раз.',
+            '❓ Эта кнопка больше недоступна. Откройте актуальное меню командой /start.',
         ),
         show_alert=True,
     )
@@ -56,6 +56,14 @@ async def handle_unknown_callback(callback: types.CallbackQuery, db_user: User):
     logger.warning(
         'Неизвестный callback от пользователя', callback_data=callback.data, from_user_id=callback.from_user.id
     )
+
+
+def register_unknown_callback_fallback(dp: Dispatcher) -> Router:
+    """Attach a terminal child router after every known callback handler."""
+    fallback_router = Router(name='unknown_callback_fallback')
+    fallback_router.callback_query.register(handle_unknown_callback)
+    dp.include_router(fallback_router)
+    return fallback_router
 
 
 async def handle_noop(callback: types.CallbackQuery, db_user: User):
