@@ -19,6 +19,7 @@ from app.services.broadcast_service import (
     resolve_email_broadcast_recipients,
     resolve_telegram_broadcast_recipient_ids,
 )
+from app.utils.telegram_html import prepare_telegram_broadcast
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.broadcasts import (
@@ -402,21 +403,19 @@ async def create_broadcast(
 
     _validate_custom_broadcast_callbacks(request.custom_buttons)
 
-    message_text = request.message_text.strip()
-    if not message_text:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Message text must not be empty',
+    try:
+        message_text = prepare_telegram_broadcast(request.message_text)
+        media_caption = (
+            prepare_telegram_broadcast(
+                request.media.caption if request.media.caption and request.media.caption.strip() else message_text
+            )
+            if request.media
+            else None
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     media_payload = request.media
-
-    # Validate caption length for media messages (Telegram limit: 1024 chars)
-    if media_payload and len(message_text) > 1024:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Текст слишком длинный для сообщения с медиа. Максимум 1024 символов, сейчас {len(message_text)}. Сократите текст или уберите медиафайл.',
-        )
 
     # Create broadcast record
     broadcast = BroadcastHistory(
@@ -425,7 +424,7 @@ async def create_broadcast(
         has_media=media_payload is not None,
         media_type=media_payload.type if media_payload else None,
         media_file_id=media_payload.file_id if media_payload else None,
-        media_caption=media_payload.caption if media_payload else None,
+        media_caption=media_caption,
         total_count=0,
         sent_count=0,
         failed_count=0,
@@ -444,7 +443,7 @@ async def create_broadcast(
         media_config = BroadcastMediaConfig(
             type=media_payload.type,
             file_id=media_payload.file_id,
-            caption=media_payload.caption or message_text,
+            caption=media_caption or message_text,
         )
 
     # Create broadcast config
@@ -565,6 +564,9 @@ async def create_combined_broadcast(
 
     admin_name = admin.username or f'Admin #{admin.id}'
 
+    telegram_message_text: str | None = None
+    media_caption: str | None = None
+
     # Validate based on channel
     if request.channel in ('telegram', 'both'):
         # Validate telegram target
@@ -574,12 +576,19 @@ async def create_combined_broadcast(
                 detail=f'Invalid target: {request.target}',
             )
 
-        # Validate telegram message
-        if not request.message_text or not request.message_text.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Message text is required for Telegram broadcast',
+        try:
+            telegram_message_text = prepare_telegram_broadcast(request.message_text)
+            media_caption = (
+                prepare_telegram_broadcast(
+                    request.media.caption
+                    if request.media.caption and request.media.caption.strip()
+                    else telegram_message_text
+                )
+                if request.media
+                else None
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
         # Validate buttons
         if not _validate_buttons(request.selected_buttons):
@@ -616,11 +625,11 @@ async def create_combined_broadcast(
     # Create broadcast record
     broadcast = BroadcastHistory(
         target_type=request.target,
-        message_text=request.message_text.strip() if request.message_text else None,
+        message_text=telegram_message_text,
         has_media=media_payload is not None,
         media_type=media_payload.type if media_payload else None,
         media_file_id=media_payload.file_id if media_payload else None,
-        media_caption=media_payload.caption if media_payload else None,
+        media_caption=media_caption,
         total_count=0,
         sent_count=0,
         failed_count=0,
@@ -638,19 +647,20 @@ async def create_combined_broadcast(
 
     # Start broadcasts based on channel
     if request.channel in ('telegram', 'both'):
+        assert telegram_message_text is not None
         # Prepare media config
         media_config = None
         if media_payload:
             media_config = BroadcastMediaConfig(
                 type=media_payload.type,
                 file_id=media_payload.file_id,
-                caption=media_payload.caption or request.message_text,
+                caption=media_caption or telegram_message_text,
             )
 
         # Create telegram broadcast config
         telegram_config = BroadcastConfig(
             target=request.target,
-            message_text=request.message_text.strip(),
+            message_text=telegram_message_text,
             selected_buttons=request.selected_buttons,
             media=media_config,
             initiator_name=admin_name,

@@ -26,6 +26,7 @@ from app.handlers.admin.messages import (
     get_target_users,
 )
 from app.utils.message_patch import caption_exceeds_telegram_limit
+from app.utils.telegram_html import prepare_telegram_broadcast
 
 
 if TYPE_CHECKING:
@@ -92,6 +93,14 @@ class BroadcastConfig:
     initiator_name: str | None = None
     custom_buttons: list[dict] | None = None
     category: str = 'system'  # system|news|promo
+
+    def __post_init__(self) -> None:
+        self.message_text = prepare_telegram_broadcast(self.message_text)
+        if self.media:
+            raw_caption = self.media.caption
+            self.media.caption = prepare_telegram_broadcast(
+                raw_caption if raw_caption and raw_caption.strip() else self.message_text
+            )
 
 
 @dataclass

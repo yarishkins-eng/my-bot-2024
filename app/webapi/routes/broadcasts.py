@@ -13,6 +13,7 @@ from app.services.broadcast_service import (
     BroadcastMediaConfig,
     broadcast_service,
 )
+from app.utils.telegram_html import prepare_telegram_broadcast
 
 from ..dependencies import get_db_session, require_api_token
 from ..schemas.broadcasts import (
@@ -52,9 +53,17 @@ async def create_broadcast(
     token: Any = Depends(require_api_token),
     db: AsyncSession = Depends(get_db_session),
 ) -> BroadcastResponse:
-    message_text = payload.message_text.strip()
-    if not message_text:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Message text must not be empty')
+    try:
+        message_text = prepare_telegram_broadcast(payload.message_text)
+        media_caption = (
+            prepare_telegram_broadcast(
+                payload.media.caption if payload.media.caption and payload.media.caption.strip() else message_text
+            )
+            if payload.media
+            else None
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
     media_payload = payload.media
 
@@ -64,7 +73,7 @@ async def create_broadcast(
         has_media=media_payload is not None,
         media_type=media_payload.type if media_payload else None,
         media_file_id=media_payload.file_id if media_payload else None,
-        media_caption=media_payload.caption if media_payload else None,
+        media_caption=media_caption,
         total_count=0,
         sent_count=0,
         failed_count=0,
@@ -81,7 +90,7 @@ async def create_broadcast(
         media_config = BroadcastMediaConfig(
             type=media_payload.type,
             file_id=media_payload.file_id,
-            caption=media_payload.caption or message_text,
+            caption=media_caption or message_text,
         )
 
     config = BroadcastConfig(

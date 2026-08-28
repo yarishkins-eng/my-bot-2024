@@ -1,8 +1,11 @@
 import re
 
+import pytest
+
 from app.utils.telegram_html import (
     html_to_telegram,
     info_page_faq_to_telegram,
+    prepare_telegram_broadcast,
     split_telegram_text,
 )
 
@@ -45,7 +48,48 @@ def test_heading_becomes_bold_block():
 
 def test_link_kept_only_with_http_href():
     assert html_to_telegram('<a href="https://example.com">x</a>') == '<a href="https://example.com">x</a>'
+    assert html_to_telegram('<a href="http://example.com:8080/path">x</a>') == (
+        '<a href="http://example.com:8080/path">x</a>'
+    )
+    assert html_to_telegram('<a href="https://example.com/%20?a=1&amp;b=2">x</a>') == (
+        '<a href="https://example.com/%20?a=1&amp;b=2">x</a>'
+    )
     assert html_to_telegram('<a href="javascript:alert(1)">x</a>') == 'x'
+
+
+@pytest.mark.parametrize('broken_anchor', ['<a>visible</a>', '<a href>visible</a>'])
+def test_anchor_without_href_is_removed_but_text_is_kept(broken_anchor: str):
+    assert html_to_telegram(broken_anchor) == 'visible'
+
+
+@pytest.mark.parametrize(
+    'unsafe_href',
+    [
+        'https://',
+        'https://?x=1',
+        'https://-',
+        'https://-bad.example',
+        'https://bad-.example',
+        'https://bad..example',
+        'https://bad_host.example',
+        'https://' + 'a' * 64 + '.example',
+        'https://' + '.'.join(['a' * 63] * 3 + ['a' * 62]),
+        'https:// example.com',
+        'ftp://example.com/file',
+        'https://user@example.com',
+        'https://:password@example.com',
+        'https://example.com:0/path',
+        'https://example.com:bad/path',
+        'https://example.com:70000/path',
+        'https://example.com/\nnext',
+        'https://example.com/\x7f',
+        'https://example.com/<bad',
+        'https://example.com/%zz',
+        'https://example.com\\x',
+    ],
+)
+def test_invalid_http_href_is_removed_but_text_is_kept(unsafe_href: str):
+    assert html_to_telegram(f'<a href="{unsafe_href}">visible</a>') == 'visible'
 
 
 def test_oversized_href_drops_anchor_but_keeps_text():
@@ -71,6 +115,51 @@ def test_text_entities_are_escaped():
 
 def test_unclosed_tags_are_closed():
     assert html_to_telegram('<b>bold') == '<b>bold</b>'
+
+
+def test_telegram_restricted_entities_are_not_nested():
+    assert html_to_telegram('<a href="https://one"><a href="https://two">x</a>y</a>') == (
+        '<a href="https://one">xy</a>'
+    )
+    assert html_to_telegram('<blockquote><blockquote>x</blockquote>y</blockquote>') == '<blockquote>xy</blockquote>'
+    assert html_to_telegram('<pre><b>x</b></pre>') == '<pre>x</pre>'
+    assert html_to_telegram('<code><i>x</i></code>') == '<code>x</code>'
+
+
+def test_styles_can_still_wrap_or_be_wrapped_by_links():
+    assert html_to_telegram('<b><a href="https://example.com">x</a></b>') == (
+        '<b><a href="https://example.com">x</a></b>'
+    )
+    assert html_to_telegram('<a href="https://example.com"><i>x</i></a>') == (
+        '<a href="https://example.com"><i>x</i></a>'
+    )
+
+
+@pytest.mark.parametrize(
+    'empty_source',
+    ['<script>only</script><style>hidden</style>', '<b></b>', '<a href="https://example.com"> </a>'],
+)
+def test_prepare_broadcast_rejects_empty_visible_render_and_source_over_limit(empty_source: str):
+    with pytest.raises(ValueError, match='пуст'):
+        prepare_telegram_broadcast(empty_source)
+    with pytest.raises(ValueError, match='4000'):
+        prepare_telegram_broadcast('x' * 4001)
+
+
+def test_prepare_broadcast_returns_canonical_telegram_html():
+    assert prepare_telegram_broadcast('<b>Привет') == '<b>Привет</b>'
+
+
+def test_prepare_broadcast_is_idempotent_for_escaped_text_at_visible_limit():
+    first = prepare_telegram_broadcast('&' * 4000)
+    assert len(first) == 20_000
+    assert prepare_telegram_broadcast(first) == first
+
+
+def test_prepare_broadcast_counts_astral_characters_as_utf16_units():
+    assert prepare_telegram_broadcast('😀' * 2000) == '😀' * 2000
+    with pytest.raises(ValueError, match='4000'):
+        prepare_telegram_broadcast('😀' * 2001)
 
 
 def test_blockquote_and_code_preserved():
@@ -122,6 +211,12 @@ def test_split_link_text_spanning_chunks_stays_within_hard_limit():
     chunks = split_telegram_text(text, max_length=3500)
     assert all(len(chunk) <= 4096 for chunk in chunks)
     assert all(chunk.count('<a ') == chunk.count('</a>') for chunk in chunks)
+
+
+def test_split_fails_closed_instead_of_raw_slicing_unbalanceable_html():
+    raw = '<b>' * 600 + 'x' + '</b>' * 600
+    with pytest.raises(ValueError, match='cannot be split'):
+        split_telegram_text(raw, max_length=1000)
 
 
 def test_hard_split_backs_off_incomplete_entity():
