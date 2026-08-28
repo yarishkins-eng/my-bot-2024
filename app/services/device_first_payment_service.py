@@ -2207,7 +2207,20 @@ async def _settle_direct_platega_payment_locked(
             attempt.reconciliation_reason = 'late_paid_wallet_credit'
             checkout.funding_state = 'late_paid_wallet_credit'
             checkout.terminal_reason = 'late_paid_wallet_credit'
+            # 🔴 РФ-3, мины U и BU: это НАСТОЯЩЕЕ пополнение кошелька живыми деньгами, и
+            # обязательство перед партнёром здесь возникает так же, как на любом другом
+            # приходе. Транзакция строится конструктором напрямую, мимо `create_transaction`,
+            # поэтому кошельковый движок её не видит вовсе — партнёр получал ноль, а признак
+            # «оплатил» у покупателя при этом поднимался. Заводим ту же durable-работу, что и
+            # штатная оплата; событие «баланс пополнен» здесь УМЕСТНО — кошелёк правда пополнен.
+            await ensure_deposit_outbox(
+                db,
+                transaction_id=transaction.id,
+                checkout_id=checkout.id,
+                pay_referral=settings.is_referral_program_enabled(),
+            )
             await db.commit()
+            await process_device_first_deposit_outbox(db, transaction_id=transaction.id, limit=1)
             logger.warning(
                 'device_first_late_archived_invoice_credited_to_wallet',
                 checkout_id=checkout.public_id,

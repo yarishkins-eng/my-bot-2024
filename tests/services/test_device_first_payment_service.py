@@ -4,6 +4,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.services import device_first_payment_service as payment_service
 from app.services.device_first_checkout_service import (
     DeviceFirstError,
     expire_checkout_quote_if_needed,
@@ -567,8 +568,12 @@ async def test_explicit_abandon_archives_only_a_fully_bound_canonical_pending_in
 
 
 @pytest.mark.asyncio
-async def test_late_exact_confirmation_after_explicit_abandon_credits_wallet_once_without_old_fulfilment():
+async def test_late_exact_confirmation_after_explicit_abandon_credits_wallet_once_without_old_fulfilment(monkeypatch):
     """The customer-facing abandon promise: old money never activates old VPN."""
+    # РФ-3: поздняя оплата теперь заводит работу в очередь выплат и будит её. Эти тесты
+    # считают вызовы к базе поимённо, поэтому очередь подменяем — она проверена отдельно.
+    monkeypatch.setattr(payment_service, 'ensure_deposit_outbox', AsyncMock())
+    monkeypatch.setattr(payment_service, 'process_device_first_deposit_outbox', AsyncMock(return_value=0))
     payment, user, attempt, checkout = _terminal_direct_rows()
     user.balance_kopeks = 0
     payment.platega_transaction_id = 'provider-1'
@@ -822,7 +827,7 @@ async def test_expired_provider_deadline_closes_the_cart_instead_of_calling_an_o
 
 
 @pytest.mark.asyncio
-async def test_late_payment_after_the_abandoned_cart_closes_lands_on_the_balance():
+async def test_late_payment_after_the_abandoned_cart_closes_lands_on_the_balance(monkeypatch):
     """🔴 Отрицательный сценарий, которого прямо требует план: деньги не должны потеряться.
 
     Ссылка Platega после закрытия корзины остаётся живой — на этом стоит вся посылка мины F.
@@ -830,6 +835,10 @@ async def test_late_payment_after_the_abandoned_cart_closes_lands_on_the_balance
     на ручной разбор. Возврат работает ТОЛЬКО на паре `cancelled` + одна из двух причин, то
     есть этот тест и есть проверка, что мина F закрывает корзину правильно.
     """
+    # РФ-3: поздняя оплата теперь заводит работу в очередь выплат и будит её. Эти тесты
+    # считают вызовы к базе поимённо, поэтому очередь подменяем — она проверена отдельно.
+    monkeypatch.setattr(payment_service, 'ensure_deposit_outbox', AsyncMock())
+    monkeypatch.setattr(payment_service, 'process_device_first_deposit_outbox', AsyncMock(return_value=0))
     payment, user, attempt, checkout = _terminal_direct_rows()
     payment.expires_at = datetime.now(UTC) - timedelta(minutes=1)
     payment.transaction_id = None
@@ -2263,7 +2272,7 @@ async def test_late_quote_payment_is_credited_to_balance_but_never_auto_fulfills
 
 
 @pytest.mark.asyncio
-async def test_late_payment_after_an_operator_closed_the_order_lands_on_the_balance():
+async def test_late_payment_after_an_operator_closed_the_order_lands_on_the_balance(monkeypatch):
     """🔴 Пункт 4.4. Оператор закрыл заказ кнопкой, а деньги пришли следом.
 
     Без нового члена в условии возврата (`device_first_payment_service`) такая оплата
@@ -2272,6 +2281,10 @@ async def test_late_payment_after_an_operator_closed_the_order_lands_on_the_bala
     берётся из кода, а проверяется РЕЗУЛЬТАТ — баланс, статус попытки и то, что старый
     заказ не ожил.
     """
+    # РФ-3: поздняя оплата теперь заводит работу в очередь выплат и будит её. Эти тесты
+    # считают вызовы к базе поимённо, поэтому очередь подменяем — она проверена отдельно.
+    monkeypatch.setattr(payment_service, 'ensure_deposit_outbox', AsyncMock())
+    monkeypatch.setattr(payment_service, 'process_device_first_deposit_outbox', AsyncMock(return_value=0))
     from app.services.device_first_checkout_service import OPERATOR_CLOSED_TERMINAL_REASON
 
     payment, user, attempt, checkout = _terminal_direct_rows()
@@ -2411,3 +2424,31 @@ async def test_the_growing_interval_is_actually_wired_into_the_release():
     assert attempt.terminal_observations == 5
     assert attempt.next_reconcile_at - before >= timedelta(hours=95)
     assert attempt.next_reconcile_at - before <= timedelta(hours=97)
+
+
+@pytest.mark.asyncio
+async def test_late_paid_invoice_pays_the_referral_commission(monkeypatch):
+    """Поздняя оплата закрытого счёта платит партнёру, как и любая другая (РФ-3).
+
+    🔴 Мины U и BU: деньги на кошелёк ложились настоящие, а работа в очередь не заводилась —
+    партнёр получал ноль, при том что признак «оплатил» у покупателя поднимался. Транзакция
+    здесь строится конструктором напрямую, мимо `create_transaction`, поэтому кошельковый
+    движок эту оплату не видит вовсе.
+
+    Сторож смотрит на ИСХОДНИК, потому что путь достижим только через живого провайдера с
+    архивным счётом: собрать его фикстурой дороже, чем он того стоит, а без сторожа строку
+    снимут как непонятную.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    source = (root / 'app/services/device_first_payment_service.py').read_text(encoding='utf-8')
+    head, _, tail = source.partition("attempt.reconciliation_reason = 'late_paid_wallet_credit'")
+    assert tail, 'ветка поздней оплаты исчезла — сторож ослеп'
+    window = tail[:1600]
+
+    assert 'ensure_deposit_outbox(' in window, 'поздняя оплата снова платит мимо очереди (мины U и BU)'
+    assert 'pay_referral=settings.is_referral_program_enabled()' in window, (
+        'выключатель обязан спрашиваться там, где обязательство ВОЗНИКАЕТ'
+    )
+    assert 'process_device_first_deposit_outbox(' in window, 'без побудки партнёр ждал бы до часового цикла'
