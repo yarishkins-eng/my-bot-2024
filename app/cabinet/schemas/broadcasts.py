@@ -173,6 +173,7 @@ class BroadcastPreviewRequest(BaseModel):
     """Request to preview broadcast recipients count."""
 
     target: str
+    category: str = Field(default='system', pattern='^(system|news|promo)$')
 
 
 class BroadcastPreviewResponse(BaseModel):
@@ -231,6 +232,7 @@ class EmailPreviewRequest(BaseModel):
     """Request to preview email broadcast recipients."""
 
     target: str
+    category: str = Field(default='system', pattern='^(system|news|promo)$')
 
 
 class EmailPreviewResponse(BaseModel):

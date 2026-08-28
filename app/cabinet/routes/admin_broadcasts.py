@@ -4,11 +4,11 @@ from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import distinct, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import BroadcastHistory, Subscription, SubscriptionStatus, Tariff, User
-from app.handlers.admin.messages import get_target_users_count
+from app.database.models import BroadcastHistory, Tariff, User
+from app.handlers.admin.messages import get_target_users
 from app.keyboards.admin import BROADCAST_BUTTONS, DEFAULT_BROADCAST_BUTTONS
 from app.services.broadcast_service import (
     BroadcastConfig,
@@ -16,6 +16,8 @@ from app.services.broadcast_service import (
     EmailBroadcastConfig,
     broadcast_service,
     email_broadcast_service,
+    resolve_email_broadcast_recipients,
+    resolve_telegram_broadcast_recipient_ids,
 )
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -49,7 +51,7 @@ router = APIRouter(prefix='/admin/broadcasts', tags=['Cabinet Admin Broadcasts']
 
 # 🔴 РС-3. Названия обязаны совпадать с тем, что фильтр РЕАЛЬНО отбирает, — прежние
 # обещали не то. Предикаты перепроверены по коду 28.08.2026
-# (`app/handlers/admin/messages.py`, `get_target_users_count` / `get_target_users`):
+# (`app/handlers/admin/messages.py`, `get_target_users`):
 #   expiring — конец в ближайшие 3 дня и БЕЗ отделения пробных. А пробная длится ровно
 #              3 дня (`TRIAL_DURATION_DAYS`), значит любая живая пробная сидит в этом окне
 #              с первой секунды. «Истекающие» на деле означало «почти все пробные»;
@@ -57,14 +59,15 @@ router = APIRouter(prefix='/admin/broadcasts', tags=['Cabinet Admin Broadcasts']
 #   trial    — любая подписка с флагом «пробная», хоть живая, хоть давно мёртвая;
 #   no       — нет ДЕЙСТВУЮЩЕЙ сейчас, а вовсе не «никогда не пробовал»;
 #   *_zero   — потрачено 0 ГБ, то есть «ни разу не подключался», а НЕ «кончился трафик».
-# ⛔ Меняются только надписи. Предикаты не тронуты: сузить `expiring` до платных — это
-# другое решение (кому слать), его принимает владелец отдельно.
+# ⛔ РС-9 не меняет состав пользовательских сегментов. Канальная проекция ниже
+# исключает недоступные адреса и opt-out, а подписи честно называют оставшиеся
+# особенности сегмента.
 FILTER_LABELS = {
-    'all': 'Все пользователи',
+    'all': 'Все активные с Telegram',
     'active': 'Действующая подписка, не пробная',
     'trial': 'Сейчас числится пробной (в т.ч. истёкшая)',
     'no': 'Сейчас без подписки',
-    'expiring': 'Заканчивается за 3 дня (включая пробные)',
+    'expiring': 'Заканчивается за 3 дня (включая пробные, без активных суточных)',
     'expired': 'Закончилась (включая пробные)',
     'zero': 'Действующая, 0 ГБ за текущий период',
     'active_zero': 'Действующая не пробная, 0 ГБ за период',
@@ -109,11 +112,11 @@ CUSTOM_FILTER_GROUPS = {
 # ============ Email Filter Labels ============
 
 EMAIL_FILTER_LABELS = {
-    'all_email': 'Все с email',
-    'email_only': 'Только email-регистрация',
-    'telegram_with_email': 'Telegram с email',
-    'active_email': 'С активной подпиской',
-    'expired_email': 'С истекшей подпиской',
+    'all_email': 'Все активные с подтверждённым email',
+    'email_only': 'Активные email-регистрации с подтверждённым адресом',
+    'telegram_with_email': 'Активные Telegram с подтверждённым email',
+    'active_email': 'Есть подписка со статусом «активна»',
+    'expired_email': 'Есть истёкшая или отключённая подписка',
 }
 
 EMAIL_FILTER_GROUPS = {
@@ -160,60 +163,9 @@ def _serialize_broadcast(broadcast: BroadcastHistory) -> BroadcastResponse:
     )
 
 
-async def _get_email_filter_count(db: AsyncSession, target: str) -> int:
-    """Get count of email users matching the filter."""
-    base_conditions = [
-        User.email.isnot(None),
-        User.email_verified == True,
-        User.status == 'active',
-    ]
-
-    if target == 'all_email':
-        query = select(func.count(User.id)).where(*base_conditions)
-
-    elif target == 'email_only':
-        query = select(func.count(User.id)).where(
-            *base_conditions,
-            User.auth_type == 'email',
-        )
-
-    elif target == 'telegram_with_email':
-        query = select(func.count(User.id)).where(
-            *base_conditions,
-            User.auth_type == 'telegram',
-            User.telegram_id.isnot(None),
-        )
-
-    elif target == 'active_email':
-        query = (
-            select(func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                *base_conditions,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-            )
-        )
-
-    elif target == 'expired_email':
-        query = (
-            select(func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                *base_conditions,
-                Subscription.status.in_(
-                    [
-                        SubscriptionStatus.EXPIRED.value,
-                        SubscriptionStatus.DISABLED.value,
-                    ]
-                ),
-            )
-        )
-
-    else:
-        return 0
-
-    result = await db.execute(query)
-    return result.scalar() or 0
+async def _get_email_filter_count(db: AsyncSession, target: str, category: str = 'system') -> int:
+    """Count the same unique email recipients the worker will materialize."""
+    return len(await resolve_email_broadcast_recipients(db, target, category))
 
 
 def _validate_email_target(target: str) -> bool:
@@ -221,18 +173,26 @@ def _validate_email_target(target: str) -> bool:
     return target in EMAIL_FILTER_LABELS
 
 
-async def _get_tariff_user_counts(db: AsyncSession) -> dict:
-    """Get count of active users per tariff."""
-    result = await db.execute(
-        select(Subscription.tariff_id, func.count(func.distinct(Subscription.user_id)).label('count'))
-        .join(User, User.id == Subscription.user_id)
-        .where(
-            User.status == 'active',
-            Subscription.status == SubscriptionStatus.ACTIVE.value,
+async def _get_tariff_user_counts(
+    db: AsyncSession,
+    category: str = 'system',
+    *,
+    preloaded_users: list[User] | None = None,
+) -> dict[int, int]:
+    """Get actual Telegram recipient counts per tariff."""
+    result = await db.execute(select(Tariff.id).where(Tariff.is_active == True))
+    tariff_ids = [row[0] for row in result.all()]
+    return {
+        tariff_id: len(
+            await resolve_telegram_broadcast_recipient_ids(
+                db,
+                f'tariff_{tariff_id}',
+                category,
+                preloaded_users=preloaded_users,
+            )
         )
-        .group_by(Subscription.tariff_id)
-    )
-    return {row.tariff_id: row.count for row in result.all()}
+        for tariff_id in tariff_ids
+    }
 
 
 def _validate_target(target: str, tariff_ids: set) -> bool:
@@ -260,18 +220,23 @@ def _validate_buttons(buttons: list[str]) -> bool:
 
 @router.get('/filters', response_model=BroadcastFiltersResponse)
 async def get_filters(
+    category: str = Query('system', pattern='^(system|news|promo)$'),
     admin: User = Depends(require_permission('broadcasts:read')),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> BroadcastFiltersResponse:
-    """Get all available filters with user counts."""
+    """Get filters with actual unique Telegram recipient counts."""
+    preloaded_users = await get_target_users(db, 'all')
     # Basic filters
     filters = []
     for key, label in FILTER_LABELS.items():
-        try:
-            count = await get_target_users_count(db, key)
-        except Exception as e:
-            logger.warning('Failed to get count for filter', key=key, error=e)
-            count = 0
+        count = len(
+            await resolve_telegram_broadcast_recipient_ids(
+                db,
+                key,
+                category,
+                preloaded_users=preloaded_users,
+            )
+        )
         filters.append(
             BroadcastFilter(
                 key=key,
@@ -284,11 +249,7 @@ async def get_filters(
     # Custom filters
     custom_filters = []
     for key, label in CUSTOM_FILTER_LABELS.items():
-        try:
-            count = await get_target_users_count(db, key)
-        except Exception as e:
-            logger.warning('Failed to get count for custom filter', key=key, error=e)
-            count = 0
+        count = len(await resolve_telegram_broadcast_recipient_ids(db, key, category))
         custom_filters.append(
             BroadcastFilter(
                 key=key,
@@ -299,7 +260,7 @@ async def get_filters(
         )
 
     # Tariff filters
-    tariff_counts = await _get_tariff_user_counts(db)
+    tariff_counts = await _get_tariff_user_counts(db, category, preloaded_users=preloaded_users)
     result = await db.execute(select(Tariff).where(Tariff.is_active == True).order_by(Tariff.name))
     tariffs = result.scalars().all()
 
@@ -323,11 +284,13 @@ async def get_filters(
 
 @router.get('/tariffs', response_model=BroadcastTariffsResponse)
 async def get_tariffs(
+    category: str = Query('system', pattern='^(system|news|promo)$'),
     admin: User = Depends(require_permission('broadcasts:read')),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> BroadcastTariffsResponse:
     """Get tariffs for broadcast filtering."""
-    tariff_counts = await _get_tariff_user_counts(db)
+    preloaded_users = await get_target_users(db, 'all')
+    tariff_counts = await _get_tariff_user_counts(db, category, preloaded_users=preloaded_users)
     result = await db.execute(select(Tariff).where(Tariff.is_active == True).order_by(Tariff.name))
     tariffs = result.scalars().all()
 
@@ -380,7 +343,7 @@ async def preview_broadcast(
         )
 
     try:
-        count = await get_target_users_count(db, request.target)
+        count = len(await resolve_telegram_broadcast_recipient_ids(db, request.target, request.category))
     except Exception as e:
         logger.error('Failed to get count for target', target=request.target, error=e)
         raise HTTPException(
@@ -510,6 +473,7 @@ async def list_broadcasts(
 
 @router.get('/email-filters', response_model=EmailFiltersResponse)
 async def get_email_filters(
+    category: str = Query('system', pattern='^(system|news|promo)$'),
     admin: User = Depends(require_permission('broadcasts:read')),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> EmailFiltersResponse:
@@ -518,11 +482,7 @@ async def get_email_filters(
     total_with_email = 0
 
     for key, label in EMAIL_FILTER_LABELS.items():
-        try:
-            count = await _get_email_filter_count(db, key)
-        except Exception as e:
-            logger.warning('Failed to get count for email filter', key=key, error=e)
-            count = 0
+        count = await _get_email_filter_count(db, key, category)
 
         filters.append(
             EmailFilterItem(
@@ -557,7 +517,7 @@ async def preview_email_broadcast(
         )
 
     try:
-        count = await _get_email_filter_count(db, request.target)
+        count = await _get_email_filter_count(db, request.target, request.category)
     except Exception as e:
         logger.error('Failed to get email count for target', target=request.target, error=e)
         raise HTTPException(
@@ -685,6 +645,7 @@ async def create_combined_broadcast(
             email_subject=request.email_subject.strip(),
             email_html_content=request.email_html_content.strip(),
             initiator_name=admin_name,
+            category=request.category,
         )
 
         await email_broadcast_service.start_broadcast(broadcast.id, email_config)
