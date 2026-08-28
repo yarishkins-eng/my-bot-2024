@@ -1,7 +1,9 @@
 import html as html_module
+import ipaddress
 import json
 import re
 from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 
 TELEGRAM_ALLOWED_TAGS = frozenset({'b', 'i', 'u', 's', 'a', 'code', 'pre', 'blockquote'})
@@ -18,7 +20,9 @@ _BLOCK_TAGS = frozenset({'p', 'div', 'section', 'article', 'table', 'tr', 'figur
 
 _SKIP_CONTENT_TAGS = frozenset({'script', 'style', 'iframe', 'video', 'audio', 'svg', 'head'})
 
-_SAFE_HREF_RE = re.compile(r'^https?://', re.IGNORECASE)
+_SAFE_URI_RE = re.compile(r"^[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$")
+
+_INVALID_PERCENT_RE = re.compile(r'%(?![0-9A-Fa-f]{2})')
 
 _TAG_RE = re.compile(r'<(/?)(\w[\w-]*)(?:\s+[^>]*)?>')
 
@@ -27,6 +31,43 @@ _INCOMPLETE_ENTITY_RE = re.compile(r'&[#\w]{0,9}$')
 _MAX_HREF_LENGTH = 1024
 
 _TELEGRAM_HARD_LIMIT = 4096
+
+
+def _safe_http_href(raw_href: str | None) -> str | None:
+    if not raw_href:
+        return None
+    href = raw_href.strip()
+    if not href or _SAFE_URI_RE.fullmatch(href) is None or _INVALID_PERCENT_RE.search(href):
+        return None
+    try:
+        parsed = urlsplit(href)
+        if parsed.scheme.lower() not in {'http', 'https'} or not parsed.hostname:
+            return None
+        if parsed.username or parsed.password:
+            return None
+        if parsed.port == 0:
+            return None
+        ascii_host = parsed.hostname.encode('idna').decode('ascii').rstrip('.')
+    except (UnicodeError, ValueError):
+        return None
+    try:
+        ipaddress.ip_address(ascii_host)
+    except ValueError:
+        labels = ascii_host.split('.')
+        if (
+            not ascii_host
+            or len(ascii_host) > 253
+            or any(
+                not label
+                or len(label) > 63
+                or label.startswith('-')
+                or label.endswith('-')
+                or re.fullmatch(r'[a-zA-Z0-9-]+', label) is None
+                for label in labels
+            )
+        ):
+            return None
+    return href
 
 
 class _TelegramHtmlRenderer(HTMLParser):
@@ -108,8 +149,8 @@ class _TelegramHtmlRenderer(HTMLParser):
             return
         if tag == 'a':
             href = next((value for name, value in attrs if name == 'href'), None)
-            if href and _SAFE_HREF_RE.match(href.strip()):
-                escaped = html_module.escape(href.strip(), quote=True)
+            if safe_href := _safe_http_href(href):
+                escaped = html_module.escape(safe_href, quote=True)
                 if len(escaped) <= _MAX_HREF_LENGTH:
                     self._open('a', f'<a href="{escaped}">')
             return
@@ -160,10 +201,13 @@ def html_to_telegram(raw_html: str | None) -> str:
     return renderer.result()
 
 
+def _telegram_visible_text(rendered_html: str) -> str:
+    return html_module.unescape(_TAG_RE.sub('', rendered_html))
+
+
 def telegram_visible_length(rendered_html: str) -> int:
     """Count parsed Telegram text in UTF-16 code units, as the Bot API does."""
-    visible_text = html_module.unescape(_TAG_RE.sub('', rendered_html))
-    return len(visible_text.encode('utf-16-le')) // 2
+    return len(_telegram_visible_text(rendered_html).encode('utf-16-le')) // 2
 
 
 def prepare_telegram_broadcast(raw_html: str | None) -> str:
@@ -171,7 +215,7 @@ def prepare_telegram_broadcast(raw_html: str | None) -> str:
     if raw_html is None:
         raise ValueError('Текст Telegram должен содержать от 1 до 4000 символов')
     rendered = html_to_telegram(raw_html)
-    if not rendered:
+    if not rendered or not _telegram_visible_text(rendered).strip():
         raise ValueError('Текст Telegram пуст после удаления неподдерживаемой HTML-разметки')
     if telegram_visible_length(rendered) > 4000:
         raise ValueError('Видимый текст Telegram должен содержать не больше 4000 символов')

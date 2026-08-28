@@ -48,7 +48,28 @@ def test_heading_becomes_bold_block():
 
 def test_link_kept_only_with_http_href():
     assert html_to_telegram('<a href="https://example.com">x</a>') == '<a href="https://example.com">x</a>'
+    assert html_to_telegram('<a href="https://example.com/%20?a=1&amp;b=2">x</a>') == (
+        '<a href="https://example.com/%20?a=1&amp;b=2">x</a>'
+    )
     assert html_to_telegram('<a href="javascript:alert(1)">x</a>') == 'x'
+
+
+@pytest.mark.parametrize(
+    'unsafe_href',
+    [
+        'https://',
+        'https://?x=1',
+        'https://-',
+        'https:// example.com',
+        'https://example.com/\nnext',
+        'https://example.com/\x7f',
+        'https://example.com/<bad',
+        'https://example.com/%zz',
+        'https://example.com\\x',
+    ],
+)
+def test_invalid_http_href_is_removed_but_text_is_kept(unsafe_href: str):
+    assert html_to_telegram(f'<a href="{unsafe_href}">visible</a>') == 'visible'
 
 
 def test_oversized_href_drops_anchor_but_keeps_text():
@@ -94,9 +115,13 @@ def test_styles_can_still_wrap_or_be_wrapped_by_links():
     )
 
 
-def test_prepare_broadcast_rejects_empty_render_and_source_over_limit():
+@pytest.mark.parametrize(
+    'empty_source',
+    ['<script>only</script><style>hidden</style>', '<b></b>', '<a href="https://example.com"> </a>'],
+)
+def test_prepare_broadcast_rejects_empty_visible_render_and_source_over_limit(empty_source: str):
     with pytest.raises(ValueError, match='пуст'):
-        prepare_telegram_broadcast('<script>only</script><style>hidden</style>')
+        prepare_telegram_broadcast(empty_source)
     with pytest.raises(ValueError, match='4000'):
         prepare_telegram_broadcast('x' * 4001)
 
@@ -166,6 +191,12 @@ def test_split_link_text_spanning_chunks_stays_within_hard_limit():
     chunks = split_telegram_text(text, max_length=3500)
     assert all(len(chunk) <= 4096 for chunk in chunks)
     assert all(chunk.count('<a ') == chunk.count('</a>') for chunk in chunks)
+
+
+def test_split_fails_closed_instead_of_raw_slicing_unbalanceable_html():
+    raw = '<b>' * 600 + 'x' + '</b>' * 600
+    with pytest.raises(ValueError, match='cannot be split'):
+        split_telegram_text(raw, max_length=1000)
 
 
 def test_hard_split_backs_off_incomplete_entity():

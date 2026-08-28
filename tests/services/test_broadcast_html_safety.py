@@ -56,7 +56,15 @@ class _RecordingSession:
 
 
 @pytest.mark.asyncio
-async def test_all_create_routes_store_and_start_only_canonical_telegram_html(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ('raw_caption', 'safe_caption'),
+    [(_MALFORMED_CAPTION, _SAFE_CAPTION), ('   ', _SAFE_TEXT)],
+)
+async def test_all_create_routes_store_and_start_only_canonical_telegram_html(
+    monkeypatch,
+    raw_caption: str,
+    safe_caption: str,
+) -> None:
     started_configs: list[BroadcastConfig] = []
 
     async def capture_config(_broadcast_id: int, config: BroadcastConfig) -> None:
@@ -74,7 +82,7 @@ async def test_all_create_routes_store_and_start_only_canonical_telegram_html(mo
             media=CabinetBroadcastMediaRequest(
                 type='photo',
                 file_id='legacy-photo',
-                caption=_MALFORMED_CAPTION,
+                caption=raw_caption,
             ),
         ),
         admin=admin,
@@ -91,7 +99,7 @@ async def test_all_create_routes_store_and_start_only_canonical_telegram_html(mo
             media=CabinetBroadcastMediaRequest(
                 type='photo',
                 file_id='combined-photo',
-                caption=_MALFORMED_CAPTION,
+                caption=raw_caption,
             ),
         ),
         admin=admin,
@@ -107,7 +115,7 @@ async def test_all_create_routes_store_and_start_only_canonical_telegram_html(mo
             media=WebApiBroadcastMedia(
                 type='photo',
                 file_id='webapi-photo',
-                caption=_MALFORMED_CAPTION,
+                caption=raw_caption,
             ),
         ),
         token=SimpleNamespace(name='api-owner'),
@@ -119,32 +127,38 @@ async def test_all_create_routes_store_and_start_only_canonical_telegram_html(mo
         _SAFE_TEXT,
     ]
     assert [row.media_caption for row in legacy_session.added + combined_session.added] == [
-        _SAFE_CAPTION,
-        _SAFE_CAPTION,
+        safe_caption,
+        safe_caption,
     ]
     assert webapi_session.added[0].message_text == _SAFE_TEXT
-    assert webapi_session.added[0].media_caption == _SAFE_CAPTION
+    assert webapi_session.added[0].media_caption == safe_caption
     assert [config.message_text for config in started_configs] == [_SAFE_TEXT] * 3
     assert [config.media.caption for config in started_configs if config.media] == [
-        _SAFE_CAPTION,
-        _SAFE_CAPTION,
-        _SAFE_CAPTION,
+        safe_caption,
+        safe_caption,
+        safe_caption,
     ]
 
 
 @pytest.mark.asyncio
-async def test_script_only_is_rejected_before_history_or_worker_in_all_create_routes(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    'empty_source',
+    ['<script>hidden()</script><style>body{display:none}</style>', '<b></b>'],
+)
+async def test_empty_visible_text_is_rejected_before_history_or_worker_in_all_create_routes(
+    monkeypatch,
+    empty_source: str,
+) -> None:
     telegram_start = AsyncMock()
     email_start = AsyncMock()
     monkeypatch.setattr(cabinet_routes.broadcast_service, 'start_broadcast', telegram_start)
     monkeypatch.setattr(cabinet_routes.email_broadcast_service, 'start_broadcast', email_start)
     admin = SimpleNamespace(id=7, username='owner')
-    script_only = '<script>hidden()</script><style>body{display:none}</style>'
 
     cases = (
         (
             cabinet_routes.create_broadcast,
-            CabinetBroadcastCreateRequest(target='all', message_text=script_only, selected_buttons=[]),
+            CabinetBroadcastCreateRequest(target='all', message_text=empty_source, selected_buttons=[]),
             {'admin': admin},
         ),
         (
@@ -152,7 +166,7 @@ async def test_script_only_is_rejected_before_history_or_worker_in_all_create_ro
             CombinedBroadcastCreateRequest(
                 channel='both',
                 target='all',
-                message_text=script_only,
+                message_text=empty_source,
                 selected_buttons=[],
                 email_subject='Subject',
                 email_html_content='<p>Email remains valid</p>',
@@ -161,7 +175,7 @@ async def test_script_only_is_rejected_before_history_or_worker_in_all_create_ro
         ),
         (
             webapi_routes.create_broadcast,
-            WebApiBroadcastCreateRequest(target='all', message_text=script_only, selected_buttons=[]),
+            WebApiBroadcastCreateRequest(target='all', message_text=empty_source, selected_buttons=[]),
             {'token': SimpleNamespace(name='api-owner')},
         ),
     )
@@ -180,8 +194,10 @@ async def test_script_only_is_rejected_before_history_or_worker_in_all_create_ro
 
 @pytest.mark.asyncio
 async def test_empty_effective_media_caption_is_rejected_before_history_or_worker_in_all_routes(monkeypatch) -> None:
-    started = AsyncMock()
-    monkeypatch.setattr(cabinet_routes.broadcast_service, 'start_broadcast', started)
+    telegram_start = AsyncMock()
+    email_start = AsyncMock()
+    monkeypatch.setattr(cabinet_routes.broadcast_service, 'start_broadcast', telegram_start)
+    monkeypatch.setattr(cabinet_routes.email_broadcast_service, 'start_broadcast', email_start)
     admin = SimpleNamespace(id=7, username='owner')
     empty_caption = '<script>hidden()</script>'
     cases = (
@@ -198,11 +214,13 @@ async def test_empty_effective_media_caption_is_rejected_before_history_or_worke
         (
             cabinet_routes.create_combined_broadcast,
             CombinedBroadcastCreateRequest(
-                channel='telegram',
+                channel='both',
                 target='all',
                 message_text='Valid message',
                 selected_buttons=[],
                 media=CabinetBroadcastMediaRequest(type='photo', file_id='combined-photo', caption=empty_caption),
+                email_subject='Subject',
+                email_html_content='<p>Valid email</p>',
             ),
             {'admin': admin},
         ),
@@ -225,7 +243,8 @@ async def test_empty_effective_media_caption_is_rejected_before_history_or_worke
         assert session.added == []
         assert session.commit_calls == 0
 
-    started.assert_not_awaited()
+    telegram_start.assert_not_awaited()
+    email_start.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -359,6 +378,28 @@ async def test_chat_admin_rejects_empty_canonical_text_without_advancing_state()
 
 
 @pytest.mark.asyncio
+async def test_chat_admin_rejects_stale_empty_fsm_before_history_or_recipients(monkeypatch) -> None:
+    original = inspect.unwrap(admin_messages.confirm_broadcast)
+    state = SimpleNamespace(
+        get_data=AsyncMock(return_value={'broadcast_target': 'all', 'broadcast_message': '<b></b>'}),
+        clear=AsyncMock(),
+    )
+    callback = SimpleNamespace(answer=AsyncMock())
+    recipients = AsyncMock()
+    monkeypatch.setattr(admin_messages, '_get_telegram_target_recipient_ids', recipients)
+    session = _RecordingSession()
+
+    await original(callback, SimpleNamespace(), state, session)
+
+    assert 'пуст' in callback.answer.await_args.args[0]
+    assert callback.answer.await_args.kwargs == {'show_alert': True}
+    recipients.assert_not_awaited()
+    assert session.added == []
+    assert session.commit_calls == 0
+    state.clear.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_chat_admin_uses_common_delivery_and_preserves_retry_state(monkeypatch) -> None:
     original = inspect.unwrap(admin_messages.confirm_broadcast)
     state = SimpleNamespace(
@@ -393,6 +434,9 @@ async def test_chat_admin_uses_common_delivery_and_preserves_retry_state(monkeyp
 
     async def fake_deliver(self, telegram_id, config, keyboard, delivery_state):
         assert telegram_id == 909
+        assert self._bot is callback.bot
+        assert config.media.type == 'photo'
+        assert config.media.file_id == 'chat-photo'
         deliver_calls.append((config, delivery_state))
         if len(deliver_calls) == 1:
             delivery_state['media_sent'] = True
