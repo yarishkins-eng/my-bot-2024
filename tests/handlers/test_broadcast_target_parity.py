@@ -480,7 +480,7 @@ async def test_preview_routes_use_channel_projection_with_current_category(monke
 
     class FakeTariffResult:
         def all(self):
-            return []
+            return [(17,)]
 
     class FakeSession:
         async def execute(self, statement):
@@ -493,21 +493,23 @@ async def test_preview_routes_use_channel_projection_with_current_category(monke
     )
     monkeypatch.setattr(broadcast_routes, 'resolve_email_broadcast_recipients', fake_email)
 
-    telegram = await broadcast_routes.preview_broadcast(
-        BroadcastPreviewRequest(target='active_zero', category='news'),
-        admin=object(),
-        db=FakeSession(),
-    )
-    email = await broadcast_routes.preview_email_broadcast(
-        EmailPreviewRequest(target='expired_email', category='promo'),
-        admin=object(),
-        db=FakeSession(),
-    )
+    for target, category in (('active_zero', 'news'), ('tariff_17', 'system')):
+        telegram = await broadcast_routes.preview_broadcast(
+            BroadcastPreviewRequest(target=target, category=category),
+            admin=object(),
+            db=FakeSession(),
+        )
+        assert telegram.count == 2
+    for target, category in (('expired_email', 'promo'), ('active_email', 'news')):
+        email = await broadcast_routes.preview_email_broadcast(
+            EmailPreviewRequest(target=target, category=category),
+            admin=object(),
+            db=FakeSession(),
+        )
+        assert email.count == 1
 
-    assert telegram.count == 2
-    assert email.count == 1
-    assert telegram_calls == [('active_zero', 'news')]
-    assert email_calls == [('expired_email', 'promo')]
+    assert telegram_calls == [('active_zero', 'news'), ('tariff_17', 'system')]
+    assert email_calls == [('expired_email', 'promo'), ('active_email', 'news')]
 
 
 @pytest.mark.asyncio
@@ -536,15 +538,19 @@ async def test_workers_delegate_to_the_same_channel_projections(monkeypatch) -> 
     monkeypatch.setattr(broadcast_module, 'resolve_telegram_broadcast_recipient_ids', fake_telegram)
     monkeypatch.setattr(broadcast_module, 'resolve_email_broadcast_recipients', fake_email)
 
-    assert await broadcast_module.broadcast_service._fetch_recipients('all', 'news') == [123]
-    recipients = await broadcast_module.email_broadcast_service._fetch_email_recipients(
-        'all_email',
-        'promo',
-    )
-    assert [recipient.email for recipient in recipients] == ['one@example.com']
+    for target, category in (('all', 'news'), ('active_zero', 'system')):
+        assert await broadcast_module.broadcast_service._fetch_recipients(target, category) == [123]
+    for target, category in (('all_email', 'promo'), ('expired_email', 'news')):
+        recipients = await broadcast_module.email_broadcast_service._fetch_email_recipients(
+            target,
+            category,
+        )
+        assert [recipient.email for recipient in recipients] == ['one@example.com']
     assert calls == [
         ('telegram', 'all', 'news'),
+        ('telegram', 'active_zero', 'system'),
         ('email', 'all_email', 'promo'),
+        ('email', 'expired_email', 'news'),
     ]
 
 
@@ -750,6 +756,17 @@ async def test_create_route_forwards_exact_target_and_category_to_each_worker(mo
     )
     await broadcast_routes.create_combined_broadcast(
         CombinedBroadcastCreateRequest(
+            channel='telegram',
+            target='active_zero',
+            message_text='Second Telegram message',
+            selected_buttons=[],
+            category='system',
+        ),
+        admin=admin,
+        db=session,
+    )
+    await broadcast_routes.create_combined_broadcast(
+        CombinedBroadcastCreateRequest(
             channel='email',
             target='expired_email',
             email_subject='Email subject',
@@ -759,10 +776,23 @@ async def test_create_route_forwards_exact_target_and_category_to_each_worker(mo
         admin=admin,
         db=session,
     )
+    await broadcast_routes.create_combined_broadcast(
+        CombinedBroadcastCreateRequest(
+            channel='email',
+            target='active_email',
+            email_subject='Second Email subject',
+            email_html_content='<p>Second Email body</p>',
+            category='news',
+        ),
+        admin=admin,
+        db=session,
+    )
 
     assert started == [
         ('telegram', 'tariff_17', 'news'),
+        ('telegram', 'active_zero', 'system'),
         ('email', 'expired_email', 'promo'),
+        ('email', 'active_email', 'news'),
     ]
 
 
