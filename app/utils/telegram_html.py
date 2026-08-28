@@ -58,11 +58,7 @@ def _safe_http_href(raw_href: str | None) -> str | None:
             not ascii_host
             or len(ascii_host) > 253
             or any(
-                not label
-                or len(label) > 63
-                or label.startswith('-')
-                or label.endswith('-')
-                or re.fullmatch(r'[a-zA-Z0-9-]+', label) is None
+                label.startswith('-') or label.endswith('-') or re.fullmatch(r'[a-zA-Z0-9-]+', label) is None
                 for label in labels
             )
         ):

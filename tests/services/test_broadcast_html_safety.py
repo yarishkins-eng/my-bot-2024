@@ -58,7 +58,7 @@ class _RecordingSession:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('raw_caption', 'safe_caption'),
-    [(_MALFORMED_CAPTION, _SAFE_CAPTION), ('   ', _SAFE_TEXT)],
+    [(_MALFORMED_CAPTION, _SAFE_CAPTION), ('   ', _SAFE_TEXT), ('x' * 1025, 'x' * 1025)],
 )
 async def test_all_create_routes_store_and_start_only_canonical_telegram_html(
     monkeypatch,
