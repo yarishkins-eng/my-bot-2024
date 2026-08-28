@@ -1,6 +1,4 @@
 import hashlib
-import html as html_module
-import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -127,15 +125,15 @@ def _prepare_logo_for_send(path: Path) -> Path:
 
 # Telegram API: caption limit is 1024 characters AFTER HTML entity parsing (tags stripped)
 TELEGRAM_CAPTION_LIMIT = 1024
-_HTML_TAG_RE = re.compile(r'<[^>]+>')
 
 
 def caption_exceeds_telegram_limit(text: str | None) -> bool:
     """Check if text exceeds Telegram's caption limit (1024 parsed chars)."""
     if not text:
         return False
-    stripped = html_module.unescape(_HTML_TAG_RE.sub('', text))
-    return len(stripped) > TELEGRAM_CAPTION_LIMIT
+    from app.utils.telegram_html import telegram_visible_length
+
+    return telegram_visible_length(text) > TELEGRAM_CAPTION_LIMIT
 
 
 _PRIVACY_RESTRICTED_CODE = 'BUTTON_USER_PRIVACY_RESTRICTED'

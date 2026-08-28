@@ -46,6 +46,7 @@ from app.services.pinned_message_service import (
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
 from app.utils.miniapp_buttons import BUTTON_KEY_TO_CABINET_PATH, build_miniapp_or_callback_button
+from app.utils.telegram_html import prepare_telegram_broadcast
 
 
 logger = structlog.get_logger(__name__)
@@ -786,10 +787,10 @@ async def select_broadcast_target(callback: types.CallbackQuery, db_user: User, 
 @admin_required
 @error_handler
 async def process_broadcast_message(message: types.Message, db_user: User, state: FSMContext, db: AsyncSession):
-    broadcast_text = message.text
-
-    if len(broadcast_text) > 4000:
-        await message.answer('❌ Сообщение слишком длинное (максимум 4000 символов)')
+    try:
+        broadcast_text = prepare_telegram_broadcast(message.text)
+    except ValueError as exc:
+        await message.answer(f'❌ {exc}')
         return
 
     await state.update_data(broadcast_message=broadcast_text)
@@ -1165,14 +1166,18 @@ async def confirm_button_selection(callback: types.CallbackQuery, db_user: User,
 async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state: FSMContext, db: AsyncSession):
     data = await state.get_data()
     target = data.get('broadcast_target')
-    message_text = data.get('broadcast_message')
+    try:
+        message_text = prepare_telegram_broadcast(data.get('broadcast_message'))
+    except ValueError as exc:
+        await callback.answer(f'❌ {exc}', show_alert=True)
+        return
     selected_buttons = data.get('selected_buttons')
     if selected_buttons is None:
         selected_buttons = list(DEFAULT_SELECTED_BUTTONS)
     has_media = data.get('has_media', False)
     media_type = data.get('media_type')
     media_file_id = data.get('media_file_id')
-    media_caption = data.get('media_caption')
+    media_caption = message_text if has_media else None
 
     # =========================================================================
     # КРИТИЧНО: Извлекаем ВСЕ скалярные значения из ORM-объектов СЕЙЧАС,
@@ -1229,6 +1234,22 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
     failed_count = 0
 
     broadcast_keyboard = create_broadcast_keyboard(selected_buttons, admin_language)
+    # Один delivery-контракт для кабинета, Web API и чат-админки: canonical HTML,
+    # точная длина подписи и защита медиа от повторной отправки после сбоя текста.
+    from app.services.broadcast_service import BroadcastConfig, BroadcastMediaConfig, BroadcastService
+
+    delivery_service = BroadcastService()
+    delivery_service.set_bot(callback.bot)
+    delivery_config = BroadcastConfig(
+        target=target,
+        message_text=message_text,
+        selected_buttons=selected_buttons,
+        media=(
+            BroadcastMediaConfig(type=media_type, file_id=media_file_id, caption=message_text)
+            if has_media and media_type and media_file_id
+            else None
+        ),
+    )
 
     # =========================================================================
     # Rate limiting: Telegram допускает ~30 msg/sec для бота.
@@ -1250,6 +1271,7 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
     async def send_single_broadcast(telegram_id: int) -> str:
         """Отправляет одно сообщение. Возвращает 'sent', 'blocked' или 'failed'."""
         nonlocal flood_wait_until
+        delivery_state: dict[str, bool] = {}
 
         for attempt in range(_MAX_SEND_RETRIES):
             # Глобальная пауза при FloodWait
@@ -1258,54 +1280,12 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
                 await asyncio.sleep(flood_wait_until - now)
 
             try:
-                if has_media and media_file_id:
-                    send_method = {
-                        'photo': callback.bot.send_photo,
-                        'video': callback.bot.send_video,
-                        'document': callback.bot.send_document,
-                    }.get(media_type)
-                    if send_method:
-                        media_kwarg = {
-                            'photo': 'photo',
-                            'video': 'video',
-                            'document': 'document',
-                        }[media_type]
-                        # Telegram ограничивает caption до 1024 символов
-                        if len(message_text) <= 1024:
-                            await send_method(
-                                chat_id=telegram_id,
-                                **{media_kwarg: media_file_id},
-                                caption=message_text,
-                                parse_mode='HTML',
-                                reply_markup=broadcast_keyboard,
-                            )
-                        else:
-                            # Медиа без caption + текст отдельным сообщением
-                            await send_method(
-                                chat_id=telegram_id,
-                                **{media_kwarg: media_file_id},
-                            )
-                            await callback.bot.send_message(
-                                chat_id=telegram_id,
-                                text=message_text,
-                                parse_mode='HTML',
-                                reply_markup=broadcast_keyboard,
-                            )
-                    else:
-                        # Неизвестный media_type — отправляем как текст
-                        await callback.bot.send_message(
-                            chat_id=telegram_id,
-                            text=message_text,
-                            parse_mode='HTML',
-                            reply_markup=broadcast_keyboard,
-                        )
-                else:
-                    await callback.bot.send_message(
-                        chat_id=telegram_id,
-                        text=message_text,
-                        parse_mode='HTML',
-                        reply_markup=broadcast_keyboard,
-                    )
+                await delivery_service._deliver_message(
+                    telegram_id,
+                    delivery_config,
+                    broadcast_keyboard,
+                    delivery_state,
+                )
                 return 'sent'
 
             except TelegramRetryAfter as e:

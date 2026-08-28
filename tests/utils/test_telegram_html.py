@@ -1,8 +1,11 @@
 import re
 
+import pytest
+
 from app.utils.telegram_html import (
     html_to_telegram,
     info_page_faq_to_telegram,
+    prepare_telegram_broadcast,
     split_telegram_text,
 )
 
@@ -71,6 +74,47 @@ def test_text_entities_are_escaped():
 
 def test_unclosed_tags_are_closed():
     assert html_to_telegram('<b>bold') == '<b>bold</b>'
+
+
+def test_telegram_restricted_entities_are_not_nested():
+    assert html_to_telegram('<a href="https://one"><a href="https://two">x</a>y</a>') == (
+        '<a href="https://one">xy</a>'
+    )
+    assert html_to_telegram('<blockquote><blockquote>x</blockquote>y</blockquote>') == '<blockquote>xy</blockquote>'
+    assert html_to_telegram('<pre><b>x</b></pre>') == '<pre>x</pre>'
+    assert html_to_telegram('<code><i>x</i></code>') == '<code>x</code>'
+
+
+def test_styles_can_still_wrap_or_be_wrapped_by_links():
+    assert html_to_telegram('<b><a href="https://example.com">x</a></b>') == (
+        '<b><a href="https://example.com">x</a></b>'
+    )
+    assert html_to_telegram('<a href="https://example.com"><i>x</i></a>') == (
+        '<a href="https://example.com"><i>x</i></a>'
+    )
+
+
+def test_prepare_broadcast_rejects_empty_render_and_source_over_limit():
+    with pytest.raises(ValueError, match='пуст'):
+        prepare_telegram_broadcast('<script>only</script><style>hidden</style>')
+    with pytest.raises(ValueError, match='4000'):
+        prepare_telegram_broadcast('x' * 4001)
+
+
+def test_prepare_broadcast_returns_canonical_telegram_html():
+    assert prepare_telegram_broadcast('<b>Привет') == '<b>Привет</b>'
+
+
+def test_prepare_broadcast_is_idempotent_for_escaped_text_at_visible_limit():
+    first = prepare_telegram_broadcast('&' * 4000)
+    assert len(first) == 20_000
+    assert prepare_telegram_broadcast(first) == first
+
+
+def test_prepare_broadcast_counts_astral_characters_as_utf16_units():
+    assert prepare_telegram_broadcast('😀' * 2000) == '😀' * 2000
+    with pytest.raises(ValueError, match='4000'):
+        prepare_telegram_broadcast('😀' * 2001)
 
 
 def test_blockquote_and_code_preserved():

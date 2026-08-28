@@ -11,7 +11,7 @@ from app.keyboards.admin import BROADCAST_BUTTONS, DEFAULT_BROADCAST_BUTTONS
 class BroadcastMedia(BaseModel):
     type: str = Field(pattern=r'^(photo|video|document)$')
     file_id: str
-    caption: str | None = None
+    caption: str | None = Field(default=None, max_length=4000)
 
 
 class BroadcastCreateRequest(BaseModel):

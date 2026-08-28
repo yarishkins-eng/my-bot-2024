@@ -6,6 +6,10 @@ from html.parser import HTMLParser
 
 TELEGRAM_ALLOWED_TAGS = frozenset({'b', 'i', 'u', 's', 'a', 'code', 'pre', 'blockquote'})
 
+_STYLE_TAGS = frozenset({'b', 'i', 'u', 's'})
+
+_CODE_TAGS = frozenset({'code', 'pre'})
+
 _TAG_ALIASES = {'strong': 'b', 'em': 'i', 'ins': 'u', 'strike': 's', 'del': 's'}
 
 _HEADING_TAGS = frozenset({'h1', 'h2', 'h3', 'h4', 'h5', 'h6'})
@@ -32,6 +36,7 @@ class _TelegramHtmlRenderer(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._parts: list[str] = []
         self._open_tags: list[str] = []
+        self._suppressed_tags: list[str] = []
         self._skip_stack: list[str] = []
         self._list_stack: list[int | None] = []
 
@@ -47,6 +52,28 @@ class _TelegramHtmlRenderer(HTMLParser):
             self._parts.append(f'</{open_tag}>')
             if open_tag == tag:
                 break
+
+    def _can_open(self, tag: str) -> bool:
+        """Apply Telegram entity nesting rules while preserving the text."""
+        if tag in _STYLE_TAGS:
+            return not any(open_tag in _CODE_TAGS for open_tag in self._open_tags)
+        if tag in _CODE_TAGS:
+            return not self._open_tags
+        return all(open_tag in _STYLE_TAGS for open_tag in self._open_tags)
+
+    def _open(self, tag: str, opening: str | None = None) -> None:
+        if not self._can_open(tag):
+            self._suppressed_tags.append(tag)
+            return
+        self._parts.append(opening or f'<{tag}>')
+        self._open_tags.append(tag)
+
+    def _close(self, tag: str) -> None:
+        for index in range(len(self._suppressed_tags) - 1, -1, -1):
+            if self._suppressed_tags[index] == tag:
+                del self._suppressed_tags[index]
+                return
+        self._close_until(tag)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -74,8 +101,7 @@ class _TelegramHtmlRenderer(HTMLParser):
             return
         if tag in _HEADING_TAGS:
             self._append('\n\n')
-            self._parts.append('<b>')
-            self._open_tags.append('b')
+            self._open('b')
             return
         if tag in _BLOCK_TAGS:
             self._append('\n\n')
@@ -85,12 +111,10 @@ class _TelegramHtmlRenderer(HTMLParser):
             if href and _SAFE_HREF_RE.match(href.strip()):
                 escaped = html_module.escape(href.strip(), quote=True)
                 if len(escaped) <= _MAX_HREF_LENGTH:
-                    self._parts.append(f'<a href="{escaped}">')
-                    self._open_tags.append('a')
+                    self._open('a', f'<a href="{escaped}">')
             return
         if tag in TELEGRAM_ALLOWED_TAGS:
-            self._parts.append(f'<{tag}>')
-            self._open_tags.append(tag)
+            self._open(tag)
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -105,7 +129,7 @@ class _TelegramHtmlRenderer(HTMLParser):
             self._append('\n')
             return
         if tag in _HEADING_TAGS:
-            self._close_until('b')
+            self._close('b')
             self._append('\n\n')
             return
         tag = _TAG_ALIASES.get(tag, tag)
@@ -113,7 +137,7 @@ class _TelegramHtmlRenderer(HTMLParser):
             self._append('\n\n')
             return
         if tag in TELEGRAM_ALLOWED_TAGS:
-            self._close_until(tag)
+            self._close(tag)
 
     def handle_data(self, data: str) -> None:
         self._append(html_module.escape(data))
@@ -134,6 +158,24 @@ def html_to_telegram(raw_html: str | None) -> str:
     renderer.feed(raw_html)
     renderer.close()
     return renderer.result()
+
+
+def telegram_visible_length(rendered_html: str) -> int:
+    """Count parsed Telegram text in UTF-16 code units, as the Bot API does."""
+    visible_text = html_module.unescape(_TAG_RE.sub('', rendered_html))
+    return len(visible_text.encode('utf-16-le')) // 2
+
+
+def prepare_telegram_broadcast(raw_html: str | None) -> str:
+    """Return canonical Telegram HTML or fail before a broadcast is created."""
+    if raw_html is None:
+        raise ValueError('Текст Telegram должен содержать от 1 до 4000 символов')
+    rendered = html_to_telegram(raw_html)
+    if not rendered:
+        raise ValueError('Текст Telegram пуст после удаления неподдерживаемой HTML-разметки')
+    if telegram_visible_length(rendered) > 4000:
+        raise ValueError('Видимый текст Telegram должен содержать не больше 4000 символов')
+    return rendered
 
 
 def info_page_faq_to_telegram(raw_content: str | None) -> str:
@@ -239,7 +281,5 @@ def split_telegram_text(text: str | None, *, max_length: int = 3500) -> list[str
         elif max_length > 1000:
             safe.extend(split_telegram_text(chunk, max_length=max_length - 500))
         else:
-            safe.extend(
-                chunk[index : index + _TELEGRAM_HARD_LIMIT] for index in range(0, len(chunk), _TELEGRAM_HARD_LIMIT)
-            )
+            raise ValueError('Telegram HTML cannot be split without breaking markup')
     return safe
