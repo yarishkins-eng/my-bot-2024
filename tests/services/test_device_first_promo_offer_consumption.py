@@ -200,12 +200,19 @@ def _armed_checkout(target):
         settlement_mode='legacy_deposit',
         quote_state='valid',
         terminal_reason=None,
-        price_breakdown={'promo_offer_discount_kopeks': DISCOUNT},
+        price_breakdown={'promo_offer_discount_kopeks': 0},
     )
 
 
 @pytest.mark.asyncio
 async def test_wallet_fulfilment_burns_the_discount_it_actually_applied(monkeypatch):
+    """Источник факта здесь — ПЕРЕСЧИТАННАЯ цена, а не замороженная разбивка заказа.
+
+    Поэтому в фикстуре они РАСХОДЯТСЯ: разбивка говорит «скидки нет», живая цена —
+    «скидка есть». Совпади они, сторож не отличал бы один источник от другого.
+    Выше по коду стоит забор `charge != checkout.quoted_price_kopeks`, но он сверяет
+    ИТОГ, а не его состав.
+    """
     monkeypatch.setattr(
         'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
         AsyncMock(return_value=ResolvedEntitlement((), ('squad-1',), 1, 'test')),
@@ -261,7 +268,9 @@ async def test_wallet_fulfilment_keeps_a_discount_the_price_did_not_use(monkeypa
     )
     target = _paid_target()
     checkout = _armed_checkout(target)
-    checkout.price_breakdown = {'promo_offer_discount_kopeks': 0}
+    # Зеркало предыдущего сторожа: замороженная разбивка утверждает скидку, живая
+    # цена её не применила. Гасить нельзя — платит именно живая цена.
+    checkout.price_breakdown = {'promo_offer_discount_kopeks': DISCOUNT}
     user = _user_with_offer()
     tariff = SimpleNamespace(id=7, pricing_revision=1, traffic_limit_gb=100, allowed_squads=[])
     extended = SimpleNamespace(id=target.id, end_date=datetime.now(UTC) + timedelta(days=50))
