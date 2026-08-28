@@ -336,7 +336,15 @@ def test_device_first_sale_snapshot_captures_immutable_entitlement_not_tariff_uu
     tariff = SimpleNamespace(name='Premium', traffic_limit_gb=100, allowed_squads=['must-not-leak'])
     entitlement = ResolvedEntitlement(('pl',), ('customer-pl',), 4, 'tariff')
 
-    snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='platega', entitlement=entitlement)
+    snapshot = _direct_sale_snapshot(
+        checkout,
+        tariff,
+        funding_mode='platega',
+        entitlement=entitlement,
+        # Личность промо-предложения замораживается вместе с ценой (СК-1). Здесь
+        # проверяются права доступа, поэтому предложения у человека нет.
+        user=SimpleNamespace(id=7, promo_offer_discount_source=None),
+    )
 
     assert snapshot['entitlement']['location_ids'] == ['pl']
     assert snapshot['entitlement_hash'] == entitlement.snapshot_hash
@@ -363,7 +371,15 @@ def test_device_first_access_point_snapshot_round_trips_the_inventory_fingerprin
         'point-policy-fingerprint',
     )
 
-    snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='wallet', entitlement=entitlement)
+    snapshot = _direct_sale_snapshot(
+        checkout,
+        tariff,
+        funding_mode='wallet',
+        entitlement=entitlement,
+        # Личность промо-предложения замораживается вместе с ценой (СК-1). Здесь
+        # проверяются права доступа, поэтому предложения у человека нет.
+        user=SimpleNamespace(id=7, promo_offer_discount_source=None),
+    )
     raw = snapshot['entitlement']
     rebuilt = ResolvedEntitlement(
         tuple(raw['location_ids']),

@@ -24,6 +24,14 @@ PERCENT = 13
 BALANCE = 41_900
 
 
+class _Savepoint:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, _traceback):
+        return False
+
+
 class _Result:
     """Одна подделка на все чтения: `scalar_one_or_none` и `scalars().first()`."""
 
@@ -41,13 +49,13 @@ class _Result:
         return SimpleNamespace(first=lambda: self._first, all=list)
 
 
-def _user_with_offer(*, percent: int = PERCENT, balance: int = BALANCE):
+def _user_with_offer(*, percent: int = PERCENT, balance: int = BALANCE, source: str = 'expired_discount_wave2'):
     return SimpleNamespace(
         id=7,
         balance_kopeks=balance,
         has_had_paid_subscription=False,
         promo_offer_discount_percent=percent,
-        promo_offer_discount_source='expired_discount_wave2',
+        promo_offer_discount_source=source,
         promo_offer_discount_expires_at=datetime.now(UTC) + timedelta(hours=9),
     )
 
@@ -74,6 +82,7 @@ async def test_applied_discount_is_burned_and_written_into_the_promo_log():
         execute=AsyncMock(return_value=_Result(first=offer)),
         add=added.append,
         flush=AsyncMock(),
+        begin_nested=lambda: _Savepoint(),
     )
 
     await service._consume_promo_offer_for_sale(
@@ -81,6 +90,7 @@ async def test_applied_discount_is_burned_and_written_into_the_promo_log():
         user=user,
         checkout=_checkout(discount_kopeks=DISCOUNT),
         applied_discount_kopeks=DISCOUNT,
+        expected_source='expired_discount_wave2',
     )
 
     assert user.promo_offer_discount_percent == 0
@@ -106,13 +116,14 @@ async def test_right_to_a_discount_without_an_applied_discount_is_never_burned()
     дают РАЗНЫЙ ответ: право есть, применённая скидка нулевая.
     """
     user = _user_with_offer()
-    db = SimpleNamespace(execute=AsyncMock(), add=AsyncMock(), flush=AsyncMock())
+    db = SimpleNamespace(execute=AsyncMock(), add=AsyncMock(), flush=AsyncMock(), begin_nested=lambda: _Savepoint())
 
     await service._consume_promo_offer_for_sale(
         db,
         user=user,
         checkout=_checkout(discount_kopeks=0),
         applied_discount_kopeks=0,
+        expected_source='expired_discount_wave2',
     )
 
     assert user.promo_offer_discount_percent == PERCENT
@@ -125,13 +136,14 @@ async def test_right_to_a_discount_without_an_applied_discount_is_never_burned()
 @pytest.mark.asyncio
 async def test_a_user_without_a_discount_costs_no_lookup_and_no_log():
     user = _user_with_offer(percent=0)
-    db = SimpleNamespace(execute=AsyncMock(), add=AsyncMock(), flush=AsyncMock())
+    db = SimpleNamespace(execute=AsyncMock(), add=AsyncMock(), flush=AsyncMock(), begin_nested=lambda: _Savepoint())
 
     await service._consume_promo_offer_for_sale(
         db,
         user=user,
         checkout=_checkout(discount_kopeks=DISCOUNT),
         applied_discount_kopeks=DISCOUNT,
+        expected_source='expired_discount_wave2',
     )
 
     db.add.assert_not_called()
@@ -143,7 +155,7 @@ async def test_a_failed_offer_lookup_still_burns_the_discount(monkeypatch):
     """Поиск предложения нужен только для подробностей лога, продажу он не решает."""
     user = _user_with_offer()
     added = []
-    db = SimpleNamespace(execute=AsyncMock(), add=added.append, flush=AsyncMock())
+    db = SimpleNamespace(execute=AsyncMock(), add=added.append, flush=AsyncMock(), begin_nested=lambda: _Savepoint())
     monkeypatch.setattr(
         service,
         'get_latest_claimed_offer_for_user',
@@ -155,6 +167,7 @@ async def test_a_failed_offer_lookup_still_burns_the_discount(monkeypatch):
         user=user,
         checkout=_checkout(discount_kopeks=DISCOUNT),
         applied_discount_kopeks=DISCOUNT,
+        expected_source='expired_discount_wave2',
     )
 
     assert user.promo_offer_discount_percent == 0
@@ -236,6 +249,7 @@ async def test_wallet_fulfilment_burns_the_discount_it_actually_applied(monkeypa
         add=added.append,
         flush=AsyncMock(),
         refresh=AsyncMock(),
+        begin_nested=lambda: _Savepoint(),
     )
     monkeypatch.setattr(service, 'get_owned_checkout', AsyncMock(return_value=checkout))
     monkeypatch.setattr(
@@ -281,6 +295,7 @@ async def test_wallet_fulfilment_keeps_a_discount_the_price_did_not_use(monkeypa
         add=added.append,
         flush=AsyncMock(),
         refresh=AsyncMock(),
+        begin_nested=lambda: _Savepoint(),
     )
     monkeypatch.setattr(service, 'get_owned_checkout', AsyncMock(return_value=checkout))
     monkeypatch.setattr(
@@ -302,15 +317,7 @@ async def test_wallet_fulfilment_keeps_a_discount_the_price_did_not_use(monkeypa
     assert not any(getattr(row, 'action', None) == 'consumed' for row in added)
 
 
-class _Savepoint:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, _traceback):
-        return False
-
-
-def _card_sale_checkout(*, discount_kopeks: int):
+def _card_sale_checkout(*, discount_kopeks: int, user=None, snapshot_source: str = 'expired_discount_wave2'):
     """Прямая продажа КАРТОЙ — ровно тот путь, что сработал на боевом 28.08.2026.
 
     Баланс здесь не трогается вовсе, поэтому гасить скидку побочным эффектом
@@ -344,6 +351,8 @@ def _card_sale_checkout(*, discount_kopeks: int):
         tariff,
         funding_mode='platega',
         entitlement=entitlement,
+        # Личность предложения замораживается вместе с ценой — в момент выставления счёта.
+        user=user if user is not None else _user_with_offer(source=snapshot_source),
     )
     return checkout
 
@@ -412,3 +421,91 @@ async def test_card_sale_without_an_applied_discount_leaves_the_offer_alone(monk
     assert result.fulfillment_state == 'fulfilled'
     assert user.promo_offer_discount_percent == PERCENT
     assert not any(getattr(row, 'action', None) == 'consumed' for row in added)
+
+
+@pytest.mark.asyncio
+async def test_card_sale_does_not_burn_an_offer_the_customer_claimed_later(monkeypatch):
+    """Счёт у провайдера живёт часами — за это время предложение могло смениться.
+
+    Замороженная цена посчитана по предложению A, а на человеке лежит уже B.
+    Сжечь B — отобрать у клиента скидку, которой эта покупка не пользовалась.
+    """
+    user = _user_with_offer(source='trial_expired_discount')
+    added = []
+    db = _patch_direct_sale(monkeypatch, added)
+    checkout = _card_sale_checkout(discount_kopeks=DISCOUNT, snapshot_source='expired_discount_wave2')
+
+    result = await service._complete_direct_sale_locked(
+        db, checkout=checkout, user=user, target=None, provider_payment_id='provider-77'
+    )
+
+    assert result.fulfillment_state == 'fulfilled'
+    assert user.promo_offer_discount_percent == PERCENT
+    assert user.promo_offer_discount_source == 'trial_expired_discount'
+    assert not any(getattr(row, 'action', None) == 'consumed' for row in added)
+
+
+@pytest.mark.asyncio
+async def test_an_order_created_before_this_change_still_burns_by_amount(monkeypatch):
+    """У заказов до СК-1 личности предложения в снимке нет — правило прежнее, «по сумме»."""
+    user = _user_with_offer()
+    added = []
+    db = _patch_direct_sale(monkeypatch, added)
+    checkout = _card_sale_checkout(discount_kopeks=DISCOUNT)
+    del checkout.sale_snapshot['promo_offer_source']
+
+    await service._complete_direct_sale_locked(
+        db, checkout=checkout, user=user, target=None, provider_payment_id='provider-77'
+    )
+
+    assert user.promo_offer_discount_percent == 0
+    assert any(getattr(row, 'action', None) == 'consumed' for row in added)
+
+
+@pytest.mark.asyncio
+async def test_a_sale_that_ends_in_operator_review_never_burns_the_discount(monkeypatch):
+    """Сторож на ПОРЯДОК: гашение обязано стоять ниже всего, что умеет бросить.
+
+    Вызывающий ловит `DeviceFirstError` и коммитит состояние разбора. Подними гашение
+    выше любой такой ветки — и скидка сгорит по несостоявшейся продаже, молча.
+    """
+    user = _user_with_offer()
+    added = []
+    db = _patch_direct_sale(monkeypatch, added)
+    # Подписка появилась после оплаты — заказ обязан уйти в разбор, не выдавая ничего.
+    monkeypatch.setattr(service, '_current_subscription', AsyncMock(return_value=SimpleNamespace(id=99)))
+    checkout = _card_sale_checkout(discount_kopeks=DISCOUNT)
+
+    with pytest.raises(service.DeviceFirstError) as raised:
+        await service._complete_direct_sale_locked(
+            db, checkout=checkout, user=user, target=None, provider_payment_id='provider-77'
+        )
+
+    assert raised.value.code == 'operator_review_required'
+    assert checkout.lifecycle_state == 'operator_review'
+    assert user.promo_offer_discount_percent == PERCENT
+    assert not any(getattr(row, 'action', None) == 'consumed' for row in added)
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_provider_webhook_burns_nothing_a_second_time(monkeypatch):
+    """Повтор вебхука не должен гасить ВТОРОЕ предложение и писать второй раз в журнал."""
+    user = _user_with_offer()
+    added = []
+    db = _patch_direct_sale(monkeypatch, added)
+    checkout = _card_sale_checkout(discount_kopeks=DISCOUNT)
+
+    await service._complete_direct_sale_locked(
+        db, checkout=checkout, user=user, target=None, provider_payment_id='provider-77'
+    )
+    assert checkout.fulfillment_state == 'fulfilled'
+    # Между попытками человек успел забрать новое предложение.
+    user.promo_offer_discount_percent = PERCENT
+    user.promo_offer_discount_source = 'expired_discount_wave2'
+
+    await service._complete_direct_sale_locked(
+        db, checkout=checkout, user=user, target=None, provider_payment_id='provider-77'
+    )
+
+    assert user.promo_offer_discount_percent == PERCENT
+    assert len([row for row in added if getattr(row, 'action', None) == 'consumed']) == 1

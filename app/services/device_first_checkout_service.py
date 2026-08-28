@@ -1555,6 +1555,10 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         user=user,
         checkout=checkout,
         applied_discount_kopeks=int(current_price.promo_offer_discount or 0),
+        # Здесь цена пересчитана ПРЯМО СЕЙЧАС из текущего предложения человека, поэтому
+        # применённое и гасимое — одно и то же по построению, и сверка тождественна.
+        # Окна, в которое предложение могло смениться, у этой ветки нет.
+        expected_source=getattr(user, 'promo_offer_discount_source', None),
     )
     ledger = Transaction(
         user_id=user.id,
@@ -1851,7 +1855,7 @@ def _load_checkout_quoted_entitlement(checkout: SubscriptionCheckout):
 
 
 def _direct_sale_snapshot(
-    checkout: SubscriptionCheckout, tariff: Tariff, *, funding_mode: str, entitlement
+    checkout: SubscriptionCheckout, tariff: Tariff, *, funding_mode: str, entitlement, user: User
 ) -> dict[str, Any]:
     """The post-confirmation source of truth; no later tariff repricing is allowed."""
     return {
@@ -1871,6 +1875,11 @@ def _direct_sale_snapshot(
         'pricing_revision': checkout.pricing_revision,
         'funding_mode': funding_mode,
         'target_snapshot': checkout.target_snapshot,
+        # 🔴 ЛИЧНОСТЬ предложения, а не только его сумма. Счёт у провайдера живёт часами,
+        # и за это время человек может забрать ДРУГОЕ предложение. Без этой строки гасилось
+        # бы то, что лежит на нём в момент вебхука, а не то, что вошло в цену, — и клиент
+        # терял бы неиспользованную скидку. Нашли две линзы ревью независимо.
+        'promo_offer_source': getattr(user, 'promo_offer_discount_source', None),
         'expires_at': checkout.quote_expires_at.isoformat(),
     }
 
@@ -1914,7 +1923,9 @@ async def prepare_direct_external_checkout(
     checkout.wallet_applied_kopeks = 0
     checkout.external_payable_kopeks = total
     checkout.funding_mode = 'platega'
-    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='platega', entitlement=entitlement)
+    checkout.sale_snapshot = _direct_sale_snapshot(
+        checkout, tariff, funding_mode='platega', entitlement=entitlement, user=user
+    )
     checkout.financial_committed_at = datetime.now(UTC)
     checkout.lifecycle_state = 'awaiting_funds'
     checkout.funding_state = 'invoice_pending'
@@ -1932,6 +1943,7 @@ async def _consume_promo_offer_for_sale(
     user: User,
     checkout: SubscriptionCheckout,
     applied_discount_kopeks: int,
+    expected_source: str | None,
 ) -> None:
     """Погасить одноразовую скидку, которую эта продажа ДЕЙСТВИТЕЛЬНО применила.
 
@@ -1961,6 +1973,18 @@ async def _consume_promo_offer_for_sale(
         return
 
     source = getattr(user, 'promo_offer_discount_source', None)
+    if source != expected_source:
+        # Предложение сменилось между расчётом цены и приходом денег. Гасить нельзя:
+        # человек потерял бы предложение, которого эта покупка не применяла. Несовпадение
+        # всегда решаем в пользу клиента — оставить скидку дешевле, чем сжечь чужую.
+        logger.info(
+            'Promo offer changed between the quote and the sale; leaving it untouched',
+            user_id=user.id,
+            checkout_id=checkout.id,
+            quoted_source=expected_source,
+            current_source=source,
+        )
+        return
     try:
         offer = await get_latest_claimed_offer_for_user(db, user.id, source)
     except Exception as lookup_error:  # pragma: no cover - defensive logging
@@ -1977,21 +2001,36 @@ async def _consume_promo_offer_for_sale(
     user.promo_offer_discount_source = None
     user.promo_offer_discount_expires_at = None
 
-    await log_promo_offer_action(
-        db,
-        user_id=user.id,
-        offer_id=offer.id if offer else None,
-        action='consumed',
-        source=source,
-        percent=percent,
-        effect_type=offer.effect_type if offer else None,
-        details={
-            'reason': 'device_first_checkout',
-            'checkout_public_id': checkout.public_id,
-            'discount_kopeks': applied_discount_kopeks,
-        },
-        commit=False,
-    )
+    # 🔴 Журнал — ВСПОМОГАТЕЛЬНЫЙ, ронять им оплаченную продажу нельзя. Сосед прикрывает
+    # свою такую запись голым `try/except` (`app/database/crud/user.py:811-828`), и этого
+    # ЗДЕСЬ мало: упавший `flush()` отравляет транзакцию, и следующий `commit()` всё равно
+    # падает `PendingRollbackError` — на карточном пути это откат продажи, за которую
+    # провайдер уже взял деньги. Поэтому сейвпоинт, как это уже сделано в том же файле
+    # вокруг выдачи подписки: откатывается только журнал, продажа остаётся.
+    try:
+        async with db.begin_nested():
+            await log_promo_offer_action(
+                db,
+                user_id=user.id,
+                offer_id=offer.id if offer else None,
+                action='consumed',
+                source=source,
+                percent=percent,
+                effect_type=offer.effect_type if offer else None,
+                details={
+                    'reason': 'device_first_checkout',
+                    'checkout_public_id': checkout.public_id,
+                    'discount_kopeks': applied_discount_kopeks,
+                },
+                commit=False,
+            )
+    except Exception as log_error:  # pragma: no cover - defensive logging
+        logger.warning(
+            'Failed to record promo offer consumption for a device-first sale',
+            user_id=user.id,
+            checkout_id=checkout.id,
+            log_error=log_error,
+        )
 
 
 async def _complete_direct_sale_locked(
@@ -2244,14 +2283,20 @@ async def _complete_direct_sale_locked(
         db.add(sale)
         await db.flush()
     user.has_had_paid_subscription = True
-    # Здесь живого пересчёта нет — цену заморозил снимок продажи, поэтому источник
-    # факта один: разбивка самого заказа. Она пишется один раз при создании
-    # (`price_breakdown=selected['breakdown']`) и больше нигде не переписывается.
+    # Читаем из СНИМКА, а не из колонки заказа. Сегодня они совпадают (колонка пишется один
+    # раз при создании), но вся остальная функция построена на снимке именно потому, что
+    # колонка изменяемая, — а на неё нет забора расхождения. Нашла линза «деньги».
+    _frozen_breakdown = (checkout.sale_snapshot or {}).get('price_breakdown') or {}
     await _consume_promo_offer_for_sale(
         db,
         user=user,
         checkout=checkout,
-        applied_discount_kopeks=int((checkout.price_breakdown or {}).get('promo_offer_discount_kopeks') or 0),
+        applied_discount_kopeks=int(_frozen_breakdown.get('promo_offer_discount_kopeks') or 0),
+        # Заказы, заведённые ДО этой правки, личности предложения не несут. Для них
+        # запасное значение делает сверку тождественной — то есть прежнее правило «по сумме».
+        expected_source=(checkout.sale_snapshot or {}).get(
+            'promo_offer_source', getattr(user, 'promo_offer_discount_source', None)
+        ),
     )
     checkout.created_subscription_id = target.id
     checkout.debit_transaction_id = sale.id
@@ -2303,7 +2348,9 @@ async def commit_direct_wallet_checkout(
     checkout.wallet_applied_kopeks = total
     checkout.external_payable_kopeks = 0
     checkout.funding_mode = 'wallet'
-    checkout.sale_snapshot = _direct_sale_snapshot(checkout, tariff, funding_mode='wallet', entitlement=entitlement)
+    checkout.sale_snapshot = _direct_sale_snapshot(
+        checkout, tariff, funding_mode='wallet', entitlement=entitlement, user=user
+    )
     checkout.financial_committed_at = datetime.now(UTC)
     await _complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
     await db.commit()

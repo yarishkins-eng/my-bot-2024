@@ -54,7 +54,7 @@ def _checkout(**overrides):
     return SimpleNamespace(**{**base, **overrides})
 
 
-def _access_point_sale_checkout(*, entitlement: ResolvedEntitlement):
+def _access_point_sale_checkout(*, entitlement: ResolvedEntitlement, user=None):
     checkout = _checkout(
         tariff_id=7,
         tariff_total_kopeks=36_900,
@@ -73,6 +73,7 @@ def _access_point_sale_checkout(*, entitlement: ResolvedEntitlement):
         tariff,
         funding_mode='platega',
         entitlement=entitlement,
+        user=user if user is not None else _user(),
     )
     return checkout, tariff
 
