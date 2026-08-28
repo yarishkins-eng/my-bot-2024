@@ -233,11 +233,16 @@ async def test_fulfillment_step_recovers_after_credit_commit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_paid_referral_queues_a_message_so_the_partner_learns_about_it():
-    """РФ-1 п.1.3: партнёр обязан УЗНАТЬ о комиссии, а не только получить её.
+async def test_a_paid_referral_queues_one_message_per_recipient():
+    """РФ-1 п.1.3 + РФ-3: каждый получатель узнаёт о деньгах ОТДЕЛЬНОЙ строкой.
 
     До этапа device-first платил молча: бота в этой цепочке нет ни в одном из трёх мест
     вызова, поэтому сообщение ставится в очередь, у которой бот уже есть.
+
+    🔴 Строка была ОДНА на заказ, и отправка считала её выполненной, если письмо ушло хотя бы
+    кому-то. У первой оплаты получателей двое — партнёр и новичок; второй не узнавал о своих
+    деньгах никогда, и повтора для него не существовало. Теперь у каждого своя строка, свой
+    статус и свой повтор. Получатель зашит в тип — схему базы это не трогает.
     """
     from app.database.models import DeviceFirstNotificationOutbox
 
@@ -246,7 +251,8 @@ async def test_a_paid_referral_queues_a_message_so_the_partner_learns_about_it()
         execute=AsyncMock(
             side_effect=[
                 Result(value=777),  # наградная строка по заказу есть — платили
-                Result(value=None),  # сообщение по этому заказу ещё не ставили
+                Result(values=[133, 172]),  # получатели: партнёр и новичок
+                Result(values=[]),  # по этому заказу ещё ничего не ставили
             ]
         ),
         add=MagicMock(side_effect=added.append),
@@ -254,10 +260,50 @@ async def test_a_paid_referral_queues_a_message_so_the_partner_learns_about_it()
 
     await service._queue_referral_reward_notification(db, checkout_id=13)
 
-    assert len(added) == 1, 'сообщение обязано быть поставлено ровно один раз'
-    assert isinstance(added[0], DeviceFirstNotificationOutbox)
-    assert added[0].checkout_id == 13
-    assert added[0].notification_type == 'referral_reward'
+    assert len(added) == 2, 'строка обязана быть у КАЖДОГО получателя, а не одна на заказ'
+    assert all(isinstance(row, DeviceFirstNotificationOutbox) for row in added)
+    assert {row.checkout_id for row in added} == {13}
+    assert [row.notification_type for row in added] == ['referral_reward:133', 'referral_reward:172']
+
+
+@pytest.mark.asyncio
+async def test_referral_message_is_not_queued_twice_for_the_same_recipient():
+    """Повторный проход не плодит вторую строку тому же человеку."""
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Result(value=777),
+                Result(values=[133, 172]),
+                Result(values=['referral_reward:133']),  # партнёру уже поставили
+            ]
+        ),
+        add=MagicMock(side_effect=added.append),
+    )
+
+    await service._queue_referral_reward_notification(db, checkout_id=13)
+
+    assert [row.notification_type for row in added] == ['referral_reward:172']
+
+
+@pytest.mark.asyncio
+async def test_old_format_row_blocks_a_second_mailing():
+    """Строка старого формата (до РФ-3) считается занятой — иначе разошлём вторично."""
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Result(value=777),
+                Result(values=[133, 172]),
+                Result(values=['referral_reward']),  # заведена до РФ-3
+            ]
+        ),
+        add=MagicMock(side_effect=added.append),
+    )
+
+    await service._queue_referral_reward_notification(db, checkout_id=13)
+
+    assert added == []
 
 
 @pytest.mark.asyncio
@@ -504,7 +550,7 @@ async def test_debt_payment_never_emits_wallet_topup_event(monkeypatch):
     monkeypatch.setattr(service, 'ensure_deposit_outbox', ensure)
     worker = AsyncMock(return_value=1)
     monkeypatch.setattr(service, 'process_device_first_deposit_outbox', worker)
-    monkeypatch.setattr(service, '_debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
+    monkeypatch.setattr(service, 'debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
     db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=AsyncMock(), expire_all=MagicMock())
 
     result = await service.pay_referral_debt(db)
@@ -548,7 +594,7 @@ async def test_debt_payment_commits_all_rows_once_before_draining(monkeypatch):
     monkeypatch.setattr(service, 'ensure_deposit_outbox', ensure)
     worker = AsyncMock(return_value=1)
     monkeypatch.setattr(service, 'process_device_first_deposit_outbox', worker)
-    monkeypatch.setattr(service, '_debt_credited_kopeks', AsyncMock(return_value={'friend': 0, 'referrer': 0}))
+    monkeypatch.setattr(service, 'debt_credited_kopeks', AsyncMock(return_value={'friend': 0, 'referrer': 0}))
     commit = AsyncMock()
     db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=commit, expire_all=MagicMock())
 
@@ -585,7 +631,7 @@ async def test_debt_payment_survives_a_failing_row_and_keeps_going(monkeypatch):
     monkeypatch.setattr(service, 'ensure_deposit_outbox', AsyncMock())
     worker = AsyncMock(side_effect=[RuntimeError('обрыв'), 1])
     monkeypatch.setattr(service, 'process_device_first_deposit_outbox', worker)
-    monkeypatch.setattr(service, '_debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
+    monkeypatch.setattr(service, 'debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
     db = SimpleNamespace(
         execute=AsyncMock(return_value=Result(None)),
         commit=AsyncMock(),
@@ -722,7 +768,7 @@ async def test_credited_split_keeps_friend_bonus_off_the_partner():
     ]
     db = SimpleNamespace(execute=AsyncMock(return_value=Result(values=ledger)))
 
-    credited = await service._debt_credited_kopeks(db, transaction_id=193)
+    credited = await service.debt_credited_kopeks(db, transaction_id=193)
 
     assert credited == {'friend': 10000, 'referrer': 59750}
 
@@ -733,7 +779,7 @@ async def test_credited_split_counts_recurring_commission_as_partner_money():
     ledger = [('deposit-side-effect:237:inviter-recurring-commission', 9225)]
     db = SimpleNamespace(execute=AsyncMock(return_value=Result(values=ledger)))
 
-    credited = await service._debt_credited_kopeks(db, transaction_id=237)
+    credited = await service.debt_credited_kopeks(db, transaction_id=237)
 
     assert credited == {'friend': 0, 'referrer': 9225}
 
@@ -749,13 +795,13 @@ def test_result_header_never_claims_paid_before_the_ledger_says_so():
     """
     from app.handlers.admin.referrals import _debt_result_text
 
-    empty = [{'credited_referrer': 0, 'credited_friend': 0, 'referrer': None, 'buyer': None}]
+    empty = [{'credited_referrer': 0, 'credited_friend': 0, 'referrer_name': '', 'buyer_name': ''}]
     paid = [
         {
             'credited_referrer': 59750,
             'credited_friend': 10000,
-            'referrer': SimpleNamespace(full_name='партнёр'),
-            'buyer': SimpleNamespace(full_name='новичок'),
+            'referrer_name': 'партнёр',
+            'buyer_name': 'новичок',
         }
     ]
 
@@ -763,3 +809,108 @@ def test_result_header_never_claims_paid_before_the_ledger_says_so():
     assert 'Долг выплачен' not in _debt_result_text(empty, paid=True, reason='')
     assert 'Долг выплачен' in _debt_result_text(paid, paid=True, reason='')
     assert 'Выплата остановлена' in _debt_result_text(empty, paid=False, reason='причина')
+
+
+def test_debt_screen_calls_it_closed_only_when_the_ledger_holds_the_full_sum():
+    """Экран отвечает за ДЕНЬГИ В КНИГЕ, а не за статусы работ (РФ-3).
+
+    🔴 Две редакции этого сторожа подряд закрепляли неправду, обе нашло ревью.
+    Первая требовала «закрыт» при `credited_friend=0` — то есть «деньги хоть кому-то».
+    Вторая сравнивала с `to_referrer`/`to_friend`, а те считаются ТОЛЬКО в ветке без проблем:
+    после выплаты проблема есть у каждой строки, ожидания нули, и сравнение вырождалось в
+    «0 >= 0» — вечное «долг закрыт» даже при пустой книге.
+
+    Сравниваем с замороженной суммой: она от состояния строк не зависит.
+    """
+    from app.handlers.admin.referrals import _debt_screen_text
+
+    def _row(*, credited: int, status: str = 'done') -> dict:
+        return {
+            'transaction_id': 193,
+            'buyer_name': 'друг',
+            'referrer_name': 'партнёр',
+            'referrer_id': 133,
+            'paid_kopeks': 199000,
+            'paid_at': None,
+            'commission_percent': 25,
+            # 🔴 Нули — то, что план РЕАЛЬНО отдаёт для строки с проблемой. Подставь сюда
+            # 10000/59750, как делала прошлая редакция, и сторож проверял бы вход, которого
+            # не бывает.
+            'to_friend': 0,
+            'to_referrer': 0,
+            'problems': [f'работа уже заведена ({status})'],
+            'credited_referrer': credited,
+            'credited_friend': 0,
+        }
+
+    full = service.REFERRAL_DEBT_2026_08_TOTAL_KOPEKS
+    assert 'Долг закрыт' in _debt_screen_text([_row(credited=full)], 0)
+
+    # 🔴 Работы закрыты, книга пуста — это НЕ «закрыт», и очередь уже НЕ доплатит.
+    empty = _debt_screen_text([_row(credited=0)], 0)
+    assert 'Долг закрыт' not in empty
+    assert 'НЕ доплатит' in empty
+
+    # 🔴 Часть денег есть, но меньше ожидаемого — это НЕ «закрыт».
+    # Без этого случая сторож переживает подмену условия на «у каждой строки что-то начислено»:
+    # одной копейки хватило бы, чтобы экран объявил долг закрытым.
+    partial = _debt_screen_text([_row(credited=100)], 0)
+    assert 'Долг закрыт' not in partial
+    assert 'НЕ доплатит' in partial
+
+    # Очередь ещё в работе — тут обещать доплату честно.
+    working = _debt_screen_text([_row(credited=0, status='pending')], 0)
+    assert 'Долг закрыт' not in working
+    assert 'ещё работает' in working
+
+
+@pytest.mark.asyncio
+async def test_concurrent_press_says_the_payment_is_running_not_that_money_is_untouched(monkeypatch):
+    """Второе окно не говорит про деньги ни в какую сторону (РФ-3).
+
+    🔴 Три редакции подряд. Первая возвращала пустой список — экран печатал «ни одна строка
+    не оплачена, деньги не тронуты» про пакет, который сосед только что закоммитил. Вторая
+    читала книгу — и это оказалось бесполезно: блокировка с нашей вставки снимается ровно на
+    `COMMIT` соседа, то есть работы уже есть, а начислений ещё нет, книга даёт нули, и экран
+    печатает ту же неправду. Нашёл прогон сценария.
+
+    Теперь отдаём признак «выплата идёт» — он верен независимо от состояния книги.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    monkeypatch.setattr(type(service.settings), 'is_referral_program_enabled', lambda self: True)
+    rows = [
+        {
+            'transaction_id': 193,
+            'checkout_id': 14,
+            'buyer_name': 'друг',
+            'referrer_name': 'партнёр',
+            'referrer_id': 133,
+            'buyer': None,
+            'referrer': None,
+            'paid_kopeks': 199000,
+            'commission_percent': 25,
+            'to_friend': 10000,
+            'to_referrer': 59750,
+            'problems': [],
+        }
+    ]
+    monkeypatch.setattr(service, 'plan_referral_debt', AsyncMock(return_value=rows))
+    monkeypatch.setattr(service, 'REFERRAL_DEBT_2026_08_TOTAL_KOPEKS', 69750)
+    monkeypatch.setattr(service, 'ensure_deposit_outbox', AsyncMock(side_effect=IntegrityError('x', 'y', Exception())))
+    ledger = AsyncMock(return_value={'friend': 0, 'referrer': 0})
+    monkeypatch.setattr(service, 'debt_credited_kopeks', ledger)
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=AsyncMock(), rollback=AsyncMock())
+
+    result = await service.pay_referral_debt(db)
+
+    assert result['paid'] is False
+    assert result['running'] is True, 'экран обязан узнать, что выплата идёт, а не гадать по книге'
+    # 🔴 Книгу здесь не читаем вовсе: она в этот момент отвечает нулями и вводит в заблуждение.
+    ledger.assert_not_awaited()
+
+    from app.handlers.admin.referrals import _debt_result_text
+
+    text = _debt_result_text(result['rows'], paid=False, reason=result['reason'], running=True)
+    assert 'уже идёт' in text
+    assert 'деньги не тронуты' not in text.lower()

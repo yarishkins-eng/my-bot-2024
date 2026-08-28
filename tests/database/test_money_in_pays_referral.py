@@ -83,7 +83,7 @@ KNOWN_MONEY_IN = {
     ('app/handlers/webhooks.py', 'handle_successful_payment'): 'НЕ платит: обработчик не подключён нигде, 0 ₽',
     ('app/services/tribute_service.py', 'force_process_payment'): 'НЕ платит: мёртвый код, вызывающих ноль, 0 ₽',
     ('app/services/device_first_payment_service.py', '_settle_direct_platega_payment_locked'): (
-        'НЕ платит: поздний платёж мимо очереди — мины U и BU, 0 ₽, отдельный этап'
+        'ПЛАТИТ: поздняя оплата заводит ту же durable-работу (РФ-3, закрыло мины U и BU)'
     ),
     # --- зачисление без явного типа: умолчание помощника = «приход» ---
     # 🔴 Эти одиннадцать мест сторож не видел вовсе, пока не научился читать умолчание.

@@ -19,6 +19,7 @@ from app.database.models import ReferralEarning, User, WithdrawalRequest, Withdr
 from app.localization.texts import get_texts
 from app.services.device_first_deposit_outbox_service import (
     REFERRAL_DEBT_2026_08_TOTAL_KOPEKS,
+    debt_credited_kopeks,
     pay_referral_debt,
     plan_referral_debt,
 )
@@ -1504,10 +1505,10 @@ def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
         '',
     ]
     for row in plan:
-        buyer = row['buyer'].full_name if row['buyer'] else f'покупатель по операции {row["transaction_id"]}'
+        buyer = row['buyer_name'] or f'покупатель по операции {row["transaction_id"]}'
         # id рядом с именем: у партнёра бывает две строки, а имена в Телеграме
         # повторяются — без номера владелец их не различит.
-        referrer = f'{row["referrer"].full_name} (id {row["referrer"].id})' if row['referrer'] else '—'
+        referrer = f'{row["referrer_name"]} (id {row["referrer_id"]})' if row['referrer_name'] else '—'
         when = row['paid_at'].strftime('%d.%m') if row.get('paid_at') else '—'
         lines.append(f'• {when} · {html.escape(buyer)} заплатил {_exact_money(row["paid_kopeks"])}')
         if row['problems']:
@@ -1529,23 +1530,40 @@ def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
             )
     lines.append('')
     lines.append(f'<b>Итого: {_exact_money(total_kopeks)}</b>')
-    if all(row['problems'] and row['problems'][0] == 'работа уже заведена (done)' for row in plan):
+    # 🔴 Судим по СУММЕ В КНИГЕ против замороженного ожидания, а не по расчёту строк.
+    # Расчёт `to_referrer`/`to_friend` живёт только в ветке `if not problems`, а после выплаты
+    # проблема есть у каждой строки — значит оба ожидания нули, и сравнение с ними вырождается
+    # в «0 >= 0», то есть в вечное «долг закрыт». Ровно это внесла первая редакция починки,
+    # поймал критик полноты. Замороженная сумма от состояния строк не зависит.
+    credited_total = sum(row.get('credited_referrer', 0) + row.get('credited_friend', 0) for row in plan)
+    paid_rows = [row for row in plan if row.get('credited_referrer') or row.get('credited_friend')]
+    if plan and credited_total >= REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
         # Не авария, а нормальная жизнь после выплаты: иначе экран навсегда остался бы
         # похожим на поломку и владелец пошёл бы «чинить» уже оплаченное.
-        # 🔴 Условие требует именно `done`. Раньше оно смотрело только на НАЛИЧИЕ работы и
-        # говорило «начислена» с момента её создания — то есть и тогда, когда все пять работ
-        # умерли в повторах и не заплатили ни копейки.
+        # 🔴 Условие смотрит в КНИГУ ОПЕРАЦИЙ и сравнивает с ожидаемым по каждому получателю.
+        # Раньше оно судило по статусу работы и говорило «начислена» с момента её создания —
+        # то есть и тогда, когда все пять работ умерли в повторах и не заплатили ни копейки.
         return (
             '🧾 <b>Долг по рефералке</b>\n\n'
-            '✅ Долг закрыт: по всем пяти оплатам работа очереди выполнена.\n\n'
+            '✅ Долг закрыт: по всем пяти оплатам деньги начислены.\n\n'
             'Суммы видны в истории операций партнёров.'
         )
-    if all(row['problems'] and row['problems'][0].startswith('работа уже заведена') for row in plan):
-        return (
-            '🧾 <b>Долг по рефералке</b>\n\n'
-            '⏳ Работы заведены, но очередь ещё не довела их до конца.\n\n'
-            'Она доплатит сама. Откройте экран через минуту-другую.'
-        )
+    # Работы заведены, а денег не хватает. Дальше важно, ЧТО с ними: работа в состоянии
+    # `done` не доплатит уже ничего — обратного перевода статуса в коде нет вовсе. Обещать
+    # «очередь доплатит» в этом случае значит отправить владельца открывать экран вечно.
+    queued = [row for row in plan if row['problems'] and row['problems'][0].startswith('работа уже заведена')]
+    if plan and len(queued) == len(plan):
+        still_working = [row for row in queued if not row['problems'][0].endswith('(done)')]
+        head = f'⏳ Начислено строк: {len(paid_rows)} из {len(plan)}, ' + _exact_money(credited_total)
+        if still_working:
+            tail = 'Очередь ещё работает — откройте экран через минуту-другую.'
+        else:
+            tail = (
+                '🔴 Очередь свою работу закончила, а денег меньше ожидаемого '
+                f'({_exact_money(REFERRAL_DEBT_2026_08_TOTAL_KOPEKS)}). Сама она уже НЕ доплатит: '
+                'вернуть работу в очередь нечем. Разбирать вручную.'
+            )
+        return '🧾 <b>Долг по рефералке</b>\n\n' + head + '\n\n' + tail
     if total_kopeks != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
         lines.append('')
         lines.append(
@@ -1560,6 +1578,14 @@ def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
 async def show_referral_debt(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Экран расчёта долга. Ничего не записывает."""
     plan = await plan_referral_debt(db)
+    # 🔴 РФ-3: судим по КНИГЕ ОПЕРАЦИЙ, а не по статусам работ. Работа в состоянии `done`
+    # доказывает, что шаг отработал, но не то, что деньги начислены: при пустом расчёте
+    # шаг честно закрывается, ничего не заплатив. Экран говорил бы «долг закрыт» там,
+    # где партнёр не получил ни рубля.
+    for row in plan:
+        credited = await debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+        row['credited_referrer'] = credited['referrer']
+        row['credited_friend'] = credited['friend']
     total = sum(row['to_friend'] + row['to_referrer'] for row in plan)
     payable = total == REFERRAL_DEBT_2026_08_TOTAL_KOPEKS and not any(row['problems'] for row in plan)
 
@@ -1613,13 +1639,22 @@ async def ask_referral_debt_payment(callback: types.CallbackQuery, db_user: User
     await callback.answer()
 
 
-def _debt_result_text(rows: list[dict], *, paid: bool, reason: str) -> str:
+def _debt_result_text(rows: list[dict], *, paid: bool, reason: str, running: bool = False) -> str:
     """Итог выплаты. Считаем по КНИГЕ и по факту, а не по флагу `paid`.
 
     🔴 Писать «деньги не тронуты» на любой отказ нельзя: пакет платит построчно и
     коммитит каждую строку, поэтому отказ на третьей означает, что первые две УЖЕ
     оплачены. Админ, прочитав «не тронуты», пошёл бы доплачивать поверх выплаченного.
     """
+    if running:
+        # 🔴 Соседнее окно уже закоммитило пакет. Говорить про деньги здесь нельзя ни в какую
+        # сторону: начислений ещё нет, но они будут через секунды. Прошлая редакция читала
+        # книгу и печатала «деньги не тронуты» — ровно ту неправду, которую убирала.
+        return (
+            '⏳ <b>Выплата уже идёт в соседнем окне</b>\n\n'
+            'Второй раз нажимать не нужно — деньги не задвоятся.\n'
+            'Откройте экран долга через минуту, он покажет итог.'
+        )
     credited = [row for row in rows if row.get('credited_referrer') or row.get('credited_friend')]
     total = sum(row['credited_referrer'] + row['credited_friend'] for row in credited)
     if not paid:
@@ -1634,10 +1669,10 @@ def _debt_result_text(rows: list[dict], *, paid: bool, reason: str) -> str:
         lines.append('')
         lines.append('<b>Начислено:</b>')
         for row in credited:
-            referrer = row['referrer'].full_name if row['referrer'] else '—'
+            referrer = row['referrer_name'] or '—'
             lines.append(f'• {html.escape(referrer)}: {_exact_money(row["credited_referrer"])}')
             if row['credited_friend']:
-                buyer = row['buyer'].full_name if row['buyer'] else 'новичку'
+                buyer = row['buyer_name'] or 'новичку'
                 lines.append(f'  • {html.escape(buyer)}: {_exact_money(row["credited_friend"])} бонус новичка')
         lines.append('')
         lines.append(f'<b>Всего: {_exact_money(total)}</b>')
@@ -1679,7 +1714,9 @@ async def pay_referral_debt_handler(callback: types.CallbackQuery, db_user: User
     )
 
     await callback.message.edit_text(
-        _debt_result_text(result['rows'], paid=result['paid'], reason=result['reason']),
+        _debt_result_text(
+            result['rows'], paid=result['paid'], reason=result['reason'], running=result.get('running', False)
+        ),
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[[types.InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_referrals')]]
         ),

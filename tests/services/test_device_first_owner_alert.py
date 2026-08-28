@@ -583,3 +583,24 @@ async def test_the_ready_message_carries_a_way_into_the_cabinet():
     # Кнопка обязана куда-то вести: либо в кабинет (web_app), либо в живой обработчик.
     only = buttons[0]
     assert only.web_app is not None or only.callback_data == 'subscription_connect'
+
+
+@pytest.mark.asyncio
+async def test_revive_catches_per_recipient_referral_rows():
+    """Оживление обязано ловить строку с получателем в типе (РФ-3).
+
+    🔴 С РФ-3 тип реферальной строки несёт получателя: `referral_reward:133`. Список типов
+    сравнивает точно, и один только он эту строку не поднял бы — то есть повтор письма о
+    деньгах исчез бы совсем, а это и есть то, ради чего этап делался.
+
+    Мутация «убрать LIKE из оживления» проходила весь набор зелёной: место для сторожа было
+    готово в этом же файле, строку просто не дописали. Нашло ревью.
+    """
+    db = _revive_db(0, 0)
+    await revive_stale_notifications(db)
+    _dead_sql, revive_sql = _revive_statements(db)
+
+    assert 'referral_reward:%' in revive_sql, 'строка с получателем в типе перестала оживать'
+    assert 'LIKE' in revive_sql, 'сравнение по началу типа исчезло — остался только точный список'
+    # И общий список никуда не делся: он держит строки владельцу.
+    assert "'order_stuck'" in revive_sql

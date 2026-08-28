@@ -321,24 +321,55 @@ async def _queue_referral_reward_notification(db: AsyncSession, *, checkout_id: 
     ).scalar_one_or_none()
     if paid is None:
         return
-    existing = (
-        await db.execute(
-            select(DeviceFirstNotificationOutbox.id)
-            .where(
-                DeviceFirstNotificationOutbox.checkout_id == checkout_id,
-                DeviceFirstNotificationOutbox.notification_type == REFERRAL_REWARD_NOTIFICATION_TYPE,
+    # 🔴 РФ-3: строка на КАЖДОГО получателя, а не одна на заказ.
+    # У первой оплаты получателей двое — партнёр и новичок. Раньше на них была одна строка, и
+    # `_send_referral_reward_message` считал её выполненной, если ушло хотя бы одно письмо:
+    # второй человек не узнавал о своих деньгах НИКОГДА, а повтора для него не существовало.
+    # Получателя кладём в сам тип (`referral_reward:<id>`) — так у каждого свой статус и свой
+    # повтор, и всё это без правки схемы: поле String(48), а `referral_reward:` + 10 цифр = 27.
+    # Приём в проекте не новый, тем же способом устроены POOL_KEY_TERMINAL_PREFIX и ledger-ключи.
+    recipient_ids: list[int] = []
+    for reward in (
+        (
+            await db.execute(
+                select(Transaction.user_id)
+                .where(
+                    Transaction.device_first_checkout_id == checkout_id,
+                    Transaction.type == TransactionType.REFERRAL_REWARD.value,
+                )
+                .order_by(Transaction.id)
             )
-            .limit(1)
         )
-    ).scalar_one_or_none()
-    if existing is not None:
+        .scalars()
+        .all()
+    ):
+        if reward not in recipient_ids:
+            recipient_ids.append(reward)
+    if not recipient_ids:
         return
-    db.add(
-        DeviceFirstNotificationOutbox(
-            checkout_id=checkout_id,
-            notification_type=REFERRAL_REWARD_NOTIFICATION_TYPE,
+    taken = set(
+        (
+            await db.execute(
+                select(DeviceFirstNotificationOutbox.notification_type).where(
+                    DeviceFirstNotificationOutbox.checkout_id == checkout_id
+                )
+            )
         )
+        .scalars()
+        .all()
     )
+    for recipient_id in recipient_ids:
+        notification_type = f'{REFERRAL_REWARD_NOTIFICATION_TYPE}:{recipient_id}'
+        # Старый формат без получателя тоже считаем занятым: иначе строки, заведённые до РФ-3,
+        # разослались бы вторично.
+        if notification_type in taken or REFERRAL_REWARD_NOTIFICATION_TYPE in taken:
+            continue
+        db.add(
+            DeviceFirstNotificationOutbox(
+                checkout_id=checkout_id,
+                notification_type=notification_type,
+            )
+        )
 
 
 async def _apply_fulfillment_step(db: AsyncSession, *, job_id: int) -> None:
@@ -518,7 +549,7 @@ REFERRAL_DEBT_2026_08_TOTAL_KOPEKS = 234925
 _DEBT_LEDGER_SUFFIXES = ('referred-first-bonus', 'inviter-first-reward', 'inviter-recurring-commission')
 
 
-async def _debt_credited_kopeks(db: AsyncSession, *, transaction_id: int) -> dict[str, int]:
+async def debt_credited_kopeks(db: AsyncSession, *, transaction_id: int) -> dict[str, int]:
     """Сколько начислено по этому приходу — по КНИГЕ, врозь получателям.
 
     Возврат воркера читать нельзя: работу мог перехватить фоновый цикл, и тогда
@@ -618,6 +649,14 @@ async def plan_referral_debt(db: AsyncSession) -> list[dict]:
             {
                 'transaction_id': transaction_id,
                 'checkout_id': checkout_id,
+                # 🔴 Имена СТРОКАМИ, а не объектами сессии. Любой `db.rollback()` — а он стоит
+                # и в обработке столкновения окон, и внутри цикла выплаты — протухает весь кэш
+                # сессии, и синхронное чтение `.full_name` после него падает в async-контексте.
+                # Экран тогда не отрисовывается вовсе: деньги ушли, а владелец видит «не удалось
+                # выполнить действие». Тот же приём уже применён выше к приходу.
+                'buyer_name': buyer.full_name if buyer is not None else '',
+                'referrer_name': referrer.full_name if referrer is not None else '',
+                'referrer_id': referrer.id if referrer is not None else None,
                 'buyer': buyer,
                 'referrer': referrer,
                 'paid_kopeks': amount_kopeks,
@@ -670,7 +709,7 @@ async def pay_referral_debt(db: AsyncSession) -> dict:
         # Поэтому по каждой строке читаем книгу и отдаём фактически начисленное.
         checked = []
         for row in plan:
-            credited = await _debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+            credited = await debt_credited_kopeks(db, transaction_id=row['transaction_id'])
             checked.append({**row, 'credited_friend': credited['friend'], 'credited_referrer': credited['referrer']})
         return {
             'paid': False,
@@ -695,7 +734,12 @@ async def pay_referral_debt(db: AsyncSession) -> dict:
         # ошибкой, а сказать по-человечески. Своих записей после отката не остаётся.
         await db.rollback()
         logger.warning('Доплата долга столкнулась со второй попыткой, откатились')
-        return {'paid': False, 'reason': 'выплата уже запущена в соседнем окне', 'rows': []}
+        # 🔴 Читать книгу здесь БЕСПОЛЕЗНО, и первая редакция починки этого не учла: блокировка
+        # с нашей вставки снимается ровно на `COMMIT` соседнего окна, то есть мы приходим сюда
+        # в ту секунду, когда работы уже записаны, а начислений ещё нет. Книга вернула бы нули,
+        # и экран снова напечатал бы «деньги не тронуты» — про пакет, который вот-вот заплатит.
+        # Поэтому отдаём не цифры, а прямой ответ: выплата идёт, смотрите через минуту.
+        return {'paid': False, 'reason': 'выплата уже запущена в соседнем окне', 'rows': [], 'running': True}
 
     for row in plan:
         try:
@@ -711,6 +755,6 @@ async def pay_referral_debt(db: AsyncSession) -> dict:
 
     done = []
     for row in plan:
-        credited = await _debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+        credited = await debt_credited_kopeks(db, transaction_id=row['transaction_id'])
         done.append({**row, 'credited_friend': credited['friend'], 'credited_referrer': credited['referrer']})
     return {'paid': True, 'reason': '', 'rows': done}
