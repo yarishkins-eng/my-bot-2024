@@ -48,6 +48,9 @@ def test_heading_becomes_bold_block():
 
 def test_link_kept_only_with_http_href():
     assert html_to_telegram('<a href="https://example.com">x</a>') == '<a href="https://example.com">x</a>'
+    assert html_to_telegram('<a href="http://example.com:8080/path">x</a>') == (
+        '<a href="http://example.com:8080/path">x</a>'
+    )
     assert html_to_telegram('<a href="https://example.com/%20?a=1&amp;b=2">x</a>') == (
         '<a href="https://example.com/%20?a=1&amp;b=2">x</a>'
     )
@@ -60,7 +63,19 @@ def test_link_kept_only_with_http_href():
         'https://',
         'https://?x=1',
         'https://-',
+        'https://-bad.example',
+        'https://bad-.example',
+        'https://bad..example',
+        'https://bad_host.example',
+        'https://' + 'a' * 64 + '.example',
+        'https://' + '.'.join(['a' * 63] * 3 + ['a' * 62]),
         'https:// example.com',
+        'ftp://example.com/file',
+        'https://user@example.com',
+        'https://:password@example.com',
+        'https://example.com:0/path',
+        'https://example.com:bad/path',
+        'https://example.com:70000/path',
         'https://example.com/\nnext',
         'https://example.com/\x7f',
         'https://example.com/<bad',
