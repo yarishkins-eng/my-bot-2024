@@ -1,5 +1,7 @@
 """Promo offers routes for cabinet - personal discounts and offers."""
 
+import html as html_module
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -25,6 +27,18 @@ from ..dependencies import get_cabinet_db, get_current_cabinet_user
 
 
 logger = structlog.get_logger(__name__)
+
+# 🔴 Ответ этого маршрута экран показывает КАК ЕСТЬ, внутри `<span>{message}</span>`
+# (`cabinet-code/.../PromoOffersSection.tsx:241`). React экранирует разметку, поэтому
+# телеграмные `<b>` из общей локали приехали бы к человеку буквами, а двойные переносы
+# схлопнулись бы в пробел. Снимаем разметку и сводим текст в одну строку.
+# Поймано прогоном сценария волны 2 — как дефект В ПОЧИНКЕ предыдущей находки.
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _as_plain_line(text: str) -> str:
+    return ' '.join(html_module.unescape(_HTML_TAG_RE.sub('', text)).split())
+
 
 router = APIRouter(prefix='/promo', tags=['Cabinet Promo'])
 
@@ -405,16 +419,18 @@ async def claim_promo_offer(
             'DISCOUNT_CLAIM_SUCCESS_WITH_EXPIRY',
             'Скидка {percent}% активирована! Она действует до {expires_at}.',
         )
-        message = template.format(
-            percent=discount_percent,
-            expires_at=format_local_datetime(discount_expires_at, '%d.%m.%Y %H:%M'),
+        message = _as_plain_line(
+            template.format(
+                percent=discount_percent,
+                expires_at=format_local_datetime(discount_expires_at, '%d.%m.%Y %H:%M'),
+            )
         )
     else:
         template = texts.get(
             'DISCOUNT_CLAIM_SUCCESS',
             'Скидка {percent}% активирована! Она применится к оплате автоматически.',
         )
-        message = template.format(percent=discount_percent)
+        message = _as_plain_line(template.format(percent=discount_percent))
 
     return ClaimOfferResponse(
         success=True,

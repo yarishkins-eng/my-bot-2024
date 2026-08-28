@@ -104,9 +104,12 @@ async def test_applied_discount_is_burned_and_written_into_the_promo_log():
     assert entry.percent == PERCENT
     assert entry.offer_id == offer.id
     assert entry.source == 'expired_discount_wave2'
-    # Ключи те, что экран журнала промо умеет рисовать, — иначе запись не увидит никто.
-    assert entry.details['amount_kopeks'] == DISCOUNT
+    # Ключ тот, что экран журнала промо умеет рисовать, — иначе запись не увидит никто.
+    # ⚠️ Сумма скидки живёт В ОПИСАНИИ, а не в `amount_kopeks`: у соседних записей этот
+    # ключ означает списанное, и владелец прочитал бы скидку как цену покупки.
     assert 'checkout-77' in entry.details['description']
+    assert '13.00' in entry.details['description']
+    assert 'amount_kopeks' not in entry.details
 
 
 @pytest.mark.asyncio
@@ -401,7 +404,7 @@ async def test_card_sale_burns_the_discount_even_though_no_balance_is_touched(mo
     assert user.promo_offer_discount_expires_at is None
     consumed = [row for row in added if getattr(row, 'action', None) == 'consumed']
     assert len(consumed) == 1
-    assert consumed[0].details['amount_kopeks'] == DISCOUNT
+    assert '13.00' in consumed[0].details['description']
 
 
 @pytest.mark.asyncio

@@ -48,3 +48,28 @@ def test_the_admin_promo_log_can_name_the_checkout_reason():
     for language in ('ru', 'en'):
         data = json.loads((LOCALES / f'{language}.json').read_text(encoding='utf-8'))
         assert key in data, f'{key} нет в {language}.json — экран покажет сырой ключ'
+
+
+@pytest.mark.parametrize('language', ['ru', 'en', 'ua', 'fa', 'zh'])
+def test_the_cabinet_answer_carries_no_telegram_markup(language: str):
+    """Кабинет отдаёт текст в REST, а экран рисует его внутри <span> — React экранирует.
+
+    Значит телеграмные теги приехали бы к человеку буквами. Общая локаль их содержит
+    намеренно (бот шлёт с parse_mode HTML), поэтому кабинет обязан их снимать.
+    """
+    from app.cabinet.routes.promo import _as_plain_line
+
+    data = json.loads((LOCALES / f'{language}.json').read_text(encoding='utf-8'))
+    for key in ('DISCOUNT_CLAIM_SUCCESS', 'DISCOUNT_CLAIM_SUCCESS_WITH_EXPIRY'):
+        raw = data[key].replace('{percent}', '13').replace('{expires_at}', '29.08.2026 06:20')
+        plain = _as_plain_line(raw)
+        assert '<' not in plain and '>' not in plain, f'{language}/{key}: разметка уехала бы клиенту'
+        assert '\n' not in plain, f'{language}/{key}: переносы в <span> схлопнутся в пробел'
+        assert plain == plain.strip() and '  ' not in plain
+        assert '13' in plain
+
+
+def test_the_russian_locale_really_does_contain_markup_worth_stripping():
+    """Мета-сторож: если из локали уберут теги, предыдущий тест станет тавтологией."""
+    data = json.loads((LOCALES / 'ru.json').read_text(encoding='utf-8'))
+    assert '<b>' in data['DISCOUNT_CLAIM_SUCCESS_WITH_EXPIRY']

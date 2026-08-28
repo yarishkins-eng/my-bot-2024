@@ -2031,8 +2031,13 @@ async def _consume_promo_offer_for_sale(
                 # владелец не увидел бы ровно того, ради чего их кладут.
                 details={
                     'reason': 'device_first_checkout',
-                    'description': f'Покупка в кассе, заказ {checkout.public_id}',
-                    'amount_kopeks': applied_discount_kopeks,
+                    # ⚠️ Сумму скидки кладём В ОПИСАНИЕ, а не в `amount_kopeks`. Экран
+                    # журнала рисует этот ключ как «💰 Сумма», и у соседних записей он
+                    # означает СПИСАННОЕ (`crud/user.py:803`). Владелец прочитал бы
+                    # «Сумма: 24,90 ₽» под покупкой за 224,10 ₽ как цену покупки.
+                    'description': (
+                        f'Покупка в кассе, заказ {checkout.public_id} · скидка {applied_discount_kopeks / 100:.2f} ₽'
+                    ),
                 },
                 commit=False,
             )
