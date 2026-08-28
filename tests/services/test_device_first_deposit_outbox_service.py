@@ -851,6 +851,13 @@ def test_debt_screen_calls_it_closed_only_when_the_ledger_holds_the_full_sum():
     assert 'Долг закрыт' not in empty
     assert 'НЕ доплатит' in empty
 
+    # 🔴 Часть денег есть, но меньше ожидаемого — это НЕ «закрыт».
+    # Без этого случая сторож переживает подмену условия на «у каждой строки что-то начислено»:
+    # одной копейки хватило бы, чтобы экран объявил долг закрытым.
+    partial = _debt_screen_text([_row(credited=100)], 0)
+    assert 'Долг закрыт' not in partial
+    assert 'НЕ доплатит' in partial
+
     # Очередь ещё в работе — тут обещать доплату честно.
     working = _debt_screen_text([_row(credited=0, status='pending')], 0)
     assert 'Долг закрыт' not in working
