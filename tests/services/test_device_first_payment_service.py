@@ -70,7 +70,19 @@ def test_checkout_return_url_keeps_only_configured_origin(monkeypatch):
     assert _checkout_return_url('checkout-1') == ('https://cabinet.example/subscription/purchase?checkout=checkout-1')
 
 
-def test_direct_return_url_never_uses_telegram_or_generic_topup_return(monkeypatch):
+def test_direct_return_url_falls_back_to_the_site_and_never_borrows_a_foreign_host(monkeypatch):
+    """Запасной путь прямой оплаты: адрес САЙТА, и чужой хост не заимствуется.
+
+    ⛔ ИМЯ ИСПРАВЛЕНО 28.08.2026 (пункт 2б). Раньше сторож назывался
+    `..._never_uses_telegram_or_generic_topup_return` и обещал договор, которого больше нет:
+    с этапа В-1 успех уводит диплинком в Телеграм, с пункта 2б — и отказ. Проходил он только
+    потому, что в тестовой среде `BOT_USERNAME` пуст, то есть щупал ИСКЛЮЧИТЕЛЬНО запасную
+    ветку. Проставь кто-нибудь `BOT_USERNAME` в окружении — сторож покраснел бы, и по имени
+    его прочли бы как «диплинк это регрессия», хотя это штатное поведение.
+    Тело не тронуто: запасная ветка проверяется по-прежнему, врало только имя.
+    Диплинк стерегут отдельные сторожа в `tests/cabinet/test_topup_return_to_telegram.py`.
+    """
+    monkeypatch.setattr('app.services.device_first_payment_service.settings.BOT_USERNAME', None, raising=False)
     monkeypatch.setattr(
         'app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example/anything'
     )
