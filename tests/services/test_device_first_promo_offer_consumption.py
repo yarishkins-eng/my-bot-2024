@@ -38,7 +38,7 @@ class _Result:
         return self._one
 
     def scalars(self):
-        return SimpleNamespace(first=lambda: self._first, all=lambda: [])
+        return SimpleNamespace(first=lambda: self._first, all=list)
 
 
 def _user_with_offer(*, percent: int = PERCENT, balance: int = BALANCE):
