@@ -19,6 +19,7 @@ from app.database.crud.promo_group import get_auto_assign_promo_groups
 from app.database.crud.promo_offer_template import get_promo_offer_template_by_id
 from app.database.crud.transaction import get_user_total_spent_kopeks
 from app.database.models import DiscountOffer, User
+from app.handlers.subscription.common import _format_text_with_placeholders
 from app.localization.texts import get_texts
 from app.services.promo_offer_service import promo_offer_service
 from app.utils.timezone import format_local_datetime
@@ -419,10 +420,18 @@ async def claim_promo_offer(
             'DISCOUNT_CLAIM_SUCCESS_WITH_EXPIRY',
             'Скидка {percent}% активирована! Она действует до {expires_at}.',
         )
+        # ⛔ НЕ `str.format`: у текста может оказаться подстановка, которой мы не дали
+        # (в промо-шаблонах живут `{server_name}`, `{valid_hours}`), и голый `.format`
+        # уронил бы КЛИЕНТСКИЙ маршрут пятисоткой. Общий помощник неизвестную подстановку
+        # оставляет видимой и не падает — бот в этом же случае деградирует, а не умирает.
+        # Он же закрывает подстановку вида `{ключ.атрибут}`. Нашла ревизия плана.
         message = _as_plain_line(
-            template.format(
-                percent=discount_percent,
-                expires_at=format_local_datetime(discount_expires_at, '%d.%m.%Y %H:%M'),
+            _format_text_with_placeholders(
+                template,
+                {
+                    'percent': discount_percent,
+                    'expires_at': format_local_datetime(discount_expires_at, '%d.%m.%Y %H:%M'),
+                },
             )
         )
     else:
@@ -430,7 +439,7 @@ async def claim_promo_offer(
             'DISCOUNT_CLAIM_SUCCESS',
             'Скидка {percent}% активирована! Она применится к оплате автоматически.',
         )
-        message = _as_plain_line(template.format(percent=discount_percent))
+        message = _as_plain_line(_format_text_with_placeholders(template, {'percent': discount_percent}))
 
     return ClaimOfferResponse(
         success=True,
