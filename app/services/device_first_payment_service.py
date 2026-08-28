@@ -1248,7 +1248,7 @@ def _direct_checkout_return_url(checkout_public_id: str, *, failed: bool = False
     #
     # 🔴 МИНА EX — ГЛАВНОЕ МЕСТО ЭТОЙ ПРАВКИ, НЕ УПРОЩАТЬ. Признак `failed` обязан ехать в
     # сборщик диплинка ЯВНО: у `_telegram_direct_checkout_return_url` умолчание `failed=False`
-    # даёт `outcome='ok'` (`:1199`). Прежний вызов стоял без него — и снятие запрета «в лоб»,
+    # даёт `outcome='ok'` (`:1200`). Прежний вызов стоял без него — и снятие запрета «в лоб»,
     # без этого аргумента, вернуло бы отказавшего с меткой «оплачено». Это было бы ХУЖЕ формы
     # входа: кабинет по метке `_ok` не показал бы отказ вовсе.
     deep_link = _telegram_direct_checkout_return_url(checkout_public_id, failed=failed)
