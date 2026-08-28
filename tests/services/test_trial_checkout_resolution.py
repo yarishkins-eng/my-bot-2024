@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.services import device_first_payment_service as payment_service
 from app.services.device_first_checkout_service import DIRECT_SETTLEMENT_MODE
 from app.services.device_first_payment_service import settle_device_first_platega_payment
 from app.services.trial_activation_service import (
@@ -196,8 +197,13 @@ async def test_explicit_trial_resolution_fences_old_invoice_and_creates_trial_at
 
 
 @pytest.mark.asyncio
-async def test_trial_resolution_then_late_exact_callback_credits_once_without_touching_new_trial():
+async def test_trial_resolution_then_late_exact_callback_credits_once_without_touching_new_trial(monkeypatch):
     """Exercise both services in the customer-visible abandonment sequence."""
+
+    # РФ-3: поздняя оплата теперь заводит работу в очередь выплат и будит её. Этот тест
+    # считает обращения к базе поимённо, поэтому очередь подменяем — она проверена отдельно.
+    monkeypatch.setattr(payment_service, 'ensure_deposit_outbox', AsyncMock())
+    monkeypatch.setattr(payment_service, 'process_device_first_deposit_outbox', AsyncMock(return_value=0))
 
     locked, checkout, attempt, payment = _pending_context()
     trial_subscription = SimpleNamespace(id=111, is_trial=True, status='trial')
