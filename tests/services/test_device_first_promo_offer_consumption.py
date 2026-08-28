@@ -509,3 +509,43 @@ async def test_a_replayed_provider_webhook_burns_nothing_a_second_time(monkeypat
 
     assert user.promo_offer_discount_percent == PERCENT
     assert len([row for row in added if getattr(row, 'action', None) == 'consumed']) == 1
+
+
+@pytest.mark.asyncio
+async def test_card_sale_reads_the_frozen_snapshot_and_not_the_mutable_column(monkeypatch):
+    """Снимок и колонка заказа разведены НАРОЧНО — иначе сторож не отличает источник.
+
+    Вся `_complete_direct_sale_locked` построена на снимке именно потому, что колонка
+    изменяемая и забора расхождения на неё нет. Мутация «читать колонку» обязана краснеть.
+    """
+    user = _user_with_offer()
+    added = []
+    db = _patch_direct_sale(monkeypatch, added)
+    checkout = _card_sale_checkout(discount_kopeks=DISCOUNT)
+    # Снимок уже заморожен со скидкой; колонку «портим» после него.
+    assert checkout.sale_snapshot['price_breakdown']['promo_offer_discount_kopeks'] == DISCOUNT
+    checkout.price_breakdown = {'promo_offer_discount_kopeks': 0}
+
+    await service._complete_direct_sale_locked(
+        db, checkout=checkout, user=user, target=None, provider_payment_id='provider-77'
+    )
+
+    assert user.promo_offer_discount_percent == 0
+    assert any(getattr(row, 'action', None) == 'consumed' for row in added)
+
+
+@pytest.mark.asyncio
+async def test_card_sale_ignores_a_column_that_claims_a_discount_the_snapshot_did_not(monkeypatch):
+    """Зеркало предыдущего: колонка утверждает скидку, замороженная цена её не применяла."""
+    user = _user_with_offer()
+    added = []
+    db = _patch_direct_sale(monkeypatch, added)
+    checkout = _card_sale_checkout(discount_kopeks=0)
+    checkout.price_breakdown = {'promo_offer_discount_kopeks': DISCOUNT}
+
+    await service._complete_direct_sale_locked(
+        db, checkout=checkout, user=user, target=None, provider_payment_id='provider-77'
+    )
+
+    assert user.promo_offer_discount_percent == PERCENT
+    assert not any(getattr(row, 'action', None) == 'consumed' for row in added)
