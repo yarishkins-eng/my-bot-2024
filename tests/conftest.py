@@ -42,7 +42,11 @@ sys.modules.setdefault('aiosqlite', types.ModuleType('aiosqlite'))
 if 'redis.asyncio' not in sys.modules:
     redis_module = types.ModuleType('redis')
     redis_async_module = types.ModuleType('redis.asyncio')
+    redis_async_client_module = types.ModuleType('redis.asyncio.client')
+    redis_async_connection_module = types.ModuleType('redis.asyncio.connection')
+    redis_async_lock_module = types.ModuleType('redis.asyncio.lock')
     redis_exceptions_module = types.ModuleType('redis.exceptions')
+    redis_typing_module = types.ModuleType('redis.typing')
 
     class _FakeRedisError(Exception):
         """Base Redis exception for tests."""
@@ -79,6 +83,14 @@ if 'redis.asyncio' not in sys.modules:
         async def incr(self, key):
             return 1
 
+    class _FakeConnectionPool:
+        @classmethod
+        def from_url(cls, url, **kwargs):
+            return cls()
+
+    class _FakeLock:
+        pass
+
     def _from_url(url):
         return _FakeRedisClient()
 
@@ -86,11 +98,19 @@ if 'redis.asyncio' not in sys.modules:
     redis_module.asyncio = redis_async_module
     redis_async_module.from_url = _from_url
     redis_async_module.Redis = _FakeRedisClient
+    redis_async_client_module.Redis = _FakeRedisClient
+    redis_async_connection_module.ConnectionPool = _FakeConnectionPool
+    redis_async_lock_module.Lock = _FakeLock
     redis_exceptions_module.RedisError = _FakeRedisError
     redis_exceptions_module.NoScriptError = _FakeNoScriptError
+    redis_typing_module.ExpiryT = object
     sys.modules['redis'] = redis_module
     sys.modules['redis.asyncio'] = redis_async_module
+    sys.modules['redis.asyncio.client'] = redis_async_client_module
+    sys.modules['redis.asyncio.connection'] = redis_async_connection_module
+    sys.modules['redis.asyncio.lock'] = redis_async_lock_module
     sys.modules['redis.exceptions'] = redis_exceptions_module
+    sys.modules['redis.typing'] = redis_typing_module
 
 # Минимальная реализация SDK YooKassa, чтобы импорт сервисов не падал.
 if 'yookassa' not in sys.modules:

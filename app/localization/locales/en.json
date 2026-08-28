@@ -1658,7 +1658,7 @@
   "PRICE": "Price",
   "YOUR_BALANCE": "Your balance",
   "UNBLOCK": "✅ Unblock",
-  "UNKNOWN_CALLBACK_ALERT": "❓ Unknown action. Please try again.",
+  "UNKNOWN_CALLBACK_ALERT": "❓ This button is no longer available. Open the current menu with /start.",
   "UNKNOWN_COMMAND_MESSAGE": "❓ I didn't understand that command. Use the menu buttons.",
   "USER_BLOCKED_FOREVER": "You are blocked from contacting support.",
   "USER_BLOCKED_UNTIL": "You are blocked until {time}",
