@@ -57,6 +57,11 @@ def test_link_kept_only_with_http_href():
     assert html_to_telegram('<a href="javascript:alert(1)">x</a>') == 'x'
 
 
+@pytest.mark.parametrize('broken_anchor', ['<a>visible</a>', '<a href>visible</a>'])
+def test_anchor_without_href_is_removed_but_text_is_kept(broken_anchor: str):
+    assert html_to_telegram(broken_anchor) == 'visible'
+
+
 @pytest.mark.parametrize(
     'unsafe_href',
     [
