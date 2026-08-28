@@ -321,24 +321,55 @@ async def _queue_referral_reward_notification(db: AsyncSession, *, checkout_id: 
     ).scalar_one_or_none()
     if paid is None:
         return
-    existing = (
-        await db.execute(
-            select(DeviceFirstNotificationOutbox.id)
-            .where(
-                DeviceFirstNotificationOutbox.checkout_id == checkout_id,
-                DeviceFirstNotificationOutbox.notification_type == REFERRAL_REWARD_NOTIFICATION_TYPE,
+    # 🔴 РФ-3: строка на КАЖДОГО получателя, а не одна на заказ.
+    # У первой оплаты получателей двое — партнёр и новичок. Раньше на них была одна строка, и
+    # `_send_referral_reward_message` считал её выполненной, если ушло хотя бы одно письмо:
+    # второй человек не узнавал о своих деньгах НИКОГДА, а повтора для него не существовало.
+    # Получателя кладём в сам тип (`referral_reward:<id>`) — так у каждого свой статус и свой
+    # повтор, и всё это без правки схемы: поле String(48), а `referral_reward:` + 10 цифр = 27.
+    # Приём в проекте не новый, тем же способом устроены POOL_KEY_TERMINAL_PREFIX и ledger-ключи.
+    recipient_ids: list[int] = []
+    for reward in (
+        (
+            await db.execute(
+                select(Transaction.user_id)
+                .where(
+                    Transaction.device_first_checkout_id == checkout_id,
+                    Transaction.type == TransactionType.REFERRAL_REWARD.value,
+                )
+                .order_by(Transaction.id)
             )
-            .limit(1)
         )
-    ).scalar_one_or_none()
-    if existing is not None:
+        .scalars()
+        .all()
+    ):
+        if reward not in recipient_ids:
+            recipient_ids.append(reward)
+    if not recipient_ids:
         return
-    db.add(
-        DeviceFirstNotificationOutbox(
-            checkout_id=checkout_id,
-            notification_type=REFERRAL_REWARD_NOTIFICATION_TYPE,
+    taken = set(
+        (
+            await db.execute(
+                select(DeviceFirstNotificationOutbox.notification_type).where(
+                    DeviceFirstNotificationOutbox.checkout_id == checkout_id
+                )
+            )
         )
+        .scalars()
+        .all()
     )
+    for recipient_id in recipient_ids:
+        notification_type = f'{REFERRAL_REWARD_NOTIFICATION_TYPE}:{recipient_id}'
+        # Старый формат без получателя тоже считаем занятым: иначе строки, заведённые до РФ-3,
+        # разослались бы вторично.
+        if notification_type in taken or REFERRAL_REWARD_NOTIFICATION_TYPE in taken:
+            continue
+        db.add(
+            DeviceFirstNotificationOutbox(
+                checkout_id=checkout_id,
+                notification_type=notification_type,
+            )
+        )
 
 
 async def _apply_fulfillment_step(db: AsyncSession, *, job_id: int) -> None:

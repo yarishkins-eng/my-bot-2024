@@ -2848,7 +2848,13 @@ async def revive_stale_notifications(db: AsyncSession) -> tuple[int, int]:
     revived = await db.execute(
         update(DeviceFirstNotificationOutbox)
         .where(
-            DeviceFirstNotificationOutbox.notification_type.in_(RETRYABLE_NOTIFICATION_TYPES),
+            # 🔴 `like` рядом со списком: с РФ-3 тип реферальной строки несёт получателя,
+            # и один только `.in_()` перестал бы её оживлять — то есть отменил бы повтор
+            # ровно там, где он и был заведён.
+            or_(
+                DeviceFirstNotificationOutbox.notification_type.in_(RETRYABLE_NOTIFICATION_TYPES),
+                DeviceFirstNotificationOutbox.notification_type.like(f'{REFERRAL_REWARD_NOTIFICATION_TYPE}:%'),
+            ),
             or_(
                 and_(
                     DeviceFirstNotificationOutbox.status == 'failed',
@@ -3341,7 +3347,15 @@ async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: Subscri
     await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
 
 
-async def _send_referral_reward_message(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
+def _referral_reward_recipient(notification_type: str) -> int | None:
+    """Получатель из типа строки. `None` — строка старого формата, до РФ-3."""
+    _, _, tail = notification_type.partition(':')
+    return int(tail) if tail.isdigit() else None
+
+
+async def _send_referral_reward_message(
+    db: AsyncSession, *, bot, checkout: SubscriptionCheckout, recipient_id: int | None = None
+) -> None:
     """Партнёр узнаёт о комиссии, а новичок — о своём бонусе (РФ-1 п.1.3).
 
     Кому и сколько — из уже созданных наградных строк. Текст различает три случая, потому что
@@ -3362,6 +3376,10 @@ async def _send_referral_reward_message(db: AsyncSession, *, bot, checkout: Subs
         .scalars()
         .all()
     )
+    if recipient_id is not None:
+        # 🔴 Одна строка — один человек. Без этого фильтра каждая из строк заказа
+        # разослала бы письма ВСЕМ, и при двух получателях каждый получил бы по два.
+        rewards = [reward for reward in rewards if reward.user_id == recipient_id]
     if not rewards:
         # Начисления не было: у покупателя нет пригласившего, программа выключена или сумма
         # ниже порога. Сообщать нечего — строка закрывается выполненной, а не падает.
@@ -3385,7 +3403,6 @@ async def _send_referral_reward_message(db: AsyncSession, *, bot, checkout: Subs
     ).scalar_one_or_none()
     paid = settings.format_price(source.amount_kopeks) if source is not None else ''
 
-    delivered = 0
     failures: list[str] = []
     for reward in rewards:
         recipient = await db.get(User, reward.user_id)
@@ -3446,16 +3463,16 @@ async def _send_referral_reward_message(db: AsyncSession, *, bot, checkout: Subs
         # Деньги при этом уже начислены, так что отказ доставки не повод считать шаг несделанным.
         try:
             await bot.send_message(recipient.telegram_id, text, parse_mode='HTML')
-            delivered += 1
         except Exception as error:
             failures.append(f'{recipient.id}:{type(error).__name__}')
 
-    if failures and not delivered:
+    # 🔴 РФ-3: у строки теперь ОДИН получатель, поэтому «дошло хоть кому-то» больше не
+    # оправдание. Любой отказ роняет строку — и оживление повторит её для этого человека,
+    # не трогая тех, кому уже дошло.
+    if failures:
         # Не дошло НИ ОДНО — это уже похоже на общий отказ, а не на закрытого клиента:
         # пусть строка попадёт в `failed` и останется следом в логе.
         raise RuntimeError(f'referral_reward_delivery_failed: {", ".join(failures)}')
-    if failures:
-        logger.warning('device_first_referral_reward_partially_delivered', checkout_id=checkout.id, failed=failures)
 
 
 async def process_device_first_notification_outbox(db: AsyncSession, *, bot, limit: int = 20) -> int:
@@ -3531,11 +3548,17 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
                 await _send_owner_checkout_drift_alert(
                     db, bot=bot, checkout=checkout, notification_type=row.notification_type
                 )
-            elif row.notification_type == REFERRAL_REWARD_NOTIFICATION_TYPE:
+            elif row.notification_type.startswith(REFERRAL_REWARD_NOTIFICATION_TYPE):
                 # 🔴 Ветка обязана стоять ДО `else`: иначе строка о реферальной награде
                 # уйдёт покупателю текстом «✅ Подписка готова» — вторым сообщением про
                 # тот же заказ, а партнёр так и не узнает о деньгах.
-                await _send_referral_reward_message(db, bot=bot, checkout=checkout)
+                # 🔴 `startswith`, а не `==`: с РФ-3 тип несёт получателя
+                # (`referral_reward:<id>`). Точное равенство увело бы новую строку в
+                # `unknown_notification_type`, а оттуда её не подняло бы и оживление —
+                # реферальные письма перестали бы повторяться вовсе.
+                await _send_referral_reward_message(
+                    db, bot=bot, checkout=checkout, recipient_id=_referral_reward_recipient(row.notification_type)
+                )
             elif row.notification_type == READY_NOTIFICATION_TYPE:
                 await _send_client_ready_message(db, bot=bot, checkout=checkout)
             else:

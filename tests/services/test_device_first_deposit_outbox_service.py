@@ -233,11 +233,16 @@ async def test_fulfillment_step_recovers_after_credit_commit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_paid_referral_queues_a_message_so_the_partner_learns_about_it():
-    """РФ-1 п.1.3: партнёр обязан УЗНАТЬ о комиссии, а не только получить её.
+async def test_a_paid_referral_queues_one_message_per_recipient():
+    """РФ-1 п.1.3 + РФ-3: каждый получатель узнаёт о деньгах ОТДЕЛЬНОЙ строкой.
 
     До этапа device-first платил молча: бота в этой цепочке нет ни в одном из трёх мест
     вызова, поэтому сообщение ставится в очередь, у которой бот уже есть.
+
+    🔴 Строка была ОДНА на заказ, и отправка считала её выполненной, если письмо ушло хотя бы
+    кому-то. У первой оплаты получателей двое — партнёр и новичок; второй не узнавал о своих
+    деньгах никогда, и повтора для него не существовало. Теперь у каждого своя строка, свой
+    статус и свой повтор. Получатель зашит в тип — схему базы это не трогает.
     """
     from app.database.models import DeviceFirstNotificationOutbox
 
@@ -246,7 +251,8 @@ async def test_a_paid_referral_queues_a_message_so_the_partner_learns_about_it()
         execute=AsyncMock(
             side_effect=[
                 Result(value=777),  # наградная строка по заказу есть — платили
-                Result(value=None),  # сообщение по этому заказу ещё не ставили
+                Result(values=[133, 172]),  # получатели: партнёр и новичок
+                Result(values=[]),  # по этому заказу ещё ничего не ставили
             ]
         ),
         add=MagicMock(side_effect=added.append),
@@ -254,10 +260,50 @@ async def test_a_paid_referral_queues_a_message_so_the_partner_learns_about_it()
 
     await service._queue_referral_reward_notification(db, checkout_id=13)
 
-    assert len(added) == 1, 'сообщение обязано быть поставлено ровно один раз'
-    assert isinstance(added[0], DeviceFirstNotificationOutbox)
-    assert added[0].checkout_id == 13
-    assert added[0].notification_type == 'referral_reward'
+    assert len(added) == 2, 'строка обязана быть у КАЖДОГО получателя, а не одна на заказ'
+    assert all(isinstance(row, DeviceFirstNotificationOutbox) for row in added)
+    assert {row.checkout_id for row in added} == {13}
+    assert [row.notification_type for row in added] == ['referral_reward:133', 'referral_reward:172']
+
+
+@pytest.mark.asyncio
+async def test_referral_message_is_not_queued_twice_for_the_same_recipient():
+    """Повторный проход не плодит вторую строку тому же человеку."""
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Result(value=777),
+                Result(values=[133, 172]),
+                Result(values=['referral_reward:133']),  # партнёру уже поставили
+            ]
+        ),
+        add=MagicMock(side_effect=added.append),
+    )
+
+    await service._queue_referral_reward_notification(db, checkout_id=13)
+
+    assert [row.notification_type for row in added] == ['referral_reward:172']
+
+
+@pytest.mark.asyncio
+async def test_old_format_row_blocks_a_second_mailing():
+    """Строка старого формата (до РФ-3) считается занятой — иначе разошлём вторично."""
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Result(value=777),
+                Result(values=[133, 172]),
+                Result(values=['referral_reward']),  # заведена до РФ-3
+            ]
+        ),
+        add=MagicMock(side_effect=added.append),
+    )
+
+    await service._queue_referral_reward_notification(db, checkout_id=13)
+
+    assert added == []
 
 
 @pytest.mark.asyncio
