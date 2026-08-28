@@ -562,6 +562,11 @@ async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatc
     base_users = [SimpleNamespace(id=1)]
     base_loads: list[str] = []
     projections: list[tuple[str, str, bool]] = []
+    all_filter_keys = [
+        *broadcast_routes.FILTER_LABELS,
+        *broadcast_routes.CUSTOM_FILTER_LABELS,
+    ]
+    expected_counts = {key: index + 1 for index, key in enumerate(all_filter_keys)}
 
     async def fake_get_target_users(session, target: str):
         base_loads.append(target)
@@ -575,16 +580,16 @@ async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatc
         preloaded_users=None,
     ):
         projections.append((target, category, preloaded_users is base_users))
-        return [100]
+        return list(range(expected_counts[target]))
 
     async def fake_tariff_counts(session, actual_category: str, *, preloaded_users=None):
         assert actual_category == category
         assert preloaded_users is base_users
-        return {}
+        return {17: 91}
 
     class FakeScalars:
         def all(self):
-            return []
+            return [SimpleNamespace(id=17, name='Tariff 17')]
 
     class FakeResult:
         def scalars(self):
@@ -609,8 +614,13 @@ async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatc
     )
 
     assert base_loads == ['all']
-    assert len(response.filters) == len(broadcast_routes.FILTER_LABELS)
-    assert len(response.custom_filters) == len(broadcast_routes.CUSTOM_FILTER_LABELS)
+    assert {item.key: item.count for item in response.filters} == {
+        key: expected_counts[key] for key in broadcast_routes.FILTER_LABELS
+    }
+    assert {item.key: item.count for item in response.custom_filters} == {
+        key: expected_counts[key] for key in broadcast_routes.CUSTOM_FILTER_LABELS
+    }
+    assert {item.tariff_id: item.count for item in response.tariff_filters} == {17: 91}
     standard_calls = [call for call in projections if not call[0].startswith('custom_')]
     custom_calls = [call for call in projections if call[0].startswith('custom_')]
     assert standard_calls and all(actual == category and reused for _, actual, reused in standard_calls)
@@ -658,10 +668,13 @@ async def test_tariff_catalog_forwards_each_category_to_projection(monkeypatch) 
 @pytest.mark.asyncio
 async def test_email_catalog_forwards_each_category_to_all_filters(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
+    expected_counts = {
+        key: index + 11 for index, key in enumerate(broadcast_routes.EMAIL_FILTER_LABELS)
+    }
 
     async def fake_count(session, target: str, category: str) -> int:
         calls.append((target, category))
-        return 1
+        return expected_counts[target]
 
     monkeypatch.setattr(broadcast_routes, '_get_email_filter_count', fake_count)
 
@@ -671,7 +684,8 @@ async def test_email_catalog_forwards_each_category_to_all_filters(monkeypatch) 
             admin=object(),
             db=object(),
         )
-        assert response.total_with_email == 1
+        assert {item.key: item.count for item in response.filters} == expected_counts
+        assert response.total_with_email == expected_counts['all_email']
 
     assert calls == [
         *((key, 'system') for key in broadcast_routes.EMAIL_FILTER_LABELS),
