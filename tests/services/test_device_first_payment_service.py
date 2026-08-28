@@ -70,7 +70,19 @@ def test_checkout_return_url_keeps_only_configured_origin(monkeypatch):
     assert _checkout_return_url('checkout-1') == ('https://cabinet.example/subscription/purchase?checkout=checkout-1')
 
 
-def test_direct_return_url_never_uses_telegram_or_generic_topup_return(monkeypatch):
+def test_direct_return_url_falls_back_to_the_site_and_never_borrows_a_foreign_host(monkeypatch):
+    """Запасной путь прямой оплаты: адрес САЙТА, и чужой хост не заимствуется.
+
+    ⛔ ИМЯ ИСПРАВЛЕНО 28.08.2026 (пункт 2б). Раньше сторож назывался
+    `..._never_uses_telegram_or_generic_topup_return` и обещал договор, которого больше нет:
+    с этапа В-1 успех уводит диплинком в Телеграм, с пункта 2б — и отказ. Проходил он только
+    потому, что в тестовой среде `BOT_USERNAME` пуст, то есть щупал ИСКЛЮЧИТЕЛЬНО запасную
+    ветку. Проставь кто-нибудь `BOT_USERNAME` в окружении — сторож покраснел бы, и по имени
+    его прочли бы как «диплинк это регрессия», хотя это штатное поведение.
+    Тело не тронуто: запасная ветка проверяется по-прежнему, врало только имя.
+    Диплинк стерегут отдельные сторожа в `tests/cabinet/test_topup_return_to_telegram.py`.
+    """
+    monkeypatch.setattr('app.services.device_first_payment_service.settings.BOT_USERNAME', None, raising=False)
     monkeypatch.setattr(
         'app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example/anything'
     )
@@ -1119,6 +1131,103 @@ async def test_direct_invoice_persists_create_identity_then_verifies_canonical_a
     assert added[1].status == 'PENDING'
     assert added[1].expires_at > datetime.now(UTC)
     assert checkout.expires_at == added[1].expires_at
+
+
+@pytest.mark.asyncio
+async def test_direct_invoice_sends_both_outcomes_to_the_provider_and_they_never_collapse(monkeypatch):
+    """🔴 СТОРОЖ ПРОВОДКИ (пункт 2б, найдено волной 2). Ловит зеркало мины EX.
+
+    Сторожа в `tests/cabinet/test_topup_return_to_telegram.py` щупают СБОРЩИК адреса в
+    изоляции, и этого мало: точку вызова не проверял никто. Все соседние интеграционные
+    тесты подсовывают `async def create_payment(self, **_kwargs)`, который адреса
+    ПРОГЛАТЫВАЕТ, и идут с пустым `BOT_USERNAME`, то есть по запасной ветке. Убери
+    `failed=True` из `_create_direct_platega_attempt` — главный предмет пункта 2б — и весь
+    набор останется зелёным.
+
+    ⛔ ПЕРВАЯ ВЕРСИЯ ЭТОГО СТОРОЖА БЫЛА ПУСТОЙ и это поймано до слияния: она подменяла
+    `_direct_checkout_return_url` шпионом и звала ШПИОНА напрямую, то есть точка вызова не
+    исполнялась вовсе. Здесь зовётся настоящая `_create_direct_platega_attempt`, а адреса
+    снимаются с того, что реально уехало провайдеру.
+    """
+    checkout = SimpleNamespace(
+        id=91,
+        public_id='550e8400-e29b-41d4-a716-446655440000',
+        external_payable_kopeks=45_000,
+        tariff_total_kopeks=45_000,
+        wallet_applied_kopeks=0,
+    )
+    added = []
+    sent = {}
+
+    def add(model):
+        added.append(model)
+
+    async def flush():
+        for model in added:
+            if getattr(model, 'id', None) is None:
+                model.id = 41 if hasattr(model, 'merchant_order_key') else 51
+
+    class FakePlategaService:
+        parse_redirect_url = staticmethod(PlategaService.parse_redirect_url)
+        parse_expires_at = staticmethod(PlategaService.parse_expires_at)
+        parse_amount_currency = staticmethod(PlategaService.parse_amount_currency)
+
+        def __init__(self):
+            self._max_retries = 0
+
+        async def create_payment(self, **kwargs):
+            # 🔴 В отличие от соседей — НЕ проглатываем: это и есть предмет проверки.
+            sent.update(kwargs)
+            return {'id': 'wiring-probe', 'url': 'https://pay.example/wiring-probe'}
+
+        async def get_transaction(self, _transaction_id):
+            return {
+                'id': 'wiring-probe',
+                'status': 'PENDING',
+                'paymentMethod': 2,
+                'paymentDetails': {'amount': '450.00', 'currency': 'RUB'},
+            }
+
+    db = SimpleNamespace(
+        add=MagicMock(side_effect=add),
+        flush=AsyncMock(side_effect=flush),
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.prepare_direct_external_checkout',
+        AsyncMock(return_value=checkout),
+    )
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.get_pending_platega_attempt',
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', FakePlategaService)
+    monkeypatch.setattr('app.services.device_first_payment_service.settings.CABINET_URL', 'https://cabinet.example')
+    # 🔴 Имя бота задаём НАРОЧНО: соседние тесты идут с пустым, то есть по запасной ветке,
+    # и диплинк у них не строится вовсе. Без этой строки сторож проверял бы не то.
+    monkeypatch.setattr('app.services.device_first_payment_service.settings.BOT_USERNAME', 'teplo_VPN_bot')
+    _stub_direct_create_identity_binding(monkeypatch, added)
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._apply_direct_pending_provider_observation',
+        AsyncMock(return_value=True),
+    )
+
+    await _create_direct_platega_attempt(
+        db,
+        checkout_public_id=checkout.public_id,
+        user_id=7,
+        method_key='sbp',
+        method_code=2,
+        was_financially_committed=False,
+    )
+
+    # 🔴 Улики: исходы РАЗНЫЕ и каждый свой. «Оба непустые» пропустило бы схлопывание.
+    assert sent['return_url'].endswith(f'co_{checkout.public_id}_ok')
+    assert sent['failed_url'].endswith(f'co_{checkout.public_id}_fail')
+    assert sent['return_url'] != sent['failed_url']
+    # Обе половины переключаются вместе — дословно тот же инвариант, что у соседа-пополнения.
+    assert ('t.me' in sent['return_url']) == ('t.me' in sent['failed_url'])
 
 
 @pytest.mark.asyncio

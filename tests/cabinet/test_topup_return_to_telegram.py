@@ -172,25 +172,66 @@ def test_direct_card_payer_is_sent_back_into_telegram(monkeypatch) -> None:
     assert dfps._direct_checkout_return_url(order) == (f'https://t.me/teplo_VPN_bot?startapp=co_{order}_ok')
 
 
-def test_failed_direct_payment_is_not_led_to_a_screen_that_would_lie(monkeypatch) -> None:
-    """🔴 Отказ в Телеграм НЕ уводим, и это решение ревью, а не недоделка.
+def test_failed_direct_payment_returns_to_telegram_with_the_failure_mark(monkeypatch) -> None:
+    """🔴 ЭТАП 2б: отказ тоже уводим в Телеграм — но ТОЛЬКО с меткой `_fail`.
 
-    Экран заказа, пока грузит строку заказа, пишет «Настраиваем VPN. Оплата учтена»
-    (`deviceFirst.processing` / `processingText`). Человеку, которому банк отказал, это прямая
-    ложь — и она мешает ему заплатить ещё раз. До этапа он туда не доезжал вовсе (упирался в
-    форму входа), значит ложь внёс бы именно этот этап.
+    ⛔ Сторож ПЕРЕПИСАН 28.08.2026, а не подкручен. Раньше он утверждал обратное («отказ в
+    Телеграм не уводим»), и это было верно ровно до тех пор, пока экран заказа не умел
+    говорить об отказе. Он научился: `DeviceFirstConfigurator.tsx:159-176` читает
+    `payment=failed`, показывает `providerDeclinedNotice` и снимает метку с адреса. Основание
+    прежнего запрета исчезло вместе с ним, поэтому и утверждение здесь другое.
 
-    Научить экран говорить после отказа банка — мина AR, дом следующего этапа; там же уместно
-    перевести на диплинк и отказ. Пока не умеет — не приводим к нему того, кому он соврёт.
+    🔴 СТЕРЕЖЁТ МИНУ EX, а не просто «есть диплинк». Хвост `_fail` — единственное, что
+    отличает эту правку от вредной: у сборщика умолчание `failed=False` даёт `_ok`, и вызов
+    без явного аргумента вернул бы отказавшего с меткой «оплачено». Кабинет по `_ok` не
+    показал бы отказ вовсе — то есть наивное снятие запрета было бы хуже формы входа.
+    Поэтому проверяем не «в адресе есть t.me», а именно исход.
     """
     from app.services import device_first_payment_service as dfps
 
     monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test', raising=False)
     monkeypatch.setattr(settings, 'BOT_USERNAME', 'teplo_VPN_bot', raising=False)
 
+    order = '550e8400-e29b-41d4-a716-446655440000'
+    failed_url = dfps._direct_checkout_return_url(order, failed=True)
+
+    assert failed_url == f'https://t.me/teplo_VPN_bot?startapp=co_{order}_fail'
+    # 🔴 Улика мины EX: исход именно `fail`. Проверка «просто не равно ok-адресу» пропустила бы
+    # опечатку в самой метке, а `endswith('_fail')` — подмену номера заказа. Нужны обе.
+    assert failed_url.endswith('_fail')
+    assert failed_url != dfps._direct_checkout_return_url(order)
+
+
+def test_successful_direct_payment_still_returns_with_the_ok_mark(monkeypatch) -> None:
+    """Второй конец шкалы: правка 2б не должна была тронуть успех.
+
+    Без этой проверки «прокинуть признак» можно было бы выполнить, поменяв умолчание, — и
+    тогда УСПЕШНО заплативший получил бы метку отказа, а кабинет объявил бы ему, что оплата
+    не прошла. Это ровно тот же вред, что и мина EX, только зеркальный.
+    """
+    from app.services import device_first_payment_service as dfps
+
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test', raising=False)
+    monkeypatch.setattr(settings, 'BOT_USERNAME', 'teplo_VPN_bot', raising=False)
+
+    order = '550e8400-e29b-41d4-a716-446655440000'
+    assert dfps._direct_checkout_return_url(order, failed=False).endswith('_ok')
+
+
+def test_failed_direct_payment_falls_back_to_the_website_keeping_the_failure_mark(monkeypatch) -> None:
+    """Диплинк собрать нечем — отказ остаётся на сайте, но признак отказа НЕ теряется.
+
+    Запасной путь существовал и раньше; проверка нужна потому, что 2б переставил его за
+    диплинк. Потеряй он здесь `payment=failed` — человек упал бы на экран заказа без единого
+    слова о том, что банк отказал, то есть ровно в ту немоту, которую этап и чинит.
+    """
+    from app.services import device_first_payment_service as dfps
+
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test', raising=False)
+    monkeypatch.setattr(settings, 'BOT_USERNAME', None, raising=False)
+
     failed_url = dfps._direct_checkout_return_url('abc123', failed=True)
     assert failed_url == 'https://cabinet.example.test/subscription/purchase?checkout=abc123&payment=failed'
-    assert 't.me' not in failed_url
 
 
 def test_direct_card_payment_falls_back_to_the_website_not_to_nothing(monkeypatch) -> None:
