@@ -549,3 +549,31 @@ async def test_card_sale_ignores_a_column_that_claims_a_discount_the_snapshot_di
 
     assert user.promo_offer_discount_percent == PERCENT
     assert not any(getattr(row, 'action', None) == 'consumed' for row in added)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_promo_log_does_not_take_the_paid_sale_down_with_it(monkeypatch):
+    """Журнал вспомогательный: его отказ не имеет права отменить оплаченную продажу.
+
+    🔴 ПРОБЕЛ, названный честно: этот сторож ловит снятие `try/except`, но НЕ ловит
+    снятие сейвпоинта — с подделкой сессии они неотличимы. Разница видна только на
+    настоящей транзакции: без сейвпоинта упавший `flush()` отравляет её, и следующий
+    `commit()` падает `PendingRollbackError` уже за пределами этой функции. Мутация
+    «сейвпоинт → if True» набор переживает, и это записано в плане, а не замолчано.
+    Сейвпоинт в коде НЕ УБИРАТЬ.
+    """
+    user = _user_with_offer()
+    added = []
+    db = _patch_direct_sale(monkeypatch, added)
+    monkeypatch.setattr(
+        service, 'log_promo_offer_action', AsyncMock(side_effect=RuntimeError('promo log table unavailable'))
+    )
+    checkout = _card_sale_checkout(discount_kopeks=DISCOUNT)
+
+    result = await service._complete_direct_sale_locked(
+        db, checkout=checkout, user=user, target=None, provider_payment_id='provider-77'
+    )
+
+    assert result.fulfillment_state == 'fulfilled'
+    # Скидка всё равно погашена: обнуление стоит ДО журнала и от него не зависит.
+    assert user.promo_offer_discount_percent == 0
