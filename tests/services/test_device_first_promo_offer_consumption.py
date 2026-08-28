@@ -104,8 +104,9 @@ async def test_applied_discount_is_burned_and_written_into_the_promo_log():
     assert entry.percent == PERCENT
     assert entry.offer_id == offer.id
     assert entry.source == 'expired_discount_wave2'
-    assert entry.details['discount_kopeks'] == DISCOUNT
-    assert entry.details['checkout_public_id'] == 'checkout-77'
+    # Ключи те, что экран журнала промо умеет рисовать, — иначе запись не увидит никто.
+    assert entry.details['amount_kopeks'] == DISCOUNT
+    assert 'checkout-77' in entry.details['description']
 
 
 @pytest.mark.asyncio
@@ -400,7 +401,7 @@ async def test_card_sale_burns_the_discount_even_though_no_balance_is_touched(mo
     assert user.promo_offer_discount_expires_at is None
     consumed = [row for row in added if getattr(row, 'action', None) == 'consumed']
     assert len(consumed) == 1
-    assert consumed[0].details['discount_kopeks'] == DISCOUNT
+    assert consumed[0].details['amount_kopeks'] == DISCOUNT
 
 
 @pytest.mark.asyncio
@@ -425,7 +426,7 @@ async def test_card_sale_without_an_applied_discount_leaves_the_offer_alone(monk
 
 @pytest.mark.asyncio
 async def test_card_sale_does_not_burn_an_offer_the_customer_claimed_later(monkeypatch):
-    """Счёт у провайдера живёт часами — за это время предложение могло смениться.
+    """Между заморозкой цены и оплатой (до 30 минут) предложение могло смениться.
 
     Замороженная цена посчитана по предложению A, а на человеке лежит уже B.
     Сжечь B — отобрать у клиента скидку, которой эта покупка не пользовалась.

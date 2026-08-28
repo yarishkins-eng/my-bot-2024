@@ -101,6 +101,7 @@ REASON_LABEL_KEYS = {
     'autopay_consumed': 'ADMIN_PROMO_OFFER_LOGS_REASON_AUTOPAY',
     'offer_expired': 'ADMIN_PROMO_OFFER_LOGS_REASON_EXPIRED',
     'test_access_expired': 'ADMIN_PROMO_OFFER_LOGS_REASON_TEST_EXPIRED',
+    'device_first_checkout': 'ADMIN_PROMO_OFFER_LOGS_REASON_CHECKOUT',
 }
 
 

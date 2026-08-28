@@ -1875,8 +1875,13 @@ def _direct_sale_snapshot(
         'pricing_revision': checkout.pricing_revision,
         'funding_mode': funding_mode,
         'target_snapshot': checkout.target_snapshot,
-        # 🔴 ЛИЧНОСТЬ предложения, а не только его сумма. Счёт у провайдера живёт часами,
-        # и за это время человек может забрать ДРУГОЕ предложение. Без этой строки гасилось
+        # 🔴 ЛИЧНОСТЬ предложения, а не только его сумма. Между заморозкой цены и приходом
+        # денег человек может забрать ДРУГОЕ предложение — оно в двух нажатиях в кабинете.
+        # ⚠️ Окно — ТРИДЦАТЬ МИНУТ (`quote_expires_at`, `:1028`), а не часы: оплату после
+        # истечения котировки уводит в «деньги только на баланс»
+        # (`device_first_payment_service.py:1925-1932`), до гашения она не доходит.
+        # Первая формулировка говорила «часами» — преувеличение, поймано критиком полноты:
+        # две линзы ревью разошлись в этом месте, разобрано по коду. Без этой строки гасилось
         # бы то, что лежит на нём в момент вебхука, а не то, что вошло в цену, — и клиент
         # терял бы неиспользованную скидку. Нашли две линзы ревью независимо.
         'promo_offer_source': getattr(user, 'promo_offer_discount_source', None),
@@ -2020,10 +2025,14 @@ async def _consume_promo_offer_for_sale(
                 source=source,
                 percent=percent,
                 effect_type=offer.effect_type if offer else None,
+                # ⚠️ Ключи именно эти: `description` и `amount_kopeks` экран журнала промо
+                # уже умеет рисовать (`handlers/admin/promo_offers.py:356-368`). Свои имена
+                # (`checkout_public_id`, `discount_kopeks`) не рисовались бы НИГДЕ — то есть
+                # владелец не увидел бы ровно того, ради чего их кладут.
                 details={
                     'reason': 'device_first_checkout',
-                    'checkout_public_id': checkout.public_id,
-                    'discount_kopeks': applied_discount_kopeks,
+                    'description': f'Покупка в кассе, заказ {checkout.public_id}',
+                    'amount_kopeks': applied_discount_kopeks,
                 },
                 commit=False,
             )
