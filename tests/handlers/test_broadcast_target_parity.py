@@ -328,7 +328,11 @@ async def test_telegram_projection_is_unique_and_respects_channel_eligibility(mo
 
     monkeypatch.setattr(broadcast_module, 'get_target_users', fake_get_target_users)
 
-    assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(object(), 'active', 'system') == [100, 300, 500]
+    assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(object(), 'active', 'system') == [
+        100,
+        300,
+        500,
+    ]
     assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(object(), 'trial', 'news') == [100, 500]
     assert await broadcast_module.resolve_telegram_broadcast_recipient_ids(object(), 'expired', 'promo') == [100, 300]
     assert calls == ['active', 'trial', 'expired']
@@ -668,9 +672,7 @@ async def test_tariff_catalog_forwards_each_category_to_projection(monkeypatch) 
 @pytest.mark.asyncio
 async def test_email_catalog_forwards_each_category_to_all_filters(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
-    expected_counts = {
-        key: index + 11 for index, key in enumerate(broadcast_routes.EMAIL_FILTER_LABELS)
-    }
+    expected_counts = {key: index + 11 for index, key in enumerate(broadcast_routes.EMAIL_FILTER_LABELS)}
 
     async def fake_count(session, target: str, category: str) -> int:
         calls.append((target, category))
