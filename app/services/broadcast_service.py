@@ -102,6 +102,7 @@ class EmailBroadcastConfig:
     email_subject: str
     email_html_content: str
     initiator_name: str | None = None
+    category: str = 'system'
 
 
 @dataclass(slots=True)
@@ -116,6 +117,117 @@ class _EmailRecipient:
 class _BroadcastTask:
     task: asyncio.Task
     cancel_event: asyncio.Event
+
+
+def _category_allows_user(user: User, category: str) -> bool:
+    """Единое правило opt-out для preview и фактической отправки."""
+    if category == 'news':
+        from app.utils.notification_prefs import is_news_enabled
+
+        return is_news_enabled(user)
+    if category == 'promo':
+        from app.utils.notification_prefs import is_promo_offers_enabled
+
+        return is_promo_offers_enabled(user)
+    return True
+
+
+async def resolve_telegram_broadcast_recipient_ids(
+    session,
+    target: str,
+    category: str = 'system',
+    *,
+    preloaded_users: list[User] | None = None,
+) -> list[int]:
+    """Материализует фактические уникальные Telegram ID для preview и worker.
+
+    `get_target_users` остаётся общим сегментом для polls/promo и поэтому не
+    может глобально исключать email-only. Канальная проекция живёт здесь.
+    """
+    if target.startswith('custom_'):
+        users = await get_custom_users(session, target[len('custom_') :])
+    elif preloaded_users is None:
+        users = await get_target_users(session, target)
+    else:
+        users = await get_target_users(session, target, preloaded_users=preloaded_users)
+
+    recipient_ids: list[int] = []
+    seen: set[int] = set()
+    for user in users:
+        telegram_id = user.telegram_id
+        if telegram_id is None or telegram_id in seen or not _category_allows_user(user, category):
+            continue
+        seen.add(telegram_id)
+        recipient_ids.append(telegram_id)
+    return recipient_ids
+
+
+def _email_recipient_from_user(user: User) -> _EmailRecipient | None:
+    email = user.email
+    if not email:
+        return None
+
+    user_name = user.username
+    if not user_name:
+        user_name = user.first_name or ''
+        if last_name := user.last_name:
+            user_name = f'{user_name} {last_name}'.strip()
+    if not user_name:
+        user_name = email.split('@')[0]
+    return _EmailRecipient(email=email, user_name=user_name)
+
+
+async def resolve_email_broadcast_recipients(
+    session,
+    target: str,
+    category: str = 'system',
+) -> list[_EmailRecipient]:
+    """Материализует тот же unique email-набор для preview и worker."""
+    base_conditions = [
+        User.email.isnot(None),
+        User.email_verified == True,
+        User.status == UserStatus.ACTIVE.value,
+    ]
+
+    if target == 'all_email':
+        query = select(User).where(*base_conditions)
+    elif target == 'email_only':
+        query = select(User).where(*base_conditions, User.auth_type == 'email')
+    elif target == 'telegram_with_email':
+        query = select(User).where(
+            *base_conditions,
+            User.auth_type == 'telegram',
+            User.telegram_id.isnot(None),
+        )
+    elif target == 'active_email':
+        query = (
+            select(User)
+            .join(Subscription, User.id == Subscription.user_id)
+            .where(*base_conditions, Subscription.status == SubscriptionStatus.ACTIVE.value)
+        )
+    elif target == 'expired_email':
+        query = (
+            select(User)
+            .join(Subscription, User.id == Subscription.user_id)
+            .where(
+                *base_conditions,
+                Subscription.status.in_([SubscriptionStatus.EXPIRED.value, SubscriptionStatus.DISABLED.value]),
+            )
+        )
+    else:
+        logger.warning('Unknown email target filter', target=target)
+        return []
+
+    result = await session.execute(query.order_by(User.id))
+    users = result.scalars().unique().all()
+    recipients: list[_EmailRecipient] = []
+    for user in users:
+        if not _category_allows_user(user, category):
+            continue
+        recipient = _email_recipient_from_user(user)
+        if recipient is not None:
+            recipients.append(recipient)
+    return recipients
 
 
 class BroadcastService:
@@ -264,26 +376,7 @@ class BroadcastService:
         Category 'system' is never filtered — system notifications reach everyone.
         """
         async with AsyncSessionLocal() as session:
-            if target.startswith('custom_'):
-                criteria = target[len('custom_') :]
-                users_orm = await get_custom_users(session, criteria)
-            else:
-                users_orm = await get_target_users(session, target)
-
-            # Filter by user notification preferences based on broadcast category
-            if category == 'news':
-                from app.utils.notification_prefs import is_news_enabled
-
-                users_orm = [u for u in users_orm if is_news_enabled(u)]
-            elif category == 'promo':
-                from app.utils.notification_prefs import is_promo_offers_enabled
-
-                users_orm = [u for u in users_orm if is_promo_offers_enabled(u)]
-            # category == 'system' → no filtering, sent to everyone
-
-            # Извлекаем telegram_id сразу, пока сессия жива.
-            # После выхода из блока ORM-объекты станут detached.
-            return [u.telegram_id for u in users_orm if u.telegram_id is not None]
+            return await resolve_telegram_broadcast_recipient_ids(session, target, category)
 
     async def _send_batched(
         self,
@@ -796,7 +889,7 @@ class EmailBroadcastService:
                 await session.commit()
 
             # Fetch email recipients
-            recipients = await self._fetch_email_recipients(config.target)
+            recipients = await self._fetch_email_recipients(config.target, config.category)
 
             # Update total count
             async with AsyncSessionLocal() as session:
@@ -838,101 +931,15 @@ class EmailBroadcastService:
             logger.exception('Critical error in email broadcast', broadcast_id=broadcast_id, exc=exc)
             await self._mark_failed(broadcast_id, sent_count, failed_count)
 
-    async def _fetch_email_recipients(self, target: str) -> list[_EmailRecipient]:
+    async def _fetch_email_recipients(self, target: str, category: str = 'system') -> list[_EmailRecipient]:
         """
         Загружает получателей email-рассылки.
 
         Возвращает список _EmailRecipient (скалярные данные), а не ORM-объектов,
         чтобы избежать detached state при долгих рассылках.
         """
-        from sqlalchemy import select
-
-        from app.database.models import Subscription, SubscriptionStatus, User
-
         async with AsyncSessionLocal() as session:
-            # Base query: verified email users with active status
-            base_conditions = [
-                User.email.isnot(None),
-                User.email_verified == True,
-                User.status == 'active',
-            ]
-
-            if target == 'all_email':
-                query = select(User).where(*base_conditions)
-
-            elif target == 'email_only':
-                query = select(User).where(
-                    *base_conditions,
-                    User.auth_type == 'email',
-                )
-
-            elif target == 'telegram_with_email':
-                query = select(User).where(
-                    *base_conditions,
-                    User.auth_type == 'telegram',
-                    User.telegram_id.isnot(None),
-                )
-
-            elif target == 'active_email':
-                query = (
-                    select(User)
-                    .join(Subscription, User.id == Subscription.user_id)
-                    .where(
-                        *base_conditions,
-                        Subscription.status == SubscriptionStatus.ACTIVE.value,
-                    )
-                )
-
-            elif target == 'expired_email':
-                query = (
-                    select(User)
-                    .join(Subscription, User.id == Subscription.user_id)
-                    .where(
-                        *base_conditions,
-                        Subscription.status.in_(
-                            [
-                                SubscriptionStatus.EXPIRED.value,
-                                SubscriptionStatus.DISABLED.value,
-                            ]
-                        ),
-                    )
-                )
-
-            else:
-                logger.warning('Unknown email target filter', target=target)
-                return []
-
-            # Загружаем батчами и извлекаем скаляры сразу
-            recipients: list[_EmailRecipient] = []
-            offset = 0
-            batch_size = 1000
-
-            while True:
-                result = await session.execute(query.offset(offset).limit(batch_size))
-                batch = result.scalars().all()
-
-                if not batch:
-                    break
-
-                for user in batch:
-                    email = user.email
-                    if not email:
-                        continue
-
-                    # Формируем имя пользователя
-                    user_name = user.username
-                    if not user_name:
-                        user_name = user.first_name or ''
-                        if last_name := user.last_name:
-                            user_name = f'{user_name} {last_name}'.strip()
-                    if not user_name:
-                        user_name = email.split('@')[0]
-
-                    recipients.append(_EmailRecipient(email=email, user_name=user_name))
-
-                offset += batch_size
-
-            return recipients
+            return await resolve_email_broadcast_recipients(session, target, category)
 
     async def _send_emails(
         self,

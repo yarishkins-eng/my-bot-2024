@@ -115,7 +115,9 @@ def test_expiring_predicate_still_mixes_trials() -> None:
     привязана к КОДУ: если в ветку `expiring` добавят фильтр по `is_trial`, тест
     покраснеет и заставит переписать надпись вместе с предикатом.
     """
-    source = inspect.getsource(admin_messages.get_target_users_count)
+    # РС-9 удалил второй SQL-предикат: и preview, и отправка теперь используют
+    # `get_target_users`. Проверять надо единственный оставшийся источник истины.
+    source = inspect.getsource(admin_messages.get_target_users)
     branch = re.search(r"if target == 'expiring':(.*?)(?=\n    if target ==|\n    elif target ==)", source, re.DOTALL)
     assert branch, 'ветка expiring не найдена — тест устарел вместе с кодом, чинить его, а не отключать'
     assert 'is_trial' not in branch.group(1), (

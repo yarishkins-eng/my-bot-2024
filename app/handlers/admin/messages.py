@@ -6,7 +6,7 @@ import structlog
 from aiogram import Dispatcher, F, types
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import InterfaceError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -705,7 +705,7 @@ async def select_custom_criteria(callback: types.CallbackQuery, db_user: User, s
         'direct': 'Прямая регистрация',
     }
 
-    user_count = await get_custom_users_count(db, criteria)
+    user_count = len(await _get_telegram_target_recipient_ids(db, f'custom_{criteria}'))
 
     await state.update_data(broadcast_target=f'custom_{criteria}')
 
@@ -740,11 +740,11 @@ async def select_broadcast_target(callback: types.CallbackQuery, db_user: User, 
     # честную надпись он видел один раз, а прежнюю обманную — дважды. Держать в согласии
     # с `FILTER_LABELS` (cabinet/routes/admin_broadcasts.py) и `get_target_name` ниже.
     target_names = {
-        'all': 'Всем пользователям',
+        'all': 'Всем активным с Telegram',
         'active': 'Действующая подписка, не пробная',
         'trial': 'Сейчас числится пробной (в т.ч. истёкшая)',
         'no': 'Сейчас без подписки',
-        'expiring': 'Заканчивается за 3 дня (включая пробные)',
+        'expiring': 'Заканчивается за 3 дня (включая пробные, без активных суточных)',
         'expired': 'Закончилась (включая пробные)',
         'zero': 'Действующая, 0 ГБ за текущий период',
         'active_zero': 'Действующая не пробная, 0 ГБ за период',
@@ -763,7 +763,7 @@ async def select_broadcast_target(callback: types.CallbackQuery, db_user: User, 
         else:
             target_name = f'Тариф #{tariff_id}'
 
-    user_count = await get_target_users_count(db, target)
+    user_count = len(await _get_telegram_target_recipient_ids(db, target))
 
     await state.update_data(broadcast_target=target)
 
@@ -1071,11 +1071,7 @@ async def confirm_button_selection(callback: types.CallbackQuery, db_user: User,
     has_media = data.get('has_media', False)
     media_type = data.get('media_type')
 
-    user_count = (
-        await get_target_users_count(db, target)
-        if not target.startswith('custom_')
-        else await get_custom_users_count(db, target.replace('custom_', ''))
-    )
+    user_count = len(await _get_telegram_target_recipient_ids(db, target))
     target_display = get_target_display_name(target)
 
     media_info = ''
@@ -1197,17 +1193,10 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
         parse_mode='HTML',
     )
 
-    # Загружаем пользователей и сразу извлекаем telegram_id в список
-    # чтобы не обращаться к ORM-объектам во время долгой рассылки
-    if target.startswith('custom_'):
-        users_orm = await get_custom_users(db, target.replace('custom_', ''))
-    else:
-        users_orm = await get_target_users(db, target)
-
-    # Извлекаем только telegram_id - это всё что нужно для отправки
-    # Фильтруем None (email-only пользователи)
-    recipient_telegram_ids: list[int] = [user.telegram_id for user in users_orm if user.telegram_id is not None]
-    total_users_count = len(users_orm)
+    # Чат-админка использует ту же канальную проекцию, что кабинетный worker:
+    # email-only и повторяющиеся Telegram ID не попадают ни в отправку, ни в total.
+    recipient_telegram_ids = await _get_telegram_target_recipient_ids(db, target)
+    total_users_count = len(recipient_telegram_ids)
 
     # Создаём запись истории рассылки
     broadcast_history = BroadcastHistory(
@@ -1455,11 +1444,6 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
         # Задержка между батчами для соблюдения rate limits
         await asyncio.sleep(_BATCH_DELAY)
 
-    # Учитываем пропущенных email-only пользователей
-    skipped_email_users = total_users_count - total_recipients
-    if skipped_email_users > 0:
-        logger.info('Пропущено email-only пользователей при рассылке', skipped_email_users=skipped_email_users)
-
     # РС-2: то же правило, что и у кабинетной рассылки. Обе двери пишут в ОДНУ таблицу
     # `broadcast_history`, и без этого полностью провалившаяся кампания из чат-админки
     # показывалась бы «Частично» рядом с кабинетной «Ошибка» — один список, два языка.
@@ -1486,7 +1470,7 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
         f'• Отправлено: {sent_count}\n'
         f'{blocked_line}'
         f'• Не доставлено: {failed_count}\n'
-        f'• Всего пользователей: {total_users_count}\n'
+        f'• Всего получателей: {total_users_count}\n'
         f'• Успешность: {success_rate}%{media_info}\n\n'
         f'<b>Администратор:</b> {html.escape(admin_name)}'
     )
@@ -1524,235 +1508,72 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
     )
 
 
+def _unique_target_users(users: list[User]) -> list[User]:
+    """Сохраняет порядок, но не даёт одному user.id стать двумя адресатами."""
+    seen: set[int] = set()
+    unique: list[User] = []
+    for user in users:
+        if user.id in seen:
+            continue
+        seen.add(user.id)
+        unique.append(user)
+    return unique
+
+
+async def _get_telegram_target_recipient_ids(db: AsyncSession, target: str) -> list[int]:
+    """Единая фактическая Telegram-аудитория для старой чат-админки.
+
+    Импорт локальный: `broadcast_service` сам переиспользует selector из этого
+    модуля. К моменту вызова оба модуля уже загружены, а import-cycle при старте нет.
+    """
+    from app.services.broadcast_service import resolve_telegram_broadcast_recipient_ids
+
+    return await resolve_telegram_broadcast_recipient_ids(db, target, 'system')
+
+
 async def get_target_users_count(db: AsyncSession, target: str) -> int:
-    """Быстрый подсчёт пользователей через SQL COUNT вместо загрузки всех в память."""
-    from sqlalchemy import distinct, func as sql_func
+    """Считает ровно ту выборку, которую затем получает отправщик.
 
-    base_filter = User.status == UserStatus.ACTIVE.value
+    РС-9: отдельный SQL COUNT был быстрее, но содержал второй набор бизнес-
+    предикатов. Он расходился с `get_target_users` по сроку, LIMITED и суточным
+    тарифам, поэтому цифра в preview не описывала фактическую аудиторию.
+    """
+    return len(await get_target_users(db, target))
 
-    if target == 'all':
-        query = select(sql_func.count(User.id)).where(base_filter)
-        result = await db.execute(query)
-        return result.scalar() or 0
 
-    if target == 'active':
-        # Активные платные подписки (не триал)
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                base_filter,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                Subscription.is_trial == False,
-            )
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    if target == 'trial':
-        # Триальные подписки (без проверки is_active, как в оригинале)
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                base_filter,
-                Subscription.is_trial == True,
-            )
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    if target == 'no':
-        # Без активной подписки - используем NOT EXISTS для корректности
-        subquery = (
-            select(Subscription.id)
-            .where(
-                Subscription.user_id == User.id,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-            )
-            .correlate(User)
-            .exists()
-        )
-        query = select(sql_func.count(User.id)).where(base_filter, ~subquery)
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    if target == 'expiring':
-        # Истекающие в ближайшие 3 дня
-        now = datetime.now(UTC)
-        expiry_threshold = now + timedelta(days=3)
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                base_filter,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                Subscription.end_date <= expiry_threshold,
-                Subscription.end_date > now,
-            )
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    if target == 'expiring_subscribers':
-        # Истекающие в ближайшие 7 дней
-        now = datetime.now(UTC)
-        expiry_threshold = now + timedelta(days=7)
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                base_filter,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                Subscription.end_date <= expiry_threshold,
-                Subscription.end_date > now,
-            )
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    if target in ('expired', 'expired_subscribers'):
-        # Истекшие подписки — исключаем юзеров с хотя бы одной активной
-        now = datetime.now(UTC)
-        expired_statuses = [
-            SubscriptionStatus.EXPIRED.value,
-            SubscriptionStatus.DISABLED.value,
-            SubscriptionStatus.LIMITED.value,
-        ]
-        has_active_sub = (
-            select(Subscription.id)
-            .where(
-                Subscription.user_id == User.id,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-            )
-            .correlate(User)
-            .exists()
-        )
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .outerjoin(Subscription, User.id == Subscription.user_id)
-            .where(
-                base_filter,
-                ~has_active_sub,
-                or_(
-                    Subscription.status.in_(expired_statuses),
-                    and_(Subscription.end_date <= now, Subscription.status != SubscriptionStatus.ACTIVE.value),
-                    and_(Subscription.id == None, User.has_had_paid_subscription == True),
-                ),
-            )
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    if target == 'active_zero':
-        # Активные платные с нулевым трафиком
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                base_filter,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                Subscription.is_trial == False,
-                or_(Subscription.traffic_used_gb == None, Subscription.traffic_used_gb <= 0),
-            )
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    if target == 'trial_zero':
-        # Триальные с нулевым трафиком
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                base_filter,
-                Subscription.is_trial == True,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                or_(Subscription.traffic_used_gb == None, Subscription.traffic_used_gb <= 0),
-            )
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    if target == 'zero':
-        # Все активные с нулевым трафиком
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                base_filter,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                or_(Subscription.traffic_used_gb == None, Subscription.traffic_used_gb <= 0),
-            )
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    # Фильтр по тарифу
-    if target.startswith('tariff_'):
-        tariff_id = int(target.split('_')[1])
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .join(Subscription, User.id == Subscription.user_id)
-            .where(
-                base_filter,
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                Subscription.tariff_id == tariff_id,
-            )
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    # Custom filters — быстрый COUNT вместо загрузки всех пользователей
+async def get_target_users(
+    db: AsyncSession,
+    target: str,
+    *,
+    preloaded_users: list[User] | None = None,
+) -> list[User]:
     if target.startswith('custom_'):
-        now = datetime.now(UTC)
-        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        criteria = target[len('custom_') :]
+        return await get_custom_users(db, target[len('custom_') :])
 
-        if criteria == 'today':
-            query = select(sql_func.count(User.id)).where(base_filter, User.created_at >= today)
-        elif criteria == 'week':
-            query = select(sql_func.count(User.id)).where(base_filter, User.created_at >= now - timedelta(days=7))
-        elif criteria == 'month':
-            query = select(sql_func.count(User.id)).where(base_filter, User.created_at >= now - timedelta(days=30))
-        elif criteria == 'active_today':
-            query = select(sql_func.count(User.id)).where(base_filter, User.last_activity >= today)
-        elif criteria == 'inactive_week':
-            query = select(sql_func.count(User.id)).where(base_filter, User.last_activity < now - timedelta(days=7))
-        elif criteria == 'inactive_month':
-            query = select(sql_func.count(User.id)).where(base_filter, User.last_activity < now - timedelta(days=30))
-        elif criteria == 'referrals':
-            query = select(sql_func.count(User.id)).where(base_filter, User.referred_by_id.isnot(None))
-        elif criteria == 'direct':
-            query = select(sql_func.count(User.id)).where(base_filter, User.referred_by_id.is_(None))
-        else:
-            return 0
+    # Экран фильтров вычисляет много сегментов за один запрос. Он может передать
+    # уже загруженную базовую выборку, чтобы не читать одних и тех же пользователей
+    # и подписки заново для каждой строки. Отправщик не передаёт её и получает
+    # обычный свежий снимок на момент старта.
+    users: list[User] = list(preloaded_users or [])
+    if preloaded_users is None:
+        offset = 0
+        batch_size = 5000
 
-        result = await db.execute(query)
-        return result.scalar() or 0
+        while True:
+            batch = await get_users_list(
+                db,
+                offset=offset,
+                limit=batch_size,
+                status=UserStatus.ACTIVE,
+            )
 
-    return 0
+            if not batch:
+                break
 
+            users.extend(batch)
+            offset += batch_size
 
-async def get_target_users(db: AsyncSession, target: str) -> list:
-    # Загружаем всех активных пользователей батчами, чтобы не ограничиваться 10к
-    users: list[User] = []
-    offset = 0
-    batch_size = 5000
-
-    while True:
-        batch = await get_users_list(
-            db,
-            offset=offset,
-            limit=batch_size,
-            status=UserStatus.ACTIVE,
-        )
-
-        if not batch:
-            break
-
-        users.extend(batch)
-        offset += batch_size
+    users = _unique_target_users(users)
 
     if target == 'all':
         return users
@@ -1772,7 +1593,7 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
 
     if target == 'expiring':
         expiring_subs = await get_expiring_subscriptions(db, 3)
-        return [sub.user for sub in expiring_subs if sub.user]
+        return _unique_target_users([sub.user for sub in expiring_subs if sub.user])
 
     if target == 'expired':
         now = datetime.now(UTC)
@@ -1823,7 +1644,7 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
 
     if target == 'expiring_subscribers':
         expiring_subs = await get_expiring_subscriptions(db, 7)
-        return [sub.user for sub in expiring_subs if sub.user]
+        return _unique_target_users([sub.user for sub in expiring_subs if sub.user])
 
     if target == 'expired_subscribers':
         now = datetime.now(UTC)
@@ -2010,12 +1831,12 @@ async def get_users_statistics(db: AsyncSession) -> dict:
 
 def get_target_name(target_type: str) -> str:
     names = {
-        'all': 'Всем пользователям',
+        'all': 'Всем активным с Telegram',
         'active': 'Действующая подписка, не пробная',
         'trial': 'Сейчас числится пробной (в т.ч. истёкшая)',
         'no': 'Сейчас без подписки',
         'sub': 'Сейчас без подписки',
-        'expiring': 'Заканчивается за 3 дня (включая пробные)',
+        'expiring': 'Заканчивается за 3 дня (включая пробные, без активных суточных)',
         'expired': 'Закончилась (включая пробные)',
         'active_zero': 'Действующая не пробная, 0 ГБ за период',
         'trial_zero': 'Действующая пробная, 0 ГБ за период',
