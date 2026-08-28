@@ -1639,13 +1639,22 @@ async def ask_referral_debt_payment(callback: types.CallbackQuery, db_user: User
     await callback.answer()
 
 
-def _debt_result_text(rows: list[dict], *, paid: bool, reason: str) -> str:
+def _debt_result_text(rows: list[dict], *, paid: bool, reason: str, running: bool = False) -> str:
     """Итог выплаты. Считаем по КНИГЕ и по факту, а не по флагу `paid`.
 
     🔴 Писать «деньги не тронуты» на любой отказ нельзя: пакет платит построчно и
     коммитит каждую строку, поэтому отказ на третьей означает, что первые две УЖЕ
     оплачены. Админ, прочитав «не тронуты», пошёл бы доплачивать поверх выплаченного.
     """
+    if running:
+        # 🔴 Соседнее окно уже закоммитило пакет. Говорить про деньги здесь нельзя ни в какую
+        # сторону: начислений ещё нет, но они будут через секунды. Прошлая редакция читала
+        # книгу и печатала «деньги не тронуты» — ровно ту неправду, которую убирала.
+        return (
+            '⏳ <b>Выплата уже идёт в соседнем окне</b>\n\n'
+            'Второй раз нажимать не нужно — деньги не задвоятся.\n'
+            'Откройте экран долга через минуту, он покажет итог.'
+        )
     credited = [row for row in rows if row.get('credited_referrer') or row.get('credited_friend')]
     total = sum(row['credited_referrer'] + row['credited_friend'] for row in credited)
     if not paid:
@@ -1705,7 +1714,9 @@ async def pay_referral_debt_handler(callback: types.CallbackQuery, db_user: User
     )
 
     await callback.message.edit_text(
-        _debt_result_text(result['rows'], paid=result['paid'], reason=result['reason']),
+        _debt_result_text(
+            result['rows'], paid=result['paid'], reason=result['reason'], running=result.get('running', False)
+        ),
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[[types.InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_referrals')]]
         ),

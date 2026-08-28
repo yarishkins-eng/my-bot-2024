@@ -2460,10 +2460,15 @@ async def test_late_paid_invoice_pays_the_referral_commission(monkeypatch):
         if not marks_late:
             continue
         # 🔴 Только ДОСТИЖИМЫЕ операторы, без `ast.walk`. Обход в глубину находил вызовы и
-        # внутри `if False:` — сторож зеленел на мёртвом коде, что и показала мутация.
+        # внутри `if False:` — сторож зеленел на мёртвом коде.
+        # 🔴 И останавливаемся на первом `return`/`raise`: без этого ОДНА вставленная строка
+        # `return payment` перед вызовами делала их мёртвыми, а сторож оставался зелёным.
+        # Нашёл скептик, проверив мутацией — типичный итог неаккуратного слияния.
         # Внутрь `try` заходим: он достижимость не отменяет, в отличие от условия.
         reachable = []
         for stmt in body:
+            if isinstance(stmt, ast.Return | ast.Raise | ast.Continue | ast.Break):
+                break
             reachable.append(stmt)
             if isinstance(stmt, ast.Try):
                 reachable.extend(stmt.body)
@@ -2478,5 +2483,14 @@ async def test_late_paid_invoice_pays_the_referral_commission(monkeypatch):
     assert 'ensure_deposit_outbox' in names, 'поздняя оплата снова платит мимо очереди — мины U и BU открыты'
     assert 'process_device_first_deposit_outbox' in names, 'без побудки партнёр ждал бы до часового цикла'
     outbox = next(call for call in late_calls if call.func.id == 'ensure_deposit_outbox')
-    kwargs = {kw.arg for kw in outbox.keywords}
+    kwargs = {kw.arg: kw.value for kw in outbox.keywords}
     assert 'pay_referral' in kwargs, 'выключатель обязан спрашиваться там, где обязательство ВОЗНИКАЕТ'
+    # 🔴 Не только имя, но и ЗНАЧЕНИЕ: жёсткие True/False прошли бы проверку на имя молча.
+    switch = kwargs['pay_referral']
+    assert isinstance(switch, ast.Call) and getattr(switch.func, 'attr', '') == 'is_referral_program_enabled', (
+        'выключатель подменён константой — программа выключена, а поздняя оплата платит'
+    )
+    settlement = kwargs.get('settlement_mode')
+    assert isinstance(settlement, ast.Name) and settlement.id == 'DIRECT_SETTLEMENT_MODE', (
+        'поздняя оплата пометится легаси-пополнением, хотя пришла по прямому счёту'
+    )
