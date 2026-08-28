@@ -2459,10 +2459,20 @@ async def test_late_paid_invoice_pays_the_referral_commission(monkeypatch):
         )
         if not marks_late:
             continue
+        # 🔴 Только ДОСТИЖИМЫЕ операторы, без `ast.walk`. Обход в глубину находил вызовы и
+        # внутри `if False:` — сторож зеленел на мёртвом коде, что и показала мутация.
+        # Внутрь `try` заходим: он достижимость не отменяет, в отличие от условия.
+        reachable = []
         for stmt in body:
-            for inner in ast.walk(stmt):
-                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name):
-                    late_calls.append(inner)
+            reachable.append(stmt)
+            if isinstance(stmt, ast.Try):
+                reachable.extend(stmt.body)
+        for stmt in reachable:
+            call = stmt.value if isinstance(stmt, ast.Expr) else None
+            if isinstance(call, ast.Await):
+                call = call.value
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                late_calls.append(call)
 
     names = {call.func.id for call in late_calls}
     assert 'ensure_deposit_outbox' in names, 'поздняя оплата снова платит мимо очереди — мины U и BU открыты'
