@@ -770,7 +770,7 @@ async def test_fulfillment_conflicts_before_debit_when_live_paid_target_would_be
             device_options=(3, 4, 5),
         ),
     )
-    calculate = AsyncMock(return_value=SimpleNamespace(final_total=10_000))
+    calculate = AsyncMock(return_value=SimpleNamespace(final_total=10_000, promo_offer_discount=0))
     monkeypatch.setattr(service.pricing_engine, 'calculate_tariff_purchase_price', calculate)
 
     result = await service.fulfill_checkout(db, checkout.public_id, user.id)
@@ -812,7 +812,7 @@ async def test_fulfillment_reprices_before_debit_when_the_current_price_changes(
     monkeypatch.setattr(
         service.pricing_engine,
         'calculate_tariff_purchase_price',
-        AsyncMock(return_value=SimpleNamespace(final_total=12_000)),
+        AsyncMock(return_value=SimpleNamespace(final_total=12_000, promo_offer_discount=0)),
     )
 
     result = await service.fulfill_checkout(db, checkout.public_id, user.id)
@@ -857,7 +857,7 @@ async def test_fulfillment_records_one_completion_time_and_finishes_the_debit(mo
     monkeypatch.setattr(
         service.pricing_engine,
         'calculate_tariff_purchase_price',
-        AsyncMock(return_value=SimpleNamespace(final_total=10_000)),
+        AsyncMock(return_value=SimpleNamespace(final_total=10_000, promo_offer_discount=0)),
     )
     monkeypatch.setattr(service, 'extend_subscription', AsyncMock(return_value=extended))
 
@@ -905,7 +905,7 @@ async def test_handcrafted_zero_price_checkout_never_debits_or_converts_a_trial(
     monkeypatch.setattr(
         service.pricing_engine,
         'calculate_tariff_purchase_price',
-        AsyncMock(return_value=SimpleNamespace(final_total=0)),
+        AsyncMock(return_value=SimpleNamespace(final_total=0, promo_offer_discount=0)),
     )
 
     result = await service.fulfill_checkout(db, checkout.public_id, user.id)
@@ -950,7 +950,7 @@ async def test_spent_exact_payment_loses_its_expiry_exemption_and_requires_a_new
     monkeypatch.setattr(
         service.pricing_engine,
         'calculate_tariff_purchase_price',
-        AsyncMock(return_value=SimpleNamespace(final_total=10_000)),
+        AsyncMock(return_value=SimpleNamespace(final_total=10_000, promo_offer_discount=0)),
     )
 
     result = await service.fulfill_checkout(db, checkout.public_id, user.id)

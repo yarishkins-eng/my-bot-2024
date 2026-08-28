@@ -17,6 +17,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database.crud.discount_offer import get_latest_claimed_offer_for_user
+from app.database.crud.promo_offer_log import log_promo_offer_action
 from app.database.crud.subscription import (
     create_paid_subscription,
     extend_subscription,
@@ -1545,6 +1547,15 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
     checkout.quote_state = 'committed'
     user.balance_kopeks -= charge
     user.has_had_paid_subscription = True
+    # Скидку меряем ПЕРЕСЧИТАННОЙ ценой, а не замороженной разбивкой заказа: выше
+    # стоит забор `charge != checkout.quoted_price_kopeks`, но он сверяет ИТОГ, а не
+    # его состав. Именно `current_price` и дал ту сумму, которую сейчас списываем.
+    await _consume_promo_offer_for_sale(
+        db,
+        user=user,
+        checkout=checkout,
+        applied_discount_kopeks=int(current_price.promo_offer_discount or 0),
+    )
     ledger = Transaction(
         user_id=user.id,
         type=TransactionType.SUBSCRIPTION_PAYMENT.value,
@@ -1915,6 +1926,74 @@ async def prepare_direct_external_checkout(
     return checkout
 
 
+async def _consume_promo_offer_for_sale(
+    db: AsyncSession,
+    *,
+    user: User,
+    checkout: SubscriptionCheckout,
+    applied_discount_kopeks: int,
+) -> None:
+    """Погасить одноразовую скидку, которую эта продажа ДЕЙСТВИТЕЛЬНО применила.
+
+    🔴 Гасим по ФАКТУ применения (сколько копеек скидки ушло в цену), а не по праву
+    на скидку. Право бывает и тогда, когда скидка на эту покупку вышла нулевой, — и
+    тогда предложение сгорает впустую. Это мина **BC**, живой пример соседа, который
+    так делать не надо: `app/handlers/menu.py:1814`. Легаси-пути гасят правильно
+    (`handlers/subscription/purchase.py:2634`, `.../tariff_purchase.py:1263`).
+
+    🔴 Звать ТОЛЬКО из блока, который исполняется один раз на заказ: повтор вебхука
+    провайдера не должен гасить второе предложение. Сегодня таких мест два, и оба
+    прикрыты уникальным `device_first_ledger_key` на денежной строке.
+
+    ⚠️ Лог пишем В ТОЙ ЖЕ сессии (`commit=False`), а не в отдельной, как это делает
+    сосед `subtract_user_balance` (`app/database/crud/user.py:780-800`). У соседа
+    деньги к этому моменту уже закоммичены, и отдельная сессия защищает его от
+    `MissingGreenlet`. Здесь коммита ещё не было: запись в отдельной сессии
+    пережила бы откат продажи и соврала бы, что скидка потрачена.
+    """
+    if applied_discount_kopeks <= 0:
+        return
+    try:
+        percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0)
+    except (TypeError, ValueError):
+        percent = 0
+    if percent <= 0:
+        return
+
+    source = getattr(user, 'promo_offer_discount_source', None)
+    try:
+        offer = await get_latest_claimed_offer_for_user(db, user.id, source)
+    except Exception as lookup_error:  # pragma: no cover - defensive logging
+        # Поиск предложения нужен только чтобы лог был подробнее. Продажу он не решает.
+        logger.warning(
+            'Failed to fetch claimed promo offer for device-first sale',
+            user_id=user.id,
+            checkout_id=checkout.id,
+            lookup_error=lookup_error,
+        )
+        offer = None
+
+    user.promo_offer_discount_percent = 0
+    user.promo_offer_discount_source = None
+    user.promo_offer_discount_expires_at = None
+
+    await log_promo_offer_action(
+        db,
+        user_id=user.id,
+        offer_id=offer.id if offer else None,
+        action='consumed',
+        source=source,
+        percent=percent,
+        effect_type=offer.effect_type if offer else None,
+        details={
+            'reason': 'device_first_checkout',
+            'checkout_public_id': checkout.public_id,
+            'discount_kopeks': applied_discount_kopeks,
+        },
+        commit=False,
+    )
+
+
 async def _complete_direct_sale_locked(
     db: AsyncSession,
     *,
@@ -2165,6 +2244,15 @@ async def _complete_direct_sale_locked(
         db.add(sale)
         await db.flush()
     user.has_had_paid_subscription = True
+    # Здесь живого пересчёта нет — цену заморозил снимок продажи, поэтому источник
+    # факта один: разбивка самого заказа. Она пишется один раз при создании
+    # (`price_breakdown=selected['breakdown']`) и больше нигде не переписывается.
+    await _consume_promo_offer_for_sale(
+        db,
+        user=user,
+        checkout=checkout,
+        applied_discount_kopeks=int((checkout.price_breakdown or {}).get('promo_offer_discount_kopeks') or 0),
+    )
     checkout.created_subscription_id = target.id
     checkout.debit_transaction_id = sale.id
     checkout.lifecycle_state = 'fulfilling'

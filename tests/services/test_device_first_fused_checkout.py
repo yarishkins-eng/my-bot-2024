@@ -154,7 +154,7 @@ async def test_access_point_policy_drift_forces_requote_before_any_funding_trans
     monkeypatch.setattr(
         service.pricing_engine,
         'calculate_tariff_purchase_price',
-        AsyncMock(return_value=SimpleNamespace(final_total=36_900)),
+        AsyncMock(return_value=SimpleNamespace(final_total=36_900, promo_offer_discount=0)),
     )
     monkeypatch.setattr(
         'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
