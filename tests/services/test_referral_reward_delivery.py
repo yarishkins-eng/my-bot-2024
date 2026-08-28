@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.database.models import TransactionType
 from app.services import device_first_checkout_service as service
 
 
