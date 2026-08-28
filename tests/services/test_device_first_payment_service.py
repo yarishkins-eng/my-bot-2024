@@ -2431,24 +2431,42 @@ async def test_late_paid_invoice_pays_the_referral_commission(monkeypatch):
     """Поздняя оплата закрытого счёта платит партнёру, как и любая другая (РФ-3).
 
     🔴 Мины U и BU: деньги на кошелёк ложились настоящие, а работа в очередь не заводилась —
-    партнёр получал ноль, при том что признак «оплатил» у покупателя поднимался. Транзакция
-    здесь строится конструктором напрямую, мимо `create_transaction`, поэтому кошельковый
-    движок эту оплату не видит вовсе.
+    партнёр получал ноль, при том что признак «оплатил» у покупателя поднимался.
 
-    Сторож смотрит на ИСХОДНИК, потому что путь достижим только через живого провайдера с
-    архивным счётом: собрать его фикстурой дороже, чем он того стоит, а без сторожа строку
-    снимут как непонятную.
+    🔴 Первая редакция этого сторожа искала ТЕКСТ в исходнике и переживала мутацию «обернуть
+    оба вызова в мёртвое условие»: строки остаются на месте, а код не исполняется. Нашло
+    ревью. Теперь сторож смотрит на разбор кода: вызовы обязаны быть достижимы, а не просто
+    присутствовать.
     """
+    import ast
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]
-    source = (root / 'app/services/device_first_payment_service.py').read_text(encoding='utf-8')
-    head, _, tail = source.partition("attempt.reconciliation_reason = 'late_paid_wallet_credit'")
-    assert tail, 'ветка поздней оплаты исчезла — сторож ослеп'
-    window = tail[:1600]
+    tree = ast.parse((root / 'app/services/device_first_payment_service.py').read_text(encoding='utf-8'))
 
-    assert 'ensure_deposit_outbox(' in window, 'поздняя оплата снова платит мимо очереди (мины U и BU)'
-    assert 'pay_referral=settings.is_referral_program_enabled()' in window, (
-        'выключатель обязан спрашиваться там, где обязательство ВОЗНИКАЕТ'
-    )
-    assert 'process_device_first_deposit_outbox(' in window, 'без побудки партнёр ждал бы до часового цикла'
+    late_calls: list[ast.Call] = []
+    for node in ast.walk(tree):
+        # Ищем присваивание причины поздней оплаты и берём его СОСЕДЕЙ по тому же блоку —
+        # так мутация «спрятать вызовы под `if False`» вынесет их из блока и сторож покраснеет.
+        if not isinstance(node, ast.If | ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        body = node.body
+        marks_late = any(
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value == 'late_paid_wallet_credit'
+            for stmt in body
+        )
+        if not marks_late:
+            continue
+        for stmt in body:
+            for inner in ast.walk(stmt):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name):
+                    late_calls.append(inner)
+
+    names = {call.func.id for call in late_calls}
+    assert 'ensure_deposit_outbox' in names, 'поздняя оплата снова платит мимо очереди — мины U и BU открыты'
+    assert 'process_device_first_deposit_outbox' in names, 'без побудки партнёр ждал бы до часового цикла'
+    outbox = next(call for call in late_calls if call.func.id == 'ensure_deposit_outbox')
+    kwargs = {kw.arg for kw in outbox.keywords}
+    assert 'pay_referral' in kwargs, 'выключатель обязан спрашиваться там, где обязательство ВОЗНИКАЕТ'

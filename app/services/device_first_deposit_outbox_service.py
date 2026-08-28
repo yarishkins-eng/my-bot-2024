@@ -649,6 +649,14 @@ async def plan_referral_debt(db: AsyncSession) -> list[dict]:
             {
                 'transaction_id': transaction_id,
                 'checkout_id': checkout_id,
+                # 🔴 Имена СТРОКАМИ, а не объектами сессии. Любой `db.rollback()` — а он стоит
+                # и в обработке столкновения окон, и внутри цикла выплаты — протухает весь кэш
+                # сессии, и синхронное чтение `.full_name` после него падает в async-контексте.
+                # Экран тогда не отрисовывается вовсе: деньги ушли, а владелец видит «не удалось
+                # выполнить действие». Тот же приём уже применён выше к приходу.
+                'buyer_name': buyer.full_name if buyer is not None else '',
+                'referrer_name': referrer.full_name if referrer is not None else '',
+                'referrer_id': referrer.id if referrer is not None else None,
                 'buyer': buyer,
                 'referrer': referrer,
                 'paid_kopeks': amount_kopeks,

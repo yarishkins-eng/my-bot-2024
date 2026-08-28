@@ -2218,9 +2218,24 @@ async def _settle_direct_platega_payment_locked(
                 transaction_id=transaction.id,
                 checkout_id=checkout.id,
                 pay_referral=settings.is_referral_program_enabled(),
+                # Деньги пришли по ПРЯМОМУ счёту, просто поздно. Без пометки будущий разбор
+                # «откуда пришли деньги» назвал бы их легаси-пополнением.
+                settlement_mode=DIRECT_SETTLEMENT_MODE,
             )
             await db.commit()
-            await process_device_first_deposit_outbox(db, transaction_id=transaction.id, limit=1)
+            try:
+                await process_device_first_deposit_outbox(db, transaction_id=transaction.id, limit=1)
+            except Exception as error:
+                # 🔴 Голый вызов отравлял бы сессию: у воркера есть свои `execute`/`commit`, а
+                # один из вызывающих — цикл сверки, который после этого продолжает итерации и
+                # падает на незакрытой транзакции. Соседний вызов на прямой продаже обёрнут
+                # ровно поэтому.
+                await db.rollback()
+                logger.warning(
+                    'device_first_late_credit_referral_wake_failed',
+                    checkout_id=checkout.public_id,
+                    error=str(error),
+                )
             logger.warning(
                 'device_first_late_archived_invoice_credited_to_wallet',
                 checkout_id=checkout.public_id,

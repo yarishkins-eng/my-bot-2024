@@ -1505,10 +1505,10 @@ def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
         '',
     ]
     for row in plan:
-        buyer = row['buyer'].full_name if row['buyer'] else f'покупатель по операции {row["transaction_id"]}'
+        buyer = row['buyer_name'] or f'покупатель по операции {row["transaction_id"]}'
         # id рядом с именем: у партнёра бывает две строки, а имена в Телеграме
         # повторяются — без номера владелец их не различит.
-        referrer = f'{row["referrer"].full_name} (id {row["referrer"].id})' if row['referrer'] else '—'
+        referrer = f'{row["referrer_name"]} (id {row["referrer_id"]})' if row['referrer_name'] else '—'
         when = row['paid_at'].strftime('%d.%m') if row.get('paid_at') else '—'
         lines.append(f'• {when} · {html.escape(buyer)} заплатил {_exact_money(row["paid_kopeks"])}')
         if row['problems']:
@@ -1530,25 +1530,40 @@ def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
             )
     lines.append('')
     lines.append(f'<b>Итого: {_exact_money(total_kopeks)}</b>')
+    # 🔴 Судим по СУММЕ В КНИГЕ против замороженного ожидания, а не по расчёту строк.
+    # Расчёт `to_referrer`/`to_friend` живёт только в ветке `if not problems`, а после выплаты
+    # проблема есть у каждой строки — значит оба ожидания нули, и сравнение с ними вырождается
+    # в «0 >= 0», то есть в вечное «долг закрыт». Ровно это внесла первая редакция починки,
+    # поймал критик полноты. Замороженная сумма от состояния строк не зависит.
+    credited_total = sum(row.get('credited_referrer', 0) + row.get('credited_friend', 0) for row in plan)
     paid_rows = [row for row in plan if row.get('credited_referrer') or row.get('credited_friend')]
-    if len(paid_rows) == len(plan) and plan:
+    if plan and credited_total >= REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
         # Не авария, а нормальная жизнь после выплаты: иначе экран навсегда остался бы
         # похожим на поломку и владелец пошёл бы «чинить» уже оплаченное.
-        # 🔴 Условие требует именно `done`. Раньше оно смотрело только на НАЛИЧИЕ работы и
-        # говорило «начислена» с момента её создания — то есть и тогда, когда все пять работ
-        # умерли в повторах и не заплатили ни копейки.
+        # 🔴 Условие смотрит в КНИГУ ОПЕРАЦИЙ и сравнивает с ожидаемым по каждому получателю.
+        # Раньше оно судило по статусу работы и говорило «начислена» с момента её создания —
+        # то есть и тогда, когда все пять работ умерли в повторах и не заплатили ни копейки.
         return (
             '🧾 <b>Долг по рефералке</b>\n\n'
             '✅ Долг закрыт: по всем пяти оплатам деньги начислены.\n\n'
             'Суммы видны в истории операций партнёров.'
         )
-    if any(row['problems'] and row['problems'][0].startswith('работа уже заведена') for row in plan):
-        return (
-            '🧾 <b>Долг по рефералке</b>\n\n'
-            f'⏳ Начислено строк: {len(paid_rows)} из {len(plan)}.\n\n'
-            'Остальные работы заведены — очередь доплатит сама. Откройте экран заново.'
-            'Она доплатит сама. Откройте экран через минуту-другую.'
-        )
+    # Работы заведены, а денег не хватает. Дальше важно, ЧТО с ними: работа в состоянии
+    # `done` не доплатит уже ничего — обратного перевода статуса в коде нет вовсе. Обещать
+    # «очередь доплатит» в этом случае значит отправить владельца открывать экран вечно.
+    queued = [row for row in plan if row['problems'] and row['problems'][0].startswith('работа уже заведена')]
+    if plan and len(queued) == len(plan):
+        still_working = [row for row in queued if not row['problems'][0].endswith('(done)')]
+        head = f'⏳ Начислено строк: {len(paid_rows)} из {len(plan)}, ' + _exact_money(credited_total)
+        if still_working:
+            tail = 'Очередь ещё работает — откройте экран через минуту-другую.'
+        else:
+            tail = (
+                '🔴 Очередь свою работу закончила, а денег меньше ожидаемого '
+                f'({_exact_money(REFERRAL_DEBT_2026_08_TOTAL_KOPEKS)}). Сама она уже НЕ доплатит: '
+                'вернуть работу в очередь нечем. Разбирать вручную.'
+            )
+        return '🧾 <b>Долг по рефералке</b>\n\n' + head + '\n\n' + tail
     if total_kopeks != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
         lines.append('')
         lines.append(
@@ -1645,10 +1660,10 @@ def _debt_result_text(rows: list[dict], *, paid: bool, reason: str) -> str:
         lines.append('')
         lines.append('<b>Начислено:</b>')
         for row in credited:
-            referrer = row['referrer'].full_name if row['referrer'] else '—'
+            referrer = row['referrer_name'] or '—'
             lines.append(f'• {html.escape(referrer)}: {_exact_money(row["credited_referrer"])}')
             if row['credited_friend']:
-                buyer = row['buyer'].full_name if row['buyer'] else 'новичку'
+                buyer = row['buyer_name'] or 'новичку'
                 lines.append(f'  • {html.escape(buyer)}: {_exact_money(row["credited_friend"])} бонус новичка')
         lines.append('')
         lines.append(f'<b>Всего: {_exact_money(total)}</b>')

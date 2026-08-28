@@ -795,13 +795,13 @@ def test_result_header_never_claims_paid_before_the_ledger_says_so():
     """
     from app.handlers.admin.referrals import _debt_result_text
 
-    empty = [{'credited_referrer': 0, 'credited_friend': 0, 'referrer': None, 'buyer': None}]
+    empty = [{'credited_referrer': 0, 'credited_friend': 0, 'referrer_name': '', 'buyer_name': ''}]
     paid = [
         {
             'credited_referrer': 59750,
             'credited_friend': 10000,
-            'referrer': SimpleNamespace(full_name='партнёр'),
-            'buyer': SimpleNamespace(full_name='новичок'),
+            'referrer_name': 'партнёр',
+            'buyer_name': 'новичок',
         }
     ]
 
@@ -811,40 +811,50 @@ def test_result_header_never_claims_paid_before_the_ledger_says_so():
     assert 'Выплата остановлена' in _debt_result_text(empty, paid=False, reason='причина')
 
 
-def test_debt_screen_calls_it_closed_only_when_the_ledger_agrees():
-    """Экран отвечает за ДЕНЬГИ, а не за статусы работ (РФ-3).
+def test_debt_screen_calls_it_closed_only_when_the_ledger_holds_the_full_sum():
+    """Экран отвечает за ДЕНЬГИ В КНИГЕ, а не за статусы работ (РФ-3).
 
-    🔴 Работа в состоянии `done` доказывает, что шаг отработал, но не то, что деньги
-    начислены: при пустом расчёте шаг честно закрывается, ничего не заплатив. Экран говорил
-    бы «долг закрыт» там, где партнёр не получил ни рубля, и владелец ушёл бы спокойным.
+    🔴 Две редакции этого сторожа подряд закрепляли неправду, обе нашло ревью.
+    Первая требовала «закрыт» при `credited_friend=0` — то есть «деньги хоть кому-то».
+    Вторая сравнивала с `to_referrer`/`to_friend`, а те считаются ТОЛЬКО в ветке без проблем:
+    после выплаты проблема есть у каждой строки, ожидания нули, и сравнение вырождалось в
+    «0 >= 0» — вечное «долг закрыт» даже при пустой книге.
 
-    Ветки различаются ровно наличием денег в книге — фикстуры дают разное.
+    Сравниваем с замороженной суммой: она от состояния строк не зависит.
     """
     from app.handlers.admin.referrals import _debt_screen_text
 
-    def _row(credited: int) -> dict:
+    def _row(*, credited: int, status: str = 'done') -> dict:
         return {
             'transaction_id': 193,
-            'buyer': SimpleNamespace(full_name='друг'),
-            'referrer': SimpleNamespace(full_name='партнёр', id=133),
+            'buyer_name': 'друг',
+            'referrer_name': 'партнёр',
+            'referrer_id': 133,
             'paid_kopeks': 199000,
             'paid_at': None,
             'commission_percent': 25,
-            'to_friend': 10000,
-            'to_referrer': 59750,
-            'problems': ['работа уже заведена (done)'],
+            # 🔴 Нули — то, что план РЕАЛЬНО отдаёт для строки с проблемой. Подставь сюда
+            # 10000/59750, как делала прошлая редакция, и сторож проверял бы вход, которого
+            # не бывает.
+            'to_friend': 0,
+            'to_referrer': 0,
+            'problems': [f'работа уже заведена ({status})'],
             'credited_referrer': credited,
             'credited_friend': 0,
         }
 
-    closed = _debt_screen_text([_row(59750)], 0)
-    assert 'Долг закрыт' in closed
-    assert 'деньги начислены' in closed
+    full = service.REFERRAL_DEBT_2026_08_TOTAL_KOPEKS
+    assert 'Долг закрыт' in _debt_screen_text([_row(credited=full)], 0)
 
-    # Работа выполнена, а денег нет — это НЕ «закрыт».
-    waiting = _debt_screen_text([_row(0)], 0)
-    assert 'Долг закрыт' not in waiting
-    assert 'Начислено строк: 0 из 1' in waiting
+    # 🔴 Работы закрыты, книга пуста — это НЕ «закрыт», и очередь уже НЕ доплатит.
+    empty = _debt_screen_text([_row(credited=0)], 0)
+    assert 'Долг закрыт' not in empty
+    assert 'НЕ доплатит' in empty
+
+    # Очередь ещё в работе — тут обещать доплату честно.
+    working = _debt_screen_text([_row(credited=0, status='pending')], 0)
+    assert 'Долг закрыт' not in working
+    assert 'ещё работает' in working
 
 
 @pytest.mark.asyncio
