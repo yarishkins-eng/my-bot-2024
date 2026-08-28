@@ -550,7 +550,7 @@ async def test_debt_payment_never_emits_wallet_topup_event(monkeypatch):
     monkeypatch.setattr(service, 'ensure_deposit_outbox', ensure)
     worker = AsyncMock(return_value=1)
     monkeypatch.setattr(service, 'process_device_first_deposit_outbox', worker)
-    monkeypatch.setattr(service, '_debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
+    monkeypatch.setattr(service, 'debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
     db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=AsyncMock(), expire_all=MagicMock())
 
     result = await service.pay_referral_debt(db)
@@ -594,7 +594,7 @@ async def test_debt_payment_commits_all_rows_once_before_draining(monkeypatch):
     monkeypatch.setattr(service, 'ensure_deposit_outbox', ensure)
     worker = AsyncMock(return_value=1)
     monkeypatch.setattr(service, 'process_device_first_deposit_outbox', worker)
-    monkeypatch.setattr(service, '_debt_credited_kopeks', AsyncMock(return_value={'friend': 0, 'referrer': 0}))
+    monkeypatch.setattr(service, 'debt_credited_kopeks', AsyncMock(return_value={'friend': 0, 'referrer': 0}))
     commit = AsyncMock()
     db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=commit, expire_all=MagicMock())
 
@@ -631,7 +631,7 @@ async def test_debt_payment_survives_a_failing_row_and_keeps_going(monkeypatch):
     monkeypatch.setattr(service, 'ensure_deposit_outbox', AsyncMock())
     worker = AsyncMock(side_effect=[RuntimeError('обрыв'), 1])
     monkeypatch.setattr(service, 'process_device_first_deposit_outbox', worker)
-    monkeypatch.setattr(service, '_debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
+    monkeypatch.setattr(service, 'debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
     db = SimpleNamespace(
         execute=AsyncMock(return_value=Result(None)),
         commit=AsyncMock(),
@@ -768,7 +768,7 @@ async def test_credited_split_keeps_friend_bonus_off_the_partner():
     ]
     db = SimpleNamespace(execute=AsyncMock(return_value=Result(values=ledger)))
 
-    credited = await service._debt_credited_kopeks(db, transaction_id=193)
+    credited = await service.debt_credited_kopeks(db, transaction_id=193)
 
     assert credited == {'friend': 10000, 'referrer': 59750}
 
@@ -779,7 +779,7 @@ async def test_credited_split_counts_recurring_commission_as_partner_money():
     ledger = [('deposit-side-effect:237:inviter-recurring-commission', 9225)]
     db = SimpleNamespace(execute=AsyncMock(return_value=Result(values=ledger)))
 
-    credited = await service._debt_credited_kopeks(db, transaction_id=237)
+    credited = await service.debt_credited_kopeks(db, transaction_id=237)
 
     assert credited == {'friend': 0, 'referrer': 9225}
 
@@ -809,3 +809,79 @@ def test_result_header_never_claims_paid_before_the_ledger_says_so():
     assert 'Долг выплачен' not in _debt_result_text(empty, paid=True, reason='')
     assert 'Долг выплачен' in _debt_result_text(paid, paid=True, reason='')
     assert 'Выплата остановлена' in _debt_result_text(empty, paid=False, reason='причина')
+
+
+def test_debt_screen_calls_it_closed_only_when_the_ledger_agrees():
+    """Экран отвечает за ДЕНЬГИ, а не за статусы работ (РФ-3).
+
+    🔴 Работа в состоянии `done` доказывает, что шаг отработал, но не то, что деньги
+    начислены: при пустом расчёте шаг честно закрывается, ничего не заплатив. Экран говорил
+    бы «долг закрыт» там, где партнёр не получил ни рубля, и владелец ушёл бы спокойным.
+
+    Ветки различаются ровно наличием денег в книге — фикстуры дают разное.
+    """
+    from app.handlers.admin.referrals import _debt_screen_text
+
+    def _row(credited: int) -> dict:
+        return {
+            'transaction_id': 193,
+            'buyer': SimpleNamespace(full_name='друг'),
+            'referrer': SimpleNamespace(full_name='партнёр', id=133),
+            'paid_kopeks': 199000,
+            'paid_at': None,
+            'commission_percent': 25,
+            'to_friend': 10000,
+            'to_referrer': 59750,
+            'problems': ['работа уже заведена (done)'],
+            'credited_referrer': credited,
+            'credited_friend': 0,
+        }
+
+    closed = _debt_screen_text([_row(59750)], 0)
+    assert 'Долг закрыт' in closed
+    assert 'деньги начислены' in closed
+
+    # Работа выполнена, а денег нет — это НЕ «закрыт».
+    waiting = _debt_screen_text([_row(0)], 0)
+    assert 'Долг закрыт' not in waiting
+    assert 'Начислено строк: 0 из 1' in waiting
+
+
+@pytest.mark.asyncio
+async def test_concurrent_press_reports_what_the_neighbour_already_paid(monkeypatch):
+    """Второе окно не врёт «деньги не тронуты» про уже выплаченное (РФ-3).
+
+    🔴 Раньше при столкновении возвращался пустой список, и экран печатал «ни одна строка не
+    оплачена». Соседнее окно к этой секунде уже могло закоммитить пакет — владелец пошёл бы
+    платить второй раз, а отзыва реферальных начислений в проекте нет.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    monkeypatch.setattr(type(service.settings), 'is_referral_program_enabled', lambda self: True)
+    rows = [
+        {
+            'transaction_id': 193,
+            'checkout_id': 14,
+            'buyer': None,
+            'referrer': None,
+            'paid_kopeks': 199000,
+            'commission_percent': 25,
+            'to_friend': 10000,
+            'to_referrer': 59750,
+            'problems': [],
+        }
+    ]
+    monkeypatch.setattr(service, 'plan_referral_debt', AsyncMock(return_value=rows))
+    monkeypatch.setattr(service, 'REFERRAL_DEBT_2026_08_TOTAL_KOPEKS', 69750)
+    monkeypatch.setattr(service, 'ensure_deposit_outbox', AsyncMock(side_effect=IntegrityError('x', 'y', Exception())))
+    # Сосед уже заплатил — книга это знает.
+    monkeypatch.setattr(service, 'debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=AsyncMock(), rollback=AsyncMock())
+
+    result = await service.pay_referral_debt(db)
+
+    assert result['paid'] is False
+    assert 'соседнем окне' in result['reason']
+    # 🔴 Главное: отчёт НЕ пустой — он показывает фактически начисленное.
+    assert result['rows'][0]['credited_referrer'] == 59750
+    assert result['rows'][0]['credited_friend'] == 10000

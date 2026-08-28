@@ -19,6 +19,7 @@ from app.database.models import ReferralEarning, User, WithdrawalRequest, Withdr
 from app.localization.texts import get_texts
 from app.services.device_first_deposit_outbox_service import (
     REFERRAL_DEBT_2026_08_TOTAL_KOPEKS,
+    debt_credited_kopeks,
     pay_referral_debt,
     plan_referral_debt,
 )
@@ -1529,7 +1530,8 @@ def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
             )
     lines.append('')
     lines.append(f'<b>Итого: {_exact_money(total_kopeks)}</b>')
-    if all(row['problems'] and row['problems'][0] == 'работа уже заведена (done)' for row in plan):
+    paid_rows = [row for row in plan if row.get('credited_referrer') or row.get('credited_friend')]
+    if len(paid_rows) == len(plan) and plan:
         # Не авария, а нормальная жизнь после выплаты: иначе экран навсегда остался бы
         # похожим на поломку и владелец пошёл бы «чинить» уже оплаченное.
         # 🔴 Условие требует именно `done`. Раньше оно смотрело только на НАЛИЧИЕ работы и
@@ -1537,13 +1539,14 @@ def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
         # умерли в повторах и не заплатили ни копейки.
         return (
             '🧾 <b>Долг по рефералке</b>\n\n'
-            '✅ Долг закрыт: по всем пяти оплатам работа очереди выполнена.\n\n'
+            '✅ Долг закрыт: по всем пяти оплатам деньги начислены.\n\n'
             'Суммы видны в истории операций партнёров.'
         )
-    if all(row['problems'] and row['problems'][0].startswith('работа уже заведена') for row in plan):
+    if any(row['problems'] and row['problems'][0].startswith('работа уже заведена') for row in plan):
         return (
             '🧾 <b>Долг по рефералке</b>\n\n'
-            '⏳ Работы заведены, но очередь ещё не довела их до конца.\n\n'
+            f'⏳ Начислено строк: {len(paid_rows)} из {len(plan)}.\n\n'
+            'Остальные работы заведены — очередь доплатит сама. Откройте экран заново.'
             'Она доплатит сама. Откройте экран через минуту-другую.'
         )
     if total_kopeks != REFERRAL_DEBT_2026_08_TOTAL_KOPEKS:
@@ -1560,6 +1563,14 @@ def _debt_screen_text(plan: list[dict], total_kopeks: int) -> str:
 async def show_referral_debt(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Экран расчёта долга. Ничего не записывает."""
     plan = await plan_referral_debt(db)
+    # 🔴 РФ-3: судим по КНИГЕ ОПЕРАЦИЙ, а не по статусам работ. Работа в состоянии `done`
+    # доказывает, что шаг отработал, но не то, что деньги начислены: при пустом расчёте
+    # шаг честно закрывается, ничего не заплатив. Экран говорил бы «долг закрыт» там,
+    # где партнёр не получил ни рубля.
+    for row in plan:
+        credited = await debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+        row['credited_referrer'] = credited['referrer']
+        row['credited_friend'] = credited['friend']
     total = sum(row['to_friend'] + row['to_referrer'] for row in plan)
     payable = total == REFERRAL_DEBT_2026_08_TOTAL_KOPEKS and not any(row['problems'] for row in plan)
 

@@ -549,7 +549,7 @@ REFERRAL_DEBT_2026_08_TOTAL_KOPEKS = 234925
 _DEBT_LEDGER_SUFFIXES = ('referred-first-bonus', 'inviter-first-reward', 'inviter-recurring-commission')
 
 
-async def _debt_credited_kopeks(db: AsyncSession, *, transaction_id: int) -> dict[str, int]:
+async def debt_credited_kopeks(db: AsyncSession, *, transaction_id: int) -> dict[str, int]:
     """Сколько начислено по этому приходу — по КНИГЕ, врозь получателям.
 
     Возврат воркера читать нельзя: работу мог перехватить фоновый цикл, и тогда
@@ -701,7 +701,7 @@ async def pay_referral_debt(db: AsyncSession) -> dict:
         # Поэтому по каждой строке читаем книгу и отдаём фактически начисленное.
         checked = []
         for row in plan:
-            credited = await _debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+            credited = await debt_credited_kopeks(db, transaction_id=row['transaction_id'])
             checked.append({**row, 'credited_friend': credited['friend'], 'credited_referrer': credited['referrer']})
         return {
             'paid': False,
@@ -726,7 +726,14 @@ async def pay_referral_debt(db: AsyncSession) -> dict:
         # ошибкой, а сказать по-человечески. Своих записей после отката не остаётся.
         await db.rollback()
         logger.warning('Доплата долга столкнулась со второй попыткой, откатились')
-        return {'paid': False, 'reason': 'выплата уже запущена в соседнем окне', 'rows': []}
+        # 🔴 РФ-3: пустой список означал бы «деньги не тронуты» — а соседнее окно к этой
+        # секунде уже могло закоммитить пакет и начать начисления. Читаем книгу и отдаём
+        # ФАКТ: экран скажет, сколько реально ушло, а не удобную неправду.
+        checked = []
+        for row in plan:
+            credited = await debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+            checked.append({**row, 'credited_friend': credited['friend'], 'credited_referrer': credited['referrer']})
+        return {'paid': False, 'reason': 'выплата уже запущена в соседнем окне', 'rows': checked}
 
     for row in plan:
         try:
@@ -742,6 +749,6 @@ async def pay_referral_debt(db: AsyncSession) -> dict:
 
     done = []
     for row in plan:
-        credited = await _debt_credited_kopeks(db, transaction_id=row['transaction_id'])
+        credited = await debt_credited_kopeks(db, transaction_id=row['transaction_id'])
         done.append({**row, 'credited_friend': credited['friend'], 'credited_referrer': credited['referrer']})
     return {'paid': True, 'reason': '', 'rows': done}
