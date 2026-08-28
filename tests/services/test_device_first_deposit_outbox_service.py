@@ -865,12 +865,16 @@ def test_debt_screen_calls_it_closed_only_when_the_ledger_holds_the_full_sum():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_press_reports_what_the_neighbour_already_paid(monkeypatch):
-    """Второе окно не врёт «деньги не тронуты» про уже выплаченное (РФ-3).
+async def test_concurrent_press_says_the_payment_is_running_not_that_money_is_untouched(monkeypatch):
+    """Второе окно не говорит про деньги ни в какую сторону (РФ-3).
 
-    🔴 Раньше при столкновении возвращался пустой список, и экран печатал «ни одна строка не
-    оплачена». Соседнее окно к этой секунде уже могло закоммитить пакет — владелец пошёл бы
-    платить второй раз, а отзыва реферальных начислений в проекте нет.
+    🔴 Три редакции подряд. Первая возвращала пустой список — экран печатал «ни одна строка
+    не оплачена, деньги не тронуты» про пакет, который сосед только что закоммитил. Вторая
+    читала книгу — и это оказалось бесполезно: блокировка с нашей вставки снимается ровно на
+    `COMMIT` соседа, то есть работы уже есть, а начислений ещё нет, книга даёт нули, и экран
+    печатает ту же неправду. Нашёл прогон сценария.
+
+    Теперь отдаём признак «выплата идёт» — он верен независимо от состояния книги.
     """
     from sqlalchemy.exc import IntegrityError
 
@@ -879,6 +883,9 @@ async def test_concurrent_press_reports_what_the_neighbour_already_paid(monkeypa
         {
             'transaction_id': 193,
             'checkout_id': 14,
+            'buyer_name': 'друг',
+            'referrer_name': 'партнёр',
+            'referrer_id': 133,
             'buyer': None,
             'referrer': None,
             'paid_kopeks': 199000,
@@ -891,14 +898,19 @@ async def test_concurrent_press_reports_what_the_neighbour_already_paid(monkeypa
     monkeypatch.setattr(service, 'plan_referral_debt', AsyncMock(return_value=rows))
     monkeypatch.setattr(service, 'REFERRAL_DEBT_2026_08_TOTAL_KOPEKS', 69750)
     monkeypatch.setattr(service, 'ensure_deposit_outbox', AsyncMock(side_effect=IntegrityError('x', 'y', Exception())))
-    # Сосед уже заплатил — книга это знает.
-    monkeypatch.setattr(service, 'debt_credited_kopeks', AsyncMock(return_value={'friend': 10000, 'referrer': 59750}))
+    ledger = AsyncMock(return_value={'friend': 0, 'referrer': 0})
+    monkeypatch.setattr(service, 'debt_credited_kopeks', ledger)
     db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)), commit=AsyncMock(), rollback=AsyncMock())
 
     result = await service.pay_referral_debt(db)
 
     assert result['paid'] is False
-    assert 'соседнем окне' in result['reason']
-    # 🔴 Главное: отчёт НЕ пустой — он показывает фактически начисленное.
-    assert result['rows'][0]['credited_referrer'] == 59750
-    assert result['rows'][0]['credited_friend'] == 10000
+    assert result['running'] is True, 'экран обязан узнать, что выплата идёт, а не гадать по книге'
+    # 🔴 Книгу здесь не читаем вовсе: она в этот момент отвечает нулями и вводит в заблуждение.
+    ledger.assert_not_awaited()
+
+    from app.handlers.admin.referrals import _debt_result_text
+
+    text = _debt_result_text(result['rows'], paid=False, reason=result['reason'], running=True)
+    assert 'уже идёт' in text
+    assert 'деньги не тронуты' not in text.lower()
