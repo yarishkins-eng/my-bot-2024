@@ -12,6 +12,7 @@ from app.cabinet.routes import admin_broadcasts as cabinet_routes
 from app.cabinet.schemas.broadcasts import (
     BroadcastCreateRequest as CabinetBroadcastCreateRequest,
     BroadcastMediaRequest as CabinetBroadcastMediaRequest,
+    BroadcastPreviewRequest,
     CombinedBroadcastCreateRequest,
 )
 from app.handlers.admin import messages as admin_messages
@@ -283,6 +284,7 @@ async def test_service_sends_canonical_text_and_effective_media_caption() -> Non
         'text': _SAFE_TEXT,
         'parse_mode': 'HTML',
         'reply_markup': keyboard,
+        'disable_web_page_preview': True,
     }
 
     bot.reset_mock()
@@ -304,6 +306,30 @@ async def test_service_sends_canonical_text_and_effective_media_caption() -> Non
         media=BroadcastMediaConfig(type='photo', file_id='photo-id', caption='   '),
     )
     assert fallback_config.media.caption == _SAFE_TEXT
+
+
+@pytest.mark.asyncio
+async def test_cabinet_preview_uses_same_canonical_text_and_caption_split_as_delivery(monkeypatch) -> None:
+    raw = '<Premium>скрытые скобки</Premium> <a href="https://пример.рф">ссылка</a>'
+    canonical = 'скрытые скобки ссылка'
+    monkeypatch.setattr(cabinet_routes, '_resolve_cabinet_telegram_recipients', AsyncMock(return_value=[123]))
+
+    response = await cabinet_routes.preview_broadcast(
+        BroadcastPreviewRequest(target='all', message_text=raw, has_media=True),
+        admin=SimpleNamespace(id=7),
+        db=_RecordingSession(),
+    )
+
+    assert response.count == 1
+    assert response.rendered_message_text == canonical
+    assert response.media_caption_separate is False
+
+    long_response = await cabinet_routes.preview_broadcast(
+        BroadcastPreviewRequest(target='all', message_text='я' * 1025, has_media=True),
+        admin=SimpleNamespace(id=7),
+        db=_RecordingSession(),
+    )
+    assert long_response.media_caption_separate is True
 
 
 @pytest.mark.asyncio
@@ -332,6 +358,7 @@ async def test_media_caption_boundary_is_measured_after_html_parsing(
     else:
         assert 'caption' not in bot.send_photo.await_args.kwargs
         assert bot.send_message.await_args.kwargs['text'] == raw
+        assert bot.send_message.await_args.kwargs['disable_web_page_preview'] is True
 
 
 @pytest.mark.asyncio

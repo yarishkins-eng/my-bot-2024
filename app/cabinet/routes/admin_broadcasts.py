@@ -19,6 +19,7 @@ from app.services.broadcast_service import (
     resolve_email_broadcast_recipients,
     resolve_telegram_broadcast_recipient_ids,
 )
+from app.utils.message_patch import caption_exceeds_telegram_limit
 from app.utils.telegram_html import prepare_telegram_broadcast
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -454,7 +455,21 @@ async def preview_broadcast(
             detail='Failed to count recipients',
         )
 
-    return BroadcastPreviewResponse(target=request.target, count=count)
+    rendered_message_text = None
+    media_caption_separate = False
+    if request.message_text is not None:
+        try:
+            rendered_message_text = prepare_telegram_broadcast(request.message_text)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        media_caption_separate = request.has_media and caption_exceeds_telegram_limit(rendered_message_text)
+
+    return BroadcastPreviewResponse(
+        target=request.target,
+        count=count,
+        rendered_message_text=rendered_message_text,
+        media_caption_separate=media_caption_separate,
+    )
 
 
 @router.post('', response_model=BroadcastResponse, status_code=status.HTTP_201_CREATED)

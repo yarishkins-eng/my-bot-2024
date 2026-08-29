@@ -175,6 +175,8 @@ class BroadcastPreviewRequest(BaseModel):
 
     target: str
     category: str = Field(default='system', pattern='^(system|news|promo)$')
+    message_text: str | None = Field(default=None, max_length=4000)
+    has_media: bool = False
 
 
 class BroadcastPreviewResponse(BaseModel):
@@ -182,6 +184,8 @@ class BroadcastPreviewResponse(BaseModel):
 
     target: str
     count: int
+    rendered_message_text: str | None = None
+    media_caption_separate: bool = False
 
 
 # ============ Email Filters ============

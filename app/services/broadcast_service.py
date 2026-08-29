@@ -651,6 +651,7 @@ class BroadcastService:
                     text=caption,
                     parse_mode='HTML',
                     reply_markup=keyboard,
+                    disable_web_page_preview=True,
                 )
                 return
 
@@ -668,6 +669,7 @@ class BroadcastService:
             text=config.message_text,
             parse_mode='HTML',
             reply_markup=keyboard,
+            disable_web_page_preview=True,
         )
 
     async def _mark_finished(
