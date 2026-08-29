@@ -160,7 +160,8 @@ def test_finished_status_keeps_partial_and_completed() -> None:
 
 def test_finished_status_blocked_only_is_not_failure() -> None:
     """Заблокировавшие бота — недостижимая аудитория, а не провал кампании."""
-    assert _finished_status(sent_count=0, failed_count=0, blocked_count=6) == 'partial'
+    assert _finished_status(sent_count=0, failed_count=0, blocked_count=6) == 'completed'
+    assert _finished_status(sent_count=12, failed_count=0, blocked_count=6) == 'completed'
 
 
 def test_finished_status_default_blocked_count_is_zero() -> None:

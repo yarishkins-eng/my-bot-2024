@@ -65,7 +65,7 @@ def _finished_status(sent_count: int, failed_count: int, blocked_count: int = 0)
     ⛔ Заблокировавшие бота считаются отдельно и провалом НЕ являются: кампания отработала,
     просто аудитория недостижима. Иначе рассылка по давно неактивным помечалась бы ошибкой.
     """
-    if failed_count == 0 and blocked_count == 0:
+    if failed_count == 0:
         return 'completed'
     if sent_count == 0 and failed_count > 0:
         return 'failed'
@@ -454,7 +454,7 @@ class BroadcastService:
         last_progress_count: int = 0
 
         async def send_single(telegram_id: int) -> str:
-            """Returns 'sent', 'blocked', or 'failed'."""
+            """Returns 'sent', 'blocked', 'failed', or 'cancelled'."""
             nonlocal flood_wait_until
 
             # Мина GA: что уже доставлено ЭТОМУ человеку, чтобы повтор не слал медиа заново.
@@ -468,7 +468,9 @@ class BroadcastService:
                     await asyncio.sleep(flood_wait_until - now)
 
                 if cancel_event.is_set():
-                    return 'failed'
+                    # РС-12: адресат, которого не начинали обрабатывать после нажатия
+                    # «Стоп», не является ошибкой доставки.
+                    return 'cancelled'
 
                 try:
                     await self._deliver_message(telegram_id, config, keyboard, delivery_state)
@@ -553,7 +555,7 @@ class BroadcastService:
                     elif result == 'blocked':
                         blocked_count += 1
                         blocked_telegram_ids.append(batch[idx])
-                    else:
+                    elif result == 'failed':
                         failed_count += 1
                 elif isinstance(result, Exception):
                     failed_count += 1
@@ -569,6 +571,15 @@ class BroadcastService:
                 await self._update_progress(broadcast_id, sent_count, failed_count, blocked_count)
                 last_progress_count = processed
                 last_progress_update = now
+
+            if cancel_event.is_set():
+                if processed >= len(recipient_ids):
+                    # Stop arrived while the last in-flight deliveries were
+                    # completing. Nobody was skipped, so preserve the honest
+                    # delivery outcome instead of calling it cancelled.
+                    return sent_count, failed_count, blocked_count, False
+                await self._mark_cancelled(broadcast_id, sent_count, failed_count, blocked_count)
+                return sent_count, failed_count, blocked_count, True
 
             # Задержка между батчами для rate limiting
             await asyncio.sleep(_TG_BATCH_DELAY)

@@ -396,3 +396,126 @@ async def test_broadcast_worker_error_logs_never_include_raw_telegram_id(
     assert records
     assert all('telegram_id' not in record for record in records)
     assert str(_TELEGRAM_ID) not in str(records)
+
+
+@pytest.mark.asyncio
+async def test_stop_during_batch_does_not_count_untouched_recipients_as_failures(monkeypatch) -> None:
+    """РС-12: после stop нетронутые адресаты не становятся ошибками."""
+    service = BroadcastService()
+    service.set_bot(AsyncMock())
+    cancel_event = asyncio.Event()
+
+    async def deliver_once_then_stop(*_args, **_kwargs) -> None:
+        cancel_event.set()
+
+    monkeypatch.setattr(service, '_deliver_message', deliver_once_then_stop)
+    monkeypatch.setattr(service, '_update_progress', AsyncMock())
+    mark_cancelled = AsyncMock()
+    monkeypatch.setattr(service, '_mark_cancelled', mark_cancelled)
+    monkeypatch.setattr(broadcast_module.asyncio, 'sleep', AsyncMock())
+
+    sent, failed, blocked, cancelled = await service._send_batched(
+        501,
+        [1001, 1002, 1003],
+        BroadcastConfig(target='all', message_text='Controlled', selected_buttons=[]),
+        None,
+        cancel_event,
+    )
+
+    assert (sent, failed, blocked, cancelled) == (1, 0, 0, True)
+    mark_cancelled.assert_awaited_once_with(501, 1, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_stop_after_last_delivery_preserves_delivery_outcome(monkeypatch) -> None:
+    """A stop racing with the final success skipped nobody and is not cancellation."""
+    service = BroadcastService()
+    service.set_bot(AsyncMock())
+    cancel_event = asyncio.Event()
+
+    async def deliver_then_stop(*_args, **_kwargs) -> None:
+        cancel_event.set()
+
+    monkeypatch.setattr(service, '_deliver_message', deliver_then_stop)
+    monkeypatch.setattr(service, '_update_progress', AsyncMock())
+    mark_cancelled = AsyncMock()
+    monkeypatch.setattr(service, '_mark_cancelled', mark_cancelled)
+    monkeypatch.setattr(broadcast_module.asyncio, 'sleep', AsyncMock())
+
+    result = await service._send_batched(
+        501,
+        [1001],
+        BroadcastConfig(target='all', message_text='Controlled', selected_buttons=[]),
+        None,
+        cancel_event,
+    )
+
+    assert result == (1, 0, 0, False)
+    mark_cancelled.assert_not_awaited()
+
+
+def test_history_target_labels_hide_internal_filter_keys() -> None:
+    assert broadcast_routes._broadcast_target_label('self') == 'Тест: только мне'
+    assert broadcast_routes._broadcast_target_label('custom_week') == 'Регистрация за неделю'
+    assert broadcast_routes._broadcast_target_label('active_email').startswith('Есть подписка')
+    assert broadcast_routes._broadcast_target_label('tariff_17') == 'Тариф #17'
+    assert broadcast_routes._broadcast_target_label('tariff_17', {17: 'Премиум'}) == 'Тариф «Премиум»'
+    assert broadcast_routes._broadcast_target_label('crafted_unknown') == 'Неизвестная аудитория'
+
+
+@pytest.mark.asyncio
+async def test_stop_refresh_preserves_worker_terminal_status(monkeypatch) -> None:
+    """Worker completion between stop request and commit cannot stick at cancelling."""
+    broadcast = SimpleNamespace(
+        id=501,
+        status='in_progress',
+        channel='telegram',
+        target_type='all',
+        message_text='Controlled',
+        has_media=False,
+        media_type=None,
+        media_file_id=None,
+        media_caption=None,
+        total_count=3,
+        sent_count=3,
+        failed_count=0,
+        blocked_count=0,
+        admin_id=_ACTOR_ID,
+        admin_name='owner',
+        created_at=datetime(2026, 8, 29, 10, 0, tzinfo=UTC),
+        completed_at=None,
+        category='system',
+        email_subject=None,
+        email_html_content=None,
+    )
+
+    class RaceSession:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def get(self, _model, _id):
+            return broadcast
+
+        async def execute(self, statement):
+            self.statements.append(str(statement))
+            # The worker wins immediately before the conditional UPDATE.
+            broadcast.status = 'completed'
+            broadcast.completed_at = datetime(2026, 8, 29, 10, 1, tzinfo=UTC)
+            return SimpleNamespace(rowcount=0)
+
+        async def refresh(self, _value) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+    request_stop = AsyncMock(return_value=True)
+    monkeypatch.setattr(broadcast_routes.broadcast_service, 'request_stop', request_stop)
+    session = RaceSession()
+
+    response = await broadcast_routes.stop_broadcast(501, admin=_admin(), db=session)
+
+    assert response.status == 'completed'
+    assert broadcast.status == 'completed'
+    assert 'broadcast_history.status IN' in session.statements[0]
+    request_stop.assert_not_awaited()

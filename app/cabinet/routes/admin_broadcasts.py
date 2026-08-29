@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import BroadcastHistory, Tariff, User
@@ -138,7 +138,27 @@ EMAIL_FILTER_GROUPS = {
 # ============ Helper Functions ============
 
 
-def _serialize_broadcast(broadcast: BroadcastHistory) -> BroadcastResponse:
+def _broadcast_target_label(target: str, tariff_labels: dict[int, str] | None = None) -> str:
+    """Return a stable human label for history, never an internal filter key."""
+    if target in FILTER_LABELS:
+        return FILTER_LABELS[target]
+    if target in CUSTOM_FILTER_LABELS:
+        return CUSTOM_FILTER_LABELS[target]
+    if target in EMAIL_FILTER_LABELS:
+        return EMAIL_FILTER_LABELS[target]
+    if target.startswith('tariff_'):
+        tariff_id = target.removeprefix('tariff_')
+        if tariff_id.isdigit():
+            if tariff_labels and int(tariff_id) in tariff_labels:
+                return f'Тариф «{tariff_labels[int(tariff_id)]}»'
+            return f'Тариф #{tariff_id}'
+    return 'Неизвестная аудитория'
+
+
+def _serialize_broadcast(
+    broadcast: BroadcastHistory,
+    tariff_labels: dict[int, str] | None = None,
+) -> BroadcastResponse:
     """Serialize broadcast to response model."""
     blocked = broadcast.blocked_count or 0
     progress = 0.0
@@ -148,6 +168,7 @@ def _serialize_broadcast(broadcast: BroadcastHistory) -> BroadcastResponse:
     return BroadcastResponse(
         id=broadcast.id,
         target_type=broadcast.target_type,
+        target_label=_broadcast_target_label(broadcast.target_type, tariff_labels),
         message_text=broadcast.message_text,
         has_media=broadcast.has_media,
         media_type=broadcast.media_type,
@@ -173,6 +194,21 @@ def _serialize_broadcast(broadcast: BroadcastHistory) -> BroadcastResponse:
 async def _get_email_filter_count(db: AsyncSession, target: str, category: str = 'system') -> int:
     """Count the same unique email recipients the worker will materialize."""
     return len(await resolve_email_broadcast_recipients(db, target, category))
+
+
+async def _history_tariff_labels(
+    db: AsyncSession,
+    broadcasts: list[BroadcastHistory],
+) -> dict[int, str]:
+    tariff_ids = {
+        int(item.target_type.removeprefix('tariff_'))
+        for item in broadcasts
+        if item.target_type.startswith('tariff_') and item.target_type.removeprefix('tariff_').isdigit()
+    }
+    if not tariff_ids:
+        return {}
+    result = await db.execute(select(Tariff.id, Tariff.name).where(Tariff.id.in_(tariff_ids)))
+    return {tariff_id: name for tariff_id, name in result.all()}
 
 
 def _validate_email_target(target: str) -> bool:
@@ -529,9 +565,10 @@ async def list_broadcasts(
         select(BroadcastHistory).order_by(BroadcastHistory.created_at.desc()).offset(offset).limit(limit)
     )
     broadcasts = result.scalars().all()
+    tariff_labels = await _history_tariff_labels(db, broadcasts)
 
     return BroadcastListResponse(
-        items=[_serialize_broadcast(b) for b in broadcasts],
+        items=[_serialize_broadcast(b, tariff_labels) for b in broadcasts],
         total=int(total),
         limit=limit,
         offset=offset,
@@ -768,7 +805,8 @@ async def get_broadcast(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Broadcast not found',
         )
-    return _serialize_broadcast(broadcast)
+    tariff_labels = await _history_tariff_labels(db, [broadcast])
+    return _serialize_broadcast(broadcast, tariff_labels)
 
 
 @router.post('/{broadcast_id}/stop', response_model=BroadcastResponse)
@@ -791,6 +829,20 @@ async def stop_broadcast(
             detail='Broadcast is not running',
         )
 
+    # Compare-and-set active -> cancelling before touching the worker. A terminal
+    # worker write can now win before OR after this atomic statement, but can
+    # never be overwritten by a stale ORM object from this request.
+    active_statuses = {'queued', 'in_progress', 'cancelling'}
+    await db.execute(
+        update(BroadcastHistory)
+        .where(BroadcastHistory.id == broadcast_id, BroadcastHistory.status.in_(active_statuses))
+        .values(status='cancelling')
+    )
+    await db.commit()
+    await db.refresh(broadcast)
+    if broadcast.status not in active_statuses:
+        return _serialize_broadcast(broadcast)
+
     # Try to stop both telegram and email broadcasts (one or both may be running)
     channel = getattr(broadcast, 'channel', 'telegram') or 'telegram'
 
@@ -801,13 +853,13 @@ async def stop_broadcast(
     if channel in ('email', 'both'):
         is_running = await email_broadcast_service.request_stop(broadcast_id) or is_running
 
-    if is_running:
-        broadcast.status = 'cancelling'
-    else:
-        broadcast.status = 'cancelled'
-        broadcast.completed_at = datetime.now(UTC)
-
-    await db.commit()
+    if not is_running:
+        await db.execute(
+            update(BroadcastHistory)
+            .where(BroadcastHistory.id == broadcast_id, BroadcastHistory.status.in_(active_statuses))
+            .values(status='cancelled', completed_at=datetime.now(UTC))
+        )
+        await db.commit()
     await db.refresh(broadcast)
 
     logger.info('Admin stopped broadcast', admin_id=admin.id, broadcast_id=broadcast_id)

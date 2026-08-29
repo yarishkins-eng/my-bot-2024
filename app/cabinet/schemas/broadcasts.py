@@ -129,6 +129,7 @@ class BroadcastResponse(BaseModel):
 
     id: int
     target_type: str
+    target_label: str
     message_text: str | None = None
     has_media: bool
     media_type: str | None = None
