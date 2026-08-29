@@ -217,25 +217,71 @@ async def test_a_stale_button_never_refunds_a_moved_on_order():
 
 
 @pytest.mark.asyncio
-async def test_refund_credits_the_balance_and_notifies_without_paying_commission(monkeypatch):
-    """🔴 Мина U — уведомление через аутбокс. И 🔴 P1 ревью — комиссия с ВОЗВРАТА не платится."""
+async def test_refund_credits_the_balance_and_pays_the_partner_like_any_other_top_up(monkeypatch):
+    """🔴 Мина U — уведомление через аутбокс. И 🔴 РФ-4 — комиссия партнёру ПЛАТИТСЯ.
+
+    ⛔ СТОРОЖ ПЕРЕПИСАН 29.08.2026, а не подкручен. Раньше он назывался
+    `..._without_paying_commission` и закреплял обратное — что с «возврата» комиссия не
+    платится. Утверждение опровергнуто замером на боевом: все 61 выплата за историю проекта
+    привязаны к деньгам НА БАЛАНСЕ (`referral_first_topup`, `referral_commission_topup`,
+    `referral_registration_pending`), за покупку подписки не платилось ни разу. Этот путь
+    кладёт деньги на баланс ровно так же, как поздний платёж пути А, — и был единственным
+    местом, выпадавшим из правила.
+
+    🔴 Улика, отличающая правку от совпадения: проверяем не «работа заведена», а ЧТО именно
+    ушло в аутбокс — `pay_referral=True`. Заглушка ловит аргумент, потому что прежняя его
+    не принимала вовсе и падала бы по типу, а это выглядело бы как поломка, не как находка.
+    """
     user = SimpleNamespace(id=186, balance_kopeks=0)
     db = _db(scalars=[0, 64900], locked_user=user)
-    job = SimpleNamespace(id=1, referral_status='pending')
+    seen = {}
 
-    async def fake_outbox(db_, *, transaction_id, checkout_id):
-        return job
+    async def fake_outbox(db_, *, transaction_id, checkout_id, pay_referral=True, **_kwargs):
+        seen['pay_referral'] = pay_referral
+        # 🔴 Работу ЗАПОМИНАЕМ, а не только возвращаем: без этого сторож слеп к частичному
+        # откату — скептик волны 2 вернул `job.referral_status = 'done'` СРАЗУ ПОСЛЕ вызова,
+        # комиссия гасла заново, а оба теста оставались зелёными. Проверять аргумент мало,
+        # надо проверить и то, во что превратилась работа к концу функции.
+        seen['job'] = SimpleNamespace(id=1, referral_status='pending' if pay_referral else 'done')
+        return seen['job']
 
     monkeypatch.setattr(service, 'ensure_deposit_outbox', fake_outbox)
     done, _ = await service.refund_operator_review_checkout(db, checkout=_checkout(), admin_user_id=1)
 
     assert done is True
     assert user.balance_kopeks == 64900
-    # Комиссию раздаёт шаг, который воркер пропускает только при `done`.
-    assert job.referral_status == 'done'
+    assert seen['pay_referral'] is True
+    # 🔴 Улика против частичного отката: работа обязана УЙТИ из функции со статусом `pending`.
+    assert seen['job'].referral_status == 'pending'
     db.commit.assert_awaited()
     added = db.add.call_args[0][0]
     assert added.device_first_ledger_key == 'operator_review_refund:101'
+
+
+@pytest.mark.asyncio
+async def test_refund_still_obeys_the_referral_kill_switch(monkeypatch):
+    """Второй конец шкалы: аварийный выключатель рефералки обязан гасить и этот путь.
+
+    Без этой проверки правку можно было бы сделать жёстким `pay_referral=True` — и тогда
+    выключатель, ради которого он заведён (РФ-1 п.1.1), перестал бы держать один из путей.
+    Это тот же класс вреда, что и исходная нестыковка, только зеркальный.
+    """
+    user = SimpleNamespace(id=186, balance_kopeks=0)
+    db = _db(scalars=[0, 64900], locked_user=user)
+    seen = {}
+
+    async def fake_outbox(db_, *, transaction_id, checkout_id, pay_referral=True, **_kwargs):
+        seen['pay_referral'] = pay_referral
+        return SimpleNamespace(id=1, referral_status='pending' if pay_referral else 'done')
+
+    monkeypatch.setattr(service, 'ensure_deposit_outbox', fake_outbox)
+    # 🔴 Грабли проекта (мина AW): у pydantic МЕТОД подменяется на КЛАССЕ, а не на
+    # экземпляре — подмена на экземпляре падает ValueError, что я и получил с первого раза.
+    monkeypatch.setattr(type(service.settings), 'is_referral_program_enabled', lambda self: False)
+    done, _ = await service.refund_operator_review_checkout(db, checkout=_checkout(), admin_user_id=1)
+
+    assert done is True
+    assert seen['pay_referral'] is False
 
 
 @pytest.mark.asyncio
