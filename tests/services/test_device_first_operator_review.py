@@ -238,7 +238,12 @@ async def test_refund_credits_the_balance_and_pays_the_partner_like_any_other_to
 
     async def fake_outbox(db_, *, transaction_id, checkout_id, pay_referral=True, **_kwargs):
         seen['pay_referral'] = pay_referral
-        return SimpleNamespace(id=1, referral_status='pending' if pay_referral else 'done')
+        # 🔴 Работу ЗАПОМИНАЕМ, а не только возвращаем: без этого сторож слеп к частичному
+        # откату — скептик волны 2 вернул `job.referral_status = 'done'` СРАЗУ ПОСЛЕ вызова,
+        # комиссия гасла заново, а оба теста оставались зелёными. Проверять аргумент мало,
+        # надо проверить и то, во что превратилась работа к концу функции.
+        seen['job'] = SimpleNamespace(id=1, referral_status='pending' if pay_referral else 'done')
+        return seen['job']
 
     monkeypatch.setattr(service, 'ensure_deposit_outbox', fake_outbox)
     done, _ = await service.refund_operator_review_checkout(db, checkout=_checkout(), admin_user_id=1)
@@ -246,6 +251,8 @@ async def test_refund_credits_the_balance_and_pays_the_partner_like_any_other_to
     assert done is True
     assert user.balance_kopeks == 64900
     assert seen['pay_referral'] is True
+    # 🔴 Улика против частичного отката: работа обязана УЙТИ из функции со статусом `pending`.
+    assert seen['job'].referral_status == 'pending'
     db.commit.assert_awaited()
     added = db.add.call_args[0][0]
     assert added.device_first_ledger_key == 'operator_review_refund:101'
