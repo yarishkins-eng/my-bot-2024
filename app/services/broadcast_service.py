@@ -93,6 +93,9 @@ class BroadcastConfig:
     initiator_name: str | None = None
     custom_buttons: list[dict] | None = None
     category: str = 'system'  # system|news|promo
+    # Server-derived cabinet identity for the special one-recipient ``self`` target.
+    # It is deliberately absent from every public request schema.
+    actor_user_id: int | None = None
 
     def __post_init__(self) -> None:
         self.message_text = prepare_telegram_broadcast(self.message_text)
@@ -147,13 +150,21 @@ async def resolve_telegram_broadcast_recipient_ids(
     category: str = 'system',
     *,
     preloaded_users: list[User] | None = None,
+    actor_user_id: int | None = None,
 ) -> list[int]:
     """Материализует фактические уникальные Telegram ID для preview и worker.
 
     `get_target_users` остаётся общим сегментом для polls/promo и поэтому не
     может глобально исключать email-only. Канальная проекция живёт здесь.
     """
-    if target.startswith('custom_'):
+    if target == 'self':
+        # Never let a crafted literal ``self`` fall through to a public segment.
+        # Only an authenticated cabinet route can provide this server-side ID.
+        if actor_user_id is None:
+            return []
+        actor = await session.get(User, actor_user_id)
+        users = [actor] if actor and actor.status == UserStatus.ACTIVE.value else []
+    elif target.startswith('custom_'):
         users = await get_custom_users(session, target[len('custom_') :])
     elif preloaded_users is None:
         users = await get_target_users(session, target)
@@ -311,7 +322,11 @@ class BroadcastService:
                 await session.commit()
 
             # _fetch_recipients теперь возвращает list[int] (telegram_id), а не ORM-объекты
-            recipient_ids: list[int] = await self._fetch_recipients(config.target, config.category)
+            recipient_ids: list[int] = await self._fetch_recipients(
+                config.target,
+                config.category,
+                actor_user_id=config.actor_user_id,
+            )
 
             async with AsyncSessionLocal() as session:
                 broadcast = await session.get(BroadcastHistory, broadcast_id)
@@ -321,6 +336,17 @@ class BroadcastService:
 
                 broadcast.total_count = len(recipient_ids)
                 await session.commit()
+
+            # The pre-commit route guard proves exact-one at request time. Re-check
+            # inside the worker so status/opt-out/identity drift can only fail closed.
+            if config.target == 'self' and len(recipient_ids) != 1:
+                logger.warning(
+                    'Self-canary recipient changed before worker start',
+                    broadcast_id=broadcast_id,
+                    recipient_count=len(recipient_ids),
+                )
+                await self._mark_failed(broadcast_id, sent_count, failed_count, blocked_count)
+                return
 
             if cancel_event.is_set():
                 await self._mark_cancelled(broadcast_id, sent_count, failed_count, blocked_count)
@@ -377,7 +403,13 @@ class BroadcastService:
             logger.exception('Критическая ошибка при выполнении рассылки', broadcast_id=broadcast_id, exc=exc)
             await self._mark_failed(broadcast_id, sent_count, failed_count, blocked_count)
 
-    async def _fetch_recipients(self, target: str, category: str = 'system') -> list[int]:
+    async def _fetch_recipients(
+        self,
+        target: str,
+        category: str = 'system',
+        *,
+        actor_user_id: int | None = None,
+    ) -> list[int]:
         """Загружает получателей и возвращает список telegram_id (скаляры, не ORM-объекты).
 
         Filters out users who disabled the given broadcast category in their
@@ -385,6 +417,13 @@ class BroadcastService:
         Category 'system' is never filtered — system notifications reach everyone.
         """
         async with AsyncSessionLocal() as session:
+            if target == 'self':
+                return await resolve_telegram_broadcast_recipient_ids(
+                    session,
+                    target,
+                    category,
+                    actor_user_id=actor_user_id,
+                )
             return await resolve_telegram_broadcast_recipient_ids(session, target, category)
 
     async def _send_batched(
@@ -442,7 +481,6 @@ class BroadcastService:
                         'FloodWait рассылки : Telegram просит сек (user попытка /)',
                         broadcast_id=broadcast_id,
                         retry_after=e.retry_after,
-                        telegram_id=telegram_id,
                         attempt=attempt + 1,
                         TG_MAX_RETRIES=_TG_MAX_RETRIES,
                     )
@@ -465,7 +503,6 @@ class BroadcastService:
                     logger.warning(
                         'Телеграм отклонил сообщение рассылки',
                         broadcast_id=broadcast_id,
-                        telegram_id=telegram_id,
                         error=str(e)[:200],
                         error_type=type(e).__name__,
                     )
@@ -477,7 +514,6 @@ class BroadcastService:
                     logger.warning(
                         'Транзиентная сетевая ошибка рассылки (retry)',
                         broadcast_id=broadcast_id,
-                        telegram_id=telegram_id,
                         attempt=attempt + 1,
                         TG_MAX_RETRIES=_TG_MAX_RETRIES,
                         error=str(exc)[:200],
@@ -490,7 +526,6 @@ class BroadcastService:
                     logger.error(
                         'Ошибка отправки рассылки пользователю (попытка /)',
                         broadcast_id=broadcast_id,
-                        telegram_id=telegram_id,
                         attempt=attempt + 1,
                         TG_MAX_RETRIES=_TG_MAX_RETRIES,
                         exc=exc,

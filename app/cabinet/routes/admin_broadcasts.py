@@ -68,6 +68,7 @@ SAFE_CUSTOM_BROADCAST_CALLBACKS = frozenset(
 # исключает недоступные адреса и opt-out, а подписи честно называют оставшиеся
 # особенности сегмента.
 FILTER_LABELS = {
+    'self': 'Тест: только мне',
     'all': 'Все активные с Telegram',
     'active': 'Действующая подписка, не пробная',
     'trial': 'Сейчас числится пробной (в т.ч. истёкшая)',
@@ -80,6 +81,7 @@ FILTER_LABELS = {
 }
 
 FILTER_GROUPS = {
+    'self': 'basic',
     'all': 'basic',
     'active': 'subscription',
     'trial': 'subscription',
@@ -220,6 +222,40 @@ def _validate_buttons(buttons: list[str]) -> bool:
     return all(button in BROADCAST_BUTTONS for button in buttons)
 
 
+async def _resolve_cabinet_telegram_recipients(
+    db: AsyncSession,
+    target: str,
+    category: str,
+    admin: User,
+    *,
+    preloaded_users: list[User] | None = None,
+) -> list[int]:
+    """Resolve a cabinet target, binding ``self`` only to the authenticated actor."""
+    kwargs = {}
+    if preloaded_users is not None:
+        kwargs['preloaded_users'] = preloaded_users
+    if target == 'self':
+        kwargs['actor_user_id'] = getattr(admin, 'id', None)
+    return await resolve_telegram_broadcast_recipient_ids(db, target, category, **kwargs)
+
+
+async def _require_exact_self_recipient(
+    db: AsyncSession,
+    target: str,
+    category: str,
+    admin: User,
+) -> None:
+    """Fail before history/worker unless the authenticated self target is exact-one."""
+    if target != 'self':
+        return
+    recipient_ids = await _resolve_cabinet_telegram_recipients(db, target, category, admin)
+    if len(recipient_ids) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Self test requires exactly one eligible Telegram recipient',
+        )
+
+
 def _validate_custom_broadcast_callbacks(custom_buttons) -> None:
     """Reject callbacks that are unsafe or have no stable public handler."""
     invalid_callbacks = sorted(
@@ -253,10 +289,11 @@ async def get_filters(
     filters = []
     for key, label in FILTER_LABELS.items():
         count = len(
-            await resolve_telegram_broadcast_recipient_ids(
+            await _resolve_cabinet_telegram_recipients(
                 db,
                 key,
                 category,
+                admin,
                 preloaded_users=preloaded_users,
             )
         )
@@ -272,7 +309,7 @@ async def get_filters(
     # Custom filters
     custom_filters = []
     for key, label in CUSTOM_FILTER_LABELS.items():
-        count = len(await resolve_telegram_broadcast_recipient_ids(db, key, category))
+        count = len(await _resolve_cabinet_telegram_recipients(db, key, category, admin))
         custom_filters.append(
             BroadcastFilter(
                 key=key,
@@ -366,7 +403,14 @@ async def preview_broadcast(
         )
 
     try:
-        count = len(await resolve_telegram_broadcast_recipient_ids(db, request.target, request.category))
+        count = len(
+            await _resolve_cabinet_telegram_recipients(
+                db,
+                request.target,
+                request.category,
+                admin,
+            )
+        )
     except Exception as e:
         logger.error('Failed to get count for target', target=request.target, error=e)
         raise HTTPException(
@@ -402,6 +446,8 @@ async def create_broadcast(
         )
 
     _validate_custom_broadcast_callbacks(request.custom_buttons)
+
+    await _require_exact_self_recipient(db, request.target, request.category, admin)
 
     try:
         message_text = prepare_telegram_broadcast(request.message_text)
@@ -455,6 +501,7 @@ async def create_broadcast(
         initiator_name=admin.username or f'Admin #{admin.id}',
         custom_buttons=[btn.model_dump() for btn in request.custom_buttons] if request.custom_buttons else None,
         category=request.category,
+        actor_user_id=admin.id if request.target == 'self' else None,
     )
 
     # Start broadcast
@@ -564,6 +611,12 @@ async def create_combined_broadcast(
 
     admin_name = admin.username or f'Admin #{admin.id}'
 
+    if request.channel == 'both' and request.target == 'self':
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Self test supports Telegram only; select an Email target separately',
+        )
+
     telegram_message_text: str | None = None
     media_caption: str | None = None
 
@@ -598,6 +651,8 @@ async def create_combined_broadcast(
             )
 
         _validate_custom_broadcast_callbacks(request.custom_buttons)
+
+        await _require_exact_self_recipient(db, request.target, request.category, admin)
 
     if request.channel in ('email', 'both'):
         # For email channel, target must be email filter or we use telegram target for 'both'
@@ -666,6 +721,7 @@ async def create_combined_broadcast(
             initiator_name=admin_name,
             custom_buttons=[btn.model_dump() for btn in request.custom_buttons] if request.custom_buttons else None,
             category=request.category,
+            actor_user_id=admin.id if request.target == 'self' else None,
         )
 
         await broadcast_service.start_broadcast(broadcast.id, telegram_config)

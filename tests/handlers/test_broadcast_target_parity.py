@@ -582,7 +582,10 @@ async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatc
         category: str,
         *,
         preloaded_users=None,
+        actor_user_id=None,
     ):
+        if target == 'self':
+            assert actor_user_id == 7
         projections.append((target, category, preloaded_users is base_users))
         return list(range(expected_counts[target]))
 
@@ -613,7 +616,7 @@ async def test_filter_catalog_reuses_one_base_load_and_keeps_category(monkeypatc
 
     response = await broadcast_routes.get_filters(
         category=category,
-        admin=object(),
+        admin=SimpleNamespace(id=7),
         db=FakeSession(),
     )
 
@@ -775,7 +778,7 @@ def test_category_is_wired_from_create_route_through_both_workers() -> None:
     )[0]
     assert 'category=request.category' in telegram_config_source
     assert 'category=request.category' in email_config_source
-    assert 'self._fetch_recipients(config.target, config.category)' in telegram_worker_source
+    assert 'actor_user_id=config.actor_user_id' in telegram_worker_source
     assert 'self._fetch_email_recipients(config.target, config.category)' in email_worker_source
 
 
