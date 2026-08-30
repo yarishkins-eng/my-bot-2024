@@ -160,7 +160,11 @@ def test_finished_status_keeps_partial_and_completed() -> None:
 
 def test_finished_status_blocked_only_is_not_failure() -> None:
     """Заблокировавшие бота — недостижимая аудитория, а не провал кампании."""
-    assert _finished_status(sent_count=0, failed_count=0, blocked_count=6) == 'completed'
+    # РС-14в: вернули ожидание, переписанное коммитом РС-12. Ноль доставленных — не успех,
+    # даже когда недоставка целиком объясняется блокировками: это тот самый случай, ради
+    # которого self-канарейку и смотрят перед широкой кампанией.
+    assert _finished_status(sent_count=0, failed_count=0, blocked_count=6) == 'partial'
+    assert _finished_status(sent_count=0, failed_count=0, blocked_count=0) == 'completed'
     assert _finished_status(sent_count=12, failed_count=0, blocked_count=6) == 'completed'
 
 
