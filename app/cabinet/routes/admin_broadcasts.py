@@ -125,16 +125,20 @@ CUSTOM_FILTER_GROUPS = {
 
 # ============ Email Filter Labels ============
 
+# РС-14е применяется и к почте: у неё «все» так же стояла ПЕРВОЙ строкой в группе `basic`,
+# то есть ровно в той раскладке, которую этот же пункт объявил опасной у Телеграма.
+# Своей канарейки «только мне» у почты нет вовсе — сухой прогон письма сделать нечем,
+# поэтому цена промаха здесь выше, а не ниже.
 EMAIL_FILTER_LABELS = {
-    'all_email': 'Все активные с подтверждённым email',
     'email_only': 'Активные email-регистрации с подтверждённым адресом',
     'telegram_with_email': 'Активные Telegram с подтверждённым email',
     'active_email': 'Есть подписка со статусом «активна»',
     'expired_email': 'Есть истёкшая или отключённая подписка',
+    'all_email': 'Все активные с подтверждённым email',
 }
 
 EMAIL_FILTER_GROUPS = {
-    'all_email': 'basic',
+    'all_email': 'broad',
     'email_only': 'auth_type',
     'telegram_with_email': 'auth_type',
     'active_email': 'subscription',
@@ -496,20 +500,48 @@ async def _reject_duplicate_broadcast(
     admin: User,
     target: str,
     message_text: str | None,
+    category: str | None = None,
+    media_file_id: str | None = None,
+    email_subject: str | None = None,
 ) -> None:
-    """Отбить повтор той же кампании на ту же аудиторию в пределах окна."""
+    """Отбить повтор той же кампании на ту же аудиторию в пределах окна.
+
+    ⛔ Сравнивать только по тексту нельзя, это ревью показало на трёх сценариях:
+    у почтовой кампании текста нет вовсе (`message_text IS NULL`), и ключ вырождался в
+    «тот же админ + та же аудитория» — два РАЗНЫХ письма подряд считались повтором, а совет
+    «измените текст» был неисполним; правка вложения, кнопки или категории перед повтором
+    канарейки тоже не снимала отказ, хотя кампания уже другая (категория вдобавок меняет
+    состав получателей). Поэтому в ключ входит всё, что делает кампанию другой.
+    """
+    # Канарейку «только мне» повторяют СПЕЦИАЛЬНО — это способ проверить рассылку перед
+    # широкой отправкой, и второе письмо самому себе никому не вредит.
+    if target == 'self':
+        return
     window_start = datetime.now(UTC) - timedelta(minutes=DUPLICATE_BROADCAST_WINDOW_MINUTES)
     text_matches = (
         BroadcastHistory.message_text.is_(None)
         if message_text is None
         else BroadcastHistory.message_text == message_text
     )
+    subject_matches = (
+        BroadcastHistory.email_subject.is_(None)
+        if email_subject is None
+        else BroadcastHistory.email_subject == email_subject
+    )
+    media_matches = (
+        BroadcastHistory.media_file_id.is_(None)
+        if media_file_id is None
+        else BroadcastHistory.media_file_id == media_file_id
+    )
     result = await db.execute(
         select(BroadcastHistory.id)
         .where(
             BroadcastHistory.admin_id == admin.id,
             BroadcastHistory.target_type == target,
+            BroadcastHistory.category == category,
             text_matches,
+            subject_matches,
+            media_matches,
             BroadcastHistory.created_at >= window_start,
         )
         .order_by(BroadcastHistory.id.desc())
@@ -568,7 +600,14 @@ async def create_broadcast(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    await _reject_duplicate_broadcast(db, admin=admin, target=request.target, message_text=message_text)
+    await _reject_duplicate_broadcast(
+        db,
+        admin=admin,
+        target=request.target,
+        message_text=message_text,
+        category=request.category,
+        media_file_id=request.media.file_id if request.media else None,
+    )
 
     media_payload = request.media
 
@@ -785,7 +824,15 @@ async def create_combined_broadcast(
                 detail='Email HTML content is required for email broadcast',
             )
 
-    await _reject_duplicate_broadcast(db, admin=admin, target=request.target, message_text=telegram_message_text)
+    await _reject_duplicate_broadcast(
+        db,
+        admin=admin,
+        target=request.target,
+        message_text=telegram_message_text,
+        category=request.category,
+        media_file_id=request.media.file_id if request.media else None,
+        email_subject=request.email_subject.strip() if request.email_subject else None,
+    )
 
     media_payload = request.media
 

@@ -13,7 +13,7 @@ from fastapi import HTTPException
 
 from app.cabinet.routes import admin_broadcasts as broadcast_routes
 from app.cabinet.schemas.broadcasts import BroadcastCreateRequest
-from app.database.models import BroadcastHistory
+from app.database.models import BroadcastHistory, UserStatus
 
 
 class _Rows:
@@ -42,6 +42,16 @@ class _RecordingSession:
             self.duplicate_sql = sql
             return _Rows([self._duplicate_id] if self._duplicate_id is not None else [])
         return _Rows([])
+
+    async def get(self, _model, pk):
+        # Путь `self` сверяет получателя с личностью админа (забор HD) — фейку нужен и `get`.
+        return SimpleNamespace(
+            id=pk,
+            telegram_id=555000,
+            username='owner',
+            status=UserStatus.ACTIVE.value,
+            language='ru',
+        )
 
     def add(self, obj) -> None:
         self.added += 1
@@ -115,6 +125,37 @@ async def test_guard_filters_by_admin_target_text_and_time(no_worker) -> None:
 async def test_window_is_short_enough_to_allow_a_deliberate_repeat() -> None:
     """Окно — защита от промаха, а не запрет повторять: намеренный повтор ждёт минуты, не часы."""
     assert 1 <= broadcast_routes.DUPLICATE_BROADCAST_WINDOW_MINUTES <= 15
+
+
+@pytest.mark.asyncio
+async def test_self_canary_repeat_is_never_blocked(no_worker) -> None:
+    """Канарейку «только мне» повторяют СПЕЦИАЛЬНО — это проверка перед широкой отправкой.
+
+    Ревью показало сценарий: послал себе, увидел в Телеграме, что картинка не прицепилась,
+    поправил и жмёшь снова — забор отвечал «измените текст», а текст-то верный.
+    """
+    session = _RecordingSession(duplicate_id=41)
+    request = BroadcastCreateRequest(target='self', message_text='Проверка', selected_buttons=[], custom_buttons=[])
+    await broadcast_routes.create_broadcast(request, SimpleNamespace(id=9, username='owner'), session)
+
+    assert session.added == 1, 'повтор канарейки заблокирован — способ проверить кампанию сломан'
+    assert session.duplicate_sql is None, 'для self история вообще не должна опрашиваться'
+
+
+@pytest.mark.asyncio
+async def test_guard_key_includes_category_media_and_subject(no_worker) -> None:
+    """Кампания, отличающаяся вложением, категорией или темой письма, — НЕ повтор.
+
+    Пока в ключе был только текст, у почтовой кампании он вырождался в `message_text IS NULL`,
+    и два РАЗНЫХ письма подряд на одну аудиторию считались одним и тем же.
+    """
+    session = _RecordingSession(duplicate_id=None)
+    await broadcast_routes.create_broadcast(_request(), SimpleNamespace(id=9, username='m'), session)
+
+    sql = session.duplicate_sql
+    assert sql is not None
+    for column in ('category', 'media_file_id', 'email_subject'):
+        assert f'broadcast_history.{column}' in sql, f'забор не смотрит на {column} — разные кампании слипнутся'
 
 
 @pytest.mark.asyncio
