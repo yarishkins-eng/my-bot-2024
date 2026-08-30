@@ -80,15 +80,38 @@ async def get_transactions(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get transaction history."""
+    # 🔴 Этап ДВ-3. Кабинет показывал то, что бот прячет с этапа РФ-1, и показывал ПЛЮСОМ.
+    # Приход от банка по прямой оплате картой (`provider_receipt`) — учётная запись о том, что
+    # деньги принял провайдер; кошелька они не касались вовсе. Человек, заплативший 1990 ₽ за
+    # подписку, видел в истории кошелька зелёное «+1990 ₽» при неизменившемся балансе, да ещё
+    # подписанное машинным английским. Список берём У БОТА, а не переписываем: два рукописных
+    # перечня разъехались бы, и один экран снова начал бы противоречить другому.
+    # ⛔ Фильтр стоит и в выборке, и в СЧЁТЧИКЕ: иначе разъедется нумерация страниц и на
+    # странице молча окажется меньше записей, чем обещано.
+    # 🟢 Админский экран пользователя это не задевает — он собирает свои записи отдельно
+    # (`app/cabinet/routes/admin_users.py`, `recent_transactions`), и владелец по-прежнему
+    # видит все движения денег.
+    from app.handlers.balance.main import HIDDEN_FROM_WALLET_HISTORY
+
     # Base query
-    query = select(Transaction).where(Transaction.user_id == user.id)
+    query = select(Transaction).where(
+        Transaction.user_id == user.id,
+        Transaction.type.notin_(HIDDEN_FROM_WALLET_HISTORY),
+    )
 
     # Filter by type
     if type:
         query = query.where(Transaction.type == type)
 
     # Get total count
-    count_query = select(func.count()).select_from(Transaction).where(Transaction.user_id == user.id)
+    count_query = (
+        select(func.count())
+        .select_from(Transaction)
+        .where(
+            Transaction.user_id == user.id,
+            Transaction.type.notin_(HIDDEN_FROM_WALLET_HISTORY),
+        )
+    )
     if type:
         count_query = count_query.where(Transaction.type == type)
 
@@ -1348,6 +1371,30 @@ def _record_to_response(record: PendingPayment) -> PendingPaymentResponse:
     )
 
 
+async def _with_purchase_step(record_response: PendingPaymentResponse, user: User) -> PendingPaymentResponse:
+    """Дописать в ответ, остался ли за человеком шаг «оформить подписку».
+
+    Зачем. Экран результата пополнения в кабинете говорил всем одно: «Ваш баланс успешно
+    пополнен. Средства уже доступны» — и давал единственную кнопку на баланс. Клиент 106
+    прочитала это как «сделка закрыта» и осталась без подписки при деньгах на счету; её
+    собственные слова владельцу — «я закинула деньги и думала, что баланс пополнен». Этап ДВ-2
+    убрал ту же ложь из ЧАТА, но экран человек видит РАНЬШЕ сообщения бота.
+
+    ⛔ Решает не этот файл. Вердикт берём у `topup_pending_purchase_hint` — той самой функции,
+    что молчит в чате. Свой список условий здесь был бы вторым, и он бы разъехался: в ДВ-2 в нём
+    и метка намерения автопокупки, и автоплатёж, и порог «пора продлевать», и починка мины HX.
+
+    ⛔ Спрашиваем ТОЛЬКО у оплаченного платежа. Пока исход неизвестен, экран показывает
+    ожидание, и подсказка ему не нужна — а маршрут опрашивают раз в три секунды.
+    """
+    if not record_response.is_paid:
+        return record_response
+    from app.services.payment.common import topup_pending_purchase_hint
+
+    record_response.purchase_step_pending = bool(await topup_pending_purchase_hint(user))
+    return record_response
+
+
 @router.get('/pending-payments', response_model=PendingPaymentListResponse)
 async def get_pending_payments(
     page: int = Query(1, ge=1, description='Page number'),
@@ -1473,7 +1520,7 @@ async def get_latest_payment_by_method(
         payment=payment,
     )
 
-    return _record_to_response(record)
+    return await _with_purchase_step(_record_to_response(record), user)
 
 
 @router.get('/pending-payments/{method}/{payment_id}', response_model=PendingPaymentResponse)
@@ -1507,7 +1554,7 @@ async def get_pending_payment_details(
             detail='Access denied',
         )
 
-    return _record_to_response(record)
+    return await _with_purchase_step(_record_to_response(record), user)
 
 
 @router.post('/pending-payments/{method}/{payment_id}/check', response_model=ManualCheckResponse)
