@@ -1,6 +1,6 @@
 """Admin routes for broadcasts in cabinet."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -68,9 +68,14 @@ SAFE_CUSTOM_BROADCAST_CALLBACKS = frozenset(
 # ⛔ РС-9 не меняет состав пользовательских сегментов. Канальная проекция ниже
 # исключает недоступные адреса и opt-out, а подписи честно называют оставшиеся
 # особенности сегмента.
+# 🔴 РС-14е. Порядок словаря = порядок кнопок на экране (ответ собирается циклом по нему).
+# «Все» стояла ВТОРОЙ строкой, вплотную к «только мне»: промах на одну строку означал отправку
+# всей базе (304 человека на 30.08.2026). Единственной защитой было подтверждение с числом.
+# Теперь «Все» уехала в конец и в собственную группу `broad` — попасть в неё мимо соседней
+# кнопки больше нельзя, а подтверждение осталось вторым рубежом, а не единственным.
+# ⛔ НЕ возвращать 'all' наверх «для удобства»: удобство здесь и есть дефект.
 FILTER_LABELS = {
     'self': 'Тест: только мне',
-    'all': 'Все активные с Telegram',
     'active': 'Действующая подписка, не пробная',
     'trial': 'Сейчас числится пробной (в т.ч. истёкшая)',
     'no': 'Сейчас без подписки',
@@ -79,11 +84,12 @@ FILTER_LABELS = {
     'zero': 'Действующая, 0 ГБ за текущий период',
     'active_zero': 'Действующая не пробная, 0 ГБ за период',
     'trial_zero': 'Действующая пробная, 0 ГБ за период',
+    'all': 'Все активные с Telegram',
 }
 
 FILTER_GROUPS = {
     'self': 'basic',
-    'all': 'basic',
+    'all': 'broad',  # РС-14е: своя группа, чтобы «Все» не стояла соседней строкой с «только мне»
     'active': 'subscription',
     'trial': 'subscription',
     'no': 'subscription',
@@ -119,16 +125,20 @@ CUSTOM_FILTER_GROUPS = {
 
 # ============ Email Filter Labels ============
 
+# РС-14е применяется и к почте: у неё «все» так же стояла ПЕРВОЙ строкой в группе `basic`,
+# то есть ровно в той раскладке, которую этот же пункт объявил опасной у Телеграма.
+# Своей канарейки «только мне» у почты нет вовсе — сухой прогон письма сделать нечем,
+# поэтому цена промаха здесь выше, а не ниже.
 EMAIL_FILTER_LABELS = {
-    'all_email': 'Все активные с подтверждённым email',
     'email_only': 'Активные email-регистрации с подтверждённым адресом',
     'telegram_with_email': 'Активные Telegram с подтверждённым email',
     'active_email': 'Есть подписка со статусом «активна»',
     'expired_email': 'Есть истёкшая или отключённая подписка',
+    'all_email': 'Все активные с подтверждённым email',
 }
 
 EMAIL_FILTER_GROUPS = {
-    'all_email': 'basic',
+    'all_email': 'broad',
     'email_only': 'auth_type',
     'telegram_with_email': 'auth_type',
     'active_email': 'subscription',
@@ -472,10 +482,102 @@ async def preview_broadcast(
     )
 
 
+# 🔴 РС-14г (мина GZ). У рассылок нет ключа идемпотентности и уникального индекса: если ответ
+# сервера потерялся, а страница перезагрузилась, ничто не мешает создать вторую такую же кампанию
+# и прислать людям второе письмо. Черновик при перезагрузке стирается целиком, поэтому повтор
+# требует заново набрать текст и выбрать аудиторию — владелец, работающий один, по дороге заглянет
+# в список кампаний. Но рассылками занимается уже не только он.
+# Настоящую идемпотентность делать нельзя: это миграция и новая колонка. Достаточно окна: две
+# ОДИНАКОВЫЕ кампании одного админа на одну аудиторию за пять минут — почти наверняка не замысел.
+# Отказ называет номер уже созданной кампании, чтобы человек пошёл смотреть её, а не гадать.
+# ⛔ Ставится ПОСЛЕ канонизации текста: сравнивать надо то, что уйдёт, а не то, что набрали.
+DUPLICATE_BROADCAST_WINDOW_MINUTES = 5
+
+
+async def _reject_duplicate_broadcast(
+    db: AsyncSession,
+    *,
+    admin: User,
+    target: str,
+    message_text: str | None,
+    category: str | None = None,
+    media_file_id: str | None = None,
+    email_subject: str | None = None,
+) -> None:
+    """Отбить повтор той же кампании на ту же аудиторию в пределах окна.
+
+    ⛔ Сравнивать только по тексту нельзя, это ревью показало на трёх сценариях:
+    у почтовой кампании текста нет вовсе (`message_text IS NULL`), и ключ вырождался в
+    «тот же админ + та же аудитория» — два РАЗНЫХ письма подряд считались повтором, а совет
+    «измените текст» был неисполним; правка вложения, кнопки или категории перед повтором
+    канарейки тоже не снимала отказ, хотя кампания уже другая (категория вдобавок меняет
+    состав получателей). Поэтому в ключ входит всё, что делает кампанию другой.
+    """
+    # Канарейку «только мне» повторяют СПЕЦИАЛЬНО — это способ проверить рассылку перед
+    # широкой отправкой, и второе письмо самому себе никому не вредит.
+    if target == 'self':
+        return
+    window_start = datetime.now(UTC) - timedelta(minutes=DUPLICATE_BROADCAST_WINDOW_MINUTES)
+    text_matches = (
+        BroadcastHistory.message_text.is_(None)
+        if message_text is None
+        else BroadcastHistory.message_text == message_text
+    )
+    subject_matches = (
+        BroadcastHistory.email_subject.is_(None)
+        if email_subject is None
+        else BroadcastHistory.email_subject == email_subject
+    )
+    media_matches = (
+        BroadcastHistory.media_file_id.is_(None)
+        if media_file_id is None
+        else BroadcastHistory.media_file_id == media_file_id
+    )
+    result = await db.execute(
+        select(BroadcastHistory.id)
+        .where(
+            # admin_id в ключе НЕТ намеренно. С ним забор структурно не ловил бы двух
+            # человек: владелец и менеджер, отправившие одну акцию с разницей в минуту,
+            # не получили бы ни одного отказа - а этап затеян ровно из-за второго человека.
+            BroadcastHistory.target_type == target,
+            # Повтор ПОСЛЕ ПРОВАЛА и после остановки - законный, а не промах:
+            # "0 доставлено" означает, что чинили битую кнопку или разметку и шлют снова
+            # (кнопок в ключе нет и быть не может - колонки под них в истории не существует),
+            # а диалог остановки сам инструктирует "создайте новую кампанию".
+            BroadcastHistory.sent_count > 0,
+            BroadcastHistory.status != 'cancelled',
+            BroadcastHistory.category == category,
+            text_matches,
+            subject_matches,
+            media_matches,
+            BroadcastHistory.created_at >= window_start,
+        )
+        .order_by(BroadcastHistory.id.desc())
+        .limit(1)
+    )
+    existing_id = result.scalars().first()
+    if existing_id is None:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            f'Такая же рассылка на эту аудиторию уже создана — кампания #{existing_id}, '
+            f'и она доставлена. Откройте её в списке и посмотрите результат. '
+            f'Если повтор нужен намеренно, измените текст, вложение, тему письма или '
+            f'категорию — либо подождите {DUPLICATE_BROADCAST_WINDOW_MINUTES} минут.'
+        ),
+    )
+
+
 @router.post('', response_model=BroadcastResponse, status_code=status.HTTP_201_CREATED)
 async def create_broadcast(
     request: BroadcastCreateRequest,
-    admin: User = Depends(require_permission('broadcasts:create')),
+    # Было `broadcasts:create`. Маршрут не просто создаёт запись - он тут же ЗАПУСКАЕТ
+    # рассылку на всю базу, то есть делает ровно то же, что `/send`. Кабинетный экран им
+    # не пользуется вовсе, а роль "только готовить, отправляю я" на нём беззвучно
+    # разваливалась: create без send давал массовую отправку и не давал остановить.
+    # Обе готовые роли имеют `broadcasts:*`, поэтому ужесточение никого не задевает.
+    admin: User = Depends(require_permission('broadcasts:send')),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> BroadcastResponse:
     """Create and start a broadcast."""
@@ -511,6 +613,15 @@ async def create_broadcast(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    await _reject_duplicate_broadcast(
+        db,
+        admin=admin,
+        target=request.target,
+        message_text=message_text,
+        category=request.category,
+        media_file_id=request.media.file_id if request.media else None,
+    )
 
     media_payload = request.media
 
@@ -726,6 +837,16 @@ async def create_combined_broadcast(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='Email HTML content is required for email broadcast',
             )
+
+    await _reject_duplicate_broadcast(
+        db,
+        admin=admin,
+        target=request.target,
+        message_text=telegram_message_text,
+        category=request.category,
+        media_file_id=request.media.file_id if request.media else None,
+        email_subject=request.email_subject.strip() if request.email_subject else None,
+    )
 
     media_payload = request.media
 
