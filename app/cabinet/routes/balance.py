@@ -79,39 +79,26 @@ async def get_transactions(
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Get transaction history."""
-    # 🔴 Этап ДВ-3. Кабинет показывал то, что бот прячет с этапа РФ-1, и показывал ПЛЮСОМ.
-    # Приход от банка по прямой оплате картой (`provider_receipt`) — учётная запись о том, что
-    # деньги принял провайдер; кошелька они не касались вовсе. Человек, заплативший 1990 ₽ за
-    # подписку, видел в истории кошелька зелёное «+1990 ₽» при неизменившемся балансе, да ещё
-    # подписанное машинным английским. Список берём У БОТА, а не переписываем: два рукописных
-    # перечня разъехались бы, и один экран снова начал бы противоречить другому.
-    # ⛔ Фильтр стоит и в выборке, и в СЧЁТЧИКЕ: иначе разъедется нумерация страниц и на
-    # странице молча окажется меньше записей, чем обещано.
-    # 🟢 Админский экран пользователя это не задевает — он собирает свои записи отдельно
-    # (`app/cabinet/routes/admin_users.py`, `recent_transactions`), и владелец по-прежнему
-    # видит все движения денег.
-    from app.handlers.balance.main import HIDDEN_FROM_WALLET_HISTORY
+    """Get transaction history.
 
+    🔴 Этап ДВ-3, решение владельца 31.08.2026. Здесь НЕТ фильтра, и это не забывчивость.
+    Первая редакция прятала приход от банка по прямой оплате картой (`provider_receipt`) —
+    по образцу бота. Владелец посмотрел на живой экран и постановил обратное: история
+    операций обязана быть ПОЛНОЙ, чтобы каждый шаг денег прослеживался и клиентом, и
+    админом. Прятать половину проводки — значит оставить одинокое списание с кошелька,
+    которого кошелёк не касался. Лечится не сокрытием, а человеческими подписями:
+    их выдаёт `device_first_checkout_service` при создании записей.
+    ⛔ Не вводить сюда фильтр по типу заново, не прочитав это.
+    """
     # Base query
-    query = select(Transaction).where(
-        Transaction.user_id == user.id,
-        Transaction.type.notin_(HIDDEN_FROM_WALLET_HISTORY),
-    )
+    query = select(Transaction).where(Transaction.user_id == user.id)
 
     # Filter by type
     if type:
         query = query.where(Transaction.type == type)
 
     # Get total count
-    count_query = (
-        select(func.count())
-        .select_from(Transaction)
-        .where(
-            Transaction.user_id == user.id,
-            Transaction.type.notin_(HIDDEN_FROM_WALLET_HISTORY),
-        )
-    )
+    count_query = select(func.count()).select_from(Transaction).where(Transaction.user_id == user.id)
     if type:
         count_query = count_query.where(Transaction.type == type)
 

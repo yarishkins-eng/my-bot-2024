@@ -41,43 +41,82 @@ class _RecordingSession:
 
 
 @pytest.mark.asyncio
-async def test_wallet_history_hides_every_type_the_bot_hides(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Кабинет обязан ЧИТАТЬ список бота, а не повторять его своими словами.
+async def test_wallet_history_hides_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """История операций обязана быть ПОЛНОЙ — решение владельца 31.08.2026.
 
-    Поэтому в список подсаживается тип, которого в проекте нет: правка, которая зашьёт
-    `provider_receipt` литералом, этот сторож не переживёт.
+    🔴 Этот сторож заменил собой прямо противоположный, написанный часом раньше в этом же
+    этапе, и замена не косметическая. Первая редакция прятала приход от банка по прямой
+    оплате картой, копируя поведение бота. Владелец посмотрел на живой экран и постановил
+    обратное: спрятанная половина проводки оставляет одинокое списание с кошелька, которого
+    кошелёк не касался, — а прослеживаться должен каждый шаг денег.
+
+    Стережём СВОЙСТВО: в запросе нет отбора по типу, кроме явно запрошенного человеком.
     """
-    from app.handlers.balance import main as bot_balance
-
-    monkeypatch.setattr(
-        bot_balance,
-        'HIDDEN_FROM_WALLET_HISTORY',
-        frozenset({TransactionType.PROVIDER_RECEIPT.value, 'sentinel_hidden_type'}),
-    )
-
     session = _RecordingSession()
     await balance_route.get_transactions(page=1, per_page=20, type=None, user=SimpleNamespace(id=42), db=session)
 
     sql = session.compiled()
     assert len(sql) == 2, 'ожидались два запроса: выборка и счётчик'
     for statement in sql:
-        assert 'provider_receipt' in statement
-        assert 'sentinel_hidden_type' in statement, 'список берётся не у бота, а переписан'
+        assert 'provider_receipt' not in statement, 'история снова что-то прячет'
+        assert 'NOT IN' not in statement.upper(), 'в запрос вернулся отбор по типу'
 
 
-@pytest.mark.asyncio
-async def test_wallet_history_hides_the_receipt_in_the_page_count_too() -> None:
-    """Счётчик страниц обязан считать по тем же правилам, что и выборка.
+def test_provider_receipt_is_a_credit_in_the_bot() -> None:
+    """Приход от банка — ПРИХОД, а не расход.
 
-    Забыть его — значит обещать двадцать записей и молча показать девятнадцать. Проверяем
-    именно COUNT-запрос, а не «хоть где-то есть фильтр».
+    Бот рисовал его минусом, человек видел «−1199 ₽» дважды подряд, и этап РФ-1 вместо
+    починки знака убрал строку с глаз. Сокрытие снято, поэтому знак обязан быть верным —
+    иначе вернётся ровно та поломка, ради которой прятали.
     """
-    session = _RecordingSession()
-    await balance_route.get_transactions(page=1, per_page=20, type=None, user=SimpleNamespace(id=42), db=session)
+    from app.handlers.balance.main import CREDIT_TRANSACTION_TYPES
 
-    counting = [s for s in session.compiled() if 'count(' in s.lower()]
-    assert len(counting) == 1
-    assert 'provider_receipt' in counting[0]
+    assert TransactionType.PROVIDER_RECEIPT.value in CREDIT_TRANSACTION_TYPES
+
+
+def test_the_bot_no_longer_hides_anything_from_the_wallet_history() -> None:
+    """Механизма сокрытия в боте больше нет — ни пустого, ни спящего.
+
+    Оставить пустой список значило бы оставить приглашение снова что-нибудь в него положить.
+    """
+    from app.handlers.balance import main as bot_balance
+
+    assert not hasattr(bot_balance, 'HIDDEN_FROM_WALLET_HISTORY')
+
+
+def test_no_english_machine_text_reaches_the_wallet_history() -> None:
+    """Проволока-растяжка против возврата машинного английского в подписи операций.
+
+    ⚠️ ЧЕСТНО ПРО ГРАНИЦУ: это сторож по ИСХОДНИКУ, а не по поведению, и сам по себе он
+    доказывает мало — правило проекта прямо предупреждает, что такие сторожа слабые.
+    Настоящая проверка (провести заказ через выдачу и прочитать созданные строки) требует
+    стенда, которого у этой функции нет: её тесты живут на фейковых сессиях и до создания
+    транзакций не доходят. Пробел записан вместо того, чтобы делать вид, что его нет.
+    Растяжка ловит ровно одну регрессию — возврат прежних шаблонов, — и этого достаточно,
+    чтобы следующий не вернул их не глядя.
+    """
+    import pathlib
+
+    source = pathlib.Path('app/services/device_first_checkout_service.py').read_text(encoding='utf-8')
+    assert 'Device-first provider receipt for checkout' not in source
+    assert 'Device-first direct sale' not in source
+    # А это — то, что человек обязан увидеть вместо них.
+    assert 'Платёж картой получен' in source
+    assert 'Оплата подписки с баланса' in source
+    assert 'Оплата подписки картой' in source
+
+
+def test_period_in_the_description_speaks_human() -> None:
+    """Срок в подписи описывает тот же помощник, что и весь проект.
+
+    Это уже проверка ПОВЕДЕНИЯ: 180 дней он обязан назвать «6 месяцев», а не «180 days».
+    Без него подпись осталась бы русской по форме и машинной по содержанию.
+    """
+    from app.utils.pricing_utils import format_period_description
+
+    assert format_period_description(180) == '6 месяцев'
+    assert format_period_description(30) == '1 месяц'
+    assert format_period_description(2) == '2 дня'
 
 
 def test_purchase_step_flag_is_silent_by_default() -> None:
