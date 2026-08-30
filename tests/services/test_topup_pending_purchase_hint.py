@@ -106,9 +106,17 @@ async def test_the_threshold_is_the_one_the_renew_button_already_uses() -> None:
 
 @pytest.mark.anyio
 async def test_a_newcomer_and_a_trial_are_both_told_the_step_remains() -> None:
-    """Новичку покупать, пробному — покупать. Молчать нельзя ни тому, ни другому."""
+    """Новичку покупать, пробному — покупать. Молчать нельзя ни тому, ни другому.
+
+    🔴 Пробная подписка на боевом — это `status='active'` С ПРИЗНАКОМ `is_trial`, а вовсе не
+    отдельный статус: строк `status='trial'` в базе НЕТ НИ ОДНОЙ (замер 30.08: active/f — 60,
+    active/t — 28, expired/t — 80). Первая версия этого сторожа сеяла `status='trial'` и потому
+    проверяла состояние, которого не бывает; мутация «приравнять пробную к платной» её пережила.
+    Срок берём ДЛИННЫЙ намеренно: у трёхдневного триала срок и так внутри порога, и разницы между
+    защитой и её отсутствием не было бы видно — а длинные пробные существуют (админская выдача).
+    """
     assert await _hint([]) is not None
-    assert await _hint([_sub(status='trial', is_trial=True, days_left=30)]) is not None
+    assert await _hint([_sub(status='active', is_trial=True, days_left=30)]) is not None
 
 
 @pytest.mark.anyio
@@ -124,3 +132,31 @@ async def test_the_hint_speaks_the_persons_language() -> None:
     assert ru == get_texts('ru').TOPUP_SUBSCRIPTION_NOT_PAID_HINT
     assert en == get_texts('en').TOPUP_SUBSCRIPTION_NOT_PAID_HINT
     assert ru != en, 'иначе перевода нет, а сторож этого не заметит'
+
+
+@pytest.mark.anyio
+async def test_the_lookup_asks_only_about_this_persons_live_subscriptions() -> None:
+    """Сторож на САМ ЗАПРОС: фикстуры выше подсовывают готовые строки и заборов не проверяют.
+
+    Имена статусов зашиты литералами намеренно — сторож, читающий ту же константу, что и код,
+    проверяет совпадение с собой, а не защиту.
+    """
+    captured = []
+
+    class _Capturing(_Session):
+        async def execute(self, statement):
+            captured.append(statement)
+            return await super().execute(statement)
+
+    user = SimpleNamespace(id=106, language='ru')
+    with patch('app.services.payment.common.AsyncSessionLocal', lambda: _Capturing([])):
+        await topup_pending_purchase_hint(user)
+
+    assert len(captured) == 1
+    sql = str(captured[0].compile(compile_kwargs={'literal_binds': True}))
+    assert 'subscriptions.user_id = 106' in sql, sql
+    for live in ("'active'", "'trial'"):
+        assert live in sql, (live, sql)
+    # Истёкшая и отключённая подписки живыми не считаются: у их владельца шаг остался.
+    for dead in ("'expired'", "'disabled'"):
+        assert dead not in sql, (dead, sql)
