@@ -12,7 +12,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.cabinet.routes import admin_broadcasts as broadcast_routes
-from app.cabinet.schemas.broadcasts import BroadcastCreateRequest
+from app.cabinet.schemas.broadcasts import BroadcastCreateRequest, CombinedBroadcastCreateRequest
 from app.database.models import BroadcastHistory, UserStatus
 
 
@@ -110,15 +110,43 @@ async def test_first_send_is_not_blocked(no_worker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_guard_filters_by_admin_target_text_and_time(no_worker) -> None:
-    """Сторож формы запроса: без любого из четырёх условий забор ловил бы чужое или всё подряд."""
+async def test_guard_filters_by_target_text_time_and_outcome(no_worker) -> None:
+    """Сторож формы запроса: без любого из условий забор ловил бы чужое или всё подряд."""
     session = _RecordingSession(duplicate_id=None)
     await broadcast_routes.create_broadcast(_request(), SimpleNamespace(id=9, username='manager'), session)
 
     sql = session.duplicate_sql
     assert sql is not None, 'запрос к истории рассылок не выполнялся вовсе'
-    for column in ('admin_id', 'target_type', 'message_text', 'created_at'):
+    for column in ('target_type', 'message_text', 'created_at', 'sent_count', 'status'):
         assert f'broadcast_history.{column}' in sql, f'забор не смотрит на {column}'
+
+
+@pytest.mark.asyncio
+async def test_guard_is_not_scoped_to_one_admin(no_worker) -> None:
+    """Ключ НЕ содержит автора: иначе два человека шлют одно и то же и оба проходят.
+
+    Этап затеян ровно из-за второго человека за экраном рассылок, поэтому забор,
+    работающий только внутри одного аккаунта, не закрывал бы главный сценарий.
+    """
+    session = _RecordingSession(duplicate_id=None)
+    await broadcast_routes.create_broadcast(_request(), SimpleNamespace(id=9, username='manager'), session)
+
+    assert 'broadcast_history.admin_id' not in session.duplicate_sql
+
+
+@pytest.mark.asyncio
+async def test_repeat_after_total_failure_is_allowed(no_worker) -> None:
+    """Кампания, не дошедшая ни до кого, повторяется законно — это починка, а не промах.
+
+    Битую кнопку в ключ не положить: колонки под кнопки в истории не существует. Поэтому
+    забор отпускает по исходу: `sent_count > 0` в условии означает «блокируем только то,
+    что реально доставлено».
+    """
+    session = _RecordingSession(duplicate_id=None)
+    await broadcast_routes.create_broadcast(_request(), SimpleNamespace(id=9, username='m'), session)
+
+    assert 'broadcast_history.sent_count' in session.duplicate_sql
+    assert 'broadcast_history.status !=' in session.duplicate_sql
 
 
 @pytest.mark.asyncio
@@ -167,3 +195,64 @@ async def test_different_text_is_not_a_duplicate(no_worker) -> None:
     )
     assert session.added == 1, 'другое письмо той же аудитории — не повтор, забор молчать обязан'
     assert BroadcastHistory.__tablename__ == 'broadcast_history'
+
+
+@pytest.mark.asyncio
+async def test_guard_runs_on_the_route_the_cabinet_actually_uses(no_worker, monkeypatch) -> None:
+    """Все прочие сторожа звали `create_broadcast` — а кабинетный экран им НЕ пользуется.
+
+    Живой путь отправки — `create_combined_broadcast` (`POST /send`). Забор, проверенный
+    только на мёртвом маршруте, ничего не доказывает про то, чем работает человек.
+    """
+    started: list = []
+
+    async def _record(*args, **kwargs):
+        started.append(args)
+
+    monkeypatch.setattr(broadcast_routes.broadcast_service, 'start_broadcast', _record)
+    session = _RecordingSession(duplicate_id=88)
+    request = CombinedBroadcastCreateRequest(
+        channel='telegram',
+        target='all',
+        message_text='Скидка 20 % до пятницы',
+        selected_buttons=[],
+        custom_buttons=[],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await broadcast_routes.create_combined_broadcast(request, SimpleNamespace(id=9, username='m'), session)
+
+    assert exc.value.status_code == 409
+    assert '#88' in exc.value.detail
+    assert session.added == 0
+    assert started == [], 'воркер запущен — второе письмо ушло бы людям'
+
+
+@pytest.mark.asyncio
+async def test_email_subject_really_enters_the_key(no_worker, monkeypatch) -> None:
+    """Тема письма в ключе — не через ветку `IS NULL`, а настоящим сравнением.
+
+    Прежний сторож вызывал `create_broadcast`, который тему НЕ передаёт вовсе: колонка
+    попадала в SQL только пустой веткой, и почтовый случай не был проверен ничем.
+    """
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(broadcast_routes.email_broadcast_service, 'start_broadcast', _noop)
+    session = _RecordingSession(duplicate_id=None)
+    request = CombinedBroadcastCreateRequest(
+        channel='email',
+        target='all_email',
+        email_subject='Августовская акция',
+        email_html_content='<p>Текст письма</p>',
+        selected_buttons=[],
+        custom_buttons=[],
+    )
+
+    await broadcast_routes.create_combined_broadcast(request, SimpleNamespace(id=9, username='m'), session)
+
+    sql = session.duplicate_sql
+    assert 'broadcast_history.email_subject =' in sql, (
+        'тема сравнивается только пустой веткой — два РАЗНЫХ письма слипнутся в «повтор»'
+    )

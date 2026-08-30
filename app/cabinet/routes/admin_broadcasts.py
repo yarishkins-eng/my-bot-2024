@@ -536,8 +536,16 @@ async def _reject_duplicate_broadcast(
     result = await db.execute(
         select(BroadcastHistory.id)
         .where(
-            BroadcastHistory.admin_id == admin.id,
+            # admin_id в ключе НЕТ намеренно. С ним забор структурно не ловил бы двух
+            # человек: владелец и менеджер, отправившие одну акцию с разницей в минуту,
+            # не получили бы ни одного отказа - а этап затеян ровно из-за второго человека.
             BroadcastHistory.target_type == target,
+            # Повтор ПОСЛЕ ПРОВАЛА и после остановки - законный, а не промах:
+            # "0 доставлено" означает, что чинили битую кнопку или разметку и шлют снова
+            # (кнопок в ключе нет и быть не может - колонки под них в истории не существует),
+            # а диалог остановки сам инструктирует "создайте новую кампанию".
+            BroadcastHistory.sent_count > 0,
+            BroadcastHistory.status != 'cancelled',
             BroadcastHistory.category == category,
             text_matches,
             subject_matches,
@@ -553,9 +561,10 @@ async def _reject_duplicate_broadcast(
     raise HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail=(
-            f'Такая же рассылка на эту аудиторию уже создана — кампания #{existing_id}. '
-            f'Откройте её в списке и посмотрите результат. Если повтор нужен намеренно, '
-            f'подождите {DUPLICATE_BROADCAST_WINDOW_MINUTES} минут или измените текст.'
+            f'Такая же рассылка на эту аудиторию уже создана — кампания #{existing_id}, '
+            f'и она доставлена. Откройте её в списке и посмотрите результат. '
+            f'Если повтор нужен намеренно, измените текст, вложение, тему письма или '
+            f'категорию — либо подождите {DUPLICATE_BROADCAST_WINDOW_MINUTES} минут.'
         ),
     )
 
@@ -563,7 +572,12 @@ async def _reject_duplicate_broadcast(
 @router.post('', response_model=BroadcastResponse, status_code=status.HTTP_201_CREATED)
 async def create_broadcast(
     request: BroadcastCreateRequest,
-    admin: User = Depends(require_permission('broadcasts:create')),
+    # Было `broadcasts:create`. Маршрут не просто создаёт запись - он тут же ЗАПУСКАЕТ
+    # рассылку на всю базу, то есть делает ровно то же, что `/send`. Кабинетный экран им
+    # не пользуется вовсе, а роль "только готовить, отправляю я" на нём беззвучно
+    # разваливалась: create без send давал массовую отправку и не давал остановить.
+    # Обе готовые роли имеют `broadcasts:*`, поэтому ужесточение никого не задевает.
+    admin: User = Depends(require_permission('broadcasts:send')),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> BroadcastResponse:
     """Create and start a broadcast."""
