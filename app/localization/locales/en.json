@@ -1391,6 +1391,7 @@
   "RESET_DEVICE_CONFIRM_BUTTON": "✅ Reset this device",
   "RESET_TRAFFIC_BUTTON": "🔄 Reset traffic",
   "NO_SAVED_SUBSCRIPTION_ORDER": "No pending subscription order was found.",
+  "TOPUP_SUBSCRIPTION_NOT_PAID_HINT": "⚠️ The money is on your balance, but the subscription will not pay for itself. Tap the button below and pick a period.",
   "RETURN_TO_SUBSCRIPTION_CHECKOUT": "⬅️ Return to subscription checkout",
   "BALANCE_TOPPED_UP_CART_SUFFICIENT": "✅ Balance topped up by {amount}!\n\n💰 Current balance: {balance}\n\n🛒 You have a saved cart for {cart_total}\nYour balance is sufficient to proceed.",
   "BALANCE_TOPPED_UP_CART_INSUFFICIENT": "✅ Balance topped up by {amount}!\n\n💰 Current balance: {balance}\n\n🛒 You have a saved cart for {cart_total}\nStill needed: {missing}",

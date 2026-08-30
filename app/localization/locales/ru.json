@@ -1413,6 +1413,7 @@
   "RESET_DEVICE_CONFIRM_BUTTON": "✅ Да, сбросить это устройство",
   "RESET_TRAFFIC_BUTTON": "🔄 Сбросить трафик",
   "NO_SAVED_SUBSCRIPTION_ORDER": "❗️ Сохраненный заказ не найден.",
+  "TOPUP_SUBSCRIPTION_NOT_PAID_HINT": "⚠️ Деньги на балансе, но подписка сама не оплатится. Нажмите кнопку ниже и выберите срок.",
   "RETURN_TO_SUBSCRIPTION_CHECKOUT": "⬅️ Вернуться к оформлению подписки",
   "BALANCE_TOPPED_UP_CART_SUFFICIENT": "✅ Баланс пополнен на {amount}!\n\n💰 Текущий баланс: {balance}\n\n🛒 У вас есть сохранённая корзина на {cart_total}\nСредств на балансе достаточно для оформления.",
   "BALANCE_TOPPED_UP_CART_INSUFFICIENT": "✅ Баланс пополнен на {amount}!\n\n💰 Текущий баланс: {balance}\n\n🛒 У вас есть сохранённая корзина на {cart_total}\nНе хватает: {missing}",

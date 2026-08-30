@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import uuid
 from datetime import UTC, datetime
 from importlib import import_module
@@ -756,6 +757,19 @@ class PlategaPaymentMixin:
         if getattr(self, 'bot', None) and user.telegram_id:
             try:
                 keyboard = await self.build_topup_success_keyboard(user)
+                # 🔴 Последняя строка сообщения РАЗНАЯ у двух разных людей, и это решение, а не
+                # небрежность. Прежняя фраза «Баланс пополнен автоматически!» ничего не добавляла
+                # к сумме строкой выше, зато ставила точку — и клиент 106 прочитала её как
+                # «покупка закрыта»: деньги легли на баланс, подписка кончилась, 249 ₽ пролежали
+                # сутки. Тому, кому ещё есть что оформлять, называем оставшийся шаг; тому, у кого
+                # подписка с запасом, оставляем прежний текст без единого изменения.
+                from app.services.payment.common import topup_pending_purchase_hint
+
+                # ⛔ Экранируем: с этой правки хвост стал ПЕРЕВОДИМЫМ текстом, а сообщение уходит
+                # с `parse_mode='HTML'`. Одна угловая скобка от переводчика — и `send_message`
+                # бросит, а `except` ниже только пишет в лог: человек не получит НИЧЕГО о своих
+                # деньгах. Раньше хвост был литералом в коде, и достать его было некому.
+                tail = html.escape(await topup_pending_purchase_hint(user) or 'Баланс пополнен автоматически!')
                 await self.bot.send_message(
                     user.telegram_id,
                     (
@@ -763,7 +777,7 @@ class PlategaPaymentMixin:
                         f'💰 Сумма: {settings.format_price(payment.amount_kopeks)}\n'
                         f'🦊 Способ: {method_title}\n'
                         f'🆔 Транзакция: {transaction.id}\n\n'
-                        'Баланс пополнен автоматически!'
+                        f'{tail}'
                     ),
                     parse_mode='HTML',
                     reply_markup=keyboard,
