@@ -272,7 +272,17 @@ async def show_balance_history(callback: types.CallbackQuery, db_user: User, db:
 
     for transaction in raw_transactions:
         rounded_time = transaction.created_at.replace(second=0, microsecond=0)
-        transaction_key = (transaction.amount_kopeks, transaction.description, rounded_time)
+        # 🔴 Этап ДВ-3, мина IE. Ключ склейки держался на том, что описание несло номер
+        # заказа и потому было уникальным. Подписи стали типовыми — и две ОДИНАКОВЫЕ по цене
+        # и сроку покупки одного человека в одну минуту схлопнулись бы в одну строку. Номер
+        # проводки восстанавливает уникальность там, где она была, и ничего не меняет для
+        # остальных записей: у них это поле пустое, как и раньше.
+        transaction_key = (
+            transaction.amount_kopeks,
+            transaction.description,
+            rounded_time,
+            transaction.device_first_ledger_key,
+        )
 
         if transaction_key not in seen_transactions:
             seen_transactions.add(transaction_key)
@@ -287,7 +297,17 @@ async def show_balance_history(callback: types.CallbackQuery, db_user: User, db:
 
     for transaction in all_transactions:
         rounded_time = transaction.created_at.replace(second=0, microsecond=0)
-        transaction_key = (transaction.amount_kopeks, transaction.description, rounded_time)
+        # 🔴 Этап ДВ-3, мина IE. Ключ склейки держался на том, что описание несло номер
+        # заказа и потому было уникальным. Подписи стали типовыми — и две ОДИНАКОВЫЕ по цене
+        # и сроку покупки одного человека в одну минуту схлопнулись бы в одну строку. Номер
+        # проводки восстанавливает уникальность там, где она была, и ничего не меняет для
+        # остальных записей: у них это поле пустое, как и раньше.
+        transaction_key = (
+            transaction.amount_kopeks,
+            transaction.description,
+            rounded_time,
+            transaction.device_first_ledger_key,
+        )
         if transaction_key not in seen_all:
             seen_all.add(transaction_key)
             total_unique += 1

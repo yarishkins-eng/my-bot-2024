@@ -805,6 +805,10 @@ async def get_user_detail(
             payment_method=t.payment_method,
             is_completed=t.is_completed,
             created_at=t.created_at,
+            # 🔴 Мина ID: номер заказа исчез со всех экранов вместе с переводом подписи.
+            # Сборщиков карточки ДВА, и оба обязаны его нести — иначе один экран владельца
+            # знает номер, а соседний нет.
+            external_id=t.external_id,
         )
         for t in transactions
     ]
@@ -3119,6 +3123,10 @@ async def get_user_transactions(
             payment_method=t.payment_method,
             is_completed=t.is_completed,
             created_at=t.created_at,
+            # 🔴 Мина ID: номер заказа исчез со всех экранов вместе с переводом подписи.
+            # Сборщиков карточки ДВА, и оба обязаны его нести — иначе один экран владельца
+            # знает номер, а соседний нет.
+            external_id=t.external_id,
         )
         for t in transactions
     ]

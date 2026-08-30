@@ -1565,10 +1565,11 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         user_id=user.id,
         type=TransactionType.SUBSCRIPTION_PAYMENT.value,
         amount_kopeks=-charge,
-        description=(
-            f'Device-first: {checkout.period_days} дн., '
-            f'{checkout.selected_device_limit} устр., checkout {checkout.public_id}'
-        ),
+        # 🔴 Этап ДВ-3. Третий машинный шаблон в этом файле, найден критиком полноты. Путь
+        # сегодня спит (ноль строк на боевом), но проснётся — и напишет в историю кошелька
+        # ровно то, что этап убирает. ⛔ Слова «устройств» здесь нет намеренно: подпись с ним
+        # уводит продажу в статистику допов (см. комментарий у прихода ниже).
+        description=(f'Оплата подписки с баланса: {format_period_description(int(checkout.period_days))}'),
         payment_method='balance',
         external_id=f'device-first:{checkout.public_id}:debit',
         device_first_checkout_id=checkout.id,

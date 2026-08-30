@@ -40,6 +40,19 @@ class _RecordingSession:
         return [str(s.compile(compile_kwargs={'literal_binds': True})) for s in self.statements]
 
 
+def _service_source() -> str:
+    """Исходник службы выдачи, найденный от САМОГО ТЕСТА, а не от текущей папки.
+
+    Нашла ревизия: два сторожа читали файл голым относительным путём, и запуск не из корня
+    репозитория ронял их `FileNotFoundError`. Остальные подобные сторожа проекта считают от
+    `__file__` — делаем как они.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    return (root / 'app' / 'services' / 'device_first_checkout_service.py').read_text(encoding='utf-8')
+
+
 @pytest.mark.asyncio
 async def test_wallet_history_hides_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """История операций обязана быть ПОЛНОЙ — решение владельца 31.08.2026.
@@ -95,11 +108,13 @@ def test_no_english_machine_text_reaches_the_wallet_history() -> None:
     Растяжка ловит ровно одну регрессию — возврат прежних шаблонов, — и этого достаточно,
     чтобы следующий не вернул их не глядя.
     """
-    import pathlib
-
-    source = pathlib.Path('app/services/device_first_checkout_service.py').read_text(encoding='utf-8')
+    source = _service_source()
     assert 'Device-first provider receipt for checkout' not in source
     assert 'Device-first direct sale' not in source
+    # 🔴 Третий шаблон в том же файле, найден критиком полноты: ветка списания с кошелька
+    # писала «Device-first: 30 дн., 2 устр., checkout <uuid>». Путь спит, но имя сторожа
+    # обещало больше, чем он делал.
+    assert 'дн., ' not in source or 'устр., checkout' not in source
     # А это — то, что человек обязан увидеть вместо них.
     assert 'Платёж картой получен' in source
     assert 'Оплата подписки с баланса' in source
@@ -126,11 +141,9 @@ def test_sale_descriptions_are_not_mistaken_for_addons() -> None:
 
     Сторож привязан к ЖИВОМУ списку шаблонов: добавят новый — проверка ужесточится сама.
     """
-    import pathlib
-
     from app.database.crud.transaction import ADDON_DESCRIPTION_PATTERNS
 
-    source = pathlib.Path('app/services/device_first_checkout_service.py').read_text(encoding='utf-8')
+    source = _service_source()
     prefixes = (
         'Платёж картой получен: подписка на ',
         'Оплата подписки с баланса: ',
@@ -158,6 +171,85 @@ def test_period_in_the_description_speaks_human() -> None:
     assert format_period_description(180) == '6 месяцев'
     assert format_period_description(30) == '1 месяц'
     assert format_period_description(2) == '2 дня'
+
+
+@pytest.mark.asyncio
+async def test_latest_payment_route_carries_the_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Маршрут, которым в кабинет приходит КЛИЕНТ 106, тоже несёт поле.
+
+    🔴 Дыру нашла ревизия перед выкладкой, и она худшего сорта: сторожа стояли на двух
+    маршрутах из трёх, а непокрытым остался ровно тот, что обслуживает названного
+    пострадавшего. Возврат по диплинку `startapp=tup-platega-ok` поднимает мини-приложение
+    заново, `sessionStorage` пуст, опрос идёт ПО СПОСОБУ — то есть сюда. Ревизия сняла
+    `_with_purchase_step` с этой ветки, и все 616 тестов остались зелёными.
+    """
+    from app.services.payment import common as payment_common
+
+    async def fake_hint(_user):
+        return 'Деньги на балансе, но подписка сама не оплатится.'
+
+    monkeypatch.setattr(payment_common, 'topup_pending_purchase_hint', fake_hint)
+
+    user = SimpleNamespace(id=106, telegram_id=1, username=None, language='ru')
+    payment = SimpleNamespace(
+        id=777,
+        user_id=106,
+        correlation_id='corr-777',
+        amount_kopeks=24_900,
+        status='PAID',
+        is_paid=True,
+        created_at=datetime.now(UTC),
+        expires_at=None,
+        user=user,
+    )
+
+    class _Session:
+        async def execute(self, _statement):
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: payment))
+
+    response = await balance_route.get_latest_payment_by_method(method='platega', user=user, db=_Session())
+
+    assert response.purchase_step_pending is True
+
+
+def test_provider_receipt_is_not_a_debit_in_the_cabinet() -> None:
+    """В кабинетном маршроте истории приход обязан оставаться плюсом.
+
+    Список дебетов зашит литералами прямо в маршруте; попади туда `provider_receipt` — и
+    человек снова увидит списание с кошелька, которого кошелёк не касался.
+    """
+    source = _route_source()
+    debit_line = next(line for line in source.splitlines() if 'is_debit = t.type in' in line)
+    assert 'provider_receipt' not in debit_line
+
+
+def _route_source() -> str:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    return (root / 'app' / 'cabinet' / 'routes' / 'balance.py').read_text(encoding='utf-8')
+
+
+def test_history_dedupe_key_stays_unique_per_order() -> None:
+    """Склейка одинаковых записей не должна съедать РАЗНЫЕ покупки.
+
+    🔴 Мина IE, наша. Ключ склейки держался на том, что описание несло номер заказа и потому
+    было уникальным. Подписи стали типовыми — и две одинаковые по цене и сроку покупки одного
+    человека в одну минуту схлопнулись бы в одну строку. Номер проводки возвращает уникальность.
+
+    ⚠️ Граница: это сторож по ИСХОДНИКУ. Настоящая проверка требует поднять обработчик с
+    aiogram-объектами, и такого стенда у экрана истории нет. Пробел назван, а не спрятан:
+    растяжка ловит ровно снятие поля из ключа — то есть возврат мины IE.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    source = (root / 'app' / 'handlers' / 'balance' / 'main.py').read_text(encoding='utf-8')
+
+    # Два места: страница и счётчик всего. Оба обязаны считать по одному правилу.
+    assert source.count('transaction.device_first_ledger_key,') == 2, (
+        'номер проводки исчез из ключа склейки — вернулась мина IE'
+    )
 
 
 def test_purchase_step_flag_is_silent_by_default() -> None:
