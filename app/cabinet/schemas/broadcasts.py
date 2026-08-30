@@ -1,5 +1,6 @@
 """Pydantic schemas for cabinet broadcasts."""
 
+import unicodedata
 from datetime import datetime
 from typing import Literal
 
@@ -75,6 +76,41 @@ class BroadcastButtonsResponse(BaseModel):
     buttons: list[BroadcastButton]
 
 
+_URL_FORBIDDEN_CATEGORIES = frozenset({'Cc', 'Cf', 'Zs', 'Zl', 'Zp'})
+
+
+def _validate_broadcast_button_url(value: str) -> str:
+    """Проверить ссылку кнопки рассылки ЦЕЛИКОМ, а не по первым восьми буквам.
+
+    🔴 РС-14а. Прежняя проверка была `startswith(('https://', 'tg://'))`. Её проходили
+    `https://пример.рф/акция ?utm=1` (пробел внутри), голое `https://` и адрес с невидимым
+    управляющим символом из копипасты. Такая кнопка уезжала в кампанию, а Телеграм отбивал
+    её `BUTTON_URL_INVALID` на КАЖДОМ получателе. Повторов у отправщика нет
+    (`broadcast_service.py`, `TelegramBadRequest` → `failed` сразу), поэтому одна опечатка
+    давала «0 доставлено» по всей аудитории — 304 человека на 30.08.2026.
+
+    ⛔ НЕ УБИРАТЬ и не ослаблять до проверки схемы: это единственное место, где ссылка
+    вообще проверяется на стороне сервера. Зеркальная проверка в кабинете
+    (`AdminBroadcastCreate.tsx`) гасит кнопку раньше, но она клиентская.
+    """
+    candidate = value.strip()
+    if not candidate.startswith(('https://', 'tg://')):
+        raise ValueError('URL must start with https:// or tg://')
+    # Категории вместо `isspace()`: неразрывный пробел (Zs), управляющий символ (Cc) и
+    # невидимый форматирующий (Cf — U+200B, U+FEFF) приезжают из копипасты и ломают ссылку
+    # ровно так же, как обычный пробел, но `isspace()` про Cf ничего не знает.
+    if any(unicodedata.category(ch) in _URL_FORBIDDEN_CATEGORIES for ch in candidate):
+        raise ValueError('URL must not contain spaces, control or invisible characters')
+    scheme, _, remainder = candidate.partition('://')
+    if not remainder:
+        raise ValueError('URL must contain an address after the scheme')
+    if scheme == 'https':
+        host = remainder.split('/', 1)[0].split('?', 1)[0].split('#', 1)[0]
+        if '.' not in host or host.startswith('.') or host.endswith('.'):
+            raise ValueError('URL must contain a valid host, for example https://teplo.example/page')
+    return candidate
+
+
 class CustomBroadcastButton(BaseModel):
     """Custom button for broadcast message."""
 
@@ -87,9 +123,8 @@ class CustomBroadcastButton(BaseModel):
     def validate_action_value(cls, v: str, info) -> str:
         action_type = info.data.get('action_type', 'callback')
         if action_type == 'url':
-            if not v.startswith(('https://', 'tg://')):
-                raise ValueError('URL must start with https:// or tg://')
-        elif action_type == 'callback':
+            return _validate_broadcast_button_url(v)
+        if action_type == 'callback':
             # Telegram API limits callback_data to 64 bytes
             if len(v.encode('utf-8')) > 64:
                 raise ValueError('Callback data must be at most 64 bytes')
