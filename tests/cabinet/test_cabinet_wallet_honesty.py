@@ -104,6 +104,15 @@ def test_no_english_machine_text_reaches_the_wallet_history() -> None:
     assert 'Платёж картой получен' in source
     assert 'Оплата подписки с баланса' in source
     assert 'Оплата подписки картой' in source
+    # 🔴 Добавлено после мутационного прогона: без этих двух строк мутация «печатать срок
+    # числом дней вместо помощника» переживала весь набор. Прежний сторож проверял САМ
+    # помощник (`format_period_description(180) == '6 месяцев'`) — то есть совпадение, а не
+    # то, что подпись им пользуется. Стережём обе подписи поимённо.
+    assert source.count('format_period_description(int(snapshot["period_days"]))') == 2
+    assert source.count('лимит устройств {int(snapshot["device_limit"])}') == 2
+    # Источник денег обязан различаться: «с баланса» при оплате кошельком — ложь при оплате
+    # картой, потому что баланс тогда не двигался вовсе.
+    assert "if checkout.funding_mode == 'wallet' else 'Оплата подписки картой: '" in source
 
 
 def test_period_in_the_description_speaks_human() -> None:
