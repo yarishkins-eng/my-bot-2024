@@ -109,10 +109,42 @@ def test_no_english_machine_text_reaches_the_wallet_history() -> None:
     # помощник (`format_period_description(180) == '6 месяцев'`) — то есть совпадение, а не
     # то, что подпись им пользуется. Стережём обе подписи поимённо.
     assert source.count('format_period_description(int(snapshot["period_days"]))') == 2
-    assert source.count('лимит устройств {int(snapshot["device_limit"])}') == 2
     # Источник денег обязан различаться: «с баланса» при оплате кошельком — ложь при оплате
     # картой, потому что баланс тогда не двигался вовсе.
     assert "if checkout.funding_mode == 'wallet' else 'Оплата подписки картой: '" in source
+
+
+def test_sale_descriptions_are_not_mistaken_for_addons() -> None:
+    """Подпись продажи не должна выглядеть как докупка устройств или трафика.
+
+    🔴 Поймано вопросом владельца «а это безопасно?» — уже после того, как код был написан,
+    отревьюен шестью линзами и прогнан мутациями. Отчёты о продажах отличают допы от продаж
+    ЕДИНСТВЕННЫМ способом: по подстроке в описании (`crud/transaction.py`). Первая редакция
+    подписи содержала «лимит устройств N», и каждая прямая продажа картой уехала бы в
+    статистику допов. Сам файл с шаблонами об этом предупреждает — предупреждение я прочитал
+    уже после того, как в него наступил.
+
+    Сторож привязан к ЖИВОМУ списку шаблонов: добавят новый — проверка ужесточится сама.
+    """
+    import pathlib
+
+    from app.database.crud.transaction import ADDON_DESCRIPTION_PATTERNS
+
+    source = pathlib.Path('app/services/device_first_checkout_service.py').read_text(encoding='utf-8')
+    prefixes = (
+        'Платёж картой получен: подписка на ',
+        'Оплата подписки с баланса: ',
+        'Оплата подписки картой: ',
+    )
+    for prefix in prefixes:
+        assert prefix in source, f'подпись {prefix!r} исчезла'
+
+    for pattern in ADDON_DESCRIPTION_PATTERNS:
+        word = pattern.strip('%').lower()
+        for prefix in prefixes:
+            assert word not in prefix.lower(), f'подпись {prefix!r} уводит продажу в статистику допов'
+
+    assert 'лимит устройств' not in source
 
 
 def test_period_in_the_description_speaks_human() -> None:
