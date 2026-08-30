@@ -230,6 +230,12 @@ async def test_a_naive_end_date_does_not_shift_the_boundary_by_three_hours(
     # И тот же момент времени с явным поясом обязан дать ТОТ ЖЕ ответ.
     aware = _sub(status='active', is_trial=False, days_left=threshold + 1 / 24)
     assert await _hint([aware]) is None
+    # 🔴 И третий зонд, без которого сторож теряет ДРУГУЮ мутацию — «убрать нормализацию совсем».
+    # Тогда наивный срок сравнивается с датой в поясе, летит `TypeError`, его глотает `except`,
+    # и функция молчит. Оба зонда выше ждут молчания, то есть такую поломку не отличили бы.
+    # Здесь срок глубоко внутри порога, и правильный ответ — фраза ЕСТЬ.
+    inside = _sub(status='active', is_trial=False, days_left=0.1, naive=True)
+    assert await _hint([inside]) is not None
 
 
 @pytest.mark.anyio
