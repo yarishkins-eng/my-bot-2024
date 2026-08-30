@@ -39,6 +39,11 @@ class _Rows:
     def scalars(self):
         return self
 
+    def first(self):
+        # РС-14г: забор повторов читает ответ через `.scalars().first()`.
+        # Пустая выборка обязана уметь отвечать «ничего нет», а не падать.
+        return None
+
 
 class _RecordingSession:
     def __init__(self) -> None:

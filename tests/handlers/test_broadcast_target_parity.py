@@ -643,8 +643,20 @@ async def test_tariff_catalog_forwards_each_category_to_projection(monkeypatch) 
         def all(self):
             return [(17,), (23,)]
 
+    class _NoDuplicates:
+        # РС-14г: забор повторов спрашивает историю рассылок и читает ответ через
+        # `.scalars().first()`. Прежний фейк отвечал СПИСКОМ ТАРИФОВ на любой запрос,
+        # то есть на вопрос «был ли такой же недавно» сказал бы «да, кампания #17».
+        def scalars(self):
+            return self
+
+        def first(self):
+            return None
+
     class FakeSession:
         async def execute(self, statement):
+            if 'broadcast_history' in str(statement):
+                return _NoDuplicates()
             return FakeRows()
 
     async def fake_projection(session, target: str, category: str, *, preloaded_users=None):
@@ -798,11 +810,21 @@ async def test_create_route_forwards_exact_target_and_category_to_each_worker(mo
         def all(self):
             return [(17,)]
 
+    class _NoDuplicates:
+        # РС-14г, см. пояснение выше: тарифы и история рассылок читаются по-разному.
+        def scalars(self):
+            return self
+
+        def first(self):
+            return None
+
     class FakeSession:
         def __init__(self):
             self.next_id = 100
 
         async def execute(self, statement):
+            if 'broadcast_history' in str(statement):
+                return _NoDuplicates()
             return FakeRows()
 
         def add(self, broadcast) -> None:

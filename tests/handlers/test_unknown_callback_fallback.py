@@ -202,8 +202,20 @@ def test_custom_broadcast_callback_allowlist_is_exact_and_urls_are_unaffected() 
 
 
 class _TariffRows:
+    """Пустой результат запроса.
+
+    РС-14г: у забора повторов ответ читается через `.scalars().first()`, поэтому фейк обязан
+    уметь и это — иначе он не «пустая выборка», а «выборка, недоступная для чтения».
+    """
+
     def all(self):
         return []
+
+    def scalars(self):
+        return self
+
+    def first(self):
+        return None
 
 
 class _NoWriteSession:

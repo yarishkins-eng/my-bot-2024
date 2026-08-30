@@ -1,6 +1,6 @@
 """Admin routes for broadcasts in cabinet."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -68,9 +68,14 @@ SAFE_CUSTOM_BROADCAST_CALLBACKS = frozenset(
 # ⛔ РС-9 не меняет состав пользовательских сегментов. Канальная проекция ниже
 # исключает недоступные адреса и opt-out, а подписи честно называют оставшиеся
 # особенности сегмента.
+# 🔴 РС-14е. Порядок словаря = порядок кнопок на экране (ответ собирается циклом по нему).
+# «Все» стояла ВТОРОЙ строкой, вплотную к «только мне»: промах на одну строку означал отправку
+# всей базе (304 человека на 30.08.2026). Единственной защитой было подтверждение с числом.
+# Теперь «Все» уехала в конец и в собственную группу `broad` — попасть в неё мимо соседней
+# кнопки больше нельзя, а подтверждение осталось вторым рубежом, а не единственным.
+# ⛔ НЕ возвращать 'all' наверх «для удобства»: удобство здесь и есть дефект.
 FILTER_LABELS = {
     'self': 'Тест: только мне',
-    'all': 'Все активные с Telegram',
     'active': 'Действующая подписка, не пробная',
     'trial': 'Сейчас числится пробной (в т.ч. истёкшая)',
     'no': 'Сейчас без подписки',
@@ -79,11 +84,12 @@ FILTER_LABELS = {
     'zero': 'Действующая, 0 ГБ за текущий период',
     'active_zero': 'Действующая не пробная, 0 ГБ за период',
     'trial_zero': 'Действующая пробная, 0 ГБ за период',
+    'all': 'Все активные с Telegram',
 }
 
 FILTER_GROUPS = {
     'self': 'basic',
-    'all': 'basic',
+    'all': 'broad',  # РС-14е: своя группа, чтобы «Все» не стояла соседней строкой с «только мне»
     'active': 'subscription',
     'trial': 'subscription',
     'no': 'subscription',
@@ -472,6 +478,56 @@ async def preview_broadcast(
     )
 
 
+# 🔴 РС-14г (мина GZ). У рассылок нет ключа идемпотентности и уникального индекса: если ответ
+# сервера потерялся, а страница перезагрузилась, ничто не мешает создать вторую такую же кампанию
+# и прислать людям второе письмо. Черновик при перезагрузке стирается целиком, поэтому повтор
+# требует заново набрать текст и выбрать аудиторию — владелец, работающий один, по дороге заглянет
+# в список кампаний. Но рассылками занимается уже не только он.
+# Настоящую идемпотентность делать нельзя: это миграция и новая колонка. Достаточно окна: две
+# ОДИНАКОВЫЕ кампании одного админа на одну аудиторию за пять минут — почти наверняка не замысел.
+# Отказ называет номер уже созданной кампании, чтобы человек пошёл смотреть её, а не гадать.
+# ⛔ Ставится ПОСЛЕ канонизации текста: сравнивать надо то, что уйдёт, а не то, что набрали.
+DUPLICATE_BROADCAST_WINDOW_MINUTES = 5
+
+
+async def _reject_duplicate_broadcast(
+    db: AsyncSession,
+    *,
+    admin: User,
+    target: str,
+    message_text: str | None,
+) -> None:
+    """Отбить повтор той же кампании на ту же аудиторию в пределах окна."""
+    window_start = datetime.now(UTC) - timedelta(minutes=DUPLICATE_BROADCAST_WINDOW_MINUTES)
+    text_matches = (
+        BroadcastHistory.message_text.is_(None)
+        if message_text is None
+        else BroadcastHistory.message_text == message_text
+    )
+    result = await db.execute(
+        select(BroadcastHistory.id)
+        .where(
+            BroadcastHistory.admin_id == admin.id,
+            BroadcastHistory.target_type == target,
+            text_matches,
+            BroadcastHistory.created_at >= window_start,
+        )
+        .order_by(BroadcastHistory.id.desc())
+        .limit(1)
+    )
+    existing_id = result.scalars().first()
+    if existing_id is None:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            f'Такая же рассылка на эту аудиторию уже создана — кампания #{existing_id}. '
+            f'Откройте её в списке и посмотрите результат. Если повтор нужен намеренно, '
+            f'подождите {DUPLICATE_BROADCAST_WINDOW_MINUTES} минут или измените текст.'
+        ),
+    )
+
+
 @router.post('', response_model=BroadcastResponse, status_code=status.HTTP_201_CREATED)
 async def create_broadcast(
     request: BroadcastCreateRequest,
@@ -511,6 +567,8 @@ async def create_broadcast(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    await _reject_duplicate_broadcast(db, admin=admin, target=request.target, message_text=message_text)
 
     media_payload = request.media
 
@@ -726,6 +784,8 @@ async def create_combined_broadcast(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='Email HTML content is required for email broadcast',
             )
+
+    await _reject_duplicate_broadcast(db, admin=admin, target=request.target, message_text=telegram_message_text)
 
     media_payload = request.media
 
