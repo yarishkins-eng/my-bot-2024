@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import uuid
 from datetime import UTC, datetime
 from importlib import import_module
@@ -764,7 +765,11 @@ class PlategaPaymentMixin:
                 # подписка с запасом, оставляем прежний текст без единого изменения.
                 from app.services.payment.common import topup_pending_purchase_hint
 
-                tail = await topup_pending_purchase_hint(user) or 'Баланс пополнен автоматически!'
+                # ⛔ Экранируем: с этой правки хвост стал ПЕРЕВОДИМЫМ текстом, а сообщение уходит
+                # с `parse_mode='HTML'`. Одна угловая скобка от переводчика — и `send_message`
+                # бросит, а `except` ниже только пишет в лог: человек не получит НИЧЕГО о своих
+                # деньгах. Раньше хвост был литералом в коде, и достать его было некому.
+                tail = html.escape(await topup_pending_purchase_hint(user) or 'Баланс пополнен автоматически!')
                 await self.bot.send_message(
                     user.telegram_id,
                     (

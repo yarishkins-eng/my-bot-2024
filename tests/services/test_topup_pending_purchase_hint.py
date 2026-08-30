@@ -17,7 +17,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -61,17 +61,25 @@ def _factory(rows):
     return lambda: _Session(rows)
 
 
-def _sub(*, status: str, is_trial: bool, days_left: float):
+def _sub(*, status: str, is_trial: bool, days_left: float, autopay: bool = False, naive: bool = False):
+    end = datetime.now(UTC) + timedelta(days=days_left)
     return SimpleNamespace(
         status=status,
         is_trial=is_trial,
-        end_date=datetime.now(UTC) + timedelta(days=days_left),
+        end_date=end.replace(tzinfo=None) if naive else end,
+        autopay_enabled=autopay,
     )
 
 
-async def _hint(rows, language: str = 'ru'):
+async def _hint(rows, language: str = 'ru', *, topup_intent: bool = False):
     user = SimpleNamespace(id=106, language=language)
-    with patch('app.services.payment.common.AsyncSessionLocal', _factory(rows)):
+    with (
+        patch('app.services.payment.common.AsyncSessionLocal', _factory(rows)),
+        patch(
+            'app.services.user_cart_service.user_cart_service.has_topup_intent',
+            AsyncMock(return_value=topup_intent),
+        ),
+    ):
         return await topup_pending_purchase_hint(user)
 
 
@@ -155,8 +163,47 @@ async def test_the_lookup_asks_only_about_this_persons_live_subscriptions() -> N
     assert len(captured) == 1
     sql = str(captured[0].compile(compile_kwargs={'literal_binds': True}))
     assert 'subscriptions.user_id = 106' in sql, sql
-    for live in ("'active'", "'trial'"):
+    for live in ("'active'", "'trial'", "'limited'"):
         assert live in sql, (live, sql)
+    assert 'autopay_enabled' in sql, sql
     # Истёкшая и отключённая подписки живыми не считаются: у их владельца шаг остался.
     for dead in ("'expired'", "'disabled'"):
         assert dead not in sql, (dead, sql)
+
+
+@pytest.mark.anyio
+async def test_we_stay_silent_when_the_cart_is_about_to_spend_the_same_money() -> None:
+    """🔴 P0 этапа. Автопокупка корзины на боевом ВКЛЮЧЕНА.
+
+    `AUTO_PURCHASE_AFTER_TOPUP_ENABLED` стоит `true` в `system_settings`, в `.env` ключа нет
+    (проверено 30.08.2026) — то есть дефолт `False` из кода не действует. Через секунду после
+    нашего сообщения автопокупка спишет тот же баланс и пришлёт своё «подписка оформлена».
+    Сказать перед ней «нажмите кнопку» — подтолкнуть купить ВТОРОЙ период поверх оплаченного.
+    """
+    expiring = [_sub(status='active', is_trial=False, days_left=0.1)]
+    assert await _hint(expiring, topup_intent=False) is not None
+    assert await _hint(expiring, topup_intent=True) is None
+
+
+@pytest.mark.anyio
+async def test_we_stay_silent_when_the_monitor_will_charge_by_itself() -> None:
+    """У автоплатежа «сами не спишутся» — прямая ложь: монитор спишет сам."""
+    assert await _hint([_sub(status='active', is_trial=False, days_left=1, autopay=True)]) is None
+    # Улика, что молчание даёт именно автоплатёж, а не срок: тот же срок без него — фраза есть.
+    assert await _hint([_sub(status='active', is_trial=False, days_left=1, autopay=False)]) is not None
+
+
+@pytest.mark.anyio
+async def test_exhausted_traffic_is_still_a_paid_subscription() -> None:
+    """`limited` — это оплаченная подписка с кончившимся трафиком, а не повод продавать снова.
+
+    Так же на неё смотрит меню подписчика (`funnel_state.py:88`).
+    """
+    assert await _hint([_sub(status='limited', is_trial=False, days_left=300)]) is None
+
+
+@pytest.mark.anyio
+async def test_a_naive_end_date_does_not_shift_the_boundary_by_three_hours() -> None:
+    """Срок без часового пояса читается как UTC, а не как местное время."""
+    assert await _hint([_sub(status='active', is_trial=False, days_left=10, naive=True)]) is None
+    assert await _hint([_sub(status='active', is_trial=False, days_left=0.1, naive=True)]) is not None
