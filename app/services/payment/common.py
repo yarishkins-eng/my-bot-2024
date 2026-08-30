@@ -68,6 +68,14 @@ async def topup_pending_purchase_hint(user: Any) -> str | None:
     `funnel_state.py:88`. Иначе человек с оплаченным годом и кончившимся трафиком получал бы
     предложение оформить подписку, которая у него есть.
 
+    ⛔ ПО СТАТУСУ НЕ ФИЛЬТРУЕМ НАМЕРЕННО, и это не небрежность, а починка мины HX. Первая
+    редакция спрашивала только ``active/trial/limited`` — и забор по автоплатежу, живущий внутри
+    того же запроса, ИСТЁКШУЮ платную подписку с автоплатежом не видел. А ``try_auto_extend_
+    expired_after_topup`` (`subscription_auto_purchase_service.py:2312`) работает ровно по ней:
+    человек получал бы «нажмите кнопку» и через секунду списание за продление — то есть ровно тот
+    толчок ко второму периоду, от которого этот забор и обещает защищать. Строк у одного человека
+    единицы, читать их все дешевле, чем держать такую дыру.
+
     ⛔ Плоское чтение своей сессией — намеренно: объект ``user`` приходит из вебхука и бывает вне
     сессии, а ленивая загрузка ``user.subscription`` роняет ``MissingGreenlet``. Молчим при любой
     осечке: фраза не обязана быть, а сообщение о зачислении денег обязано дойти.
@@ -105,10 +113,7 @@ async def topup_pending_purchase_hint(user: Any) -> str | None:
                         Subscription.is_trial,
                         Subscription.end_date,
                         Subscription.autopay_enabled,
-                    ).where(
-                        Subscription.user_id == user_id,
-                        Subscription.status.in_(['active', 'trial', 'limited']),
-                    )
+                    ).where(Subscription.user_id == user_id)
                 )
             ).all()
         now = datetime.now(UTC)
