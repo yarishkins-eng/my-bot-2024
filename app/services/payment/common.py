@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -28,6 +28,66 @@ from app.services.subscription_checkout_service import (
 from app.services.user_cart_service import user_cart_service
 from app.utils.miniapp_buttons import build_main_menu_button, build_miniapp_or_callback_button
 from app.utils.payment_logger import payment_logger as logger
+
+
+async def topup_pending_purchase_hint(user: Any) -> str | None:
+    """Назвать оставшийся шаг тому, кому он нужен — и промолчать тому, кому нет.
+
+    Зачем эта функция существует. Сообщение о пополнении кончалось фразой «Баланс пополнен
+    автоматически!». Она не несёт ничего сверх суммы строкой выше, зато ставит точку: галочка,
+    «успешно», «автоматически». Клиент 106 прочитала её ровно так и осталась без подписки при
+    деньгах на балансе — на прямой вопрос владельца ответила «я закинула деньги и думала, что
+    баланс пополнен». Это не потеря навигации: по кнопке она не шла, потому что не знала, что надо.
+
+    ⛔ Фраза НЕ обещает, что денег теперь хватает. В этот момент бот не знает ни выбранного срока,
+    ни числа устройств, и у человека, положившего 100 ₽ при цене 249 ₽, такое обещание было бы
+    новой ложью вместо старой. Говорим только то, что верно всегда: списание с баланса делает
+    человек, а не система. Сколько именно нужно — скажет экран покупки, он это умеет с этапа БК.
+
+    Порог «пора оформлять» НЕ придуман здесь: это тот же
+    ``get_subscriber_menu_renew_threshold_days``, по которому бот решает, показывать ли кнопку
+    «Продлить» (`app/utils/funnel_state.py:102`). Один порог на оба места — иначе фраза и кнопка
+    под ней разойдутся.
+
+    ⛔ Плоское чтение своей сессией — намеренно, по тем же причинам, что и у соседей в этом файле:
+    объект ``user`` приходит из вебхука и бывает вне сессии, а ленивая загрузка ``user.subscription``
+    роняет ``MissingGreenlet``. Молчим при любой осечке: фраза не обязана быть, а сообщение о
+    зачислении денег обязано дойти.
+    """
+    try:
+        texts = get_texts(getattr(user, 'language', None) or 'ru')
+        user_id = getattr(user, 'id', None)
+        if user_id is None:
+            return None
+        threshold_days = settings.get_subscriber_menu_renew_threshold_days()
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(Subscription.status, Subscription.is_trial, Subscription.end_date).where(
+                        Subscription.user_id == user_id,
+                        Subscription.status.in_(['active', 'trial']),
+                    )
+                )
+            ).all()
+        now = datetime.now(UTC)
+        for row in rows:
+            end_date = row.end_date
+            if end_date is None:
+                continue
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=UTC)
+            # Молчим только у того, кому оформлять сейчас нечего: платная подписка с запасом
+            # больше порога. Пробная сюда не попадает намеренно — ему как раз покупать.
+            if not row.is_trial and row.status == 'active' and end_date > now + timedelta(days=threshold_days):
+                return None
+        return texts.TOPUP_SUBSCRIPTION_NOT_PAID_HINT
+    except Exception as error:
+        logger.warning(
+            'Не удалось решить, называть ли оставшийся шаг после пополнения',
+            user_id=getattr(user, 'id', None),
+            error=error,
+        )
+        return None
 
 
 class PaymentCommonMixin:

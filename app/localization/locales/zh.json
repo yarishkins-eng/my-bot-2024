@@ -1326,6 +1326,7 @@
   "RESET_DEVICE_CONFIRM_BUTTON": "✅是，重置此设备",
   "RESET_TRAFFIC_BUTTON": "🔄重置流量",
   "NO_SAVED_SUBSCRIPTION_ORDER": "❗️未找到已保存的订单。",
+  "TOPUP_SUBSCRIPTION_NOT_PAID_HINT": "⚠️ 余额已到账，但不会自动购买订阅 — 请点击下方按钮。",
   "RETURN_TO_SUBSCRIPTION_CHECKOUT": "⬅️返回订阅结账",
   "RULES_ACCEPT": "✅我接受规则",
   "RULES_ACCEPTED_PROCESSING": "✅规则已接受！正在完成注册...",
