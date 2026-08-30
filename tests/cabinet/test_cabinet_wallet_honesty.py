@@ -179,6 +179,38 @@ async def test_unresolved_payment_does_not_ask_at_all(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+async def test_manual_check_carries_the_flag_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Все три сборщика ответа несут поле, а не два из трёх.
+
+    Нашла линза корректности. Маршрут ручной проверки платежа сегодня из кабинета никто не
+    зовёт — но оставить один сборщик без поля значит завести мину себе же: тот, кто завтра
+    выведет кнопку «Проверить статус» на экран результата, молча вернёт прежний текст.
+    """
+    from app.services.payment import common as payment_common
+
+    async def fake_hint(_user):
+        return 'Деньги на балансе, но подписка сама не оплатится.'
+
+    monkeypatch.setattr(payment_common, 'topup_pending_purchase_hint', fake_hint)
+
+    user = SimpleNamespace(id=106, telegram_id=1, username=None, language='ru')
+    record = _paid_record(user)
+
+    async def fake_get_payment_record(_db, _method, _payment_id):
+        return record
+
+    monkeypatch.setattr(balance_route, 'get_payment_record', fake_get_payment_record)
+    # Ручная проверка для этого способа недоступна — берём самую раннюю из трёх веток ответа.
+    monkeypatch.setattr(balance_route, '_is_checkable', lambda _record: False)
+
+    response = await balance_route.check_payment_status(
+        method='platega', payment_id=777, user=user, db=SimpleNamespace()
+    )
+
+    assert response.payment.purchase_step_pending is True
+
+
+@pytest.mark.asyncio
 async def test_the_route_itself_carries_the_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """Сторож на функцию не доказывает, что функция ПОДКЛЮЧЕНА.
 

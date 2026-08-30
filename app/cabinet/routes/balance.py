@@ -1384,8 +1384,22 @@ async def _with_purchase_step(record_response: PendingPaymentResponse, user: Use
     что молчит в чате. Свой список условий здесь был бы вторым, и он бы разъехался: в ДВ-2 в нём
     и метка намерения автопокупки, и автоплатёж, и порог «пора продлевать», и починка мины HX.
 
+    ⚠️ НО «одна функция» НЕ значит «чат и кабинет всегда говорят одно», и первая редакция этого
+    комментария так и утверждала — неверно. В ЧАТЕ функцию зовёт ровно один платёжный канал
+    (`app/services/payment/platega.py`); остальные восемнадцать шлют прежнее «Баланс пополнен
+    автоматически!» без всяких условий — это названная граница, мина **HY**. Здесь же вердикт
+    спрашивается для ЛЮБОГО способа оплаты. Значит при включении второго шлюза кабинет заговорит
+    там, где чат промолчит. Сегодня это ничего не меняет (живой шлюз ровно один: 170 платежей
+    Platega против нуля у всех прочих, замер 30.08.2026), и расхождение идёт в безопасную
+    сторону — кабинет говорит БОЛЬШЕ правды, а не меньше. Но знать об этом обязан тот, кто
+    будет включать второй шлюз: чинить надо чат, а не глушить кабинет.
+
     ⛔ Спрашиваем ТОЛЬКО у оплаченного платежа. Пока исход неизвестен, экран показывает
     ожидание, и подсказка ему не нужна — а маршрут опрашивают раз в три секунды.
+
+    ⚠️ Где помощник НЕ стоит и почему: списочный маршрут `/pending-payments` отдаёт до десяти
+    записей разом, и вердикт там означал бы десять походов в базу и в Redis на один запрос.
+    Экран результата пополнения его не зовёт (во фронте кабинета у него вообще нет вызовов).
     """
     if not record_response.is_paid:
         return record_response
@@ -1594,7 +1608,7 @@ async def check_payment_status(
         return ManualCheckResponse(
             success=False,
             message='Ручная проверка недоступна для этого платежа',
-            payment=_record_to_response(record),
+            payment=await _with_purchase_step(_record_to_response(record), user),
             status_changed=False,
         )
 
@@ -1613,7 +1627,7 @@ async def check_payment_status(
         return ManualCheckResponse(
             success=False,
             message='Не удалось проверить статус платежа',
-            payment=_record_to_response(record),
+            payment=await _with_purchase_step(_record_to_response(record), user),
             status_changed=False,
         )
 
@@ -1628,7 +1642,7 @@ async def check_payment_status(
     return ManualCheckResponse(
         success=True,
         message=message,
-        payment=_record_to_response(updated),
+        payment=await _with_purchase_step(_record_to_response(updated), user),
         status_changed=status_changed,
         old_status=old_status,
         new_status=updated.status,
