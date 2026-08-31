@@ -75,30 +75,60 @@ def test_assembled_client_message_never_carries_the_campaign_name():
         assert CAMPAIGN_NAME not in assembled, f'{locale}.json:{key} печатает клиенту имя кампании'
 
 
-@pytest.mark.asyncio
-async def test_admin_notification_still_names_the_campaign():
-    """⛔ Обратная сторона забора: владелец обязан ПРОДОЛЖАТЬ видеть, по какой кампании пришёл человек."""
+def _campaign() -> AdvertisingCampaign:
+    """Настоящая модель, а не подделка: подпись бонуса читает её свойства (`is_balance_bonus`)."""
+    return AdvertisingCampaign(
+        id=4, name=CAMPAIGN_NAME, start_parameter='teplo2', bonus_type='balance', balance_bonus_kopeks=5000
+    )
+
+
+def _service() -> AdminNotificationService:
     service = AdminNotificationService(bot=SimpleNamespace())
     service._is_enabled = lambda: True
     service._record_subscription_event = AsyncMock(return_value=None)
+    service._record_campaign_link_visit = AsyncMock(return_value=None)
     service._get_user_promo_group = AsyncMock(return_value=None)
     service._send_message = AsyncMock(return_value=True)
+    return service
 
+
+async def _registration_notification(service: AdminNotificationService) -> None:
     await service.send_campaign_registration_notification(
         db=AsyncMock(),
         telegram_user_id=777,
         telegram_user_name='Тестовый',
         telegram_username=None,
-        # Настоящая модель, а не подделка: подпись бонуса читает её свойства (`is_balance_bonus`).
-        campaign=AdvertisingCampaign(
-            id=4, name=CAMPAIGN_NAME, start_parameter='teplo2', bonus_type='balance', balance_bonus_kopeks=5000
-        ),
+        campaign=_campaign(),
         user=SimpleNamespace(id=1),
         bonus_type='balance',
         balance_kopeks=5000,
     )
 
+
+async def _link_visit_notification(service: AdminNotificationService) -> None:
+    await service.send_campaign_link_visit_notification(
+        db=AsyncMock(),
+        telegram_user=SimpleNamespace(id=777, full_name='Тестовый', username=None),
+        campaign=_campaign(),
+        user=None,
+    )
+
+
+# 🔴 Уведомлений про кампанию ДВА, и вскрыла это мутация, а не чтение: первый прогон заменил
+# имя в переходе по ссылке, сторож промолчал — он стерёг только регистрацию. Закрываем оба:
+# владелец различает кампании по обоим, и вычистить имя «за компанию» можно из любого.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('label', 'call'),
+    [('регистрация по кампании', _registration_notification), ('переход по ссылке', _link_visit_notification)],
+)
+async def test_admin_notification_still_names_the_campaign(label, call):
+    """⛔ Обратная сторона забора: владелец обязан ПРОДОЛЖАТЬ видеть, по какой кампании пришёл человек."""
+    service = _service()
+
+    await call(service)
+
     service._send_message.assert_awaited()
     sent_text = service._send_message.await_args.args[0]
-    assert CAMPAIGN_NAME in sent_text, 'владелец перестал видеть имя кампании в уведомлении о регистрации'
-    assert 'teplo2' in sent_text, 'владелец перестал видеть метку кампании'
+    assert CAMPAIGN_NAME in sent_text, f'владелец перестал видеть имя кампании: {label}'
+    assert 'teplo2' in sent_text, f'владелец перестал видеть метку кампании: {label}'
