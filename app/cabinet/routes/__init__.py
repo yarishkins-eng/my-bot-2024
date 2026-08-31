@@ -8,6 +8,7 @@ from .account_linking import merge_router as merge_router, router as account_lin
 from .admin_access_points import router as admin_access_points_router
 from .admin_apps import router as admin_apps_router
 from .admin_audit_log import router as admin_audit_log_router
+from .admin_auto_messages import router as admin_auto_messages_router
 from .admin_ban_system import router as admin_ban_system_router
 from .admin_broadcasts import router as admin_broadcasts_router
 from .admin_bulk_actions import router as admin_bulk_actions_router
@@ -147,6 +148,7 @@ router.include_router(admin_payment_methods_router)
 router.include_router(admin_landings_router)
 router.include_router(admin_payments_router)
 router.include_router(admin_promo_offers_router)
+router.include_router(admin_auto_messages_router)
 router.include_router(admin_remnawave_router)
 router.include_router(admin_email_templates_router)
 router.include_router(admin_updates_router)
