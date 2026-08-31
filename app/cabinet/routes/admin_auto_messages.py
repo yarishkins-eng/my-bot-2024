@@ -1,6 +1,13 @@
-"""Раздел кабинета «Автосообщения» — то, что бот отправляет клиентам сам.
+"""Раздел кабинета «Автосообщения» — то, что бот отправляет клиентам по расписанию.
 
-Экран читающий: он показывает ВСЕ автоматические сообщения бота, но менять умеет
+🔴 ГРАНИЦА КАТАЛОГА, не расширять молча. Здесь только сообщения, которые рождает
+СЛУЖБА МОНИТОРИНГА и служба суточных подписок — то есть те, что уходят сами, по
+времени. Подтверждения после действия клиента (авто-продление и авто-покупка
+после пополнения баланса — ``subscription_auto_purchase_service``, восемь отправок)
+в каталог НЕ входят: у них другая природа, другие условия и другой владелец. Если
+их когда-нибудь добавят, надо править и обещание на экране.
+
+Экран читающий: он показывает все сообщения по расписанию, но менять умеет
 только те пять, у которых выключатель уже существует в коде
 (``NotificationSettingsService._DEFAULTS``). Для остальных пятнадцати ``control``
 честно говорит «настроек нет», а ``PATCH`` по ним отвечает 409 — интерфейс не
@@ -60,9 +67,19 @@ MAX_OFFER_DISCOUNT_PERCENT = 50
 # на котором видно, кто именно обнулил цену: промогруппа или наше сообщение.
 _GUARD_REFERENCE_PRICE_KOPEKS = 100
 
+# Ноль процентов — не «выключено», а письмо «Скидка 0% на продление». Выключают
+# тумблером, а не обнулением.
+MIN_OFFER_DISCOUNT_PERCENT = 1
 MIN_VALID_HOURS = 1
 MAX_VALID_HOURS = 168
 MAX_TRIGGER_DAYS = 60
+
+# Человеческие имена полей: в отказ уходят они, а не латиница из кода.
+FIELD_TITLES: dict[str, str] = {
+    'discount_percent': 'Размер скидки',
+    'valid_hours': 'Сколько действует',
+    'trigger_days': 'Через сколько дней',
+}
 
 
 async def _max_promo_group_percent(db: AsyncSession) -> int:
@@ -93,12 +110,13 @@ async def _max_promo_group_percent(db: AsyncSession) -> int:
 
 async def _assert_discount_is_safe(db: AsyncSession, percent: int) -> None:
     """Отбить процент, от которого цена уходит в ноль. 422 с внятной причиной."""
-    if percent < 0 or percent > MAX_OFFER_DISCOUNT_PERCENT:
+    if percent < MIN_OFFER_DISCOUNT_PERCENT or percent > MAX_OFFER_DISCOUNT_PERCENT:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                f'Скидка сообщения не может быть больше {MAX_OFFER_DISCOUNT_PERCENT}%: '
-                'вместе со скидкой промогруппы цена может уйти в ноль.'
+                f'Размер скидки: допустимо от {MIN_OFFER_DISCOUNT_PERCENT} '
+                f'до {MAX_OFFER_DISCOUNT_PERCENT}%. Чтобы сообщение перестало уходить, '
+                'выключите его, а не ставьте ноль.'
             ),
         )
 
@@ -454,6 +472,9 @@ class AutoMessageItem(BaseModel):
     sent_count: int | None = None
     claimed_count: int | None = None
     claim_tracked: bool = False
+    # Границы для каждого поля. Экран берёт их отсюда, а не зашивает у себя: пол
+    # «через сколько дней» у разных сообщений разный, и зашитая единица врала бы.
+    limits: dict[str, list[int]] | None = None
 
 
 class AutoMessageSummary(BaseModel):
@@ -601,9 +622,13 @@ def _params_for(entry: dict[str, Any]) -> dict[str, int] | None:
     подтянет к границе. Геттеры делают и то и другое.
     """
     key = entry.get('settings_key')
-    names = entry.get('params')
-    if not key or not names:
+    if not key:
         return None
+    names = entry.get('params')
+    if not names:
+        # Пустой словарь, а НЕ None: у сообщения есть выключатель, просто нет числовых
+        # полей. None экран читал как «управлять нельзя» и говорил это про управляемое.
+        return {}
     values: dict[str, int] = {}
     for name in names:
         getter = GETTER_NAMES.get((key, name))
@@ -681,6 +706,23 @@ def _sent_for(entry: dict[str, Any], counts: dict[tuple[str, int | None], int]) 
     return sum(value for (key, _), value in counts.items() if key == sent_type)
 
 
+def _limits_for(entry: dict[str, Any]) -> dict[str, list[int]] | None:
+    """Границы полей ИМЕННО этого сообщения — экран не должен их угадывать."""
+    key = entry.get('settings_key')
+    names = entry.get('params')
+    if not key or not names:
+        return None
+    bounds: dict[str, list[int]] = {}
+    for name in names:
+        if name == 'discount_percent':
+            bounds[name] = [MIN_OFFER_DISCOUNT_PERCENT, MAX_OFFER_DISCOUNT_PERCENT]
+        elif name == 'valid_hours':
+            bounds[name] = [MIN_VALID_HOURS, MAX_VALID_HOURS]
+        elif name == 'trigger_days':
+            bounds[name] = [TRIGGER_DAYS_MIN.get(key, 1), MAX_TRIGGER_DAYS]
+    return bounds
+
+
 def _build_item(
     entry: dict[str, Any],
     reasons: dict[str, str],
@@ -705,6 +747,7 @@ def _build_item(
         sent_count=_sent_for(entry, sent_counts),
         claimed_count=claimed_counts.get(claim_type, 0) if claim_type else None,
         claim_tracked=bool(claim_type),
+        limits=_limits_for(entry),
     )
 
 
@@ -866,22 +909,27 @@ async def patch_auto_message(
 
     allowed = set(entry.get('params') or ())
     changes = payload.model_dump(exclude_none=True)
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Нечего сохранять: в запросе нет ни одного изменения.',
+        )
 
     for field in ('discount_percent', 'valid_hours', 'trigger_days'):
         if field in changes and field not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f'У этого сообщения нет настройки «{field}».',
+                detail=f'У этого сообщения нет настройки «{FIELD_TITLES[field]}».',
             )
 
     # Заборы ДО записи: половина применённых изменений хуже, чем ни одного.
     if 'discount_percent' in changes:
         await _assert_discount_is_safe(db, changes['discount_percent'])
     if 'valid_hours' in changes:
-        _assert_in_range(changes['valid_hours'], MIN_VALID_HOURS, MAX_VALID_HOURS, 'Срок действия скидки, часов')
+        _assert_in_range(changes['valid_hours'], MIN_VALID_HOURS, MAX_VALID_HOURS, FIELD_TITLES['valid_hours'])
     if 'trigger_days' in changes:
         min_days = TRIGGER_DAYS_MIN.get(settings_key, 1)
-        _assert_in_range(changes['trigger_days'], min_days, MAX_TRIGGER_DAYS, 'Через сколько дней')
+        _assert_in_range(changes['trigger_days'], min_days, MAX_TRIGGER_DAYS, FIELD_TITLES['trigger_days'])
 
     # 🔴 Включение — тоже опасное действие. Процент мог быть выставлен в сто из
     # чат-админки бота, где потолка нет; без этой проверки тумблер выпускал бы его
@@ -906,15 +954,21 @@ async def patch_auto_message(
             logger.error('auto_messages_setter_missing', settings_key=settings_key, field=field)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail='Внутренняя ошибка настройки. Значение не изменено.',
+                detail='Не удалось сохранить из-за ошибки в настройках раздела. Значение не изменено.',
             )
         written.append(bool(getattr(NotificationSettingsService, setter_name)(changes[field])))
 
     if written and not all(written):
+        # 🔴 Сервис меняет значение в памяти ДО записи на диск и не откатывает его при
+        # отказе. Кабинет и мониторинг — один процесс, поэтому без отката бот применял бы
+        # к живым клиентам значение, про которое нам только что сказали «не сохранено».
+        # Сбрасываем кэш, чтобы память вернулась к тому, что реально лежит на диске.
+        NotificationSettingsService._loaded = False
+        NotificationSettingsService._load()
         logger.error('auto_messages_save_failed', message_id=message_id, changes=sorted(changes))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Не удалось записать настройку на диск. Проверьте состояние сервера.',
+            detail='Не удалось сохранить: сервер не принял изменение. Значение осталось прежним.',
         )
 
     logger.info('auto_messages_patched', message_id=message_id, changes=sorted(changes))

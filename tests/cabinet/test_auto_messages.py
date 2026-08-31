@@ -336,3 +336,115 @@ async def test_history_permission_check_receives_the_client_ip() -> None:
     ):
         await _history_for(_history_db([]), CATALOG_BY_ID['return-wave2'], MagicMock(), MagicMock())
     assert checker.await_args.kwargs.get('ip_address') == '10.0.0.7'
+
+
+# ---------------------------------------------------------------------------
+# 5. Причина молчания и уточнение — разные вещи
+# ---------------------------------------------------------------------------
+
+
+def test_note_never_masquerades_as_a_reason_to_be_silent() -> None:
+    """«Низкий баланс» уходит — просто адресно. Оговорка про адресность не должна
+    делать сообщение молчащим и занижать счётчик работающих."""
+    from app.cabinet.routes.admin_auto_messages import _state_of
+
+    entry = CATALOG_BY_ID['low-balance']
+    notes = {'client_opt_in': 'уходит только тем, кто сам включил это в своих настройках'}
+    with patch.object(NotificationSettingsService, 'are_notifications_globally_enabled', return_value=True):
+        state, quiet_reason, note = _state_of(entry, {}, notes)
+
+    assert state == 'live'
+    assert quiet_reason is None, 'уточнение уехало в поле причины молчания'
+    assert note == notes['client_opt_in']
+
+
+def test_real_reason_still_makes_the_message_quiet() -> None:
+    from app.cabinet.routes.admin_auto_messages import _state_of
+
+    entry = CATALOG_BY_ID['grace-2d']
+    with patch.object(NotificationSettingsService, 'are_notifications_globally_enabled', return_value=True):
+        state, quiet_reason, note = _state_of(entry, {'grace_enabled': 'выключено на сервере'}, {})
+
+    assert state == 'quiet'
+    assert quiet_reason == 'выключено на сервере'
+    assert note is None
+
+
+# ---------------------------------------------------------------------------
+# 6. Права привязаны к маршрутам
+# ---------------------------------------------------------------------------
+
+
+def test_routes_require_the_right_permissions() -> None:
+    """Чтение и запись разведены НА МАРШРУТАХ, а не только в реестре прав.
+
+    🔴 Остальные тесты зовут обработчики напрямую, минуя зависимости FastAPI, —
+    подмена edit на read в декораторе прошла бы мимо всех них.
+    """
+    from app.cabinet.routes.admin_auto_messages import router
+
+    required: dict[tuple[str, str], set[str]] = {}
+    for route in router.routes:
+        codes: set[str] = set()
+        # Право зашито в замыкании зависимости — достаём из свободных переменных.
+        for dep in getattr(getattr(route, 'dependant', None), 'dependencies', []):
+            call = getattr(dep, 'call', None)
+            closure = getattr(call, '__closure__', None) or ()
+            for cell in closure:
+                value = cell.cell_contents
+                if isinstance(value, tuple) and value and isinstance(value[0], str) and ':' in value[0]:
+                    codes.update(value)
+        for method in getattr(route, 'methods', set()):
+            required[(method, getattr(route, 'path', ''))] = codes
+
+    assert required, 'не удалось вычитать права маршрутов — сторож ослеп'
+    for (method, path), codes in required.items():
+        assert codes, f'{method} {path} не требует ни одного права'
+        if method == 'PATCH':
+            assert 'auto_messages:edit' in codes, f'{method} {path} пускает на запись без edit'
+        else:
+            assert codes == {'auto_messages:read'}, f'{method} {path} требует неожиданное: {codes}'
+
+
+def test_zero_percent_is_refused() -> None:
+    """Ноль процентов — это письмо «Скидка 0%», а не выключение."""
+    from app.cabinet.routes.admin_auto_messages import MIN_OFFER_DISCOUNT_PERCENT
+
+    assert MIN_OFFER_DISCOUNT_PERCENT >= 1
+
+
+@pytest.mark.asyncio
+async def test_zero_percent_is_rejected_by_the_guard() -> None:
+    with patch(f'{_ROUTE}._max_promo_group_percent', AsyncMock(return_value=0)):
+        with pytest.raises(HTTPException) as exc:
+            await _assert_discount_is_safe(AsyncMock(), 0)
+    assert exc.value.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+@pytest.mark.asyncio
+async def test_empty_patch_is_refused_rather_than_reported_as_saved() -> None:
+    with pytest.raises(HTTPException) as exc:
+        await patch_auto_message('return-wave2', AutoMessagePatch(), AsyncMock(), MagicMock())
+    assert exc.value.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_message_with_a_switch_but_no_numbers_is_still_manageable() -> None:
+    """У «первого дня без подписки» есть выключатель и нет числовых полей.
+
+    Пустой словарь, а не None: None экран читал как «управлять нельзя» и говорил
+    это про управляемое сообщение.
+    """
+    from app.cabinet.routes.admin_auto_messages import _params_for
+
+    assert _params_for(CATALOG_BY_ID['return-day1']) == {}
+    assert _params_for(CATALOG_BY_ID['trial-2h']) is None
+
+
+def test_limits_are_per_message_and_reach_the_screen() -> None:
+    """Пол «через сколько дней» разный у разных сообщений — экран берёт его отсюда."""
+    from app.cabinet.routes.admin_auto_messages import _limits_for
+
+    assert _limits_for(CATALOG_BY_ID['return-wave3'])['trigger_days'][0] == 2
+    assert _limits_for(CATALOG_BY_ID['trial-discount'])['trigger_days'][0] == 1
+    assert _limits_for(CATALOG_BY_ID['return-wave2'])['discount_percent'] == [1, 50]
+    assert _limits_for(CATALOG_BY_ID['trial-2h']) is None
