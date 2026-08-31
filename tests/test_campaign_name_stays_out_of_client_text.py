@@ -10,8 +10,12 @@
 оставлено в АДМИНСКОМ уведомлении — третий тест это закрепляет, иначе следующий исполнитель
 вычистит «за компанию» и то, по чему владелец различает кампании.
 
-Сторож стережёт СВОЙСТВО («клиентское сообщение не называет кампанию»), а не букву фразы:
-он берёт ВСЕ ключи семейства во ВСЕХ локалях, поэтому новый ключ не протащит имя молча.
+Сторож стережёт СВОЙСТВО («клиентское сообщение не называет кампанию»), а не букву фразы.
+
+⚠️ ГРАНИЦА, названная честно (её нашла линза корректности мутациями, а не чтение):
+сторож накрывает ключи с префиксом `CAMPAIGN_BONUS_` в `locales/*.json` и подпись проводки.
+Клиентский текст, заведённый под ДРУГИМ именем ключа, он не увидит. Это цена того, что
+префикс — единственный машинный признак «текст про бонус кампании», который у нас есть.
 """
 
 import html
@@ -31,12 +35,27 @@ LOCALES = pathlib.Path(__file__).resolve().parents[1] / 'app' / 'localization' /
 # Подстановка, которой имя кампании попадало в текст. Забор именно на неё: она и есть механизм.
 CAMPAIGN_NAME_PLACEHOLDER = '{name}'
 
-CAMPAIGN_NAME = 'Кувалда 7000₽'
+# 🔴 Имя С АМПЕРСАНДОМ выбрано намеренно. С «Кувалда 7000₽» `html.escape` — пустая операция,
+# и сравнение проходило по совпадению: утечка имени, содержащего `&`, уезжала клиенту как
+# `Кувалда &amp; Ко` и сторож её не видел. Имя владелец пишет руками, `&` в нём законен.
+CAMPAIGN_NAME = 'Кувалда & Ко 7000₽'
+
+
+# 🔴 Ключи перечислены ПОИМЁННО, а не посчитаны. Прежний сторож требовал «хотя бы 10 штук»
+# и переживал удаление целого ключа из всех пяти локалей: 5×3=15, минус 5 = ровно 10.
+# А `start.py:421` на пропавшем ключе роняет каждую рекламную регистрацию.
+REQUIRED_KEYS = ('CAMPAIGN_BONUS_BALANCE', 'CAMPAIGN_BONUS_SUBSCRIPTION', 'CAMPAIGN_BONUS_TARIFF')
+
+
+def _locale_files() -> list[pathlib.Path]:
+    files = sorted(LOCALES.glob('*.json'))
+    assert files, 'локалей не найдено — сторож обязан упасть, а не позеленеть на пустоте'
+    return files
 
 
 def _client_bonus_texts() -> dict[tuple[str, str], str]:
     found: dict[tuple[str, str], str] = {}
-    for path in sorted(LOCALES.glob('*.json')):
+    for path in _locale_files():
         data = json.loads(path.read_text(encoding='utf-8'))
         for key, value in data.items():
             if key.startswith('CAMPAIGN_BONUS_') and isinstance(value, str):
@@ -44,11 +63,17 @@ def _client_bonus_texts() -> dict[tuple[str, str], str]:
     return found
 
 
+def test_every_locale_still_carries_every_bonus_key():
+    """Пропажа ключа — не косметика: `texts.CAMPAIGN_BONUS_*` роняет регистрацию по рекламе."""
+    texts = _client_bonus_texts()
+    missing = [
+        f'{path.stem}.json:{key}' for path in _locale_files() for key in REQUIRED_KEYS if (path.stem, key) not in texts
+    ]
+    assert not missing, 'пропали клиентские тексты бонуса кампании: ' + ', '.join(missing)
+
+
 def test_no_client_bonus_text_in_any_locale_prints_the_campaign_name():
     texts = _client_bonus_texts()
-    # Защита от пустого прогона: если ключи переименуют, сторож обязан упасть, а не позеленеть.
-    assert len(texts) >= 10, f'ожидались ключи бонуса кампании во всех локалях, найдено {len(texts)}'
-
     offenders = [f'{locale}.json:{key}' for (locale, key), value in texts.items() if CAMPAIGN_NAME_PLACEHOLDER in value]
     assert not offenders, (
         'Имя рекламной кампании снова попало в текст, который читает КЛИЕНТ: '
@@ -70,13 +95,23 @@ def test_assembled_client_message_never_carries_the_campaign_name():
             devices=1,
             tariff_name='Базовый',
         )
-        assert CAMPAIGN_NAME not in assembled, f'{locale}.json:{key} печатает клиенту имя кампании'
+        # Ищем ОБЕ формы: как имя пишет владелец и как его экранирует вызывающий код.
+        for form in (CAMPAIGN_NAME, html.escape(CAMPAIGN_NAME)):
+            assert form not in assembled, f'{locale}.json:{key} печатает клиенту имя кампании'
 
 
 def _campaign() -> AdvertisingCampaign:
     """Настоящая модель, а не подделка: подпись бонуса читает её свойства (`is_balance_bonus`)."""
+    # `is_active=True` задаётся ЯВНО: у колонки default применяется при вставке в базу,
+    # а не при создании объекта в памяти — без него ветка бонуса отваливается на первой проверке.
     return AdvertisingCampaign(
-        id=4, name=CAMPAIGN_NAME, start_parameter='teplo2', bonus_type='balance', balance_bonus_kopeks=5000
+        id=4,
+        name=CAMPAIGN_NAME,
+        start_parameter='teplo2',
+        bonus_type='balance',
+        balance_bonus_kopeks=5000,
+        is_active=True,
+        partner_user_id=None,
     )
 
 
@@ -84,7 +119,6 @@ def _service() -> AdminNotificationService:
     service = AdminNotificationService(bot=SimpleNamespace())
     service._is_enabled = lambda: True
     service._record_subscription_event = AsyncMock(return_value=None)
-    service._record_campaign_link_visit = AsyncMock(return_value=None)
     service._get_user_promo_group = AsyncMock(return_value=None)
     service._send_message = AsyncMock(return_value=True)
     return service
@@ -128,5 +162,51 @@ async def test_admin_notification_still_names_the_campaign(label, call):
 
     service._send_message.assert_awaited()
     sent_text = service._send_message.await_args.args[0]
-    assert CAMPAIGN_NAME in sent_text, f'владелец перестал видеть имя кампании: {label}'
+    # Админский текст хранит имя УЖЕ экранированным (`html.escape(campaign.name)`), поэтому
+    # ищем именно эту форму: сравнение с сырым именем дало бы ложный отказ на имени с «&».
+    assert html.escape(CAMPAIGN_NAME) in sent_text, f'владелец перестал видеть имя кампании: {label}'
     assert 'teplo2' in sent_text, f'владелец перестал видеть метку кампании: {label}'
+
+
+@pytest.mark.asyncio
+async def test_wallet_ledger_entry_never_carries_the_campaign_name(monkeypatch):
+    """🔴 Вторая дверь, найденная волной 1: подпись проводки в истории кошелька.
+
+    Её печатают КЛИЕНТУ две поверхности — «📊 История операций» бота
+    (`app/handlers/balance/main.py`) и вкладка «Баланс» кабинета
+    (`app/cabinet/routes/balance.py` → `Balance.tsx`). До РЕК-1 там стояло
+    «Бонус за регистрацию по кампании 'Кувалда 7000₽'», и на боевом такие строки
+    лежали у всех 114 пришедших по рекламе.
+
+    ⛔ Проверяем ВЫЗОВОМ, а не чтением исходника: сторож, ищущий подстроку в файле,
+    в этом проекте уже дважды оказывался пустым.
+    """
+    from app.services import campaign_service as module
+
+    captured: dict[str, object] = {}
+
+    async def fake_add_user_balance(db, user, amount, description=None, **kwargs):
+        captured['description'] = description
+        captured['amount'] = amount
+        return True
+
+    async def fake_record_campaign_registration(db, **kwargs):
+        return (object(), True)
+
+    monkeypatch.setattr(module, 'add_user_balance', fake_add_user_balance)
+    monkeypatch.setattr(module, 'record_campaign_registration', fake_record_campaign_registration)
+
+    result = await module.AdvertisingCampaignService().apply_campaign_bonus(
+        AsyncMock(),
+        SimpleNamespace(id=1, telegram_id=777),
+        _campaign(),
+    )
+
+    assert result.success, 'бонус перестал начисляться — сторож обязан ловить и это'
+    description = str(captured['description'])
+    assert description, 'подпись проводки исчезла: человек перестанет понимать, откуда деньги'
+    for form in (CAMPAIGN_NAME, html.escape(CAMPAIGN_NAME)):
+        assert form not in description, f'имя кампании вернулось в историю кошелька клиента: {description!r}'
+    # Причину начисления подпись называть ОБЯЗАНА: приветствие о ней больше не говорит,
+    # и история кошелька — единственное оставшееся объяснение «откуда 50 ₽».
+    assert 'регистрац' in description.lower(), f'подпись перестала называть причину начисления: {description!r}'
