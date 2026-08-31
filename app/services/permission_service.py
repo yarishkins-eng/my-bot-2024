@@ -84,6 +84,9 @@ PERMISSION_REGISTRY: dict[str, list[str]] = {
     'bulk_actions': ['read', 'execute'],
     'info_pages': ['read', 'create', 'edit', 'delete'],
     'news': ['read', 'create', 'edit', 'delete'],
+    # Автосообщения: раздел кабинета над теми уведомлениями, которые бот шлёт сам.
+    # 'edit' отделён от 'read' намеренно — правка процента скидки двигает деньги.
+    'auto_messages': ['read', 'edit', 'test'],
 }
 
 

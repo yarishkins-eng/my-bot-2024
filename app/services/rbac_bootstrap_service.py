@@ -184,6 +184,7 @@ _PRESET_ROLES: list[dict] = [
             'landings:create',
             'landings:edit',
             'landings:delete',
+            'auto_messages:*',
         ],
         'color': '#F59E0B',
         'icon': 'crown',
@@ -212,6 +213,10 @@ _PRESET_ROLES: list[dict] = [
             'sales_stats:read',
             'pinned_messages:*',
             'wheel:*',
+            # Решение владельца 31.08.2026: менеджер меняет автосообщения наравне с владельцем.
+            # Он и так управляет промокодами, промо-предложениями и группами скидок — это
+            # выравнивание с тем, что у него уже есть, а не расширение зоны.
+            'auto_messages:*',
         ],
         'color': '#8B5CF6',
         'icon': 'megaphone',
