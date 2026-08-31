@@ -75,6 +75,17 @@ def _format_campaign_summary(campaign, texts) -> str:
     )
 
 
+# 🔴 РЕК-6А. Метка кампании — ПУБЛИЧНАЯ: Телеграм печатает `/start <метка>` сообщением в чат
+# самого клиента, когда он заходит по рекламной ссылке. Владелец называет кампании внутренними
+# кличками с рекламным бюджетом («Кувалда 7000₽»), и одна метка вида `kuvalda7000` вернула бы
+# утечку, которую закрыл РЕК-1, — мимо всякого кода. Предупреждение живёт ОДНОЙ константой,
+# чтобы обе формы (создание и правка) не разъехались, а сторож проверял объект, а не файл.
+START_PARAMETER_PUBLIC_WARNING = (
+    '⚠️ Эту метку клиент УВИДИТ у себя в чате: Телеграм печатает её сообщением, '
+    'когда человек заходит по ссылке. Не пишите в ней внутреннее название или бюджет.'
+)
+
+
 async def _get_bot_deep_link(callback: types.CallbackQuery, start_parameter: str) -> str:
     bot = await callback.bot.get_me()
     return f'https://t.me/{bot.username}?start={start_parameter}'
@@ -472,7 +483,8 @@ async def start_edit_campaign_start_parameter(
         (
             '🔗 <b>Изменение стартового параметра</b>\n\n'
             f'Текущий параметр: <code>{campaign.start_parameter}</code>\n'
-            'Введите новый параметр (латинские буквы, цифры, - или _, 3-32 символа):'
+            'Введите новый параметр (латинские буквы, цифры, - или _, 3-32 символа):\n\n'
+            + START_PARAMETER_PUBLIC_WARNING
         ),
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1260,7 +1272,7 @@ async def process_campaign_name(
     await state.update_data(campaign_name=name)
     await state.set_state(AdminStates.creating_campaign_start)
     await message.answer(
-        '🔗 Теперь введите параметр старта (латинские буквы, цифры, - или _):',
+        '🔗 Теперь введите параметр старта (латинские буквы, цифры, - или _):\n\n' + START_PARAMETER_PUBLIC_WARNING,
     )
 
 
