@@ -32,15 +32,19 @@ CREDIT_TRANSACTION_TYPES: frozenset[str] = frozenset(
         TransactionType.REFERRAL_REWARD.value,
         TransactionType.REFUND.value,
         TransactionType.POLL_REWARD.value,
+        # 🔴 Этап ДВ-3. Приход от банка по прямой оплате картой — именно ПРИХОД. Бот рисовал
+        # его минусом, человек видел «−1199 ₽» дважды подряд, и этап РФ-1 вместо починки знака
+        # убрал строку с глаз. Знак починен здесь; сокрытие снято ниже.
+        TransactionType.PROVIDER_RECEIPT.value,
     }
 )
 
-# 🔴 Найдено прогоном сценария (РФ-1). Приход от банка по прямой оплате — учётная запись о
-# том, что провайдер принял деньги; КОШЕЛЬКА он не касается. В истории операций он рисовался
-# минусом рядом со списанием за ту же подписку, и человек, заплативший 249 ₽, видел «−249 ₽»
-# дважды. Ни плюсом, ни минусом он здесь не верен — на баланс не влиял вовсе, поэтому в
-# истории кошелька ему не место. Живой пример: два «−1990 ₽» у покупателя 194.
-HIDDEN_FROM_WALLET_HISTORY: frozenset[str] = frozenset({TransactionType.PROVIDER_RECEIPT.value})
+# 🔴 Этап ДВ-3, решение владельца 31.08.2026: история операций НЕ прячет ничего.
+# ~~HIDDEN_FROM_WALLET_HISTORY~~ (РФ-1) убран целиком. Он прятал приход от банка по прямой
+# оплате картой — но настоящей бедой был знак (приход рисовался минусом, и человек видел
+# «−1199 ₽» дважды), а не сама строка. Знак починен выше. Прятать половину проводки нельзя:
+# остаётся одинокое списание с кошелька, которого кошелёк не касался, и человеку нечем
+# проследить, куда ушли его деньги. Подписи делает человеческими `device_first_checkout_service`.
 
 
 async def route_payment_by_method(
@@ -267,10 +271,18 @@ async def show_balance_history(callback: types.CallbackQuery, db_user: User, db:
     unique_transactions = []
 
     for transaction in raw_transactions:
-        if transaction.type in HIDDEN_FROM_WALLET_HISTORY:
-            continue
         rounded_time = transaction.created_at.replace(second=0, microsecond=0)
-        transaction_key = (transaction.amount_kopeks, transaction.description, rounded_time)
+        # 🔴 Этап ДВ-3, мина IE. Ключ склейки держался на том, что описание несло номер
+        # заказа и потому было уникальным. Подписи стали типовыми — и две ОДИНАКОВЫЕ по цене
+        # и сроку покупки одного человека в одну минуту схлопнулись бы в одну строку. Номер
+        # проводки восстанавливает уникальность там, где она была, и ничего не меняет для
+        # остальных записей: у них это поле пустое, как и раньше.
+        transaction_key = (
+            transaction.amount_kopeks,
+            transaction.description,
+            rounded_time,
+            transaction.device_first_ledger_key,
+        )
 
         if transaction_key not in seen_transactions:
             seen_transactions.add(transaction_key)
@@ -284,10 +296,18 @@ async def show_balance_history(callback: types.CallbackQuery, db_user: User, db:
     total_unique = 0
 
     for transaction in all_transactions:
-        if transaction.type in HIDDEN_FROM_WALLET_HISTORY:
-            continue
         rounded_time = transaction.created_at.replace(second=0, microsecond=0)
-        transaction_key = (transaction.amount_kopeks, transaction.description, rounded_time)
+        # 🔴 Этап ДВ-3, мина IE. Ключ склейки держался на том, что описание несло номер
+        # заказа и потому было уникальным. Подписи стали типовыми — и две ОДИНАКОВЫЕ по цене
+        # и сроку покупки одного человека в одну минуту схлопнулись бы в одну строку. Номер
+        # проводки восстанавливает уникальность там, где она была, и ничего не меняет для
+        # остальных записей: у них это поле пустое, как и раньше.
+        transaction_key = (
+            transaction.amount_kopeks,
+            transaction.description,
+            rounded_time,
+            transaction.device_first_ledger_key,
+        )
         if transaction_key not in seen_all:
             seen_all.add(transaction_key)
             total_unique += 1

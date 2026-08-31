@@ -165,6 +165,11 @@ class UserTransactionItem(BaseModel):
     payment_method: str | None = None
     is_completed: bool = True
     created_at: datetime
+    # 🔴 Этап ДВ-3, мина ID. Номер заказа жил ТОЛЬКО внутри английской подписи, и вместе с её
+    # переводом на русский исчез со всех человеческих экранов разом. Владелец читал его прямо
+    # со строки в карточке клиента — а нужен он ровно тогда, когда дорого: спор, возврат,
+    # чарджбэк. Отдаём отдельным полем, а не возвращаем uuid в клиентский текст.
+    external_id: str | None = None
 
 
 class UserReferralInfo(BaseModel):

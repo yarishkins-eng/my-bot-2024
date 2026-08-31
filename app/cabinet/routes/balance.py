@@ -79,7 +79,17 @@ async def get_transactions(
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Get transaction history."""
+    """Get transaction history.
+
+    🔴 Этап ДВ-3, решение владельца 31.08.2026. Здесь НЕТ фильтра, и это не забывчивость.
+    Первая редакция прятала приход от банка по прямой оплате картой (`provider_receipt`) —
+    по образцу бота. Владелец посмотрел на живой экран и постановил обратное: история
+    операций обязана быть ПОЛНОЙ, чтобы каждый шаг денег прослеживался и клиентом, и
+    админом. Прятать половину проводки — значит оставить одинокое списание с кошелька,
+    которого кошелёк не касался. Лечится не сокрытием, а человеческими подписями:
+    их выдаёт `device_first_checkout_service` при создании записей.
+    ⛔ Не вводить сюда фильтр по типу заново, не прочитав это.
+    """
     # Base query
     query = select(Transaction).where(Transaction.user_id == user.id)
 
@@ -1348,6 +1358,44 @@ def _record_to_response(record: PendingPayment) -> PendingPaymentResponse:
     )
 
 
+async def _with_purchase_step(record_response: PendingPaymentResponse, user: User) -> PendingPaymentResponse:
+    """Дописать в ответ, остался ли за человеком шаг «оформить подписку».
+
+    Зачем. Экран результата пополнения в кабинете говорил всем одно: «Ваш баланс успешно
+    пополнен. Средства уже доступны» — и давал единственную кнопку на баланс. Клиент 106
+    прочитала это как «сделка закрыта» и осталась без подписки при деньгах на счету; её
+    собственные слова владельцу — «я закинула деньги и думала, что баланс пополнен». Этап ДВ-2
+    убрал ту же ложь из ЧАТА, но экран человек видит РАНЬШЕ сообщения бота.
+
+    ⛔ Решает не этот файл. Вердикт берём у `topup_pending_purchase_hint` — той самой функции,
+    что молчит в чате. Свой список условий здесь был бы вторым, и он бы разъехался: в ДВ-2 в нём
+    и метка намерения автопокупки, и автоплатёж, и порог «пора продлевать», и починка мины HX.
+
+    ⚠️ НО «одна функция» НЕ значит «чат и кабинет всегда говорят одно», и первая редакция этого
+    комментария так и утверждала — неверно. В ЧАТЕ функцию зовёт ровно один платёжный канал
+    (`app/services/payment/platega.py`); остальные восемнадцать шлют прежнее «Баланс пополнен
+    автоматически!» без всяких условий — это названная граница, мина **HY**. Здесь же вердикт
+    спрашивается для ЛЮБОГО способа оплаты. Значит при включении второго шлюза кабинет заговорит
+    там, где чат промолчит. Сегодня это ничего не меняет (живой шлюз ровно один: 170 платежей
+    Platega против нуля у всех прочих, замер 30.08.2026), и расхождение идёт в безопасную
+    сторону — кабинет говорит БОЛЬШЕ правды, а не меньше. Но знать об этом обязан тот, кто
+    будет включать второй шлюз: чинить надо чат, а не глушить кабинет.
+
+    ⛔ Спрашиваем ТОЛЬКО у оплаченного платежа. Пока исход неизвестен, экран показывает
+    ожидание, и подсказка ему не нужна — а маршрут опрашивают раз в три секунды.
+
+    ⚠️ Где помощник НЕ стоит и почему: списочный маршрут `/pending-payments` отдаёт до десяти
+    записей разом, и вердикт там означал бы десять походов в базу и в Redis на один запрос.
+    Экран результата пополнения его не зовёт (во фронте кабинета у него вообще нет вызовов).
+    """
+    if not record_response.is_paid:
+        return record_response
+    from app.services.payment.common import topup_pending_purchase_hint
+
+    record_response.purchase_step_pending = bool(await topup_pending_purchase_hint(user))
+    return record_response
+
+
 @router.get('/pending-payments', response_model=PendingPaymentListResponse)
 async def get_pending_payments(
     page: int = Query(1, ge=1, description='Page number'),
@@ -1473,7 +1521,7 @@ async def get_latest_payment_by_method(
         payment=payment,
     )
 
-    return _record_to_response(record)
+    return await _with_purchase_step(_record_to_response(record), user)
 
 
 @router.get('/pending-payments/{method}/{payment_id}', response_model=PendingPaymentResponse)
@@ -1507,7 +1555,7 @@ async def get_pending_payment_details(
             detail='Access denied',
         )
 
-    return _record_to_response(record)
+    return await _with_purchase_step(_record_to_response(record), user)
 
 
 @router.post('/pending-payments/{method}/{payment_id}/check', response_model=ManualCheckResponse)
@@ -1547,7 +1595,7 @@ async def check_payment_status(
         return ManualCheckResponse(
             success=False,
             message='Ручная проверка недоступна для этого платежа',
-            payment=_record_to_response(record),
+            payment=await _with_purchase_step(_record_to_response(record), user),
             status_changed=False,
         )
 
@@ -1566,7 +1614,7 @@ async def check_payment_status(
         return ManualCheckResponse(
             success=False,
             message='Не удалось проверить статус платежа',
-            payment=_record_to_response(record),
+            payment=await _with_purchase_step(_record_to_response(record), user),
             status_changed=False,
         )
 
@@ -1581,7 +1629,7 @@ async def check_payment_status(
     return ManualCheckResponse(
         success=True,
         message=message,
-        payment=_record_to_response(updated),
+        payment=await _with_purchase_step(_record_to_response(updated), user),
         status_changed=status_changed,
         old_status=old_status,
         new_status=updated.status,

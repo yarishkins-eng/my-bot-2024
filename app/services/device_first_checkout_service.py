@@ -48,6 +48,7 @@ from app.services.device_first_deposit_outbox_service import (
 from app.services.device_first_eligibility import resolve_single_eligible_tariff, tariff_eligibility
 from app.services.pricing_engine import pricing_engine
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
+from app.utils.pricing_utils import format_period_description
 
 
 OPEN_STATES = {'draft', 'confirmed', 'awaiting_funds', 'armed', 'fulfilling'}
@@ -1564,10 +1565,11 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         user_id=user.id,
         type=TransactionType.SUBSCRIPTION_PAYMENT.value,
         amount_kopeks=-charge,
-        description=(
-            f'Device-first: {checkout.period_days} дн., '
-            f'{checkout.selected_device_limit} устр., checkout {checkout.public_id}'
-        ),
+        # 🔴 Этап ДВ-3. Третий машинный шаблон в этом файле, найден критиком полноты. Путь
+        # сегодня спит (ноль строк на боевом), но проснётся — и напишет в историю кошелька
+        # ровно то, что этап убирает. ⛔ Слова «устройств» здесь нет намеренно: подпись с ним
+        # уводит продажу в статистику допов (см. комментарий у прихода ниже).
+        description=(f'Оплата подписки с баланса: {format_period_description(int(checkout.period_days))}'),
         payment_method='balance',
         external_id=f'device-first:{checkout.public_id}:debit',
         device_first_checkout_id=checkout.id,
@@ -2244,7 +2246,20 @@ async def _complete_direct_sale_locked(
                 user_id=user.id,
                 type=TransactionType.PROVIDER_RECEIPT.value,
                 amount_kopeks=total,
-                description=f'Device-first provider receipt for checkout {checkout.public_id}',
+                # 🔴 Этап ДВ-3. Подпись читает ЖИВОЙ человек — и клиент в истории кошелька, и
+                # владелец в карточке пользователя. Прежняя была английским машинным текстом с
+                # номером заказа: она не сообщала ни смысла, ни валюты слов. Срок описываем тем
+                # же помощником, что и весь проект: 180 дней он назовёт «6 месяцев».
+                # ⛔ ЧИСЛА УСТРОЙСТВ ЗДЕСЬ НЕТ, И ЭТО НЕ ЗАБЫВЧИВОСТЬ. Отчёты о продажах
+                # отличают докупку устройств от продажи подписки ЕДИНСТВЕННЫМ способом —
+                # по слову «устройств» в описании (`crud/transaction.py`, DEVICE_ADDON_PATTERNS
+                # = '%устройств%'). Любая форма слова содержит этот корень, поэтому упоминание
+                # устройств увело бы КАЖДУЮ прямую продажу картой в статистику допов.
+                # Поймано вопросом владельца «а это безопасно?», сторож рядом.
+                # ⛔ Старую формулировку сюда не возвращать: на неё стоит растяжка в тестах.
+                description=(
+                    f'Платёж картой получен: подписка на {format_period_description(int(snapshot["period_days"]))}'
+                ),
                 payment_method='platega',
                 external_id=provider_payment_id,
                 device_first_checkout_id=checkout.id,
@@ -2286,9 +2301,13 @@ async def _complete_direct_sale_locked(
             user_id=user.id,
             type=TransactionType.SUBSCRIPTION_PAYMENT.value,
             amount_kopeks=-total,
+            # 🔴 Этап ДВ-3. Подпись зависит от того, ОТКУДА пришли деньги, и это не украшение:
+            # при оплате картой баланс не двигался вовсе, и слово «с баланса» было бы новой
+            # ложью вместо старой. Оба варианта верны буквально.
+            # ⛔ Про отсутствие числа устройств — см. комментарий у прихода выше.
             description=(
-                f'Device-first direct sale: {snapshot["period_days"]} days, '
-                f'{snapshot["device_limit"]} devices, checkout {checkout.public_id}'
+                ('Оплата подписки с баланса: ' if checkout.funding_mode == 'wallet' else 'Оплата подписки картой: ')
+                + f'{format_period_description(int(snapshot["period_days"]))}'
             ),
             payment_method='balance' if checkout.funding_mode == 'wallet' else 'platega',
             external_id=f'device-first-sale:{checkout.public_id}',
