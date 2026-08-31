@@ -75,6 +75,32 @@ def _format_campaign_summary(campaign, texts) -> str:
     )
 
 
+# 🔴 РЕК-6А. Метка кампании — ПУБЛИЧНАЯ: Телеграм печатает `/start <метка>` сообщением в чат
+# самого клиента, когда он заходит по рекламной ссылке. Владелец называет кампании внутренними
+# кличками с рекламным бюджетом («Кувалда 7000₽»), и одна метка вида `kuvalda7000` вернула бы
+# утечку, которую закрыл РЕК-1, — мимо всякого кода. Предупреждение живёт ОДНОЙ константой,
+# чтобы обе формы (создание и правка) не разъехались.
+# 🔴 ПОЧЕМУ ТОЛЬКО ПРЕДУПРЕЖДЕНИЕ, А НЕ ПРОВЕРКА — формулировка исправлена после линзы «костыли
+# и мины», прежняя врала. Неверно: «машинную проверку поставить нельзя, она сломает заведённые
+# кампании». Линза сверила с боевой базой: все три метки нейтральны, партнёрских кампаний ноль,
+# ломать нечего, а транслитератор кириллицы уже лежит в проекте (`cabinet/schemas/news.py`),
+# и имя кампании в момент ввода метки под рукой в обеих формах. Верно так: **мягкую подсказку
+# «метка похожа на название кампании» поставить МОЖНО, мы решили не ставить в этом заходе** —
+# это выбор объёма, а не запрет по безопасности. Дом остатка — пункт РЕК-6Б плана.
+# 🔴 Только для формы ПРАВКИ. Метку выбирают один раз: сменил — и все уже размещённые
+# рекламные ссылки перестают находить кампанию (`start.py` не найдёт её по старой метке и
+# молча ничего не выдаст). На форме СОЗДАНИЯ этот текст был бы ложью, поэтому константа отдельная.
+START_PARAMETER_CHANGE_WARNING = (
+    '⛔ Метку лучше не менять. Все уже размещённые рекламные ссылки перестанут работать: '
+    'кто по ним придёт, не получит бонус и не попадёт в статистику.'
+)
+
+START_PARAMETER_PUBLIC_WARNING = (
+    '⚠️ Эту метку увидит клиент: когда человек заходит по вашей ссылке, она появляется '
+    'у него в чате сообщением. Не пишите в ней внутреннее название кампании или бюджет.'
+)
+
+
 async def _get_bot_deep_link(callback: types.CallbackQuery, start_parameter: str) -> str:
     bot = await callback.bot.get_me()
     return f'https://t.me/{bot.username}?start={start_parameter}'
@@ -472,7 +498,10 @@ async def start_edit_campaign_start_parameter(
         (
             '🔗 <b>Изменение стартового параметра</b>\n\n'
             f'Текущий параметр: <code>{campaign.start_parameter}</code>\n'
-            'Введите новый параметр (латинские буквы, цифры, - или _, 3-32 символа):'
+            'Введите новый параметр (латинские буквы, цифры, - или _, 3-32 символа):\n\n'
+            + START_PARAMETER_PUBLIC_WARNING
+            + '\n\n'
+            + START_PARAMETER_CHANGE_WARNING
         ),
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
@@ -505,7 +534,10 @@ async def process_edit_campaign_start_parameter(
 
     new_param = message.text.strip()
     if not _CAMPAIGN_PARAM_REGEX.match(new_param):
-        await message.answer('❌ Разрешены только латинские буквы, цифры, символы - и _. Длина 3-32 символа.')
+        await message.answer(
+            '❌ Разрешены только латинские буквы, цифры, символы - и _. Длина 3-32 символа.\n\n'
+            + START_PARAMETER_PUBLIC_WARNING
+        )
         return
 
     campaign = await get_campaign_by_id(db, campaign_id)
@@ -1260,7 +1292,7 @@ async def process_campaign_name(
     await state.update_data(campaign_name=name)
     await state.set_state(AdminStates.creating_campaign_start)
     await message.answer(
-        '🔗 Теперь введите параметр старта (латинские буквы, цифры, - или _):',
+        '🔗 Теперь введите параметр старта (латинские буквы, цифры, - или _):\n\n' + START_PARAMETER_PUBLIC_WARNING,
     )
 
 
@@ -1274,7 +1306,10 @@ async def process_campaign_start_parameter(
 ):
     start_param = message.text.strip()
     if not _CAMPAIGN_PARAM_REGEX.match(start_param):
-        await message.answer('❌ Разрешены только латинские буквы, цифры, символы - и _. Длина 3-32 символа.')
+        await message.answer(
+            '❌ Разрешены только латинские буквы, цифры, символы - и _. Длина 3-32 символа.\n\n'
+            + START_PARAMETER_PUBLIC_WARNING
+        )
         return
 
     existing = await get_campaign_by_start_parameter(db, start_param)
