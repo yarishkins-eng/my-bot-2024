@@ -50,7 +50,7 @@ def test_catalog_covers_every_recorded_notification_type() -> None:
     файла: иначе он сверялся бы сам с собой и пропустил бы новое сообщение.
     """
     source = Path('app/services/monitoring_service.py').read_text(encoding='utf-8')
-    recorded = set(re.findall(r"record_notification\(\s*db,[^)]*?'([a-z0-9_]+)'", source, re.S))
+    recorded = set(re.findall(r"record_notification\(\s*db,[^)]*?'([a-z0-9_]+)'", source, re.DOTALL))
     assert recorded, 'не удалось вычитать типы из monitoring_service — сторож ослеп'
 
     catalogued = {entry['sent_type'] for entry in AUTO_MESSAGE_CATALOG if entry.get('sent_type')}
@@ -85,7 +85,7 @@ def test_setters_exist_and_match_catalog_params() -> None:
 
 
 def test_globally_switched_ids_exist_in_catalog() -> None:
-    assert GLOBALLY_SWITCHED_IDS <= set(CATALOG_BY_ID)
+    assert set(CATALOG_BY_ID) >= GLOBALLY_SWITCHED_IDS
     # Общий выключатель гасит ПЯТЬ сообщений, а не все двадцать: так в monitoring_service.
     # Если это число поедет, подпись на экране станет ложью.
     assert len(GLOBALLY_SWITCHED_IDS) == 5
