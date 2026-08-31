@@ -210,3 +210,50 @@ async def test_wallet_ledger_entry_never_carries_the_campaign_name(monkeypatch):
     # Причину начисления подпись называть ОБЯЗАНА: приветствие о ней больше не говорит,
     # и история кошелька — единственное оставшееся объяснение «откуда 50 ₽».
     assert 'регистрац' in description.lower(), f'подпись перестала называть причину начисления: {description!r}'
+
+
+@pytest.mark.asyncio
+async def test_real_client_path_never_emits_the_campaign_name(monkeypatch):
+    """🔴 Дыра, на которой независимо сошлись скептик и критик полноты волны 2.
+
+    Все прежние сторожа проверяли ИНГРЕДИЕНТЫ — строки в локалях и одну функцию сервиса.
+    Ни один не выполнял код, который собирает сообщение клиенту. Скептик доказал это
+    инъекцией: дописать `+ f' ({campaign.name})'` прямо в `_apply_campaign_bonus_if_needed`
+    — и весь набор оставался зелёным. Здесь проходим настоящий путь: тот самый вызов,
+    результат которого уходит человеку через `message.answer` (`start.py:1908`, `:2266`, `:2761`).
+
+    Заодно закрывается класс «имя вписали в локаль БУКВАЛЬНО, без подстановки»: сторож на
+    `{name}` его не видел, а собранное сообщение — видит.
+    """
+    from app.handlers import start as start_module
+    from app.localization.texts import get_texts
+    from app.services import campaign_service as service_module
+
+    campaign = _campaign()
+
+    async def fake_add_user_balance(db, user, amount, description=None, **kwargs):
+        return True
+
+    async def fake_record_campaign_registration(db, **kwargs):
+        return (object(), True)
+
+    async def fake_get_campaign_by_id(db, campaign_id):
+        return campaign
+
+    monkeypatch.setattr(service_module, 'add_user_balance', fake_add_user_balance)
+    monkeypatch.setattr(service_module, 'record_campaign_registration', fake_record_campaign_registration)
+    monkeypatch.setattr(start_module, 'get_campaign_by_id', fake_get_campaign_by_id)
+
+    message = await start_module._apply_campaign_bonus_if_needed(
+        AsyncMock(),
+        SimpleNamespace(id=1, telegram_id=777, language='ru'),
+        {'campaign_id': campaign.id},
+        get_texts('ru'),
+        bot=None,
+    )
+
+    assert message, 'сообщение о бонусе исчезло — человек не узнает, что получил деньги'
+    for form in (CAMPAIGN_NAME, html.escape(CAMPAIGN_NAME)):
+        assert form not in message, f'имя кампании доехало до клиента живым путём: {message!r}'
+    # Сумму сообщение назвать ОБЯЗАНО: без неё оно теряет весь смысл.
+    assert '50' in message, f'сообщение перестало называть сумму бонуса: {message!r}'
