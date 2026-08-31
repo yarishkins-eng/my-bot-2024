@@ -29,6 +29,8 @@ from app.database.models import (
     PromoGroup,
     SentNotification,
     Subscription,
+    SubscriptionStatus,
+    Tariff,
     User,
 )
 from app.services.notification_settings_service import NotificationSettingsService
@@ -50,13 +52,16 @@ router = APIRouter(prefix='/admin/auto-messages', tags=['Admin Auto Messages'])
 # (PricingEngine.apply_stacked_discounts), поэтому опасно не само число, а итог.
 MAX_OFFER_DISCOUNT_PERCENT = 50
 
-# Самая дешёвая мыслимая цена — 1 ₽. Если на ней итог остаётся положительным,
-# на любой реальной цене он тем более положителен.
+# Опорная цена для проверки итога — 1 ₽.
+# 🔴 Осторожно с рассуждением «меньшая цена опаснее»: оно НЕВЕРНО. `apply_discount`
+# округляет вниз саму СКИДКУ (`amount * percent // 100`), поэтому при проценте ниже
+# 100 цена не может стать нулём ни на рубле, ни на копейке. Ноль рождается ровно от
+# ста процентов. Опорная цена здесь — не «худший случай», а просто общий знаменатель,
+# на котором видно, кто именно обнулил цену: промогруппа или наше сообщение.
 _GUARD_REFERENCE_PRICE_KOPEKS = 100
 
 MIN_VALID_HOURS = 1
 MAX_VALID_HOURS = 168
-MIN_TRIGGER_DAYS = 1
 MAX_TRIGGER_DAYS = 60
 
 
@@ -87,7 +92,7 @@ async def _max_promo_group_percent(db: AsyncSession) -> int:
 
 
 async def _assert_discount_is_safe(db: AsyncSession, percent: int) -> None:
-    """Отбить процент, при котором цена может уйти в ноль. 422 с внятной причиной."""
+    """Отбить процент, от которого цена уходит в ноль. 422 с внятной причиной."""
     if percent < 0 or percent > MAX_OFFER_DISCOUNT_PERCENT:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -98,14 +103,18 @@ async def _assert_discount_is_safe(db: AsyncSession, percent: int) -> None:
         )
 
     group_percent = await _max_promo_group_percent(db)
+    after_group = PricingEngine.apply_discount(_GUARD_REFERENCE_PRICE_KOPEKS, group_percent)
+    if after_group <= 0:
+        # Цену обнулила промогруппа, а не мы. Запрещать тут правку нельзя: иначе
+        # раздел запирается целиком, и сбить сбежавшую скидку станет невозможно
+        # ровно тогда, когда это нужнее всего.
+        return
+
     final_price, _, _ = PricingEngine.apply_stacked_discounts(_GUARD_REFERENCE_PRICE_KOPEKS, group_percent, percent)
     if final_price <= 0:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f'При скидке {percent}% вместе со скидкой промогруппы ({group_percent}%) '
-                'цена станет нулевой. Уменьшите процент.'
-            ),
+            detail=(f'При скидке {percent}% вместе со скидкой промогруппы цена станет нулевой. Уменьшите процент.'),
         )
 
 
@@ -188,7 +197,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'paid-1d',
         'group': 'paid',
         'title': 'Подписка истекает завтра',
-        'when': 'За 1 день до конца · если сообщение «за 3 дня» уже ушло, второй раз не отправляется',
+        'when': 'За 1 день до конца · более срочное вытесняет трёхдневное, а не наоборот',
         'control': 'locked',
         'sent_type': 'expiring',
         'sent_days': 1,
@@ -275,6 +284,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'control': 'toggle',
         'settings_key': 'trial_channel_unsubscribed',
         'params': (),
+        'sent_type': 'trial_channel_unsubscribed',
         'quiet_check': 'channel_required',
         'buttons': [{'label': '✅ Я подписался', 'target': 'Повторная проверка в боте', 'tracked': True}],
     },
@@ -338,7 +348,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'title': 'Автоплатёж приостановлен: подписка без тарифа',
         'when': 'Один раз в неделю тем, чья подписка создана до введения тарифов',
         'control': 'locked',
-        'quiet_check': 'autopay',
+        'quiet_check': 'legacy_subscriptions',
         'buttons': [],
     },
     {
@@ -366,9 +376,8 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'traffic-reset',
         'group': 'other',
         'title': 'Сброс докупленного трафика',
-        'when': 'Через 30 дней после первой докупки гигабайтов',
+        'when': 'Когда истекает срок докупленного пакета гигабайтов',
         'control': 'locked',
-        'quiet_check': 'traffic_topups',
         'buttons': [],
     },
 ]
@@ -387,6 +396,29 @@ SETTER_NAMES: dict[tuple[str, str], str] = {
     ('trial_expired_discount', 'discount_percent'): 'set_trial_expired_discount_percent',
     ('trial_expired_discount', 'valid_hours'): 'set_trial_expired_discount_valid_hours',
     ('trial_expired_discount', 'trigger_days'): 'set_trial_expired_discount_trigger_days',
+}
+
+# Читаем тоже через геттеры, а не из сырого файла: в них сидят те же ограничители,
+# и экран показывает ровно то число, которое применит бот. Чтение сырого JSON
+# показывало бы 0 там, где бот подставляет 2.
+GETTER_NAMES: dict[tuple[str, str], str] = {
+    ('expired_second_wave', 'discount_percent'): 'get_second_wave_discount_percent',
+    ('expired_second_wave', 'valid_hours'): 'get_second_wave_valid_hours',
+    ('expired_third_wave', 'discount_percent'): 'get_third_wave_discount_percent',
+    ('expired_third_wave', 'valid_hours'): 'get_third_wave_valid_hours',
+    ('expired_third_wave', 'trigger_days'): 'get_third_wave_trigger_days',
+    ('trial_expired_discount', 'discount_percent'): 'get_trial_expired_discount_percent',
+    ('trial_expired_discount', 'valid_hours'): 'get_trial_expired_discount_valid_hours',
+    ('trial_expired_discount', 'trigger_days'): 'get_trial_expired_discount_trigger_days',
+}
+
+# Нижняя граница «через сколько дней» у сообщений РАЗНАЯ: у третьей волны сеттер
+# поднимает единицу до двойки, у скидки после пробного двойка не нужна. Общая
+# константа врала бы одному из двух: приняли бы 1, а записалось бы 2, и ответ
+# молча вернул бы не то, что просили.
+TRIGGER_DAYS_MIN: dict[str, int] = {
+    'expired_third_wave': 2,
+    'trial_expired_discount': 1,
 }
 
 # Сообщения, которые гасит общий выключатель ENABLE_NOTIFICATIONS. Он покрывает
@@ -415,6 +447,9 @@ class AutoMessageItem(BaseModel):
     enabled: bool | None = None
     state: str
     quiet_reason: str | None = None
+    # Уточнение к РАБОТАЮЩЕМУ сообщению («кому именно уходит»). Отдельно от причины
+    # молчания намеренно: одно поле на два смысла уже сделало живое сообщение «молчащим».
+    note: str | None = None
     params: dict[str, int] | None = None
     sent_count: int | None = None
     claimed_count: int | None = None
@@ -427,8 +462,12 @@ class AutoMessageSummary(BaseModel):
     configurable_count: int
     sent_total: int
     claimed_total: int
+    # Только для показа. Этот переключатель живёт в настройках бота и отсюда не меняется:
+    # он пишет общий ключ конфигурации, который вдобавок глушит уведомления клиентам об
+    # ответах поддержки. Раздел про автосообщения такой радиус обещать не может.
     global_enabled: bool
     global_affects: int
+    global_editable_here: bool = False
     last_cycle_at: datetime | None = None
 
 
@@ -450,14 +489,14 @@ class AutoMessageDetail(AutoMessageItem):
 
 
 class AutoMessagePatch(BaseModel):
+    # extra='forbid': опечатка в имени поля должна быть отказом, а не тихим 200,
+    # после которого менеджер уверен, что скидку поменял.
+    model_config = {'extra': 'forbid'}
+
     enabled: bool | None = None
     discount_percent: int | None = Field(default=None, ge=0, le=100)
-    valid_hours: int | None = Field(default=None, ge=0, le=1000)
-    trigger_days: int | None = Field(default=None, ge=0, le=1000)
-
-
-class GlobalPatch(BaseModel):
-    enabled: bool
+    valid_hours: int | None = Field(default=None, ge=MIN_VALID_HOURS, le=MAX_VALID_HOURS)
+    trigger_days: int | None = Field(default=None, ge=1, le=MAX_TRIGGER_DAYS)
 
 
 # ---------------------------------------------------------------------------
@@ -465,54 +504,112 @@ class GlobalPatch(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _quiet_reasons(db: AsyncSession) -> dict[str, str | None]:
-    """Почему то или иное сообщение сегодня никому не уходит.
+async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]]:
+    """Факты о системе для колонки «идёт или молчит».
 
-    Считаем по фактам системы, а не по догадкам: чтобы менеджер видел причину,
-    а не пустой счётчик.
+    Возвращает ДВА разных словаря, и это принципиально:
+      * ``reasons`` — почему сообщение сегодня никому не уходит;
+      * ``notes``   — уточнение к работающему сообщению («кому именно уходит»).
+
+    В одном словаре они уже путались: заметка про адресность делала живое
+    сообщение вечно «молчащим» и занижала счётчик работающих.
     """
     from app.config import settings
-
-    reasons: dict[str, str | None] = {}
-
-    with_limit = await db.scalar(
-        select(func.count())
-        .select_from(Subscription)
-        .where(Subscription.status.in_(['active', 'trial']), Subscription.traffic_limit_gb > 0)
-    )
-    total_active = await db.scalar(
-        select(func.count()).select_from(Subscription).where(Subscription.status.in_(['active', 'trial']))
-    )
-    reasons['traffic_limits'] = None if (with_limit or 0) > 0 else 'ни у одной активной подписки нет лимита гигабайтов'
-    if (with_limit or 0) > 0:
-        reasons['traffic_limits_note'] = f'лимит есть у {with_limit} подписок из {total_active or 0}'
-
-    reasons['channel_required'] = None if settings.CHANNEL_IS_REQUIRED_SUB else 'подписка на канал не обязательна'
-    reasons['grace_enabled'] = None if settings.GRACE_ENABLED else 'бонусные дни выключены на сервере'
-    reasons['client_opt_in'] = 'уходит только тем, кто сам включил это в своих настройках'
-
-    autopay_count = await db.scalar(
-        select(func.count()).select_from(Subscription).where(Subscription.autopay_enabled.is_(True))
-    )
-    reasons['autopay'] = None if (autopay_count or 0) > 0 else 'автоплатёж не включён ни у одной подписки'
-    if (autopay_count or 0) > 0:
-        reasons['autopay_note'] = f'автоплатёж включён у {autopay_count} подписок'
-
     from app.services.daily_subscription_service import daily_subscription_service
 
-    reasons['daily_tariffs'] = None if daily_subscription_service.is_enabled() else 'суточные тарифы выключены'
-    reasons['traffic_topups'] = None
-    return reasons
+    reasons: dict[str, str] = {}
+    notes: dict[str, str] = {}
+
+    # `limited` — это подписка, исчерпавшая трафик. Выкинуть её из подсчёта значило бы
+    # считать лимиты без тех, у кого лимит уже сработал.
+    live_statuses = ['active', 'trial', 'limited']
+    with_limit = (
+        await db.scalar(
+            select(func.count())
+            .select_from(Subscription)
+            .where(Subscription.status.in_(live_statuses), Subscription.traffic_limit_gb > 0)
+        )
+        or 0
+    )
+    total_live = (
+        await db.scalar(select(func.count()).select_from(Subscription).where(Subscription.status.in_(live_statuses)))
+        or 0
+    )
+    if with_limit:
+        notes['traffic_limits'] = f'лимит есть у {with_limit} подписок из {total_live}'
+    else:
+        reasons['traffic_limits'] = 'ни у одной живой подписки нет лимита гигабайтов'
+
+    if not settings.CHANNEL_IS_REQUIRED_SUB:
+        reasons['channel_required'] = 'подписка на канал не обязательна'
+    if not settings.GRACE_ENABLED:
+        reasons['grace_enabled'] = 'бонусные дни выключены на сервере'
+
+    # Это НЕ причина молчания: сообщение работает, просто адресно.
+    notes['client_opt_in'] = 'уходит только тем, кто сам включил это в своих настройках'
+
+    # Считаем ровно ту выборку, которую берёт сам автоплатёж: не триальные и живые.
+    # Счёт «по всем подпискам» преувеличивал бы — там и триалы, и давно истёкшие.
+    autopay_count = (
+        await db.scalar(
+            select(func.count())
+            .select_from(Subscription)
+            .where(
+                Subscription.autopay_enabled.is_(True),
+                Subscription.is_trial.is_(False),
+                Subscription.status == SubscriptionStatus.ACTIVE.value,
+            )
+        )
+        or 0
+    )
+    if autopay_count:
+        notes['autopay'] = f'автоплатёж включён у {autopay_count} подписок'
+    else:
+        reasons['autopay'] = 'автоплатёж не включён ни у одной активной платной подписки'
+
+    # Флага мало: он включён по умолчанию, а суточных тарифов может не быть вовсе.
+    # Причина должна называть факт, а не настройку.
+    if not daily_subscription_service.is_enabled():
+        reasons['daily_tariffs'] = 'суточные тарифы выключены настройкой'
+    else:
+        daily_tariffs = await db.scalar(select(func.count()).select_from(Tariff).where(Tariff.is_daily.is_(True))) or 0
+        if not daily_tariffs:
+            reasons['daily_tariffs'] = 'суточных тарифов не заведено'
+
+    legacy_count = (
+        await db.scalar(
+            select(func.count())
+            .select_from(Subscription)
+            .where(
+                Subscription.tariff_id.is_(None),
+                Subscription.status == SubscriptionStatus.ACTIVE.value,
+            )
+        )
+        or 0
+    )
+    if not legacy_count:
+        reasons['legacy_subscriptions'] = 'подписок без тарифа не осталось'
+
+    return reasons, notes
 
 
 def _params_for(entry: dict[str, Any]) -> dict[str, int] | None:
-    """Текущие значения настраиваемых полей сообщения."""
+    """Текущие значения настраиваемых полей — через геттеры сервиса.
+
+    Сырой файл читать нельзя: там может лежать мусор (упадёт весь список из-за
+    одной записи) или значение вне допустимого диапазона, которое бот всё равно
+    подтянет к границе. Геттеры делают и то и другое.
+    """
     key = entry.get('settings_key')
     names = entry.get('params')
     if not key or not names:
         return None
-    section = NotificationSettingsService.get_config().get(key, {})
-    return {name: int(section.get(name, 0)) for name in names if name in section}
+    values: dict[str, int] = {}
+    for name in names:
+        getter = GETTER_NAMES.get((key, name))
+        if getter:
+            values[name] = int(getattr(NotificationSettingsService, getter)())
+    return values
 
 
 def _resolve_when(entry: dict[str, Any], params: dict[str, int] | None) -> str:
@@ -530,22 +627,25 @@ def _is_enabled(entry: dict[str, Any]) -> bool | None:
     return bool(NotificationSettingsService.is_enabled(key))
 
 
-def _state_of(entry: dict[str, Any], reasons: dict[str, str | None]) -> tuple[str, str | None]:
-    """Идёт сообщение или молчит, и почему. Выключатель — только одна из причин."""
-    enabled = _is_enabled(entry)
-    if enabled is False:
-        return 'quiet', 'выключено в этом разделе'
+def _state_of(
+    entry: dict[str, Any], reasons: dict[str, str], notes: dict[str, str]
+) -> tuple[str, str | None, str | None]:
+    """Идёт сообщение или молчит, почему молчит и что уточнить, если идёт.
+
+    Возвращает ``(state, quiet_reason, note)``. Причина и уточнение — разные поля:
+    класть уточнение в поле причины значит объяснять тишину там, где её нет.
+    """
+    if _is_enabled(entry) is False:
+        return 'quiet', 'выключено в этом разделе', None
     if not NotificationSettingsService.are_notifications_globally_enabled() and entry['id'] in GLOBALLY_SWITCHED_IDS:
-        return 'quiet', 'выключено общим переключателем'
+        return 'quiet', 'выключено общим переключателем в настройках бота', None
     check = entry.get('quiet_check')
     if check:
         reason = reasons.get(check)
         if reason:
-            return 'quiet', reason
-        note = reasons.get(f'{check}_note')
-        if note:
-            return 'live', note
-    return 'live', None
+            return 'quiet', reason, None
+        return 'live', None, notes.get(check)
+    return 'live', None, None
 
 
 # ---------------------------------------------------------------------------
@@ -583,12 +683,13 @@ def _sent_for(entry: dict[str, Any], counts: dict[tuple[str, int | None], int]) 
 
 def _build_item(
     entry: dict[str, Any],
-    reasons: dict[str, str | None],
+    reasons: dict[str, str],
+    notes: dict[str, str],
     sent_counts: dict[tuple[str, int | None], int],
     claimed_counts: dict[str, int],
 ) -> AutoMessageItem:
     params = _params_for(entry)
-    state, quiet_reason = _state_of(entry, reasons)
+    state, quiet_reason, note = _state_of(entry, reasons, notes)
     claim_type = entry.get('claim_type')
     return AutoMessageItem(
         id=entry['id'],
@@ -599,6 +700,7 @@ def _build_item(
         enabled=_is_enabled(entry),
         state=state,
         quiet_reason=quiet_reason,
+        note=note,
         params=params,
         sent_count=_sent_for(entry, sent_counts),
         claimed_count=claimed_counts.get(claim_type, 0) if claim_type else None,
@@ -616,11 +718,11 @@ async def list_auto_messages(
     db: AsyncSession = Depends(get_cabinet_db),
     _: User = Depends(require_permission('auto_messages:read')),
 ) -> AutoMessageListResponse:
-    reasons = await _quiet_reasons(db)
+    reasons, notes = await _quiet_facts(db)
     sent_counts = await _sent_counts(db)
     claimed_counts = await _claimed_counts(db)
 
-    items = [_build_item(entry, reasons, sent_counts, claimed_counts) for entry in AUTO_MESSAGE_CATALOG]
+    items = [_build_item(entry, reasons, notes, sent_counts, claimed_counts) for entry in AUTO_MESSAGE_CATALOG]
 
     last_cycle_at = await db.scalar(
         select(func.max(MonitoringLog.created_at)).where(MonitoringLog.event_type == 'monitoring_cycle_completed')
@@ -634,6 +736,7 @@ async def list_auto_messages(
         claimed_total=sum(item.claimed_count or 0 for item in items),
         global_enabled=NotificationSettingsService.are_notifications_globally_enabled(),
         global_affects=len(GLOBALLY_SWITCHED_IDS),
+        global_editable_here=False,
         last_cycle_at=last_cycle_at,
     )
     return AutoMessageListResponse(summary=summary, items=items)
@@ -650,10 +753,10 @@ async def get_auto_message(
     if not entry:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Сообщение не найдено')
 
-    reasons = await _quiet_reasons(db)
-    item = _build_item(entry, reasons, await _sent_counts(db), await _claimed_counts(db))
+    reasons, notes = await _quiet_facts(db)
+    item = _build_item(entry, reasons, notes, await _sent_counts(db), await _claimed_counts(db))
 
-    history = await _history_for(db, entry, user)
+    history = await _history_for(db, entry, user, request)
     return AutoMessageDetail(
         **item.model_dump(),
         buttons=[AutoMessageButton(**button) for button in entry.get('buttons', [])],
@@ -664,15 +767,27 @@ async def get_auto_message(
     )
 
 
-async def _history_for(db: AsyncSession, entry: dict[str, Any], viewer: User) -> list[AutoMessageHistoryRow]:
-    """Последние 30 дней отправок. Имена показываем только тем, кто и так видит клиентскую базу."""
+async def _history_for(
+    db: AsyncSession, entry: dict[str, Any], viewer: User, request: Request
+) -> list[AutoMessageHistoryRow]:
+    """Последние 30 дней отправок. Имена показываем только тем, кто и так видит клиентскую базу.
+
+    🔴 IP передаётся обязательно: без него политика запрета «не показывать клиентов вне
+    офисной сети» молча не применяется, и маска снимается там, где не должна.
+    """
     sent_type = entry.get('sent_type')
     if not sent_type:
         return []
 
     from app.services.permission_service import PermissionService
 
-    may_see_names, _ = await PermissionService.check_permission(db, viewer, 'users:read')
+    from ..ip_utils import get_client_ip
+
+    try:
+        client_ip = get_client_ip(request)
+    except HTTPException:
+        client_ip = None
+    may_see_names, _ = await PermissionService.check_permission(db, viewer, 'users:read', ip_address=client_ip)
 
     since = datetime.now(UTC) - timedelta(days=30)
     conditions = [SentNotification.notification_type == sent_type, SentNotification.created_at >= since]
@@ -689,19 +804,29 @@ async def _history_for(db: AsyncSession, entry: dict[str, Any], viewer: User) ->
         User.first_name,
     ]
     if claim_type:
-        columns.append(DiscountOffer.claimed_at)
-
-    query = select(*columns).join(User, User.id == SentNotification.user_id)
-    if claim_type:
-        # Склейка по (клиент, подписка, тип) — иначе чужой оффер того же типа
-        # засчитался бы этой строке как «забрал скидку».
-        query = query.outerjoin(
-            DiscountOffer,
-            (DiscountOffer.user_id == SentNotification.user_id)
-            & (DiscountOffer.subscription_id == SentNotification.subscription_id)
-            & (DiscountOffer.notification_type == claim_type),
+        # 🔴 Подзапрос, а НЕ outerjoin. Пара (клиент, подписка, тип) не уникальна:
+        # забранный или истёкший оффер не переиспользуется, рядом создаётся новый.
+        # Join размножил бы одну отправку на несколько строк, а `limit` считает
+        # строки ПОСЛЕ склейки — история молча теряла бы часть событий.
+        columns.append(
+            select(func.max(DiscountOffer.claimed_at))
+            .where(
+                DiscountOffer.user_id == SentNotification.user_id,
+                DiscountOffer.subscription_id == SentNotification.subscription_id,
+                DiscountOffer.notification_type == claim_type,
+            )
+            .correlate(SentNotification)
+            .scalar_subquery()
+            .label('claimed_at')
         )
-    query = query.where(*conditions).order_by(SentNotification.created_at.desc()).limit(50)
+
+    query = (
+        select(*columns)
+        .join(User, User.id == SentNotification.user_id)
+        .where(*conditions)
+        .order_by(SentNotification.created_at.desc())
+        .limit(50)
+    )
 
     history: list[AutoMessageHistoryRow] = []
     for row in (await db.execute(query)).all():
@@ -719,36 +844,6 @@ async def _history_for(db: AsyncSession, entry: dict[str, Any], viewer: User) ->
             )
         )
     return history
-
-
-@router.patch('/global')
-async def patch_global_switch(
-    payload: GlobalPatch,
-    db: AsyncSession = Depends(get_cabinet_db),
-    _: User = Depends(require_permission('auto_messages:edit')),
-) -> dict[str, Any]:
-    """Общий выключатель. Гасит ПЯТЬ сообщений из двадцати, а не всё — так в коде бота."""
-    from app.services.system_settings_service import BotConfigurationService
-
-    try:
-        await BotConfigurationService.set_value(db, 'ENABLE_NOTIFICATIONS', payload.enabled)
-    except Exception as error:
-        logger.error('auto_messages_global_switch_failed', error=str(error))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Не удалось сохранить настройку. Значение осталось прежним.',
-        ) from error
-
-    # 🔴 Отвечаем ДЕЙСТВУЮЩИМ значением, а не запрошенным. Если ключ задан в
-    # окружении, запись уходит в базу, но на живого бота не влияет — тогда экран
-    # обязан сказать правду, а не отрапортовать успех.
-    effective = NotificationSettingsService.are_notifications_globally_enabled()
-    logger.info('auto_messages_global_switch', requested=payload.enabled, effective=effective)
-    return {
-        'enabled': effective,
-        'applied': effective == payload.enabled,
-        'affects': len(GLOBALLY_SWITCHED_IDS),
-    }
 
 
 @router.patch('/{message_id}', response_model=AutoMessageItem)
@@ -785,22 +880,44 @@ async def patch_auto_message(
     if 'valid_hours' in changes:
         _assert_in_range(changes['valid_hours'], MIN_VALID_HOURS, MAX_VALID_HOURS, 'Срок действия скидки, часов')
     if 'trigger_days' in changes:
-        _assert_in_range(changes['trigger_days'], MIN_TRIGGER_DAYS, MAX_TRIGGER_DAYS, 'Через сколько дней')
+        min_days = TRIGGER_DAYS_MIN.get(settings_key, 1)
+        _assert_in_range(changes['trigger_days'], min_days, MAX_TRIGGER_DAYS, 'Через сколько дней')
 
+    # 🔴 Включение — тоже опасное действие. Процент мог быть выставлен в сто из
+    # чат-админки бота, где потолка нет; без этой проверки тумблер выпускал бы его
+    # в бой мимо забора.
+    if changes.get('enabled') and 'discount_percent' in (entry.get('params') or ()):
+        stored = (_params_for(entry) or {}).get('discount_percent')
+        if stored is not None and 'discount_percent' not in changes:
+            await _assert_discount_is_safe(db, stored)
+
+    # Каждая запись возвращает bool. Выбросить его значило бы ответить «сохранено» на
+    # том, что не легло на диск: значения живут в памяти процесса и исчезнут при рестарте.
+    written: list[bool] = []
     if 'enabled' in changes:
-        NotificationSettingsService.set_enabled(settings_key, changes['enabled'])
+        written.append(bool(NotificationSettingsService.set_enabled(settings_key, changes['enabled'])))
     for field in ('discount_percent', 'valid_hours', 'trigger_days'):
         if field not in changes:
             continue
         setter_name = SETTER_NAMES.get((settings_key, field))
         if not setter_name:
+            # Сюда попасть можно только при рассинхроне каталога и таблицы сеттеров —
+            # это наша поломка, а не ошибка пользователя.
+            logger.error('auto_messages_setter_missing', settings_key=settings_key, field=field)
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f'У этого сообщения нет настройки «{field}».',
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='Внутренняя ошибка настройки. Значение не изменено.',
             )
-        getattr(NotificationSettingsService, setter_name)(changes[field])
+        written.append(bool(getattr(NotificationSettingsService, setter_name)(changes[field])))
+
+    if written and not all(written):
+        logger.error('auto_messages_save_failed', message_id=message_id, changes=sorted(changes))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Не удалось записать настройку на диск. Проверьте состояние сервера.',
+        )
 
     logger.info('auto_messages_patched', message_id=message_id, changes=sorted(changes))
 
-    reasons = await _quiet_reasons(db)
-    return _build_item(entry, reasons, await _sent_counts(db), await _claimed_counts(db))
+    reasons, notes = await _quiet_facts(db)
+    return _build_item(entry, reasons, notes, await _sent_counts(db), await _claimed_counts(db))
