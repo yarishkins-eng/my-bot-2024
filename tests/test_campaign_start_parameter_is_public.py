@@ -26,7 +26,7 @@ import inspect
 import textwrap
 
 from app.handlers.admin import campaigns
-from app.handlers.admin.campaigns import START_PARAMETER_PUBLIC_WARNING
+from app.handlers.admin.campaigns import START_PARAMETER_CHANGE_WARNING, START_PARAMETER_PUBLIC_WARNING
 
 
 def test_warning_says_the_client_will_see_the_tag():
@@ -65,3 +65,26 @@ def test_both_forms_use_the_same_constant():
     }
     missing = [label for label, func in forms.items() if not _reads_constant(func)]
     assert not missing, 'форма перестала показывать предупреждение: ' + ', '.join(missing)
+
+
+def _reads(func, name: str) -> bool:
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    return any(isinstance(node, ast.Name) and node.id == name for node in ast.walk(tree))
+
+
+def test_change_warning_says_what_actually_breaks():
+    """Метку выбирают один раз: сменил — старые рекламные ссылки перестают находить кампанию."""
+    text = START_PARAMETER_CHANGE_WARNING.lower()
+    assert 'ссылк' in text, 'предупреждение перестало называть то, что ломается'
+    assert 'бонус' in text, 'предупреждение перестало говорить, что человек не получит бонус'
+    assert 'статистик' in text or 'учёт' in text, 'предупреждение перестало говорить про потерю учёта'
+
+
+def test_change_warning_only_on_the_edit_form():
+    """⛔ На форме СОЗДАНИЯ этот текст был бы ложью: там ещё нечего ломать."""
+    assert _reads(campaigns.start_edit_campaign_start_parameter, 'START_PARAMETER_CHANGE_WARNING'), (
+        'форма правки перестала предупреждать, что смена метки ломает размещённые ссылки'
+    )
+    assert not _reads(campaigns.process_campaign_name, 'START_PARAMETER_CHANGE_WARNING'), (
+        'предупреждение о СМЕНЕ метки уехало на форму создания, где оно неверно'
+    )
