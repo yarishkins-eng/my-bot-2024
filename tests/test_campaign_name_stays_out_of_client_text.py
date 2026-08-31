@@ -49,9 +49,7 @@ def test_no_client_bonus_text_in_any_locale_prints_the_campaign_name():
     # Защита от пустого прогона: если ключи переименуют, сторож обязан упасть, а не позеленеть.
     assert len(texts) >= 10, f'ожидались ключи бонуса кампании во всех локалях, найдено {len(texts)}'
 
-    offenders = [
-        f'{locale}.json:{key}' for (locale, key), value in texts.items() if CAMPAIGN_NAME_PLACEHOLDER in value
-    ]
+    offenders = [f'{locale}.json:{key}' for (locale, key), value in texts.items() if CAMPAIGN_NAME_PLACEHOLDER in value]
     assert not offenders, (
         'Имя рекламной кампании снова попало в текст, который читает КЛИЕНТ: '
         + ', '.join(sorted(offenders))
