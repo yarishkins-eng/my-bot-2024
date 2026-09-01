@@ -171,10 +171,27 @@ async def test_a_waiting_payment_gets_its_turn_after_one_pass(session) -> None:
 
     Двадцать выданных продаж занимают всю выборку. До починки строка, ждущая
     досверки, не попадала в неё никогда — ровно это и было на боевом три дня.
+
+    🔴 Проверяется САМА ждущая строка, а не «все двадцать отодвинулись».
+    Второе слабее названия теста: очередь могла бы освободиться и не пустить
+    именно её.
     """
     for index in range(1, 21):
         await _seed_delivered_sale(session, index)
+    waiting_id = await _seed_delivered_sale(session, 21)
+    # Ждущий платёж: досверка не закончена, срок наступил ПОЗЖЕ, чем у пробок,
+    # — именно поэтому он и оказывался за ними.
+    await session.execute(
+        text(
+            'UPDATE checkout_payment_attempts '
+            "SET status = 'reconciliation', next_reconcile_at = now() - interval '1 hour' "
+            'WHERE id = :i'
+        ),
+        {'i': waiting_id},
+    )
+    await session.commit()
 
+    # Первый проход: выборка целиком занята двадцатью пробками.
     await service.reconcile_device_first_payments(session, limit=20, direct_only=True)
 
     still_due = await session.scalar(
@@ -186,3 +203,14 @@ async def test_a_waiting_payment_gets_its_turn_after_one_pass(session) -> None:
         )
     )
     assert still_due == 0, f'{still_due} выданных продаж всё ещё держат очередь после прохода'
+
+    # Второй проход: место освободилось — ждущего обязаны взять. Улика того,
+    # что взяли именно его: счётчик его попыток сдвинулся.
+    before = await session.scalar(
+        select(CheckoutPaymentAttempt.reconcile_attempts).where(CheckoutPaymentAttempt.id == waiting_id)
+    )
+    await service.reconcile_device_first_payments(session, limit=20, direct_only=True)
+    after = await session.scalar(
+        select(CheckoutPaymentAttempt.reconcile_attempts).where(CheckoutPaymentAttempt.id == waiting_id)
+    )
+    assert after > before, 'ждущий платёж так и не дождался своей очереди'
