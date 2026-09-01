@@ -1477,7 +1477,10 @@ async def test_fused_confirmation_shows_the_wallet_and_a_top_up_door_on_a_partia
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 199 ₽' in caption
     # Обратная дорога названа ДО того, как человек ушёл платить: доплата заказ не оформляет.
-    assert 'Ваш баланс уже учтён в строке «Не хватает». Доплатите в том же окне, ваш выбор сохранится.' in caption
+    assert (
+        'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.'
+        in caption
+    )
     # Вторая строка обязательна: без неё «продолжите» посылает человека в этот же чат, где
     # висит ЭТО ЖЕ сообщение с числами, которые доплата только что сделала ложными.
     assert 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.' in caption
@@ -1634,7 +1637,10 @@ async def test_direct_payment_methods_screen_shows_the_wallet_and_the_top_up_doo
     assert '5 устройств · 3 месяца' in caption
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 1 139 ₽' in caption
-    assert 'Ваш баланс уже учтён в строке «Не хватает». Доплатите в том же окне, ваш выбор сохранится.' in caption
+    assert (
+        'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.'
+        in caption
+    )
     assert 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.' in caption
     assert 'Или оплатите полной суммой: деньги с баланса при этом не спишутся.' in caption
     assert keyboard[0][0].text == '💰 Доплатить 1 139 ₽'
@@ -1797,7 +1803,7 @@ async def test_fused_confirmation_speaks_english_to_an_english_customer() -> Non
     assert '💳 Balance: ₽50' in caption
     assert '⚠️ Shortage: ₽199' in caption
     assert (
-        'Your balance is already counted in the «Shortage» line. Pay it in the same window, we keep your choice.'
+        'Your balance is already counted in the «Shortage» line. Top up and finish the purchase in the same window — we keep your choice.'
         in caption
     )
     assert 'After the top-up this chat screen will not refresh: its buttons still charge the full price.' in caption
@@ -2145,6 +2151,12 @@ async def test_cancel_fused_does_not_claim_a_cancellation_when_an_order_is_alive
     # 🔴 Сторож на САМУЮ дорогую половину находки: вопрос «врём ли мы про деньги» обязан
     # видеть и остановившиеся заказы, где деньги уже взяты. Состояния перечислены
     # ЛИТЕРАЛАМИ: сторож, повторяющий выражение кода, доказывает только сам себя.
+    # 🔴 Ровно шесть состояний, перечислены ЛИТЕРАЛАМИ. `operator_review` — единственное
+    # «остановившееся», где деньги взяты И которое умеет показать кнопка ниже. Три соседних
+    # (`conflict`, `failed`, `reprice_required`) сюда НЕ входят намеренно: они доплатёжные,
+    # `get_open_checkout_for_user` их не выбирает, а `reprice_required` ставится обычным
+    # истечением котировки и живёт вечно — спрашивая его, мы объявляли бы «у вас открыт заказ»
+    # каждому, кто когда-либо бросил расчёт.
     assert set(in_flight.await_args.kwargs['states']) == {
         'draft',
         'confirmed',
@@ -2152,9 +2164,6 @@ async def test_cancel_fused_does_not_claim_a_cancellation_when_an_order_is_alive
         'armed',
         'fulfilling',
         'operator_review',
-        'conflict',
-        'failed',
-        'reprice_required',
     }
 
     caption = render.await_args.kwargs['caption']
@@ -2171,6 +2180,29 @@ async def test_cancel_fused_does_not_claim_a_cancellation_when_an_order_is_alive
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert keyboard[0][0].callback_data == 'df:start'
     assert keyboard[1][0].callback_data == 'back_to_menu'
+
+
+@pytest.mark.asyncio
+async def test_has_order_in_flight_asks_the_database_for_exactly_the_states_it_was_given() -> None:
+    """🔴 Сторож на САМ ЗАПРОС, а не на его мок. Оба соседних теста `cancel_fused` подменяют
+    `_has_order_in_flight` целиком — значит расширенный набор состояний до базы не доезжает ни
+    разу, и сужение или расширение фильтра прошло бы мимо всех проверок. Здесь исполняется
+    настоящее выражение и читается СКОМПИЛИРОВАННЫЙ SQL: приём уже есть в проекте."""
+    from app.handlers.subscription.device_first import _has_order_in_flight
+
+    db = AsyncMock()
+    db.scalar = AsyncMock(return_value=None)
+
+    assert await _has_order_in_flight(db, user_id=17, states=('draft', 'operator_review')) is False
+
+    statement = db.scalar.await_args[0][0]
+    compiled = statement.compile(compile_kwargs={'literal_binds': True})
+    sql = str(compiled)
+    assert "'draft'" in sql
+    assert "'operator_review'" in sql
+    # Состояния, которых в наборе НЕ было, в запрос попасть не могут.
+    assert "'reprice_required'" not in sql
+    assert 'subscription_checkouts' in sql
 
 
 @pytest.mark.asyncio
