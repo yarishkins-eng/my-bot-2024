@@ -29,7 +29,7 @@ try:  # pragma: no cover - глобальная фикстура ставит з
 except ModuleNotFoundError:  # pragma: no cover
     asyncpg = None
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database.models import (
@@ -63,8 +63,14 @@ async def session():
     await engine.dispose()
 
 
-async def _seed_delivered_sale(db, index: int) -> int:
-    """Успешная выданная продажа: её попытка остаётся `paid_processing` навсегда."""
+async def _seed_delivered_sale(db, index: int, *, delivered: bool = True) -> int:
+    """Настоящая выданная продажа — та самая форма, что стоит на боевом.
+
+    🔴 `fulfillment_state='fulfilled'` + `lifecycle_state='ready'` обязательны:
+    именно на этой форме `fulfill_direct_external_checkout` возвращается ШТАТНО,
+    не бросая исключения. Первая редакция починки стояла в `except` и на этой
+    форме не срабатывала вовсе — а на боевом такими были все двадцать строк.
+    """
     now = datetime.now(UTC)
     user = User(telegram_id=900000 + index, username=f'buyer{index}')
     tariff = Tariff(name=f'tariff{index}')
@@ -81,7 +87,9 @@ async def _seed_delivered_sale(db, index: int) -> int:
         pricing_revision=1,
         quote_expires_at=now,
         expires_at=now,
-        lifecycle_state='ready',
+        lifecycle_state='ready' if delivered else 'fulfilling',
+        funding_state='funded' if delivered else 'paid',
+        fulfillment_state='fulfilled' if delivered else 'not_started',
         settlement_mode=service.DIRECT_SETTLEMENT_MODE,
     )
     payment = PlategaPayment(
@@ -112,11 +120,13 @@ async def _seed_delivered_sale(db, index: int) -> int:
     return attempt.id
 
 
-async def test_a_delivered_sale_stops_hogging_the_queue(session, monkeypatch) -> None:
-    async def _refuses(*args, **kwargs):
-        raise service.DeviceFirstError('invalid_state', 'Checkout is already being fulfilled')
+async def test_a_delivered_sale_stops_hogging_the_queue(session) -> None:
+    """Без подмены: настоящая выданная продажа проходит настоящий код.
 
-    monkeypatch.setattr(service, 'fulfill_direct_external_checkout', _refuses)
+    Подменять `fulfill_direct_external_checkout` здесь нельзя — это ровно та
+    функция, чьё поведение (вернуть или бросить) решает, сработает починка или
+    нет. Тест с подменой прошёл бы и на коде, который беду не лечит.
+    """
     attempt_id = await _seed_delivered_sale(session, 1)
     before = await session.scalar(
         select(CheckoutPaymentAttempt.next_reconcile_at).where(CheckoutPaymentAttempt.id == attempt_id)
@@ -127,46 +137,52 @@ async def test_a_delivered_sale_stops_hogging_the_queue(session, monkeypatch) ->
     after = await session.scalar(
         select(CheckoutPaymentAttempt.next_reconcile_at).where(CheckoutPaymentAttempt.id == attempt_id)
     )
-    assert after > before, 'строка снова не отодвинула свой срок и осталась в голове очереди'
-    assert after > datetime.now(UTC), 'срок обязан уехать в будущее, а не остаться в прошлом'
-    tries = await session.scalar(
-        select(CheckoutPaymentAttempt.reconcile_attempts).where(CheckoutPaymentAttempt.id == attempt_id)
+    assert after > before, 'выданная продажа снова не отодвинула срок и держит голову очереди'
+    assert after > datetime.now(UTC), 'срок обязан уехать в будущее'
+    assert (
+        await session.scalar(
+            select(CheckoutPaymentAttempt.reconcile_attempts).where(CheckoutPaymentAttempt.id == attempt_id)
+        )
+        == 1
     )
-    assert tries == 1
 
 
-async def test_a_waiting_payment_gets_its_turn_after_one_pass(session, monkeypatch) -> None:
+async def test_a_paid_but_undelivered_order_keeps_its_fast_retry(session) -> None:
+    """Тот, кто заплатил и ждёт подписку, замедляться не должен.
+
+    Отличать «выдано, сверять нечего» от «деньги взяты, подписки нет» —
+    единственное, что здесь важно: час ожидания на пустом месте платит клиент.
+    """
+    attempt_id = await _seed_delivered_sale(session, 2, delivered=False)
+    before = await session.scalar(
+        select(CheckoutPaymentAttempt.next_reconcile_at).where(CheckoutPaymentAttempt.id == attempt_id)
+    )
+
+    await service.reconcile_device_first_payments(session, limit=20, direct_only=True)
+
+    after = await session.scalar(
+        select(CheckoutPaymentAttempt.next_reconcile_at).where(CheckoutPaymentAttempt.id == attempt_id)
+    )
+    assert after == before, 'невыданный оплаченный заказ отодвинули — оплативший ждёт на пустом месте'
+
+
+async def test_a_waiting_payment_gets_its_turn_after_one_pass(session) -> None:
     """Главное, ради чего этап: живой платёж перестаёт быть двадцать первым.
 
     Двадцать выданных продаж занимают всю выборку. До починки строка, ждущая
     досверки, не попадала в неё никогда — ровно это и было на боевом три дня.
     """
-
-    async def _refuses(*args, **kwargs):
-        raise service.DeviceFirstError('invalid_state', 'Checkout is already being fulfilled')
-
-    monkeypatch.setattr(service, 'fulfill_direct_external_checkout', _refuses)
     for index in range(1, 21):
         await _seed_delivered_sale(session, index)
-    waiting_id = await _seed_delivered_sale(session, 21)
-    # Двадцать первый ждёт дольше всех остальных по НОМЕРУ, но позже по сроку —
-    # именно так он и оказывался за пробкой.
-    await session.execute(
-        text(
-            "UPDATE checkout_payment_attempts SET status = :st, next_reconcile_at = now() - interval '1 day' WHERE id = :i"
-        ),
-        {'st': 'reconciliation', 'i': waiting_id},
-    )
-    await session.commit()
 
-    picked = await service.reconcile_device_first_payments(session, limit=20, direct_only=True)
-    assert picked >= 0
+    await service.reconcile_device_first_payments(session, limit=20, direct_only=True)
 
-    # После одного прохода все двадцать пробок отодвинуты в будущее,
-    # значит следующий проход возьмёт ждущего.
-    stuck_ahead = await session.scalar(
-        text(
-            'SELECT count(*) FROM checkout_payment_attempts WHERE status = :st AND next_reconcile_at <= now()'
-        ).bindparams(st='paid_processing')
+    still_due = await session.scalar(
+        select(func.count())
+        .select_from(CheckoutPaymentAttempt)
+        .where(
+            CheckoutPaymentAttempt.status == 'paid_processing',
+            CheckoutPaymentAttempt.next_reconcile_at <= datetime.now(UTC),
+        )
     )
-    assert stuck_ahead == 0, f'{stuck_ahead} выданных продаж всё ещё держат очередь'
+    assert still_due == 0, f'{still_due} выданных продаж всё ещё держат очередь после прохода'

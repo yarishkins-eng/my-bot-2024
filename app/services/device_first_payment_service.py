@@ -2344,23 +2344,42 @@ def _reconcile_backoff(reconcile_attempts: int) -> timedelta:
     return timedelta(minutes=min(60, 2 ** min(reconcile_attempts, 6)))
 
 
-async def _defer_direct_attempt_reconcile(
+async def _defer_settled_direct_attempt(
     db: AsyncSession,
     *,
     attempt_id: int,
+    checkout_id: int,
     lease_token: str | None,
     lease_epoch: int | None,
 ) -> None:
-    """Отодвинуть следующую сверку строки, за которую взялись и не смогли.
+    """Отодвинуть сверку строки, которой сверять уже нечего.
 
-    🔴 Строка, которой не назначили следующую проверку, остаётся в голове
-    очереди навсегда: выборка воркера идёт по `next_reconcile_at` с потолком в
-    двадцать строк, и такие «вечные» строки не пропускают за собой живые
-    платежи. Проверено замером на боевом 01.09.2026: двадцать выданных продаж
-    в `paid_processing` занимали всю выборку, а заказ, ждавший досверки с
-    29.08, не досматривался ни разу.
+    🔴 Зачем. Попытка успешной прямой продажи остаётся в `paid_processing`
+    НАВСЕГДА — это запись идемпотентности, так задумано (`crud/tariff.py`).
+    Ветка, которая её обрабатывает, выходила через `continue` мимо блока,
+    назначающего следующую проверку, поэтому `next_reconcile_at` у таких строк
+    не сдвигался никогда. Выборка воркера идёт по этому полю с потолком в
+    двадцать строк — и двадцать выданных продаж заняли её целиком.
+    Замер на боевом 01.09.2026: заказ, ждавший досверки с 29.08, не
+    досматривался ни разу за три дня, потому что стоял двадцать первым.
+
+    🔴 Откладываем ТОЛЬКО выданное. Человек, который заплатил и ждёт подписку,
+    обязан сохранить быстрый повтор: замедлить его на час — значит заставить
+    оплатившего ждать на пустом месте. Поэтому решает не «получилось или нет»,
+    а состояние самого заказа.
     """
     if lease_token is None or lease_epoch is None:
+        return
+    delivered = (
+        await db.execute(
+            select(SubscriptionCheckout.id).where(
+                SubscriptionCheckout.id == checkout_id,
+                SubscriptionCheckout.fulfillment_state == 'fulfilled',
+                SubscriptionCheckout.lifecycle_state.in_(['fulfilling', 'ready']),
+            )
+        )
+    ).scalar_one_or_none()
+    if delivered is None:
         return
     attempt = await _lock_owned_direct_attempt_lease(
         db,
@@ -2369,6 +2388,10 @@ async def _defer_direct_attempt_reconcile(
         lease_epoch=lease_epoch,
     )
     if attempt is None:
+        # Аренда истекла или её забрал другой проход. Молчать нельзя: именно
+        # тогда, когда батч медленный, откат нужнее всего, а его отсутствие
+        # ничем не видно.
+        logger.warning('device_first_defer_settled_attempt_lost_lease', attempt_id=attempt_id)
         return
     attempt.reconcile_attempts += 1
     attempt.next_reconcile_at = datetime.now(UTC) + _reconcile_backoff(attempt.reconcile_attempts)
@@ -2523,6 +2546,7 @@ async def reconcile_device_first_payments(
                 )
             continue
         if attempt.status == 'paid_processing' and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
+            checkout_id = attempt.checkout_id
             try:
                 await fulfill_direct_external_checkout(
                     db,
@@ -2535,21 +2559,20 @@ async def reconcile_device_first_payments(
                 reconciled += 1
             except DeviceFirstError as error:
                 logger.warning('device_first_direct_paid_recovery_failed', attempt_id=attempt_id, code=error.code)
-                # 🔴 Без этого отката ветка уходила через `continue` мимо блока,
-                # который назначает следующую проверку, — и `next_reconcile_at`
-                # у строки не сдвигался НИКОГДА. А `paid_processing` остаётся у
-                # успешной прямой продажи навсегда (`crud/tariff.py`), то есть
-                # такие строки копятся. Двадцать из них заняли всю выборку
-                # воркера (`limit=20`, порядок по `next_reconcile_at`) и три дня
-                # не пропускали за собой ни одного живого платежа.
-                # Опрашивать их не перестаём — перестаём опрашивать каждые 10 с.
-                await _defer_direct_attempt_reconcile(
+            finally:
+                # 🔴 Откат стоит в `finally`, а не в `except`, и это НЕ мелочь.
+                # Выданная продажа возвращается ШТАТНО (идемпотентный ранний
+                # выход в `fulfill_direct_external_checkout`), исключения не
+                # бросает — и первая редакция этой правки, стоявшая в `except`,
+                # не сдвинула бы на боевом ни одной строки из двадцати.
+                # Замер 01.09.2026: все двадцать были `ready` + `fulfilled`.
+                await _defer_settled_direct_attempt(
                     db,
                     attempt_id=attempt_id,
+                    checkout_id=checkout_id,
                     lease_token=lease_token,
                     lease_epoch=lease_epoch,
                 )
-            finally:
                 await _release_direct_attempt_lease(
                     db,
                     attempt_id=attempt_id,
