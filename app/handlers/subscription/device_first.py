@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection
 from datetime import datetime
 from html import escape
 from itertools import islice
@@ -13,6 +14,7 @@ from aiogram import F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import CheckoutPaymentAttempt, PlategaPayment, SubscriptionCheckout, Tariff, User
@@ -50,6 +52,12 @@ from app.utils.timezone import format_local_datetime
 # 🔴 Первая запись в журнал во всём файле нативной кассы. До этапа БК серверного следа не
 # оставлял ни один её экран, и отличить «люди увидели и пошли доплачивать» от «экрана никто
 # не открывал» было нечем: кнопки оплаты — web_app, боту при нажатии не приходит ничего.
+# 🔴 РЕК-8в. Единственное «остановившееся» состояние, где деньги ВЗЯТЫ и которое умеет
+# показать `get_open_checkout_for_user`. Соседние три (`conflict`, `failed`,
+# `reprice_required`) — доплатёжные и этой функцией не выбираются; подробности в докстроке
+# `cancel_fused`.
+OPERATOR_REVIEW_STATE = 'operator_review'
+
 logger = structlog.get_logger(__name__)
 
 
@@ -325,7 +333,7 @@ def _top_up_button(
     )
 
 
-async def _has_order_in_flight(db: AsyncSession, *, user_id: int) -> bool:
+async def _has_order_in_flight(db: AsyncSession, *, user_id: int, states: Collection[str] = OPEN_STATES) -> bool:
     """Answer «is any order of this customer already in flight?» without side effects.
 
     ⛔ Deliberately a plain read instead of ``get_open_checkout_for_user``: that
@@ -335,13 +343,20 @@ async def _has_order_in_flight(db: AsyncSession, *, user_id: int) -> bool:
     debit, where a commit would land on somebody else's unit of work.  The broad
     question errs toward hiding the top-up door, which is the honest answer for
     an order we cannot classify.
+
+    🔴 РЕК-8в. ``states`` появился параметром, а не расширением умолчания, и это решение.
+    Умолчание ``OPEN_STATES`` держит ДВЕРЬ ДОПЛАТЫ (мина FE) — расширить его значило бы
+    молча поменять поведение экрана заказа, у которого своя причина и свой сторож. А вопрос
+    «врём ли мы про деньги» шире: он обязан видеть и остановившиеся заказы, где деньги уже
+    взяты (``OPERATOR_REVIEWABLE_STATES``). Один запрос, два разных вопроса — поэтому набор
+    состояний спрашивает вызывающий.
     """
     return (
         await db.scalar(
             select(SubscriptionCheckout.id)
             .where(
                 SubscriptionCheckout.user_id == user_id,
-                SubscriptionCheckout.lifecycle_state.in_(OPEN_STATES),
+                SubscriptionCheckout.lifecycle_state.in_(tuple(states)),
             )
             .limit(1)
         )
@@ -394,8 +409,25 @@ def _money_block(
     # этот чат — а здесь его ждёт ЭТО ЖЕ сообщение с числами, которые доплата только что сделала
     # ложными, и с кнопками полной цены. Перерисовать его нечем: дверь и кнопки оплаты — web_app,
     # боту при нажатии не приходит ничего, а деньги зачисляет вебхук.
-    hint_ru = 'Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.'
-    hint_en = 'Top up and finish the purchase in the same window — we keep your choice.'
+    # 🔴 РЕК-8б. Две строки выше называют ЧИСЛА, но ни одна не называет СВЯЗЬ: человек читает
+    # «Баланс» — слово из банковского приложения — и сам должен догадаться, что недостача уже
+    # посчитана с его деньгами. Говорим это словами, не повторяя чисел: они стоят строкой выше,
+    # и третье их упоминание превратило бы блок в ребус.
+    # ⛔ Глагол «вычтены» тут стоял и снят волной ревью: в совершенном виде он утверждает
+    # СОБЫТИЕ, которого не было — деньги на счету лежат нетронутыми, и при оплате картой так и
+    # останутся. Это ровно мина DE, от которой на этом же экране стоит сторож «деньги с баланса
+    # при этом не спишутся» двумя строками ниже. Указываем на СТРОКУ экрана: недостача и правда
+    # посчитана как цена минус баланс, и это проверяемо глазами.
+    # ⛔ Слово «подарок»/«бонус» здесь НЕ писать: на балансе может лежать сдача, возврат или
+    # собственное пополнение, а происхождение денег этот экран не знает.
+    hint_ru = (
+        'Ваш баланс уже учтён в строке «Не хватает». '
+        'Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.'
+    )
+    hint_en = (
+        'Your balance is already counted in the «Shortage» line. '
+        'Top up and finish the purchase in the same window — we keep your choice.'
+    )
     stale_ru = 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.'
     stale_en = 'After the top-up this chat screen will not refresh: its buttons still charge the full price.'
     # Второе число появляется, только когда провайдерский минимум больше недостачи: тогда в
@@ -2379,10 +2411,84 @@ async def cancel_fused(
     db: AsyncSession,
     state: FSMContext,
 ) -> None:
-    """Cancel the checkout-free showcase; nothing was persisted or charged."""
-    del db
+    """Discard the showcase — and never claim to cancel an order that outlived it.
+
+    🔴 РЕК-8в. Прежняя редакция выбрасывала соединение с базой (``del db``) и БЕЗУСЛОВНО писала
+    «Заказ отменён. Деньги не списаны», ни разу не заглянув в базу. В момент ОТРИСОВКИ экрана
+    заказа действительно нет — но соседние кнопки на нём открывают кабинет меткой
+    ``autostart=1``, и заказ рождается ТАМ, пока сообщение в чате остаётся прежним. Человек,
+    вернувшийся и нажавший «Отменить заказ», уходил в уверенности, что всё закрыл, — а живой
+    счёт оставался. Это ложь про деньги на платёжном экране.
+
+    🔴 Спрашиваем ШИРЕ открытых состояний — но ровно на ОДНО состояние, а не на четыре.
+    Волна 1 добавила весь ``OPERATOR_REVIEWABLE_STATES``, волна 2 это опровергла, и обе
+    поправки записаны здесь, чтобы следующий не «дорасширил» обратно:
+      · ``operator_review`` — деньги ВЗЯТЫ, подписки нет. Он и нужен, ради него правка;
+      · ``conflict`` / ``reprice_required`` — ДОплатёжные: их ставят
+        ``expire_checkout_quote_if_needed`` («expire an open quote before any money-moving
+        transition») и предкоммитная сверка. Сам сервис пишет о них прямым текстом:
+        «остановившийся заказ покупку не держит вовсе»;
+      · ``failed`` — сегодня не присваивается нигде.
+    ⛔ И решающее: эти три состояния ``get_open_checkout_for_user`` НЕ выбирает, то есть кнопка
+    ниже их показать не может — мы обещали бы «откройте заказ» и приводили на выбор срока.
+    ⛔ Хуже: ``reprice_required`` ставится обычным истечением котировки и не снимается никем.
+    Спрашивая его, мы сказали бы «у вас открыт заказ» КАЖДОМУ, кто когда-либо бросил расчёт, —
+    и поменяли бы одну неправду на другую, в обратную сторону.
+
+    ⛔ Сам заказ отсюда НЕ отменяем, и это решение, а не недоделка. У настоящей отмены своё
+    предупреждение про живую платёжную ссылку и своё второе подтверждение (``df:x:`` →
+    ``df:xa:``). Сделать её молча по кнопке, которая только что обещала «ничего не было»,
+    значит поменять одну неправду на другую.
+
+    ⛔ И НИКАКИХ обещаний, что именно с заказом можно сделать: набор включает и ``fulfilling``
+    (отменить уже нельзя), и ``operator_review`` (ждёт человека), и ``confirmed`` (кнопки
+    отмены на его экране нет вовсе). Текст зовёт ПОСМОТРЕТЬ, а не обещает действие.
+
+    ⚠️ Границы названы. (1) Чтение может отказать — тогда мы НЕ утверждаем, что списания не
+    было: неизвестность честнее ложного успокоения. (2) Надпись самой кнопки осталась
+    «Отменить заказ» — менять её значит трогать экран, который этот этап не открывал.
+    (3) Для исторического ``legacy_deposit``-черновика ``df:start`` заказ погасит и откроет
+    новый расчёт; на живом пути такие заказы не рождаются с 01.08.
+    """
     await callback.answer()
     await state.clear()
+    try:
+        has_order = await _has_order_in_flight(db, user_id=db_user.id, states=(*OPEN_STATES, OPERATOR_REVIEW_STATE))
+    except SQLAlchemyError:
+        # Отказ чтения — не повод сказать «денег не списывали». Ведём себя как при живом
+        # заказе: текст ниже ничего про деньги не утверждает и зовёт посмотреть самому.
+        logger.warning(
+            'Кнопка отмены не смогла прочитать заказы клиента',
+            user_id=db_user.id,
+            exc_info=True,
+        )
+        has_order = True
+    if has_order:
+        await edit_or_answer_photo(
+            callback=callback,
+            caption=_text(
+                db_user,
+                'Заказ не отменён.\n\n'
+                '⚠️ Эта кнопка закрывает экран, а не заказ. Он остаётся открытым — откройте его, '
+                'чтобы увидеть, в каком он состоянии и что с ним можно сделать.',
+                'The order was not cancelled.\n\n'
+                '⚠️ This button closes the screen, not the order. It stays open — open it to see '
+                'where it stands and what you can do with it.',
+            ),
+            keyboard=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=_text(db_user, 'К моему заказу', 'My order'),
+                            callback_data='df:start',
+                        )
+                    ],
+                    [_main_menu(db_user)],
+                ]
+            ),
+            parse_mode='HTML',
+        )
+        return
     await edit_or_answer_photo(
         callback=callback,
         caption=_text(
