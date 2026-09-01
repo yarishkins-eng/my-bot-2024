@@ -35,8 +35,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
 from app.database.models import (
+    AccountErasureRequest,
     Base,
     CheckoutPaymentAttempt,
+    GuestPurchase,
     PlategaPayment,
     ReferralEarning,
     ServerSquad,
@@ -60,6 +62,12 @@ pytestmark = [
         reason='TEST_ACCOUNT_RESET_TEST_DATABASE_URL is required for the PostgreSQL reset tests',
     ),
 ]
+
+
+async def _panel_ok(user, panel_uuids):
+    """Панель в этих тестах не участвует: её путь проверяется отдельно."""
+    return True
+
 
 STAND_TELEGRAM_ID = 7749231125
 OUTSIDER_TELEGRAM_ID = 999000111
@@ -263,7 +271,7 @@ async def test_reset_refuses_while_an_order_is_still_in_flight(session, monkeypa
 
     assert plan.allowed is False
     assert plan.done is False
-    assert 'в работе' in (plan.blocked_reason or '')
+    assert 'не закончен' in (plan.blocked_reason or '')
     assert (await _counts(session, stand.id))['subscriptions'] == 1
     await session.refresh(stand)
     assert stand.balance_kopeks == 1000
@@ -326,9 +334,102 @@ async def test_nothing_changes_when_the_panel_refuses_to_delete(session, monkeyp
 
     assert plan.done is False
     assert plan.allowed is False
-    assert 'Ничего не тронуто' in (plan.blocked_reason or '')
+    assert 'ничего не тронуто' in (plan.blocked_reason or '').lower()
     assert (await _counts(session, stand_id))['subscriptions'] == 1
     stand = await session.get(User, stand_id)
     assert stand.balance_kopeks == 22450
     assert stand.status == UserStatus.ACTIVE.value
     assert await session.scalar(select(func.sum(ServerSquad.current_users))) == squad_users_before
+
+
+async def test_a_successful_purchase_does_not_lock_the_button(session, monkeypatch) -> None:
+    """Главная ловушка: `paid_processing` остаётся у успешной продажи навсегда.
+
+    Если считать его «деньгами в пути», кнопка ломается ровно на том стенде,
+    где владелец впервые довёл покупку до конца.
+    """
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    await session.execute(
+        text('UPDATE checkout_payment_attempts SET status = :st'),
+        {'st': 'paid_processing'},
+    )
+    await session.commit()
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.blocked_reason is None
+    assert plan.done is True
+    assert (await _counts(session, stand.id))['subscriptions'] == 0
+
+
+async def test_an_abandoned_invoice_does_not_lock_the_button(session, monkeypatch) -> None:
+    """Открыл оплату и закрыл вкладку — счёт протух. Это не деньги в пути."""
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    await session.execute(text("UPDATE platega_payments SET status = 'EXPIRED', is_paid = false"))
+    await session.commit()
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.blocked_reason is None
+    assert plan.done is True
+
+
+async def test_a_finished_closure_does_not_lock_the_button_forever(session, monkeypatch) -> None:
+    """Строка заявки на закрытие не удаляется никогда — запирать по её
+    наличию значило бы убить кнопку первым же нажатием «удалить»."""
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    session.add(AccountErasureRequest(user_id=stand.id, state='completed'))
+    await session.commit()
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.done is True
+
+    # А незакрытая — запирает.
+    other = await _seed_person(session, OUTSIDER_TELEGRAM_ID, balance_kopeks=0)
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(OUTSIDER_TELEGRAM_ID))
+    session.add(AccountErasureRequest(user_id=other.id, state='awaiting_manual_resolution'))
+    await session.commit()
+
+    blocked = await user_service.reset_test_account(session, other, admin_id=1, confirm=True)
+    assert blocked.done is False
+    assert 'закрывается' in (blocked.blocked_reason or '')
+
+
+async def test_a_paid_gift_of_a_real_buyer_survives(session, monkeypatch) -> None:
+    """`SET NULL` на ссылке — указание схемы «строка переживает человека»."""
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    buyer = User(telegram_id=444333222, username='buyer')
+    session.add(buyer)
+    await session.flush()
+    # Подарок купил ЖИВОЙ человек, активировал — стенд.
+    session.add(
+        GuestPurchase(
+            buyer_user_id=buyer.id,
+            user_id=stand.id,
+            amount_kopeks=19900,
+            status='paid',
+            token=f'gift-{STAND_TELEGRAM_ID}',
+            contact_type='telegram',
+            contact_value=str(STAND_TELEGRAM_ID),
+            period_days=30,
+        )
+    )
+    await session.commit()
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    stand_id = stand.id
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    # Кнопка честно отказывается: про подарки она судить не умеет.
+    assert plan.done is False
+    assert 'подарки' in (plan.blocked_reason or '')
+    assert await session.scalar(select(func.count()).select_from(GuestPurchase)) == 1
+    assert (await _counts(session, stand_id))['subscriptions'] == 1

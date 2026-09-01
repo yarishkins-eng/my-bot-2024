@@ -66,23 +66,112 @@ def test_stand_is_recognised_only_by_telegram_id(monkeypatch) -> None:
     assert user_service.is_test_account(SimpleNamespace(telegram_id=None, id=7749231125)) is False
 
 
+def test_allowlist_is_not_editable_from_the_cabinet() -> None:
+    """Список доступа к необратимому действию обязан жить только в окружении.
+
+    Кабинет делает редактируемым КАЖДОЕ поле Settings, которого нет в этом
+    наборе, и применяет новое значение мгновенно, без рестарта. Рядом по той
+    же причине лежат ADMIN_IDS и ADMIN_EMAILS.
+    """
+    from app.services.system_settings_service import BotConfigurationService
+
+    assert 'TEST_ACCOUNT_TELEGRAM_IDS' in BotConfigurationService.EXCLUDED_KEYS
+    # Соседи по смыслу: если однажды уберут их, эта проверка тоже обязана упасть.
+    assert {'ADMIN_IDS', 'ADMIN_EMAILS'} <= BotConfigurationService.EXCLUDED_KEYS
+
+
 def test_allowlist_empty_closes_the_door_for_everyone(monkeypatch) -> None:
     monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', '')
     assert user_service.is_test_account(SimpleNamespace(telegram_id=7749231125)) is False
 
 
-def test_every_user_owned_table_is_either_wiped_or_named_explicitly() -> None:
-    """Сторож, который ищет сам: новая таблица со ссылкой на пользователя
-    обязана быть либо в плане удаления, либо в списке «не трогаем никогда».
+# 🔴 Снимок того, что кнопка сносит СЕГОДНЯ. Он пришпилен руками намеренно.
+#
+# Прежний сторож сравнивал план с тем же признаком, по которому план и
+# строится, — то есть не мог покраснеть в принципе, и завтрашняя таблица со
+# ссылкой на пользователя молча уехала бы в снос. Здесь наоборот: любое
+# изменение набора роняет тест и требует РЕШЕНИЯ ЧЕЛОВЕКА, а не тишины.
+_PINNED_WIPED_TABLES = frozenset(
+    {
+        'advertising_campaign_registrations',
+        'apple_iap_accounts',
+        'apple_transactions',
+        'cabinet_refresh_tokens',
+        'checkout_payment_attempts',
+        'cloudpayments_payments',
+        'cryptobot_payments',
+        'device_first_deposit_outbox',
+        'device_first_mutations',
+        'device_first_notification_outbox',
+        'device_first_outbox',
+        'device_first_provider_events',
+        'discount_offers',
+        'freekassa_payments',
+        'heleket_payments',
+        'kassa_ai_payments',
+        'mulenpay_payments',
+        'pal24_payments',
+        'partner_applications',
+        'platega_payments',
+        'poll_responses',
+        'promocode_uses',
+        'referral_earnings',
+        'saved_payment_methods',
+        'sent_notifications',
+        'subscription_checkouts',
+        'subscription_conversions',
+        'subscription_entitlement_snapshots',
+        'subscription_entitlement_term_projection_outbox',
+        'subscription_entitlement_terms',
+        'subscription_events',
+        'subscription_servers',
+        'subscription_temporary_access',
+        'subscriptions',
+        'ticket_messages',
+        'ticket_notifications',
+        'tickets',
+        'traffic_purchases',
+        'transactions',
+        'user_device_aliases',
+        'user_promo_groups',
+        'wata_payments',
+        'withdrawal_requests',
+        'yandex_client_id_map',
+        'yookassa_payments',
+    }
+)
 
-    Рукописный перечень слепнет ровно на той таблице, которую добавят завтра;
-    этот тест краснеет вместо того, чтобы молча оставить чужой хвост на стенде.
-    """
-    unclassified = _owned_table_names() - set(_plan_names()) - user_service._TEST_RESET_NEVER_WIPED
-    assert unclassified == set(), (
-        'У этих таблиц появилась ссылка «строка принадлежит пользователю», '
-        'но обнуление стенда о них не знает: ' + ', '.join(sorted(unclassified))
+
+def test_wiped_tables_match_the_pinned_snapshot() -> None:
+    actual = set(_plan_names())
+    added = actual - _PINNED_WIPED_TABLES
+    removed = _PINNED_WIPED_TABLES - actual
+    assert not added, (
+        'Кнопка обнуления стенда начала сносить НОВЫЕ таблицы: '
+        + ', '.join(sorted(added))
+        + '. Решите по каждой: это мусор стенда или чужие данные? '
+        'Если мусор — впишите в снимок; если нет — в _TEST_RESET_NEVER_WIPED.'
     )
+    assert not removed, 'Кнопка перестала сносить: ' + ', '.join(sorted(removed)) + '. Убедитесь, что это осознанно.'
+
+
+def test_rows_the_schema_marks_as_outliving_the_person_are_left_alone() -> None:
+    """`SET NULL` на ссылке = «строка переживает человека». Спорить нельзя."""
+    names = set(_plan_names())
+    for survivor in (
+        'guest_purchases',  # оплаченный подарок ЖИВОГО покупателя
+        'apple_iap_abuse_events',  # улики злоупотреблений
+        'promo_offer_logs',
+        'entitlement_identities',
+        'button_click_logs',
+    ):
+        assert survivor not in names, f'{survivor} объявлена SET NULL — её удалять нельзя'
+
+
+def test_other_peoples_money_rows_are_left_alone() -> None:
+    """В `referral_earnings` строка принадлежит тому, кто ЗАРАБОТАЛ."""
+    assert 'referral_id' not in user_service._TEST_RESET_OWNERSHIP_COLUMNS
+    assert 'buyer_user_id' not in user_service._TEST_RESET_OWNERSHIP_COLUMNS
 
 
 def test_never_wiped_tables_stay_out_of_the_plan() -> None:
@@ -122,17 +211,45 @@ def test_plan_deletes_children_before_parents(child, parent) -> None:
     assert names.index(child) < names.index(parent), f'{child} обязана удаляться раньше {parent}'
 
 
-def test_finished_and_settled_lists_are_positive_not_negative() -> None:
-    """Незнакомое состояние обязано ЗАПИРАТЬ кнопку, а не проскакивать."""
-    assert 'ready' in user_service._TEST_RESET_FINISHED_CHECKOUT_STATES
-    for in_flight in ('awaiting_funds', 'fulfilling', 'operator_review', 'conflict'):
-        assert in_flight not in user_service._TEST_RESET_FINISHED_CHECKOUT_STATES
+def test_settled_lists_follow_the_project_and_not_my_own_invention() -> None:
+    """Наборы «законченного» берутся у проекта, а не пишутся рядом заново.
 
-    # `paid_processing` намеренно остаётся у успешной прямой продажи навсегда,
-    # поэтому «в работе ли заказ» спрашивается у lifecycle_state заказа. Но
-    # сама попытка в этом состоянии завершённой НЕ считается.
-    for in_flight in ('creating', 'pending', 'paid_processing', 'reconciliation', 'operator_review'):
+    Если проект заведёт новое состояние заказа или новый терминальный статус
+    провайдера, этот тест покраснеет — и кто-то решит, деньги это или мусор.
+    """
+    from app.services.device_first_checkout_service import TERMINAL_STATES
+    from app.services.device_first_payment_service import PROVIDER_TERMINAL_STATUSES
+
+    # Заказ: терминальные состояния проекта МИНУС те, где деньги на разборе.
+    assert user_service._TEST_RESET_FINISHED_CHECKOUT_STATES == (
+        TERMINAL_STATES - user_service._TEST_RESET_MONEY_REVIEW_CHECKOUT_STATES
+    )
+    # Провайдер: терминальные статусы проекта ПЛЮС успех.
+    assert PROVIDER_TERMINAL_STATUSES | {'CONFIRMED'} == user_service._TEST_RESET_SETTLED_PROVIDER_STATUSES
+
+
+def test_a_successful_purchase_does_not_lock_the_button_forever() -> None:
+    """`paid_processing` остаётся у УСПЕШНОЙ продажи навсегда.
+
+    Считать его «деньгами в пути» значит запереть кнопку на любом стенде,
+    где хоть раз прошла настоящая покупка, — то есть сломать инструмент ровно
+    тогда, когда он впервые понадобился. Ловушка описана в самом проекте:
+    `app/database/crud/tariff.py`.
+    """
+    assert 'paid_processing' in user_service._TEST_RESET_SETTLED_ATTEMPT_STATUSES
+    # Брошенный счёт — тоже законченный: открыл оплату и закрыл вкладку.
+    assert 'EXPIRED' in user_service._TEST_RESET_SETTLED_PROVIDER_STATUSES
+    # Остановившийся заказ сносится обязательно: пока он жив, клиенту закрыт
+    # пробный период.
+    assert 'failed' in user_service._TEST_RESET_FINISHED_CHECKOUT_STATES
+    assert 'reprice_required' in user_service._TEST_RESET_FINISHED_CHECKOUT_STATES
+
+
+def test_unknown_state_locks_the_button_rather_than_slipping_through() -> None:
+    """Списки положительные: чего в них нет — то запирает."""
+    for in_flight in ('awaiting_funds', 'fulfilling', 'operator_review', 'conflict', 'draft'):
+        assert in_flight not in user_service._TEST_RESET_FINISHED_CHECKOUT_STATES
+    for in_flight in ('creating', 'pending', 'reconciliation', 'operator_review'):
         assert in_flight not in user_service._TEST_RESET_SETTLED_ATTEMPT_STATUSES
-    for in_flight in ('VERIFYING', 'OPERATOR_REVIEW', 'PENDING'):
+    for in_flight in ('VERIFYING', 'OPERATOR_REVIEW', 'PENDING', 'CHARGEBACKED'):
         assert in_flight not in user_service._TEST_RESET_SETTLED_PROVIDER_STATUSES
-    assert 'CONFIRMED' in user_service._TEST_RESET_SETTLED_PROVIDER_STATUSES

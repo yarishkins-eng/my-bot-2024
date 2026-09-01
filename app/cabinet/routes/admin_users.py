@@ -2808,10 +2808,16 @@ async def reset_test_account_route(
 
     from app.services.user_service import reset_test_account
 
-    plan = await reset_test_account(db, user, admin.id, confirm=request.confirm)
+    # 🔴 Номера снимаются ДО вызова: внутри есть откат, а он «протухает» ВСЕ
+    # объекты этой сессии — включая `admin`, которого FastAPI взял из неё же.
+    # Чтение `admin.id` после отката уронило бы маршрут 500-й, и владелец
+    # вместо человеческого отказа увидел бы Internal Server Error.
+    admin_id = admin.id
+
+    plan = await reset_test_account(db, user, admin_id, confirm=request.confirm)
     logger.info(
         'Admin test account reset',
-        admin_id=admin.id,
+        admin_id=admin_id,
         user_id=user_id,
         confirm=request.confirm,
         allowed=plan.allowed,

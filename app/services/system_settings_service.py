@@ -78,6 +78,11 @@ class BotConfigurationService:
         'BOT_TOKEN',
         'ADMIN_IDS',
         'ADMIN_EMAILS',
+        # Список тестовых стендов — это список доступа к НЕОБРАТИМОМУ действию,
+        # ровно как ADMIN_IDS. Если его можно править из кабинета, любой, у кого
+        # есть settings:edit, впишет туда живого клиента, снесёт ему подписку и
+        # деньги и вернёт настройку назад. Только окружение.
+        'TEST_ACCOUNT_TELEGRAM_IDS',
         'CABINET_JWT_SECRET',
         'WEB_API_DEFAULT_TOKEN',
         'WEB_API_TOKEN_HMAC_SECRET',
