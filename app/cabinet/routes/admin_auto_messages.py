@@ -7,11 +7,10 @@
 в каталог НЕ входят: у них другая природа, другие условия и другой владелец. Если
 их когда-нибудь добавят, надо править и обещание на экране.
 
-Экран читающий: он показывает все сообщения по расписанию, но менять умеет
-только те пять, у которых выключатель уже существует в коде
-(``NotificationSettingsService._DEFAULTS``). Для остальных пятнадцати ``control``
-честно говорит «настроек нет», а ``PATCH`` по ним отвечает 409 — интерфейс не
-обещает того, чего не может.
+После АС-2 выключатель есть у девятнадцати сообщений из двадцати. Двадцатое —
+бонусные дни: там рычаг гасит не письмо, а сам бонус, поэтому ``control`` честно
+говорит «настроек нет», а ``PATCH`` по нему отвечает 409. Обратное правило важнее:
+нарисованный выключатель обязан правда запирать отправку, иначе экран врёт.
 
 🔴 Забор на деньги (``_assert_discount_is_safe``) не формальность: менять процент
 может не только владелец, но и роль Marketer, а нулевая итоговая цена ведёт себя
@@ -42,6 +41,7 @@ from app.database.models import (
 )
 from app.services.notification_settings_service import NotificationSettingsService
 from app.services.pricing_engine import PricingEngine
+from app.utils.formatters import format_hours_declension, format_subscriptions_declension
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -69,13 +69,32 @@ _GUARD_REFERENCE_PRICE_KOPEKS = 100
 
 # Ноль процентов — не «выключено», а письмо «Скидка 0% на продление». Выключают
 # тумблером, а не обнулением.
+# 🔴 Не меньше часа. Служба мониторинга обходит всех раз в час, а условие отправки —
+# «до конца осталось не больше N». Окно уже часа цикл перешагнёт, и большинство
+# клиентов не получит предупреждения вовсе, причём молча.
+#
+# 🔴 Ровно час НЕ подходит, хотя владелец выбрал именно его как самое малое: цикл спит
+# час ПОСЛЕ работы, значит шаг между обходами — час плюс длительность обхода. Окно
+# шириной ровно в час уже шага, и в каждом обороте остаётся слепая полоса. Самое малое
+# работающее — два часа; это ровно то, что стоит на боевом сегодня.
+MIN_WARN_HOURS = 2
+MAX_WARN_HOURS = 48
 MIN_OFFER_DISCOUNT_PERCENT = 1
 MIN_VALID_HOURS = 1
 MAX_VALID_HOURS = 168
-MAX_TRIGGER_DAYS = 60
+# 🔴 29, и не 30. Выборка «кто остался без подписки» смотрит назад ровно на 30 дней, а
+# отправка требует, чтобы прошло от N до N+1 дня. При 30 эти два условия пересекаются в
+# единственной точке «ровно 30,000 суток», куда часовой обход не попадает. Работает
+# последнее полное окно — 29. Мина из АС-1: сначала стояло 60, потом 30 — оба мёртвые.
+MAX_TRIGGER_DAYS = NotificationSettingsService.MAX_TRIGGER_DAYS
 
 # Человеческие имена полей: в отказ уходят они, а не латиница из кода.
+# Все числовые поля раздела в одном месте: обработчик перебирает именно этот набор,
+# и добавление нового поля мимо него молча ничего не сохранит.
+_NUMERIC_FIELDS: tuple[str, ...] = ('warn_hours', 'discount_percent', 'valid_hours', 'trigger_days')
+
 FIELD_TITLES: dict[str, str] = {
+    'warn_hours': 'За сколько предупредить',
     'discount_percent': 'Размер скидки',
     'valid_hours': 'Сколько действует',
     'trigger_days': 'Через сколько дней',
@@ -162,9 +181,11 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
     {
         'id': 'trial-2h',
         'group': 'trial',
-        'title': 'Пробный истекает через 2 часа',
-        'when': 'За 2 часа до конца — каждому, у кого идёт пробный',
-        'control': 'locked',
+        'title': 'Пробный скоро истекает',
+        'when': 'За {warn_hours} до конца — каждому, у кого идёт пробный',
+        'control': 'toggle',
+        'settings_key': 'trial_2h',
+        'params': ('warn_hours',),
         'sent_type': 'trial_2h',
         'buttons': [
             {'label': '💎 Купить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
@@ -176,10 +197,14 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'trial',
         'title': 'Пробный истёк',
         'when': 'Сразу, как только закончился пробный период',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'subscription_expired',
+        'params': (),
+        'shares_switch_with': 'Подписка истекла',
+        'warning': 'Выключите — и человек, у которого кончился пробный, просто увидит, что VPN перестал работать. Бот ему ничего не напишет.',
         'buttons': [
             {'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
-            {'label': '💳 Тарифы', 'target': 'Список тарифов в боте', 'tracked': True},
+            {'label': '💳 Тарифы', 'target': 'Список тарифов в боте', 'tracked': False},
         ],
     },
     {
@@ -201,8 +226,11 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'paid-3d',
         'group': 'paid',
         'title': 'Подписка истекает через 3 дня',
-        'when': 'За 3 дня до конца — тем, у кого активна платная подписка',
-        'control': 'locked',
+        'when': 'За 3 дня до конца — тем, у кого активна платная подписка и кто не отключил это у себя',
+        'control': 'toggle',
+        'settings_key': 'subscription_expiring',
+        'params': (),
+        'shares_switch_with': 'Подписка истекает завтра',
         'sent_type': 'expiring',
         'sent_days': 3,
         'buttons': [
@@ -215,8 +243,13 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'paid-1d',
         'group': 'paid',
         'title': 'Подписка истекает завтра',
-        'when': 'За 1 день до конца · более срочное вытесняет трёхдневное, а не наоборот',
-        'control': 'locked',
+        'when': (
+            'За 1 день до конца — тем, кто не отключил это у себя · более срочное вытесняет трёхдневное, а не наоборот'
+        ),
+        'control': 'toggle',
+        'settings_key': 'subscription_expiring',
+        'params': (),
+        'shares_switch_with': 'Подписка истекает через 3 дня',
         'sent_type': 'expiring',
         'sent_days': 1,
         'buttons': [
@@ -230,7 +263,11 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'paid',
         'title': 'Подписка истекла',
         'when': 'В момент отключения доступа',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'subscription_expired',
+        'params': (),
+        'shares_switch_with': 'Пробный истёк',
+        'warning': 'Это единственное сообщение, из которого клиент узнаёт, что подписка кончилась и доступ закрыт. Выключите — люди будут молча терять связь.',
         'buttons': [
             {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
@@ -248,7 +285,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'buttons': [
             {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
-            {'label': '🆘 Поддержка', 'target': 'Кабинет, экран поддержки', 'tracked': False},
+            {'label': '🆘 Поддержка', 'target': 'Экран поддержки в боте', 'tracked': False},
         ],
     },
     {
@@ -265,7 +302,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
             {'label': '🎁 Получить скидку', 'target': 'Выдаёт скидку', 'tracked': True},
             {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
-            {'label': '🆘 Поддержка', 'target': 'Кабинет, экран поддержки', 'tracked': False},
+            {'label': '🆘 Поддержка', 'target': 'Экран поддержки в боте', 'tracked': False},
         ],
     },
     {
@@ -282,15 +319,21 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
             {'label': '🎁 Получить скидку', 'target': 'Выдаёт скидку', 'tracked': True},
             {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
-            {'label': '🆘 Поддержка', 'target': 'Кабинет, экран поддержки', 'tracked': False},
+            {'label': '🆘 Поддержка', 'target': 'Экран поддержки в боте', 'tracked': False},
         ],
     },
     {
         'id': 'traffic-80',
         'group': 'other',
         'title': 'Израсходовано много трафика',
-        'when': 'При достижении порога — но только там, где вообще есть лимит гигабайт',
-        'control': 'locked',
+        'when': (
+            'Когда израсходована та доля гигабайт, которую клиент выставил себе сам — и только '
+            'там, где лимит вообще есть'
+        ),
+        'control': 'toggle',
+        'settings_key': 'traffic_warning',
+        'params': (),
+        'warning': 'Это единственное предупреждение перед тем, как гигабайты закончатся. Выключите — интернет у клиента остановится без предупреждения.',
         'quiet_check': 'traffic_limits',
         'buttons': [],
     },
@@ -298,13 +341,27 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'channel-left',
         'group': 'other',
         'title': 'Отписка от канала: доступ закрыт',
-        'when': 'Сразу после отписки от обязательного канала',
+        'when': 'После отписки от обязательного канала: сразу и повторно на ближайшей проверке',
         'control': 'toggle',
         'settings_key': 'trial_channel_unsubscribed',
         'params': (),
         'sent_type': 'trial_channel_unsubscribed',
         'quiet_check': 'channel_required',
-        'buttons': [{'label': '✅ Я подписался', 'target': 'Повторная проверка в боте', 'tracked': True}],
+        'buttons': [
+            {'label': '🔗 <название канала>', 'target': 'Ссылка на канал — своя кнопка на каждый', 'tracked': False},
+            {'label': '✅ Я подписался', 'target': 'Повторная проверка в боте', 'tracked': False},
+        ],
+    },
+    {
+        'id': 'channel-back',
+        'group': 'other',
+        'title': 'Вернулся в канал: доступ открыт',
+        'when': 'Сразу после того, как клиент снова подписался на обязательный канал',
+        'control': 'toggle',
+        'settings_key': 'channel_restored',
+        'params': (),
+        'quiet_check': 'channel_required',
+        'buttons': [],
     },
     {
         'id': 'grace-2d',
@@ -322,17 +379,24 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'low-balance',
         'group': 'other',
         'title': 'Низкий баланс',
-        'when': 'Когда баланс становится низким — но только тем, кто сам включил это в своих настройках',
-        'control': 'locked',
+        'when': (
+            'Когда баланс низкий — и только если клиент сам включил это у себя, автоплатёж у него '
+            'включён, подписка кончается в ближайшие дни и сейчас не ночь'
+        ),
+        'control': 'toggle',
+        'settings_key': 'low_balance',
+        'params': (),
         'quiet_check': 'client_opt_in',
-        'buttons': [{'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False}],
+        'buttons': [{'label': '💳 Пополнить баланс', 'target': 'Кабинет, главный экран', 'tracked': False}],
     },
     {
         'id': 'autopay-ok',
         'group': 'other',
         'title': 'Автоплатёж прошёл',
         'when': 'После успешного списания с баланса',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'autopay_success',
+        'params': (),
         'quiet_check': 'autopay',
         'buttons': [],
     },
@@ -341,7 +405,10 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Автоплатёж не прошёл',
         'when': 'Когда на балансе не хватило денег',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'autopay_failed',
+        'params': (),
+        'shares_switch_with': 'Последнее напоминание об автоплатеже',
         'quiet_check': 'autopay',
         'buttons': [
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
@@ -353,7 +420,11 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Последнее напоминание об автоплатеже',
         'when': 'За несколько часов до отключения, если денег так и не хватило',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'autopay_failed',
+        'params': (),
+        'shares_switch_with': 'Автоплатёж не прошёл',
+        'warning': 'Последнее предупреждение перед отключением за неуплату. Выключите — подписка оборвётся без напоминания.',
         'quiet_check': 'autopay',
         'buttons': [
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
@@ -365,7 +436,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Автоплатёж приостановлен: подписка без тарифа',
         'when': 'Один раз в неделю тем, чья подписка создана до введения тарифов',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'autopay_legacy',
+        'params': (),
         'quiet_check': 'legacy_subscriptions',
         'buttons': [],
     },
@@ -374,7 +447,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Суточное списание',
         'when': 'Каждые сутки на суточном тарифе',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'daily_charge',
+        'params': (),
         'quiet_check': 'daily_tariffs',
         'buttons': [],
     },
@@ -383,11 +458,14 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Подписка приостановлена: не хватило на сутки',
         'when': 'Когда на суточное списание не хватило денег',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'daily_paused',
+        'params': (),
+        'warning': 'Гасит только сообщение. Подписка всё равно приостановится — клиент останется без VPN и не будет знать почему.',
         'quiet_check': 'daily_tariffs',
         'buttons': [
-            {'label': '💳 Пополнить баланс', 'target': 'Экран баланса в боте', 'tracked': True},
-            {'label': '📱 Моя подписка', 'target': 'Экран подписки в боте', 'tracked': True},
+            {'label': '💳 Пополнить баланс', 'target': 'Экран баланса в боте', 'tracked': False},
+            {'label': '📱 Моя подписка', 'target': 'Экран подписки в боте', 'tracked': False},
         ],
     },
     {
@@ -395,7 +473,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Сброс докупленного трафика',
         'when': 'Когда истекает срок докупленного пакета гигабайтов',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'traffic_reset',
+        'params': (),
         'buttons': [],
     },
 ]
@@ -414,6 +494,7 @@ SETTER_NAMES: dict[tuple[str, str], str] = {
     ('trial_expired_discount', 'discount_percent'): 'set_trial_expired_discount_percent',
     ('trial_expired_discount', 'valid_hours'): 'set_trial_expired_discount_valid_hours',
     ('trial_expired_discount', 'trigger_days'): 'set_trial_expired_discount_trigger_days',
+    ('trial_2h', 'warn_hours'): 'set_trial_warn_hours',
 }
 
 # Читаем тоже через геттеры, а не из сырого файла: в них сидят те же ограничители,
@@ -428,6 +509,7 @@ GETTER_NAMES: dict[tuple[str, str], str] = {
     ('trial_expired_discount', 'discount_percent'): 'get_trial_expired_discount_percent',
     ('trial_expired_discount', 'valid_hours'): 'get_trial_expired_discount_valid_hours',
     ('trial_expired_discount', 'trigger_days'): 'get_trial_expired_discount_trigger_days',
+    ('trial_2h', 'warn_hours'): 'get_trial_warn_hours',
 }
 
 # Нижняя граница «через сколько дней» у сообщений РАЗНАЯ: у третьей волны сеттер
@@ -468,6 +550,11 @@ class AutoMessageItem(BaseModel):
     # Уточнение к РАБОТАЮЩЕМУ сообщению («кому именно уходит»). Отдельно от причины
     # молчания намеренно: одно поле на два смысла уже сделало живое сообщение «молчащим».
     note: str | None = None
+    # Имя сообщения, которое гасится ТЕМ ЖЕ выключателем. Три пары в коде бота пишет
+    # одно и то же место, разделить их — отдельная работа (решение владельца 01.09.2026).
+    shares_switch_with: str | None = None
+    # Что случится с клиентом, если это выключить. Только там, где последствие настоящее.
+    warning: str | None = None
     params: dict[str, int] | None = None
     sent_count: int | None = None
     claimed_count: int | None = None
@@ -515,6 +602,7 @@ class AutoMessagePatch(BaseModel):
     model_config = {'extra': 'forbid'}
 
     enabled: bool | None = None
+    warn_hours: int | None = Field(default=None, ge=MIN_WARN_HOURS, le=MAX_WARN_HOURS)
     discount_percent: int | None = Field(default=None, ge=0, le=100)
     valid_hours: int | None = Field(default=None, ge=MIN_VALID_HOURS, le=MAX_VALID_HOURS)
     trigger_days: int | None = Field(default=None, ge=1, le=MAX_TRIGGER_DAYS)
@@ -541,9 +629,10 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
     reasons: dict[str, str] = {}
     notes: dict[str, str] = {}
 
-    # `limited` — это подписка, исчерпавшая трафик. Выкинуть её из подсчёта значило бы
-    # считать лимиты без тех, у кого лимит уже сработал.
-    live_statuses = ['active', 'trial', 'limited']
+    # Ровно те статусы, которые видит отправитель (monitoring_service: выборка по
+    # traffic_limit_gb). `limited` он не берёт: у такой подписки трафик уже кончился,
+    # предупреждать поздно. Считать её здесь значило бы обещать письма, которых не будет.
+    live_statuses = ['active', 'trial']
     with_limit = (
         await db.scalar(
             select(func.count())
@@ -557,7 +646,7 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
         or 0
     )
     if with_limit:
-        notes['traffic_limits'] = f'лимит есть у {with_limit} подписок из {total_live}'
+        notes['traffic_limits'] = f'лимит есть у {format_subscriptions_declension(with_limit)} из {total_live}'
     else:
         reasons['traffic_limits'] = 'ни у одной живой подписки нет лимита гигабайтов'
 
@@ -584,7 +673,7 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
         or 0
     )
     if autopay_count:
-        notes['autopay'] = f'автоплатёж включён у {autopay_count} подписок'
+        notes['autopay'] = f'автоплатёж включён у {format_subscriptions_declension(autopay_count)}'
     else:
         reasons['autopay'] = 'автоплатёж не включён ни у одной активной платной подписки'
 
@@ -638,10 +727,20 @@ def _params_for(entry: dict[str, Any]) -> dict[str, int] | None:
 
 
 def _resolve_when(entry: dict[str, Any], params: dict[str, int] | None) -> str:
+    """Подставить в подпись живые значения настроек.
+
+    🔴 Подпись обязана следовать за настройкой. Пока число было зашито в текст,
+    можно было поменять момент отправки и оставить на экране старую цифру — ровно
+    то враньё, за которое владелец и зацепился.
+    """
     when = entry['when']
+    values = params or {}
     if '{trigger_days}' in when:
-        days = (params or {}).get('trigger_days')
-        return when.replace('{trigger_days}', str(days) if days else '—')
+        days = values.get('trigger_days')
+        when = when.replace('{trigger_days}', str(days) if days else '—')
+    if '{warn_hours}' in when:
+        hours = values.get('warn_hours')
+        when = when.replace('{warn_hours}', format_hours_declension(hours) if hours else '—')
     return when
 
 
@@ -720,6 +819,8 @@ def _limits_for(entry: dict[str, Any]) -> dict[str, list[int]] | None:
             bounds[name] = [MIN_VALID_HOURS, MAX_VALID_HOURS]
         elif name == 'trigger_days':
             bounds[name] = [TRIGGER_DAYS_MIN.get(key, 1), MAX_TRIGGER_DAYS]
+        elif name == 'warn_hours':
+            bounds[name] = [MIN_WARN_HOURS, MAX_WARN_HOURS]
     return bounds
 
 
@@ -743,6 +844,8 @@ def _build_item(
         state=state,
         quiet_reason=quiet_reason,
         note=note,
+        shares_switch_with=entry.get('shares_switch_with'),
+        warning=entry.get('warning'),
         params=params,
         sent_count=_sent_for(entry, sent_counts),
         claimed_count=claimed_counts.get(claim_type, 0) if claim_type else None,
@@ -915,7 +1018,7 @@ async def patch_auto_message(
             detail='Нечего сохранять: в запросе нет ни одного изменения.',
         )
 
-    for field in ('discount_percent', 'valid_hours', 'trigger_days'):
+    for field in _NUMERIC_FIELDS:
         if field in changes and field not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -925,6 +1028,8 @@ async def patch_auto_message(
     # Заборы ДО записи: половина применённых изменений хуже, чем ни одного.
     if 'discount_percent' in changes:
         await _assert_discount_is_safe(db, changes['discount_percent'])
+    if 'warn_hours' in changes:
+        _assert_in_range(changes['warn_hours'], MIN_WARN_HOURS, MAX_WARN_HOURS, FIELD_TITLES['warn_hours'])
     if 'valid_hours' in changes:
         _assert_in_range(changes['valid_hours'], MIN_VALID_HOURS, MAX_VALID_HOURS, FIELD_TITLES['valid_hours'])
     if 'trigger_days' in changes:
@@ -944,7 +1049,7 @@ async def patch_auto_message(
     written: list[bool] = []
     if 'enabled' in changes:
         written.append(bool(NotificationSettingsService.set_enabled(settings_key, changes['enabled'])))
-    for field in ('discount_percent', 'valid_hours', 'trigger_days'):
+    for field in _NUMERIC_FIELDS:
         if field not in changes:
             continue
         setter_name = SETTER_NAMES.get((settings_key, field))

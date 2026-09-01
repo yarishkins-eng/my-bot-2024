@@ -12,6 +12,13 @@ logger = structlog.get_logger(__name__)
 
 
 class NotificationSettingsService:
+    # 🔴 Последний день, на который сообщение реально уйдёт. Выборка «кто остался без
+    # подписки» смотрит назад ровно на 30 дней, а отправка требует, чтобы прошло от N
+    # до N+1 дня: при 30 остаётся точка «ровно 30,000 суток», в которую часовой обход
+    # не попадает. Зажимаем ЗДЕСЬ, а не только на экране: в файл настроек можно попасть
+    # мимо раздела (чат-админка потолка не имеет), и тогда сообщение молча не уходило бы
+    # никогда. Лучше отправить на последний рабочий день, чем не отправить вовсе.
+    MAX_TRIGGER_DAYS = 29
     """Runtime-editable notification settings stored on disk."""
 
     _storage_path: Path = Path('data/notification_settings.json')
@@ -40,6 +47,23 @@ class NotificationSettingsService:
             'valid_hours': 24,
             'trigger_days': 1,
         },
+        # --- АС-2: выключатели остальным сообщениям ---
+        # Умолчание True у всех: появление ключа не должно ничего менять в поведении.
+        # 🔴 Три ключа гасят ПО ДВА сообщения сразу — так устроен код бота, и на экране
+        # это написано прямо. Разводить их по отдельным выключателям — отдельная работа
+        # (решение владельца 01.09.2026).
+        'trial_2h': {'enabled': True, 'warn_hours': 2},
+        'subscription_expired': {'enabled': True},  # «пробный истёк» И «подписка истекла»
+        'subscription_expiring': {'enabled': True},  # «истекает через 3 дня» И «истекает завтра»
+        'traffic_warning': {'enabled': True},
+        'low_balance': {'enabled': True},
+        'autopay_success': {'enabled': True},
+        'autopay_failed': {'enabled': True},  # «не прошёл» И «последнее напоминание»
+        'autopay_legacy': {'enabled': True},
+        'daily_charge': {'enabled': True},
+        'daily_paused': {'enabled': True},
+        'traffic_reset': {'enabled': True},
+        'channel_restored': {'enabled': True},
     }
 
     @classmethod
@@ -230,14 +254,14 @@ class NotificationSettingsService:
     def get_third_wave_trigger_days(cls) -> int:
         value = cls._get('expired_third_wave').get('trigger_days', 5)
         try:
-            return max(2, min(60, int(value)))
+            return max(2, min(cls.MAX_TRIGGER_DAYS, int(value)))
         except (TypeError, ValueError):
             return 5
 
     @classmethod
     def set_third_wave_trigger_days(cls, days: int) -> bool:
         try:
-            days_int = max(2, min(60, int(days)))
+            days_int = max(2, min(cls.MAX_TRIGGER_DAYS, int(days)))
         except (TypeError, ValueError):
             return False
         return cls._set_field('expired_third_wave', 'trigger_days', days_int)
@@ -287,17 +311,40 @@ class NotificationSettingsService:
     def get_trial_expired_discount_trigger_days(cls) -> int:
         value = cls._get('trial_expired_discount').get('trigger_days', 1)
         try:
-            return max(1, min(60, int(value)))
+            return max(1, min(cls.MAX_TRIGGER_DAYS, int(value)))
         except (TypeError, ValueError):
             return 1
 
     @classmethod
     def set_trial_expired_discount_trigger_days(cls, days: int) -> bool:
         try:
-            days_int = max(1, min(60, int(days)))
+            days_int = max(1, min(cls.MAX_TRIGGER_DAYS, int(days)))
         except (TypeError, ValueError):
             return False
         return cls._set_field('trial_expired_discount', 'trigger_days', days_int)
+
+    @classmethod
+    def get_trial_warn_hours(cls) -> int:
+        """За сколько часов до конца пробного предупреждать.
+
+        🔴 Нижняя граница — ДВА часа, и это не вкусовщина. Служба мониторинга спит час
+        ПОСЛЕ обхода, значит шаг между обходами — час плюс длительность самого обхода.
+        Условие отправки — «до конца осталось не больше N», то есть окно шириной ровно N.
+        Окно в один час уже шага, и в каждом обороте остаётся слепая полоса: кто попал в
+        неё, не получит ничего, причём молча. Два часа перекрывают шаг с запасом.
+        """
+        try:
+            return max(2, min(48, int(cls._get('trial_2h').get('warn_hours', 2))))
+        except (TypeError, ValueError):
+            return 2
+
+    @classmethod
+    def set_trial_warn_hours(cls, hours: int) -> bool:
+        try:
+            value = max(2, min(48, int(hours)))
+        except (TypeError, ValueError):
+            return False
+        return cls._set_field('trial_2h', 'warn_hours', value)
 
     @classmethod
     def are_notifications_globally_enabled(cls) -> bool:

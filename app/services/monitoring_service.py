@@ -1,5 +1,6 @@
 import asyncio
 import html
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -133,6 +134,26 @@ class AutopayFailState:
             last_sent_ts=float(data.get('last_sent_ts', 0.0)),
             final_sent=bool(data.get('final_sent', False)),
         )
+
+
+def trial_hours_left(end_date: datetime | None, window_hours: int) -> int:
+    """Сколько часов написать клиенту в письме «пробный скоро закончится».
+
+    🔴 Настроенное «за сколько предупредить» — это ШИРИНА ОКНА, а не остаток. При
+    «за 24 часа» в одну проверку попадают и тот, у кого сутки, и тот, у кого два часа.
+    Написать обоим «через 24 часа» — соврать второму: он отложит покупку и останется
+    без VPN. Поэтому в письме стоит настоящий остаток.
+
+    Округляем ВВЕРХ и не ниже часа: занизить хуже, чем завысить. «Через час» тому, у
+    кого полтора, торопит; «через два» тому, у кого час, — расслабляет. Больше ширины
+    окна не пишем: это уже не остаток, а разъехавшиеся часы на сервере.
+    """
+    if end_date is None:
+        return window_hours
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=UTC)
+    left = (end_date - datetime.now(UTC)).total_seconds() / 3600
+    return max(1, min(window_hours, math.ceil(left)))
 
 
 def decide_autopay_fail_notification(
@@ -622,6 +643,13 @@ class MonitoringService:
 
         `cause` ('charge_error' | 'insufficient_balance') selects the email/non-Telegram
         reason wording so a non-balance charge failure isn't mislabelled as low balance."""
+        # Один выключатель на «не прошёл» и «последнее напоминание»: оба рождает эта
+        # функция, а какое именно — решает decide_autopay_fail_notification ниже.
+        # Забор стоит ДО загрузки состояния: пока сообщение выключено, счётчик попыток
+        # не двигается, и при обратном включении отсчёт начнётся заново.
+        if not NotificationSettingsService.is_enabled('autopay_failed'):
+            return
+
         cycle_token = int(subscription.end_date.timestamp())
         now_ts = current_time.timestamp()
         hours_left = (subscription.end_date - current_time).total_seconds() / 3600.0
@@ -1021,6 +1049,10 @@ class MonitoringService:
             return None
 
     async def _check_expiring_subscriptions(self, db: AsyncSession):
+        # Один выключатель на оба сообщения («через 3 дня» и «завтра»): они рождаются
+        # одним циклом по списку дней, и разделить их — отдельная работа.
+        if not NotificationSettingsService.is_enabled('subscription_expiring'):
+            return
         try:
             warning_days = settings.get_autopay_warning_days()
             all_processed_users = set()
@@ -1139,8 +1171,11 @@ class MonitoringService:
             logger.error('Ошибка проверки истекающих подписок', error=e)
 
     async def _check_trial_expiring_soon(self, db: AsyncSession):
+        if not NotificationSettingsService.is_enabled('trial_2h'):
+            return
         try:
-            threshold_time = datetime.now(UTC) + timedelta(hours=2)
+            warn_hours = NotificationSettingsService.get_trial_warn_hours()
+            threshold_time = datetime.now(UTC) + timedelta(hours=warn_hours)
 
             result = await db.execute(
                 select(Subscription)
@@ -1173,11 +1208,11 @@ class MonitoringService:
                     continue
 
                 if self.bot:
-                    success = await self._send_trial_ending_notification(user, subscription)
+                    success = await self._send_trial_ending_notification(user, subscription, warn_hours)
                     if success:
                         await record_notification(db, user.id, subscription.id, 'trial_2h')
                         logger.info(
-                            '🎁 Пользователю отправлено уведомление об окончании тестовой подписки через 2 часа',
+                            '🎁 Пользователю отправлено предупреждение о конце пробного',
                             telegram_id=user.telegram_id,
                         )
 
@@ -1898,6 +1933,8 @@ class MonitoringService:
                         user_id=sub.user_id,
                     )
                     # Notify user once that autopay won't work without a tariff
+                    if not NotificationSettingsService.is_enabled('autopay_legacy'):
+                        continue
                     autopay_legacy_key = f'autopay_legacy_notified:{sub.user_id}'
                     try:
                         if not await cache.exists(autopay_legacy_key):
@@ -2188,8 +2225,10 @@ class MonitoringService:
                                 await self._send_autopay_success_notification(
                                     user, charge_amount, autopay_period, subscription=subscription
                                 )
-                            elif not user.telegram_id:
+                            elif not user.telegram_id and NotificationSettingsService.is_enabled('autopay_success'):
                                 # Email-only user - use notification delivery service
+                                # Забор тот же, что и у телеграм-ветки: нарисованный тумблер
+                                # обязан запирать письмо целиком, а не только одну дорогу.
                                 await notification_delivery_service.notify_autopay_success(
                                     user=user,
                                     amount_kopeks=charge_amount,
@@ -2264,6 +2303,11 @@ class MonitoringService:
     async def _send_subscription_expired_notification(
         self, user: User, subscription: Subscription, *, tariff_name: str | None = None
     ) -> bool:
+        # 🔴 Забор стоит ДО ветвления по is_trial ниже: одна и та же функция пишет и
+        # «пробный истёк», и «подписка истекла». Поэтому выключатель здесь один на два
+        # сообщения, и на экране это сказано прямо.
+        if not NotificationSettingsService.is_enabled('subscription_expired'):
+            return True
         try:
             if getattr(subscription, 'is_trial', False):
                 return await self._send_trial_expired_notification(user)
@@ -2506,17 +2550,28 @@ class MonitoringService:
             )
             return False
 
-    async def _send_trial_ending_notification(self, user: User, subscription: Subscription) -> bool:
+    async def _send_trial_ending_notification(
+        self, user: User, subscription: Subscription, warn_hours: int | None = None
+    ) -> bool:
         try:
             get_texts(user.language)
 
             tariff_label = ''
             if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
                 tariff_label = f' «{subscription.tariff.name}»'
+            # 🔴 В письме стоит НАСТОЯЩИЙ остаток, а не настроенное «за сколько предупредить».
+            # Настройка задаёт лишь ширину окна: при «за 24 часа» в одну проверку попадают и
+            # те, у кого сутки, и те, у кого два часа. Писать всем «через 24 часа» — врать
+            # человеку, который из-за этого отложит покупку и потеряет VPN.
+            from app.utils.formatters import format_hours_declension
+
+            window_hours = warn_hours if warn_hours is not None else NotificationSettingsService.get_trial_warn_hours()
+            hours = trial_hours_left(subscription.end_date, window_hours)
+            hours_text = format_hours_declension(hours)
             message = f"""
 🎁 <b>Тестовая подписка{tariff_label} скоро закончится!</b>
 
-Ваша тестовая подписка истекает через 2 часа.
+Ваша тестовая подписка истекает через {hours_text}.
 
 💎 <b>Не хотите остаться без VPN?</b>
 Переходите на полную подписку!
@@ -2898,6 +2953,8 @@ class MonitoringService:
     async def _send_autopay_success_notification(
         self, user: User, amount: int, days: int, *, subscription: Subscription | None = None
     ):
+        if not NotificationSettingsService.is_enabled('autopay_success'):
+            return
         try:
             texts = get_texts(user.language)
             tariff_label = ''
@@ -3027,6 +3084,8 @@ class MonitoringService:
         """Check subscriptions approaching traffic limit and notify users."""
         if not self.bot:
             return
+        if not NotificationSettingsService.is_enabled('traffic_warning'):
+            return
 
         try:
             from sqlalchemy import select
@@ -3124,6 +3183,8 @@ class MonitoringService:
         - Rate-limited: max 1 alert per 24 hours per user
         """
         if not self.bot:
+            return
+        if not NotificationSettingsService.is_enabled('low_balance'):
             return
 
         try:

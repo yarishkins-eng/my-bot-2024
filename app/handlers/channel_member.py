@@ -24,10 +24,16 @@ from app.keyboards.inline import get_channel_sub_keyboard
 from app.localization.loader import DEFAULT_LANGUAGE
 from app.localization.texts import get_texts
 from app.services.channel_subscription_service import channel_subscription_service
+from app.services.notification_settings_service import NotificationSettingsService
 from app.services.subscription_service import SubscriptionService
 
 
 logger = structlog.get_logger(__name__)
+
+
+class _SkipNotification(Exception):
+    """Письмо погашено выключателем раздела. Не ошибка — не логируется как ошибка."""
+
 
 router = Router(name='channel_member')
 
@@ -107,13 +113,20 @@ async def on_user_joined_channel(event: ChatMemberUpdated, bot: Bot) -> None:
                         logger.error('Failed to enable RemnaWave user', error=api_error)
 
             # Notify the user
+            # 🔴 Забор стоит ТОЛЬКО на письме: доступ выше уже восстановлен, и выключатель
+            # раздела не имеет права его отменять — иначе «выключить сообщение» молча
+            # означало бы «не возвращать человеку VPN».
             try:
+                if not NotificationSettingsService.is_enabled('channel_restored'):
+                    raise _SkipNotification
                 texts = get_texts(db_user.language or DEFAULT_LANGUAGE)
                 notification_text = texts.t(
                     'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE',
                     'Your subscription has been restored! Thank you for subscribing to the channels.',
                 )
                 await bot.send_message(user.id, notification_text)
+            except _SkipNotification:
+                pass
             except Exception as notify_error:
                 logger.warning('Failed to send notification', telegram_id=user.id, error=notify_error)
 
@@ -191,7 +204,16 @@ async def on_user_left_channel(event: ChatMemberUpdated, bot: Bot) -> None:
                         logger.error('Failed to disable RemnaWave user', error=api_error)
 
             # Notify the user with channel subscription keyboard
+            # 🔴 Тот же ключ, что и у почасовой сверки: событие одно, писем два. Без этого
+            # забора выключатель в разделе гасил бы только вторую копию, а клиент всё равно
+            # получал бы письмо — ровно тот обман, ради которого затевался раздел.
+            # Забор стоит ТОЛЬКО на письме: VPN выше уже отключён и остаётся отключённым.
             try:
+                if not (
+                    NotificationSettingsService.are_notifications_globally_enabled()
+                    and NotificationSettingsService.is_enabled('trial_channel_unsubscribed')
+                ):
+                    raise _SkipNotification
                 texts = get_texts(db_user.language or DEFAULT_LANGUAGE)
                 unsub_channels = await channel_subscription_service.get_channels_with_status(user.id)
                 notification_text = texts.t(
@@ -200,6 +222,8 @@ async def on_user_left_channel(event: ChatMemberUpdated, bot: Bot) -> None:
                 )
                 channel_kb = get_channel_sub_keyboard(unsub_channels, language=db_user.language or DEFAULT_LANGUAGE)
                 await bot.send_message(user.id, notification_text, reply_markup=channel_kb)
+            except _SkipNotification:
+                pass
             except Exception as notify_error:
                 logger.warning('Failed to send notification', telegram_id=user.id, error=notify_error)
 

@@ -20,6 +20,7 @@ from app.localization.loader import DEFAULT_LANGUAGE
 from app.localization.texts import get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.channel_subscription_service import channel_subscription_service
+from app.services.notification_settings_service import NotificationSettingsService
 from app.services.subscription_service import SubscriptionService
 from app.utils.cache import cache
 from app.utils.check_reg_process import is_registration_process
@@ -505,7 +506,16 @@ class ChannelCheckerMiddleware(BaseMiddleware):
                             )
 
                 # Notify user about deactivation
-                if deactivated_subs:
+                # 🔴 ЧЕТВЁРТОЕ место, откуда уходит это же письмо: посредник проверяет
+                # подписку на канал при каждом действии клиента, независимо от почасовой
+                # службы и от мгновенного обработчика события. Без забора здесь выключатель
+                # в разделе гасил бы три письма из четырёх, а клиент всё равно получал бы
+                # четвёртое. Доступ отключается ВЫШЕ и забором не затрагивается.
+                if (
+                    deactivated_subs
+                    and NotificationSettingsService.are_notifications_globally_enabled()
+                    and NotificationSettingsService.is_enabled('trial_channel_unsubscribed')
+                ):
                     try:
                         normalized = _normalize_channels(channels)
                         texts = get_texts(user.language or DEFAULT_LANGUAGE)
@@ -593,25 +603,31 @@ class ChannelCheckerMiddleware(BaseMiddleware):
                             )
 
                 # Notify user about reactivation
-                try:
-                    texts = get_texts(user.language or DEFAULT_LANGUAGE)
-                    if settings.is_multi_tariff_enabled() and len(disabled_subs) > 1:
-                        notification_text = texts.t(
-                            'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE_MULTI',
-                            '✅ Ваши подписки восстановлены!\n\nСпасибо, что подписались на канал. VPN снова работает.',
+                # 🔴 Сюда клиент приходит по кнопке «✅ Я подписался» — то есть это
+                # ОСНОВНОЙ путь возврата, а не редкий угол. Забор стоит только на письме:
+                # VPN включён выше и остаётся включённым.
+                if NotificationSettingsService.is_enabled('channel_restored'):
+                    try:
+                        texts = get_texts(user.language or DEFAULT_LANGUAGE)
+                        if settings.is_multi_tariff_enabled() and len(disabled_subs) > 1:
+                            notification_text = texts.t(
+                                'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE_MULTI',
+                                '✅ Ваши подписки восстановлены!\n\nСпасибо, что подписались на канал. '
+                                'VPN снова работает.',
+                            )
+                        else:
+                            notification_text = texts.t(
+                                'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE',
+                                '✅ Ваша подписка восстановлена!\n\nСпасибо, что подписались на канал. '
+                                'VPN снова работает.',
+                            )
+                        await bot.send_message(telegram_id, notification_text)
+                    except Exception as notify_error:
+                        logger.warning(
+                            'Failed to send reactivation notification to user',
+                            telegram_id=telegram_id,
+                            notify_error=notify_error,
                         )
-                    else:
-                        notification_text = texts.t(
-                            'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE',
-                            '✅ Ваша подписка восстановлена!\n\nСпасибо, что подписались на канал. VPN снова работает.',
-                        )
-                    await bot.send_message(telegram_id, notification_text)
-                except Exception as notify_error:
-                    logger.warning(
-                        'Failed to send reactivation notification to user',
-                        telegram_id=telegram_id,
-                        notify_error=notify_error,
-                    )
                 await db.commit()
             except Exception as db_error:
                 logger.error('Error reactivating subscription', telegram_id=telegram_id, db_error=db_error)
