@@ -482,10 +482,13 @@ _NAMED_GETTER_KEYS = {
 _SENDING_MODULES = (
     'app/services/monitoring_service.py',
     'app/services/daily_subscription_service.py',
-    # 🔴 Третье место: письма об отписке от канала и о возврате в него бот шлёт сразу по
-    # событию, мимо почасовой службы. Пока этого файла тут не было, забор проверялся
-    # только у половины писем — а выключатель в разделе гасил только её.
+    # 🔴 Письма о канале уходят из ЧЕТЫРЁХ мест, а не из одного: почасовая служба,
+    # мгновенный обработчик события и посредник, который проверяет подписку на канал
+    # при каждом действии клиента (в том числе по кнопке «✅ Я подписался» — это
+    # основной путь возврата). Пока этих файлов тут не было, сторож проверял забор у
+    # одного письма из четырёх, а выключатель в разделе гасил ровно его.
     'app/handlers/channel_member.py',
+    'app/middlewares/channel_checker.py',
 )
 
 
@@ -793,11 +796,14 @@ def test_realtime_channel_letters_obey_the_switch() -> None:
     а клиент всё равно получал письмо. Забор обязан гасить письмо и не трогать сам
     доступ — иначе «выключить сообщение» означало бы «не возвращать человеку VPN».
     """
-    source = (_BOT_ROOT / 'app/handlers/channel_member.py').read_text(encoding='utf-8')
-    assert "is_enabled('trial_channel_unsubscribed')" in source, 'письмо об отписке без забора'
-    assert "is_enabled('channel_restored')" in source, 'письмо о возврате без забора'
+    senders = ('app/handlers/channel_member.py', 'app/middlewares/channel_checker.py')
+    for name in senders:
+        source = (_BOT_ROOT / name).read_text(encoding='utf-8')
+        assert "is_enabled('trial_channel_unsubscribed')" in source, f'{name}: письмо об отписке без забора'
+        assert "is_enabled('channel_restored')" in source, f'{name}: письмо о возврате без забора'
 
-    tree = ast.parse(source)
+    source = '\n'.join((_BOT_ROOT / name).read_text(encoding='utf-8') for name in senders)
+    tree = ast.parse((_BOT_ROOT / senders[0]).read_text(encoding='utf-8'))
     for node in ast.walk(tree):
         if not isinstance(node, ast.If) or 'is_enabled' not in ast.dump(node.test):
             continue
@@ -864,3 +870,26 @@ def test_stored_days_above_the_cap_still_send() -> None:
     ):
         with patch.object(NotificationSettingsService, '_get', return_value={'trigger_days': 45}):
             assert getter() == MAX_TRIGGER_DAYS, f'{key}: сохранённые 45 дн. остались мёртвыми'
+
+
+def test_no_fifth_place_sends_the_channel_letters() -> None:
+    """Каждое место, откуда уходит письмо о канале, обязано быть под забором.
+
+    🔴 Скептик нашёл четвёртое место уже ПОСЛЕ того, как я объявил, что их два.
+    Поэтому сторож больше не перечисляет файлы руками, а ищет отправителей по всему
+    коду бота: появится пятый — тест назовёт его сам.
+    """
+    letters = (
+        'SUBSCRIPTION_DEACTIVATED_CHANNEL_UNSUBSCRIBE',
+        'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE',
+        'TRIAL_CHANNEL_UNSUBSCRIBED',
+    )
+    unguarded = []
+    for path in sorted((_BOT_ROOT / 'app').rglob('*.py')):
+        source = path.read_text(encoding='utf-8')
+        if not any(letter in source for letter in letters):
+            continue
+        if 'is_enabled(' in source or 'is_trial_channel_unsubscribed_enabled(' in source:
+            continue
+        unguarded.append(str(path.relative_to(_BOT_ROOT)))
+    assert not unguarded, 'письмо о канале уходит мимо выключателя из: ' + ', '.join(unguarded)
