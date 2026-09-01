@@ -1476,7 +1476,9 @@ async def test_fused_confirmation_shows_the_wallet_and_a_top_up_door_on_a_partia
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 199 ₽' in caption
     # Обратная дорога названа ДО того, как человек ушёл платить: доплата заказ не оформляет.
-    assert 'Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.' in caption
+    assert (
+        'Ваши деньги со счёта уже вычтены из цены — доплатите остаток в том же окне, ваш выбор сохранится.' in caption
+    )
     # Вторая строка обязательна: без неё «продолжите» посылает человека в этот же чат, где
     # висит ЭТО ЖЕ сообщение с числами, которые доплата только что сделала ложными.
     assert 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.' in caption
@@ -1531,7 +1533,7 @@ async def test_fused_confirmation_hides_the_top_up_door_while_an_order_is_open()
     caption = render.await_args.kwargs['caption']
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 199 ₽' in caption
-    assert 'Доплатите и продолжите' not in caption
+    assert 'уже вычтены из цены' not in caption
     # Проверяем то, что видит ЧЕЛОВЕК: на экране нет кнопки с надписью «Доплатить».
     # По ссылке дверь от кнопки оплаты не отличить — подменённый `build_cabinet_url`
     # отдаёт одно и то же всем. А адрес доплаты код собирает и выбрасывает намеренно:
@@ -1576,7 +1578,7 @@ async def test_fused_confirmation_hides_the_top_up_door_when_it_would_cost_the_f
     caption = render.await_args.kwargs['caption']
     assert '💳 Баланс: 0,50 ₽' in caption
     assert '⚠️ Не хватает: 248,50 ₽' in caption
-    assert 'Доплатите и продолжите' not in caption
+    assert 'уже вычтены из цены' not in caption
     # Отказ наступает ДО обращения к базе: сравнение сумм дешевле запроса.
     db.scalar.assert_not_awaited()
     # Проверяем то, что видит ЧЕЛОВЕК: на экране нет кнопки с надписью «Доплатить».
@@ -1633,7 +1635,9 @@ async def test_direct_payment_methods_screen_shows_the_wallet_and_the_top_up_doo
     assert '5 устройств · 3 месяца' in caption
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 1 139 ₽' in caption
-    assert 'Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.' in caption
+    assert (
+        'Ваши деньги со счёта уже вычтены из цены — доплатите остаток в том же окне, ваш выбор сохранится.' in caption
+    )
     assert 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.' in caption
     assert 'Или оплатите полной суммой: деньги с баланса при этом не спишутся.' in caption
     assert keyboard[0][0].text == '💰 Доплатить 1 139 ₽'
@@ -1720,7 +1724,7 @@ async def test_direct_payment_methods_screen_hides_the_door_when_the_funding_mod
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 199 ₽' in caption
-    assert 'Доплатите и продолжите' not in caption
+    assert 'уже вычтены из цены' not in caption
     assert not any(TOP_UP_LABEL in button.text for row in keyboard for button in row)
     # Слова на кнопке мало: та же дверь под другой надписью прошла бы мимо. Здесь забор
     # срабатывает ДО сборки адреса, поэтому адрес можно проверить — и он не запрашивался.
@@ -1795,7 +1799,10 @@ async def test_fused_confirmation_speaks_english_to_an_english_customer() -> Non
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert '💳 Balance: ₽50' in caption
     assert '⚠️ Shortage: ₽199' in caption
-    assert 'Top up and finish the purchase in the same window — we keep your choice.' in caption
+    assert (
+        'Your balance is already deducted from the price — pay the rest in the same window, we keep your choice.'
+        in caption
+    )
     assert 'After the top-up this chat screen will not refresh: its buttons still charge the full price.' in caption
     assert 'Or pay the full amount: your balance stays untouched.' in caption
     assert keyboard[0][0].text == '💰 Top up ₽199'
@@ -2099,16 +2106,58 @@ async def test_cancel_fused_clears_state_without_touching_any_checkout() -> None
     with (
         patch('app.handlers.subscription.device_first.get_open_checkout_for_user', AsyncMock()) as get_open,
         patch('app.handlers.subscription.device_first.cancel_checkout', AsyncMock()) as cancel_checkout,
+        # 🔴 РЕК-8в: заказа НЕТ — это и есть случай, ради которого прежняя формулировка писалась.
+        patch(
+            'app.handlers.subscription.device_first._has_order_in_flight',
+            AsyncMock(return_value=False),
+        ) as in_flight,
         patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
     ):
         await cancel_fused(callback, user, AsyncMock(), state)
 
     get_open.assert_not_awaited()
     cancel_checkout.assert_not_awaited()
+    # 🔴 Заглядывать в базу теперь ОБЯЗАНО: без этого утверждение про деньги — догадка.
+    in_flight.assert_awaited_once()
     state.clear.assert_awaited_once()
     assert 'Деньги не списаны' in render.await_args.kwargs['caption']
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert keyboard[0][0].callback_data == 'back_to_menu'
+
+
+@pytest.mark.asyncio
+async def test_cancel_fused_does_not_claim_a_cancellation_when_an_order_is_alive() -> None:
+    """🔴 РЕК-8в. Кнопка стоит на экране, соседние кнопки которого открывают кабинет меткой
+    ``autostart=1`` — заказ рождается там, а сообщение в чате остаётся прежним. Прежде эта
+    кнопка отвечала «Заказ отменён. Деньги не списаны», не заглянув в базу, и человек уходил
+    в уверенности, что закрыл живой счёт."""
+    callback = SimpleNamespace(data='df:x2', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru')
+    state = SimpleNamespace(clear=AsyncMock())
+
+    with (
+        patch('app.handlers.subscription.device_first.cancel_checkout', AsyncMock()) as cancel_checkout,
+        patch(
+            'app.handlers.subscription.device_first._has_order_in_flight',
+            AsyncMock(return_value=True),
+        ),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await cancel_fused(callback, user, AsyncMock(), state)
+
+    caption = render.await_args.kwargs['caption']
+    # Ни слова про отмену и ни слова про деньги: заказ бывает и уже оплаченным
+    # (``armed``/``fulfilling`` входят в тот же набор состояний).
+    assert 'Заказ отменён' not in caption
+    assert 'не списаны' not in caption
+    assert 'ещё жив' in caption
+    # ⛔ И сам заказ отсюда не отменяется: у настоящей отмены своё предупреждение про живую
+    # платёжную ссылку и своё второе подтверждение.
+    cancel_checkout.assert_not_awaited()
+    # Дверь к настоящему заказу, а не тупик.
+    keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
+    assert keyboard[0][0].callback_data == 'df:start'
+    assert keyboard[1][0].callback_data == 'back_to_menu'
 
 
 @pytest.mark.asyncio
