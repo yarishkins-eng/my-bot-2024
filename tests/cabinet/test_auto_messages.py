@@ -8,14 +8,18 @@
 2. **Забор на деньги.** Процент скидки может менять не только владелец, но и роль
    Marketer. Проверяется не только правка процента, но и ВКЛЮЧЕНИЕ сообщения:
    процент мог быть выставлен в сто из чат-админки бота, где потолка нет.
-3. **Честность управления.** У пятнадцати сообщений из двадцати выключателя в коде
-   нет. ``PATCH`` по ним обязан отказывать, а не делать вид, что сохранил.
+3. **Честность управления.** После АС-2 выключатель есть у девятнадцати сообщений из
+   двадцати; двадцатое гасится вместе с самим бонусом, а не отдельно. ``PATCH`` по
+   неуправляемому обязан отказывать, а не делать вид, что сохранил. И наоборот:
+   нарисованный тумблер обязан правда запирать отправку — это проверяется разбором
+   синтаксиса, а не поиском подстроки.
 4. **Маскирование клиентов.** Имена видит только тот, кому и так открыта клиентская
    база. Без этого сторожа маску можно снять, не покрасив ни одного теста.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -472,12 +476,63 @@ _NAMED_GETTER_KEYS = {
 }
 
 
+_SENDING_MODULES = (
+    'app/services/monitoring_service.py',
+    'app/services/daily_subscription_service.py',
+)
+
+
 def _bot_sending_sources() -> str:
     """Исходники обеих служб, которые реально отправляют сообщения клиентам."""
-    return '\n'.join(
-        (_BOT_ROOT / name).read_text(encoding='utf-8')
-        for name in ('app/services/monitoring_service.py', 'app/services/daily_subscription_service.py')
-    )
+    return '\n'.join((_BOT_ROOT / name).read_text(encoding='utf-8') for name in _SENDING_MODULES)
+
+
+_GETTER_TO_KEY = {getter: key for key, getter in _NAMED_GETTER_KEYS.items()}
+
+
+def _short_circuited(test: ast.expr) -> bool:
+    """`if False and …` / `if True or …` — вызов внутри уже ничего не решает."""
+    if isinstance(test, ast.BoolOp):
+        wanted = not isinstance(test.op, ast.And)
+        return any(isinstance(value, ast.Constant) and value.value is wanted for value in test.values)
+    return False
+
+
+def _keys_with_live_guards() -> set[str]:
+    """Ключи, которые в коде бота правда что-то решают.
+
+    🔴 Поиском подстроки это не проверяется: `if False and is_enabled('x')` содержит
+    ключ, но не запирает ничего. Поэтому разбираем синтаксис и требуем, чтобы вызов
+    стоял в условии — либо в `if`, либо в вычислении условия — и чтобы это условие
+    не было заведомо мёртвым. У отрицательной формы `if not …` дополнительно требуем
+    выход из функции: без него забор не запирает.
+    """
+    keys: set[str] = set()
+
+    def collect(expr: ast.expr) -> None:
+        for call in ast.walk(expr):
+            if not isinstance(call, ast.Call):
+                continue
+            name = getattr(call.func, 'attr', getattr(call.func, 'id', ''))
+            if name == 'is_enabled' and call.args and isinstance(call.args[0], ast.Constant):
+                keys.add(call.args[0].value)
+            elif name in _GETTER_TO_KEY:
+                keys.add(_GETTER_TO_KEY[name])
+
+    for name in _SENDING_MODULES:
+        tree = ast.parse((_BOT_ROOT / name).read_text(encoding='utf-8'))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                if _short_circuited(node.test):
+                    continue
+                negated = isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not)
+                if negated and not any(isinstance(stmt, (ast.Return, ast.Continue, ast.Break)) for stmt in node.body):
+                    continue
+                collect(node.test)
+            elif isinstance(node, ast.Assign) and isinstance(node.value, (ast.BoolOp, ast.UnaryOp)):
+                if not _short_circuited(node.value):
+                    collect(node.value)
+    return keys
 
 
 def test_every_switch_actually_guards_sending() -> None:
@@ -488,16 +543,13 @@ def test_every_switch_actually_guards_sending() -> None:
     нарисовать тумблер, который ничего не выключает. Тест читает исходники обеих
     отправляющих служб и требует, чтобы ключ там встречался.
     """
-    source = _bot_sending_sources()
+    live = _keys_with_live_guards()
     missing = []
     for entry in AUTO_MESSAGE_CATALOG:
         if entry['control'] != 'toggle':
             continue
-        key = entry['settings_key']
-        named = _NAMED_GETTER_KEYS.get(key)
-        guarded = f"is_enabled('{key}')" in source or (named and f'{named}()' in source)
-        if not guarded:
-            missing.append(f'{entry["id"]} → {key}')
+        if entry['settings_key'] not in live:
+            missing.append(f'{entry["id"]} → {entry["settings_key"]}')
     assert not missing, 'переключатель есть, а забора в боте нет: ' + ', '.join(missing)
 
 
@@ -558,10 +610,22 @@ def test_trial_hours_are_not_hardcoded_anymore() -> None:
     🔴 Число жило в трёх местах: порог выборки, текст письма и подпись в разделе.
     Поменять одно и забыть остальные — значит слать за три часа и писать «через два».
     """
-    source = (_BOT_ROOT / 'app/services/monitoring_service.py').read_text(encoding='utf-8')
+    path = _BOT_ROOT / 'app/services/monitoring_service.py'
+    source = path.read_text(encoding='utf-8')
     assert 'get_trial_warn_hours()' in source, 'момент отправки не читает настройку'
-    assert 'истекает через 2 часа' not in source, 'в тексте письма осталась зашитая двойка'
     assert 'timedelta(hours=warn_hours)' in source, 'порог выборки не следует за настройкой'
+
+    # Число в тексте обязано прийти переменной. Литерал здесь — это ровно тот случай,
+    # когда владелец ставит шесть часов, а письмо продолжает обещать два.
+    literals = [
+        node.args[0].value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, 'id', getattr(node.func, 'attr', '')) == 'format_hours_declension'
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    ]
+    assert not literals, f'в тексте письма снова зашито число: {literals}'
 
 
 def test_trial_hours_floor_is_the_monitoring_interval() -> None:
@@ -574,8 +638,20 @@ def test_trial_hours_floor_is_the_monitoring_interval() -> None:
     from app.config import settings
 
     interval_hours = settings.MONITORING_INTERVAL / 60
-    assert MIN_WARN_HOURS >= interval_hours, (
+    assert interval_hours <= MIN_WARN_HOURS, (
         f'граница {MIN_WARN_HOURS} ч меньше промежутка между обходами {interval_hours} ч'
+    )
+
+    # Константы раздела мало: в файл настроек можно попасть и мимо экрана, поэтому
+    # держать пол обязан сам сервис — и на чтении, и на записи.
+    with patch.object(NotificationSettingsService, '_get', return_value={'warn_hours': 0}):
+        assert NotificationSettingsService.get_trial_warn_hours() >= interval_hours, (
+            'сервис отдал значение ниже промежутка между обходами'
+        )
+    with patch.object(NotificationSettingsService, '_set_field', return_value=True) as write:
+        NotificationSettingsService.set_trial_warn_hours(0)
+    assert write.call_args.args[-1] >= interval_hours, (
+        f'сервис записал {write.call_args.args[-1]} ч — цикл такое окно перешагнёт'
     )
 
 
