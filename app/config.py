@@ -325,6 +325,13 @@ class Settings(BaseSettings):
     # one owner account is explicitly allowlisted for the controlled canary.
     # This deliberately uses internal user ids and is never returned by an API.
     DEVICE_FIRST_CANARY_USER_IDS: str = ''
+
+    # Telegram ids владельца, которые разрешено обнулять кнопкой «Обнулить
+    # тестовый аккаунт». Пусто по умолчанию: пока сюда никого не вписали,
+    # кнопки нет ни у кого и серверный маршрут отбивает любой запрос. Это
+    # ЕДИНСТВЕННЫЙ вход в необратимое действие, поэтому список живёт в
+    # окружении, а не в базе: из кабинета его не правит никто, включая админа.
+    TEST_ACCOUNT_TELEGRAM_IDS: str = ''
     # Direct-sale reconciliation must not wait for the coarse, general
     # subscription monitoring loop. Keep this short but bounded: the worker
     # handles only v2 rows, each protected by its own database lease.

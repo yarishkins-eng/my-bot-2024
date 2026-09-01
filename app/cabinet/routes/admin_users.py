@@ -87,6 +87,8 @@ from ..schemas.users import (
     SyncFromPanelResponse,
     SyncToPanelRequest,
     SyncToPanelResponse,
+    TestAccountResetRequest,
+    TestAccountResetResponse,
     TrafficPurchaseItem,
     UpdateBalanceRequest,
     UpdateBalanceResponse,
@@ -134,6 +136,13 @@ def _reject_account_erasure_mutation(user: User) -> None:
                 'message': 'Аккаунт закрывается после финансовой сверки; статус и ограничения изменять нельзя.',
             },
         )
+
+
+def _is_test_account(user: User) -> bool:
+    """Стенд владельца из ``TEST_ACCOUNT_TELEGRAM_IDS``. Импорт ленивый — как у соседей."""
+    from app.services.user_service import is_test_account
+
+    return is_test_account(user)
 
 
 def _build_user_list_item(user: User, spending_stats: dict = None) -> UserListItem:
@@ -864,6 +873,7 @@ async def get_user_detail(
             if settings.is_multi_tariff_enabled() and primary_sub and primary_sub.remnawave_uuid
             else user.remnawave_uuid
         ),
+        is_test_account=_is_test_account(user),
     )
 
 
@@ -2765,6 +2775,61 @@ async def resolve_financial_account_erasure(
         message=result.message,
         deletion_state=result.state,
         account_closed=True,
+    )
+
+
+@router.post('/{user_id}/test-reset', response_model=TestAccountResetResponse)
+async def reset_test_account_route(
+    user_id: int,
+    request: TestAccountResetRequest = TestAccountResetRequest(),
+    admin: User = Depends(require_permission('users:delete')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Обнулить тестовый аккаунт владельца до состояния «этого человека ещё не было».
+
+    ``confirm=false`` (по умолчанию) НИЧЕГО не меняет и возвращает план: сколько
+    денег, какая подписка, сколько заказов и можно ли вообще. Всё остальное —
+    в ``app/services/user_service.py``, включая три забора.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
+
+    # Забор №1. Он же — единственная причина, по которой действие вообще
+    # существует. Аккаунта нет в списке окружения — маршрута для него нет.
+    if not _is_test_account(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                'code': 'not_a_test_account',
+                'message': 'Этот аккаунт не в списке тестовых. Обнулять его нельзя.',
+            },
+        )
+
+    from app.services.user_service import reset_test_account
+
+    plan = await reset_test_account(db, user, admin.id, confirm=request.confirm)
+    logger.info(
+        'Admin test account reset',
+        admin_id=admin.id,
+        user_id=user_id,
+        confirm=request.confirm,
+        allowed=plan.allowed,
+        done=plan.done,
+    )
+    return TestAccountResetResponse(
+        allowed=plan.allowed,
+        blocked_reason=plan.blocked_reason,
+        done=plan.done,
+        balance_kopeks=plan.balance_kopeks,
+        subscription=plan.subscription,
+        orders=plan.orders,
+        payments=plan.payments,
+        transactions=plan.transactions,
+        invited_users=plan.invited_users,
+        panel_linked=plan.panel_linked,
+        panel_deleted=plan.panel_deleted,
+        deleted_rows=plan.deleted_rows,
     )
 
 

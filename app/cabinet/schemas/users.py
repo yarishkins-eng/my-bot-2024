@@ -252,6 +252,10 @@ class UserDetailResponse(BaseModel):
     # Remnawave UUID
     remnawave_uuid: str | None = None
 
+    # Тестовый стенд владельца: Телеграм стоит в TEST_ACCOUNT_TELEGRAM_IDS.
+    # Только у такого аккаунта экран рисует кнопку обнуления.
+    is_test_account: bool = False
+
 
 # === Panel Info ===
 
@@ -511,6 +515,29 @@ class ResetDevicesResponse(BaseModel):
     success: bool
     message: str
     deleted_count: int = 0
+
+
+class TestAccountResetRequest(BaseModel):
+    """Запрос обнуления тестового аккаунта."""
+
+    confirm: bool = Field(default=False, description='False — только показать, что будет снесено')
+
+
+class TestAccountResetResponse(BaseModel):
+    """План обнуления — он же отчёт после выполнения."""
+
+    allowed: bool = False
+    blocked_reason: str | None = None
+    done: bool = False
+    balance_kopeks: int = 0
+    subscription: str | None = None
+    orders: int = 0
+    payments: int = 0
+    transactions: int = 0
+    invited_users: int = 0
+    panel_linked: bool = False
+    panel_deleted: bool = False
+    deleted_rows: dict[str, int] = Field(default_factory=dict)
 
 
 class DeleteUserRequest(BaseModel):
