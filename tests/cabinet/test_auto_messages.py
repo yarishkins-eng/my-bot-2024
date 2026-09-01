@@ -8,8 +8,8 @@
 2. **Забор на деньги.** Процент скидки может менять не только владелец, но и роль
    Marketer. Проверяется не только правка процента, но и ВКЛЮЧЕНИЕ сообщения:
    процент мог быть выставлен в сто из чат-админки бота, где потолка нет.
-3. **Честность управления.** После АС-2 выключатель есть у девятнадцати сообщений из
-   двадцати; двадцатое гасится вместе с самим бонусом, а не отдельно. ``PATCH`` по
+3. **Честность управления.** После АС-2 выключатель есть у всех сообщений, кроме одного;
+   оно гасится вместе с самим бонусом, а не отдельно. ``PATCH`` по
    неуправляемому обязан отказывать, а не делать вид, что сохранил. И наоборот:
    нарисованный тумблер обязан правда запирать отправку — это проверяется разбором
    синтаксиса, а не поиском подстроки.
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,6 +34,8 @@ from app.cabinet.routes.admin_auto_messages import (
     GETTER_NAMES,
     GLOBALLY_SWITCHED_IDS,
     MAX_OFFER_DISCOUNT_PERCENT,
+    MAX_WARN_HOURS,
+    MIN_WARN_HOURS,
     SETTER_NAMES,
     TRIGGER_DAYS_MIN,
     AutoMessagePatch,
@@ -100,10 +103,10 @@ def test_every_settings_key_exists_in_the_bot() -> None:
     known = set(NotificationSettingsService._DEFAULTS)
     used = {entry['settings_key'] for entry in AUTO_MESSAGE_CATALOG if entry.get('settings_key')}
     assert used <= known, f'каталог ссылается на несуществующие ключи: {sorted(used - known)}'
-    # После АС-2 управляются девятнадцать из двадцати. Единственное исключение —
+    # После АС-2 управляются все, кроме одного. Единственное исключение —
     # бонусные дни: там выключатель гасит не сообщение, а сам бонус.
     toggles = [entry for entry in AUTO_MESSAGE_CATALOG if entry['control'] == 'toggle']
-    assert len(toggles) == 19
+    assert len(toggles) == len(AUTO_MESSAGE_CATALOG) - 1
     assert [entry['id'] for entry in AUTO_MESSAGE_CATALOG if entry['control'] != 'toggle'] == ['grace-2d']
 
 
@@ -456,7 +459,7 @@ def test_limits_are_per_message_and_reach_the_screen() -> None:
     assert _limits_for(CATALOG_BY_ID['return-wave3'])['trigger_days'][0] == 2
     assert _limits_for(CATALOG_BY_ID['trial-discount'])['trigger_days'][0] == 1
     assert _limits_for(CATALOG_BY_ID['return-wave2'])['discount_percent'] == [1, 50]
-    assert _limits_for(CATALOG_BY_ID['trial-2h'])['warn_hours'] == [1, 48]
+    assert _limits_for(CATALOG_BY_ID['trial-2h'])['warn_hours'] == [MIN_WARN_HOURS, MAX_WARN_HOURS]
     assert _limits_for(CATALOG_BY_ID['grace-2d']) is None
 
 
@@ -479,6 +482,10 @@ _NAMED_GETTER_KEYS = {
 _SENDING_MODULES = (
     'app/services/monitoring_service.py',
     'app/services/daily_subscription_service.py',
+    # 🔴 Третье место: письма об отписке от канала и о возврате в него бот шлёт сразу по
+    # событию, мимо почасовой службы. Пока этого файла тут не было, забор проверялся
+    # только у половины писем — а выключатель в разделе гасил только её.
+    'app/handlers/channel_member.py',
 )
 
 
@@ -526,7 +533,8 @@ def _keys_with_live_guards() -> set[str]:
                 if _short_circuited(node.test):
                     continue
                 negated = isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not)
-                if negated and not any(isinstance(stmt, (ast.Return, ast.Continue, ast.Break)) for stmt in node.body):
+                exits = (ast.Return, ast.Continue, ast.Break, ast.Raise)
+                if negated and not any(isinstance(stmt, exits) for stmt in node.body):
                     continue
                 collect(node.test)
             elif isinstance(node, ast.Assign) and isinstance(node.value, (ast.BoolOp, ast.UnaryOp)):
@@ -719,3 +727,119 @@ def test_subscriptions_declension() -> None:
     assert format_subscriptions_declension(2) == '2 подписок'
     assert format_subscriptions_declension(11) == '11 подписок'
     assert format_subscriptions_declension(21) == '21 подписки'
+
+
+# ---------------------------------------------------------------------------
+# Находки первой волны ревью АС-2: экран обещал то, чего в боте нет
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_days_cap_leaves_a_whole_day() -> None:
+    """Потолок «через сколько дней» должен оставлять ПОЛНОЕ окно, а не точку.
+
+    🔴 Мина, поставленная дважды. Отправка требует «прошло от N до N+1 дня», выборка
+    смотрит назад ровно на 30. При N = 30 два условия пересекаются в единственной точке
+    «ровно 30,000 суток», куда часовой обход не попадает: экран показывает «включено»,
+    письмо не уходит никогда. Сначала здесь стояло 60, потом 30 — оба мёртвые.
+    """
+    from app.cabinet.routes.admin_auto_messages import MAX_TRIGGER_DAYS
+
+    source = (_BOT_ROOT / 'app/services/monitoring_service.py').read_text(encoding='utf-8')
+    lookbacks = {int(days) for days in re.findall(r'lookback = now - timedelta\(days=(\d+)\)', source)}
+    assert lookbacks, 'не удалось вычитать окно выборки — сторож ослеп'
+    assert min(lookbacks) > MAX_TRIGGER_DAYS, (
+        f'при потолке {MAX_TRIGGER_DAYS} и окне {min(lookbacks)} дн. остаётся точка, а не сутки'
+    )
+
+
+def test_only_buttons_that_record_a_click_are_marked_tracked() -> None:
+    """«Нажатие видно в статистике» — только там, где нажатие правда записывается.
+
+    🔴 Раздел показывает ровно два числа: отправки и забранные скидки. Больше нигде
+    никаких нажатий не пишется — сборщик статистики кнопок к этому разделу отношения
+    не имеет и на боевом вообще не подключён. Значит `tracked` имеет право стоять
+    только у кнопки, которая выдаёт скидку.
+    """
+    liars = [
+        f'{entry["id"]} → {button["label"]}'
+        for entry in AUTO_MESSAGE_CATALOG
+        for button in entry['buttons']
+        if button['tracked'] and not entry.get('claim_type')
+    ]
+    assert not liars, 'кнопка обещает статистику, которой в разделе нет: ' + ', '.join(liars)
+
+
+def test_traffic_counter_counts_what_the_sender_sees() -> None:
+    """«Лимит есть у N подписок» считается по той же выборке, что и отправка.
+
+    Лишний статус в подсчёте — обещание писем, которых не будет: у подписки со
+    статусом `limited` трафик уже кончился, предупреждать поздно.
+    """
+    route = (_BOT_ROOT / 'app/cabinet/routes/admin_auto_messages.py').read_text(encoding='utf-8')
+    sender = (_BOT_ROOT / 'app/services/monitoring_service.py').read_text(encoding='utf-8')
+
+    counted = re.search(r'live_statuses = (\[[^\]]*\])', route)
+    sent_to = re.search(r'Subscription\.status\.in_\((\[[^\]]*\])\),\s*\n\s*Subscription\.traffic_limit_gb', sender)
+    assert counted and sent_to, 'не удалось вычитать выборки — сторож ослеп'
+    assert ast.literal_eval(counted.group(1)) == ast.literal_eval(sent_to.group(1)), (
+        'раздел считает не тех, кому бот шлёт предупреждение о трафике'
+    )
+
+
+def test_realtime_channel_letters_obey_the_switch() -> None:
+    """Письма об отписке и о возврате в канал бот шлёт сразу, мимо почасовой службы.
+
+    🔴 До этого забор стоял только на почасовой копии: менеджер выключал сообщение,
+    а клиент всё равно получал письмо. Забор обязан гасить письмо и не трогать сам
+    доступ — иначе «выключить сообщение» означало бы «не возвращать человеку VPN».
+    """
+    source = (_BOT_ROOT / 'app/handlers/channel_member.py').read_text(encoding='utf-8')
+    assert "is_enabled('trial_channel_unsubscribed')" in source, 'письмо об отписке без забора'
+    assert "is_enabled('channel_restored')" in source, 'письмо о возврате без забора'
+
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or 'is_enabled' not in ast.dump(node.test):
+            continue
+        body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+        assert 'disable_remnawave_user' not in body and 'enable_remnawave_user' not in body, (
+            'забор задевает доступ к VPN, а не только письмо'
+        )
+        assert 'deactivate_subscription' not in body and 'reactivate_subscription' not in body, (
+            'забор задевает саму подписку, а не только письмо'
+        )
+
+
+@pytest.mark.parametrize(
+    ('minutes_left', 'window', 'expected'),
+    [
+        (144, 24, 3),  # 2,4 ч при окне в сутки → «через 3 часа», а не «через 24»
+        (1410, 24, 24),  # 23,5 ч → округление вверх упирается в ширину окна
+        (10, 2, 1),  # меньше часа → «через 1 час», ноль писать нельзя
+        (110, 2, 2),  # 1,83 ч → вверх до двух
+    ],
+)
+def test_trial_letter_states_the_real_remainder(minutes_left: int, window: int, expected: int) -> None:
+    """В письме стоит настоящий остаток, а не настроенная ширина окна.
+
+    🔴 При «за 24 часа» в одну проверку попадают и тот, у кого сутки, и тот, у кого два
+    часа. Написать обоим «через 24 часа» — соврать второму: он отложит покупку и
+    останется без VPN.
+    """
+    from app.services.monitoring_service import trial_hours_left
+
+    end_date = datetime.now(UTC) + timedelta(minutes=minutes_left)
+    assert trial_hours_left(end_date, window) == expected
+
+
+def test_trial_letter_survives_a_naive_date_and_a_missing_one() -> None:
+    """Дата без часового пояса не имеет права уронить отправку.
+
+    Вычитание «с поясом минус без пояса» бросает исключение, а оно здесь съедается
+    общим `except` — письмо просто не ушло бы, молча.
+    """
+    from app.services.monitoring_service import trial_hours_left
+
+    naive = (datetime.now(UTC) + timedelta(hours=1, minutes=10)).replace(tzinfo=None)
+    assert trial_hours_left(naive, 6) == 2
+    assert trial_hours_left(None, 6) == 6

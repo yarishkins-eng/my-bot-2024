@@ -1,5 +1,6 @@
 import asyncio
 import html
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -133,6 +134,26 @@ class AutopayFailState:
             last_sent_ts=float(data.get('last_sent_ts', 0.0)),
             final_sent=bool(data.get('final_sent', False)),
         )
+
+
+def trial_hours_left(end_date: datetime | None, window_hours: int) -> int:
+    """Сколько часов написать клиенту в письме «пробный скоро закончится».
+
+    🔴 Настроенное «за сколько предупредить» — это ШИРИНА ОКНА, а не остаток. При
+    «за 24 часа» в одну проверку попадают и тот, у кого сутки, и тот, у кого два часа.
+    Написать обоим «через 24 часа» — соврать второму: он отложит покупку и останется
+    без VPN. Поэтому в письме стоит настоящий остаток.
+
+    Округляем ВВЕРХ и не ниже часа: занизить хуже, чем завысить. «Через час» тому, у
+    кого полтора, торопит; «через два» тому, у кого час, — расслабляет. Больше ширины
+    окна не пишем: это уже не остаток, а разъехавшиеся часы на сервере.
+    """
+    if end_date is None:
+        return window_hours
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=UTC)
+    left = (end_date - datetime.now(UTC)).total_seconds() / 3600
+    return max(1, min(window_hours, math.ceil(left)))
 
 
 def decide_autopay_fail_notification(
@@ -2536,11 +2557,14 @@ class MonitoringService:
             tariff_label = ''
             if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
                 tariff_label = f' «{subscription.tariff.name}»'
-            # Число берётся из той же настройки, что и момент отправки: иначе бот шлёт
-            # за три часа, а пишет «через два». Владелец поймал ровно этот класс вранья.
+            # 🔴 В письме стоит НАСТОЯЩИЙ остаток, а не настроенное «за сколько предупредить».
+            # Настройка задаёт лишь ширину окна: при «за 24 часа» в одну проверку попадают и
+            # те, у кого сутки, и те, у кого два часа. Писать всем «через 24 часа» — врать
+            # человеку, который из-за этого отложит покупку и потеряет VPN.
             from app.utils.formatters import format_hours_declension
 
-            hours = warn_hours if warn_hours is not None else NotificationSettingsService.get_trial_warn_hours()
+            window_hours = warn_hours if warn_hours is not None else NotificationSettingsService.get_trial_warn_hours()
+            hours = trial_hours_left(subscription.end_date, window_hours)
             hours_text = format_hours_declension(hours)
             message = f"""
 🎁 <b>Тестовая подписка{tariff_label} скоро закончится!</b>

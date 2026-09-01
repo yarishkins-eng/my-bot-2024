@@ -56,6 +56,7 @@ class NotificationSettingsService:
         'daily_charge': {'enabled': True},
         'daily_paused': {'enabled': True},
         'traffic_reset': {'enabled': True},
+        'channel_restored': {'enabled': True},
     }
 
     @classmethod
@@ -319,19 +320,21 @@ class NotificationSettingsService:
     def get_trial_warn_hours(cls) -> int:
         """За сколько часов до конца пробного предупреждать.
 
-        🔴 Нижняя граница — час, и это не вкусовщина. Служба мониторинга обходит всех
-        раз в час, а условие отправки — «до конца осталось не больше N». Окно уже часа
-        цикл просто перешагнёт, и большинство клиентов не получит ничего, причём молча.
+        🔴 Нижняя граница — ДВА часа, и это не вкусовщина. Служба мониторинга спит час
+        ПОСЛЕ обхода, значит шаг между обходами — час плюс длительность самого обхода.
+        Условие отправки — «до конца осталось не больше N», то есть окно шириной ровно N.
+        Окно в один час уже шага, и в каждом обороте остаётся слепая полоса: кто попал в
+        неё, не получит ничего, причём молча. Два часа перекрывают шаг с запасом.
         """
         try:
-            return max(1, min(48, int(cls._get('trial_2h').get('warn_hours', 2))))
+            return max(2, min(48, int(cls._get('trial_2h').get('warn_hours', 2))))
         except (TypeError, ValueError):
             return 2
 
     @classmethod
     def set_trial_warn_hours(cls, hours: int) -> bool:
         try:
-            value = max(1, min(48, int(hours)))
+            value = max(2, min(48, int(hours)))
         except (TypeError, ValueError):
             return False
         return cls._set_field('trial_2h', 'warn_hours', value)
