@@ -440,7 +440,7 @@ def test_message_with_a_switch_but_no_numbers_is_still_manageable() -> None:
     from app.cabinet.routes.admin_auto_messages import _params_for
 
     assert _params_for(CATALOG_BY_ID['return-day1']) == {}
-    assert _params_for(CATALOG_BY_ID['trial-2h']) == {}
+    assert _params_for(CATALOG_BY_ID['trial-2h']) == {'warn_hours': 2}
     # У бонусных дней ключа настроек нет вовсе — только там None.
     assert _params_for(CATALOG_BY_ID['grace-2d']) is None
 
@@ -452,7 +452,7 @@ def test_limits_are_per_message_and_reach_the_screen() -> None:
     assert _limits_for(CATALOG_BY_ID['return-wave3'])['trigger_days'][0] == 2
     assert _limits_for(CATALOG_BY_ID['trial-discount'])['trigger_days'][0] == 1
     assert _limits_for(CATALOG_BY_ID['return-wave2'])['discount_percent'] == [1, 50]
-    assert _limits_for(CATALOG_BY_ID['trial-2h']) is None
+    assert _limits_for(CATALOG_BY_ID['trial-2h'])['warn_hours'] == [1, 48]
     assert _limits_for(CATALOG_BY_ID['grace-2d']) is None
 
 
@@ -545,3 +545,91 @@ def test_trigger_days_cap_matches_the_bot_lookback() -> None:
     assert min(lookbacks) >= MAX_TRIGGER_DAYS, (
         f'потолок {MAX_TRIGGER_DAYS} больше окна выборки {min(lookbacks)} — сообщение не уйдёт никогда'
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. Час пробного: число живёт в одном месте, а не в трёх
+# ---------------------------------------------------------------------------
+
+
+def test_trial_hours_are_not_hardcoded_anymore() -> None:
+    """Ни момент отправки, ни текст сообщения больше не зашивают двойку.
+
+    🔴 Число жило в трёх местах: порог выборки, текст письма и подпись в разделе.
+    Поменять одно и забыть остальные — значит слать за три часа и писать «через два».
+    """
+    source = (_BOT_ROOT / 'app/services/monitoring_service.py').read_text(encoding='utf-8')
+    assert 'get_trial_warn_hours()' in source, 'момент отправки не читает настройку'
+    assert 'истекает через 2 часа' not in source, 'в тексте письма осталась зашитая двойка'
+    assert 'timedelta(hours=warn_hours)' in source, 'порог выборки не следует за настройкой'
+
+
+def test_trial_hours_floor_is_the_monitoring_interval() -> None:
+    """Нижняя граница не может быть меньше того, как часто бот обходит клиентов.
+
+    Окно уже промежутка между обходами цикл просто перешагнёт, и большинство
+    клиентов не получит предупреждения — молча.
+    """
+    from app.cabinet.routes.admin_auto_messages import MIN_WARN_HOURS
+    from app.config import settings
+
+    interval_hours = settings.MONITORING_INTERVAL / 60
+    assert MIN_WARN_HOURS >= interval_hours, (
+        f'граница {MIN_WARN_HOURS} ч меньше промежутка между обходами {interval_hours} ч'
+    )
+
+
+def test_label_follows_the_setting() -> None:
+    """Подпись на экране обязана показывать то же число, что применит бот."""
+    from app.cabinet.routes.admin_auto_messages import _resolve_when
+
+    entry = CATALOG_BY_ID['trial-2h']
+    assert '3 часа' in _resolve_when(entry, {'warn_hours': 3})
+    assert '1 час' in _resolve_when(entry, {'warn_hours': 1})
+    assert '5 часов' in _resolve_when(entry, {'warn_hours': 5})
+
+
+def test_message_text_uses_the_same_number_as_the_threshold() -> None:
+    """Текст письма собирается из того же числа, которым отобрали получателей."""
+    from app.utils.formatters import format_hours_declension
+
+    assert format_hours_declension(1) == '1 час'
+    assert format_hours_declension(2) == '2 часа'
+    assert format_hours_declension(5) == '5 часов'
+    assert format_hours_declension(11) == '11 часов'
+    assert format_hours_declension(21) == '21 час'
+
+
+@pytest.mark.asyncio
+async def test_saving_trial_hours_reaches_the_setter() -> None:
+    """Новое поле реально сохраняется, а не отбрасывается перебором старых трёх."""
+    with (
+        patch(f'{_ROUTE}._params_for', return_value={'warn_hours': 2}),
+        patch.object(NotificationSettingsService, 'set_trial_warn_hours', return_value=True) as setter,
+        patch(f'{_ROUTE}._quiet_facts', AsyncMock(return_value=({}, {}))),
+        patch(f'{_ROUTE}._sent_counts', AsyncMock(return_value={})),
+        patch(f'{_ROUTE}._claimed_counts', AsyncMock(return_value={})),
+    ):
+        await patch_auto_message('trial-2h', AutoMessagePatch(warn_hours=3), AsyncMock(), MagicMock())
+    setter.assert_called_once_with(3)
+
+
+@pytest.mark.asyncio
+async def test_trial_hours_below_the_floor_are_refused() -> None:
+    """Меньше часа не пропускаем: цикл обходит клиентов раз в час."""
+    with patch.object(NotificationSettingsService, 'set_trial_warn_hours') as setter:
+        with pytest.raises(HTTPException) as exc:
+            await patch_auto_message(
+                'trial-2h', AutoMessagePatch.model_construct(warn_hours=0), AsyncMock(), MagicMock()
+            )
+    assert exc.value.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    setter.assert_not_called()
+
+
+def test_numeric_fields_registry_covers_every_catalog_param() -> None:
+    """Поле, добавленное в каталог мимо общего набора, молча не сохранилось бы."""
+    from app.cabinet.routes.admin_auto_messages import _NUMERIC_FIELDS
+
+    used = {field for entry in AUTO_MESSAGE_CATALOG for field in (entry.get('params') or ())}
+    assert used <= set(_NUMERIC_FIELDS), f'поля вне общего набора: {sorted(used - set(_NUMERIC_FIELDS))}'
+    assert set(AutoMessagePatch.model_fields) - {'enabled'} == set(_NUMERIC_FIELDS)

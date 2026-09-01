@@ -45,7 +45,7 @@ class NotificationSettingsService:
         # 🔴 Три ключа гасят ПО ДВА сообщения сразу — так устроен код бота, и на экране
         # это написано прямо. Разводить их по отдельным выключателям — отдельная работа
         # (решение владельца 01.09.2026).
-        'trial_2h': {'enabled': True},
+        'trial_2h': {'enabled': True, 'warn_hours': 2},
         'subscription_expired': {'enabled': True},  # «пробный истёк» И «подписка истекла»
         'subscription_expiring': {'enabled': True},  # «истекает через 3 дня» И «истекает завтра»
         'traffic_warning': {'enabled': True},
@@ -314,6 +314,27 @@ class NotificationSettingsService:
         except (TypeError, ValueError):
             return False
         return cls._set_field('trial_expired_discount', 'trigger_days', days_int)
+
+    @classmethod
+    def get_trial_warn_hours(cls) -> int:
+        """За сколько часов до конца пробного предупреждать.
+
+        🔴 Нижняя граница — час, и это не вкусовщина. Служба мониторинга обходит всех
+        раз в час, а условие отправки — «до конца осталось не больше N». Окно уже часа
+        цикл просто перешагнёт, и большинство клиентов не получит ничего, причём молча.
+        """
+        try:
+            return max(1, min(48, int(cls._get('trial_2h').get('warn_hours', 2))))
+        except (TypeError, ValueError):
+            return 2
+
+    @classmethod
+    def set_trial_warn_hours(cls, hours: int) -> bool:
+        try:
+            value = max(1, min(48, int(hours)))
+        except (TypeError, ValueError):
+            return False
+        return cls._set_field('trial_2h', 'warn_hours', value)
 
     @classmethod
     def are_notifications_globally_enabled(cls) -> bool:

@@ -98,6 +98,19 @@ def format_days_declension(days: int, language: str = 'ru') -> str:
     return f'{days} дней'
 
 
+def format_hours_declension(hours: int, language: str = 'ru') -> str:
+    """«1 час» / «2 часа» / «5 часов». Рядом с format_days_declension и по её образцу."""
+    language_code = (language or 'ru').split('-')[0].lower()
+    if language_code not in {'ru', 'fa'}:
+        return f'{hours} hour{"s" if hours != 1 else ""}'
+
+    if hours % 10 == 1 and hours % 100 != 11:
+        return f'{hours} час'
+    if hours % 10 in [2, 3, 4] and hours % 100 not in [12, 13, 14]:
+        return f'{hours} часа'
+    return f'{hours} часов'
+
+
 def format_duration(seconds: int) -> str:
     if seconds < 60:
         return f'{seconds} сек.'

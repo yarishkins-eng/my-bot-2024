@@ -1153,7 +1153,8 @@ class MonitoringService:
         if not NotificationSettingsService.is_enabled('trial_2h'):
             return
         try:
-            threshold_time = datetime.now(UTC) + timedelta(hours=2)
+            warn_hours = NotificationSettingsService.get_trial_warn_hours()
+            threshold_time = datetime.now(UTC) + timedelta(hours=warn_hours)
 
             result = await db.execute(
                 select(Subscription)
@@ -1186,11 +1187,11 @@ class MonitoringService:
                     continue
 
                 if self.bot:
-                    success = await self._send_trial_ending_notification(user, subscription)
+                    success = await self._send_trial_ending_notification(user, subscription, warn_hours)
                     if success:
                         await record_notification(db, user.id, subscription.id, 'trial_2h')
                         logger.info(
-                            '🎁 Пользователю отправлено уведомление об окончании тестовой подписки через 2 часа',
+                            '🎁 Пользователю отправлено предупреждение о конце пробного',
                             telegram_id=user.telegram_id,
                         )
 
@@ -2526,17 +2527,25 @@ class MonitoringService:
             )
             return False
 
-    async def _send_trial_ending_notification(self, user: User, subscription: Subscription) -> bool:
+    async def _send_trial_ending_notification(
+        self, user: User, subscription: Subscription, warn_hours: int | None = None
+    ) -> bool:
         try:
             get_texts(user.language)
 
             tariff_label = ''
             if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
                 tariff_label = f' «{subscription.tariff.name}»'
+            # Число берётся из той же настройки, что и момент отправки: иначе бот шлёт
+            # за три часа, а пишет «через два». Владелец поймал ровно этот класс вранья.
+            from app.utils.formatters import format_hours_declension
+
+            hours = warn_hours if warn_hours is not None else NotificationSettingsService.get_trial_warn_hours()
+            hours_text = format_hours_declension(hours)
             message = f"""
 🎁 <b>Тестовая подписка{tariff_label} скоро закончится!</b>
 
-Ваша тестовая подписка истекает через 2 часа.
+Ваша тестовая подписка истекает через {hours_text}.
 
 💎 <b>Не хотите остаться без VPN?</b>
 Переходите на полную подписку!

@@ -42,6 +42,7 @@ from app.database.models import (
 )
 from app.services.notification_settings_service import NotificationSettingsService
 from app.services.pricing_engine import PricingEngine
+from app.utils.formatters import format_hours_declension
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -69,6 +70,11 @@ _GUARD_REFERENCE_PRICE_KOPEKS = 100
 
 # Ноль процентов — не «выключено», а письмо «Скидка 0% на продление». Выключают
 # тумблером, а не обнулением.
+# 🔴 Не меньше часа. Служба мониторинга обходит всех раз в час, а условие отправки —
+# «до конца осталось не больше N». Окно уже часа цикл перешагнёт, и большинство
+# клиентов не получит предупреждения вовсе, причём молча.
+MIN_WARN_HOURS = 1
+MAX_WARN_HOURS = 48
 MIN_OFFER_DISCOUNT_PERCENT = 1
 MIN_VALID_HOURS = 1
 MAX_VALID_HOURS = 168
@@ -78,7 +84,12 @@ MAX_VALID_HOURS = 168
 MAX_TRIGGER_DAYS = 30
 
 # Человеческие имена полей: в отказ уходят они, а не латиница из кода.
+# Все числовые поля раздела в одном месте: обработчик перебирает именно этот набор,
+# и добавление нового поля мимо него молча ничего не сохранит.
+_NUMERIC_FIELDS: tuple[str, ...] = ('warn_hours', 'discount_percent', 'valid_hours', 'trigger_days')
+
 FIELD_TITLES: dict[str, str] = {
+    'warn_hours': 'За сколько предупредить',
     'discount_percent': 'Размер скидки',
     'valid_hours': 'Сколько действует',
     'trigger_days': 'Через сколько дней',
@@ -165,11 +176,11 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
     {
         'id': 'trial-2h',
         'group': 'trial',
-        'title': 'Пробный истекает через 2 часа',
-        'when': 'За 2 часа до конца — каждому, у кого идёт пробный',
+        'title': 'Пробный скоро истекает',
+        'when': 'За {warn_hours} до конца — каждому, у кого идёт пробный',
         'control': 'toggle',
         'settings_key': 'trial_2h',
-        'params': (),
+        'params': ('warn_hours',),
         'sent_type': 'trial_2h',
         'buttons': [
             {'label': '💎 Купить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
@@ -456,6 +467,7 @@ SETTER_NAMES: dict[tuple[str, str], str] = {
     ('trial_expired_discount', 'discount_percent'): 'set_trial_expired_discount_percent',
     ('trial_expired_discount', 'valid_hours'): 'set_trial_expired_discount_valid_hours',
     ('trial_expired_discount', 'trigger_days'): 'set_trial_expired_discount_trigger_days',
+    ('trial_2h', 'warn_hours'): 'set_trial_warn_hours',
 }
 
 # Читаем тоже через геттеры, а не из сырого файла: в них сидят те же ограничители,
@@ -470,6 +482,7 @@ GETTER_NAMES: dict[tuple[str, str], str] = {
     ('trial_expired_discount', 'discount_percent'): 'get_trial_expired_discount_percent',
     ('trial_expired_discount', 'valid_hours'): 'get_trial_expired_discount_valid_hours',
     ('trial_expired_discount', 'trigger_days'): 'get_trial_expired_discount_trigger_days',
+    ('trial_2h', 'warn_hours'): 'get_trial_warn_hours',
 }
 
 # Нижняя граница «через сколько дней» у сообщений РАЗНАЯ: у третьей волны сеттер
@@ -562,6 +575,7 @@ class AutoMessagePatch(BaseModel):
     model_config = {'extra': 'forbid'}
 
     enabled: bool | None = None
+    warn_hours: int | None = Field(default=None, ge=MIN_WARN_HOURS, le=MAX_WARN_HOURS)
     discount_percent: int | None = Field(default=None, ge=0, le=100)
     valid_hours: int | None = Field(default=None, ge=MIN_VALID_HOURS, le=MAX_VALID_HOURS)
     trigger_days: int | None = Field(default=None, ge=1, le=MAX_TRIGGER_DAYS)
@@ -685,10 +699,20 @@ def _params_for(entry: dict[str, Any]) -> dict[str, int] | None:
 
 
 def _resolve_when(entry: dict[str, Any], params: dict[str, int] | None) -> str:
+    """Подставить в подпись живые значения настроек.
+
+    🔴 Подпись обязана следовать за настройкой. Пока число было зашито в текст,
+    можно было поменять момент отправки и оставить на экране старую цифру — ровно
+    то враньё, за которое владелец и зацепился.
+    """
     when = entry['when']
+    values = params or {}
     if '{trigger_days}' in when:
-        days = (params or {}).get('trigger_days')
-        return when.replace('{trigger_days}', str(days) if days else '—')
+        days = values.get('trigger_days')
+        when = when.replace('{trigger_days}', str(days) if days else '—')
+    if '{warn_hours}' in when:
+        hours = values.get('warn_hours')
+        when = when.replace('{warn_hours}', format_hours_declension(hours) if hours else '—')
     return when
 
 
@@ -767,6 +791,8 @@ def _limits_for(entry: dict[str, Any]) -> dict[str, list[int]] | None:
             bounds[name] = [MIN_VALID_HOURS, MAX_VALID_HOURS]
         elif name == 'trigger_days':
             bounds[name] = [TRIGGER_DAYS_MIN.get(key, 1), MAX_TRIGGER_DAYS]
+        elif name == 'warn_hours':
+            bounds[name] = [MIN_WARN_HOURS, MAX_WARN_HOURS]
     return bounds
 
 
@@ -964,7 +990,7 @@ async def patch_auto_message(
             detail='Нечего сохранять: в запросе нет ни одного изменения.',
         )
 
-    for field in ('discount_percent', 'valid_hours', 'trigger_days'):
+    for field in _NUMERIC_FIELDS:
         if field in changes and field not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -974,6 +1000,8 @@ async def patch_auto_message(
     # Заборы ДО записи: половина применённых изменений хуже, чем ни одного.
     if 'discount_percent' in changes:
         await _assert_discount_is_safe(db, changes['discount_percent'])
+    if 'warn_hours' in changes:
+        _assert_in_range(changes['warn_hours'], MIN_WARN_HOURS, MAX_WARN_HOURS, FIELD_TITLES['warn_hours'])
     if 'valid_hours' in changes:
         _assert_in_range(changes['valid_hours'], MIN_VALID_HOURS, MAX_VALID_HOURS, FIELD_TITLES['valid_hours'])
     if 'trigger_days' in changes:
@@ -993,7 +1021,7 @@ async def patch_auto_message(
     written: list[bool] = []
     if 'enabled' in changes:
         written.append(bool(NotificationSettingsService.set_enabled(settings_key, changes['enabled'])))
-    for field in ('discount_percent', 'valid_hours', 'trigger_days'):
+    for field in _NUMERIC_FIELDS:
         if field not in changes:
             continue
         setter_name = SETTER_NAMES.get((settings_key, field))
