@@ -808,18 +808,19 @@ def test_realtime_channel_letters_obey_the_switch() -> None:
         assert 'trial_channel_unsubscribed' in live, f'{name}: письмо об отписке без живого забора'
         assert 'channel_restored' in live, f'{name}: письмо о возврате без живого забора'
 
-    source = '\n'.join((_BOT_ROOT / name).read_text(encoding='utf-8') for name in senders)
-    tree = ast.parse((_BOT_ROOT / senders[0]).read_text(encoding='utf-8'))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If) or 'is_enabled' not in ast.dump(node.test):
-            continue
-        body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
-        assert 'disable_remnawave_user' not in body and 'enable_remnawave_user' not in body, (
-            'забор задевает доступ к VPN, а не только письмо'
-        )
-        assert 'deactivate_subscription' not in body and 'reactivate_subscription' not in body, (
-            'забор задевает саму подписку, а не только письмо'
-        )
+    # И в ОБОИХ файлах забор обязан гасить письмо, не трогая доступ: иначе «выключить
+    # сообщение» молча означало бы «не возвращать человеку VPN».
+    for name in senders:
+        for node in ast.walk(ast.parse((_BOT_ROOT / name).read_text(encoding='utf-8'))):
+            if not isinstance(node, ast.If) or 'is_enabled' not in ast.dump(node.test):
+                continue
+            body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+            assert 'disable_remnawave_user' not in body and 'enable_remnawave_user' not in body, (
+                f'{name}: забор задевает доступ к VPN, а не только письмо'
+            )
+            assert 'deactivate_subscription' not in body and 'reactivate_subscription' not in body, (
+                f'{name}: забор задевает саму подписку, а не только письмо'
+            )
 
 
 @pytest.mark.parametrize(
