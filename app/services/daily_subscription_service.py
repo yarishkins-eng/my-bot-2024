@@ -30,6 +30,7 @@ from app.services.notification_delivery_service import (
     NotificationType,
     notification_delivery_service,
 )
+from app.services.notification_settings_service import NotificationSettingsService
 
 
 logger = structlog.get_logger(__name__)
@@ -341,6 +342,8 @@ class DailySubscriptionService:
 
     async def _notify_daily_charge(self, user, subscription, amount_kopeks: int):
         """Уведомляет пользователя о суточном списании."""
+        if not NotificationSettingsService.is_enabled('daily_charge'):
+            return
         get_texts(getattr(user, 'language', 'ru'))
         amount_rubles = amount_kopeks / 100
         balance_rubles = user.balance_kopeks / 100
@@ -369,6 +372,10 @@ class DailySubscriptionService:
 
     async def _notify_insufficient_balance(self, user, subscription, required_amount: int):
         """Уведомляет пользователя о недостатке средств."""
+        # 🔴 Гасит только СООБЩЕНИЕ. Сама приостановка подписки происходит выше и от
+        # этого выключателя не зависит: клиент останется без VPN, просто молча.
+        if not NotificationSettingsService.is_enabled('daily_paused'):
+            return
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
         get_texts(getattr(user, 'language', 'ru'))
@@ -728,6 +735,8 @@ class DailySubscriptionService:
 
     async def _notify_traffic_reset(self, user: User, subscription: Subscription, reset_gb: int):
         """Уведомляет пользователя о сбросе докупленного трафика."""
+        if not NotificationSettingsService.is_enabled('traffic_reset'):
+            return
         tariff_label = ''
         if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
             tariff_label = f'\n📦 Тариф: «{subscription.tariff.name}»'

@@ -72,7 +72,10 @@ _GUARD_REFERENCE_PRICE_KOPEKS = 100
 MIN_OFFER_DISCOUNT_PERCENT = 1
 MIN_VALID_HOURS = 1
 MAX_VALID_HOURS = 168
-MAX_TRIGGER_DAYS = 60
+# 🔴 Ровно 30, и не больше. Выборка «кто остался без подписки» смотрит назад на 30 дней
+# (monitoring_service: lookback), поэтому «через 35 дней» выставить можно было, а сообщение
+# не ушло бы никогда — и экран показывал бы «включено». Моя мина из АС-1.
+MAX_TRIGGER_DAYS = 30
 
 # Человеческие имена полей: в отказ уходят они, а не латиница из кода.
 FIELD_TITLES: dict[str, str] = {
@@ -164,7 +167,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'trial',
         'title': 'Пробный истекает через 2 часа',
         'when': 'За 2 часа до конца — каждому, у кого идёт пробный',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'trial_2h',
+        'params': (),
         'sent_type': 'trial_2h',
         'buttons': [
             {'label': '💎 Купить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
@@ -176,7 +181,11 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'trial',
         'title': 'Пробный истёк',
         'when': 'Сразу, как только закончился пробный период',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'subscription_expired',
+        'params': (),
+        'shares_switch_with': 'Подписка истекла',
+        'warning': 'Выключите — и человек, у которого кончился пробный, просто увидит, что VPN перестал работать. Бот ему ничего не напишет.',
         'buttons': [
             {'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
             {'label': '💳 Тарифы', 'target': 'Список тарифов в боте', 'tracked': True},
@@ -202,7 +211,10 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'paid',
         'title': 'Подписка истекает через 3 дня',
         'when': 'За 3 дня до конца — тем, у кого активна платная подписка',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'subscription_expiring',
+        'params': (),
+        'shares_switch_with': 'Подписка истекает завтра',
         'sent_type': 'expiring',
         'sent_days': 3,
         'buttons': [
@@ -216,7 +228,10 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'paid',
         'title': 'Подписка истекает завтра',
         'when': 'За 1 день до конца · более срочное вытесняет трёхдневное, а не наоборот',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'subscription_expiring',
+        'params': (),
+        'shares_switch_with': 'Подписка истекает через 3 дня',
         'sent_type': 'expiring',
         'sent_days': 1,
         'buttons': [
@@ -230,7 +245,11 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'paid',
         'title': 'Подписка истекла',
         'when': 'В момент отключения доступа',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'subscription_expired',
+        'params': (),
+        'shares_switch_with': 'Пробный истёк',
+        'warning': 'Это единственное сообщение, из которого клиент узнаёт, что подписка кончилась и доступ закрыт. Выключите — люди будут молча терять связь.',
         'buttons': [
             {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
@@ -290,7 +309,10 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Израсходовано много трафика',
         'when': 'При достижении порога — но только там, где вообще есть лимит гигабайт',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'traffic_warning',
+        'params': (),
+        'warning': 'Это единственное предупреждение перед тем, как гигабайты закончатся. Выключите — интернет у клиента остановится без предупреждения.',
         'quiet_check': 'traffic_limits',
         'buttons': [],
     },
@@ -323,7 +345,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Низкий баланс',
         'when': 'Когда баланс становится низким — но только тем, кто сам включил это в своих настройках',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'low_balance',
+        'params': (),
         'quiet_check': 'client_opt_in',
         'buttons': [{'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False}],
     },
@@ -332,7 +356,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Автоплатёж прошёл',
         'when': 'После успешного списания с баланса',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'autopay_success',
+        'params': (),
         'quiet_check': 'autopay',
         'buttons': [],
     },
@@ -341,7 +367,10 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Автоплатёж не прошёл',
         'when': 'Когда на балансе не хватило денег',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'autopay_failed',
+        'params': (),
+        'shares_switch_with': 'Последнее напоминание об автоплатеже',
         'quiet_check': 'autopay',
         'buttons': [
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
@@ -353,7 +382,11 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Последнее напоминание об автоплатеже',
         'when': 'За несколько часов до отключения, если денег так и не хватило',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'autopay_failed',
+        'params': (),
+        'shares_switch_with': 'Автоплатёж не прошёл',
+        'warning': 'Последнее предупреждение перед отключением за неуплату. Выключите — подписка оборвётся без напоминания.',
         'quiet_check': 'autopay',
         'buttons': [
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
@@ -365,7 +398,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Автоплатёж приостановлен: подписка без тарифа',
         'when': 'Один раз в неделю тем, чья подписка создана до введения тарифов',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'autopay_legacy',
+        'params': (),
         'quiet_check': 'legacy_subscriptions',
         'buttons': [],
     },
@@ -374,7 +409,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Суточное списание',
         'when': 'Каждые сутки на суточном тарифе',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'daily_charge',
+        'params': (),
         'quiet_check': 'daily_tariffs',
         'buttons': [],
     },
@@ -383,7 +420,10 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Подписка приостановлена: не хватило на сутки',
         'when': 'Когда на суточное списание не хватило денег',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'daily_paused',
+        'params': (),
+        'warning': 'Гасит только сообщение. Подписка всё равно приостановится — клиент останется без VPN и не будет знать почему.',
         'quiet_check': 'daily_tariffs',
         'buttons': [
             {'label': '💳 Пополнить баланс', 'target': 'Экран баланса в боте', 'tracked': True},
@@ -395,7 +435,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'group': 'other',
         'title': 'Сброс докупленного трафика',
         'when': 'Когда истекает срок докупленного пакета гигабайтов',
-        'control': 'locked',
+        'control': 'toggle',
+        'settings_key': 'traffic_reset',
+        'params': (),
         'buttons': [],
     },
 ]
@@ -468,6 +510,11 @@ class AutoMessageItem(BaseModel):
     # Уточнение к РАБОТАЮЩЕМУ сообщению («кому именно уходит»). Отдельно от причины
     # молчания намеренно: одно поле на два смысла уже сделало живое сообщение «молчащим».
     note: str | None = None
+    # Имя сообщения, которое гасится ТЕМ ЖЕ выключателем. Три пары в коде бота пишет
+    # одно и то же место, разделить их — отдельная работа (решение владельца 01.09.2026).
+    shares_switch_with: str | None = None
+    # Что случится с клиентом, если это выключить. Только там, где последствие настоящее.
+    warning: str | None = None
     params: dict[str, int] | None = None
     sent_count: int | None = None
     claimed_count: int | None = None
@@ -743,6 +790,8 @@ def _build_item(
         state=state,
         quiet_reason=quiet_reason,
         note=note,
+        shares_switch_with=entry.get('shares_switch_with'),
+        warning=entry.get('warning'),
         params=params,
         sent_count=_sent_for(entry, sent_counts),
         claimed_count=claimed_counts.get(claim_type, 0) if claim_type else None,

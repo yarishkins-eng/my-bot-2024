@@ -40,6 +40,22 @@ class NotificationSettingsService:
             'valid_hours': 24,
             'trigger_days': 1,
         },
+        # --- АС-2: выключатели остальным сообщениям ---
+        # Умолчание True у всех: появление ключа не должно ничего менять в поведении.
+        # 🔴 Три ключа гасят ПО ДВА сообщения сразу — так устроен код бота, и на экране
+        # это написано прямо. Разводить их по отдельным выключателям — отдельная работа
+        # (решение владельца 01.09.2026).
+        'trial_2h': {'enabled': True},
+        'subscription_expired': {'enabled': True},  # «пробный истёк» И «подписка истекла»
+        'subscription_expiring': {'enabled': True},  # «истекает через 3 дня» И «истекает завтра»
+        'traffic_warning': {'enabled': True},
+        'low_balance': {'enabled': True},
+        'autopay_success': {'enabled': True},
+        'autopay_failed': {'enabled': True},  # «не прошёл» И «последнее напоминание»
+        'autopay_legacy': {'enabled': True},
+        'daily_charge': {'enabled': True},
+        'daily_paused': {'enabled': True},
+        'traffic_reset': {'enabled': True},
     }
 
     @classmethod

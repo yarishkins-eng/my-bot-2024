@@ -622,6 +622,13 @@ class MonitoringService:
 
         `cause` ('charge_error' | 'insufficient_balance') selects the email/non-Telegram
         reason wording so a non-balance charge failure isn't mislabelled as low balance."""
+        # Один выключатель на «не прошёл» и «последнее напоминание»: оба рождает эта
+        # функция, а какое именно — решает decide_autopay_fail_notification ниже.
+        # Забор стоит ДО загрузки состояния: пока сообщение выключено, счётчик попыток
+        # не двигается, и при обратном включении отсчёт начнётся заново.
+        if not NotificationSettingsService.is_enabled('autopay_failed'):
+            return
+
         cycle_token = int(subscription.end_date.timestamp())
         now_ts = current_time.timestamp()
         hours_left = (subscription.end_date - current_time).total_seconds() / 3600.0
@@ -1021,6 +1028,10 @@ class MonitoringService:
             return None
 
     async def _check_expiring_subscriptions(self, db: AsyncSession):
+        # Один выключатель на оба сообщения («через 3 дня» и «завтра»): они рождаются
+        # одним циклом по списку дней, и разделить их — отдельная работа.
+        if not NotificationSettingsService.is_enabled('subscription_expiring'):
+            return
         try:
             warning_days = settings.get_autopay_warning_days()
             all_processed_users = set()
@@ -1139,6 +1150,8 @@ class MonitoringService:
             logger.error('Ошибка проверки истекающих подписок', error=e)
 
     async def _check_trial_expiring_soon(self, db: AsyncSession):
+        if not NotificationSettingsService.is_enabled('trial_2h'):
+            return
         try:
             threshold_time = datetime.now(UTC) + timedelta(hours=2)
 
@@ -1898,6 +1911,8 @@ class MonitoringService:
                         user_id=sub.user_id,
                     )
                     # Notify user once that autopay won't work without a tariff
+                    if not NotificationSettingsService.is_enabled('autopay_legacy'):
+                        continue
                     autopay_legacy_key = f'autopay_legacy_notified:{sub.user_id}'
                     try:
                         if not await cache.exists(autopay_legacy_key):
@@ -2264,6 +2279,11 @@ class MonitoringService:
     async def _send_subscription_expired_notification(
         self, user: User, subscription: Subscription, *, tariff_name: str | None = None
     ) -> bool:
+        # 🔴 Забор стоит ДО ветвления по is_trial ниже: одна и та же функция пишет и
+        # «пробный истёк», и «подписка истекла». Поэтому выключатель здесь один на два
+        # сообщения, и на экране это сказано прямо.
+        if not NotificationSettingsService.is_enabled('subscription_expired'):
+            return True
         try:
             if getattr(subscription, 'is_trial', False):
                 return await self._send_trial_expired_notification(user)
@@ -2898,6 +2918,8 @@ class MonitoringService:
     async def _send_autopay_success_notification(
         self, user: User, amount: int, days: int, *, subscription: Subscription | None = None
     ):
+        if not NotificationSettingsService.is_enabled('autopay_success'):
+            return
         try:
             texts = get_texts(user.language)
             tariff_label = ''
@@ -3027,6 +3049,8 @@ class MonitoringService:
         """Check subscriptions approaching traffic limit and notify users."""
         if not self.bot:
             return
+        if not NotificationSettingsService.is_enabled('traffic_warning'):
+            return
 
         try:
             from sqlalchemy import select
@@ -3124,6 +3148,8 @@ class MonitoringService:
         - Rate-limited: max 1 alert per 24 hours per user
         """
         if not self.bot:
+            return
+        if not NotificationSettingsService.is_enabled('low_balance'):
             return
 
         try:

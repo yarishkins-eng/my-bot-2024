@@ -96,8 +96,11 @@ def test_every_settings_key_exists_in_the_bot() -> None:
     known = set(NotificationSettingsService._DEFAULTS)
     used = {entry['settings_key'] for entry in AUTO_MESSAGE_CATALOG if entry.get('settings_key')}
     assert used <= known, f'каталог ссылается на несуществующие ключи: {sorted(used - known)}'
-    # Управляемых ровно пять — столько выключателей есть в боте.
-    assert sum(1 for entry in AUTO_MESSAGE_CATALOG if entry['control'] == 'toggle') == 5
+    # После АС-2 управляются девятнадцать из двадцати. Единственное исключение —
+    # бонусные дни: там выключатель гасит не сообщение, а сам бонус.
+    toggles = [entry for entry in AUTO_MESSAGE_CATALOG if entry['control'] == 'toggle']
+    assert len(toggles) == 19
+    assert [entry['id'] for entry in AUTO_MESSAGE_CATALOG if entry['control'] != 'toggle'] == ['grace-2d']
 
 
 def test_setters_and_getters_exist_and_match_catalog_params() -> None:
@@ -258,9 +261,9 @@ async def test_failed_disk_write_is_not_reported_as_success() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('message_id', ['trial-2h', 'paid-1d', 'grace-2d', 'low-balance'])
+@pytest.mark.parametrize('message_id', ['grace-2d'])
 async def test_patch_on_unmanaged_message_is_refused(message_id: str) -> None:
-    """У этих сообщений выключателя в коде нет. Отказ — единственный честный ответ."""
+    """У бонусных дней выключателя нет: там рычаг гасит сам бонус, а не сообщение."""
     with patch.object(NotificationSettingsService, 'set_enabled') as set_enabled:
         with pytest.raises(HTTPException) as exc:
             await patch_auto_message(message_id, AutoMessagePatch(enabled=False), AsyncMock(), MagicMock())
@@ -437,7 +440,9 @@ def test_message_with_a_switch_but_no_numbers_is_still_manageable() -> None:
     from app.cabinet.routes.admin_auto_messages import _params_for
 
     assert _params_for(CATALOG_BY_ID['return-day1']) == {}
-    assert _params_for(CATALOG_BY_ID['trial-2h']) is None
+    assert _params_for(CATALOG_BY_ID['trial-2h']) == {}
+    # У бонусных дней ключа настроек нет вовсе — только там None.
+    assert _params_for(CATALOG_BY_ID['grace-2d']) is None
 
 
 def test_limits_are_per_message_and_reach_the_screen() -> None:
@@ -448,3 +453,95 @@ def test_limits_are_per_message_and_reach_the_screen() -> None:
     assert _limits_for(CATALOG_BY_ID['trial-discount'])['trigger_days'][0] == 1
     assert _limits_for(CATALOG_BY_ID['return-wave2'])['discount_percent'] == [1, 50]
     assert _limits_for(CATALOG_BY_ID['trial-2h']) is None
+    assert _limits_for(CATALOG_BY_ID['grace-2d']) is None
+
+
+# ---------------------------------------------------------------------------
+# 7. Выключатель обязан что-то выключать
+# ---------------------------------------------------------------------------
+
+
+# Пять ключей, которые бот читает не общим `is_enabled`, а именованными геттерами —
+# они существовали до АС-2 и переписывать их незачем.
+_NAMED_GETTER_KEYS = {
+    'trial_channel_unsubscribed': 'is_trial_channel_unsubscribed_enabled',
+    'expired_1d': 'is_expired_1d_enabled',
+    'expired_second_wave': 'is_second_wave_enabled',
+    'expired_third_wave': 'is_third_wave_enabled',
+    'trial_expired_discount': 'is_trial_expired_discount_enabled',
+}
+
+
+def _bot_sending_sources() -> str:
+    """Исходники обеих служб, которые реально отправляют сообщения клиентам."""
+    return '\n'.join(
+        (_BOT_ROOT / name).read_text(encoding='utf-8')
+        for name in ('app/services/monitoring_service.py', 'app/services/daily_subscription_service.py')
+    )
+
+
+def test_every_switch_actually_guards_sending() -> None:
+    """У каждого переключателя в разделе есть забор в коде бота.
+
+    🔴 Это главный сторож АС-2. Владелец поймал ровно обратное: экран говорил
+    «выключить нельзя» там, где он этого не просил. Обратная беда опаснее —
+    нарисовать тумблер, который ничего не выключает. Тест читает исходники обеих
+    отправляющих служб и требует, чтобы ключ там встречался.
+    """
+    source = _bot_sending_sources()
+    missing = []
+    for entry in AUTO_MESSAGE_CATALOG:
+        if entry['control'] != 'toggle':
+            continue
+        key = entry['settings_key']
+        named = _NAMED_GETTER_KEYS.get(key)
+        guarded = f"is_enabled('{key}')" in source or (named and f'{named}()' in source)
+        if not guarded:
+            missing.append(f'{entry["id"]} → {key}')
+    assert not missing, 'переключатель есть, а забора в боте нет: ' + ', '.join(missing)
+
+
+def test_messages_sharing_a_switch_say_so() -> None:
+    """Если один ключ гасит два сообщения — оба обязаны об этом сказать.
+
+    Молчание здесь и есть та ложь, которую экран не имеет права допускать:
+    человек выключает одно, а замолкают два.
+    """
+    by_key: dict[str, list[dict]] = {}
+    for entry in AUTO_MESSAGE_CATALOG:
+        if entry['control'] == 'toggle':
+            by_key.setdefault(entry['settings_key'], []).append(entry)
+
+    for key, entries in by_key.items():
+        if len(entries) == 1:
+            assert not entries[0].get('shares_switch_with'), f'{entries[0]["id"]}: ключ {key} ни с кем не делится'
+            continue
+        assert len(entries) == 2, f'ключ {key} гасит больше двух сообщений — подпись на экране не рассчитана'
+        first, second = entries
+        assert first.get('shares_switch_with') == second['title'], f'{first["id"]} молчит про пару'
+        assert second.get('shares_switch_with') == first['title'], f'{second["id"]} молчит про пару'
+
+
+def test_dangerous_messages_explain_the_consequence() -> None:
+    """Там, где выключение оставит клиента без объяснения, это написано словами."""
+    dangerous = {'trial-expired', 'paid-expired', 'traffic-80', 'daily-paused', 'autopay-final'}
+    for message_id in dangerous:
+        warning = CATALOG_BY_ID[message_id].get('warning')
+        assert warning, f'{message_id}: последствие выключения не названо'
+        assert len(warning) > 40, f'{message_id}: предупреждение слишком короткое, чтобы что-то объяснить'
+
+
+def test_trigger_days_cap_matches_the_bot_lookback() -> None:
+    """Потолок «через сколько дней» не может быть больше окна выборки бота.
+
+    Моя мина из АС-1: потолок стоял 60, а бот смотрит назад на 30 — выставить
+    можно было, а сообщение не ушло бы никогда.
+    """
+    from app.cabinet.routes.admin_auto_messages import MAX_TRIGGER_DAYS
+
+    source = (_BOT_ROOT / 'app/services/monitoring_service.py').read_text(encoding='utf-8')
+    lookbacks = {int(days) for days in re.findall(r'lookback = now - timedelta\(days=(\d+)\)', source)}
+    assert lookbacks, 'не удалось вычитать окно выборки — сторож ослеп'
+    assert min(lookbacks) >= MAX_TRIGGER_DAYS, (
+        f'потолок {MAX_TRIGGER_DAYS} больше окна выборки {min(lookbacks)} — сообщение не уйдёт никогда'
+    )
