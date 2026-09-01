@@ -325,7 +325,6 @@ class Settings(BaseSettings):
     # one owner account is explicitly allowlisted for the controlled canary.
     # This deliberately uses internal user ids and is never returned by an API.
     DEVICE_FIRST_CANARY_USER_IDS: str = ''
-
     # Direct-sale reconciliation must not wait for the coarse, general
     # subscription monitoring loop. Keep this short but bounded: the worker
     # handles only v2 rows, each protected by its own database lease.
