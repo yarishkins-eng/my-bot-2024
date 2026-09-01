@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.database.crud.promo_group import get_promo_group_by_id
+from app.database.crud.promo_group import get_default_promo_group, get_promo_group_by_id
 from app.database.crud.subscription import get_subscription_by_user_id
 from app.database.crud.transaction import get_user_transactions_count
 from app.database.crud.user import (
@@ -61,6 +62,7 @@ from app.database.models import (
     SubscriptionCheckout,
     SubscriptionConversion,
     SubscriptionServer,
+    Ticket,
     Transaction,
     User,
     UserMessage,
@@ -1737,3 +1739,610 @@ class UserService:
         except Exception as e:
             logger.error('Ошибка получения пользователей по критериям', error=e)
             return []
+
+
+# ============================================================================
+# Обнуление тестового аккаунта.
+#
+# 🔴 ЭТО ИНСТРУМЕНТ, А НЕ ПРОДУКТ. Он нужен, чтобы владелец мог проверять
+# правки глазами клиента, не заводя новый Телеграм на каждую проверку.
+#
+# Действие необратимо и живёт под тремя НЕЗАВИСИМЫМИ заборами. Ни один из них
+# не унаследован от соседнего кода — каждый спрашивает своё:
+#   1. Телеграм обязан стоять в ``TEST_ACCOUNT_TELEGRAM_IDS`` (окружение).
+#   2. У аккаунта не должно быть служебной роли и он не должен быть админом —
+#      даже если его вписали в список по ошибке.
+#   3. Никаких денег в пути.
+#
+# 🔴 «Финансовая сверка» (``resolve_financial_account_erasure``) — самый
+# короткий путь к тому же результату, и он снимает забор №3 целиком. Здесь она
+# НЕ используется намеренно.
+# ============================================================================
+
+# Колонка со ссылкой на пользователя означает «эта строка принадлежит человеку»
+# только под такими именами. Всё остальное (``created_by``, ``admin_id``,
+# ``actor_user_id``, ``referred_by_id`` …) — это ЧУЖАЯ строка, которая на
+# человека лишь ссылается, и трогать её нельзя.
+# 🔴 `referral_id` и `buyer_user_id` сюда НЕ входят, и это не забывчивость.
+# В `referral_earnings` строка принадлежит тому, кто ЗАРАБОТАЛ (`user_id`), а
+# `referral_id` — лишь указатель на приглашённого. Снести её по `referral_id`
+# значит стереть запись о деньгах ЖИВОГО человека и отнять у него право вывода
+# (`referral_withdrawal_service.py`: право = заработано − выведено). То же у
+# `guest_purchases.buyer_user_id` — это оплаченный подарок покупателя.
+_TEST_RESET_OWNERSHIP_COLUMNS = frozenset({'user_id', 'owner_user_id'})
+
+# Эти таблицы не чистятся никогда. Три из четырёх при этом являются причиной
+# ОТКАЗА: если в них есть строка, обнуление не начнётся вовсе.
+_TEST_RESET_NEVER_WIPED = frozenset(
+    {
+        'admin_audit_log',  # несгораемый след админских действий
+        'user_roles',  # есть роль → забор №2 отказал раньше
+        'account_erasure_requests',  # незакрытая заявка → отказ, в чужую механику не лезем
+        'device_first_reconciliation_credits',  # неразобранные деньги → отказ
+        # Счётчик победителей раунда не уменьшается нигде, и снос попыток
+        # оставил бы раунд с `winners_count`, который больше никто не наберёт.
+        # Для «девственности» стенда конкурсы значения не имеют.
+        'contest_attempts',
+        # Идемпотентность оплаты Telegram Stars держится на `charge_id` этой
+        # таблицы: снесём — и повторный колбэк начислит второй раз.
+        'wheel_spins',
+    }
+)
+
+# Положительные списки: всё, чего в них нет, считается «в пути» и запирает
+# кнопку. Так новое состояние, о котором мы ещё не знаем, отказывает само.
+# Списки положительные: всё, чего в них нет, считается «в пути» и запирает
+# кнопку. Наборы взяты у САМОГО проекта, а не написаны заново, — тест
+# `test_settled_lists_follow_the_project` краснеет, если проект их изменит.
+#
+# Заказ: `device_first_checkout_service.TERMINAL_STATES` минус два состояния,
+# где деньги на разборе. `failed` и `reprice_required` — это остановившийся
+# заказ, денег в нём нет, и снести его ОБЯЗАТЕЛЬНО: пока он жив, клиенту
+# закрыт пробный период (`trial_activation_service` пускает только
+# `cancelled`, `expired`, `ready`).
+_TEST_RESET_MONEY_REVIEW_CHECKOUT_STATES = frozenset({'operator_review', 'conflict'})
+_TEST_RESET_FINISHED_CHECKOUT_STATES = frozenset({'ready', 'cancelled', 'expired', 'failed', 'reprice_required'})
+# 🔴 `paid_processing` НАМЕРЕННО остаётся у успешной прямой продажи навсегда —
+# это запись идемпотентности, а не открытый счёт (`app/database/crud/tariff.py`
+# объясняет это прямым текстом). Считать её «деньгами в пути» значит запереть
+# кнопку на любом стенде, где хоть раз прошла настоящая покупка, — то есть
+# сломать инструмент ровно тогда, когда он впервые понадобился.
+_TEST_RESET_SETTLED_ATTEMPT_STATUSES = frozenset({'failed', 'credited', 'paid_processing'})
+# Провайдер: `device_first_payment_service.PROVIDER_TERMINAL_STATUSES` плюс
+# успех. Без `EXPIRED` брошенный счёт (обычнейшее действие на стенде: открыл
+# оплату и закрыл вкладку) запирал бы кнопку навсегда.
+_TEST_RESET_SETTLED_PROVIDER_STATUSES = frozenset({'CONFIRMED', 'FAILED', 'CANCELED', 'EXPIRED'})
+
+# Кассы, про состояние которых эта кнопка судить не умеет: у каждой свой набор
+# статусов, и разбирать двадцать наборов ради выключенных касс — не работа
+# этого инструмента. Строки их обнуление сносит, поэтому наличие такой строки
+# = отказ. Сегодня все они пусты и выключены; включат — кнопка честно скажет,
+# что не берётся, вместо того чтобы снести молча.
+# Список положительный, как и остальные: новый статус заявки запрёт кнопку,
+# а не проскочит молча.
+_TEST_RESET_FINISHED_WITHDRAWAL_STATUSES = frozenset({'rejected', 'completed', 'cancelled'})
+_TEST_RESET_FINISHED_GIFT_STATUSES = frozenset({'delivered', 'failed', 'expired'})
+
+_TEST_RESET_SUBSCRIPTION_STATE_RU = {
+    'active': 'действует',
+    'expired': 'закончилась',
+    'disabled': 'отключена',
+    'pending': 'ещё не оплачена',
+    'limited': 'трафик исчерпан',
+}
+
+_TEST_RESET_UNJUDGED_PAYMENT_TABLES = (
+    (YooKassaPayment, 'ЮKassa'),
+    (CryptoBotPayment, 'CryptoBot'),
+    (HeleketPayment, 'Heleket'),
+    (MulenPayPayment, 'MulenPay'),
+    (Pal24Payment, 'Pal24'),
+    (WataPayment, 'Wata'),
+    (CloudPaymentsPayment, 'CloudPayments'),
+    (FreekassaPayment, 'FreeKassa'),
+    (KassaAiPayment, 'Kassa.ai'),
+    (AppleTransaction, 'Apple'),
+    # 🔴 У этих одиннадцати `user_id` объявлен `SET NULL`, поэтому обнуление их
+    # НЕ сносит — а их ссылка на проводку объявлена без правила удаления, и
+    # живая строка запрещает удалить проводку вовсе. Промолчать про них значит
+    # и пропустить платёж в пути, и намертво заклинить кнопку.
+    (RioPayPayment, 'RioPay'),
+    (SeverPayPayment, 'SeverPay'),
+    (PayPearPayment, 'PayPear'),
+    (RollyPayPayment, 'RollyPay'),
+    (OverpayPayment, 'Overpay'),
+    (AuraPayPayment, 'AuraPay'),
+    (EtoplatezhiPayment, 'Этоплатежи'),
+    (AntilopayPayment, 'Antilopay'),
+    (JupiterPayment, 'Jupiter'),
+    (DonutPayment, 'Donut'),
+    (LavaPayment, 'Lava'),
+)
+
+
+@dataclass
+class TestAccountResetPlan:
+    """Что кнопка снесёт (и снесла) — один и тот же объект до и после."""
+
+    allowed: bool = False
+    blocked_reason: str | None = None
+    balance_kopeks: int = 0
+    subscription: str | None = None
+    orders: int = 0
+    payments: int = 0
+    transactions: int = 0
+    invited_users: int = 0
+    tickets: int = 0
+    panel_linked: bool = False
+    done: bool = False
+    panel_deleted: bool = False
+    deleted_rows: dict[str, int] = dataclass_field(default_factory=dict)
+
+
+def test_account_telegram_ids() -> frozenset[int]:
+    """Разобрать список тестовых аккаунтов. Пусто по умолчанию и при мусоре.
+
+    🔴 Читается ПРЯМО из окружения, а не через `Settings`, и это осознанно.
+    Кабинет делает редактируемой каждую настройку класса `Settings`, которой
+    нет в списке исключений, и применяет её без рестарта. Список доступа к
+    необратимому действию не должен зависеть от того, не забыл ли кто-то
+    вписать его в тот список: значения нет среди настроек вовсе, поэтому
+    изменить его из кабинета, админки бота или Web API физически нечем.
+    """
+    result: set[int] = set()
+    for raw in os.getenv('TEST_ACCOUNT_TELEGRAM_IDS', '').split(','):
+        value = raw.strip()
+        if not value:
+            continue
+        try:
+            telegram_id = int(value)
+        except ValueError:
+            logger.warning('test_account_reset_invalid_allowlist_entry')
+            continue
+        if telegram_id > 0:
+            result.add(telegram_id)
+    return frozenset(result)
+
+
+def is_test_account(user: User) -> bool:
+    """Стенд опознаётся ТОЛЬКО по Телеграму из окружения."""
+    telegram_id = getattr(user, 'telegram_id', None)
+    if not telegram_id:
+        return False
+    return int(telegram_id) in test_account_telegram_ids()
+
+
+def _test_reset_delete_plan(scopes: dict[str, list[int]]) -> list[tuple[Any, Any]]:
+    """Пары «таблица, условие» в порядке удаления: дети раньше родителей.
+
+    Порядок берётся у самой SQLAlchemy (``sorted_tables`` сортирует родителей
+    первыми, здесь он развёрнут), а не пишется руками: рукописный порядок
+    слепнет ровно на той таблице, которую добавят завтра.
+    """
+    from app.database.models import Base
+
+    plan: list[tuple[Any, Any]] = []
+    for table in reversed(Base.metadata.sorted_tables):
+        if table.name in _TEST_RESET_NEVER_WIPED:
+            continue
+        clauses = []
+        for column in table.columns:
+            for foreign_key in column.foreign_keys:
+                parent = f'{foreign_key.column.table.name}.{foreign_key.column.name}'
+                if parent == 'users.id':
+                    # 🔴 `SET NULL` — это прямое указание схемы «строка
+                    # переживает человека»: так объявлены подарки, журнал
+                    # злоупотреблений Apple и логи промо-предложений. Удалять
+                    # их значит спорить со схемой и стирать чужие улики.
+                    if (
+                        column.name in _TEST_RESET_OWNERSHIP_COLUMNS
+                        and (foreign_key.ondelete or '').upper() != 'SET NULL'
+                    ):
+                        clauses.append(column.in_(scopes['users.id']))
+                    continue
+                # Ссылка с ``SET NULL`` обнулится сама при удалении родителя —
+                # её строка чужая и остаётся жить.
+                if parent in scopes and scopes[parent] and (foreign_key.ondelete or '').upper() != 'SET NULL':
+                    clauses.append(column.in_(scopes[parent]))
+        if clauses:
+            plan.append((table, or_(*clauses)))
+    return plan
+
+
+async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None:
+    """Первая причина, по которой обнулять нельзя. ``None`` — можно."""
+    from app.database.models import AccountErasureRequest, DeviceFirstReconciliationCredit, UserRole
+
+    # Забор №2: служебный аккаунт не стенд, даже если его вписали в список.
+    # Снос отвязал бы Телеграм и лишил человека входа в кабинет.
+    if settings.is_admin(telegram_id=user.telegram_id, email=user.email):
+        return 'Это админский аккаунт. Обнулять его нельзя: он потеряет доступ в кабинет.'
+    if await db.scalar(select(UserRole.id).where(UserRole.user_id == user.id).limit(1)):
+        return 'У этого человека есть служебная роль в кабинете. Обнулять его нельзя.'
+    # Третий, отдельный реестр служебных людей: модераторы поддержки живут не в
+    # базе, а в файле настроек. У такого человека нет ни роли, ни строки в
+    # ADMIN_IDS — но он каждый день отвечает клиентам в тикетах.
+    from app.services.support_settings_service import SupportSettingsService
+
+    if user.telegram_id is not None and SupportSettingsService.is_moderator(int(user.telegram_id)):
+        return 'Этот человек — модератор поддержки. Обнулять его нельзя.'
+
+    # Забор №3: деньги. Каждая проверка спрашивает своё.
+    #
+    # 🔴 Везде спрашивается СОСТОЯНИЕ строки, а не её наличие. Строка заявки на
+    # закрытие в этом проекте не удаляется никогда — «есть строка = отказ»
+    # означало бы, что первое же нажатие «удалить пользователя» на стенде
+    # убивает кнопку навсегда. То же с давно разобранным кредитом и с
+    # отклонённой заявкой на вывод.
+    if await db.scalar(
+        select(AccountErasureRequest.id)
+        .where(AccountErasureRequest.user_id == user.id, AccountErasureRequest.state != 'completed')
+        .limit(1)
+    ):
+        return 'Этот аккаунт сейчас закрывается по финансовой сверке. Дождитесь конца — в эту механику не лезем.'
+    # 🔴 Здесь спрашивается НАЛИЧИЕ, и это не забывчивость. Строка кредита
+    # держит попытку оплаты ссылкой с запретом удаления, а саму строку
+    # обнуление не трогает (это деньги). Значит даже разобранный кредит
+    # заклинил бы удаление намертво — честнее отказать и позвать человека.
+    if await db.scalar(
+        select(DeviceFirstReconciliationCredit.id).where(DeviceFirstReconciliationCredit.user_id == user.id).limit(1)
+    ):
+        return (
+            'На аккаунте есть кредит финансовой сверки. Эта кнопка с ним не справится '
+            'и трогать его не будет — скажите разработчику.'
+        )
+    if await db.scalar(
+        select(WithdrawalRequest.id)
+        .where(
+            WithdrawalRequest.user_id == user.id,
+            WithdrawalRequest.status.not_in(sorted(_TEST_RESET_FINISHED_WITHDRAWAL_STATUSES)),
+        )
+        .limit(1)
+    ):
+        return 'На аккаунте есть незакрытая заявка на вывод денег. Закройте её и вернитесь.'
+
+    money_review = (
+        await db.execute(
+            select(SubscriptionCheckout.id)
+            .where(
+                SubscriptionCheckout.user_id == user.id,
+                SubscriptionCheckout.lifecycle_state.in_(sorted(_TEST_RESET_MONEY_REVIEW_CHECKOUT_STATES)),
+            )
+            .limit(1)
+        )
+    ).first()
+    if money_review is not None:
+        return (
+            f'Заказ №{money_review[0]} лежит на разборе — по нему могли взять деньги. '
+            'Разберите его в админ-панели бота, раздел «Заказы на разборе», и вернитесь.'
+        )
+
+    live_checkout = (
+        await db.execute(
+            select(SubscriptionCheckout.id)
+            .where(
+                SubscriptionCheckout.user_id == user.id,
+                SubscriptionCheckout.lifecycle_state.not_in(sorted(_TEST_RESET_FINISHED_CHECKOUT_STATES)),
+            )
+            .limit(1)
+        )
+    ).first()
+    if live_checkout is not None:
+        # 🔴 Не обещаем, что «завершится сам»: протухший заказ гасится только
+        # при НОВОЙ покупке того же человека, и даже тогда не гасится, если по
+        # нему есть попытка оплаты. Обещание самопроизвольного конца было бы
+        # неправдой ровно в том случае, который случается чаще всего.
+        return (
+            f'Заказ №{live_checkout[0]} не закончен — по нему может идти сверка с банком. '
+            'Сам он не закроется. Если висит больше суток — скажите разработчику.'
+        )
+
+    unsettled_attempt = (
+        await db.execute(
+            select(CheckoutPaymentAttempt.id)
+            .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
+            .where(
+                SubscriptionCheckout.user_id == user.id,
+                CheckoutPaymentAttempt.status.not_in(sorted(_TEST_RESET_SETTLED_ATTEMPT_STATUSES)),
+            )
+            .limit(1)
+        )
+    ).first()
+    if unsettled_attempt is not None:
+        return (
+            f'Оплата по заказу №{unsettled_attempt[0]} ещё сверяется с банком. '
+            'Подождите, пока сверка закончится, и вернитесь.'
+        )
+
+    unsettled_payment = (
+        await db.execute(
+            select(PlategaPayment.amount_kopeks)
+            .where(
+                PlategaPayment.user_id == user.id,
+                func.upper(PlategaPayment.status).not_in(sorted(_TEST_RESET_SETTLED_PROVIDER_STATUSES)),
+            )
+            .limit(1)
+        )
+    ).first()
+    if unsettled_payment is not None:
+        amount = (unsettled_payment[0] or 0) / 100
+        return f'Платёж на {amount:.2f} ₽ ещё не досверен с банком. По вашему правилу такие деньги ждём, а не удаляем.'
+
+    # 🔴 Забор смотрит на Platega. Остальные кассы у проекта выключены, но их
+    # строки обнуление всё равно сносит, поэтому судить о них мы не можем:
+    # есть строка чужой кассы — отказываем и зовём человека, а не гадаем.
+    # Подарок судим по статусу: завершённый — просто история (строку схема
+    # велит сохранить), незавершённый — деньги в пути.
+    if await db.scalar(
+        select(GuestPurchase.id)
+        .where(
+            or_(GuestPurchase.user_id == user.id, GuestPurchase.buyer_user_id == user.id),
+            GuestPurchase.status.not_in(sorted(_TEST_RESET_FINISHED_GIFT_STATUSES)),
+        )
+        .limit(1)
+    ):
+        return 'На аккаунте есть незавершённый подарок — деньги по нему могут быть в пути.'
+
+    for model, human in _TEST_RESET_UNJUDGED_PAYMENT_TABLES:
+        if await db.scalar(select(model.id).where(model.user_id == user.id).limit(1)):
+            return (
+                f'На аккаунте есть платежи через {human}, а про них эта кнопка судить не умеет. '
+                'Скажите разработчику — обнулять вслепую не будем.'
+            )
+    return None
+
+
+async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str]) -> bool:
+    """Удалить пользователя из панели RemnaWave. ``False`` — не удалось.
+
+    Логика взята у штатного закрытия аккаунта (``account_erasure_service``), а
+    не написана рядом заново. Две вещи оттуда критичны:
+
+    * UUID доискивается по Телеграму и почте. POST мог дойти до панели, а его
+      ответ потеряться — тогда локального UUID нет, а пользователь в панели
+      есть, и «мусора не осталось» было бы неправдой.
+    * 404 — это УСПЕХ. Панель могли почистить руками, и на стенде это норма.
+      Считать 404 отказом значило бы запереть кнопку навсегда.
+    """
+    from app.external.remnawave_api import RemnaWaveAPIError
+    from app.services.remnawave_service import RemnaWaveService
+    from app.services.remnawave_webhook_service import RemnaWaveWebhookService
+
+    found = set(panel_uuids)
+    try:
+        async with RemnaWaveService().get_api_client() as api:
+            if user.telegram_id is not None:
+                found.update(
+                    item.uuid for item in await api.get_user_by_telegram_id(int(user.telegram_id)) if item.uuid
+                )
+            if user.email:
+                found.update(item.uuid for item in await api.get_user_by_email(user.email) if item.uuid)
+            if not found:
+                return True
+
+            RemnaWaveWebhookService.mark_intentional_panel_deletion(
+                panel_uuids=sorted(found),
+                telegram_id=int(user.telegram_id) if user.telegram_id is not None else None,
+            )
+            for panel_uuid in sorted(found):
+                try:
+                    deleted = await api.delete_user(panel_uuid)
+                except RemnaWaveAPIError as error:
+                    if error.status_code != 404:
+                        raise
+                    deleted = True
+                if not deleted:
+                    logger.warning('test_account_reset_panel_delete_returned_false', remnawave_uuid=panel_uuid)
+                    return False
+    except Exception as error:
+        logger.error('test_account_reset_panel_delete_error', error=error)
+        return False
+    return True
+
+
+async def reset_test_account(
+    db: AsyncSession,
+    user: User,
+    admin_id: int | None,
+    *,
+    confirm: bool,
+) -> TestAccountResetPlan:
+    """Показать план обнуления стенда, а при ``confirm`` — выполнить его.
+
+    Показ и выполнение идут ОДНИМ путём: то, что владелец прочитал на первом
+    нажатии, и то, что снесётся на втором, считается одним и тем же кодом.
+    """
+    from app.database.crud.subscription import decrement_subscription_server_counts
+
+    # Номер берётся ДО первой записи: любой откат ниже «протухает» ORM-объект,
+    # и обращение к его полю после этого попытается сходить в базу вне сессии.
+    user_id = user.id
+    subscriptions = (await db.execute(select(Subscription).where(Subscription.user_id == user_id))).scalars().all()
+    sub_ids = [sub.id for sub in subscriptions]
+    checkout_ids = list(
+        (await db.execute(select(SubscriptionCheckout.id).where(SubscriptionCheckout.user_id == user_id)))
+        .scalars()
+        .all()
+    )
+    attempt_ids = (
+        list(
+            (
+                await db.execute(
+                    select(CheckoutPaymentAttempt.id).where(CheckoutPaymentAttempt.checkout_id.in_(checkout_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if checkout_ids
+        else []
+    )
+    term_ids: list[int] = []
+    if sub_ids:
+        from app.database.models import SubscriptionEntitlementTerm
+
+        term_ids = list(
+            (
+                await db.execute(
+                    select(SubscriptionEntitlementTerm.id).where(
+                        SubscriptionEntitlementTerm.subscription_id.in_(sub_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    plan = TestAccountResetPlan(
+        balance_kopeks=int(user.balance_kopeks or 0),
+        orders=len(checkout_ids),
+        payments=int(
+            await db.scalar(select(func.count(PlategaPayment.id)).where(PlategaPayment.user_id == user_id)) or 0
+        ),
+        transactions=int(
+            await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user_id)) or 0
+        ),
+        invited_users=int(await db.scalar(select(func.count(User.id)).where(User.referred_by_id == user_id)) or 0),
+        # Обращения в поддержку исчезают вместе с перепиской ВНУТРИ них — в том
+        # числе с ответами менеджера. Владелец обязан это видеть до нажатия, а
+        # не узнавать постфактум: их удаление ничем на экране не отражалось.
+        tickets=int(await db.scalar(select(func.count(Ticket.id)).where(Ticket.user_id == user_id)) or 0),
+        panel_linked=bool(user.remnawave_uuid) or any(sub.remnawave_uuid for sub in subscriptions),
+    )
+    if subscriptions:
+        first = subscriptions[0]
+        kind = 'пробная' if first.is_trial else 'платная'
+        # Владелец читает это перед необратимым действием. Сырое `active` из
+        # базы ему ничего не говорит; неизвестное состояние показываем как есть,
+        # но не притворяемся, что перевели.
+        state = _TEST_RESET_SUBSCRIPTION_STATE_RU.get(str(first.status), str(first.status))
+        tail = f' и ещё {len(subscriptions) - 1}' if len(subscriptions) > 1 else ''
+        plan.subscription = f'{kind}, {state}, до {first.end_date:%d.%m.%Y}{tail}'
+
+    plan.blocked_reason = await _test_reset_blocked_reason(db, user)
+    plan.allowed = plan.blocked_reason is None
+    if not plan.allowed or not confirm:
+        return plan
+
+    panel_uuids = sorted(
+        {value for value in [user.remnawave_uuid, *(sub.remnawave_uuid for sub in subscriptions)] if value}
+    )
+    scopes = {
+        'users.id': [user_id],
+        'subscriptions.id': sub_ids,
+        'subscription_checkouts.id': checkout_ids,
+        'checkout_payment_attempts.id': attempt_ids,
+        'subscription_entitlement_terms.id': term_ids,
+    }
+
+    # 🔴 Панель — ПЕРВОЙ и ВНЕ транзакции. Обратный порядок держал бы
+    # эксклюзивную блокировку на строках ОБЩИХ серверов всё время сетевого
+    # вызова (у панели таймаут 60 с и три повтора), и обнуление стенда
+    # тормозило бы покупки живых клиентов. Проект пишет это правило прямым
+    # текстом в `trial_activation_service`: не держать блокировки через IO.
+    #
+    # Удаление в панели идемпотентно (404 = успех), поэтому повтор безопасен:
+    # если база ниже не дастся, владелец нажмёт ещё раз и дойдёт до конца.
+    plan.panel_deleted = await _test_reset_delete_panel_identity(user, panel_uuids)
+    if not plan.panel_deleted:
+        plan.allowed = False
+        plan.blocked_reason = 'Панель RemnaWave не ответила. В базе ничего не тронуто — нажмите ещё раз чуть позже.'
+        return plan
+
+    try:
+        # Счётчики занятости серверов принадлежат ЧУЖИМ строкам: не уменьшив их
+        # до удаления связок, мы испортим общий сервер для всех остальных.
+        for subscription in subscriptions:
+            await decrement_subscription_server_counts(db, subscription)
+
+        # Использования промокодов удаляются, а счётчик у самого промокода —
+        # общий. Не уменьшив его, мы сожгли бы чужому промокоду места: у кода
+        # с лимитом 1 после первой же проверки на стенде не осталось бы ни
+        # одного. Проект уже умеет это откатывать (`promocode_service`).
+        used_promocode_ids = list(
+            (await db.execute(select(PromoCodeUse.promocode_id).where(PromoCodeUse.user_id == user_id))).scalars().all()
+        )
+        for promocode_id in used_promocode_ids:
+            await db.execute(
+                update(PromoCode)
+                .where(PromoCode.id == promocode_id, PromoCode.current_uses > 0)
+                .values(current_uses=PromoCode.current_uses - 1)
+            )
+
+        # 🔴 Строку заработка реферера мы храним — это ЕГО деньги. Но она
+        # ссылается на проводку стенда ссылкой без правила удаления, и живая
+        # ссылка запретит удалить проводку вовсе: обнуление падало бы каждый
+        # раз, уже ПОСЛЕ удаления пользователя из панели. Тот же шаг делает
+        # штатное восстановление при `/start`.
+        await db.execute(
+            update(ReferralEarning)
+            .where(or_(ReferralEarning.user_id == user_id, ReferralEarning.referral_id == user_id))
+            .values(referral_transaction_id=None)
+        )
+
+        for table, whereclause in _test_reset_delete_plan(scopes):
+            result = await db.execute(delete(table).where(whereclause))
+            if result.rowcount:
+                plan.deleted_rows[table.name] = int(result.rowcount)
+
+        # Единственная строка «про этого человека» без внешнего ключа: она
+        # висит на telegram_id, поэтому обход по метаданным её не находит.
+        if user.telegram_id is not None:
+            from app.database.models import UserChannelSubscription
+
+            result = await db.execute(
+                delete(UserChannelSubscription).where(UserChannelSubscription.telegram_id == user.telegram_id)
+            )
+            if result.rowcount:
+                plan.deleted_rows['user_channel_subscriptions'] = int(result.rowcount)
+
+        # Цены, которые увидит «новичок», зависят от промо-группы и от того,
+        # пополнял ли он хоть раз. Не сбросив это, стенд показал бы на экране
+        # «Тарифы» не те цены, что настоящий новый клиент, — то есть ровно ту
+        # ложную картину, из-за которой этот инструмент и понадобился.
+        default_group = await get_default_promo_group(db)
+        if default_group is not None:
+            user.promo_group_id = default_group.id
+        user.has_made_first_topup = False
+        user.auto_promo_group_assigned = False
+        user.auto_promo_group_threshold_kopeks = 0
+
+        # Запреты покупки и пополнения переживают удаление строк — а проверять
+        # «что видит ограниченный клиент» на стенде совершенно естественно.
+        # Не сняв их, мы вернули бы аккаунт, который не умеет покупать.
+        user.restriction_topup = False
+        user.restriction_subscription = False
+        user.restriction_reason = None
+        user.promo_offer_discount_percent = 0
+        user.promo_offer_discount_source = None
+        user.promo_offer_discount_expires_at = None
+
+        user.balance_kopeks = 0
+        user.remnawave_uuid = None
+        user.has_had_paid_subscription = False
+        user.referred_by_id = None
+        user.used_promocodes = 0
+        user.status = UserStatus.DELETED.value
+        user.account_erasure_requested_at = None
+        user.updated_at = datetime.now(UTC)
+        await db.commit()
+    except Exception as error:
+        await db.rollback()
+        logger.error('test_account_reset_failed', user_id=user_id, error=error)
+        plan.allowed = False
+        plan.deleted_rows = {}
+        plan.blocked_reason = (
+            'Обнулить не удалось: в базе ничего не изменено, но в панели RemnaWave пользователь '
+            'уже удалён. Нажмите ещё раз — повтор безопасен.'
+        )
+        return plan
+
+    plan.done = True
+    logger.info(
+        'test_account_reset_done',
+        user_id=user_id,
+        admin_id=admin_id,
+        deleted_rows=plan.deleted_rows,
+        panel_uuids=len(panel_uuids),
+    )
+    return plan
