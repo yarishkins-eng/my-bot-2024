@@ -508,7 +508,7 @@ def _short_circuited(test: ast.expr) -> bool:
     return False
 
 
-def _keys_with_live_guards() -> set[str]:
+def _keys_with_live_guards(modules: tuple[str, ...] = _SENDING_MODULES) -> set[str]:
     """Ключи, которые в коде бота правда что-то решают.
 
     🔴 Поиском подстроки это не проверяется: `if False and is_enabled('x')` содержит
@@ -529,7 +529,7 @@ def _keys_with_live_guards() -> set[str]:
             elif name in _GETTER_TO_KEY:
                 keys.add(_GETTER_TO_KEY[name])
 
-    for name in _SENDING_MODULES:
+    for name in modules:
         tree = ast.parse((_BOT_ROOT / name).read_text(encoding='utf-8'))
         for node in ast.walk(tree):
             if isinstance(node, ast.If):
@@ -649,19 +649,22 @@ def test_trial_hours_floor_is_the_monitoring_interval() -> None:
     from app.config import settings
 
     interval_hours = settings.MONITORING_INTERVAL / 60
-    assert interval_hours <= MIN_WARN_HOURS, (
-        f'граница {MIN_WARN_HOURS} ч меньше промежутка между обходами {interval_hours} ч'
+    # Строго больше, а не «не меньше»: обход не мгновенный, шаг между двумя обходами
+    # равен промежутку ПЛЮС длительность самого обхода. Окно шириной ровно в промежуток
+    # уже шага, и в каждом обороте остаётся слепая полоса.
+    assert interval_hours < MIN_WARN_HOURS, (
+        f'граница {MIN_WARN_HOURS} ч не перекрывает промежуток между обходами {interval_hours} ч'
     )
 
     # Константы раздела мало: в файл настроек можно попасть и мимо экрана, поэтому
     # держать пол обязан сам сервис — и на чтении, и на записи.
     with patch.object(NotificationSettingsService, '_get', return_value={'warn_hours': 0}):
-        assert NotificationSettingsService.get_trial_warn_hours() >= interval_hours, (
-            'сервис отдал значение ниже промежутка между обходами'
+        assert NotificationSettingsService.get_trial_warn_hours() > interval_hours, (
+            'сервис отдал значение, не перекрывающее промежуток между обходами'
         )
     with patch.object(NotificationSettingsService, '_set_field', return_value=True) as write:
         NotificationSettingsService.set_trial_warn_hours(0)
-    assert write.call_args.args[-1] >= interval_hours, (
+    assert write.call_args.args[-1] > interval_hours, (
         f'сервис записал {write.call_args.args[-1]} ч — цикл такое окно перешагнёт'
     )
 
@@ -797,10 +800,13 @@ def test_realtime_channel_letters_obey_the_switch() -> None:
     доступ — иначе «выключить сообщение» означало бы «не возвращать человеку VPN».
     """
     senders = ('app/handlers/channel_member.py', 'app/middlewares/channel_checker.py')
+    # 🔴 Поиском подстроки это не проверить дважды: тот же ключ живёт и в почасовой
+    # службе, поэтому «ключ встречается» было бы правдой даже с мёртвым забором здесь.
+    # Спрашиваем про КАЖДЫЙ файл отдельно и через разбор синтаксиса.
     for name in senders:
-        source = (_BOT_ROOT / name).read_text(encoding='utf-8')
-        assert "is_enabled('trial_channel_unsubscribed')" in source, f'{name}: письмо об отписке без забора'
-        assert "is_enabled('channel_restored')" in source, f'{name}: письмо о возврате без забора'
+        live = _keys_with_live_guards((name,))
+        assert 'trial_channel_unsubscribed' in live, f'{name}: письмо об отписке без живого забора'
+        assert 'channel_restored' in live, f'{name}: письмо о возврате без живого забора'
 
     source = '\n'.join((_BOT_ROOT / name).read_text(encoding='utf-8') for name in senders)
     tree = ast.parse((_BOT_ROOT / senders[0]).read_text(encoding='utf-8'))
