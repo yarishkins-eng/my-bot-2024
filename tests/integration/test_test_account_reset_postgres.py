@@ -429,9 +429,9 @@ async def test_a_paid_gift_of_a_real_buyer_survives(session, monkeypatch) -> Non
 
     plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
 
-    # Кнопка честно отказывается: про подарки она судить не умеет.
+    # Оплаченный, но ещё не доставленный подарок — деньги в пути: отказ.
     assert plan.done is False
-    assert 'подарки' in (plan.blocked_reason or '')
+    assert 'подарок' in (plan.blocked_reason or '')
     assert await session.scalar(select(func.count()).select_from(GuestPurchase)) == 1
     assert (await _counts(session, stand_id))['subscriptions'] == 1
 
@@ -594,3 +594,90 @@ async def test_prices_look_like_a_newcomers_again(session, monkeypatch) -> None:
     assert refreshed.promo_group_id == default_id
     assert refreshed.has_made_first_topup is False
     assert refreshed.auto_promo_group_assigned is False
+
+
+async def test_a_restricted_stand_comes_back_able_to_buy(session, monkeypatch) -> None:
+    """Проверять «что видит ограниченный клиент» на стенде — обычное дело.
+
+    Запреты покупки и пополнения живут на строке пользователя и переживают
+    удаление всего остального. Не сняв их, мы вернули бы «нового клиента»,
+    который не умеет покупать.
+    """
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    stand.restriction_topup = True
+    stand.restriction_subscription = True
+    stand.restriction_reason = 'проверяли экран ограничений'
+    stand.promo_offer_discount_percent = 30
+    await session.commit()
+    stand_id = stand.id
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.done is True, plan.blocked_reason
+    refreshed = await session.get(User, stand_id)
+    assert refreshed.restriction_topup is False
+    assert refreshed.restriction_subscription is False
+    assert refreshed.restriction_reason is None
+    assert refreshed.promo_offer_discount_percent == 0
+
+
+async def test_the_plan_names_the_support_conversation_before_it_disappears(session, monkeypatch) -> None:
+    """Обращение сносится вместе с перепиской ВНУТРИ него — включая ответы
+    менеджера. Это исчезало незаметно: в плане обращений не было вовсе."""
+    from app.database.models import Ticket, TicketMessage
+
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    manager = User(telegram_id=101010101, username='manager')
+    session.add(manager)
+    await session.flush()
+    ticket = Ticket(user_id=stand.id, title='вопрос', status='open')
+    session.add(ticket)
+    await session.flush()
+    # Ответ менеджера лежит ВНУТРИ обращения стенда и уедет по каскаду.
+    session.add_all(
+        [
+            TicketMessage(ticket_id=ticket.id, user_id=stand.id, message_text='не работает'),
+            TicketMessage(ticket_id=ticket.id, user_id=manager.id, message_text='смотрим', is_from_admin=True),
+        ]
+    )
+    await session.commit()
+
+    preview = await user_service.reset_test_account(session, stand, admin_id=1, confirm=False)
+    assert preview.tickets == 1, 'обращения обязаны быть видны ДО нажатия'
+
+    done = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    assert done.done is True, done.blocked_reason
+    assert await session.scalar(select(func.count()).select_from(TicketMessage)) == 0
+
+
+async def test_an_unfinished_gift_locks_but_a_finished_one_does_not(session, monkeypatch) -> None:
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    gift = GuestPurchase(
+        user_id=stand.id,
+        amount_kopeks=19900,
+        status='pending',
+        token='gift-pending',
+        contact_type='telegram',
+        contact_value=str(STAND_TELEGRAM_ID),
+        period_days=30,
+    )
+    session.add(gift)
+    await session.commit()
+
+    blocked = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    assert blocked.done is False
+    assert 'подарок' in (blocked.blocked_reason or '')
+
+    # Завершённый — просто история, схема велит строку сохранить.
+    gift.status = 'delivered'
+    await session.commit()
+
+    done = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    assert done.done is True, done.blocked_reason
+    assert await session.scalar(select(func.count()).select_from(GuestPurchase)) == 1

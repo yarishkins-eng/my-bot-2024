@@ -2833,6 +2833,7 @@ async def reset_test_account_route(
         payments=plan.payments,
         transactions=plan.transactions,
         invited_users=plan.invited_users,
+        tickets=plan.tickets,
         panel_linked=plan.panel_linked,
         panel_deleted=plan.panel_deleted,
         deleted_rows=plan.deleted_rows,

@@ -61,6 +61,7 @@ from app.database.models import (
     SubscriptionCheckout,
     SubscriptionConversion,
     SubscriptionServer,
+    Ticket,
     Transaction,
     User,
     UserMessage,
@@ -1819,6 +1820,7 @@ _TEST_RESET_SETTLED_PROVIDER_STATUSES = frozenset({'CONFIRMED', 'FAILED', 'CANCE
 # Список положительный, как и остальные: новый статус заявки запрёт кнопку,
 # а не проскочит молча.
 _TEST_RESET_FINISHED_WITHDRAWAL_STATUSES = frozenset({'rejected', 'completed', 'cancelled'})
+_TEST_RESET_FINISHED_GIFT_STATUSES = frozenset({'delivered', 'failed', 'expired'})
 
 _TEST_RESET_SUBSCRIPTION_STATE_RU = {
     'active': 'действует',
@@ -1839,7 +1841,6 @@ _TEST_RESET_UNJUDGED_PAYMENT_TABLES = (
     (FreekassaPayment, 'FreeKassa'),
     (KassaAiPayment, 'Kassa.ai'),
     (AppleTransaction, 'Apple'),
-    (GuestPurchase, 'подарки'),
     # 🔴 У этих одиннадцати `user_id` объявлен `SET NULL`, поэтому обнуление их
     # НЕ сносит — а их ссылка на проводку объявлена без правила удаления, и
     # живая строка запрещает удалить проводку вовсе. Промолчать про них значит
@@ -1870,6 +1871,7 @@ class TestAccountResetPlan:
     payments: int = 0
     transactions: int = 0
     invited_users: int = 0
+    tickets: int = 0
     panel_linked: bool = False
     done: bool = False
     panel_deleted: bool = False
@@ -2017,9 +2019,13 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
         )
     ).first()
     if live_checkout is not None:
+        # 🔴 Не обещаем, что «завершится сам»: протухший заказ гасится только
+        # при НОВОЙ покупке того же человека, и даже тогда не гасится, если по
+        # нему есть попытка оплаты. Обещание самопроизвольного конца было бы
+        # неправдой ровно в том случае, который случается чаще всего.
         return (
-            f'Заказ №{live_checkout[0]} ещё не закончен — деньги могут быть в пути. '
-            'Подождите, пока он завершится сам, и вернитесь.'
+            f'Заказ №{live_checkout[0]} не закончен — по нему может идти сверка с банком. '
+            'Сам он не закроется. Если висит больше суток — скажите разработчику.'
         )
 
     unsettled_attempt = (
@@ -2056,6 +2062,18 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
     # 🔴 Забор смотрит на Platega. Остальные кассы у проекта выключены, но их
     # строки обнуление всё равно сносит, поэтому судить о них мы не можем:
     # есть строка чужой кассы — отказываем и зовём человека, а не гадаем.
+    # Подарок судим по статусу: завершённый — просто история (строку схема
+    # велит сохранить), незавершённый — деньги в пути.
+    if await db.scalar(
+        select(GuestPurchase.id)
+        .where(
+            or_(GuestPurchase.user_id == user.id, GuestPurchase.buyer_user_id == user.id),
+            GuestPurchase.status.not_in(sorted(_TEST_RESET_FINISHED_GIFT_STATUSES)),
+        )
+        .limit(1)
+    ):
+        return 'На аккаунте есть незавершённый подарок — деньги по нему могут быть в пути.'
+
     for model, human in _TEST_RESET_UNJUDGED_PAYMENT_TABLES:
         if await db.scalar(select(model.id).where(model.user_id == user.id).limit(1)):
             return (
@@ -2176,6 +2194,10 @@ async def reset_test_account(
             await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user_id)) or 0
         ),
         invited_users=int(await db.scalar(select(func.count(User.id)).where(User.referred_by_id == user_id)) or 0),
+        # Обращения в поддержку исчезают вместе с перепиской ВНУТРИ них — в том
+        # числе с ответами менеджера. Владелец обязан это видеть до нажатия, а
+        # не узнавать постфактум: их удаление ничем на экране не отражалось.
+        tickets=int(await db.scalar(select(func.count(Ticket.id)).where(Ticket.user_id == user_id)) or 0),
         panel_linked=bool(user.remnawave_uuid) or any(sub.remnawave_uuid for sub in subscriptions),
     )
     if subscriptions:
@@ -2275,6 +2297,16 @@ async def reset_test_account(
         user.has_made_first_topup = False
         user.auto_promo_group_assigned = False
         user.auto_promo_group_threshold_kopeks = 0
+
+        # Запреты покупки и пополнения переживают удаление строк — а проверять
+        # «что видит ограниченный клиент» на стенде совершенно естественно.
+        # Не сняв их, мы вернули бы аккаунт, который не умеет покупать.
+        user.restriction_topup = False
+        user.restriction_subscription = False
+        user.restriction_reason = None
+        user.promo_offer_discount_percent = 0
+        user.promo_offer_discount_source = None
+        user.promo_offer_discount_expires_at = None
 
         user.balance_kopeks = 0
         user.remnawave_uuid = None

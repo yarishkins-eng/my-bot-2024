@@ -535,6 +535,7 @@ class TestAccountResetResponse(BaseModel):
     payments: int = 0
     transactions: int = 0
     invited_users: int = 0
+    tickets: int = 0
     panel_linked: bool = False
     panel_deleted: bool = False
     deleted_rows: dict[str, int] = Field(default_factory=dict)
