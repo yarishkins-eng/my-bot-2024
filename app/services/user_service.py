@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.database.crud.promo_group import get_promo_group_by_id
+from app.database.crud.promo_group import get_default_promo_group, get_promo_group_by_id
 from app.database.crud.subscription import get_subscription_by_user_id
 from app.database.crud.transaction import get_user_transactions_count
 from app.database.crud.user import (
@@ -1816,6 +1816,10 @@ _TEST_RESET_SETTLED_PROVIDER_STATUSES = frozenset({'CONFIRMED', 'FAILED', 'CANCE
 # этого инструмента. Строки их обнуление сносит, поэтому наличие такой строки
 # = отказ. Сегодня все они пусты и выключены; включат — кнопка честно скажет,
 # что не берётся, вместо того чтобы снести молча.
+# Список положительный, как и остальные: новый статус заявки запрёт кнопку,
+# а не проскочит молча.
+_TEST_RESET_FINISHED_WITHDRAWAL_STATUSES = frozenset({'rejected', 'completed', 'cancelled'})
+
 _TEST_RESET_SUBSCRIPTION_STATE_RU = {
     'active': 'действует',
     'expired': 'закончилась',
@@ -1836,6 +1840,21 @@ _TEST_RESET_UNJUDGED_PAYMENT_TABLES = (
     (KassaAiPayment, 'Kassa.ai'),
     (AppleTransaction, 'Apple'),
     (GuestPurchase, 'подарки'),
+    # 🔴 У этих одиннадцати `user_id` объявлен `SET NULL`, поэтому обнуление их
+    # НЕ сносит — а их ссылка на проводку объявлена без правила удаления, и
+    # живая строка запрещает удалить проводку вовсе. Промолчать про них значит
+    # и пропустить платёж в пути, и намертво заклинить кнопку.
+    (RioPayPayment, 'RioPay'),
+    (SeverPayPayment, 'SeverPay'),
+    (PayPearPayment, 'PayPear'),
+    (RollyPayPayment, 'RollyPay'),
+    (OverpayPayment, 'Overpay'),
+    (AuraPayPayment, 'AuraPay'),
+    (EtoplatezhiPayment, 'Этоплатежи'),
+    (AntilopayPayment, 'Antilopay'),
+    (JupiterPayment, 'Jupiter'),
+    (DonutPayment, 'Donut'),
+    (LavaPayment, 'Lava'),
 )
 
 
@@ -1926,9 +1945,16 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
     # Забор №2: служебный аккаунт не стенд, даже если его вписали в список.
     # Снос отвязал бы Телеграм и лишил человека входа в кабинет.
     if settings.is_admin(telegram_id=user.telegram_id, email=user.email):
-        return 'Это админский аккаунт: обнулять нельзя.'
+        return 'Это админский аккаунт. Обнулять его нельзя: он потеряет доступ в кабинет.'
     if await db.scalar(select(UserRole.id).where(UserRole.user_id == user.id).limit(1)):
-        return 'У аккаунта есть служебная роль в кабинете: обнулять нельзя.'
+        return 'У этого человека есть служебная роль в кабинете. Обнулять его нельзя.'
+    # Третий, отдельный реестр служебных людей: модераторы поддержки живут не в
+    # базе, а в файле настроек. У такого человека нет ни роли, ни строки в
+    # ADMIN_IDS — но он каждый день отвечает клиентам в тикетах.
+    from app.services.support_settings_service import SupportSettingsService
+
+    if user.telegram_id is not None and SupportSettingsService.is_moderator(int(user.telegram_id)):
+        return 'Этот человек — модератор поддержки. Обнулять его нельзя.'
 
     # Забор №3: деньги. Каждая проверка спрашивает своё.
     #
@@ -1943,18 +1969,23 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
         .limit(1)
     ):
         return 'Этот аккаунт сейчас закрывается по финансовой сверке. Дождитесь конца — в эту механику не лезем.'
+    # 🔴 Здесь спрашивается НАЛИЧИЕ, и это не забывчивость. Строка кредита
+    # держит попытку оплаты ссылкой с запретом удаления, а саму строку
+    # обнуление не трогает (это деньги). Значит даже разобранный кредит
+    # заклинил бы удаление намертво — честнее отказать и позвать человека.
     if await db.scalar(
-        select(DeviceFirstReconciliationCredit.id)
-        .where(
-            DeviceFirstReconciliationCredit.user_id == user.id,
-            DeviceFirstReconciliationCredit.status != 'resolved',
-        )
-        .limit(1)
+        select(DeviceFirstReconciliationCredit.id).where(DeviceFirstReconciliationCredit.user_id == user.id).limit(1)
     ):
-        return 'На аккаунте есть деньги, которые ещё разбирают. Разберите их и вернитесь.'
+        return (
+            'На аккаунте есть кредит финансовой сверки. Эта кнопка с ним не справится '
+            'и трогать его не будет — скажите разработчику.'
+        )
     if await db.scalar(
         select(WithdrawalRequest.id)
-        .where(WithdrawalRequest.user_id == user.id, WithdrawalRequest.status.in_(['pending', 'approved']))
+        .where(
+            WithdrawalRequest.user_id == user.id,
+            WithdrawalRequest.status.not_in(sorted(_TEST_RESET_FINISHED_WITHDRAWAL_STATUSES)),
+        )
         .limit(1)
     ):
         return 'На аккаунте есть незакрытая заявка на вывод денег. Закройте её и вернитесь.'
@@ -2207,6 +2238,17 @@ async def reset_test_account(
                 .values(current_uses=PromoCode.current_uses - 1)
             )
 
+        # 🔴 Строку заработка реферера мы храним — это ЕГО деньги. Но она
+        # ссылается на проводку стенда ссылкой без правила удаления, и живая
+        # ссылка запретит удалить проводку вовсе: обнуление падало бы каждый
+        # раз, уже ПОСЛЕ удаления пользователя из панели. Тот же шаг делает
+        # штатное восстановление при `/start`.
+        await db.execute(
+            update(ReferralEarning)
+            .where(or_(ReferralEarning.user_id == user_id, ReferralEarning.referral_id == user_id))
+            .values(referral_transaction_id=None)
+        )
+
         for table, whereclause in _test_reset_delete_plan(scopes):
             result = await db.execute(delete(table).where(whereclause))
             if result.rowcount:
@@ -2222,6 +2264,17 @@ async def reset_test_account(
             )
             if result.rowcount:
                 plan.deleted_rows['user_channel_subscriptions'] = int(result.rowcount)
+
+        # Цены, которые увидит «новичок», зависят от промо-группы и от того,
+        # пополнял ли он хоть раз. Не сбросив это, стенд показал бы на экране
+        # «Тарифы» не те цены, что настоящий новый клиент, — то есть ровно ту
+        # ложную картину, из-за которой этот инструмент и понадобился.
+        default_group = await get_default_promo_group(db)
+        if default_group is not None:
+            user.promo_group_id = default_group.id
+        user.has_made_first_topup = False
+        user.auto_promo_group_assigned = False
+        user.auto_promo_group_threshold_kopeks = 0
 
         user.balance_kopeks = 0
         user.remnawave_uuid = None

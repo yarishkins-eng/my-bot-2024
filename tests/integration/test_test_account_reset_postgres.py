@@ -39,6 +39,7 @@ from app.database.models import (
     Base,
     CheckoutPaymentAttempt,
     GuestPurchase,
+    LavaPayment,
     PlategaPayment,
     ReferralEarning,
     ServerSquad,
@@ -433,3 +434,163 @@ async def test_a_paid_gift_of_a_real_buyer_survives(session, monkeypatch) -> Non
     assert 'подарки' in (plan.blocked_reason or '')
     assert await session.scalar(select(func.count()).select_from(GuestPurchase)) == 1
     assert (await _counts(session, stand_id))['subscriptions'] == 1
+
+
+async def test_referrers_earning_does_not_deadlock_the_reset(session, monkeypatch) -> None:
+    """Строку заработка реферера мы храним — а она ссылается на транзакцию стенда.
+
+    База запрещает удалить транзакцию, пока ссылка жива (`NO ACTION`). Без
+    обнуления ссылки обнуление падало бы КАЖДЫЙ раз, уже после удаления
+    пользователя из панели, — то есть стенд оставался бы заперт навсегда.
+    """
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    referrer = User(telegram_id=111222333, username='referrer')
+    session.add(referrer)
+    await session.flush()
+    stand_transaction = await session.scalar(select(Transaction.id).where(Transaction.user_id == stand.id))
+    session.add(
+        ReferralEarning(
+            user_id=referrer.id,
+            referral_id=stand.id,
+            amount_kopeks=15000,
+            reason='referral_first_topup',
+            referral_transaction_id=stand_transaction,
+        )
+    )
+    await session.commit()
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    referrer_id = referrer.id
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.done is True, plan.blocked_reason
+    # Заработок реферера цел, только указатель на снесённую транзакцию снят.
+    earning = (
+        await session.execute(select(ReferralEarning).where(ReferralEarning.user_id == referrer_id))
+    ).scalar_one()
+    assert earning.amount_kopeks == 15000
+    assert earning.referral_transaction_id is None
+
+
+async def test_a_sleeping_payment_gateway_row_locks_the_button(session, monkeypatch) -> None:
+    """Кассы с `SET NULL` не сносятся, но держат транзакции ссылкой `NO ACTION`.
+
+    Значит про них нельзя ни судить, ни молчать: строка есть — отказ.
+    """
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    session.add(LavaPayment(user_id=stand.id, order_id='lava-1', amount_kopeks=19900, status='pending'))
+    await session.commit()
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.done is False
+    assert 'Lava' in (plan.blocked_reason or '')
+    assert (await _counts(session, stand.id))['subscriptions'] == 1
+
+
+async def test_an_admin_in_the_list_is_still_refused(session, monkeypatch) -> None:
+    """Забор №2 существует ровно для ошибки, которую список отменить не может.
+
+    Мутационный прогон показал, что эта строка не была защищена ничем: убери
+    её — и админский аккаунт, случайно вписанный в список, обнулился бы молча.
+    """
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setattr(settings, 'ADMIN_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.done is False
+    assert 'админский' in (plan.blocked_reason or '').lower()
+    assert (await _counts(session, stand.id))['subscriptions'] == 1
+
+
+async def test_a_support_moderator_is_still_refused(session, monkeypatch) -> None:
+    """Третий реестр служебных людей живёт в файле, а не в базе."""
+    from app.services.support_settings_service import SupportSettingsService
+
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setattr(SupportSettingsService, 'is_moderator', classmethod(lambda cls, tid: True))
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.done is False
+    assert 'модератор' in (plan.blocked_reason or '').lower()
+
+
+async def test_a_staff_role_is_refused_for_the_right_reason(session, monkeypatch) -> None:
+    """Панель подменена намеренно: иначе тест краснел бы из-за неё, а не из-за роли."""
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+    await session.execute(
+        text(
+            'INSERT INTO admin_roles (id, name, level, permissions, is_system, is_active) '
+            'VALUES (1, :name, 50, :perms, false, true)'
+        ),
+        {'name': 'Модератор', 'perms': '{}'},
+    )
+    await session.execute(
+        text('INSERT INTO user_roles (user_id, role_id, is_active) VALUES (:uid, 1, true)'),
+        {'uid': stand.id},
+    )
+    await session.commit()
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert 'служебная роль' in (plan.blocked_reason or '')
+
+
+async def test_a_used_promocode_gets_its_slot_back(session, monkeypatch) -> None:
+    """Иначе у кода с лимитом 1 после первой проверки не осталось бы мест."""
+    from app.database.models import PromoCode, PromoCodeUse
+
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    promocode = PromoCode(code='TEST1', type='balance', max_uses=1, current_uses=1)
+    session.add(promocode)
+    await session.flush()
+    session.add(PromoCodeUse(promocode_id=promocode.id, user_id=stand.id))
+    await session.commit()
+    promocode_id = promocode.id
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.done is True, plan.blocked_reason
+    assert await session.scalar(select(PromoCode.current_uses).where(PromoCode.id == promocode_id)) == 0
+
+
+async def test_prices_look_like_a_newcomers_again(session, monkeypatch) -> None:
+    """Стенд со скидочной промо-группой показал бы не те цены, что новичок.
+
+    Ровно это расхождение и сорвало приёмку, из-за которой инструмент затеян.
+    """
+    from app.database.models import PromoGroup
+
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    default_group = PromoGroup(name='Базовая', is_default=True)
+    discount_group = PromoGroup(name='Скидка 50', is_default=False)
+    session.add_all([default_group, discount_group])
+    await session.flush()
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
+    stand.promo_group_id = discount_group.id
+    stand.has_made_first_topup = True
+    stand.auto_promo_group_assigned = True
+    await session.commit()
+    default_id, stand_id = default_group.id, stand.id
+
+    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+
+    assert plan.done is True, plan.blocked_reason
+    refreshed = await session.get(User, stand_id)
+    assert refreshed.promo_group_id == default_id
+    assert refreshed.has_made_first_topup is False
+    assert refreshed.auto_promo_group_assigned is False

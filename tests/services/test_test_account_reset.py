@@ -253,3 +253,113 @@ def test_unknown_state_locks_the_button_rather_than_slipping_through() -> None:
         assert in_flight not in user_service._TEST_RESET_SETTLED_ATTEMPT_STATUSES
     for in_flight in ('VERIFYING', 'OPERATOR_REVIEW', 'PENDING', 'CHARGEBACKED'):
         assert in_flight not in user_service._TEST_RESET_SETTLED_PROVIDER_STATUSES
+
+
+class _FakePanelApi:
+    """Панель, которая ведёт себя как настоящая: 404 бросается, не возвращается."""
+
+    def __init__(self, *, missing: set[str] | None = None, by_telegram: list[str] | None = None) -> None:
+        self.missing = missing or set()
+        self.by_telegram = by_telegram or []
+        self.deleted: list[str] = []
+
+    async def get_user_by_telegram_id(self, telegram_id):
+        return [SimpleNamespace(uuid=value) for value in self.by_telegram]
+
+    async def get_user_by_email(self, email):
+        return []
+
+    async def delete_user(self, uuid):
+        from app.external.remnawave_api import RemnaWaveAPIError
+
+        if uuid in self.missing:
+            raise RemnaWaveAPIError('not found', 404)
+        self.deleted.append(uuid)
+        return True
+
+
+def _install_fake_panel(monkeypatch, api: _FakePanelApi) -> None:
+    from contextlib import asynccontextmanager
+
+    from app.services import remnawave_service as remnawave_module
+
+    @asynccontextmanager
+    async def _client(self):
+        yield api
+
+    monkeypatch.setattr(remnawave_module.RemnaWaveService, 'get_api_client', _client, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_panel_404_counts_as_success(monkeypatch) -> None:
+    """Панель могли почистить руками — на стенде это норма.
+
+    Считать 404 отказом значило бы запереть кнопку навсегда. Мутационный
+    прогон показал, что эту ветку не исполнял ни один тест: все подменяли
+    функцию целиком.
+    """
+    api = _FakePanelApi(missing={'gone-uuid'})
+    _install_fake_panel(monkeypatch, api)
+
+    ok = await user_service._test_reset_delete_panel_identity(
+        SimpleNamespace(telegram_id=7749231125, email=None), ['gone-uuid']
+    )
+
+    assert ok is True
+    assert api.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_panel_identity_is_looked_up_by_telegram_too(monkeypatch) -> None:
+    """POST мог дойти до панели, а его ответ потеряться — локального uuid нет."""
+    api = _FakePanelApi(by_telegram=['orphan-uuid'])
+    _install_fake_panel(monkeypatch, api)
+
+    ok = await user_service._test_reset_delete_panel_identity(SimpleNamespace(telegram_id=7749231125, email=None), [])
+
+    assert ok is True
+    assert api.deleted == ['orphan-uuid']
+
+
+@pytest.mark.asyncio
+async def test_panel_error_other_than_404_is_a_refusal(monkeypatch) -> None:
+    class _Broken(_FakePanelApi):
+        async def delete_user(self, uuid):
+            from app.external.remnawave_api import RemnaWaveAPIError
+
+            raise RemnaWaveAPIError('boom', 500)
+
+    _install_fake_panel(monkeypatch, _Broken())
+
+    ok = await user_service._test_reset_delete_panel_identity(
+        SimpleNamespace(telegram_id=7749231125, email=None), ['live-uuid']
+    )
+
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_route_refuses_an_account_outside_the_list(monkeypatch) -> None:
+    """Забор №1 на самом маршруте: экран лишь не рисует кнопку, отбивает сервер."""
+    from fastapi import HTTPException
+
+    from app.cabinet.routes import admin_users as route_module
+    from app.cabinet.schemas.users import TestAccountResetRequest
+
+    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', '7749231125')
+
+    async def _fake_get_user(db, user_id):
+        return SimpleNamespace(id=user_id, telegram_id=555000111)
+
+    monkeypatch.setattr(route_module, 'get_user_by_id', _fake_get_user)
+
+    with pytest.raises(HTTPException) as exc:
+        await route_module.reset_test_account_route(
+            42,
+            TestAccountResetRequest(confirm=True),
+            admin=SimpleNamespace(id=1),
+            db=object(),
+        )
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail['code'] == 'not_a_test_account'
