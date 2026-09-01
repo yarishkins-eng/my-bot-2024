@@ -209,7 +209,10 @@ async def on_user_left_channel(event: ChatMemberUpdated, bot: Bot) -> None:
             # получал бы письмо — ровно тот обман, ради которого затевался раздел.
             # Забор стоит ТОЛЬКО на письме: VPN выше уже отключён и остаётся отключённым.
             try:
-                if not NotificationSettingsService.is_enabled('trial_channel_unsubscribed'):
+                if not (
+                    NotificationSettingsService.are_notifications_globally_enabled()
+                    and NotificationSettingsService.is_enabled('trial_channel_unsubscribed')
+                ):
                     raise _SkipNotification
                 texts = get_texts(db_user.language or DEFAULT_LANGUAGE)
                 unsub_channels = await channel_subscription_service.get_channels_with_status(user.id)

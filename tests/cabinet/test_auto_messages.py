@@ -900,3 +900,39 @@ def test_no_fifth_place_sends_the_channel_letters() -> None:
             continue
         unguarded.append(str(path.relative_to(_BOT_ROOT)))
     assert not unguarded, 'письмо о канале уходит мимо выключателя из: ' + ', '.join(unguarded)
+
+
+def test_globally_switched_letters_really_obey_the_master_switch() -> None:
+    """Если экран пишет «выключено общим переключателем» — так и должно быть везде.
+
+    🔴 Письмо о канале уходит из четырёх мест, а общий рубильник стоял в одном.
+    Погасив его, менеджер читал на экране «молчит», а клиент получал письмо при
+    первом же своём действии.
+    """
+    letters = ('SUBSCRIPTION_DEACTIVATED_CHANNEL_UNSUBSCRIBE', 'TRIAL_CHANNEL_UNSUBSCRIBED')
+    assert 'channel-left' in GLOBALLY_SWITCHED_IDS, 'проверяем не то сообщение'
+    unguarded = [
+        str(path.relative_to(_BOT_ROOT))
+        for path in sorted((_BOT_ROOT / 'app').rglob('*.py'))
+        if any(letter in (source := path.read_text(encoding='utf-8')) for letter in letters)
+        and 'are_notifications_globally_enabled' not in source
+    ]
+    assert not unguarded, 'общий переключатель не гасит письмо о канале в: ' + ', '.join(unguarded)
+
+
+def test_autopay_success_switch_closes_both_roads() -> None:
+    """У «Автоплатёж прошёл» две дороги — телеграм и почта. Тумблер запирает обе.
+
+    Клиентов без телеграма у проекта, похоже, нет, но нарисованный выключатель
+    обязан означать ровно то, что написано, а не «почти».
+    """
+    tree = ast.parse((_BOT_ROOT / 'app/services/monitoring_service.py').read_text(encoding='utf-8'))
+    guarded = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        if "'autopay_success'" not in ast.dump(node.test):
+            continue
+        if 'notify_autopay_success' in ast.dump(ast.Module(body=node.body, type_ignores=[])):
+            guarded = True
+    assert guarded, 'почтовая ветка «Автоплатёж прошёл» идёт мимо выключателя'

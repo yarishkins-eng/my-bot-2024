@@ -511,7 +511,11 @@ class ChannelCheckerMiddleware(BaseMiddleware):
                 # службы и от мгновенного обработчика события. Без забора здесь выключатель
                 # в разделе гасил бы три письма из четырёх, а клиент всё равно получал бы
                 # четвёртое. Доступ отключается ВЫШЕ и забором не затрагивается.
-                if deactivated_subs and NotificationSettingsService.is_enabled('trial_channel_unsubscribed'):
+                if (
+                    deactivated_subs
+                    and NotificationSettingsService.are_notifications_globally_enabled()
+                    and NotificationSettingsService.is_enabled('trial_channel_unsubscribed')
+                ):
                     try:
                         normalized = _normalize_channels(channels)
                         texts = get_texts(user.language or DEFAULT_LANGUAGE)

@@ -2225,8 +2225,10 @@ class MonitoringService:
                                 await self._send_autopay_success_notification(
                                     user, charge_amount, autopay_period, subscription=subscription
                                 )
-                            elif not user.telegram_id:
+                            elif not user.telegram_id and NotificationSettingsService.is_enabled('autopay_success'):
                                 # Email-only user - use notification delivery service
+                                # Забор тот же, что и у телеграм-ветки: нарисованный тумблер
+                                # обязан запирать письмо целиком, а не только одну дорогу.
                                 await notification_delivery_service.notify_autopay_success(
                                     user=user,
                                     amount_kopeks=charge_amount,
