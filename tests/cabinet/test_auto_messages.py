@@ -843,3 +843,24 @@ def test_trial_letter_survives_a_naive_date_and_a_missing_one() -> None:
     naive = (datetime.now(UTC) + timedelta(hours=1, minutes=10)).replace(tzinfo=None)
     assert trial_hours_left(naive, 6) == 2
     assert trial_hours_left(None, 6) == 6
+
+
+def test_stored_days_above_the_cap_still_send() -> None:
+    """Значение выше потолка не имеет права означать «не отправлять никогда».
+
+    🔴 В файл настроек можно попасть мимо раздела: в чат-админке бота у этого поля
+    потолка нет. Раньше сохранённые «45 дней» проходили сквозь службу как есть, а
+    выборка смотрит назад на 30 — сообщение молчало, и узнать об этом было негде.
+    Зажимаем в самой службе: лучше уйти на последний рабочий день, чем не уйти.
+    """
+    from app.cabinet.routes.admin_auto_messages import MAX_TRIGGER_DAYS
+
+    assert NotificationSettingsService.MAX_TRIGGER_DAYS == MAX_TRIGGER_DAYS, (
+        'потолок раздела и потолок службы разъехались — экран обещал бы одно, бот делал другое'
+    )
+    for key, getter in (
+        ('expired_third_wave', NotificationSettingsService.get_third_wave_trigger_days),
+        ('trial_expired_discount', NotificationSettingsService.get_trial_expired_discount_trigger_days),
+    ):
+        with patch.object(NotificationSettingsService, '_get', return_value={'trigger_days': 45}):
+            assert getter() == MAX_TRIGGER_DAYS, f'{key}: сохранённые 45 дн. остались мёртвыми'

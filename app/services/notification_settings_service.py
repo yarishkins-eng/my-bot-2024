@@ -12,6 +12,13 @@ logger = structlog.get_logger(__name__)
 
 
 class NotificationSettingsService:
+    # 🔴 Последний день, на который сообщение реально уйдёт. Выборка «кто остался без
+    # подписки» смотрит назад ровно на 30 дней, а отправка требует, чтобы прошло от N
+    # до N+1 дня: при 30 остаётся точка «ровно 30,000 суток», в которую часовой обход
+    # не попадает. Зажимаем ЗДЕСЬ, а не только на экране: в файл настроек можно попасть
+    # мимо раздела (чат-админка потолка не имеет), и тогда сообщение молча не уходило бы
+    # никогда. Лучше отправить на последний рабочий день, чем не отправить вовсе.
+    MAX_TRIGGER_DAYS = 29
     """Runtime-editable notification settings stored on disk."""
 
     _storage_path: Path = Path('data/notification_settings.json')
@@ -247,14 +254,14 @@ class NotificationSettingsService:
     def get_third_wave_trigger_days(cls) -> int:
         value = cls._get('expired_third_wave').get('trigger_days', 5)
         try:
-            return max(2, min(60, int(value)))
+            return max(2, min(cls.MAX_TRIGGER_DAYS, int(value)))
         except (TypeError, ValueError):
             return 5
 
     @classmethod
     def set_third_wave_trigger_days(cls, days: int) -> bool:
         try:
-            days_int = max(2, min(60, int(days)))
+            days_int = max(2, min(cls.MAX_TRIGGER_DAYS, int(days)))
         except (TypeError, ValueError):
             return False
         return cls._set_field('expired_third_wave', 'trigger_days', days_int)
@@ -304,14 +311,14 @@ class NotificationSettingsService:
     def get_trial_expired_discount_trigger_days(cls) -> int:
         value = cls._get('trial_expired_discount').get('trigger_days', 1)
         try:
-            return max(1, min(60, int(value)))
+            return max(1, min(cls.MAX_TRIGGER_DAYS, int(value)))
         except (TypeError, ValueError):
             return 1
 
     @classmethod
     def set_trial_expired_discount_trigger_days(cls, days: int) -> bool:
         try:
-            days_int = max(1, min(60, int(days)))
+            days_int = max(1, min(cls.MAX_TRIGGER_DAYS, int(days)))
         except (TypeError, ValueError):
             return False
         return cls._set_field('trial_expired_discount', 'trigger_days', days_int)
