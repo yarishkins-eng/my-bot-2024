@@ -16,7 +16,7 @@ from app.services import device_first_payment_service as service
 
 
 def test_backoff_grows_and_is_capped_at_an_hour() -> None:
-    minutes = [int(service._reconcile_backoff(n).total_seconds() // 60) for n in range(0, 10)]
+    minutes = [int(service._reconcile_backoff(n).total_seconds() // 60) for n in range(10)]
     # Растёт: 1, 2, 4, 8, 16, 32, потом упирается в час.
     assert minutes[:6] == [1, 2, 4, 8, 16, 32]
     assert all(value == 60 for value in minutes[6:]), minutes
