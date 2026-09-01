@@ -42,7 +42,7 @@ from app.database.models import (
 )
 from app.services.notification_settings_service import NotificationSettingsService
 from app.services.pricing_engine import PricingEngine
-from app.utils.formatters import format_hours_declension
+from app.utils.formatters import format_hours_declension, format_subscriptions_declension
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -618,7 +618,7 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
         or 0
     )
     if with_limit:
-        notes['traffic_limits'] = f'лимит есть у {with_limit} подписок из {total_live}'
+        notes['traffic_limits'] = f'лимит есть у {format_subscriptions_declension(with_limit)} из {total_live}'
     else:
         reasons['traffic_limits'] = 'ни у одной живой подписки нет лимита гигабайтов'
 
@@ -645,7 +645,7 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
         or 0
     )
     if autopay_count:
-        notes['autopay'] = f'автоплатёж включён у {autopay_count} подписок'
+        notes['autopay'] = f'автоплатёж включён у {format_subscriptions_declension(autopay_count)}'
     else:
         reasons['autopay'] = 'автоплатёж не включён ни у одной активной платной подписки'
 

@@ -633,3 +633,13 @@ def test_numeric_fields_registry_covers_every_catalog_param() -> None:
     used = {field for entry in AUTO_MESSAGE_CATALOG for field in (entry.get('params') or ())}
     assert used <= set(_NUMERIC_FIELDS), f'поля вне общего набора: {sorted(used - set(_NUMERIC_FIELDS))}'
     assert set(AutoMessagePatch.model_fields) - {'enabled'} == set(_NUMERIC_FIELDS)
+
+
+def test_subscriptions_declension() -> None:
+    """«у 1 подписок» — то, что владелец увидел на экране. Больше не должно быть."""
+    from app.utils.formatters import format_subscriptions_declension
+
+    assert format_subscriptions_declension(1) == '1 подписки'
+    assert format_subscriptions_declension(2) == '2 подписок'
+    assert format_subscriptions_declension(11) == '11 подписок'
+    assert format_subscriptions_declension(21) == '21 подписки'

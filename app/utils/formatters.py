@@ -111,6 +111,13 @@ def format_hours_declension(hours: int, language: str = 'ru') -> str:
     return f'{hours} часов'
 
 
+def format_subscriptions_declension(count: int) -> str:
+    """«1 подписки» / «2 подписок» в родительном падеже: «лимит есть у N подписок»."""
+    if count % 10 == 1 and count % 100 != 11:
+        return f'{count} подписки'
+    return f'{count} подписок'
+
+
 def format_duration(seconds: int) -> str:
     if seconds < 60:
         return f'{seconds} сек.'
