@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1879,9 +1880,17 @@ class TestAccountResetPlan:
 
 
 def test_account_telegram_ids() -> frozenset[int]:
-    """Разобрать список тестовых аккаунтов. Пусто по умолчанию и при мусоре."""
+    """Разобрать список тестовых аккаунтов. Пусто по умолчанию и при мусоре.
+
+    🔴 Читается ПРЯМО из окружения, а не через `Settings`, и это осознанно.
+    Кабинет делает редактируемой каждую настройку класса `Settings`, которой
+    нет в списке исключений, и применяет её без рестарта. Список доступа к
+    необратимому действию не должен зависеть от того, не забыл ли кто-то
+    вписать его в тот список: значения нет среди настроек вовсе, поэтому
+    изменить его из кабинета, админки бота или Web API физически нечем.
+    """
     result: set[int] = set()
-    for raw in (settings.TEST_ACCOUNT_TELEGRAM_IDS or '').split(','):
+    for raw in os.getenv('TEST_ACCOUNT_TELEGRAM_IDS', '').split(','):
         value = raw.strip()
         if not value:
             continue

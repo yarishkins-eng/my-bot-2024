@@ -195,7 +195,7 @@ async def _counts(db, user_id: int) -> dict[str, int]:
 
 
 async def test_reset_removes_the_stand_and_leaves_everyone_else_alone(session, monkeypatch) -> None:
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=22450)
     outsider = await _seed_person(session, OUTSIDER_TELEGRAM_ID, balance_kopeks=50000)
 
@@ -265,7 +265,7 @@ async def test_reset_removes_the_stand_and_leaves_everyone_else_alone(session, m
 
 
 async def test_reset_refuses_while_an_order_is_still_in_flight(session, monkeypatch) -> None:
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000, checkout_state='awaiting_funds')
 
     plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
@@ -280,7 +280,7 @@ async def test_reset_refuses_while_an_order_is_still_in_flight(session, monkeypa
 
 
 async def test_reset_refuses_when_the_provider_has_not_answered_yet(session, monkeypatch) -> None:
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
     await session.execute(
         text("UPDATE platega_payments SET status = 'VERIFYING', is_paid = false WHERE user_id = :uid"),
@@ -298,7 +298,7 @@ async def test_reset_refuses_when_the_provider_has_not_answered_yet(session, mon
 
 async def test_reset_refuses_a_staff_account_even_if_it_is_on_the_list(session, monkeypatch) -> None:
     """Забор №2. Ровно тот случай, где список сам себя отменить не может."""
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
     await session.execute(
         text(
@@ -321,7 +321,7 @@ async def test_reset_refuses_a_staff_account_even_if_it_is_on_the_list(session, 
 
 
 async def test_nothing_changes_when_the_panel_refuses_to_delete(session, monkeypatch) -> None:
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=22450)
 
     async def _panel_says_no(user, panel_uuids):
@@ -349,7 +349,7 @@ async def test_a_successful_purchase_does_not_lock_the_button(session, monkeypat
     Если считать его «деньгами в пути», кнопка ломается ровно на том стенде,
     где владелец впервые довёл покупку до конца.
     """
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     await session.execute(
         text('UPDATE checkout_payment_attempts SET status = :st'),
@@ -367,7 +367,7 @@ async def test_a_successful_purchase_does_not_lock_the_button(session, monkeypat
 
 async def test_an_abandoned_invoice_does_not_lock_the_button(session, monkeypatch) -> None:
     """Открыл оплату и закрыл вкладку — счёт протух. Это не деньги в пути."""
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     await session.execute(text("UPDATE platega_payments SET status = 'EXPIRED', is_paid = false"))
     await session.commit()
@@ -382,7 +382,7 @@ async def test_an_abandoned_invoice_does_not_lock_the_button(session, monkeypatc
 async def test_a_finished_closure_does_not_lock_the_button_forever(session, monkeypatch) -> None:
     """Строка заявки на закрытие не удаляется никогда — запирать по её
     наличию значило бы убить кнопку первым же нажатием «удалить»."""
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     session.add(AccountErasureRequest(user_id=stand.id, state='completed'))
     await session.commit()
@@ -394,7 +394,7 @@ async def test_a_finished_closure_does_not_lock_the_button_forever(session, monk
 
     # А незакрытая — запирает.
     other = await _seed_person(session, OUTSIDER_TELEGRAM_ID, balance_kopeks=0)
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(OUTSIDER_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(OUTSIDER_TELEGRAM_ID))
     session.add(AccountErasureRequest(user_id=other.id, state='awaiting_manual_resolution'))
     await session.commit()
 
@@ -405,7 +405,7 @@ async def test_a_finished_closure_does_not_lock_the_button_forever(session, monk
 
 async def test_a_paid_gift_of_a_real_buyer_survives(session, monkeypatch) -> None:
     """`SET NULL` на ссылке — указание схемы «строка переживает человека»."""
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     buyer = User(telegram_id=444333222, username='buyer')
     session.add(buyer)
@@ -443,7 +443,7 @@ async def test_referrers_earning_does_not_deadlock_the_reset(session, monkeypatc
     обнуления ссылки обнуление падало бы КАЖДЫЙ раз, уже после удаления
     пользователя из панели, — то есть стенд оставался бы заперт навсегда.
     """
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     referrer = User(telegram_id=111222333, username='referrer')
     session.add(referrer)
@@ -478,7 +478,7 @@ async def test_a_sleeping_payment_gateway_row_locks_the_button(session, monkeypa
 
     Значит про них нельзя ни судить, ни молчать: строка есть — отказ.
     """
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     session.add(LavaPayment(user_id=stand.id, order_id='lava-1', amount_kopeks=19900, status='pending'))
     await session.commit()
@@ -497,7 +497,7 @@ async def test_an_admin_in_the_list_is_still_refused(session, monkeypatch) -> No
     Мутационный прогон показал, что эта строка не была защищена ничем: убери
     её — и админский аккаунт, случайно вписанный в список, обнулился бы молча.
     """
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     monkeypatch.setattr(settings, 'ADMIN_IDS', str(STAND_TELEGRAM_ID))
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
@@ -513,7 +513,7 @@ async def test_a_support_moderator_is_still_refused(session, monkeypatch) -> Non
     """Третий реестр служебных людей живёт в файле, а не в базе."""
     from app.services.support_settings_service import SupportSettingsService
 
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     monkeypatch.setattr(SupportSettingsService, 'is_moderator', classmethod(lambda cls, tid: True))
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
@@ -526,7 +526,7 @@ async def test_a_support_moderator_is_still_refused(session, monkeypatch) -> Non
 
 async def test_a_staff_role_is_refused_for_the_right_reason(session, monkeypatch) -> None:
     """Панель подменена намеренно: иначе тест краснел бы из-за неё, а не из-за роли."""
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
     await session.execute(
@@ -551,7 +551,7 @@ async def test_a_used_promocode_gets_its_slot_back(session, monkeypatch) -> None
     """Иначе у кода с лимитом 1 после первой проверки не осталось бы мест."""
     from app.database.models import PromoCode, PromoCodeUse
 
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     promocode = PromoCode(code='TEST1', type='balance', max_uses=1, current_uses=1)
@@ -574,7 +574,7 @@ async def test_prices_look_like_a_newcomers_again(session, monkeypatch) -> None:
     """
     from app.database.models import PromoGroup
 
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     default_group = PromoGroup(name='Базовая', is_default=True)
     discount_group = PromoGroup(name='Скидка 50', is_default=False)
@@ -603,7 +603,7 @@ async def test_a_restricted_stand_comes_back_able_to_buy(session, monkeypatch) -
     удаление всего остального. Не сняв их, мы вернули бы «нового клиента»,
     который не умеет покупать.
     """
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     stand.restriction_topup = True
@@ -628,7 +628,7 @@ async def test_the_plan_names_the_support_conversation_before_it_disappears(sess
     менеджера. Это исчезало незаметно: в плане обращений не было вовсе."""
     from app.database.models import Ticket, TicketMessage
 
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     manager = User(telegram_id=101010101, username='manager')
@@ -655,7 +655,7 @@ async def test_the_plan_names_the_support_conversation_before_it_disappears(sess
 
 
 async def test_an_unfinished_gift_locks_but_a_finished_one_does_not(session, monkeypatch) -> None:
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=0)
     gift = GuestPurchase(

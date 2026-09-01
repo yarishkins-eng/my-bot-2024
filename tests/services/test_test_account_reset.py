@@ -54,12 +54,12 @@ def _owned_table_names() -> set[str]:
 )
 def test_allowlist_is_empty_by_default_and_drops_garbage(monkeypatch, raw, expected) -> None:
     """Пустой и испорченный список означают «нет тестовых аккаунтов», а не «все»."""
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', raw)
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', raw)
     assert user_service.test_account_telegram_ids() == expected
 
 
 def test_stand_is_recognised_only_by_telegram_id(monkeypatch) -> None:
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', '7749231125')
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', '7749231125')
     assert user_service.is_test_account(SimpleNamespace(telegram_id=7749231125)) is True
     assert user_service.is_test_account(SimpleNamespace(telegram_id=7749231126)) is False
     # Внутренний номер строки не открывает дверь: список только про Телеграм.
@@ -69,19 +69,24 @@ def test_stand_is_recognised_only_by_telegram_id(monkeypatch) -> None:
 def test_allowlist_is_not_editable_from_the_cabinet() -> None:
     """Список доступа к необратимому действию обязан жить только в окружении.
 
-    Кабинет делает редактируемым КАЖДОЕ поле Settings, которого нет в этом
-    наборе, и применяет новое значение мгновенно, без рестарта. Рядом по той
-    же причине лежат ADMIN_IDS и ADMIN_EMAILS.
+    Кабинет делает редактируемым КАЖДОЕ поле `Settings`, которого нет в наборе
+    исключений, и применяет новое значение мгновенно, без рестарта. Поэтому у
+    списка поля `Settings` нет вовсе — а строка в исключениях стоит второй
+    линией, на случай если кто-то однажды заведёт поле.
     """
     from app.services.system_settings_service import BotConfigurationService
 
+    assert not hasattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS'), (
+        'У списка появилось поле Settings — теперь его можно править из кабинета. '
+        'Либо уберите поле, либо убедитесь, что исключение реально работает.'
+    )
     assert 'TEST_ACCOUNT_TELEGRAM_IDS' in BotConfigurationService.EXCLUDED_KEYS
     # Соседи по смыслу: если однажды уберут их, эта проверка тоже обязана упасть.
     assert {'ADMIN_IDS', 'ADMIN_EMAILS'} <= BotConfigurationService.EXCLUDED_KEYS
 
 
 def test_allowlist_empty_closes_the_door_for_everyone(monkeypatch) -> None:
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', '')
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', '')
     assert user_service.is_test_account(SimpleNamespace(telegram_id=7749231125)) is False
 
 
@@ -346,7 +351,7 @@ async def test_route_refuses_an_account_outside_the_list(monkeypatch) -> None:
     from app.cabinet.routes import admin_users as route_module
     from app.cabinet.schemas.users import TestAccountResetRequest
 
-    monkeypatch.setattr(settings, 'TEST_ACCOUNT_TELEGRAM_IDS', '7749231125')
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', '7749231125')
 
     async def _fake_get_user(db, user_id):
         return SimpleNamespace(id=user_id, telegram_id=555000111)

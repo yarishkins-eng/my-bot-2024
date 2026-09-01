@@ -326,15 +326,6 @@ class Settings(BaseSettings):
     # This deliberately uses internal user ids and is never returned by an API.
     DEVICE_FIRST_CANARY_USER_IDS: str = ''
 
-    # Telegram ids владельца, которые разрешено обнулять кнопкой «Обнулить
-    # тестовый аккаунт». Пусто по умолчанию: пока сюда никого не вписали,
-    # кнопки нет ни у кого и серверный маршрут отбивает любой запрос.
-    #
-    # 🔴 Это список доступа к НЕОБРАТИМОМУ действию, поэтому он обязан жить
-    # только в окружении. Ключ внесён в `SystemSettingsService.EXCLUDED_KEYS`
-    # рядом с ADMIN_IDS — иначе кабинет делает редактируемым КАЖДОЕ поле
-    # Settings, и настройка правится прямо из админки, без рестарта.
-    TEST_ACCOUNT_TELEGRAM_IDS: str = ''
     # Direct-sale reconciliation must not wait for the coarse, general
     # subscription monitoring loop. Keep this short but bounded: the worker
     # handles only v2 rows, each protected by its own database lease.
