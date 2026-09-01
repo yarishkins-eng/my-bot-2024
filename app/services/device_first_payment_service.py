@@ -2339,6 +2339,65 @@ async def _release_direct_attempt_lease(
     await db.commit()
 
 
+def _reconcile_backoff(reconcile_attempts: int) -> timedelta:
+    """Пауза до следующей сверки. Одна формула на всех, чтобы не разошлись."""
+    return timedelta(minutes=min(60, 2 ** min(reconcile_attempts, 6)))
+
+
+async def _defer_settled_direct_attempt(
+    db: AsyncSession,
+    *,
+    attempt_id: int,
+    checkout_id: int,
+    lease_token: str | None,
+    lease_epoch: int | None,
+) -> None:
+    """Отодвинуть сверку строки, которой сверять уже нечего.
+
+    🔴 Зачем. Попытка успешной прямой продажи остаётся в `paid_processing`
+    НАВСЕГДА — это запись идемпотентности, так задумано (`crud/tariff.py`).
+    Ветка, которая её обрабатывает, выходила через `continue` мимо блока,
+    назначающего следующую проверку, поэтому `next_reconcile_at` у таких строк
+    не сдвигался никогда. Выборка воркера идёт по этому полю с потолком в
+    двадцать строк — и двадцать выданных продаж заняли её целиком.
+    Замер на боевом 01.09.2026: заказ, ждавший досверки с 29.08, не
+    досматривался ни разу за три дня, потому что стоял двадцать первым.
+
+    🔴 Откладываем ТОЛЬКО выданное. Человек, который заплатил и ждёт подписку,
+    обязан сохранить быстрый повтор: замедлить его на час — значит заставить
+    оплатившего ждать на пустом месте. Поэтому решает не «получилось или нет»,
+    а состояние самого заказа.
+    """
+    if lease_token is None or lease_epoch is None:
+        return
+    delivered = (
+        await db.execute(
+            select(SubscriptionCheckout.id).where(
+                SubscriptionCheckout.id == checkout_id,
+                SubscriptionCheckout.fulfillment_state == 'fulfilled',
+                SubscriptionCheckout.lifecycle_state.in_(['fulfilling', 'ready']),
+            )
+        )
+    ).scalar_one_or_none()
+    if delivered is None:
+        return
+    attempt = await _lock_owned_direct_attempt_lease(
+        db,
+        attempt_id=attempt_id,
+        lease_token=lease_token,
+        lease_epoch=lease_epoch,
+    )
+    if attempt is None:
+        # Аренда истекла или её забрал другой проход. Молчать нельзя: именно
+        # тогда, когда батч медленный, откат нужнее всего, а его отсутствие
+        # ничем не видно.
+        logger.warning('device_first_defer_settled_attempt_lost_lease', attempt_id=attempt_id)
+        return
+    attempt.reconcile_attempts += 1
+    attempt.next_reconcile_at = datetime.now(UTC) + _reconcile_backoff(attempt.reconcile_attempts)
+    await db.commit()
+
+
 async def _lock_owned_direct_attempt_lease(
     db: AsyncSession,
     *,
@@ -2487,6 +2546,7 @@ async def reconcile_device_first_payments(
                 )
             continue
         if attempt.status == 'paid_processing' and settlement_mode(attempt) == DIRECT_SETTLEMENT_MODE:
+            checkout_id = attempt.checkout_id
             try:
                 await fulfill_direct_external_checkout(
                     db,
@@ -2500,6 +2560,19 @@ async def reconcile_device_first_payments(
             except DeviceFirstError as error:
                 logger.warning('device_first_direct_paid_recovery_failed', attempt_id=attempt_id, code=error.code)
             finally:
+                # 🔴 Откат стоит в `finally`, а не в `except`, и это НЕ мелочь.
+                # Выданная продажа возвращается ШТАТНО (идемпотентный ранний
+                # выход в `fulfill_direct_external_checkout`), исключения не
+                # бросает — и первая редакция этой правки, стоявшая в `except`,
+                # не сдвинула бы на боевом ни одной строки из двадцати.
+                # Замер 01.09.2026: все двадцать были `ready` + `fulfilled`.
+                await _defer_settled_direct_attempt(
+                    db,
+                    attempt_id=attempt_id,
+                    checkout_id=checkout_id,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                )
                 await _release_direct_attempt_lease(
                     db,
                     attempt_id=attempt_id,
@@ -2519,9 +2592,7 @@ async def reconcile_device_first_payments(
                     continue
                 attempt = owned_attempt
             attempt.reconcile_attempts += 1
-            attempt.next_reconcile_at = datetime.now(UTC) + timedelta(
-                minutes=min(60, 2 ** min(attempt.reconcile_attempts, 6))
-            )
+            attempt.next_reconcile_at = datetime.now(UTC) + _reconcile_backoff(attempt.reconcile_attempts)
             await db.commit()
             provider_request_started_at = datetime.now(UTC)
             try:

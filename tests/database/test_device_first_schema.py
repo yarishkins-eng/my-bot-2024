@@ -102,7 +102,19 @@ def test_payment_reconciler_uses_due_time_and_bounded_backoff():
     assert 'CheckoutPaymentAttempt.next_reconcile_at <=' in worker
     assert '.order_by(' in worker
     assert 'CheckoutPaymentAttempt.next_reconcile_at' in worker
-    assert 'minutes=min(60, 2 ** min(attempt.reconcile_attempts, 6))' in worker
+    # 🔴 Ожидание изменено 01.09.2026 (этап СВ-1), и вот почему. Раньше здесь
+    # искалась буквальная формула внутри тела воркера. Формула вынесена в
+    # `_reconcile_backoff`, потому что понадобилась второй ветке: без отката в
+    # ней двадцать выданных продаж навсегда занимали всю выборку и не
+    # пропускали живые платежи. Две копии формулы разошлись бы — это и было бы
+    # возвратом той же беды. Поведение не изменилось: тот же рост, тот же
+    # потолок в час. Здесь стережём смысл и место, а настоящую проверку
+    # значений делает `tests/services/test_reconcile_queue_not_clogged.py`,
+    # вызывая функцию, а не читая исходник.
+    assert '_reconcile_backoff(' in worker
+    backoff = source.split('def _reconcile_backoff', 1)[1].split('\n\n\n', 1)[0]
+    assert 'min(60,' in backoff, 'потолок паузы пропал'
+    assert '2 ** min(' in backoff, 'пауза перестала расти'
 
 
 def test_financial_workers_preserve_lock_order_and_refresh_locked_users():
