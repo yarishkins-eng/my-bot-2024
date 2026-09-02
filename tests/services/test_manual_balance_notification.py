@@ -105,7 +105,7 @@ def test_alive_statuses_are_taken_from_the_shared_classifier():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('status', sorted(['active', 'trial', 'limited']))
+@pytest.mark.parametrize('status', sorted(['active', 'limited']))
 async def test_live_subscriber_is_not_told_his_subscription_is_missing(captured, status):
     """🔴 Переписанное ожидание, обоснование.
 
@@ -121,6 +121,41 @@ async def test_live_subscriber_is_not_told_his_subscription_is_missing(captured,
     message = captured['message']
     assert 'оформите' not in message, f'{status}: живому подписчику сказали оформить подписку'
     assert 'не работает' not in message, f'{status}: живую подписку назвали неработающей'
+
+
+@pytest.mark.asyncio
+async def test_trial_is_warned_that_money_will_not_extend_it(captured):
+    """Пробный период — единственное живое состояние, где деньги сами ничего не сделают.
+
+    Автоплатёж триалы исключает явно (`Subscription.is_trial == False` в выборке
+    monitoring_service). Человек иначе решит, что срок продлится сам: триал кончится,
+    доступ погаснет, деньги пролежат. Нашёл прогон сценария второй волны.
+    """
+    user = _user(subscriptions=[_sub('trial')])
+
+    await UserService().send_balance_change_notification(bot=object(), user=user, amount_kopeks=50000)
+
+    message = captured['message']
+    assert 'Пробный период' in message, 'триалу не сказали, что деньгами он не продлевается'
+    assert 'не работает' not in message, 'работающий триал назвали неработающим'
+
+
+@pytest.mark.asyncio
+async def test_pending_subscription_is_not_offered_extension(captured):
+    """🔴 P0 второй волны.
+
+    Продление ЧИНИТ запись для expired/disabled/limited/trial (`extend_subscription`
+    переводит их в active), а для pending только пишет предупреждение: деньги списались
+    бы, статус остался бы pending, и кабинетный экран продления такую запись потом уже
+    не примет (`_non_renewable = {DISABLED, PENDING}`). Поэтому кнопка — «Тарифы».
+    """
+    user = _user(subscriptions=[_sub('pending')])
+
+    await UserService().send_balance_change_notification(bot=object(), user=user, amount_kopeks=50000)
+
+    assert _callbacks(captured['markup']) == ['funnel_tariffs'], (
+        'зависшую подписку повели на продление — деньги спишутся, запись останется сломанной'
+    )
 
 
 @pytest.mark.asyncio

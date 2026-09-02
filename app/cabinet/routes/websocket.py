@@ -63,21 +63,29 @@ class CabinetConnectionManager:
 
         logger.debug('Cabinet WS disconnected: user_id', user_id=user_id)
 
-    async def send_to_user(self, user_id: int, message: dict) -> None:
-        """Отправить сообщение конкретному пользователю."""
+    async def send_to_user(self, user_id: int, message: dict) -> bool:
+        """Отправить сообщение конкретному пользователю. Возвращает «дошло ли».
+
+        🔴 Возврат добавлен этапом УБ-1. Раньше метод молча выходил, когда открытых окон
+        нет, а вызывающий (`_send_websocket_notification`) считал это успехом — и отчёт о
+        доставке говорил админу «сообщение отправлено» про человека, у которого не было ни
+        одного открытого окна и не поднята почта.
+        """
         # Snapshot connections under the lock to avoid mutation during iteration
         async with self._lock:
             connections = list(self._user_connections.get(user_id, set()))
 
         if not connections:
-            return
+            return False
 
         disconnected = set()
+        delivered = False
         data = json.dumps(message, default=str, ensure_ascii=False)
 
         for ws in connections:
             try:
                 await ws.send_text(data)
+                delivered = True
             except Exception as e:
                 logger.warning('Failed to send to user', user_id=user_id, e=e)
                 disconnected.add(ws)
@@ -87,6 +95,8 @@ class CabinetConnectionManager:
             async with self._lock:
                 for ws in disconnected:
                     self._user_connections.get(user_id, set()).discard(ws)
+
+        return delivered
 
     async def send_to_admins(self, message: dict) -> None:
         """Отправить сообщение всем админам."""

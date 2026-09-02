@@ -429,8 +429,9 @@ class NotificationDeliveryService:
                 **context,
             }
 
-            await self.ws_manager.send_to_user(user.id, message)
-            return True
+            # Возврат, а не «не бросил исключение»: при нуле открытых окон отправки не было,
+            # и объявлять её успехом нельзя — на этом отчёт о доставке врал админу (УБ-1).
+            return await self.ws_manager.send_to_user(user.id, message)
 
         except Exception as e:
             logger.debug('WebSocket уведомление не отправлено пользователю', user_id=user.id, e=e)

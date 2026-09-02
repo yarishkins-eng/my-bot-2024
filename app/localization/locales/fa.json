@@ -961,6 +961,7 @@
   "BALANCE_ADMIN_ADDED": "💰 <b>موجودی شما {amount} افزایش یافت</b>\n\nموجودی فعلی: {balance}",
   "BALANCE_ADMIN_ADDED_NO_SUBSCRIPTION": "این پول در حساب شماست، نه اشتراک — VPN زمانی فعال می‌شود که اشتراک تهیه کنید.",
   "BALANCE_ADMIN_ADDED_SUBSCRIPTION_OFF": "اشتراک شما در حال حاضر کار نمی‌کند — پول به‌تنهایی آن را فعال نمی‌کند.",
+  "BALANCE_ADMIN_ADDED_TRIAL": "دوره آزمایشی با موجودی تمدید نمی‌شود — پیش از پایان آن اشتراک تهیه کنید.",
   "BALANCE_ADMIN_REASON": "دلیل: {reason}",
   "BALANCE_ADMIN_SUBTRACTED": "💸 <b>مبلغ {amount} از موجودی شما کسر شد</b>\n\nموجودی فعلی: {balance}",
   "BALANCE_ADMIN_SUBTRACTED_HINT": "اگر اشتباه است، به {support} پیام دهید تا بررسی کنیم.",

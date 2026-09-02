@@ -469,9 +469,12 @@ async def _do_add_balance(
     # Массовая выдача — такое же начисление, как поштучное, и молчать о нём нельзя.
     from app.services.user_service import notify_balance_change
 
-    notified = await notify_balance_change(
-        db, user.id, amount_kopeks, reason=params.balance_description, bot=_get_bot()
-    )
+    # 🔴 Бот строится ТОЛЬКО когда токен есть: create_bot() валидирует токен и бросает,
+    # а деньги к этому моменту уже закоммичены — исключение пометило бы строку ошибкой,
+    # и владелец повторил бы прогон, начислив второй раз.
+    # Причину клиенту отсюда НЕ передаём: поля описания у массовой выдачи на экране нет,
+    # и всем ушла бы служебная строка «Массовое начисление баланса».
+    notified = await notify_balance_change(db, user.id, amount_kopeks, bot=_get_bot() if settings.BOT_TOKEN else None)
     # Пауза ради лимита Телеграма (~30 сообщений в секунду): без неё массовая выдача
     # на сотню человек упрётся во flood control. Тот же шаг, что у рассылки закреплённых
     # сообщений (`services/pinned_message_service.py`) — и бот, как там, ОДИН на прогон.
@@ -1161,6 +1164,9 @@ async def _stream_bulk_execute(
             'message': result.message,
             'username': result.username,
             'subscriptions': [s.model_dump() for s in result.subscriptions] if result.subscriptions else None,
+            # Исход доставки обязан ехать и потоком: кабинет ходит ТОЛЬКО потоком,
+            # и без этой строки счётчик «Не уведомлены» структурно всегда нулевой.
+            'notified': result.notified,
         }
         yield f'data: {json.dumps(progress, ensure_ascii=False)}\n\n'
 
@@ -1222,6 +1228,9 @@ async def _stream_bulk_execute_subscriptions(
             'message': result.message,
             'username': result.username,
             'subscriptions': [s.model_dump() for s in result.subscriptions] if result.subscriptions else None,
+            # Исход доставки обязан ехать и потоком: кабинет ходит ТОЛЬКО потоком,
+            # и без этой строки счётчик «Не уведомлены» структурно всегда нулевой.
+            'notified': result.notified,
         }
         yield f'data: {json.dumps(progress, ensure_ascii=False)}\n\n'
 

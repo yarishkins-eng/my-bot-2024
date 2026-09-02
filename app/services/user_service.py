@@ -85,6 +85,11 @@ from app.services.notification_delivery_service import (
 from app.utils.funnel_state import _ALIVE_STATUSES as ALIVE_SUBSCRIPTION_STATUSES
 
 
+# Статусы, которые ПРОДЛЕНИЕ приводит в порядок (crud/subscription.py::extend_subscription).
+# pending сюда не входит намеренно: продление его не чинит, а деньги списывает.
+_EXTEND_REPAIRS_STATUS = ALIVE_SUBSCRIPTION_STATUSES | {'expired', 'disabled'}
+
+
 logger = structlog.get_logger(__name__)
 
 
@@ -228,8 +233,21 @@ class UserService:
         # «подписки нет», и бот предлагал ему купить вторую. Нашли три линзы независимо.
         # `actual_status`, а не `status`: остальной бот судит по нему — он учитывает срок.
         subs = getattr(user, 'subscriptions', None) or []
+        statuses = [sub.actual_status for sub in subs]
         has_any_subscription = bool(subs)
-        has_live_subscription = any(sub.actual_status in ALIVE_SUBSCRIPTION_STATUSES for sub in subs)
+        has_live_subscription = any(status in ALIVE_SUBSCRIPTION_STATUSES for status in statuses)
+        # 🔴 Кнопку «Продлить» показываем только там, где продление ЧИНИТ запись.
+        # `extend_subscription` переводит expired/disabled/limited/trial в active, а
+        # pending только пишет предупреждение: деньги списались бы, подписка осталась
+        # сломанной, и кабинетный экран продления её потом уже не примет
+        # (`_non_renewable = {DISABLED, PENDING}`). Нашёл скептик второй волны.
+        can_extend = any(status in _EXTEND_REPAIRS_STATUS for status in statuses)
+        # Пробный период деньгами не продлевается: автоплатёж триалы исключает явно
+        # (`Subscription.is_trial == False` в выборке monitoring_service). Человек
+        # иначе решит, что срок продлится сам, и деньги пролежат до конца доступа.
+        only_trial_is_live = has_live_subscription and all(
+            status == 'trial' for status in statuses if status in ALIVE_SUBSCRIPTION_STATUSES
+        )
 
         if amount_kopeks > 0:
             message = texts.t(
@@ -263,6 +281,11 @@ class UserService:
                     'BALANCE_ADMIN_ADDED_NO_SUBSCRIPTION',
                     'Это деньги на счету, а не подписка — VPN включится, когда вы её оформите.',
                 )
+            elif only_trial_is_live:
+                message += '\n\n' + texts.t(
+                    'BALANCE_ADMIN_ADDED_TRIAL',
+                    'Пробный период деньгами не продлевается — оформите подписку до его конца.',
+                )
             elif not has_live_subscription:
                 message += '\n\n' + texts.t(
                     'BALANCE_ADMIN_ADDED_SUBSCRIPTION_OFF',
@@ -285,7 +308,7 @@ class UserService:
         if amount_kopeks > 0:
             # Оба колбэка проверены на регистрацию: `subscription_extend` — purchase.py,
             # `funnel_tariffs` — tariff_purchase.py. Сторож этапа проверяет это тестом.
-            if has_any_subscription:
+            if can_extend:
                 button_text = texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку')
                 button_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
             else:
@@ -679,8 +702,19 @@ class UserService:
                 # Обновляем пользователя для получения нового баланса
                 await db.refresh(user)
 
-                # Отправляем уведомление (не блокируем операцию если не удалось отправить)
-                await self.send_balance_change_notification(bot, user, amount_kopeks, reason=description)
+                # 🔴 Свой try: деньги УЖЕ закоммичены, и сбой письма не имеет права
+                # превратиться в «❌ Ошибка изменения баланса» — админ повторил бы
+                # операцию и начислил второй раз. Причину отсюда не передаём: описание
+                # тут собирается машиной («Пополнение администратором: +500 ₽») и
+                # дублировало бы сумму, к тому же с обрезанными копейками.
+                try:
+                    await self.send_balance_change_notification(bot, user, amount_kopeks)
+                except Exception as notify_error:
+                    logger.warning(
+                        'Баланс изменён, но сообщение клиенту не ушло',
+                        user_id=user_id,
+                        error=notify_error,
+                    )
 
             return success
 
