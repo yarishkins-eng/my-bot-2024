@@ -157,8 +157,22 @@ jobs:
             # ровно то, что и так открыто всем, и живёт это минуты. `printf` взят намеренно —
             # он встроен в bash, поэтому сырой токен не уходит в argv отдельного процесса.
             # ⛔ Не эхоить $GH_TOKEN и не включать `set -x` в этом шаге.
-            git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
-              fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+            # ⚠️ Токен берётся МЯГКО (`${GH_TOKEN:-}`) и путь раздваивается — это не перестраховка,
+            # а требование скрипта: он идёт под `set -u`, и голое `$GH_TOKEN` роняло его с
+            # «unbound variable» везде, где переменной нет. Поймали СВОИ ЖЕ тесты выкладки
+            # (`tests/workflows/test_migration_recovery_workflow.py`): они вытаскивают этот
+            # скрипт из файла и прогоняют с поддельным git — 19 падений. Без ветки безымянного
+            # скачивания любой запуск без токена умирал бы непонятной ошибкой вместо честного 401.
+            # ⚠️ `base64 | tr -d '\n'`, а НЕ `base64 -w0`: ключ `-w` есть в GNU и отсутствует в
+            # BSD/macOS. Отказ упаковки внутри подстановки команд не роняет строку — заголовок
+            # молча вышел бы ПУСТЫМ, и вернулся бы тот же 401, но уже без видимой причины.
+            # Поймал собственный сторож этой правки, прогнанный не на Linux.
+            if [ -n "${GH_TOKEN:-}" ]; then
+              git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')" \
+                fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+            else
+              git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+            fi
             readonly PREVIOUS_SHA="$(git rev-parse HEAD)"
             readonly REMOTE_MAIN_SHA="$(git rev-parse origin/main)"
 
