@@ -419,6 +419,7 @@ async def _do_add_traffic(
 
 
 _cached_bot: Bot | None = None
+_bot_unavailable = False
 
 
 def _get_bot() -> Bot | None:
@@ -434,11 +435,17 @@ def _get_bot() -> Bot | None:
     прогон и начислил второй раз. Прежняя редакция обещала этот забор условием на
     непустоту; ревизия справедливо указала, что обещание шире дела.
     """
-    global _cached_bot
+    global _cached_bot, _bot_unavailable
+    if _bot_unavailable:
+        # Неудачу помним тоже: иначе на партии в 300 человек будет 600 бесполезных
+        # попыток и 600 строк в логе — по одной здесь и по одной внутри
+        # `notify_balance_change`, которая на None поднимает своего бота.
+        return None
     if _cached_bot is None:
         try:
             _cached_bot = create_bot()
         except Exception as error:
+            _bot_unavailable = True
             logger.warning('Не удалось поднять бота для массового уведомления', error=str(error))
             return None
     return _cached_bot
@@ -480,9 +487,8 @@ async def _do_add_balance(
     # Массовая выдача — такое же начисление, как поштучное, и молчать о нём нельзя.
     from app.services.user_service import notify_balance_change
 
-    # 🔴 Бот строится ТОЛЬКО когда токен есть: create_bot() валидирует токен и бросает,
-    # а деньги к этому моменту уже закоммичены — исключение пометило бы строку ошибкой,
-    # и владелец повторил бы прогон, начислив второй раз.
+    # Почему бот приходит снаружи и почему его подъём не может бросить — в докстринге
+    # `_get_bot`. Здесь не повторяем: два объяснения одного места расходятся первыми.
     # Причину клиенту отсюда НЕ передаём: поля описания у массовой выдачи на экране нет,
     # и всем ушла бы служебная строка «Массовое начисление баланса».
     notified = await notify_balance_change(db, user.id, amount_kopeks, bot=_get_bot())
