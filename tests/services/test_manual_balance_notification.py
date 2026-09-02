@@ -221,3 +221,57 @@ def test_every_manual_balance_surface_tells_the_client(relative, name, human):
     assert 'notify_balance_change' in source or 'send_balance_change_notification' in source, (
         f'{human}: меняет баланс и молчит — человек не узнает о своих деньгах'
     )
+
+
+# ---------------------------------------------------------------------------
+# Деньги важнее письма
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_never_rolls_back_the_money(monkeypatch):
+    """Если Телеграм недоступен, начисление обязано остаться начислением.
+
+    ``notify_balance_change`` ловит всё и возвращает False. Пробрось она исключение —
+    кабинетный маршрут ответил бы админу ошибкой ПОСЛЕ того, как деньги уже легли на
+    счёт, и тот начислил бы второй раз.
+    """
+    from app.services import user_service as module
+
+    def exploding_create_bot(*args, **kwargs):
+        raise RuntimeError('Telegram недоступен')
+
+    async def fake_get_user_by_id(db, user_id):
+        return _user()
+
+    monkeypatch.setattr('app.bot_factory.create_bot', exploding_create_bot)
+    monkeypatch.setattr(module, 'get_user_by_id', fake_get_user_by_id)
+    monkeypatch.setattr(module.settings, 'BOT_TOKEN', 'test-token')
+
+    assert await module.notify_balance_change(db=object(), user_id=42, amount_kopeks=50000) is False
+
+
+@pytest.mark.asyncio
+async def test_delivery_result_is_reported_truthfully(monkeypatch):
+    """Обратная сторона: когда доставка удалась, наверх обязано прийти True —
+    иначе кабинет будет пугать админа «не доставлено» на каждом успешном начислении."""
+    from app.services import user_service as module
+
+    class FakeBot:
+        session = SimpleNamespace(close=lambda: _noop())
+
+    async def _noop():
+        return None
+
+    async def fake_get_user_by_id(db, user_id):
+        return _user()
+
+    async def fake_send(self, bot, user, amount_kopeks):
+        return True
+
+    monkeypatch.setattr('app.bot_factory.create_bot', lambda *a, **k: FakeBot())
+    monkeypatch.setattr(module, 'get_user_by_id', fake_get_user_by_id)
+    monkeypatch.setattr(module.settings, 'BOT_TOKEN', 'test-token')
+    monkeypatch.setattr(module.UserService, 'send_balance_change_notification', fake_send)
+
+    assert await module.notify_balance_change(db=object(), user_id=42, amount_kopeks=50000) is True
