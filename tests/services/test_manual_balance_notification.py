@@ -205,22 +205,44 @@ SURFACES = [
 ]
 
 
-def _function_source(relative: str, name: str) -> str:
+NOTIFIERS = {'notify_balance_change', 'send_balance_change_notification'}
+
+
+def _called_names(relative: str, name: str) -> set[str]:
+    """Что функция реально ВЫЗЫВАЕТ.
+
+    🔴 Первая редакция этого сторожа искала имя в тексте функции — и мутация показала,
+    что он пуст: строка ``from ... import notify_balance_change`` остаётся на месте,
+    даже когда сам вызов вырезан, и сторож продолжал зеленеть. Считаем узлы вызова.
+    """
     path = APP_DIR / relative
     tree = ast.parse(path.read_text(encoding='utf-8'))
     for node in ast.walk(tree):
         if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name == name:
-            return ast.get_source_segment(path.read_text(encoding='utf-8'), node) or ''
+            called = set()
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call):
+                    func = inner.func
+                    if isinstance(func, ast.Name):
+                        called.add(func.id)
+                    elif isinstance(func, ast.Attribute):
+                        called.add(func.attr)
+            return called
     raise AssertionError(f'{relative}: не нашёл функцию {name} — она переименована или переехала')
+
+
+def test_the_call_guard_itself_is_not_blind():
+    """Мета-проверка: сборщик вызовов обязан видеть заведомо присутствующий вызов.
+    Верни он пустое множество — проверка ниже стала бы зелёной и бесполезной."""
+    called = _called_names('services/user_service.py', 'update_user_balance')
+    assert 'get_user_by_id' in called, 'сборщик вызовов ослеп'
 
 
 @pytest.mark.parametrize(('relative', 'name', 'human'), SURFACES)
 def test_every_manual_balance_surface_tells_the_client(relative, name, human):
     """Дыр было три из четырёх. Сторож против того, чтобы починили одну и забыли остальные."""
-    source = _function_source(relative, name)
-    assert 'notify_balance_change' in source or 'send_balance_change_notification' in source, (
-        f'{human}: меняет баланс и молчит — человек не узнает о своих деньгах'
-    )
+    called = _called_names(relative, name)
+    assert called & NOTIFIERS, f'{human}: меняет баланс и молчит — человек не узнает о своих деньгах'
 
 
 # ---------------------------------------------------------------------------
