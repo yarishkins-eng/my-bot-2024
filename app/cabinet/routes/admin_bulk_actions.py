@@ -421,15 +421,26 @@ async def _do_add_traffic(
 _cached_bot: Bot | None = None
 
 
-def _get_bot() -> Bot:
+def _get_bot() -> Bot | None:
     """Один бот на весь процесс — как в рассылке закреплённых сообщений.
 
     Своя сессия на каждого человека стоит TLS-рукопожатия плюс 250 мс на закрытие
     в aiogram: выдача на 500 человек уезжала из секунд в минуты.
+
+    🔴 Возвращает None вместо исключения. Проверки `settings.BOT_TOKEN` для этого
+    НЕ ХВАТАЕТ: она смотрит на непустоту, а `create_bot()` валидирует ФОРМУ токена и
+    на кривом непустом бросит `TokenValidationError`. Деньги к этому моменту уже
+    закоммичены, и исключение пометило бы строку ошибкой — владелец повторил бы
+    прогон и начислил второй раз. Прежняя редакция обещала этот забор условием на
+    непустоту; ревизия справедливо указала, что обещание шире дела.
     """
     global _cached_bot
     if _cached_bot is None:
-        _cached_bot = create_bot()
+        try:
+            _cached_bot = create_bot()
+        except Exception as error:
+            logger.warning('Не удалось поднять бота для массового уведомления', error=str(error))
+            return None
     return _cached_bot
 
 
@@ -474,7 +485,7 @@ async def _do_add_balance(
     # и владелец повторил бы прогон, начислив второй раз.
     # Причину клиенту отсюда НЕ передаём: поля описания у массовой выдачи на экране нет,
     # и всем ушла бы служебная строка «Массовое начисление баланса».
-    notified = await notify_balance_change(db, user.id, amount_kopeks, bot=_get_bot() if settings.BOT_TOKEN else None)
+    notified = await notify_balance_change(db, user.id, amount_kopeks, bot=_get_bot())
     # Пауза ради лимита Телеграма (~30 сообщений в секунду): без неё массовая выдача
     # на сотню человек упрётся во flood control. Тот же шаг, что у рассылки закреплённых
     # сообщений (`services/pinned_message_service.py`) — и бот, как там, ОДИН на прогон.
