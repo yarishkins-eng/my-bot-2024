@@ -3,13 +3,21 @@ import string
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database.crud.transaction import REAL_PAYMENT_METHODS
-from app.database.models import ReferralEarning, Subscription, SubscriptionStatus, Transaction, TransactionType, User
+from app.database.models import (
+    GuestPurchase,
+    ReferralEarning,
+    Subscription,
+    SubscriptionStatus,
+    Transaction,
+    TransactionType,
+    User,
+)
 
 
 logger = structlog.get_logger(__name__)
@@ -106,6 +114,83 @@ async def mark_user_as_had_paid_subscription(db: AsyncSession, user: User) -> bo
     except Exception as e:
         logger.error('Ошибка отметки пользователя как имевшего платную подписку', user_id=user.id, error=e)
         return False
+
+
+def _guest_purchase_base_payment_method(method: str | None) -> str:
+    """Normalize guest checkout sub-options to their real gateway name."""
+    if not method:
+        return ''
+    if method in REAL_PAYMENT_METHODS:
+        return method
+    if '_' in method:
+        base = method.rsplit('_', 1)[0]
+        if base in REAL_PAYMENT_METHODS:
+            return base
+    return method
+
+
+async def real_payment_user_ids(db: AsyncSession, user_ids) -> set[int]:
+    """Return users who have ever made a confirmed external payment.
+
+    The ordinary transaction ledger is primary. ``GuestPurchase`` is a required
+    fallback: landing delivery commits before its accounting transaction, so a
+    successful payment can legitimately exist without that secondary row.
+
+    For gifts the buyer paid and the recipient did not. Balance/manual operations,
+    free grants and unpaid invoices are deliberately excluded. A later refund does
+    not erase the historical fact that an external payment once happened.
+    """
+    ids = list(user_ids)
+    if not ids:
+        return set()
+
+    transaction_rows = await db.execute(
+        select(Transaction.user_id)
+        .where(
+            Transaction.user_id.in_(ids),
+            Transaction.is_completed.is_(True),
+            Transaction.amount_kopeks != 0,
+            Transaction.type.in_(
+                (
+                    TransactionType.DEPOSIT.value,
+                    TransactionType.PROVIDER_RECEIPT.value,
+                    TransactionType.SUBSCRIPTION_PAYMENT.value,
+                    TransactionType.GIFT_PAYMENT.value,
+                )
+            ),
+            Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
+        )
+        .distinct()
+    )
+    paid_ids = set(transaction_rows.scalars().all())
+
+    guest_rows = await db.execute(
+        select(
+            GuestPurchase.buyer_user_id,
+            GuestPurchase.user_id,
+            GuestPurchase.is_gift,
+            GuestPurchase.payment_method,
+        ).where(
+            GuestPurchase.paid_at.isnot(None),
+            GuestPurchase.amount_kopeks > 0,
+            or_(
+                GuestPurchase.buyer_user_id.in_(ids),
+                and_(
+                    GuestPurchase.is_gift.is_(False),
+                    GuestPurchase.user_id.in_(ids),
+                ),
+            ),
+        )
+    )
+    candidate_ids = set(ids)
+    for buyer_user_id, recipient_user_id, is_gift, payment_method in guest_rows.all():
+        if _guest_purchase_base_payment_method(payment_method) not in REAL_PAYMENT_METHODS:
+            continue
+        payer_id = buyer_user_id if buyer_user_id is not None else (None if is_gift else recipient_user_id)
+        if payer_id in candidate_ids:
+            paid_ids.add(payer_id)
+
+    return paid_ids
 
 
 async def paid_referral_ids(db: AsyncSession, referral_ids) -> set[int]:

@@ -26,11 +26,18 @@ PUBLIC_TARGETS = (
     'no',
     'expiring',
     'expired',
+    'expired_trial_unpaid',
+    'former_payer_no_subscription',
     'zero',
     'active_zero',
     'trial_zero',
     'tariff_11',
     'custom_today',
+    'custom_registered_0_7_unpaid',
+    'custom_registered_8_30_unpaid',
+    'custom_inactive_7_29',
+    'custom_inactive_30_89',
+    'custom_inactive_90_plus',
 )
 
 

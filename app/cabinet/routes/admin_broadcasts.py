@@ -52,6 +52,10 @@ SAFE_CUSTOM_BROADCAST_CALLBACKS = frozenset(
     {config['callback'] for config in BROADCAST_BUTTONS.values()} | {'menu_buy'}
 )
 
+# Live tariff identity verified on 02.09.2026. Use the stable database id, not
+# the tariff's changing position in the alphabetically sorted dropdown.
+ARCHIVED_BROADCAST_TARIFF_IDS = frozenset({4})  # Team
+
 
 # ============ Filter Labels ============
 
@@ -77,8 +81,12 @@ SAFE_CUSTOM_BROADCAST_CALLBACKS = frozenset(
 FILTER_LABELS = {
     'self': 'Тест: только мне',
     'active': 'Действующая подписка, не пробная',
-    'trial': 'Сейчас числится пробной (в т.ч. истёкшая)',
     'no': 'Сейчас без подписки',
+    'expired_trial_unpaid': 'Триал закончился, ни разу не оплачивал',
+    'former_payer_no_subscription': 'Раньше платил — сейчас без подписки',
+    # Старые аудитории остаются рабочими для истории и редких ручных случаев,
+    # но на экране собраны в самом нижнем разделе «Архив».
+    'trial': 'Сейчас числится пробной (в т.ч. истёкшая)',
     'expiring': 'Заканчивается за 3 дня (включая пробные, без активных суточных)',
     'expired': 'Закончилась (включая пробные)',
     'zero': 'Действующая, 0 ГБ за текущий период',
@@ -91,35 +99,47 @@ FILTER_GROUPS = {
     'self': 'basic',
     'all': 'broad',  # РС-14е: своя группа, чтобы «Все» не стояла соседней строкой с «только мне»
     'active': 'subscription',
-    'trial': 'subscription',
     'no': 'subscription',
-    'expiring': 'subscription',
-    'expired': 'subscription',
-    'zero': 'traffic',
-    'active_zero': 'traffic',
-    'trial_zero': 'traffic',
+    'expired_trial_unpaid': 'subscription',
+    'former_payer_no_subscription': 'subscription',
+    'trial': 'archive',
+    'expiring': 'archive',
+    'expired': 'archive',
+    'zero': 'archive',
+    'active_zero': 'archive',
+    'trial_zero': 'archive',
 }
 
 CUSTOM_FILTER_LABELS = {
+    'custom_registered_0_7_unpaid': 'Регистрация за последние 7 дней, ни одной оплаты',
+    'custom_registered_8_30_unpaid': 'Регистрация 8–30 дней назад, ни одной оплаты',
+    'custom_inactive_7_29': 'Без действий в боте: 7–29 дней',
+    'custom_inactive_30_89': 'Без действий в боте: 30–89 дней',
+    'custom_inactive_90_plus': 'Без действий в боте: 90+ дней',
+    'custom_referrals': 'Пришли по рефералу',
+    'custom_direct': 'Прямая регистрация',
     'custom_today': 'Регистрация сегодня',
     'custom_week': 'Регистрация за неделю',
     'custom_month': 'Регистрация за месяц',
     'custom_active_today': 'Активны сегодня',
     'custom_inactive_week': 'Неактивны 7+ дней',
     'custom_inactive_month': 'Неактивны 30+ дней',
-    'custom_referrals': 'Пришли по рефералу',
-    'custom_direct': 'Прямая регистрация',
 }
 
 CUSTOM_FILTER_GROUPS = {
-    'custom_today': 'registration',
-    'custom_week': 'registration',
-    'custom_month': 'registration',
-    'custom_active_today': 'activity',
-    'custom_inactive_week': 'activity',
-    'custom_inactive_month': 'activity',
+    'custom_registered_0_7_unpaid': 'registration',
+    'custom_registered_8_30_unpaid': 'registration',
+    'custom_inactive_7_29': 'activity',
+    'custom_inactive_30_89': 'activity',
+    'custom_inactive_90_plus': 'activity',
     'custom_referrals': 'source',
     'custom_direct': 'source',
+    'custom_today': 'archive',
+    'custom_week': 'archive',
+    'custom_month': 'archive',
+    'custom_active_today': 'archive',
+    'custom_inactive_week': 'archive',
+    'custom_inactive_month': 'archive',
 }
 
 
@@ -379,6 +399,7 @@ async def get_filters(
                 label=tariff.name,
                 tariff_id=tariff.id,
                 count=tariff_counts.get(tariff.id, 0),
+                group='archive' if tariff.id in ARCHIVED_BROADCAST_TARIFF_IDS else 'tariff',
             )
         )
 
