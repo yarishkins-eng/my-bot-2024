@@ -1194,11 +1194,18 @@ async def update_user_balance(
         amount_kopeks=format(request.amount_kopeks, '+d'),
     )
 
+    # Деньги на счету — теперь человеку надо об этом сказать. До этапа УБ-1 маршрут
+    # молча возвращал ответ, и клиент сидел с деньгами, не зная о них.
+    from app.services.user_service import notify_balance_change
+
+    notified = await notify_balance_change(db, user_id, request.amount_kopeks)
+
     return UpdateBalanceResponse(
         success=True,
         old_balance_kopeks=old_balance,
         new_balance_kopeks=user.balance_kopeks,
         message=f'Balance updated: {old_balance / 100:.2f}₽ -> {user.balance_kopeks / 100:.2f}₽',
+        notified=notified,
     )
 
 

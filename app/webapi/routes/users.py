@@ -350,6 +350,11 @@ async def update_balance(
     if not success:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, 'Failed to update balance')
 
+    # Тот же долг, что у кабинетных маршрутов: правку баланса человеку надо назвать.
+    from app.services.user_service import notify_balance_change
+
+    await notify_balance_change(db, found_user.id, payload.amount_kopeks)
+
     # Reload the user to ensure we have the latest data
     if found_user.telegram_id == user_id:
         found_user = await get_user_by_telegram_id(db, user_id)

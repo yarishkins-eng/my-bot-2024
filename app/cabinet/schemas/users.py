@@ -319,6 +319,10 @@ class UpdateBalanceResponse(BaseModel):
     old_balance_kopeks: int
     new_balance_kopeks: int
     message: str
+    # Дошло ли до клиента сообщение об изменении. False — либо у человека нет ни
+    # Телеграма, ни подтверждённой почты, либо он заблокировал бота. Экран обязан
+    # сказать это админу вслух: до этапа УБ-1 он не говорил вообще ничего.
+    notified: bool = False
 
 
 class UpdateSubscriptionRequest(BaseModel):

@@ -1,3 +1,4 @@
+import asyncio
 import os
 from dataclasses import dataclass, field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -189,125 +190,74 @@ class UserService:
         has_legacy_history = has_legacy_provider or has_guest_purchase or has_legacy_platega or has_legacy_transaction
         return has_device_first or has_legacy_history, has_legacy_history
 
-    async def send_topup_success_to_user(
-        self,
-        bot: Bot,
-        user: User,
-        amount_kopeks: int,
-        subscription: Subscription | None = None,
-    ) -> bool:
-        """
-        Отправляет пользователю уведомление об успешном пополнении баланса.
-        Если подписки нет - показывает БОЛЬШОЕ предупреждение что нужно активировать.
-        Поддерживает как Telegram, так и email-only пользователей.
+    async def send_balance_change_notification(self, bot: Bot, user: User, amount_kopeks: int) -> bool:
+        """Сообщает человеку, что его баланс изменили руками.
+
+        Зовётся из ВСЕХ четырёх поверхностей ручной правки баланса: чат-админка,
+        кабинетная карточка, кабинетные массовые действия и Web API. До этапа УБ-1
+        говорила только чат-админка, остальные три молчали.
+
+        ⛔ Ручное начисление НЕЛЬЗЯ проводить через ``send_cart_notification_after_topup``
+        (`app/services/payment/common.py`), хотя он и шлёт похожее письмо: он тянет за собой
+        автовозобновление суточной, автопокупку сохранённой корзины и
+        ``try_auto_extend_expired_after_topup`` (#629889) — подарок молча ушёл бы на
+        продление. Мина **JN**. Здесь только сообщение, без побочных действий.
+
+        Работает для КОГО УГОДНО: подписка, тариф и выбранный язык роли не играют —
+        ``notification_delivery_service`` отказывает только забаненным и удалённым.
+        Возвращает True, если сообщение реально ушло хотя бы одним каналом.
         """
         texts = get_texts(user.language)
+        formatted_balance = settings.format_price(user.balance_kopeks)
 
-        has_active_subscription = subscription is not None and subscription.status in {'active', 'trial'}
-
-        if has_active_subscription:
-            # У пользователя есть активная подписка - обычное сообщение
-            message = (
-                f'✅ <b>Баланс пополнен на {settings.format_price(amount_kopeks)}!</b>\n\n'
-                f'💳 Текущий баланс: {settings.format_price(user.balance_kopeks)}\n\n'
-                f'Спасибо за использование нашего сервиса! 🎉'
-            )
-            extend_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
-            keyboard = types.InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        types.InlineKeyboardButton(
-                            text=texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку'),
-                            callback_data=extend_callback,
-                        )
-                    ]
-                ]
-            )
-        else:
-            # НЕТ активной подписки - БОЛЬШОЕ ПРЕДУПРЕЖДЕНИЕ
-            message = (
-                f'✅ <b>Баланс пополнен на {settings.format_price(amount_kopeks)}!</b>\n\n'
-                f'💳 Текущий баланс: {settings.format_price(user.balance_kopeks)}\n\n'
-                f'{"─" * 25}\n\n'
-                f'⚠️ <b>ВАЖНО!</b> ⚠️\n\n'
-                f'🔴 <b>ПОДПИСКА НЕ АКТИВНА!</b>\n\n'
-                f'Пополнение баланса НЕ активирует подписку автоматически!\n\n'
-                f'👇 <b>Выберите действие:</b>'
-            )
-            extend_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
-            keyboard = types.InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [types.InlineKeyboardButton(text='🚀 АКТИВИРОВАТЬ ПОДПИСКУ', callback_data='subscription_buy')],
-                    [types.InlineKeyboardButton(text='💎 ПРОДЛИТЬ ПОДПИСКУ', callback_data=extend_callback)],
-                    [
-                        types.InlineKeyboardButton(
-                            text='📱 ДОБАВИТЬ УСТРОЙСТВА', callback_data='subscription_add_devices'
-                        )
-                    ],
-                ]
-            )
-
-        # Use unified notification delivery service
-        return await notification_delivery_service.notify_balance_topup(
-            user=user,
-            amount_kopeks=amount_kopeks,
-            new_balance_kopeks=user.balance_kopeks,
-            bot=bot,
-            telegram_message=message,
-            telegram_markup=keyboard,
-        )
-
-    async def _send_balance_notification(self, bot: Bot, user: User, amount_kopeks: int, admin_name: str) -> bool:
-        """
-        Отправляет уведомление пользователю о пополнении/списании баланса.
-        Поддерживает как Telegram, так и email-only пользователей.
-        """
-        if amount_kopeks > 0:
-            # Пополнение
-            emoji = '💰'
-            amount_text = f'+{settings.format_price(amount_kopeks)}'
-            message = (
-                f'{emoji} <b>Баланс пополнен!</b>\n\n'
-                f'💵 <b>Сумма:</b> {amount_text}\n'
-                f'💳 <b>Текущий баланс:</b> {settings.format_price(user.balance_kopeks)}\n\n'
-                f'Спасибо за использование нашего сервиса! 🎉'
-            )
-        else:
-            # Списание
-            emoji = '💸'
-            amount_text = f'-{settings.format_price(abs(amount_kopeks))}'
-            message = (
-                f'{emoji} <b>Средства списаны с баланса</b>\n\n'
-                f'💵 <b>Сумма:</b> {amount_text}\n'
-                f'💳 <b>Текущий баланс:</b> {settings.format_price(user.balance_kopeks)}\n\n'
-                f'Если у вас есть вопросы, обратитесь в поддержку.'
-            )
-
-        keyboard_rows = []
         subs = getattr(user, 'subscriptions', None) or []
         has_extendable = any(sub.status in {'active', 'expired', 'trial'} for sub in subs)
-        if has_extendable:
-            extend_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
-            keyboard_rows.append(
-                [
-                    types.InlineKeyboardButton(
-                        text=get_texts(user.language).t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку'),
-                        callback_data=extend_callback,
-                    )
-                ]
+
+        if amount_kopeks > 0:
+            message = texts.t(
+                'BALANCE_ADMIN_ADDED',
+                '💰 <b>Баланс пополнен на {amount}</b>\n\nСейчас на счету: {balance}',
+            ).format(amount=settings.format_price(amount_kopeks), balance=formatted_balance)
+            # Человеку без подписки говорим главное: деньги на счету — это ещё не VPN.
+            # Это единственная полезная мысль из снесённой send_topup_success_to_user;
+            # её собственные кнопки были мертвы (`subscription_buy`,
+            # `subscription_add_devices` не зарегистрированы нигде в проекте).
+            if not has_extendable:
+                message += '\n\n' + texts.t(
+                    'BALANCE_ADMIN_ADDED_NO_SUBSCRIPTION',
+                    'Подписка от этого не включается — её нужно оформить.',
+                )
+        else:
+            message = texts.t(
+                'BALANCE_ADMIN_SUBTRACTED',
+                '💸 <b>С баланса списано {amount}</b>\n\nСейчас на счету: {balance}',
+            ).format(amount=settings.format_price(abs(amount_kopeks)), balance=formatted_balance)
+            message += '\n\n' + texts.t(
+                'BALANCE_ADMIN_SUBTRACTED_HINT',
+                'Если это ошибка — напишите в поддержку.',
             )
 
-        reply_markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
+        # Кнопка обязана вести в живой обработчик. Оба колбэка проверены на регистрацию:
+        # `subscription_extend` — purchase.py, `funnel_tariffs` — tariff_purchase.py.
+        if has_extendable:
+            button_text = texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку')
+            button_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
+        else:
+            button_text = texts.t('FUNNEL_TARIFFS', '💳 Тарифы')
+            button_callback = 'funnel_tariffs'
 
-        # Use unified notification delivery service
+        reply_markup = types.InlineKeyboardMarkup(
+            inline_keyboard=[[types.InlineKeyboardButton(text=button_text, callback_data=button_callback)]]
+        )
+
         context = {
             'amount_kopeks': amount_kopeks,
             'amount_rubles': amount_kopeks / 100,
             'new_balance_kopeks': user.balance_kopeks,
             'new_balance_rubles': user.balance_kopeks / 100,
             'formatted_amount': settings.format_price(amount_kopeks),
-            'formatted_balance': settings.format_price(user.balance_kopeks),
-            # No description - don't expose admin name to user
+            'formatted_balance': formatted_balance,
+            # Имя админа и служебная подпись операции клиенту не показываются.
         }
 
         return await notification_delivery_service.send_notification(
@@ -643,7 +593,6 @@ class UserService:
         description: str,
         admin_id: int,
         bot: Bot | None = None,
-        admin_name: str | None = None,
     ) -> bool:
         try:
             user = await get_user_by_id(db, user_id)
@@ -682,16 +631,13 @@ class UserService:
 
             # Отправляем уведомление пользователю, если операция прошла успешно
             if success and bot:
-                # Обновляем пользователя для получения нового баланса
-                await db.refresh(user)
-
-                # Получаем имя администратора
-                if not admin_name:
-                    admin_user = await get_user_by_id(db, admin_id)
-                    admin_name = admin_user.full_name if admin_user else f'Админ #{admin_id}'
+                # Перечитываем человека целиком, а не db.refresh: refresh снимает загруженные
+                # связи, а уведомление читает user.subscriptions — в асинхронной сессии
+                # доленивиться нечем. get_user_by_id тянет подписки selectinload'ом.
+                user = await get_user_by_id(db, user_id) or user
 
                 # Отправляем уведомление (не блокируем операцию если не удалось отправить)
-                await self._send_balance_notification(bot, user, amount_kopeks, admin_name)
+                await self.send_balance_change_notification(bot, user, amount_kopeks)
 
             return success
 
@@ -1877,6 +1823,49 @@ class TestAccountResetPlan:
     done: bool = False
     panel_deleted: bool = False
     deleted_rows: dict[str, int] = dataclass_field(default_factory=dict)
+
+
+async def notify_balance_change(db: AsyncSession, user_id: int, amount_kopeks: int) -> bool:
+    """Сказать человеку, что его баланс изменили руками. Возвращает «дошло ли».
+
+    Общая точка для поверхностей, у которых экземпляра бота нет в руках: кабинетная
+    карточка, кабинетные массовые действия и Web API — все три живут в FastAPI. Бот
+    создаётся на месте и закрывается, ровно как это уже делают выводы средств
+    (`cabinet/routes/admin_withdrawals.py`) и реферальная регистрация.
+
+    🔴 Сбой доставки НЕ роняет начисление: деньги уже на счету, и отказ Телеграма не
+    повод возвращать админу ошибку. Поэтому здесь ловится всё и возвращается False.
+    """
+    if not settings.BOT_TOKEN:
+        return False
+
+    try:
+        # Перечитываем целиком: нужен и свежий баланс, и подписки (selectinload) —
+        # уведомление выбирает по ним кнопку, а доленивиться в асинхронной сессии нечем.
+        user = await get_user_by_id(db, user_id)
+        if not user:
+            return False
+
+        from app.bot_factory import create_bot
+
+        bot = create_bot()
+        try:
+            # У телеграм-отправки три попытки по 15 с. Без потолка кнопка «Начислить»
+            # в кабинете могла бы думать три четверти минуты.
+            return await asyncio.wait_for(
+                UserService().send_balance_change_notification(bot, user, amount_kopeks),
+                timeout=20.0,
+            )
+        finally:
+            await bot.session.close()
+    except Exception as error:
+        logger.error(
+            'Не удалось сообщить человеку о ручной правке баланса',
+            user_id=user_id,
+            amount_kopeks=amount_kopeks,
+            error=error,
+        )
+        return False
 
 
 def test_account_telegram_ids() -> frozenset[int]:

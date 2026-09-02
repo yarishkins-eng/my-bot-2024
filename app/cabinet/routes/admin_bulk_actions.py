@@ -1,5 +1,6 @@
 """Admin routes for bulk actions on users."""
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -448,10 +449,20 @@ async def _do_add_balance(
             username=user.username,
         )
 
+    # Массовая выдача — такое же начисление, как поштучное, и молчать о нём нельзя.
+    from app.services.user_service import notify_balance_change
+
+    notified = await notify_balance_change(db, user.id, amount_kopeks)
+    # Пауза ради лимита Телеграма (~30 сообщений в секунду): без неё массовая выдача
+    # на сотню человек упрётся во flood control. Тот же шаг, что у рассылки закреплённых
+    # сообщений (`services/pinned_message_service.py`).
+    await asyncio.sleep(0.05)
+
+    suffix = '' if notified else ' (клиент не уведомлён)'
     return BulkUserResult(
         user_id=user.id,
         success=True,
-        message=f'Added {amount_kopeks / 100:.2f}₽ to balance',
+        message=f'Added {amount_kopeks / 100:.2f}₽ to balance{suffix}',
         username=user.username,
     )
 
