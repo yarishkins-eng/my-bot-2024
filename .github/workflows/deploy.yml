@@ -30,7 +30,12 @@ jobs:
 
       - name: Deploy the exact non-migration revision and wait for health
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        env:
+          # Токен, который GitHub выдаёт самому прогону. Права — `contents: read`, гаснет
+          # вместе с прогоном. Нужен только для скачивания кода на сервер.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          envs: GH_TOKEN
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -281,7 +286,47 @@ jobs:
               exit 12
             fi
 
-            git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+            # 🔴 02.09.2026: выкладка встала намертво — `git fetch` с боевого отвечал
+            # «could not read Username for 'https://github.com'», хотя репозиторий ПУБЛИЧНЫЙ и
+            # снаружи читается анонимно. Три перезапуска подряд не помогли.
+            # 🟢 ДОКАЗАНО ТРАССИРОВКОЙ САМОГО GIT НА БОЕВОМ (`GIT_CURL_VERBOSE=1`):
+            #     Recv header: HTTP/2 200      ← первый запрос, объявление ссылок
+            #     Recv header: HTTP/2 401
+            #     Recv header: www-authenticate: Basic realm="GitHub"   ← второй запрос
+            # То есть GitHub отдаёт объявление анонимно, а на РАБОЧИЙ запрос требует
+            # представиться. Лечение одно: приходить не безымянно.
+            # ⚠️ ЛОВУШКА, НА КОТОРОЙ Я СПОТКНУЛСЯ САМ, И СКЕПТИК ТОЖЕ: `curl` на тот же адрес
+            # отвечает 200 и создаёт впечатление, что всё в порядке. Он посылает ПУСТОЙ запрос,
+            # и GitHub вежливо отвечает «200, ноль байт». Проверять надо трассировкой git, а не
+            # curl'ом.
+            # ⚠️ Переключение на протокол версии 1 НЕ помогает — проверено, меняет только текст
+            # ошибки: 401 приходит на второй запрос в любой версии протокола.
+            # 🟢 Токен даёт сам GitHub на время прогона, он живёт минуты и гаснет вместе с ним;
+            # на сервере не заводится и не сохраняется, в `git config` не пишется (`-c` действует
+            # на один запуск).
+            # ⚠️ ЧЕСТНО ПРО ГРАНИЦУ, назвал ревьюер: на время шага токен ВИДЕН в списке процессов
+            # сервера — `appleboy/ssh-action` дописывает `export` в начало скрипта, а тот идёт
+            # аргументом `bash -c`. Локальный пользователь сервера прочитает его через `ps`.
+            # Цена мала и названа: права — `contents: read` на ПУБЛИЧНЫЙ репозиторий, то есть
+            # ровно то, что и так открыто всем, и живёт это минуты. `printf` взят намеренно —
+            # он встроен в bash, поэтому сырой токен не уходит в argv отдельного процесса.
+            # ⛔ Не эхоить $GH_TOKEN и не включать `set -x` в этом шаге.
+            # ⚠️ Токен берётся МЯГКО (`${GH_TOKEN:-}`) и путь раздваивается — это не перестраховка,
+            # а требование скрипта: он идёт под `set -u`, и голое `$GH_TOKEN` роняло его с
+            # «unbound variable» везде, где переменной нет. Поймали СВОИ ЖЕ тесты выкладки
+            # (`tests/workflows/test_migration_recovery_workflow.py`): они вытаскивают этот
+            # скрипт из файла и прогоняют с поддельным git — 19 падений. Без ветки безымянного
+            # скачивания любой запуск без токена умирал бы непонятной ошибкой вместо честного 401.
+            # ⚠️ `base64 | tr -d '\n'`, а НЕ `base64 -w0`: ключ `-w` есть в GNU и отсутствует в
+            # BSD/macOS. Отказ упаковки внутри подстановки команд не роняет строку — заголовок
+            # молча вышел бы ПУСТЫМ, и вернулся бы тот же 401, но уже без видимой причины.
+            # Поймал собственный сторож этой правки, прогнанный не на Linux.
+            if [ -n "${GH_TOKEN:-}" ]; then
+              git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')" \
+                fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+            else
+              git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+            fi
             readonly PREVIOUS_SHA="$(git rev-parse HEAD)"
             readonly REMOTE_MAIN_SHA="$(git rev-parse origin/main)"
 

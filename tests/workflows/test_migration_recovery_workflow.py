@@ -460,6 +460,7 @@ def _ordinary_deploy_interlock_integration(
     deploy_state: str,
     recovery_journal: str | None,
     recovery_audit: str | None = None,
+    gh_token: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Path]]:
     repo = tmp_path / 'repo'
     state = tmp_path / 'state'
@@ -479,11 +480,26 @@ def _ordinary_deploy_interlock_integration(
         r"""#!/usr/bin/env bash
 set -eu
 case "$1" in
-  status|fetch|cat-file) exit 0 ;;
+  status|cat-file) exit 0 ;;
+  fetch) printf 'plain\n' >> "$FAKE_STATE/fetch-mode"; exit 0 ;;
   rev-parse)
     if [ "$2" = 'HEAD' ]; then cat "$FAKE_STATE/source"; else printf '%s\n' "$ORDINARY_TARGET_SHA"; fi
     ;;
   merge-base|diff) exit 0 ;;
+  -c)
+    # 🔴 02.09.2026: выкладка ходит за кодом с заголовком авторизации, иначе GitHub отвечает
+    # 401 «www-authenticate: Basic realm=GitHub» на рабочий запрос. Подделка записывает САМ
+    # ФАКТ и то, что заголовок непустой, но НЕ печатает его значение — там живой токен.
+    case "$2" in
+      http.extraheader=*)
+        printf '%s\n' "$2" | grep -q 'AUTHORIZATION: basic .\+' \
+          && printf 'auth\n' >> "$FAKE_STATE/fetch-mode" \
+          || printf 'auth-empty\n' >> "$FAKE_STATE/fetch-mode"
+        exit 0
+        ;;
+      *) printf 'unexpected fake ordinary git -c: %s\n' "$2" >&2; exit 93 ;;
+    esac
+    ;;
   *) printf 'unexpected fake ordinary git call: %s\n' "$*" >&2; exit 98 ;;
 esac
 """,
@@ -522,6 +538,8 @@ fi
         'ROLLBACK_IMAGE': ROLLBACK_IMAGE,
         'PREVIOUS_SCHEMA': PREVIOUS_SCHEMA,
     }
+    if gh_token is not None:
+        env['GH_TOKEN'] = gh_token
     result = subprocess.run(  # noqa: S603 - executes extracted ordinary deployment shell
         ['/bin/bash', str(shell)],
         cwd=repo,
@@ -943,6 +961,50 @@ def test_extracted_ordinary_deploy_reaches_first_mutation_from_consistent_state(
     )
     assert result.returncode == 66, result.stderr
     assert paths['fake'].joinpath('mutations').read_text() == 'tag\n'
+
+
+def test_extracted_ordinary_deploy_fetches_with_authorization_when_token_present() -> None:
+    """Выкладка ходит за кодом ИМЕНОВАННО, когда пропуск передан.
+
+    🔴 02.09.2026 выкладка встала намертво: `git fetch` с боевого получал 401 и
+    `www-authenticate: Basic realm="GitHub"` на рабочий запрос — GitHub перестал обслуживать
+    безымянные скачивания. Доказано трассировкой самого git на сервере.
+    ⛔ Сторож проверяет ФАКТ авторизации, а не значение заголовка: в нём живой токен.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp_path = Path(raw)
+        result, paths = _ordinary_deploy_interlock_integration(
+            tmp_path,
+            current_source=ROLLBACK_SHA,
+            deploy_state=f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n',
+            recovery_journal=_completed_v1_recovery_journal(),
+            gh_token='ghs-fake-token-for-test',
+        )
+        assert result.returncode == 66, result.stderr
+        assert paths['fake'].joinpath('fetch-mode').read_text() == 'auth\n'
+
+
+def test_extracted_ordinary_deploy_falls_back_to_plain_fetch_without_token() -> None:
+    """Без пропуска скрипт НЕ падает, а качает по-старому.
+
+    Скрипт идёт под `set -u`, и голое `$GH_TOKEN` роняло его с «unbound variable» везде, где
+    переменной нет. Честный откат к безымянному скачиванию даёт понятный отказ GitHub вместо
+    непонятной ошибки оболочки.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp_path = Path(raw)
+        result, paths = _ordinary_deploy_interlock_integration(
+            tmp_path,
+            current_source=ROLLBACK_SHA,
+            deploy_state=f'sha={ROLLBACK_SHA}\nimage={ROLLBACK_IMAGE}\n',
+            recovery_journal=_completed_v1_recovery_journal(),
+        )
+        assert result.returncode == 66, result.stderr
+        assert paths['fake'].joinpath('fetch-mode').read_text() == 'plain\n'
 
 
 def test_extracted_ordinary_deploy_accepts_verified_recovery_state(
