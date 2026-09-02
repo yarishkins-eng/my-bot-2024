@@ -444,12 +444,29 @@ def test_delivery_outcome_travels_with_the_streaming_event():
     assert events >= 2, f'нашёл {events} событий потока вместо двух — генераторы переименованы или переехали'
 
 
-def test_bulk_builds_the_bot_only_behind_the_token_guard():
-    """При пустом или битом BOT_TOKEN create_bot бросает. Деньги к этому моменту уже
+def test_bulk_never_lets_a_broken_token_mark_credited_rows_as_failed():
+    """При пустом ИЛИ БИТОМ BOT_TOKEN create_bot бросает. Деньги к этому моменту уже
     закоммичены, и исключение пометило бы строку ошибкой: владелец повторил бы прогон
-    и начислил второй раз."""
+    и начислил второй раз.
+
+    🔴 Переписано ревизией: прежняя редакция сторожила проверку `settings.BOT_TOKEN`,
+    а она смотрит только на НЕПУСТОТУ. `create_bot()` валидирует форму токена и на
+    кривом непустом бросит всё равно. Теперь исключение ловится и наружу отдаётся
+    None — сторож проверяет это, а не форму условия.
+    """
     source = (APP_DIR / 'cabinet' / 'routes' / 'admin_bulk_actions.py').read_text(encoding='utf-8')
-    assert '_get_bot() if settings.BOT_TOKEN else None' in source, 'бот в массовой выдаче строится без проверки токена'
+    tree = ast.parse(source)
+    func = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_get_bot')
+
+    handlers = [h for n in ast.walk(func) if isinstance(n, ast.Try) for h in n.handlers]
+    assert handlers, 'подъём бота снова без защиты — битый токен пометит ошибкой выданные деньги'
+    assert any(
+        isinstance(node, ast.Return) and isinstance(node.value, ast.Constant) and node.value.value is None
+        for h in handlers
+        for node in ast.walk(h)
+    ), 'исключение ловится, но наружу не отдаётся None — вызывающий всё равно упадёт'
+
+    assert 'bot=_get_bot()' in source
 
 
 def test_websocket_reports_whether_anyone_actually_received_it():
