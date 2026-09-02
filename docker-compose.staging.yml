@@ -1,0 +1,128 @@
+# Тестовый (staging) стек Teplo VPN.
+# Полностью изолирован от боевого бота: свой токен, своя база, свой redis.
+# Бот работает в режиме polling (не нужен домен/webhook).
+# Запуск на сервере: docker compose -f docker-compose.staging.yml up -d --build
+# Требует файлы рядом: .env.staging (настройки бота) и .env (только STAGING_DB_PASSWORD).
+
+services:
+  postgres_staging:
+    image: postgres:15-alpine
+    container_name: teplo_staging_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: teplo_staging
+      POSTGRES_USER: staging_user
+      POSTGRES_PASSWORD: ${STAGING_DB_PASSWORD:-staging_local_only}
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+    volumes:
+      - staging_postgres_data:/var/lib/postgresql/data
+    networks:
+      - staging_net
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U staging_user -d teplo_staging']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis_staging:
+    image: redis:7-alpine
+    container_name: teplo_staging_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    networks:
+      - staging_net
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  bot_staging:
+    build: .
+    container_name: teplo_staging_bot
+    restart: unless-stopped
+    depends_on:
+      postgres_staging:
+        condition: service_healthy
+      redis_staging:
+        condition: service_healthy
+    env_file:
+      - .env.staging
+    environment:
+      # Подключение к ИЗОЛИРОВАННОЙ тестовой базе и redis (перекрывает .env.staging)
+      DOCKER_ENV: 'true'
+      DATABASE_MODE: 'auto'
+      POSTGRES_HOST: 'postgres_staging'
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: 'teplo_staging'
+      POSTGRES_USER: 'staging_user'
+      POSTGRES_PASSWORD: '${STAGING_DB_PASSWORD:-staging_local_only}'
+      DATABASE_URL: 'postgresql+asyncpg://staging_user:${STAGING_DB_PASSWORD:-staging_local_only}@postgres_staging:5432/teplo_staging'
+      REDIS_URL: 'redis://redis_staging:6379/0'
+      TZ: 'Europe/Moscow'
+      # Тестовый бот повторяет боевой UX: правила доступны только через FAQ,
+      # без обязательного принятия при /start.
+      SKIP_RULES_ACCEPT: 'true'
+      # В продакшене код не запрашивается при регистрации; реферальная программа
+      # в меню при этом продолжает работать.
+      SKIP_REFERRAL_CODE: 'true'
+      # Тестируем те же пользовательские меню, что и в продакшене. Администраторы
+      # и модераторы по логике бота всё равно видят своё полное служебное меню.
+      MAIN_MENU_MODE: 'cabinet'
+      MENU_LAYOUT_ENABLED: 'false'
+      FUNNEL_MENU_ENABLED: 'true'
+      FUNNEL_SUBSCRIBER_MENU_ENABLED: 'true'
+      SUBSCRIBER_MENU_RENEW_THRESHOLD_DAYS: '0'
+      # Отдельный тестовый кабинет на том же TLS-домене, но другом origin/порту.
+      # Это не production URL и не разделяет браузерное хранилище с боевым кабинетом.
+      WEB_API_ENABLED: 'true'
+      WEB_API_HOST: '0.0.0.0'
+      WEB_API_PORT: '8080'
+      CABINET_ENABLED: 'true'
+      # A distinct WebApp URL makes Telegram create a new staging document after
+      # the theme-state release; build_cabinet_url keeps this query after routes.
+      # CABINET_URL feeds backend callback/return URLs, so it must stay a clean
+      # origin. Only the Telegram WebApp launcher below is versioned.
+      CABINET_URL: 'https://cabinet.lilulalu.xyz:8443'
+      MINIAPP_CUSTOM_URL: 'https://cabinet.lilulalu.xyz:8443?release=device-first-v2-20260801-r1'
+      CABINET_ALLOWED_ORIGINS: 'https://cabinet.lilulalu.xyz:8443'
+      # Не пишет в БД и не создаёт VPN-конфигурацию: только позволяет будущим
+      # staging-сценариям увидеть и скопировать заведомо нерабочий .invalid URL.
+      STAGING_FAKE_SUBSCRIPTION_URL_ENABLED: 'true'
+      # В staging панель RemnaWave намеренно недоступна — не создаём ложных тревог.
+      MAINTENANCE_MONITORING_ENABLED: 'false'
+      LOCALES_PATH: '/app/locales'
+    ports:
+      # Только loopback: наружу staging API доступен исключительно через отдельный nginx route.
+      - '127.0.0.1:18080:8080'
+    volumes:
+      - ./logs:/app/logs:rw
+      - ./data:/app/data:rw
+      - ./locales:/app/locales:rw
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./uploads:/app/uploads:rw
+      - ./vpn_logo.png:/app/vpn_logo.png:ro
+    networks:
+      - staging_net
+    # Docker healthcheck проверяет polling-процесс и его реальные зависимости.
+    # Готовность HTTP API дополнительно проверяется в deploy-staging.yml: веб-сервер
+    # запускается внутри общей последовательности старта бота немного позднее.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import os, socket; assert b'python' in open('/proc/1/cmdline', 'rb').read(); socket.create_connection(('postgres_staging', 5432), 5).close(); socket.create_connection(('redis_staging', 6379), 5).close()"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  staging_postgres_data:
+    driver: local
+
+networks:
+  staging_net:
+    driver: bridge

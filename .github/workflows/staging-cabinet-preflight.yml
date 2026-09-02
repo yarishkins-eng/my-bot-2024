@@ -1,0 +1,69 @@
+name: Inspect staging cabinet prerequisites
+
+on:
+  push:
+    branches:
+      - staging
+    paths:
+      - '.github/workflows/staging-cabinet-preflight.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect only the isolated staging prerequisites
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 5m
+          script: |
+            set -Eeuo pipefail
+
+            readonly STAGING_DIR='/opt/teplo-bot-staging'
+            readonly NGINX_CONTAINER='remnawave-nginx'
+
+            printf '%s\n' '== staging source and resources =='
+            git -C "$STAGING_DIR" rev-parse HEAD
+            df -Pk "$STAGING_DIR" | awk 'NR == 1 || NR == 2 { print }'
+            docker ps --format '{{.Names}} {{.Status}} {{.Ports}}' \
+              --filter 'name=teplo_staging_' \
+              --filter 'name=cabinet_frontend' \
+              --filter 'name=remnawave-nginx'
+
+            printf '%s\n' '== staging config presence (values are intentionally not printed) =='
+            for key in CABINET_ENABLED CABINET_JWT_SECRET CABINET_ALLOWED_ORIGINS WEB_API_ENABLED MINIAPP_CUSTOM_URL; do
+              if awk -F= -v target="$key" '$1 == target && length($2) > 0 { found = 1 } END { exit(found ? 0 : 1) }' "$STAGING_DIR/.env.staging"; then
+                printf '%s=%s\n' "$key" configured
+              else
+                printf '%s=%s\n' "$key" absent_or_empty
+              fi
+            done
+
+            printf '%s\n' '== proxy and certificate capability =='
+            test -f /opt/remnawave/nginx.conf
+            sha256sum /opt/remnawave/nginx.conf | awk '{ print "nginx_conf_sha256=" $1 }'
+            docker inspect "$NGINX_CONTAINER" --format '{{.State.Status}} network={{.HostConfig.NetworkMode}}'
+            docker exec "$NGINX_CONTAINER" nginx -t
+            docker exec "$NGINX_CONTAINER" nginx -T 2>/dev/null \
+              | grep -E '^[[:space:]]*(listen|server_name)[[:space:]]' \
+              | sed -n '1,120p'
+            ss -ltn '( sport = :80 or sport = :443 or sport = :8443 )' | sed -n '1,20p'
+
+            printf '%s\n' '== isolation targets =='
+            if test -d /opt/teplo-cabinet-staging; then
+              printf '%s\n' 'staging_cabinet_directory=present'
+            else
+              printf '%s\n' 'staging_cabinet_directory=absent'
+            fi
+            if docker ps -a --format '{{.Names}}' | grep -qx 'teplo_staging_cabinet'; then
+              printf '%s\n' 'staging_cabinet_container=present'
+            else
+              printf '%s\n' 'staging_cabinet_container=absent'
+            fi
