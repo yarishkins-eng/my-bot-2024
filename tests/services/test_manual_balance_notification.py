@@ -469,6 +469,33 @@ def test_bulk_never_lets_a_broken_token_mark_credited_rows_as_failed():
     assert 'bot=_get_bot()' in source
 
 
+@pytest.mark.asyncio
+async def test_broken_token_is_attempted_once_and_not_once_per_person(monkeypatch):
+    """Обещание коммита «600 бесполезных попыток → одна» доказывается прогоном, а не чтением.
+
+    Замечание третьей ревизии: память неудачи была покрыта только разбором дерева, то
+    есть проверялось наличие защиты, а не её эффект. При стабильно битом токене на
+    партии в сотни человек это разница между одной строкой в логе и сотнями.
+    """
+    from app.cabinet.routes import admin_bulk_actions as module
+
+    attempts = []
+
+    def exploding_create_bot(*args, **kwargs):
+        attempts.append(1)
+        raise RuntimeError('Token is invalid!')
+
+    monkeypatch.setattr(module, 'create_bot', exploding_create_bot)
+    monkeypatch.setattr(module, '_cached_bot', None, raising=False)
+    monkeypatch.setattr(module, '_bot_unavailable', False, raising=False)
+
+    assert module._get_bot() is None
+    for _ in range(20):
+        assert module._get_bot() is None
+
+    assert len(attempts) == 1, f'подъём бота повторился {len(attempts)} раз вместо одного'
+
+
 def test_websocket_reports_whether_anyone_actually_received_it():
     """Отправка в ноль открытых окон — не доставка.
 
