@@ -1146,6 +1146,18 @@ async def update_user_balance(
         )
     _reject_account_erasure_mutation(user)
 
+    # Ноль отбиваем, как это давно делает Web API: он проходил валидацию, уходил в ветку
+    # начисления, писал проводку на 0 ₽ — а клиенту улетало «списано 0 ₽, если это ошибка,
+    # напишите в поддержку». Обращение в поддержку на пустом месте.
+    # Копейки отбиваем по той же причине: цены в проекте округляются
+    # (`PRICE_ROUNDING_ENABLED`), и суммы до 50 копеек печатаются клиенту как «0 ₽».
+    # Достижимо опечаткой «0.5» вместо «50».
+    if abs(request.amount_kopeks) < 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Минимальная сумма — 1 ₽',
+        )
+
     old_balance = user.balance_kopeks
 
     if request.amount_kopeks >= 0:
@@ -1194,11 +1206,18 @@ async def update_user_balance(
         amount_kopeks=format(request.amount_kopeks, '+d'),
     )
 
+    # Деньги на счету — теперь человеку надо об этом сказать. До этапа УБ-1 маршрут
+    # молча возвращал ответ, и клиент сидел с деньгами, не зная о них.
+    from app.services.user_service import notify_balance_change
+
+    notified = await notify_balance_change(db, user_id, request.amount_kopeks, reason=request.description)
+
     return UpdateBalanceResponse(
         success=True,
         old_balance_kopeks=old_balance,
         new_balance_kopeks=user.balance_kopeks,
         message=f'Balance updated: {old_balance / 100:.2f}₽ -> {user.balance_kopeks / 100:.2f}₽',
+        notified=notified,
     )
 
 

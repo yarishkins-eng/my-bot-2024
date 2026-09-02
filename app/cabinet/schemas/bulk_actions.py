@@ -66,6 +66,10 @@ class BulkUserResult(BaseModel):
     message: str
     username: str | None = None
     subscriptions: list[BulkSubscriptionInfo] | None = None
+    # Дошло ли до клиента сообщение о деньгах. None — действие вообще не про деньги.
+    # Отдельным полем, а не хвостом в message: message приходит по-английски и рисуется
+    # только у неуспешных строк, то есть отметка «не уведомлён» была невидима.
+    notified: bool | None = None
 
 
 class BulkExecuteResponse(BaseModel):

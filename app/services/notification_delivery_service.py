@@ -429,8 +429,9 @@ class NotificationDeliveryService:
                 **context,
             }
 
-            await self.ws_manager.send_to_user(user.id, message)
-            return True
+            # Возврат, а не «не бросил исключение»: при нуле открытых окон отправки не было,
+            # и объявлять её успехом нельзя — на этом отчёт о доставке врал админу (УБ-1).
+            return await self.ws_manager.send_to_user(user.id, message)
 
         except Exception as e:
             logger.debug('WebSocket уведомление не отправлено пользователю', user_id=user.id, e=e)
@@ -439,34 +440,6 @@ class NotificationDeliveryService:
     # ============================================================================
     # Convenience methods for common notification types
     # ============================================================================
-
-    async def notify_balance_topup(
-        self,
-        user: User,
-        amount_kopeks: int,
-        new_balance_kopeks: int,
-        bot: Bot | None = None,
-        telegram_message: str | None = None,
-        telegram_markup: Any | None = None,
-    ) -> bool:
-        """Notify user about balance top-up."""
-        context = {
-            'amount_kopeks': amount_kopeks,
-            'amount_rubles': amount_kopeks / 100,
-            'new_balance_kopeks': new_balance_kopeks,
-            'new_balance_rubles': new_balance_kopeks / 100,
-            'formatted_amount': settings.format_price(amount_kopeks),
-            'formatted_balance': settings.format_price(new_balance_kopeks),
-        }
-
-        return await self.send_notification(
-            user=user,
-            notification_type=NotificationType.BALANCE_TOPUP,
-            context=context,
-            bot=bot,
-            telegram_message=telegram_message,
-            telegram_markup=telegram_markup,
-        )
 
     async def notify_subscription_expiring(
         self,

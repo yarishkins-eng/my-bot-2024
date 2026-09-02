@@ -1,14 +1,17 @@
 """Admin routes for bulk actions on users."""
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 
 import structlog
+from aiogram import Bot
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bot_factory import create_bot
 from app.config import settings
 from app.database.crud.subscription import (
     add_subscription_traffic,
@@ -415,6 +418,21 @@ async def _do_add_traffic(
     )
 
 
+_cached_bot: Bot | None = None
+
+
+def _get_bot() -> Bot:
+    """Один бот на весь процесс — как в рассылке закреплённых сообщений.
+
+    Своя сессия на каждого человека стоит TLS-рукопожатия плюс 250 мс на закрытие
+    в aiogram: выдача на 500 человек уезжала из секунд в минуты.
+    """
+    global _cached_bot
+    if _cached_bot is None:
+        _cached_bot = create_bot()
+    return _cached_bot
+
+
 async def _do_add_balance(
     db: AsyncSession,
     user: User,
@@ -448,11 +466,26 @@ async def _do_add_balance(
             username=user.username,
         )
 
+    # Массовая выдача — такое же начисление, как поштучное, и молчать о нём нельзя.
+    from app.services.user_service import notify_balance_change
+
+    # 🔴 Бот строится ТОЛЬКО когда токен есть: create_bot() валидирует токен и бросает,
+    # а деньги к этому моменту уже закоммичены — исключение пометило бы строку ошибкой,
+    # и владелец повторил бы прогон, начислив второй раз.
+    # Причину клиенту отсюда НЕ передаём: поля описания у массовой выдачи на экране нет,
+    # и всем ушла бы служебная строка «Массовое начисление баланса».
+    notified = await notify_balance_change(db, user.id, amount_kopeks, bot=_get_bot() if settings.BOT_TOKEN else None)
+    # Пауза ради лимита Телеграма (~30 сообщений в секунду): без неё массовая выдача
+    # на сотню человек упрётся во flood control. Тот же шаг, что у рассылки закреплённых
+    # сообщений (`services/pinned_message_service.py`) — и бот, как там, ОДИН на прогон.
+    await asyncio.sleep(0.05)
+
     return BulkUserResult(
         user_id=user.id,
         success=True,
         message=f'Added {amount_kopeks / 100:.2f}₽ to balance',
         username=user.username,
+        notified=notified,
     )
 
 
@@ -1131,6 +1164,9 @@ async def _stream_bulk_execute(
             'message': result.message,
             'username': result.username,
             'subscriptions': [s.model_dump() for s in result.subscriptions] if result.subscriptions else None,
+            # Исход доставки обязан ехать и потоком: кабинет ходит ТОЛЬКО потоком,
+            # и без этой строки счётчик «Не уведомлены» структурно всегда нулевой.
+            'notified': result.notified,
         }
         yield f'data: {json.dumps(progress, ensure_ascii=False)}\n\n'
 
@@ -1192,6 +1228,9 @@ async def _stream_bulk_execute_subscriptions(
             'message': result.message,
             'username': result.username,
             'subscriptions': [s.model_dump() for s in result.subscriptions] if result.subscriptions else None,
+            # Исход доставки обязан ехать и потоком: кабинет ходит ТОЛЬКО потоком,
+            # и без этой строки счётчик «Не уведомлены» структурно всегда нулевой.
+            'notified': result.notified,
         }
         yield f'data: {json.dumps(progress, ensure_ascii=False)}\n\n'
 

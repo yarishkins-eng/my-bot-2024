@@ -2445,7 +2445,7 @@ async def process_balance_edit(message: types.Message, db_user: User, state: FSM
             description = f'Списание администратором: {int(amount_rubles)} ₽'
 
         success = await user_service.update_user_balance(
-            db, user_id, amount_kopeks, description, db_user.id, bot=message.bot, admin_name=db_user.full_name
+            db, user_id, amount_kopeks, description, db_user.id, bot=message.bot
         )
 
         if success:
