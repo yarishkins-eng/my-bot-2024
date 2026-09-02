@@ -412,6 +412,86 @@ def test_bulk_reports_delivery_by_a_field_not_by_a_russian_tail():
     assert 'notified' in schema, 'результат массового действия снова не сообщает об исходе доставки'
 
 
+def test_delivery_outcome_travels_with_the_streaming_event():
+    """🔴 Кабинет ходит в массовые действия ТОЛЬКО потоком.
+
+    Поле notified жило в схеме ответа, но оба генератора SSE собирают словарь события
+    руками — и без него счётчик «Не уведомлены» на экране структурно всегда нулевой.
+    Нашли скептик и прогон сценария независимо.
+    """
+    source = (APP_DIR / 'cabinet' / 'routes' / 'admin_bulk_actions.py').read_text(encoding='utf-8')
+    tree = ast.parse(source)
+
+    events = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = {k.value for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+        if 'type' in keys and 'current' in keys and 'total' in keys:
+            events += 1
+            assert 'notified' in keys, 'событие потока не несёт исход доставки — счётчик на экране будет пуст'
+    assert events >= 2, f'нашёл {events} событий потока вместо двух — генераторы переименованы или переехали'
+
+
+def test_bulk_builds_the_bot_only_behind_the_token_guard():
+    """При пустом или битом BOT_TOKEN create_bot бросает. Деньги к этому моменту уже
+    закоммичены, и исключение пометило бы строку ошибкой: владелец повторил бы прогон
+    и начислил второй раз."""
+    source = (APP_DIR / 'cabinet' / 'routes' / 'admin_bulk_actions.py').read_text(encoding='utf-8')
+    assert '_get_bot() if settings.BOT_TOKEN else None' in source, 'бот в массовой выдаче строится без проверки токена'
+
+
+def test_websocket_reports_whether_anyone_actually_received_it():
+    """Отправка в ноль открытых окон — не доставка.
+
+    Пока send_to_user молча выходил, отчёт говорил админу «сообщение отправлено» про
+    человека без Телеграма, у которого не открыто ни одного окна и не поднята почта.
+    """
+    source = (APP_DIR / 'cabinet' / 'routes' / 'websocket.py').read_text(encoding='utf-8')
+    tree = ast.parse(source)
+    func = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == 'send_to_user')
+    returns = [n for n in ast.walk(func) if isinstance(n, ast.Return)]
+    assert returns, 'send_to_user снова ничего не возвращает — отчёт о доставке начнёт врать'
+    assert any(isinstance(r.value, ast.Constant) and r.value.value is False for r in returns), (
+        'нет ветки «никто не получил» — ноль открытых окон снова считался бы доставкой'
+    )
+
+    delivery = (APP_DIR / 'services' / 'notification_delivery_service.py').read_text(encoding='utf-8')
+    assert 'return await self.ws_manager.send_to_user' in delivery, (
+        'маршрутизатор снова объявляет доставку по отсутствию исключения'
+    )
+
+
+def test_chat_admin_does_not_turn_a_failed_message_into_a_failed_credit():
+    """Деньги коммитятся раньше письма. Пока вызов стоял в общем try, сбой отправки
+    возвращал False, и админ читал «❌ Ошибка изменения баланса» — приглашение
+    начислить второй раз."""
+    called = _called_names('services/user_service.py', 'update_user_balance')
+    assert 'send_balance_change_notification' in called
+
+    tree = ast.parse((APP_DIR / 'services' / 'user_service.py').read_text(encoding='utf-8'))
+    func = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == 'update_user_balance')
+    guarded = False
+    for node in ast.walk(func):
+        if isinstance(node, ast.Try):
+            names = {
+                inner.func.attr
+                for inner in ast.walk(node)
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
+            }
+            # свой try, а не общий: общий охватывает и списание баланса
+            if 'send_balance_change_notification' in names and 'subtract_user_balance' not in names:
+                guarded = True
+    assert guarded, 'уведомление снова стоит в общем try — его сбой читается как «баланс не изменён»'
+
+
+def test_cabinet_route_rejects_amounts_that_would_print_as_zero():
+    """Цены округляются: до 50 копеек клиент прочитал бы «списано 0 ₽» — та же
+    бессмыслица, от которой писали защиту от нуля. Достижимо опечаткой «0.5»."""
+    source = (APP_DIR / 'cabinet' / 'routes' / 'admin_users.py').read_text(encoding='utf-8')
+    assert 'abs(request.amount_kopeks) < 100' in source, 'копеечные суммы снова проходят'
+
+
 # ---------------------------------------------------------------------------
 # Деньги важнее письма
 # ---------------------------------------------------------------------------
