@@ -31,6 +31,7 @@ class TariffFilter(BaseModel):
     label: str  # tariff name
     tariff_id: int
     count: int
+    group: str | None = None
 
 
 class BroadcastFiltersResponse(BaseModel):

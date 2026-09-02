@@ -45,8 +45,10 @@ from app.services.pinned_message_service import (
 )
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
+from app.utils.grace import is_in_grace
 from app.utils.miniapp_buttons import BUTTON_KEY_TO_CABINET_PATH, build_miniapp_or_callback_button
 from app.utils.telegram_html import prepare_telegram_broadcast
+from app.utils.user_utils import real_payment_user_ids
 
 
 logger = structlog.get_logger(__name__)
@@ -747,6 +749,8 @@ async def select_broadcast_target(callback: types.CallbackQuery, db_user: User, 
         'no': 'Сейчас без подписки',
         'expiring': 'Заканчивается за 3 дня (включая пробные, без активных суточных)',
         'expired': 'Закончилась (включая пробные)',
+        'expired_trial_unpaid': 'Триал закончился, ни разу не оплачивал',
+        'former_payer_no_subscription': 'Раньше платил — сейчас без подписки',
         'zero': 'Действующая, 0 ГБ за текущий период',
         'active_zero': 'Действующая не пробная, 0 ГБ за период',
         'trial_zero': 'Действующая пробная, 0 ГБ за период',
@@ -1595,6 +1599,68 @@ async def get_target_users(
                 expired_users.append(user)
         return expired_users
 
+    if target in {'expired_trial_unpaid', 'former_payer_no_subscription'}:
+        now = datetime.now(UTC)
+        paid_ids = await real_payment_user_ids(db, [user.id for user in users])
+
+        def has_current_subscription(user: User) -> bool:
+            return any(
+                (
+                    subscription.end_date is not None
+                    and subscription.end_date > now
+                    and subscription.status
+                    in {
+                        SubscriptionStatus.ACTIVE.value,
+                        SubscriptionStatus.TRIAL.value,
+                        SubscriptionStatus.LIMITED.value,
+                    }
+                )
+                or is_in_grace(subscription, now)
+                for subscription in (getattr(user, 'subscriptions', None) or [])
+            )
+
+        def belongs_to_archived_expired(user: User) -> bool:
+            subscriptions = getattr(user, 'subscriptions', None) or []
+            if not subscriptions:
+                return bool(user.has_had_paid_subscription)
+            if any(subscription.is_active for subscription in subscriptions):
+                return False
+            return any(
+                subscription.status
+                in {
+                    SubscriptionStatus.EXPIRED.value,
+                    SubscriptionStatus.DISABLED.value,
+                }
+                or (subscription.end_date is not None and subscription.end_date <= now)
+                for subscription in subscriptions
+            )
+
+        if target == 'former_payer_no_subscription':
+            return [
+                user
+                for user in users
+                if user.id in paid_ids and belongs_to_archived_expired(user) and not has_current_subscription(user)
+            ]
+
+        expired_statuses = {
+            SubscriptionStatus.EXPIRED.value,
+            SubscriptionStatus.DISABLED.value,
+        }
+        return [
+            user
+            for user in users
+            if user.id not in paid_ids
+            and not has_current_subscription(user)
+            and any(
+                subscription.is_trial
+                and (
+                    subscription.status in expired_statuses
+                    or (subscription.end_date is not None and subscription.end_date <= now)
+                )
+                for subscription in (getattr(user, 'subscriptions', None) or [])
+            )
+        ]
+
     if target == 'active_zero':
         return [
             user
@@ -1726,13 +1792,51 @@ async def get_custom_users_count(db: AsyncSession, criteria: str) -> int:
     return len(users)
 
 
+_NEW_TIME_SEGMENTS = frozenset(
+    {
+        'registered_0_7_unpaid',
+        'registered_8_30_unpaid',
+        'inactive_7_29',
+        'inactive_30_89',
+        'inactive_90_plus',
+    }
+)
+
+
+def _matches_new_time_segment(user: User, criteria: str, now: datetime) -> bool:
+    """Half-open day windows: every boundary belongs to exactly one segment."""
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+    ninety_days_ago = now - timedelta(days=90)
+
+    if criteria == 'registered_0_7_unpaid':
+        created_at = user.created_at
+        return created_at is not None and week_ago <= created_at <= now
+    if criteria == 'registered_8_30_unpaid':
+        created_at = user.created_at
+        return created_at is not None and month_ago <= created_at < week_ago
+
+    last_activity = user.last_activity
+    if last_activity is None:
+        return False
+    if criteria == 'inactive_7_29':
+        return month_ago < last_activity <= week_ago
+    if criteria == 'inactive_30_89':
+        return ninety_days_ago < last_activity <= month_ago
+    if criteria == 'inactive_90_plus':
+        return last_activity <= ninety_days_ago
+    return False
+
+
 async def get_custom_users(db: AsyncSession, criteria: str) -> list:
     now = datetime.now(UTC)
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
     month_ago = now - timedelta(days=30)
 
-    if criteria == 'today':
+    if criteria in _NEW_TIME_SEGMENTS:
+        stmt = select(User).where(User.status == 'active')
+    elif criteria == 'today':
         stmt = select(User).where(and_(User.status == 'active', User.created_at >= today))
     elif criteria == 'week':
         stmt = select(User).where(and_(User.status == 'active', User.created_at >= week_ago))
@@ -1752,7 +1856,13 @@ async def get_custom_users(db: AsyncSession, criteria: str) -> list:
         return []
 
     result = await db.execute(stmt)
-    return result.scalars().all()
+    users = result.scalars().all()
+    if criteria in _NEW_TIME_SEGMENTS:
+        users = [user for user in users if _matches_new_time_segment(user, criteria, now)]
+    if criteria in {'registered_0_7_unpaid', 'registered_8_30_unpaid'}:
+        paid_ids = await real_payment_user_ids(db, [user.id for user in users])
+        return [user for user in users if user.id not in paid_ids]
+    return users
 
 
 async def get_users_statistics(db: AsyncSession) -> dict:
@@ -1818,15 +1928,22 @@ def get_target_name(target_type: str) -> str:
         'sub': 'Сейчас без подписки',
         'expiring': 'Заканчивается за 3 дня (включая пробные, без активных суточных)',
         'expired': 'Закончилась (включая пробные)',
+        'expired_trial_unpaid': 'Триал закончился, ни разу не оплачивал',
+        'former_payer_no_subscription': 'Раньше платил — сейчас без подписки',
         'active_zero': 'Действующая не пробная, 0 ГБ за период',
         'trial_zero': 'Действующая пробная, 0 ГБ за период',
         'zero': 'Действующая, 0 ГБ за текущий период',
         'custom_today': 'Зарегистрированные сегодня',
         'custom_week': 'Зарегистрированные за неделю',
         'custom_month': 'Зарегистрированные за месяц',
+        'custom_registered_0_7_unpaid': 'Регистрация за последние 7 дней, ни одной оплаты',
+        'custom_registered_8_30_unpaid': 'Регистрация 8–30 дней назад, ни одной оплаты',
         'custom_active_today': 'Активные сегодня',
         'custom_inactive_week': 'Неактивные 7+ дней',
         'custom_inactive_month': 'Неактивные 30+ дней',
+        'custom_inactive_7_29': 'Без действий в боте: 7–29 дней',
+        'custom_inactive_30_89': 'Без действий в боте: 30–89 дней',
+        'custom_inactive_90_plus': 'Без действий в боте: 90+ дней',
         'custom_referrals': 'Через рефералов',
         'custom_direct': 'Прямая регистрация',
     }
