@@ -1477,13 +1477,17 @@ async def test_fused_confirmation_shows_the_wallet_and_a_top_up_door_on_a_partia
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 199 ₽' in caption
     # Обратная дорога названа ДО того, как человек ушёл платить: доплата заказ не оформляет.
-    assert (
-        'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.'
-        in caption
-    )
-    # Вторая строка обязательна: без неё «продолжите» посылает человека в этот же чат, где
-    # висит ЭТО ЖЕ сообщение с числами, которые доплата только что сделала ложными.
-    assert 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.' in caption
+    assert 'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне.' in caption
+    # 🔴 РЕК-16.3 переписал это ожидание, и это ЗАЯВЛЕНИЕ, а не подкрутка под новый текст.
+    # Здесь требовалась строка «этот экран не обновится: его кнопки возьмут полную цену».
+    # С этапа РЕК-8а она неверна: кнопки способов — `web_app` в кабинет с `autostart=1`, а
+    # кабинет по ним счёт не выставляет, пока на счету есть деньги, а округлённая недостача
+    # меньше цены. Это ровно состояние, в котором печатается абзац. Предупреждение о вреде,
+    # которого больше нет, — такая же ложь, как молчание о настоящем.
+    # ⚠️ Граница честно: забор стережёт отсутствие СНЯТОГО обещания по его словам. Новую
+    # неправду другими словами он не поймает — это цена любого текстового сторожа.
+    assert 'не обновится' not in caption
+    assert 'полную цену' not in caption
     # Остаток мины DE: строка про баланс без этой оговорки читается как «зачтётся».
     assert 'Или оплатите полной суммой: деньги с баланса при этом не спишутся.' in caption
     # Провайдерский минимум здесь меньше недостачи, значит второго числа на экране нет.
@@ -1637,11 +1641,9 @@ async def test_direct_payment_methods_screen_shows_the_wallet_and_the_top_up_doo
     assert '5 устройств · 3 месяца' in caption
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 1 139 ₽' in caption
-    assert (
-        'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне — ваш выбор сохранится.'
-        in caption
-    )
-    assert 'После доплаты этот экран в чате не обновится: его кнопки возьмут полную цену.' in caption
+    assert 'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне.' in caption
+    # РЕК-16.3: см. объяснение у первого такого забора выше.
+    assert 'не обновится' not in caption
     assert 'Или оплатите полной суммой: деньги с баланса при этом не спишутся.' in caption
     assert keyboard[0][0].text == '💰 Доплатить 1 139 ₽'
     # Адрес возврата несёт СРОК И УСТРОЙСТВА ЭТОГО ЗАКАЗА, а не выбор из состояния диалога:
@@ -1803,10 +1805,12 @@ async def test_fused_confirmation_speaks_english_to_an_english_customer() -> Non
     assert '💳 Balance: ₽50' in caption
     assert '⚠️ Shortage: ₽199' in caption
     assert (
-        'Your balance is already counted in the «Shortage» line. Top up and finish the purchase in the same window — we keep your choice.'
+        'Your balance is already counted in the «Shortage» line. Top up and finish the purchase in the same window.'
         in caption
     )
-    assert 'After the top-up this chat screen will not refresh: its buttons still charge the full price.' in caption
+    # РЕК-16.3: обе половины снятого предупреждения — и по-английски тоже.
+    assert 'will not refresh' not in caption
+    assert 'charge the full price' not in caption
     assert 'Or pay the full amount: your balance stays untouched.' in caption
     assert keyboard[0][0].text == '💰 Top up ₽199'
 
