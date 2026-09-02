@@ -24,6 +24,10 @@ from app.services.user_service import UserService
 APP_DIR = Path(__file__).resolve().parents[2] / 'app'
 
 
+async def _noop_close():
+    return None
+
+
 def _user(**overrides):
     defaults = {
         'id': 42,
@@ -274,16 +278,44 @@ async def test_delivery_failure_never_rolls_back_the_money(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_undelivered_is_reported_as_undelivered(monkeypatch):
+    """🔴 Самый частый отказ доставки НЕ бросает исключение.
+
+    Человек заблокировал бота, или у него нет ни Телеграма, ни подтверждённой почты —
+    ``send_notification`` просто возвращает False. Если наверх при этом уйдёт True,
+    кабинет напишет админу «клиент уведомлён» про человека, который ничего не получил,
+    и разбор жалобы пойдёт по ложному следу.
+
+    Сторож заведён мутацией: она вставляла ``return True`` перед настоящим возвратом,
+    и весь набор оставался зелёным.
+    """
+    from app.services import user_service as module
+
+    class FakeBot:
+        session = SimpleNamespace(close=_noop_close)
+
+    async def fake_get_user_by_id(db, user_id):
+        return _user()
+
+    async def fake_send(self, bot, user, amount_kopeks):
+        return False
+
+    monkeypatch.setattr('app.bot_factory.create_bot', lambda *a, **k: FakeBot())
+    monkeypatch.setattr(module, 'get_user_by_id', fake_get_user_by_id)
+    monkeypatch.setattr(module.settings, 'BOT_TOKEN', 'test-token')
+    monkeypatch.setattr(module.UserService, 'send_balance_change_notification', fake_send)
+
+    assert await module.notify_balance_change(db=object(), user_id=42, amount_kopeks=50000) is False
+
+
+@pytest.mark.asyncio
 async def test_delivery_result_is_reported_truthfully(monkeypatch):
     """Обратная сторона: когда доставка удалась, наверх обязано прийти True —
     иначе кабинет будет пугать админа «не доставлено» на каждом успешном начислении."""
     from app.services import user_service as module
 
     class FakeBot:
-        session = SimpleNamespace(close=lambda: _noop())
-
-    async def _noop():
-        return None
+        session = SimpleNamespace(close=_noop_close)
 
     async def fake_get_user_by_id(db, user_id):
         return _user()
