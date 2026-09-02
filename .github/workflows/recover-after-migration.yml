@@ -56,6 +56,7 @@ jobs:
       - name: Recover only the captured pre-migration bot image
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET_SHA: ${{ github.sha }}
           REQUESTED_ROLLBACK_SHA: ${{ inputs.rollback_source_sha }}
         with:
@@ -63,7 +64,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 15m
-          envs: TARGET_SHA,REQUESTED_ROLLBACK_SHA
+          envs: TARGET_SHA,REQUESTED_ROLLBACK_SHA,GH_TOKEN
           script: |
             set -Eeuo pipefail
 
@@ -216,7 +217,19 @@ jobs:
             fi
             [[ "$REQUESTED_ROLLBACK_SHA" =~ ^[0-9a-f]{40}$ ]]
 
-            git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+            # 🔴 02.09.2026: выкладка кабинета встала намертво — `git fetch` с боевого отвечал
+            # «could not read Username for 'https://github.com'», хотя репозиторий ПУБЛИЧНЫЙ,
+            # адрес верный, DNS и 443 в порядке, а GitHub на `info/refs` отдавал серверу
+            # HTTP 200. Разобрано пробами прямо с сервера (только чтение): список веток
+            # читается, само скачивание — отказ 401. Это подпись отказа обслуживать
+            # БЕЗЫМЯННЫЕ скачивания с этого адреса. Три перезапуска подряд не помогли.
+            # ⚠️ Переключение на протокол версии 1 НЕ помогает — проверено, меняет только текст
+            # ошибки. Лечение одно: приходить не безымянно.
+            # 🟢 Токен даёт сам GitHub на время прогона, он живёт минуты и гаснет вместе с ним;
+            # на сервере ничего не заводится и не хранится, в `git config` не пишется.
+            # ⛔ Не эхоить $GH_TOKEN и не включать `set -x` в этом шаге.
+            git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
+              fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
             CURRENT_SOURCE_SHA="$(git rev-parse HEAD)"
             REMOTE_MAIN_SHA="$(git rev-parse origin/main)"
             CURRENT_IMAGE_ID="$(docker inspect --format '{{.Image}}' remnawave_bot)"
