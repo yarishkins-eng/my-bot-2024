@@ -1146,6 +1146,15 @@ async def update_user_balance(
         )
     _reject_account_erasure_mutation(user)
 
+    # Ноль отбиваем, как это давно делает Web API: он проходил валидацию, уходил в ветку
+    # начисления, писал проводку на 0 ₽ — а клиенту улетало «списано 0 ₽, если это ошибка,
+    # напишите в поддержку». Обращение в поддержку на пустом месте.
+    if request.amount_kopeks == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Сумма не может быть нулевой',
+        )
+
     old_balance = user.balance_kopeks
 
     if request.amount_kopeks >= 0:
@@ -1198,7 +1207,7 @@ async def update_user_balance(
     # молча возвращал ответ, и клиент сидел с деньгами, не зная о них.
     from app.services.user_service import notify_balance_change
 
-    notified = await notify_balance_change(db, user_id, request.amount_kopeks)
+    notified = await notify_balance_change(db, user_id, request.amount_kopeks, reason=request.description)
 
     return UpdateBalanceResponse(
         success=True,

@@ -353,7 +353,7 @@ async def update_balance(
     # Тот же долг, что у кабинетных маршрутов: правку баланса человеку надо назвать.
     from app.services.user_service import notify_balance_change
 
-    await notify_balance_change(db, found_user.id, payload.amount_kopeks)
+    await notify_balance_change(db, found_user.id, payload.amount_kopeks, reason=payload.description)
 
     # Reload the user to ensure we have the latest data
     if found_user.telegram_id == user_id:

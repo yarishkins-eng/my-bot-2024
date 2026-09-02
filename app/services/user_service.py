@@ -1,4 +1,5 @@
 import asyncio
+import html
 import os
 from dataclasses import dataclass, field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -78,6 +79,10 @@ from app.services.notification_delivery_service import (
     NotificationType,
     notification_delivery_service,
 )
+
+# Живость подписки — один набор на весь проект. Своя копия уже дала P1: `limited`
+# (платящий человек с исчерпанным трафиком) читался как «подписки нет».
+from app.utils.funnel_state import _ALIVE_STATUSES as ALIVE_SUBSCRIPTION_STATUSES
 
 
 logger = structlog.get_logger(__name__)
@@ -190,7 +195,9 @@ class UserService:
         has_legacy_history = has_legacy_provider or has_guest_purchase or has_legacy_platega or has_legacy_transaction
         return has_device_first or has_legacy_history, has_legacy_history
 
-    async def send_balance_change_notification(self, bot: Bot, user: User, amount_kopeks: int) -> bool:
+    async def send_balance_change_notification(
+        self, bot: Bot, user: User, amount_kopeks: int, reason: str | None = None
+    ) -> bool:
         """Сообщает человеку, что его баланс изменили руками.
 
         Зовётся из ВСЕХ четырёх поверхностей ручной правки баланса: чат-админка,
@@ -207,48 +214,86 @@ class UserService:
         ``notification_delivery_service`` отказывает только забаненным и удалённым.
         Возвращает True, если сообщение реально ушло хотя бы одним каналом.
         """
+        # Ноль сообщать нечего, а ветвление по знаку отправило бы его в «списано 0 ₽»
+        # с приглашением жаловаться в поддержку. Дыру нашли четыре линзы ревью разом.
+        if amount_kopeks == 0:
+            return False
+
         texts = get_texts(user.language)
         formatted_balance = settings.format_price(user.balance_kopeks)
 
+        # 🔴 Живость подписки берём ОБЩИМ классификатором проекта, а не своим набором.
+        # Первая редакция писала набор в третий раз и перевернула его на трёх статусах
+        # из пяти: `limited` (платящий человек, у которого кончился трафик) читался как
+        # «подписки нет», и бот предлагал ему купить вторую. Нашли три линзы независимо.
+        # `actual_status`, а не `status`: остальной бот судит по нему — он учитывает срок.
         subs = getattr(user, 'subscriptions', None) or []
-        has_extendable = any(sub.status in {'active', 'expired', 'trial'} for sub in subs)
+        has_any_subscription = bool(subs)
+        has_live_subscription = any(sub.actual_status in ALIVE_SUBSCRIPTION_STATUSES for sub in subs)
 
         if amount_kopeks > 0:
             message = texts.t(
                 'BALANCE_ADMIN_ADDED',
-                '💰 <b>Баланс пополнен на {amount}</b>\n\nСейчас на счету: {balance}',
+                '💰 <b>Баланс пополнен на {amount}</b>\n\nТекущий баланс: {balance}',
             ).format(amount=settings.format_price(amount_kopeks), balance=formatted_balance)
-            # Человеку без подписки говорим главное: деньги на счету — это ещё не VPN.
-            # Это единственная полезная мысль из снесённой send_topup_success_to_user;
-            # её собственные кнопки были мертвы (`subscription_buy`,
-            # `subscription_add_devices` не зарегистрированы нигде в проекте).
-            if not has_extendable:
-                message += '\n\n' + texts.t(
-                    'BALANCE_ADMIN_ADDED_NO_SUBSCRIPTION',
-                    'Подписка от этого не включается — её нужно оформить.',
-                )
         else:
             message = texts.t(
                 'BALANCE_ADMIN_SUBTRACTED',
-                '💸 <b>С баланса списано {amount}</b>\n\nСейчас на счету: {balance}',
+                '💸 <b>С баланса списано {amount}</b>\n\nТекущий баланс: {balance}',
             ).format(amount=settings.format_price(abs(amount_kopeks)), balance=formatted_balance)
-            message += '\n\n' + texts.t(
-                'BALANCE_ADMIN_SUBTRACTED_HINT',
-                'Если это ошибка — напишите в поддержку.',
+
+        # Причина, которую админ написал в поле «Описание». Кабинет прямо подписывает это
+        # поле «увидит клиент», и клиент действительно видит его в истории операций — но
+        # в самом сообщении её не было, и списание приходило голым числом. Имя админа при
+        # этом клиенту по-прежнему не показывается: его в описании нет.
+        clean_reason = (reason or '').strip()
+        if clean_reason:
+            message += '\n' + texts.t('BALANCE_ADMIN_REASON', 'Причина: {reason}').format(
+                reason=html.escape(clean_reason[:300])
             )
 
-        # Кнопка обязана вести в живой обработчик. Оба колбэка проверены на регистрацию:
-        # `subscription_extend` — purchase.py, `funnel_tariffs` — tariff_purchase.py.
-        if has_extendable:
-            button_text = texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку')
-            button_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
+        if amount_kopeks > 0:
+            # Три случая, а не два: «работает» / «есть, но не работает» / «нет вовсе».
+            # Второй появился потому, что при ОБЫЧНОМ пополнении истёкшая подписка у
+            # платившего продлевается сама (`try_auto_extend_expired_after_topup`), а
+            # ручное начисление этот путь намеренно не трогает — и человек об этом
+            # не догадается, если ему не сказать.
+            if not has_any_subscription:
+                message += '\n\n' + texts.t(
+                    'BALANCE_ADMIN_ADDED_NO_SUBSCRIPTION',
+                    'Это деньги на счету, а не подписка — VPN включится, когда вы её оформите.',
+                )
+            elif not has_live_subscription:
+                message += '\n\n' + texts.t(
+                    'BALANCE_ADMIN_ADDED_SUBSCRIPTION_OFF',
+                    'Подписка сейчас не работает — деньги сами её не включают.',
+                )
         else:
-            button_text = texts.t('FUNNEL_TARIFFS', '💳 Тарифы')
-            button_callback = 'funnel_tariffs'
+            message += '\n\n' + texts.t(
+                'BALANCE_ADMIN_SUBTRACTED_HINT',
+                'Если это ошибка — напишите {support}, разберёмся.',
+            ).format(support=settings.get_support_contact_display_html())
 
-        reply_markup = types.InlineKeyboardMarkup(
-            inline_keyboard=[[types.InlineKeyboardButton(text=button_text, callback_data=button_callback)]]
-        )
+        # 🔴 У СПИСАНИЯ КНОПКИ НЕТ, и это не забывчивость.
+        # Бот живёт в режиме с картинкой (`ENABLE_LOGO_MODE`), и оба живых колбэка это
+        # сообщение уничтожают: `funnel_tariffs` роняет `edit_media` на текстовом
+        # сообщении и уходит в ветку `callback.message.delete()`, `subscription_extend`
+        # перерисовывает его поверх. Человек, которому написали «если это ошибка —
+        # напишите в поддержку», нажал бы единственную кнопку и потерял сумму и дату,
+        # которые собирался процитировать. Поэтому контакт поддержки стоит в тексте.
+        reply_markup = None
+        if amount_kopeks > 0:
+            # Оба колбэка проверены на регистрацию: `subscription_extend` — purchase.py,
+            # `funnel_tariffs` — tariff_purchase.py. Сторож этапа проверяет это тестом.
+            if has_any_subscription:
+                button_text = texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку')
+                button_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
+            else:
+                button_text = texts.t('FUNNEL_TARIFFS', '💳 Тарифы')
+                button_callback = 'funnel_tariffs'
+            reply_markup = types.InlineKeyboardMarkup(
+                inline_keyboard=[[types.InlineKeyboardButton(text=button_text, callback_data=button_callback)]]
+            )
 
         context = {
             'amount_kopeks': amount_kopeks,
@@ -257,7 +302,7 @@ class UserService:
             'new_balance_rubles': user.balance_kopeks / 100,
             'formatted_amount': settings.format_price(amount_kopeks),
             'formatted_balance': formatted_balance,
-            # Имя админа и служебная подпись операции клиенту не показываются.
+            # Имя админа клиенту не показывается.
         }
 
         return await notification_delivery_service.send_notification(
@@ -631,13 +676,11 @@ class UserService:
 
             # Отправляем уведомление пользователю, если операция прошла успешно
             if success and bot:
-                # Перечитываем человека целиком, а не db.refresh: refresh снимает загруженные
-                # связи, а уведомление читает user.subscriptions — в асинхронной сессии
-                # доленивиться нечем. get_user_by_id тянет подписки selectinload'ом.
-                user = await get_user_by_id(db, user_id) or user
+                # Обновляем пользователя для получения нового баланса
+                await db.refresh(user)
 
                 # Отправляем уведомление (не блокируем операцию если не удалось отправить)
-                await self.send_balance_change_notification(bot, user, amount_kopeks)
+                await self.send_balance_change_notification(bot, user, amount_kopeks, reason=description)
 
             return success
 
@@ -1825,7 +1868,13 @@ class TestAccountResetPlan:
     deleted_rows: dict[str, int] = dataclass_field(default_factory=dict)
 
 
-async def notify_balance_change(db: AsyncSession, user_id: int, amount_kopeks: int) -> bool:
+async def notify_balance_change(
+    db: AsyncSession,
+    user_id: int,
+    amount_kopeks: int,
+    reason: str | None = None,
+    bot: Bot | None = None,
+) -> bool:
     """Сказать человеку, что его баланс изменили руками. Возвращает «дошло ли».
 
     Общая точка для поверхностей, у которых экземпляра бота нет в руках: кабинетная
@@ -1836,30 +1885,45 @@ async def notify_balance_change(db: AsyncSession, user_id: int, amount_kopeks: i
     🔴 Сбой доставки НЕ роняет начисление: деньги уже на счету, и отказ Телеграма не
     повод возвращать админу ошибку. Поэтому здесь ловится всё и возвращается False.
     """
-    if not settings.BOT_TOKEN:
+    if not settings.BOT_TOKEN or amount_kopeks == 0:
         return False
 
+    own_bot = None
     try:
-        # Перечитываем целиком: нужен и свежий баланс, и подписки (selectinload) —
-        # уведомление выбирает по ним кнопку, а доленивиться в асинхронной сессии нечем.
+        # Перечитываем целиком: нужен и свежий баланс, и подписки — уведомление выбирает
+        # по ним и текст, и кнопку.
         user = await get_user_by_id(db, user_id)
         if not user:
             return False
 
-        from app.bot_factory import create_bot
+        if bot is None:
+            # 🔴 Бота передаёт вызывающий, если зовёт нас в цикле. Своя сессия на каждого
+            # человека — это TLS-рукопожатие плюс 250 мс на закрытие в aiogram: массовая
+            # выдача на 500 человек уезжала из секунд в минуты. Цитируемый образец
+            # (`admin_pinned_messages`) как раз держит ОДНОГО бота на всю рассылку.
+            from app.bot_factory import create_bot
 
-        bot = create_bot()
+            own_bot = create_bot()
+            bot = own_bot
+
         try:
             # У телеграм-отправки три попытки по 15 с. Без потолка кнопка «Начислить»
             # в кабинете могла бы думать три четверти минуты.
+            # ⚠️ Известная плата: при flood control потолок обрывает ретраи отправителя,
+            # и человек помечается «подтверждения нет». Поэтому подпись в кабинете
+            # НЕ называет причину — их девять, и мы знаем только факт.
             return await asyncio.wait_for(
-                UserService().send_balance_change_notification(bot, user, amount_kopeks),
+                UserService().send_balance_change_notification(bot, user, amount_kopeks, reason=reason),
                 timeout=20.0,
             )
         finally:
-            await bot.session.close()
+            if own_bot is not None:
+                await own_bot.session.close()
     except Exception as error:
-        logger.error(
+        # warning, а не error: сетевой таймаут и flood control — ожидаемые исходы, а
+        # уровень error пересылается в админ-чат (TelegramNotifierProcessor). Соседний
+        # код в notification_delivery_service понизил их по той же причине.
+        logger.warning(
             'Не удалось сообщить человеку о ручной правке баланса',
             user_id=user_id,
             amount_kopeks=amount_kopeks,

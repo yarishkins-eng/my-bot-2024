@@ -5,11 +5,13 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import structlog
+from aiogram import Bot
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bot_factory import create_bot
 from app.config import settings
 from app.database.crud.subscription import (
     add_subscription_traffic,
@@ -416,6 +418,21 @@ async def _do_add_traffic(
     )
 
 
+_cached_bot: Bot | None = None
+
+
+def _get_bot() -> Bot:
+    """Один бот на весь процесс — как в рассылке закреплённых сообщений.
+
+    Своя сессия на каждого человека стоит TLS-рукопожатия плюс 250 мс на закрытие
+    в aiogram: выдача на 500 человек уезжала из секунд в минуты.
+    """
+    global _cached_bot
+    if _cached_bot is None:
+        _cached_bot = create_bot()
+    return _cached_bot
+
+
 async def _do_add_balance(
     db: AsyncSession,
     user: User,
@@ -452,18 +469,20 @@ async def _do_add_balance(
     # Массовая выдача — такое же начисление, как поштучное, и молчать о нём нельзя.
     from app.services.user_service import notify_balance_change
 
-    notified = await notify_balance_change(db, user.id, amount_kopeks)
+    notified = await notify_balance_change(
+        db, user.id, amount_kopeks, reason=params.balance_description, bot=_get_bot()
+    )
     # Пауза ради лимита Телеграма (~30 сообщений в секунду): без неё массовая выдача
     # на сотню человек упрётся во flood control. Тот же шаг, что у рассылки закреплённых
-    # сообщений (`services/pinned_message_service.py`).
+    # сообщений (`services/pinned_message_service.py`) — и бот, как там, ОДИН на прогон.
     await asyncio.sleep(0.05)
 
-    suffix = '' if notified else ' (клиент не уведомлён)'
     return BulkUserResult(
         user_id=user.id,
         success=True,
-        message=f'Added {amount_kopeks / 100:.2f}₽ to balance{suffix}',
+        message=f'Added {amount_kopeks / 100:.2f}₽ to balance',
         username=user.username,
+        notified=notified,
     )
 
 
