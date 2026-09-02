@@ -276,9 +276,20 @@ async def test_admin_name_never_reaches_the_client(captured):
 
     await UserService().send_balance_change_notification(bot=object(), user=user, amount_kopeks=50000)
 
+    # 🔴 Проверка «нет слова admin среди значений» пережила мутацию, которая клала в
+    # контекст НАСТОЯЩЕЕ имя («Пётр»): слова admin в нём нет. Поэтому пришпиливаем
+    # ТОЧНЫЙ состав — любое новое поле обязано быть замечено и обосновано.
+    assert set(captured['context']) == {
+        'amount_kopeks',
+        'amount_rubles',
+        'new_balance_kopeks',
+        'new_balance_rubles',
+        'formatted_amount',
+        'formatted_balance',
+    }, 'в контекст уведомления добавили поле — проверьте, что оно не про админа'
+
     values = ' '.join(str(v) for v in captured['context'].values())
     assert 'admin' not in values.lower()
-    assert 'description' not in captured['context']
 
 
 # ---------------------------------------------------------------------------
