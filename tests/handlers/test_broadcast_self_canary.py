@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from aiogram.exceptions import (
     TelegramBadRequest,
+    TelegramForbiddenError,
     TelegramNetworkError,
     TelegramRetryAfter,
 )
@@ -457,6 +458,113 @@ async def test_stop_after_last_delivery_preserves_delivery_outcome(monkeypatch) 
 
     assert result == (1, 0, 0, False)
     mark_cancelled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_worker_hands_the_exact_resolved_audience_to_delivery(monkeypatch) -> None:
+    """The worker must send to the rematerialized set, with no hidden expansion."""
+    broadcast = SimpleNamespace(
+        id=501,
+        status='queued',
+        sent_count=0,
+        failed_count=0,
+        blocked_count=0,
+        total_count=0,
+    )
+
+    class Session:
+        async def get(self, _model, _broadcast_id):
+            return broadcast
+
+        async def commit(self):
+            return None
+
+    class SessionContext:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    service = BroadcastService()
+    service.set_bot(AsyncMock())
+    resolved_ids = [1001, 2002, 3003]
+    monkeypatch.setattr(broadcast_module, 'AsyncSessionLocal', SessionContext)
+    monkeypatch.setattr(service, '_fetch_recipients', AsyncMock(return_value=resolved_ids))
+    send_batched = AsyncMock(return_value=(3, 0, 0, False))
+    monkeypatch.setattr(service, '_send_batched', send_batched)
+    mark_finished = AsyncMock()
+    monkeypatch.setattr(service, '_mark_finished', mark_finished)
+
+    config = BroadcastConfig(target='custom_registered_0_7_unpaid', message_text='Controlled', selected_buttons=[])
+    await service._run_broadcast(501, config, asyncio.Event())
+
+    assert broadcast.total_count == len(resolved_ids)
+    assert send_batched.await_args.args[1] == resolved_ids
+    mark_finished.assert_awaited_once_with(501, 3, 0, 0, cancelled=False)
+
+
+@pytest.mark.asyncio
+async def test_batched_delivery_records_one_terminal_outcome_per_resolved_recipient(monkeypatch) -> None:
+    """Every non-transient recipient attempt becomes exactly one terminal outcome."""
+    service = BroadcastService()
+    service.set_bot(AsyncMock())
+    attempted: list[int] = []
+
+    async def deliver(telegram_id: int, *_args, **_kwargs) -> None:
+        attempted.append(telegram_id)
+        method = SendMessage(chat_id=telegram_id, text='Controlled')
+        if telegram_id == 2002:
+            raise TelegramForbiddenError(method=method, message='Forbidden: bot was blocked by the user')
+        if telegram_id == 3003:
+            raise TelegramBadRequest(method=method, message='chat not found')
+
+    monkeypatch.setattr(service, '_deliver_message', deliver)
+    monkeypatch.setattr(service, '_update_progress', AsyncMock())
+    monkeypatch.setattr(broadcast_module.asyncio, 'sleep', AsyncMock())
+
+    recipient_ids = [1001, 2002, 3003, 4004]
+    sent, failed, unavailable, cancelled = await service._send_batched(
+        501,
+        recipient_ids,
+        BroadcastConfig(target='custom_registered_0_7_unpaid', message_text='Controlled', selected_buttons=[]),
+        None,
+        asyncio.Event(),
+    )
+
+    assert attempted == recipient_ids
+    assert len(attempted) == len(set(attempted))
+    assert (sent, failed, unavailable, cancelled) == (2, 0, 2, False)
+    assert sent + failed + unavailable == len(recipient_ids)
+
+
+@pytest.mark.asyncio
+async def test_transient_retries_still_record_one_recipient_outcome(monkeypatch) -> None:
+    """Several Bot API attempts for one ID must not inflate the recipient counters."""
+    service = BroadcastService()
+    service.set_bot(AsyncMock())
+    method = SendMessage(chat_id=1001, text='Controlled')
+    deliver = AsyncMock(
+        side_effect=[
+            TelegramNetworkError(method=method, message='temporary network failure'),
+            None,
+        ]
+    )
+    monkeypatch.setattr(service, '_deliver_message', deliver)
+    monkeypatch.setattr(service, '_update_progress', AsyncMock())
+    monkeypatch.setattr(broadcast_module.asyncio, 'sleep', AsyncMock())
+
+    sent, failed, unavailable, cancelled = await service._send_batched(
+        501,
+        [1001],
+        BroadcastConfig(target='custom_registered_0_7_unpaid', message_text='Controlled', selected_buttons=[]),
+        None,
+        asyncio.Event(),
+    )
+
+    assert deliver.await_count == 2
+    assert (sent, failed, unavailable, cancelled) == (1, 0, 0, False)
+    assert sent + failed + unavailable == 1
 
 
 def test_history_target_labels_hide_internal_filter_keys() -> None:
