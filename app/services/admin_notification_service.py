@@ -127,8 +127,8 @@ class AdminNotificationService:
             return f'ID {referred_by_id}'
 
     async def _get_user_promo_group(self, db: AsyncSession, user: User) -> PromoGroup | None:
-        if getattr(user, 'promo_group', None):
-            return user.promo_group
+        if promo_group := user.__dict__.get('promo_group'):
+            return promo_group
 
         if not user.promo_group_id:
             return None
@@ -139,8 +139,8 @@ class AdminNotificationService:
             # relationship might not be available — fallback to direct fetch
             pass
 
-        if getattr(user, 'promo_group', None):
-            return user.promo_group
+        if promo_group := user.__dict__.get('promo_group'):
+            return promo_group
 
         try:
             return await get_promo_group_by_id(db, user.promo_group_id)
