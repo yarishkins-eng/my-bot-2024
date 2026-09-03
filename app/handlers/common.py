@@ -5,8 +5,9 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import User
-from app.keyboards.inline import get_back_keyboard
+from app.keyboards.inline import get_back_keyboard, get_support_keyboard
 from app.localization.texts import get_rules, get_texts
+from app.services.support_settings_service import SupportSettingsService
 
 
 logger = structlog.get_logger(__name__)
@@ -92,14 +93,41 @@ async def handle_unknown_message(
     message: types.Message,
     db_user: User | None = None,
 ):
-    texts = get_texts(db_user.language if db_user else 'ru')
+    language = db_user.language if db_user else 'ru'
+    texts = get_texts(language)
+    try:
+        support_enabled = SupportSettingsService.is_support_menu_enabled()
+    except Exception:
+        support_enabled = True
+
+    reply_markup = get_support_keyboard(language) if support_enabled else get_back_keyboard(language)
+    has_support_action = support_enabled and any(
+        button.url or (button.callback_data and button.callback_data != 'back_to_menu')
+        for row in reply_markup.inline_keyboard
+        for button in row
+    )
+
+    if not has_support_action:
+        await message.answer(
+            texts.t(
+                'UNKNOWN_COMMAND_MESSAGE_SUPPORT_UNAVAILABLE',
+                '❓ Не понял сообщение. Поддержка сейчас временно недоступна. Вернитесь в меню и попробуйте позже.',
+            ),
+            reply_markup=reply_markup,
+        )
+        return
 
     await message.answer(
         texts.t(
-            'UNKNOWN_COMMAND_MESSAGE',
-            '❓ Не понимаю эту команду. Используйте кнопки меню.',
+            'UNKNOWN_MEDIA_MESSAGE' if message.text is None else 'UNKNOWN_COMMAND_MESSAGE',
+            (
+                '📎 Получил вложение, но вне обращения оно не передаётся поддержке. '
+                'Выберите способ связи ниже и опишите, что случилось.'
+                if message.text is None
+                else '❓ Не понял сообщение. Если что-то не работает, выберите способ связи с поддержкой ниже.'
+            ),
         ),
-        reply_markup=get_back_keyboard(db_user.language if db_user else 'ru'),
+        reply_markup=reply_markup,
     )
 
 
