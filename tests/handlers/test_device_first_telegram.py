@@ -29,6 +29,7 @@ from app.handlers.subscription.device_first import (
     pay,
     pay_fused,
     pay_wallet_fused,
+    refresh_status,
     restart_device_first_or_show_legacy_tariffs,
     show_device_first_entry,
 )
@@ -54,6 +55,19 @@ def _db(*, open_order: bool = False):
 
 def _user(language: str = 'ru'):
     return SimpleNamespace(language=language)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('ui_state', 'message'), [('awaiting_payment', 'Статус не изменился.'), ('processing', 'Оплата подтверждена. Текущий статус показан ниже.'), ('cancelled', 'Счёт больше не действует.'), ('operator_review', 'Текущий статус показан ниже.'), (DeviceFirstError('invalid_state', 'closed'), None)])  # fmt: skip
+async def test_refresh_status_answers_with_visible_result(ui_state: str | DeviceFirstError, message: str | None) -> None:  # fmt: skip
+    callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='ru', balance_kopeks=0)
+    error = ui_state if isinstance(ui_state, DeviceFirstError) else None
+    render, error_render = AsyncMock(), AsyncMock()
+    with patch('app.handlers.subscription.device_first.get_owned_checkout', AsyncMock(side_effect=error, return_value=SimpleNamespace())), patch('app.handlers.subscription.device_first.serialize_checkout', return_value={'ui_state': ui_state}), patch('app.handlers.subscription.device_first._render_checkout', render), patch('app.handlers.subscription.device_first._render_error', error_render):  # fmt: skip
+        await refresh_status(callback, user, AsyncMock(), AsyncMock())
+    callback.answer.assert_awaited_once_with(*(() if error else (message,)))
+    assert (render.await_count, error_render.await_count) == ((0, 1) if error else (1, 0))
 
 
 @pytest.mark.asyncio

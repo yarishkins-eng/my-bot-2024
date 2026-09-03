@@ -1871,7 +1871,6 @@ async def refresh_status(
     state: FSMContext,
 ) -> None:
     del state
-    await callback.answer()
     try:
         checkout = await get_owned_checkout(
             db,
@@ -1879,8 +1878,14 @@ async def refresh_status(
             user_id=db_user.id,
         )
     except DeviceFirstError as error:
+        await callback.answer()
         await _render_error(callback, db_user, error)
         return
+    except Exception:
+        await callback.answer()
+        raise
+    ru = 'Оплата подтверждена. Текущий статус показан ниже.' if (ui_state := serialize_checkout(checkout, balance_kopeks=db_user.balance_kopeks)['ui_state']) in {'processing', 'provisioning', 'ready'} else 'Счёт больше не действует.' if ui_state in {'reprice_required', 'conflict', 'cancelled', 'expired'} else 'Статус не изменился.' if ui_state == 'awaiting_payment' else 'Текущий статус показан ниже.'  # fmt: skip
+    await callback.answer(_text(db_user, ru, 'Payment confirmed. The current status is shown below.' if ui_state in {'processing', 'provisioning', 'ready'} else 'The invoice is no longer valid.' if ui_state in {'reprice_required', 'conflict', 'cancelled', 'expired'} else 'The status has not changed.' if ui_state == 'awaiting_payment' else 'The current status is shown below.'))  # fmt: skip
     await _render_checkout(callback, db_user, db, checkout)
 
 
