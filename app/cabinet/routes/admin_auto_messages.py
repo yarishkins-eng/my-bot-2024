@@ -627,10 +627,25 @@ class AutoMessageHistoryRow(BaseModel):
     claimed: bool | None
 
 
+class AutoMessageInsert(BaseModel):
+    """Метка, вместо которой подставляется не число, а другой текст."""
+
+    name: str
+    variants: list[str]
+
+
 class AutoMessageDetail(AutoMessageItem):
     buttons: list[AutoMessageButton]
     history: list[AutoMessageHistoryRow]
     history_note: str
+    # Текст письма, прочитанный оттуда же, откуда его берёт отправитель.
+    text: str | None = None
+    # Куски, которые отправитель ДОПИСЫВАЕТ к тексту сам (ссылка на кабинет, строка тарифа).
+    text_suffixes: list[str] = []
+    # Метки, вместо которых подставляется другой текст, — со списком вариантов.
+    text_inserts: list[AutoMessageInsert] = []
+    # Имя сообщения, у которого ТОТ ЖЕ текст. Выводится из общего ключа, не из руки.
+    shares_text_with: str | None = None
 
 
 class AutoMessagePatch(BaseModel):
@@ -907,6 +922,123 @@ def _build_item(
 
 
 # ---------------------------------------------------------------------------
+# Текст письма
+# ---------------------------------------------------------------------------
+#
+# 🔴 Карточка показывает текст, ПРОЧИТАННЫЙ ОТТУДА ЖЕ, откуда его берёт отправитель.
+# Копию текста здесь заводить нельзя ни под каким видом: экран показывал бы то, что
+# не уходит, и ни один тест этого бы не поймал (прямой запрет владельца 05.09.2026).
+#
+# Источников ровно два:
+#   * словарь локалей `ru.json` — 14 сообщений, ключ ниже;
+#   * константа рядом с отправителем — 8 сообщений, которых в словаре нет вовсе.
+
+_LOCALE_TEXT_KEYS: dict[str, str] = {
+    'trial-expired': 'TRIAL_EXPIRED_NOTIFICATION',
+    'trial-discount': 'TRIAL_EXPIRED_DISCOUNT',
+    'paid-3d': 'SUBSCRIPTION_EXPIRING_PAID',
+    'paid-1d': 'SUBSCRIPTION_EXPIRING_PAID',
+    'return-day1': 'SUBSCRIPTION_EXPIRED_1D',
+    'return-wave2': 'SUBSCRIPTION_EXPIRED_SECOND_WAVE',
+    'return-wave3': 'SUBSCRIPTION_EXPIRED_THIRD_WAVE',
+    'traffic-80': 'TRAFFIC_WARNING_ALERT',
+    'channel-left': 'TRIAL_CHANNEL_UNSUBSCRIBED',
+    'channel-back': 'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE',
+    'low-balance': 'LOW_BALANCE_ALERT',
+    'autopay-ok': 'AUTOPAY_SUCCESS',
+    'autopay-fail': 'AUTOPAY_FAILED',
+    'autopay-final': 'AUTOPAY_FAILED_FINAL',
+}
+
+# Метки, вместо которых подставляется не число, а ДРУГОЙ ТЕКСТ. Показать шаблон и
+# промолчать про них — значит показать предложение с невидимыми дырами.
+_INSERT_KEYS: dict[str, tuple[str, ...]] = {
+    'autopay_status': ('AUTOPAY_STATUS_CARD_ACTIVE', 'AUTOPAY_STATUS_NO_CARD', 'AUTOPAY_STATUS_OFF'),
+    'action_text': ('AUTOPAY_ACTION_RENEW', 'AUTOPAY_ACTION_ENABLE', 'AUTOPAY_ACTION_CHECK_BALANCE'),
+    'check_button': ('CHANNEL_CHECK_BUTTON',),
+}
+
+# Кому отправитель дописывает ссылку на кабинет, а кому — строку с тарифом.
+_CABINET_LINK_IDS = frozenset({'grace-2d', 'paid-expired', 'paid-3d', 'paid-1d'})
+_TARIFF_LINE_IDS = frozenset({'autopay-ok', 'autopay-fail', 'autopay-final'})
+
+
+def _const_texts() -> dict[str, str]:
+    """Тексты, которых в словаре нет: берутся у самих отправителей, не копируются."""
+    from app.services.daily_subscription_service import (
+        DAILY_CHARGE_TEXT,
+        DAILY_PAUSED_TEXT,
+        TRAFFIC_RESET_TEXT,
+    )
+    from app.services.monitoring_service import (
+        AUTOPAY_LEGACY_TEXT,
+        GRACE_STARTED_TEXT,
+        SUBSCRIPTION_EXPIRED_TEXT,
+        TRIAL_ENDING_TEXT,
+        TRIAL_NOT_CONNECTED_TEXT,
+    )
+
+    return {
+        'grace-2d': GRACE_STARTED_TEXT,
+        'autopay-legacy': AUTOPAY_LEGACY_TEXT,
+        'paid-expired': SUBSCRIPTION_EXPIRED_TEXT,
+        'trial-2h': TRIAL_ENDING_TEXT,
+        'trial-not-connected': TRIAL_NOT_CONNECTED_TEXT,
+        'daily-charge': DAILY_CHARGE_TEXT,
+        'daily-paused': DAILY_PAUSED_TEXT,
+        'traffic-reset': TRAFFIC_RESET_TEXT,
+    }
+
+
+def _shares_text_with(message_id: str) -> str | None:
+    """Кто ещё шлёт ТОТ ЖЕ текст. Выводится из общего ключа, а не пишется рукой."""
+    key = _LOCALE_TEXT_KEYS.get(message_id)
+    if not key:
+        return None
+    for other_id, other_key in _LOCALE_TEXT_KEYS.items():
+        if other_key == key and other_id != message_id:
+            twin = CATALOG_BY_ID.get(other_id)
+            if twin:
+                return twin['title']
+    return None
+
+
+def _text_facts(message_id: str) -> dict[str, Any]:
+    """Текст письма и всё, без чего он на экране был бы неправдой."""
+    from app.localization.loader import DEFAULT_LANGUAGE
+    from app.localization.texts import get_texts
+    from app.services.monitoring_service import AUTOPAY_TARIFF_LINE, cabinet_link_suffix
+
+    texts = get_texts(DEFAULT_LANGUAGE)
+    key = _LOCALE_TEXT_KEYS.get(message_id)
+    body = texts.get(key) if key else _const_texts().get(message_id)
+
+    suffixes: list[str] = []
+    if message_id in _CABINET_LINK_IDS:
+        link = cabinet_link_suffix()
+        if link:
+            suffixes.append(link)
+    if message_id in _TARIFF_LINE_IDS:
+        suffixes.append(AUTOPAY_TARIFF_LINE)
+
+    inserts = [
+        AutoMessageInsert(
+            name=name,
+            variants=[value for value in (texts.get(variant_key) for variant_key in variant_keys) if value],
+        )
+        for name, variant_keys in _INSERT_KEYS.items()
+        if body and '{' + name + '}' in body
+    ]
+
+    return {
+        'text': body,
+        'text_suffixes': suffixes,
+        'text_inserts': inserts,
+        'shares_text_with': _shares_text_with(message_id),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Эндпоинты
 # ---------------------------------------------------------------------------
 
@@ -957,6 +1089,7 @@ async def get_auto_message(
     history = await _history_for(db, entry, user, request)
     return AutoMessageDetail(
         **item.model_dump(),
+        **_text_facts(message_id),
         buttons=[AutoMessageButton(**button) for button in entry.get('buttons', [])],
         history=history,
         history_note=(
