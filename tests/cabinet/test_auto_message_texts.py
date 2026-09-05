@@ -7,6 +7,7 @@
 
 import ast
 import pathlib
+import re
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -22,10 +23,10 @@ from app.cabinet.routes.admin_auto_messages import (
 
 
 _BOT_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_SENDING_MODULES = (
-    'app/services/monitoring_service.py',
-    'app/services/daily_subscription_service.py',
-)
+_MONITORING = 'app/services/monitoring_service.py'
+_DAILY = 'app/services/daily_subscription_service.py'
+_CHANNEL_CHECKER = 'app/middlewares/channel_checker.py'
+_SENDING_MODULES = (_MONITORING, _DAILY)
 
 # Длиннее этого литерал уже не служебная строка, а письмо человеку.
 _LETTER_LENGTH = 60
@@ -127,7 +128,105 @@ async def test_the_shown_text_is_the_one_that_is_actually_sent() -> None:
     assert tail and sent['text'].endswith(tail), 'хвост письма на карточке не совпал с отправленным'
 
 
-def test_a_dictionary_letter_shows_the_dictionary_value_not_the_inline_fallback() -> None:
+# Кто ИМЕННО шлёт каждое сообщение. Таблица написана здесь заново и намеренно: сторож
+# обязан утверждать правду сам, а не сверяться с той же картой, которую проверяет.
+# Без неё обе подмены проходили насквозь — и подмена ключа словаря (карточка «Трафик»
+# показывала бы письмо про баланс), и подмена константы на выдуманную копию, то есть
+# ровно то, что владелец запретил прямым текстом.
+_SENDER_OF: dict[str, tuple[str, str, str]] = {
+    # id: (модуль, функция-отправитель, имя ключа локали ИЛИ имя константы)
+    'trial-not-connected': (_MONITORING, '_send_trial_not_connected_notification', 'TRIAL_NOT_CONNECTED_TEXT'),
+    'trial-2h': (_MONITORING, '_send_trial_ending_notification', 'TRIAL_ENDING_TEXT'),
+    'trial-expired': (_MONITORING, '_send_trial_expired_notification', 'TRIAL_EXPIRED_NOTIFICATION'),
+    'trial-discount': (_MONITORING, '_send_trial_expired_discount_notification', 'TRIAL_EXPIRED_DISCOUNT'),
+    'paid-3d': (_MONITORING, '_send_subscription_expiring_notification', 'SUBSCRIPTION_EXPIRING_PAID'),
+    'paid-1d': (_MONITORING, '_send_subscription_expiring_notification', 'SUBSCRIPTION_EXPIRING_PAID'),
+    'paid-expired': (_MONITORING, '_send_subscription_expired_notification', 'SUBSCRIPTION_EXPIRED_TEXT'),
+    'return-day1': (_MONITORING, '_send_expired_day1_notification', 'SUBSCRIPTION_EXPIRED_1D'),
+    'return-wave2': (_MONITORING, '_send_expired_discount_notification', 'SUBSCRIPTION_EXPIRED_SECOND_WAVE'),
+    'return-wave3': (_MONITORING, '_send_expired_discount_notification', 'SUBSCRIPTION_EXPIRED_THIRD_WAVE'),
+    'traffic-80': (_MONITORING, '_check_traffic_warnings', 'TRAFFIC_WARNING_ALERT'),
+    'channel-left': (_MONITORING, '_send_trial_channel_unsubscribed_notification', 'TRIAL_CHANNEL_UNSUBSCRIBED'),
+    'channel-back': (
+        _CHANNEL_CHECKER,
+        '_reactivate_subscription_on_subscribe',
+        'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE',
+    ),
+    'grace-2d': (_MONITORING, '_send_grace_started_notification', 'GRACE_STARTED_TEXT'),
+    'low-balance': (_MONITORING, '_check_low_balance_alerts', 'LOW_BALANCE_ALERT'),
+    'autopay-ok': (_MONITORING, '_send_autopay_success_notification', 'AUTOPAY_SUCCESS'),
+    'autopay-fail': (_MONITORING, '_send_autopay_failed_notification', 'AUTOPAY_FAILED'),
+    'autopay-final': (_MONITORING, '_send_autopay_failed_notification', 'AUTOPAY_FAILED_FINAL'),
+    'autopay-legacy': (_MONITORING, '_process_autopayments', 'AUTOPAY_LEGACY_TEXT'),
+    'daily-charge': (_DAILY, '_notify_daily_charge', 'DAILY_CHARGE_TEXT'),
+    'daily-paused': (_DAILY, '_notify_insufficient_balance', 'DAILY_PAUSED_TEXT'),
+    'traffic-reset': (_DAILY, '_notify_traffic_reset', 'TRAFFIC_RESET_TEXT'),
+}
+
+
+def _function_source(module_name: str, function_name: str) -> str:
+    source = (_BOT_ROOT / module_name).read_text(encoding='utf-8')
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
+            return ast.get_source_segment(source, node) or ''
+    raise AssertionError(f'{module_name}: функции {function_name} больше нет')
+
+
+def test_every_card_names_the_source_its_own_sender_uses() -> None:
+    """Карточка читает ровно тот ключ (или ту константу), которым пользуется ЕЁ отправитель.
+
+    🔴 Без этого сторожа подмена одного ключа в карте проходила сквозь весь набор:
+    карточка «Израсходовано много трафика» показывала бы письмо про низкий баланс, и
+    ничто бы не покраснело. Имя ищется ВНУТРИ тела отправителя, а не по всему файлу —
+    иначе годится любой ключ, который в этом файле вообще встречается.
+    """
+    wrong: list[str] = []
+    for message_id, (module_name, function_name, name) in _SENDER_OF.items():
+        body = _function_source(module_name, function_name)
+        if not re.search(rf'\b{re.escape(name)}\b', body):
+            wrong.append(f'{message_id}: {name} не встречается в {function_name}')
+    assert not wrong, 'карточка читает не тот источник: ' + '; '.join(wrong)
+
+
+def test_the_map_covers_every_card_and_names_the_right_kind_of_source() -> None:
+    """Таблица отправителей полна, и словарные не перепутаны с константными."""
+    assert set(_SENDER_OF) == {entry['id'] for entry in AUTO_MESSAGE_CATALOG}
+    for message_id, (_, _, name) in _SENDER_OF.items():
+        if message_id in _LOCALE_TEXT_KEYS:
+            assert _LOCALE_TEXT_KEYS[message_id] == name, f'{message_id}: карта указывает на другой ключ'
+        else:
+            assert name.endswith('_TEXT'), f'{message_id}: у бесключевого письма источник должен быть константой'
+
+
+def test_a_shown_const_is_the_senders_own_object_not_a_copy_of_it() -> None:
+    """Показанный текст — ТОТ ЖЕ объект, что у отправителя, а не равная ему строка.
+
+    🔴 Прямой запрет владельца: копии текста быть не должно. Проверка на равенство
+    его не держит — выдуманная копия, случайно совпавшая с оригиналом, равна ему.
+    Держит только тождество объекта: подмени константу литералом — покраснеет.
+    """
+    from app.services import daily_subscription_service as daily, monitoring_service as monitoring
+
+    modules = {_MONITORING: monitoring, _DAILY: daily}
+    for message_id, shown in _const_texts().items():
+        module_name, _, const_name = _SENDER_OF[message_id]
+        original = getattr(modules[module_name], const_name)
+        assert shown is original, f'{message_id}: карточке подсунута копия текста, а не сам источник'
+
+
+@pytest.fixture
+def multi_tariff(monkeypatch):
+    """Переключатель многотарифного режима. Подмена МЕТОДА pydantic-настроек — только
+    на классе: на экземпляре она молча не применяется (урок ритуала от 19.08)."""
+    from app.config import settings
+
+    def _set(value: bool) -> None:
+        monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: value)
+
+    return _set
+
+
+def test_a_dictionary_letter_shows_the_dictionary_value_not_the_inline_fallback(multi_tariff) -> None:
     """У вызовов вида ``texts.t(КЛЮЧ, 'запасной текст')`` формулировки РАЗНЫЕ.
 
     Клиенту уходит значение из ``ru.json``, а встроенный запасной мёртв. Показать
@@ -135,9 +234,33 @@ def test_a_dictionary_letter_shows_the_dictionary_value_not_the_inline_fallback(
     """
     import json
 
+    multi_tariff(True)
     ru = json.loads((_BOT_ROOT / 'app/localization/locales/ru.json').read_text(encoding='utf-8'))
     for message_id, key in _LOCALE_TEXT_KEYS.items():
         assert _text_facts(message_id)['text'] == ru[key], f'{message_id}: показан не {key} из ru.json'
+
+
+def test_the_tariff_never_appears_on_a_card_while_the_mode_that_fills_it_is_off(multi_tariff) -> None:
+    """Метка тарифа и строка тарифа следуют за многотарифным режимом, как у отправителя.
+
+    🔴 У отправителя ОДИННАДЦАТЬ мест, и каждое стоит за ``is_multi_tariff_enabled()``.
+    Пока режим выключен, метка разворачивается в пустоту у каждого клиента. Показывать
+    её владельцу — значит показывать кусок письма, которого никто не получит: ровно то,
+    ради чего этап и делается. Первая редакция АС-10 показывала, три линзы нашли.
+    """
+    multi_tariff(False)
+    for entry in AUTO_MESSAGE_CATALOG:
+        facts = _text_facts(entry['id'])
+        assert '{tariff_label}' not in (facts['text'] or ''), f'{entry["id"]}: метка тарифа при выключенном режиме'
+        assert not any('Тариф' in suffix for suffix in facts['text_suffixes']), (
+            f'{entry["id"]}: строка тарифа при выключенном режиме'
+        )
+
+    # А когда режим включён — обе на месте: сторож обязан отличать одно от другого,
+    # иначе он проходит и на коде, который просто выбросил тариф навсегда.
+    multi_tariff(True)
+    assert '{tariff_label}' in _text_facts('trial-2h')['text']
+    assert any('Тариф' in suffix for suffix in _text_facts('autopay-ok')['text_suffixes'])
 
 
 def test_the_cabinet_link_appendix_is_shown_where_the_sender_adds_it(monkeypatch) -> None:

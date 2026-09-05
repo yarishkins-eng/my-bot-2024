@@ -1005,6 +1005,7 @@ def _shares_text_with(message_id: str) -> str | None:
 
 def _text_facts(message_id: str) -> dict[str, Any]:
     """Текст письма и всё, без чего он на экране был бы неправдой."""
+    from app.config import settings
     from app.localization.loader import DEFAULT_LANGUAGE
     from app.localization.texts import get_texts
     from app.services.monitoring_service import AUTOPAY_TARIFF_LINE, cabinet_link_suffix
@@ -1013,12 +1014,21 @@ def _text_facts(message_id: str) -> dict[str, Any]:
     key = _LOCALE_TEXT_KEYS.get(message_id)
     body = texts.get(key) if key else _const_texts().get(message_id)
 
+    # 🔴 Строка тарифа и метка {tariff_label} живут ТОЛЬКО в многотарифном режиме: у
+    # отправителя каждое из одиннадцати мест стоит за `is_multi_tariff_enabled()`
+    # (проверено поимённо 05.09.2026). Пока режим выключен, они разворачиваются в
+    # пустоту у КАЖДОГО клиента — и показать их владельцу значило бы показать кусок
+    # письма, которого никто не получит. Ровно то, ради чего этап и делается.
+    multi_tariff = settings.is_multi_tariff_enabled()
+    if body and not multi_tariff:
+        body = body.replace('{tariff_label}', '')
+
     suffixes: list[str] = []
     if message_id in _CABINET_LINK_IDS:
         link = cabinet_link_suffix()
         if link:
             suffixes.append(link)
-    if message_id in _TARIFF_LINE_IDS:
+    if message_id in _TARIFF_LINE_IDS and multi_tariff:
         suffixes.append(AUTOPAY_TARIFF_LINE)
 
     inserts = [
