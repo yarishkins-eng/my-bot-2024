@@ -7,7 +7,6 @@
 
 import ast
 import pathlib
-import re
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -164,12 +163,29 @@ _SENDER_OF: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _function_source(module_name: str, function_name: str) -> str:
+def _function_node(module_name: str, function_name: str) -> ast.AST:
     source = (_BOT_ROOT / module_name).read_text(encoding='utf-8')
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
-            return ast.get_source_segment(source, node) or ''
+            return node
     raise AssertionError(f'{module_name}: функции {function_name} больше нет')
+
+
+def _names_used_in(node: ast.AST) -> set[str]:
+    """Имена, которые функция реально называет, — по узлам дерева, не по тексту.
+
+    Текстовый поиск засчитывал бы имя, упомянутое в комментарии или в докстринге,
+    то есть ровно там, где оно ничего не делает.
+    """
+    used: set[str] = set()
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Name):
+            used.add(inner.id)
+        elif isinstance(inner, ast.Attribute):
+            used.add(inner.attr)
+        elif isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+            used.add(inner.value)
+    return used
 
 
 def test_every_card_names_the_source_its_own_sender_uses() -> None:
@@ -182,9 +198,8 @@ def test_every_card_names_the_source_its_own_sender_uses() -> None:
     """
     wrong: list[str] = []
     for message_id, (module_name, function_name, name) in _SENDER_OF.items():
-        body = _function_source(module_name, function_name)
-        if not re.search(rf'\b{re.escape(name)}\b', body):
-            wrong.append(f'{message_id}: {name} не встречается в {function_name}')
+        if name not in _names_used_in(_function_node(module_name, function_name)):
+            wrong.append(f'{message_id}: {name} не называется в {function_name}')
     assert not wrong, 'карточка читает не тот источник: ' + '; '.join(wrong)
 
 
@@ -196,6 +211,66 @@ def test_the_map_covers_every_card_and_names_the_right_kind_of_source() -> None:
             assert _LOCALE_TEXT_KEYS[message_id] == name, f'{message_id}: карта указывает на другой ключ'
         else:
             assert name.endswith('_TEXT'), f'{message_id}: у бесключевого письма источник должен быть константой'
+
+
+def test_every_template_is_filled_with_exactly_the_names_it_asks_for() -> None:
+    """Метки шаблона совпадают с тем, что подставляет отправитель, — имя в имя.
+
+    🔴 Заведён критиком полноты волны 2. Пока письма были f-строками, опечатку в
+    имени подстановки ловил линтер: `F821`, неопределённое имя, и ворота проекта
+    не пускали такой код. Как только текст переехал в строковый литерал, имя стало
+    невидимо для линтера: мутация `{amount}` → `{amount_typo}` прошла `ruff check`
+    и все 3591 тестов, а в бою дала бы `KeyError` на живом клиенте. У суточного
+    списания это ещё и превращает успешное списание в «ошибку» в журнале.
+
+    То есть перевод в шаблоны снял чужую защиту, и вернуть её обязан этот сторож.
+    """
+    import string
+
+    from app.services import daily_subscription_service as daily, monitoring_service as monitoring
+
+    modules = {_MONITORING: monitoring, _DAILY: daily}
+    checked = 0
+    problems: list[str] = []
+
+    for module_name, module in modules.items():
+        source = (_BOT_ROOT / module_name).read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        # Все константы-тексты этого модуля: ИМЯ_ЧЕГО_ТО_TEXT или строка тарифа.
+        const_names = {
+            name
+            for name in dir(module)
+            if (name.endswith('_TEXT') or name == 'AUTOPAY_TARIFF_LINE') and isinstance(getattr(module, name), str)
+        }
+        assert const_names, f'{module_name}: констант-текстов не найдено, сторож стал пустым'
+
+        called_with: dict[str, list[set[str]]] = {name: [] for name in const_names}
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'format'
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in const_names
+            ):
+                assert not node.args, f'{node.func.value.id}: позиционная подстановка, имена не проверить'
+                called_with[node.func.value.id].append({kw.arg for kw in node.keywords if kw.arg})
+
+        for name in sorted(const_names):
+            wanted = {field for _, field, _, _ in string.Formatter().parse(getattr(module, name)) if field is not None}
+            calls = called_with[name]
+            if not calls:
+                if wanted:
+                    problems.append(f'{name}: в тексте есть метки {sorted(wanted)}, а .format() никто не зовёт')
+                checked += 1
+                continue
+            for given in calls:
+                if given != wanted:
+                    problems.append(f'{name}: в тексте {sorted(wanted)}, подставляют {sorted(given)}')
+                checked += 1
+
+    assert checked >= 9, f'сторож проверил всего {checked} шаблонов — он ослеп'
+    assert not problems, 'подстановка разошлась с текстом: ' + '; '.join(problems)
 
 
 def test_a_shown_const_is_the_senders_own_object_not_a_copy_of_it() -> None:
@@ -285,6 +360,47 @@ def test_the_twins_name_each_other() -> None:
     assert _text_facts('paid-3d')['shares_text_with'] == 'Подписка истекает завтра'
     assert _text_facts('paid-1d')['shares_text_with'] == 'Подписка истекает через 3 дня'
     assert _text_facts('trial-expired')['shares_text_with'] is None, 'у одиночного письма выдуман близнец'
+
+
+def test_a_variant_the_settings_cannot_produce_is_not_shown(monkeypatch) -> None:
+    """Из двух взаимоисключающих фраз показана та, которую даёт текущая настройка.
+
+    🔴 Прогон сценария 05.09.2026: владелец читает список вариантов сверху вниз и
+    достраивает письмо, которого не бывает. Пару «включите автоплатёж» / «продлите
+    вручную» отправитель выбирает не по клиенту, а по настройке бота — значит одна
+    из них не уходит НИКОМУ, и показывать её нельзя по той же причине, по которой
+    убрана строка тарифа.
+    """
+    from app.config import settings
+
+    def shown() -> set[str]:
+        for insert in _text_facts('paid-3d')['text_inserts']:
+            if insert.name == 'action_text':
+                return {variant.text for variant in insert.variants}
+        raise AssertionError('метка action_text пропала с карточки')
+
+    # Поле pydantic живёт на ЭКЗЕМПЛЯРЕ: классовая подмена молча не применилась бы
+    # (урок ритуала от 19.08 — там же сказано, что для МЕТОДОВ наоборот).
+    monkeypatch.setattr(settings, 'ENABLE_AUTOPAY', False)
+    without = shown()
+    monkeypatch.setattr(settings, 'ENABLE_AUTOPAY', True)
+    with_autopay = shown()
+
+    assert without != with_autopay, 'настройка не влияет на список — забор пустой'
+    assert not (without & {phrase for phrase in with_autopay if 'втоплат' in phrase and 'ключите' in phrase})
+    for variants in (without, with_autopay):
+        assert len(variants) == 2, f'вариантов должно остаться два, а не {len(variants)}'
+
+
+def test_every_variant_says_when_it_happens() -> None:
+    """У каждой фразы написано, при каком условии она встаёт. Список без условий —
+    это приглашение собрать в голове письмо, которого не бывает."""
+    facts = _text_facts('paid-3d')
+    assert facts['text_inserts'], 'вставки пропали'
+    for insert in facts['text_inserts']:
+        for variant in insert.variants:
+            assert variant.when.strip(), f'{insert.name}: у варианта нет условия'
+            assert variant.text.strip(), f'{insert.name}: у варианта нет текста'
 
 
 def test_inserts_are_listed_exactly_where_the_placeholder_stands() -> None:

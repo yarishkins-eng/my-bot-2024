@@ -209,7 +209,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
             'ответила — бот промолчит, но не скажет «вы не подключились» человеку с работающим VPN.'
         ),
         'buttons': [
-            {'label': '📲 Подключиться', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '📲 Подключиться', 'target': 'Кабинет, экран подключения', 'tracked': False},
             {'label': '💬 Написать в поддержку', 'target': 'Кабинет, экран поддержки', 'tracked': False},
         ],
     },
@@ -627,11 +627,18 @@ class AutoMessageHistoryRow(BaseModel):
     claimed: bool | None
 
 
+class AutoMessageInsertVariant(BaseModel):
+    """Одна из фраз, которая может встать вместо метки, и условие, при котором встаёт."""
+
+    text: str
+    when: str
+
+
 class AutoMessageInsert(BaseModel):
     """Метка, вместо которой подставляется не число, а другой текст."""
 
     name: str
-    variants: list[str]
+    variants: list[AutoMessageInsertVariant]
 
 
 class AutoMessageDetail(AutoMessageItem):
@@ -952,11 +959,30 @@ _LOCALE_TEXT_KEYS: dict[str, str] = {
 
 # Метки, вместо которых подставляется не число, а ДРУГОЙ ТЕКСТ. Показать шаблон и
 # промолчать про них — значит показать предложение с невидимыми дырами.
-_INSERT_KEYS: dict[str, tuple[str, ...]] = {
-    'autopay_status': ('AUTOPAY_STATUS_CARD_ACTIVE', 'AUTOPAY_STATUS_NO_CARD', 'AUTOPAY_STATUS_OFF'),
-    'action_text': ('AUTOPAY_ACTION_RENEW', 'AUTOPAY_ACTION_ENABLE', 'AUTOPAY_ACTION_CHECK_BALANCE'),
-    'check_button': ('CHANNEL_CHECK_BUTTON',),
+# 🔴 В письмо встаёт ОДНА из фраз, а не все. Показывать их списком без условия —
+# значит дать владельцу собрать в голове письмо, которого не бывает: прогон сценария
+# 05.09.2026 показал, что он прочитает сверху вниз и решит, будто платящим клиентам
+# уходит спокойное «автоплатёж включён», тогда как на боевом автоплатёж включён у
+# ОДНОЙ активной платной подписки из 60 (замер 05.09.2026).
+# Условия списаны с ветвлений отправителя `_send_subscription_expiring_notification`.
+_INSERT_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
+    'autopay_status': (
+        ('AUTOPAY_STATUS_CARD_ACTIVE', 'автоплатёж включён, карта привязана'),
+        ('AUTOPAY_STATUS_NO_CARD', 'автоплатёж включён, карты нет'),
+        ('AUTOPAY_STATUS_OFF', 'автоплатёж выключен'),
+    ),
+    'action_text': (
+        ('AUTOPAY_ACTION_CHECK_BALANCE', 'автоплатёж включён'),
+        ('AUTOPAY_ACTION_ENABLE', 'автоплатёж выключен, а в настройках бота он разрешён'),
+        ('AUTOPAY_ACTION_RENEW', 'автоплатёж выключен, и в настройках бота он тоже выключен'),
+    ),
+    'check_button': (('CHANNEL_CHECK_BUTTON', 'всегда'),),
 }
+
+# Пара, которую отправитель выбирает НЕ по клиенту, а по настройке бота: показывать
+# обе — показывать фразу, которой сегодня не бывает ни у кого.
+_ONLY_WITH_AUTOPAY_ALLOWED = 'AUTOPAY_ACTION_ENABLE'
+_ONLY_WITHOUT_AUTOPAY_ALLOWED = 'AUTOPAY_ACTION_RENEW'
 
 # Кому отправитель дописывает ссылку на кабинет, а кому — строку с тарифом.
 _CABINET_LINK_IDS = frozenset({'grace-2d', 'paid-expired', 'paid-3d', 'paid-1d'})
@@ -1015,8 +1041,8 @@ def _text_facts(message_id: str) -> dict[str, Any]:
     body = texts.get(key) if key else _const_texts().get(message_id)
 
     # 🔴 Строка тарифа и метка {tariff_label} живут ТОЛЬКО в многотарифном режиме: у
-    # отправителя каждое из одиннадцати мест стоит за `is_multi_tariff_enabled()`
-    # (проверено поимённо 05.09.2026). Пока режим выключен, они разворачиваются в
+    # отправителей КАЖДОЕ место, где они рождаются, стоит за `is_multi_tariff_enabled()`
+    # (проверено поимённо 05.09.2026 и перепроверено скептиком). Пока режим выключен, они разворачиваются в
     # пустоту у КАЖДОГО клиента — и показать их владельцу значило бы показать кусок
     # письма, которого никто не получит. Ровно то, ради чего этап и делается.
     multi_tariff = settings.is_multi_tariff_enabled()
@@ -1031,12 +1057,25 @@ def _text_facts(message_id: str) -> dict[str, Any]:
     if message_id in _TARIFF_LINE_IDS and multi_tariff:
         suffixes.append(AUTOPAY_TARIFF_LINE)
 
+    autopay_allowed = bool(getattr(settings, 'ENABLE_AUTOPAY', False))
+
+    def _reachable(variant_key: str) -> bool:
+        if variant_key == _ONLY_WITH_AUTOPAY_ALLOWED:
+            return autopay_allowed
+        if variant_key == _ONLY_WITHOUT_AUTOPAY_ALLOWED:
+            return not autopay_allowed
+        return True
+
     inserts = [
         AutoMessageInsert(
             name=name,
-            variants=[value for value in (texts.get(variant_key) for variant_key in variant_keys) if value],
+            variants=[
+                AutoMessageInsertVariant(text=text, when=when)
+                for variant_key, when in variants
+                if _reachable(variant_key) and (text := texts.get(variant_key))
+            ],
         )
-        for name, variant_keys in _INSERT_KEYS.items()
+        for name, variants in _INSERT_KEYS.items()
         if body and '{' + name + '}' in body
     ]
 
