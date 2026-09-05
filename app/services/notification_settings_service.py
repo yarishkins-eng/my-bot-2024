@@ -53,6 +53,10 @@ class NotificationSettingsService:
         # это написано прямо. Разводить их по отдельным выключателям — отдельная работа
         # (решение владельца 01.09.2026).
         'trial_2h': {'enabled': True, 'warn_hours': 2},
+        # Письмо тем, у кого идёт пробный, а первого подключения не было.
+        # По умолчанию ВЫКЛЮЧЕНО: появление ключа не должно начать рассылку само,
+        # включается вручную в кабинете. Тот же порядок, что у 'trial_expired_discount'.
+        'trial_not_connected': {'enabled': False},
         'subscription_expired': {'enabled': True},  # «пробный истёк» И «подписка истекла»
         'subscription_expiring': {'enabled': True},  # «истекает через 3 дня» И «истекает завтра»
         'traffic_warning': {'enabled': True},

@@ -208,6 +208,25 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         ],
     },
     {
+        'id': 'trial-not-connected',
+        'group': 'trial',
+        'title': 'Пробный идёт, а VPN не подключён',
+        'when': 'Через 3 часа после начала пробного — тем, у кого не было ни одного подключения',
+        'control': 'toggle',
+        'settings_key': 'trial_not_connected',
+        'params': (),
+        'sent_type': 'trial_not_connected',
+        'warning': (
+            'По умолчанию выключено. Включите — и письмо уйдёт всем, кто уже висит '
+            'неподключённым дольше трёх часов, а дальше по одному-двум в сутки. '
+            'Факт подключения бот спрашивает у панели; если панель молчит, письмо не уходит.'
+        ),
+        'buttons': [
+            {'label': '📲 Подключиться', 'target': 'Экран подключения', 'tracked': False},
+            {'label': '💬 Написать в поддержку', 'target': 'Экран поддержки в боте', 'tracked': False},
+        ],
+    },
+    {
         'id': 'trial-discount',
         'group': 'trial',
         'title': 'Скидка на первую подписку',
