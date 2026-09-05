@@ -222,6 +222,12 @@ LOGO_PATH = Path(settings.LOGO_FILE)
 # `notification_sent`. Три часа — чтобы у человека было время настроить самому.
 TRIAL_NOT_CONNECTED_AFTER_HOURS = 3
 
+# Сколько часов пробного должно ОСТАВАТЬСЯ, чтобы письмо имело смысл. Без этой границы
+# человек на 71-м часу теста получал бы за один проход сначала «пробный истекает через
+# час», а следом «поставьте приложение и добавьте подписку» — предложение начать
+# настройку, на которую времени уже нет.
+TRIAL_NOT_CONNECTED_MIN_HOURS_LEFT = 12
+
 
 class MonitoringService:
     def __init__(self, bot=None):
@@ -1256,7 +1262,19 @@ class MonitoringService:
             # выдача превратит всех до одного в «ни разу не подключался».
             logger.warning('Панель вернула ноль пользователей — читаем это как «не знаем»')
             return None
-        return {panel_user.uuid for panel_user in panel_users if panel_user.first_connected_at is not None}
+        connected = {panel_user.uuid for panel_user in panel_users if panel_user.first_connected_at is not None}
+        if not connected:
+            # 🔴 Та же болезнь с другой стороны: панель ответила про людей, но НИ У ОДНОГО
+            # нет даты первого подключения. На живой панели с сотней учёток это не факт,
+            # а подпись расхождения схемы (поле `userTraffic` приходит не во всех ответах
+            # RemnaWave). Без этой проверки одно обновление панели разослало бы письмо
+            # «вы не подключились» всем подряд, включая тех, у кого VPN работает.
+            logger.warning(
+                'Панель не показала ни одного первого подключения — читаем это как «не знаем»',
+                panel_users=len(panel_users),
+            )
+            return None
+        return connected
 
     async def _check_trial_not_connected(self, db: AsyncSession):
         """Письмо тем, у кого идёт пробный период, а первого подключения так и не было.
@@ -1292,14 +1310,22 @@ class MonitoringService:
                         # несут `is_trial=True`, живут годами (одна до 21.12.2031) и по флагу
                         # неотличимы от трёхдневного теста. Им это письмо адресовано быть не может.
                         Subscription.tariff_id == trial_tariff.id,
-                        Subscription.end_date > now,
                         Subscription.start_date <= now - timedelta(hours=TRIAL_NOT_CONNECTED_AFTER_HOURS),
-                        # 🔴 Второй пояс против того же Team. Отбор по помеченному пробному
-                        # тарифу верен ровно до тех пор, пока метку `is_trial_available` не
-                        # переставили: один щелчок в админке переносит её на любой тариф, и
-                        # тогда под письмо попали бы бесплатные подписки друзей со сроком
-                        # в годы. Живой пробный кончается в пределах своего срока, вечный — нет.
-                        Subscription.end_date <= now + timedelta(days=settings.TRIAL_DURATION_DAYS + 1),
+                        # Единственная граница по сроку: пробного должно ОСТАВАТЬСЯ столько,
+                        # чтобы письмо имело смысл. Она же покрывает `end_date > now`.
+                        #
+                        # 🔴 Верхней границы здесь СОЗНАТЕЛЬНО НЕТ. Ставил её вторым поясом
+                        # против тарифа Team — пояс оказался иллюзорным: подписка друга со
+                        # сроком 113 дней на 110-й день тоже «скоро кончается» и проходит.
+                        # Team не вечный, он длинный. А цена границы реальная: продление
+                        # пробного из кабинета не снимает `is_trial` и отодвигает срок, плюс
+                        # у тарифа есть своё `trial_duration_days`, перебивающее настройку, —
+                        # и живая цель письма молча выпадала бы из выборки.
+                        #
+                        # От Team защищает отбор по помеченному пробному тарифу выше, и
+                        # защищает полностью — ровно до тех пор, пока метку `is_trial_available`
+                        # не переставили на другой тариф. Переставят — письмо пойдёт за ней.
+                        Subscription.end_date > now + timedelta(hours=TRIAL_NOT_CONNECTED_MIN_HOURS_LEFT),
                         User.status == UserStatus.ACTIVE.value,
                     )
                 )
@@ -1321,6 +1347,7 @@ class MonitoringService:
                 logger.warning('Панель не ответила: письма о неподключении пропущены до следующего обхода')
                 return
 
+            sent = 0
             for subscription in pending:
                 user = subscription.user
 
@@ -1354,6 +1381,18 @@ class MonitoringService:
                         '📡 Отправлено письмо о неподключённом VPN',
                         telegram_id=user.telegram_id,
                     )
+                    sent += 1
+
+            # Числа прохода в журнал мониторинга: у этого письма счётчик отправок в кабинете
+            # стирается при продлении подписки, то есть ровно те, на ком оно сработало, из
+            # него исчезают. Эта запись — единственное место, где видно «смотрели N, написали M».
+            if sent:
+                await self._log_monitoring_event(
+                    db,
+                    'trial_not_connected_notifications_sent',
+                    f'Проверено {len(pending)} пробных без подключения, отправлено {sent}',
+                    {'checked': len(pending), 'sent': sent},
+                )
 
         except Exception as e:
             logger.error('Ошибка проверки неподключённых пробных подписок', error=e)
@@ -2773,7 +2812,16 @@ class MonitoringService:
 
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [build_miniapp_or_callback_button(text='📲 Подключиться', callback_data='subscription_connect')],
+                    [
+                        build_miniapp_or_callback_button(
+                            text='📲 Подключиться',
+                            callback_data='subscription_connect',
+                            # 🔴 Явный адрес: без него кабинет уводит с /subscription на Главную,
+                            # где под нужной кнопкой стоит предложение купить подписку. Письмо
+                            # помощи застрявшему человеку не должно первым делом продавать.
+                            cabinet_path='/connection',
+                        )
+                    ],
                     [build_miniapp_or_callback_button(text='💬 Написать в поддержку', callback_data='menu_support')],
                 ]
             )

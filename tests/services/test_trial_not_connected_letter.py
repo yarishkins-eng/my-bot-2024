@@ -94,8 +94,9 @@ async def test_query_filters_by_the_trial_tariff_so_team_friends_are_excluded(wi
     where = sql.split('WHERE', 1)[1]
     assert 'tariff_id' in where, 'отбор перестал ограничиваться пробным тарифом — письмо уедет на Team'
     assert 'start_date <=' in where, 'пропала нижняя граница возраста пробного'
-    # Второй пояс против Team: вечная подписка не может быть живым пробным.
-    assert 'end_date <=' in where, 'пропала верхняя граница срока — под письмо попадут вечные подписки'
+    # Письмо не должно приходить тому, у кого пробный вот-вот кончится: предлагать
+    # ставить приложение человеку, у которого остался час, бессмысленно.
+    assert 'end_date >' in where, 'пропал запас времени до конца пробного'
 
 
 @pytest.mark.asyncio
