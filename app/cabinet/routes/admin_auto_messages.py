@@ -179,6 +179,27 @@ def _assert_in_range(value: int, low: int, high: int, what: str) -> None:
 
 AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
     {
+        'id': 'trial-not-connected',
+        'group': 'trial',
+        'title': 'Пробный идёт, а VPN не подключён',
+        'when': 'Через 3 часа после начала пробного — тем, у кого не было ни одного подключения',
+        'control': 'toggle',
+        'settings_key': 'trial_not_connected',
+        'params': (),
+        'sent_type': 'trial_not_connected',
+        'quiet_check': 'trial_tariff_marked',
+        'warning': (
+            'Выключите — и человек, который активировал пробный и не подключился, '
+            'не услышит от бота ничего до самого конца теста. Первое включение накроет '
+            'всех, кто уже висит неподключённым дольше трёх часов. Факт подключения бот '
+            'спрашивает у панели: молчит панель — письмо не уходит.'
+        ),
+        'buttons': [
+            {'label': '📲 Подключиться', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '💬 Написать в поддержку', 'target': 'Кабинет, экран поддержки', 'tracked': False},
+        ],
+    },
+    {
         'id': 'trial-2h',
         'group': 'trial',
         'title': 'Пробный скоро истекает',
@@ -205,25 +226,6 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'buttons': [
             {'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
             {'label': '💳 Тарифы', 'target': 'Список тарифов в боте', 'tracked': False},
-        ],
-    },
-    {
-        'id': 'trial-not-connected',
-        'group': 'trial',
-        'title': 'Пробный идёт, а VPN не подключён',
-        'when': 'Через 3 часа после начала пробного — тем, у кого не было ни одного подключения',
-        'control': 'toggle',
-        'settings_key': 'trial_not_connected',
-        'params': (),
-        'sent_type': 'trial_not_connected',
-        'warning': (
-            'По умолчанию выключено. Включите — и письмо уйдёт всем, кто уже висит '
-            'неподключённым дольше трёх часов, а дальше по одному-двум в сутки. '
-            'Факт подключения бот спрашивает у панели; если панель молчит, письмо не уходит.'
-        ),
-        'buttons': [
-            {'label': '📲 Подключиться', 'target': 'Экран подключения', 'tracked': False},
-            {'label': '💬 Написать в поддержку', 'target': 'Экран поддержки в боте', 'tracked': False},
         ],
     },
     {
@@ -668,6 +670,15 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
         notes['traffic_limits'] = f'лимит есть у {format_subscriptions_declension(with_limit)} из {total_live}'
     else:
         reasons['traffic_limits'] = 'ни у одной живой подписки нет лимита гигабайтов'
+
+    # Письмо о неподключении отбирает людей по ПОМЕЧЕННОМУ пробному тарифу. Метки нет —
+    # отбирать не по чему, и служба выходит молча. Без этой строки экран показал бы
+    # «работает» сообщению, которое не может уйти никогда.
+    trial_tariff_marked = await db.scalar(
+        select(func.count()).select_from(Tariff).where(Tariff.is_trial_available.is_(True))
+    )
+    if not trial_tariff_marked:
+        reasons['trial_tariff_marked'] = 'ни один тариф не помечен пробным — отбирать не по чему'
 
     if not settings.CHANNEL_IS_REQUIRED_SUB:
         reasons['channel_required'] = 'подписка на канал не обязательна'

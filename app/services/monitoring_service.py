@@ -217,9 +217,9 @@ logger = structlog.get_logger(__name__)
 LOGO_PATH = Path(settings.LOGO_FILE)
 
 # Через сколько часов после начала пробного писать тому, кто так и не подключился.
-# 🔴 Меньше двух ставить нельзя: служба спит час ПОСЛЕ обхода, поэтому шаг между
-# обходами больше часа. Нижняя граница без верхней — окно не может оказаться уже шага,
-# и никто не проскочит молча; повтор держит `notification_sent`.
+# Граница только НИЖНЯЯ: человек остаётся кандидатом до конца пробного, поэтому окно
+# не может оказаться уже часового шага обхода и никто не проскочит молча. Повтор держит
+# `notification_sent`. Три часа — чтобы у человека было время настроить самому.
 TRIAL_NOT_CONNECTED_AFTER_HOURS = 3
 
 
@@ -1250,6 +1250,12 @@ class MonitoringService:
         except Exception as e:
             logger.error('Не удалось прочитать первые подключения из панели', error=e)
             return None
+        if not panel_users:
+            # 🔴 Ноль пользователей в панели при живых пробных подписках — это сбой чтения,
+            # а не факт. Пустой ответ обязан читаться как «не знаем»: иначе оборванная
+            # выдача превратит всех до одного в «ни разу не подключался».
+            logger.warning('Панель вернула ноль пользователей — читаем это как «не знаем»')
+            return None
         return {panel_user.uuid for panel_user in panel_users if panel_user.first_connected_at is not None}
 
     async def _check_trial_not_connected(self, db: AsyncSession):
@@ -1288,12 +1294,26 @@ class MonitoringService:
                         Subscription.tariff_id == trial_tariff.id,
                         Subscription.end_date > now,
                         Subscription.start_date <= now - timedelta(hours=TRIAL_NOT_CONNECTED_AFTER_HOURS),
+                        # 🔴 Второй пояс против того же Team. Отбор по помеченному пробному
+                        # тарифу верен ровно до тех пор, пока метку `is_trial_available` не
+                        # переставили: один щелчок в админке переносит её на любой тариф, и
+                        # тогда под письмо попали бы бесплатные подписки друзей со сроком
+                        # в годы. Живой пробный кончается в пределах своего срока, вечный — нет.
+                        Subscription.end_date <= now + timedelta(days=settings.TRIAL_DURATION_DAYS + 1),
                         User.status == UserStatus.ACTIVE.value,
                     )
                 )
             )
             candidates = [subscription for subscription in result.scalars().all() if subscription.user]
-            if not candidates:
+            # 🔴 Отсев уже написанных ДО обращения к панели. Пробный живёт 72 часа и остаётся
+            # кандидатом почти все из них, а письмо уходит на первом же обходе: без этого
+            # отсева бот обходил бы всю панель каждый час впустую. Обход стоит в цикле перед
+            # сверкой платежей, поэтому его зависание откладывает работу с деньгами.
+            pending = []
+            for subscription in candidates:
+                if not await notification_sent(db, subscription.user.id, subscription.id, 'trial_not_connected'):
+                    pending.append(subscription)
+            if not pending:
                 return
 
             connected_uuids = await self._fetch_connected_panel_uuids()
@@ -1301,13 +1321,21 @@ class MonitoringService:
                 logger.warning('Панель не ответила: письма о неподключении пропущены до следующего обхода')
                 return
 
-            for subscription in candidates:
+            for subscription in pending:
                 user = subscription.user
 
-                if await notification_sent(db, user.id, subscription.id, 'trial_not_connected'):
+                uuids = {subscription.remnawave_uuid, user.remnawave_uuid} - {None, ''}
+                if not uuids:
+                    # 🔴 Сравнивать не с чем: у подписки нет учётки в панели. Это то же
+                    # «мы не знаем», что и молчание панели, и трактовать его как
+                    # «не подключался» нельзя — человек мог подключаться, а мог вообще
+                    # не иметь профиля, и тогда подключаться ему нечем.
+                    logger.warning(
+                        'У пробной подписки нет учётки в панели: письмо о неподключении не отправлено',
+                        subscription_id=subscription.id,
+                    )
                     continue
 
-                uuids = {subscription.remnawave_uuid, user.remnawave_uuid} - {None}
                 if uuids & connected_uuids:
                     continue
 
@@ -2736,9 +2764,9 @@ class MonitoringService:
             message = """
 🔔 <b>Пробный период идёт, а VPN ещё не подключён</b>
 
-Вы активировали пробный доступ, но соединения с нашими серверами пока не было. Возможно, не дошли руки — а возможно, при настройке что-то не получилось.
+У вас идёт пробный период, но подключения к нашим серверам мы пока не видим. Возможно, не дошли руки. А возможно, при настройке что-то не получилось.
 
-Подключение занимает пару минут. Если не выйдет — напишите нам, поможем.
+Подключение — это поставить приложение и добавить в него подписку. Если застряли — напишите нам, поможем.
 """
 
             from aiogram.types import InlineKeyboardMarkup

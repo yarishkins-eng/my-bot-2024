@@ -8,12 +8,13 @@
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from app.services import monitoring_service as module
 from app.services.monitoring_service import MonitoringService
+
 
 TRIAL_TARIFF_ID = 5
 TEAM_TARIFF_ID = 4
@@ -93,10 +94,14 @@ async def test_query_filters_by_the_trial_tariff_so_team_friends_are_excluded(wi
     where = sql.split('WHERE', 1)[1]
     assert 'tariff_id' in where, 'отбор перестал ограничиваться пробным тарифом — письмо уедет на Team'
     assert 'start_date <=' in where, 'пропала нижняя граница возраста пробного'
+    # Второй пояс против Team: вечная подписка не может быть живым пробным.
+    assert 'end_date <=' in where, 'пропала верхняя граница срока — под письмо попадут вечные подписки'
 
 
 @pytest.mark.asyncio
-async def test_silent_panel_never_becomes_not_connected(wired) -> None:
+async def test_silent_panel_never_becomes_not_connected(wired, monkeypatch) -> None:
+    fake_logger = SimpleNamespace(info=Mock(), warning=Mock(), error=Mock(), debug=Mock())
+    monkeypatch.setattr(module, 'logger', fake_logger)
     service = _service()
     service._fetch_connected_panel_uuids = AsyncMock(return_value=None)
     db, _ = _db_returning([_subscription()])
@@ -105,15 +110,19 @@ async def test_silent_panel_never_becomes_not_connected(wired) -> None:
 
     service._send_trial_not_connected_notification.assert_not_awaited()
     wired.assert_not_awaited()
-    # 🔴 Улика того, что сработал именно ВЫХОД, а не падение внутри цикла: до проверки
-    # «писали ли уже» дело дойти не должно. Без неё сторож зелен и когда выход снят —
-    # код просто падает на None, и общий except делает отсутствие письма неотличимым.
-    module.notification_sent.assert_not_awaited()
+    # 🔴 Улика того, что сработал именно ВЫХОД, а не падение внутри цикла. Без неё сторож
+    # зелен и когда выход снят: код спотыкается о None, общий except глотает исключение,
+    # и «письма нет» становится неотличимо от «письма нет по правильной причине».
+    fake_logger.error.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_empty_panel_answer_is_not_the_same_as_silence(wired) -> None:
-    """Пустое множество значит «никто не подключался» — письмо уходит."""
+    """Панель ответила про людей, но подключившихся среди них нет — письмо уходит.
+
+    Не путать с ответом «ноль пользователей вообще»: тот читается как сбой чтения
+    и до сюда не доходит, его отбивает сама _fetch_connected_panel_uuids.
+    """
     service = _service()
     service._fetch_connected_panel_uuids = AsyncMock(return_value=set())
     db, _ = _db_returning([_subscription()])
@@ -267,3 +276,48 @@ async def test_panel_read_returns_only_those_who_actually_connected() -> None:
     service = _service_with_panel(api)
 
     assert await service._fetch_connected_panel_uuids() == {'connected-one'}
+
+
+@pytest.mark.asyncio
+async def test_subscription_without_a_panel_account_is_left_alone(wired) -> None:
+    """Сравнивать не с чем — значит «не знаем», а не «не подключался»."""
+    service = _service()
+    service._fetch_connected_panel_uuids = AsyncMock(return_value={'somebody'})
+    db, _ = _db_returning([_subscription(uuid=None, user_uuid=None)])
+
+    await service._check_trial_not_connected(db)
+
+    service._send_trial_not_connected_notification.assert_not_awaited()
+    wired.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_uuid_string_counts_as_no_panel_account(wired) -> None:
+    service = _service()
+    service._fetch_connected_panel_uuids = AsyncMock(return_value={'somebody'})
+    db, _ = _db_returning([_subscription(uuid='', user_uuid='')])
+
+    await service._check_trial_not_connected(db)
+
+    service._send_trial_not_connected_notification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_panel_returning_zero_users_is_a_failure_not_a_fact() -> None:
+    """Ноль пользователей в панели при живых пробных — сбой чтения, а не ответ."""
+    service = _service_with_panel(_FakeApi(users=[]))
+
+    assert await service._fetch_connected_panel_uuids() is None
+
+
+@pytest.mark.asyncio
+async def test_panel_is_not_touched_when_everyone_was_already_written(wired, monkeypatch) -> None:
+    """Обход всей панели стоит дорого и стоит в цикле перед сверкой платежей."""
+    monkeypatch.setattr(module, 'notification_sent', AsyncMock(return_value=True))
+    service = _service()
+    service._fetch_connected_panel_uuids = AsyncMock()
+    db, _ = _db_returning([_subscription()])
+
+    await service._check_trial_not_connected(db)
+
+    service._fetch_connected_panel_uuids.assert_not_awaited()
