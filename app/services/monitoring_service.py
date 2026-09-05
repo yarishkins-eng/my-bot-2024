@@ -223,6 +223,77 @@ LOGO_PATH = Path(settings.LOGO_FILE)
 TRIAL_NOT_CONNECTED_MIN_HOURS_LEFT = 12
 
 
+# ---------------------------------------------------------------------------
+# Тексты писем, которых нет в словаре локалей
+# ---------------------------------------------------------------------------
+#
+# 🔴 Это ЕДИНСТВЕННЫЙ источник этих пяти текстов: отсюда их берёт отправитель и
+# отсюда же их читает карточка раздела «Автосообщения» в кабинете. Копию текста
+# заводить нельзя нигде — экран показал бы то, что не уходит, и ни один тест
+# этого бы не поймал (прямой запрет владельца 05.09.2026, этап АС-10).
+#
+# Раньше здесь были f-строки прямо в теле отправителей. Показать такой текст
+# нельзя: подстановка вшита в литерал. Поэтому подстановка вынесена в .format().
+
+GRACE_STARTED_TEXT = (
+    '🎁 <b>Подписка закончилась</b>\n\n'
+    'Но мы оставили VPN включённым ещё на 2 дня — продли спокойно, без спешки.\n\n'
+    '⏳ Отключится {until_str}.'
+)
+
+AUTOPAY_LEGACY_TEXT = (
+    '⚠️ <b>Автоплатёж приостановлен</b>\n\n'
+    'Ваша подписка была создана до введения тарифов. '
+    'Для работы автоплатежа необходимо выбрать тариф.\n\n'
+    'Перейдите в раздел «Моя подписка» → «Продлить», чтобы выбрать тариф.'
+)
+
+SUBSCRIPTION_EXPIRED_TEXT = """
+⛔ <b>Подписка{tariff_label} истекла</b>
+
+Ваша подписка истекла. Для восстановления доступа продлите подписку.
+
+🔧 Доступ к серверам заблокирован до продления.
+"""
+
+TRIAL_ENDING_TEXT = """
+🎁 <b>Тестовая подписка{tariff_label} скоро закончится!</b>
+
+Ваша тестовая подписка истекает через {hours_text}.
+
+💎 <b>Не хотите остаться без VPN?</b>
+Переходите на полную подписку!
+
+⚡️ Успейте оформить до окончания тестового периода!
+"""
+
+TRIAL_NOT_CONNECTED_TEXT = """
+🔔 <b>Пробный период идёт, а VPN ещё не подключён</b>
+
+Подключения мы пока не видим. Что-то помешало?
+
+Напишите — поможем.
+"""
+
+# Строка, которую отправитель ДОПИСЫВАЕТ к письмам об автоплатеже в многотарифном
+# режиме. Вынесена сюда, чтобы карточка показывала письмо целиком: без неё экран
+# показывал бы не то, что придёт.
+AUTOPAY_TARIFF_LINE = '\n📦 Тариф: «{tariff_name}»'
+
+
+def cabinet_link_suffix() -> str:
+    """Строка-приписка со ссылкой на кабинет в браузере (вход без VPN), если настроена.
+
+    Сообщение «оседает» в чате → человек может зайти и продлить даже если VPN отключится.
+    Модульная функция, а не метод: её зовёт ещё и карточка раздела «Автосообщения»,
+    чтобы показать письмо целиком, а не без хвоста (этап АС-10).
+    """
+    cabinet_url = settings.get_cabinet_link()
+    if not cabinet_url:
+        return ''
+    return f'\n\n🌐 Продлить можно и в браузере (работает без VPN, если домен доступен):\n{cabinet_url}'
+
+
 class MonitoringService:
     def __init__(self, bot=None):
         self.is_running = False
@@ -896,11 +967,7 @@ class MonitoringService:
             from aiogram.types import InlineKeyboardMarkup
 
             until_str = format_local_datetime(grace_until, '%d.%m')
-            message = (
-                '🎁 <b>Подписка закончилась</b>\n\n'
-                'Но мы оставили VPN включённым ещё на 2 дня — продли спокойно, без спешки.\n\n'
-                f'⏳ Отключится {until_str}.'
-            )
+            message = GRACE_STARTED_TEXT.format(until_str=until_str)
             message += self._cabinet_link_suffix()
 
             extend_callback = f'se:{subscription.id}' if settings.is_multi_tariff_enabled() else 'subscription_extend'
@@ -928,12 +995,7 @@ class MonitoringService:
             return False
 
     def _cabinet_link_suffix(self) -> str:
-        """Строка-приписка со ссылкой на кабинет в браузере (вход без VPN), если настроена.
-        Сообщение «оседает» в чате → человек может зайти и продлить даже если VPN отключится."""
-        cabinet_url = settings.get_cabinet_link()
-        if not cabinet_url:
-            return ''
-        return f'\n\n🌐 Продлить можно и в браузере (работает без VPN, если домен доступен):\n{cabinet_url}'
+        return cabinet_link_suffix()
 
     async def update_remnawave_user(self, db: AsyncSession, subscription: Subscription) -> RemnaWaveUser | None:
         try:
@@ -2105,12 +2167,7 @@ class MonitoringService:
                             if user and user.telegram_id and self.bot:
                                 await self.bot.send_message(
                                     chat_id=user.telegram_id,
-                                    text=(
-                                        '⚠️ <b>Автоплатёж приостановлен</b>\n\n'
-                                        'Ваша подписка была создана до введения тарифов. '
-                                        'Для работы автоплатежа необходимо выбрать тариф.\n\n'
-                                        'Перейдите в раздел «Моя подписка» → «Продлить», чтобы выбрать тариф.'
-                                    ),
+                                    text=AUTOPAY_LEGACY_TEXT,
                                     parse_mode='HTML',
                                 )
                             await cache.set(autopay_legacy_key, 1, expire=86400 * 7)
@@ -2481,13 +2538,7 @@ class MonitoringService:
                     tariff_label = f' «{tariff_name}»'
                 elif hasattr(subscription, 'tariff') and subscription.tariff:
                     tariff_label = f' «{subscription.tariff.name}»'
-            message = f"""
-⛔ <b>Подписка{tariff_label} истекла</b>
-
-Ваша подписка истекла. Для восстановления доступа продлите подписку.
-
-🔧 Доступ к серверам заблокирован до продления.
-"""
+            message = SUBSCRIPTION_EXPIRED_TEXT.format(tariff_label=tariff_label)
             message += self._cabinet_link_suffix()
 
             from aiogram.types import InlineKeyboardMarkup
@@ -2731,16 +2782,7 @@ class MonitoringService:
             window_hours = warn_hours if warn_hours is not None else NotificationSettingsService.get_trial_warn_hours()
             hours = trial_hours_left(subscription.end_date, window_hours)
             hours_text = format_hours_declension(hours)
-            message = f"""
-🎁 <b>Тестовая подписка{tariff_label} скоро закончится!</b>
-
-Ваша тестовая подписка истекает через {hours_text}.
-
-💎 <b>Не хотите остаться без VPN?</b>
-Переходите на полную подписку!
-
-⚡️ Успейте оформить до окончания тестового периода!
-"""
+            message = TRIAL_ENDING_TEXT.format(tariff_label=tariff_label, hours_text=hours_text)
 
             from aiogram.types import InlineKeyboardMarkup
 
@@ -2793,13 +2835,7 @@ class MonitoringService:
         единственный способ узнать, обо что.
         """
         try:
-            message = """
-🔔 <b>Пробный период идёт, а VPN ещё не подключён</b>
-
-Подключения мы пока не видим. Что-то помешало?
-
-Напишите — поможем.
-"""
+            message = TRIAL_NOT_CONNECTED_TEXT
 
             from aiogram.types import InlineKeyboardMarkup
 
@@ -3198,7 +3234,7 @@ class MonitoringService:
                 tariff_label = f' «{subscription.tariff.name}»'
             message = texts.AUTOPAY_SUCCESS.format(days=days, amount=settings.format_price(amount))
             if tariff_label:
-                message += f'\n📦 Тариф:{tariff_label}'
+                message += AUTOPAY_TARIFF_LINE.format(tariff_name=subscription.tariff.name)
             await self._send_message_with_logo(
                 chat_id=user.telegram_id,
                 text=message,
@@ -3246,7 +3282,7 @@ class MonitoringService:
                 and hasattr(subscription, 'tariff')
                 and subscription.tariff
             ):
-                message += f'\n📦 Тариф: «{subscription.tariff.name}»'
+                message += AUTOPAY_TARIFF_LINE.format(tariff_name=subscription.tariff.name)
 
             from aiogram.types import InlineKeyboardMarkup
 

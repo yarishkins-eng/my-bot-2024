@@ -36,6 +36,41 @@ from app.services.notification_settings_service import NotificationSettingsServi
 logger = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Тексты писем суточных подписок
+# ---------------------------------------------------------------------------
+#
+# 🔴 ЕДИНСТВЕННЫЙ источник этих трёх текстов: отсюда их берёт отправитель и отсюда
+# же их читает карточка раздела «Автосообщения» в кабинете. Копию заводить нельзя
+# (прямой запрет владельца 05.09.2026, этап АС-10).
+#
+# Числа приходят уже отформатированными строками: раньше здесь стояли f-строки с
+# {amount_rubles:.2f} прямо внутри литерала, и текст было не отделить от подстановки.
+
+DAILY_CHARGE_TEXT = (
+    '💳 <b>Суточное списание</b>\n\n'
+    'Списано: {amount} ₽\n'
+    'Остаток баланса: {balance} ₽{tariff_label}\n\n'
+    'Следующее списание через 24 часа.'
+)
+
+DAILY_PAUSED_TEXT = (
+    '⚠️ <b>Подписка{tariff_label} приостановлена</b>\n\n'
+    'Недостаточно средств для суточной оплаты.\n\n'
+    'Требуется: {required} ₽\n'
+    'Баланс: {balance} ₽\n\n'
+    'Пополните баланс, чтобы возобновить подписку.'
+)
+
+TRAFFIC_RESET_TEXT = (
+    'ℹ️ <b>Сброс докупленного трафика</b>\n\n'
+    'Ваш докупленный трафик ({reset_gb} ГБ) был сброшен, '
+    'так как прошло 30 дней с момента первой докупки.{tariff_label}\n\n'
+    'Текущий лимит трафика: {limit_gb} ГБ\n\n'
+    'Вы можете докупить трафик снова в любое время.'
+)
+
+
 class DailySubscriptionService:
     """
     Сервис автоматического списания для суточных подписок.
@@ -351,11 +386,10 @@ class DailySubscriptionService:
         tariff_label = ''
         if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
             tariff_label = f'\n📦 Тариф: «{subscription.tariff.name}»'
-        message = (
-            f'💳 <b>Суточное списание</b>\n\n'
-            f'Списано: {amount_rubles:.2f} ₽\n'
-            f'Остаток баланса: {balance_rubles:.2f} ₽{tariff_label}\n\n'
-            f'Следующее списание через 24 часа.'
+        message = DAILY_CHARGE_TEXT.format(
+            amount=f'{amount_rubles:.2f}',
+            balance=f'{balance_rubles:.2f}',
+            tariff_label=tariff_label,
         )
 
         # Use unified notification delivery service
@@ -385,12 +419,10 @@ class DailySubscriptionService:
         tariff_label = ''
         if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
             tariff_label = f' «{subscription.tariff.name}»'
-        message = (
-            f'⚠️ <b>Подписка{tariff_label} приостановлена</b>\n\n'
-            f'Недостаточно средств для суточной оплаты.\n\n'
-            f'Требуется: {required_rubles:.2f} ₽\n'
-            f'Баланс: {balance_rubles:.2f} ₽\n\n'
-            f'Пополните баланс, чтобы возобновить подписку.'
+        message = DAILY_PAUSED_TEXT.format(
+            tariff_label=tariff_label,
+            required=f'{required_rubles:.2f}',
+            balance=f'{balance_rubles:.2f}',
         )
 
         keyboard = InlineKeyboardMarkup(
@@ -740,12 +772,10 @@ class DailySubscriptionService:
         tariff_label = ''
         if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
             tariff_label = f'\n📦 Тариф: «{subscription.tariff.name}»'
-        message = (
-            f'ℹ️ <b>Сброс докупленного трафика</b>\n\n'
-            f'Ваш докупленный трафик ({reset_gb} ГБ) был сброшен, '
-            f'так как прошло 30 дней с момента первой докупки.{tariff_label}\n\n'
-            f'Текущий лимит трафика: {subscription.traffic_limit_gb} ГБ\n\n'
-            f'Вы можете докупить трафик снова в любое время.'
+        message = TRAFFIC_RESET_TEXT.format(
+            reset_gb=reset_gb,
+            tariff_label=tariff_label,
+            limit_gb=subscription.traffic_limit_gb,
         )
 
         context = {
