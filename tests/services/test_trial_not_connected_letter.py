@@ -312,6 +312,24 @@ async def test_panel_returning_zero_users_is_a_failure_not_a_fact() -> None:
 
 
 @pytest.mark.asyncio
+async def test_panel_answering_without_connection_data_is_a_failure_too() -> None:
+    """Люди пришли, а даты подключения нет ни у кого — подпись расхождения схемы.
+
+    Это опаснее пустого ответа: письмо ушло бы всем подряд, включая тех, у кого
+    VPN работает. Читается как «не знаем».
+    """
+    api = _FakeApi(
+        users=[
+            SimpleNamespace(uuid='a', first_connected_at=None),
+            SimpleNamespace(uuid='b', first_connected_at=None),
+        ]
+    )
+    service = _service_with_panel(api)
+
+    assert await service._fetch_connected_panel_uuids() is None
+
+
+@pytest.mark.asyncio
 async def test_panel_is_not_touched_when_everyone_was_already_written(wired, monkeypatch) -> None:
     """Обход всей панели стоит дорого и стоит в цикле перед сверкой платежей."""
     monkeypatch.setattr(module, 'notification_sent', AsyncMock(return_value=True))
@@ -322,3 +340,27 @@ async def test_panel_is_not_touched_when_everyone_was_already_written(wired, mon
     await service._check_trial_not_connected(db)
 
     service._fetch_connected_panel_uuids.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_connect_button_points_at_the_connection_screen(monkeypatch) -> None:
+    """Без явного адреса кабинет уводит на Главную, где под нужной кнопкой стоит апселл."""
+    calls = []
+
+    def spy(text, **kwargs):
+        calls.append({'text': text, **kwargs})
+        return SimpleNamespace(callback_data=kwargs.get('callback_data'))
+
+    monkeypatch.setattr(module, 'build_miniapp_or_callback_button', spy)
+    service = MonitoringService.__new__(MonitoringService)
+
+    async def fake_send(**kwargs):
+        return None
+
+    service._send_message_with_logo = fake_send
+    await service._send_trial_not_connected_notification(
+        SimpleNamespace(telegram_id=5207068834, language='ru'), _subscription()
+    )
+
+    connect = next(call for call in calls if call['callback_data'] == 'subscription_connect')
+    assert connect.get('cabinet_path') == '/connection', 'кнопка снова уводит на Главную с апселлом'
