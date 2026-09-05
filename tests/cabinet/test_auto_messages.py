@@ -41,7 +41,10 @@ from app.cabinet.routes.admin_auto_messages import (
     AutoMessagePatch,
     _assert_discount_is_safe,
     _history_for,
+    _limits_for,
     _max_promo_group_percent,
+    _params_for,
+    _resolve_when,
     patch_auto_message,
 )
 from app.services.notification_settings_service import NotificationSettingsService
@@ -936,3 +939,61 @@ def test_autopay_success_switch_closes_both_roads() -> None:
         if 'notify_autopay_success' in ast.dump(ast.Module(body=node.body, type_ignores=[])):
             guarded = True
     assert guarded, 'почтовая ветка «Автоплатёж прошёл» идёт мимо выключателя'
+
+
+def test_not_connected_hours_reach_the_screen_with_their_own_bounds() -> None:
+    """У письма о неподключении своё число и СВОИ границы, а не соседские."""
+    entry = CATALOG_BY_ID['trial-not-connected']
+
+    params = _params_for(entry)
+    limits = _limits_for(entry)
+
+    assert set(params) == {'not_connected_after_hours'}, 'число не доехало до экрана'
+    assert limits == {
+        'not_connected_after_hours': [
+            NotificationSettingsService.MIN_NOT_CONNECTED_HOURS,
+            NotificationSettingsService.MAX_NOT_CONNECTED_HOURS,
+        ]
+    }, 'границы чужие или отсутствуют — экран будет угадывать'
+
+
+def test_every_catalog_label_is_fully_resolved() -> None:
+    """В подписи не должно остаться неподставленных плейсхолдеров ни у одного сообщения.
+
+    Забытая ветка в `_resolve_when` выводит на экран литерал вида `{имя_поля}` —
+    и заметит это только владелец, глазами.
+    """
+    for entry in AUTO_MESSAGE_CATALOG:
+        resolved = _resolve_when(entry, _params_for(entry))
+        assert '{' not in resolved, f'{entry["id"]}: подпись осталась с плейсхолдером — {resolved}'
+
+
+def test_two_trial_messages_do_not_share_a_setting() -> None:
+    """Сообщения группы «Пробный» настраиваются независимо друг от друга.
+
+    Обе ручки про часы, и обе в одной группе: привязка к чужому геттеру означала бы,
+    что настройка одного письма молча меняет другое.
+    """
+    before_warn = NotificationSettingsService.get_trial_warn_hours()
+
+    assert NotificationSettingsService.set_trial_not_connected_after_hours(6) is True
+    assert NotificationSettingsService.get_trial_not_connected_after_hours() == 6
+    assert NotificationSettingsService.get_trial_warn_hours() == before_warn, 'задета настройка соседа'
+
+    NotificationSettingsService.set_trial_not_connected_after_hours(3)
+
+
+def test_not_connected_hours_are_clamped_to_their_own_ceiling() -> None:
+    """Значение выше потолка зажимается в службе, а не только на экране.
+
+    В файл настроек можно попасть мимо раздела — тогда число выше потолка молча
+    убило бы сообщение навсегда.
+    """
+    NotificationSettingsService.set_trial_not_connected_after_hours(999)
+
+    assert (
+        NotificationSettingsService.get_trial_not_connected_after_hours()
+        == NotificationSettingsService.MAX_NOT_CONNECTED_HOURS
+    )
+
+    NotificationSettingsService.set_trial_not_connected_after_hours(3)

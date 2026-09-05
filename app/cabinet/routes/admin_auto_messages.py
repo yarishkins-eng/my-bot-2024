@@ -87,17 +87,28 @@ MAX_VALID_HOURS = 168
 # единственной точке «ровно 30,000 суток», куда часовой обход не попадает. Работает
 # последнее полное окно — 29. Мина из АС-1: сначала стояло 60, потом 30 — оба мёртвые.
 MAX_TRIGGER_DAYS = NotificationSettingsService.MAX_TRIGGER_DAYS
+# Границы живут в службе, а не здесь: продублируй их литералами — и экран однажды
+# пообещает то, чего бот не применит.
+MIN_NOT_CONNECTED_HOURS = NotificationSettingsService.MIN_NOT_CONNECTED_HOURS
+MAX_NOT_CONNECTED_HOURS = NotificationSettingsService.MAX_NOT_CONNECTED_HOURS
 
 # Человеческие имена полей: в отказ уходят они, а не латиница из кода.
 # Все числовые поля раздела в одном месте: обработчик перебирает именно этот набор,
 # и добавление нового поля мимо него молча ничего не сохранит.
-_NUMERIC_FIELDS: tuple[str, ...] = ('warn_hours', 'discount_percent', 'valid_hours', 'trigger_days')
+_NUMERIC_FIELDS: tuple[str, ...] = (
+    'warn_hours',
+    'discount_percent',
+    'valid_hours',
+    'trigger_days',
+    'not_connected_after_hours',
+)
 
 FIELD_TITLES: dict[str, str] = {
     'warn_hours': 'За сколько предупредить',
     'discount_percent': 'Размер скидки',
     'valid_hours': 'Сколько действует',
     'trigger_days': 'Через сколько дней',
+    'not_connected_after_hours': 'Через сколько часов после начала',
 }
 
 
@@ -178,6 +189,27 @@ def _assert_in_range(value: int, low: int, high: int, what: str) -> None:
 # monitoring_service обязан иметь здесь соответствие.
 
 AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
+    {
+        'id': 'trial-not-connected',
+        'group': 'trial',
+        'title': 'Пробный идёт, а VPN не подключён',
+        'when': 'Через {not_connected_after_hours} после начала пробного — тем, у кого не было подключений',
+        'control': 'toggle',
+        'settings_key': 'trial_not_connected',
+        'params': ('not_connected_after_hours',),
+        'sent_type': 'trial_not_connected',
+        'quiet_check': 'trial_tariff_marked',
+        'warning': (
+            'Выключите — и человек, который активировал пробный и не подключился, '
+            'не услышит от бота ничего до самого конца теста. Первое включение накроет '
+            'всех, кто уже висит неподключённым дольше выбранного срока. Факт подключения бот '
+            'спрашивает у панели: молчит панель — письмо не уходит.'
+        ),
+        'buttons': [
+            {'label': '📲 Подключиться', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '💬 Написать в поддержку', 'target': 'Кабинет, экран поддержки', 'tracked': False},
+        ],
+    },
     {
         'id': 'trial-2h',
         'group': 'trial',
@@ -495,6 +527,7 @@ SETTER_NAMES: dict[tuple[str, str], str] = {
     ('trial_expired_discount', 'valid_hours'): 'set_trial_expired_discount_valid_hours',
     ('trial_expired_discount', 'trigger_days'): 'set_trial_expired_discount_trigger_days',
     ('trial_2h', 'warn_hours'): 'set_trial_warn_hours',
+    ('trial_not_connected', 'not_connected_after_hours'): 'set_trial_not_connected_after_hours',
 }
 
 # Читаем тоже через геттеры, а не из сырого файла: в них сидят те же ограничители,
@@ -510,6 +543,7 @@ GETTER_NAMES: dict[tuple[str, str], str] = {
     ('trial_expired_discount', 'valid_hours'): 'get_trial_expired_discount_valid_hours',
     ('trial_expired_discount', 'trigger_days'): 'get_trial_expired_discount_trigger_days',
     ('trial_2h', 'warn_hours'): 'get_trial_warn_hours',
+    ('trial_not_connected', 'not_connected_after_hours'): 'get_trial_not_connected_after_hours',
 }
 
 # Нижняя граница «через сколько дней» у сообщений РАЗНАЯ: у третьей волны сеттер
@@ -606,6 +640,7 @@ class AutoMessagePatch(BaseModel):
     discount_percent: int | None = Field(default=None, ge=0, le=100)
     valid_hours: int | None = Field(default=None, ge=MIN_VALID_HOURS, le=MAX_VALID_HOURS)
     trigger_days: int | None = Field(default=None, ge=1, le=MAX_TRIGGER_DAYS)
+    not_connected_after_hours: int | None = Field(default=None, ge=MIN_NOT_CONNECTED_HOURS, le=MAX_NOT_CONNECTED_HOURS)
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +684,15 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
         notes['traffic_limits'] = f'лимит есть у {format_subscriptions_declension(with_limit)} из {total_live}'
     else:
         reasons['traffic_limits'] = 'ни у одной живой подписки нет лимита гигабайтов'
+
+    # Письмо о неподключении отбирает людей по ПОМЕЧЕННОМУ пробному тарифу. Метки нет —
+    # отбирать не по чему, и служба выходит молча. Без этой строки экран показал бы
+    # «работает» сообщению, которое не может уйти никогда.
+    trial_tariff_marked = await db.scalar(
+        select(func.count()).select_from(Tariff).where(Tariff.is_trial_available.is_(True))
+    )
+    if not trial_tariff_marked:
+        reasons['trial_tariff_marked'] = 'ни один тариф не помечен пробным — отбирать не по чему'
 
     if not settings.CHANNEL_IS_REQUIRED_SUB:
         reasons['channel_required'] = 'подписка на канал не обязательна'
@@ -741,6 +785,9 @@ def _resolve_when(entry: dict[str, Any], params: dict[str, int] | None) -> str:
     if '{warn_hours}' in when:
         hours = values.get('warn_hours')
         when = when.replace('{warn_hours}', format_hours_declension(hours) if hours else '—')
+    if '{not_connected_after_hours}' in when:
+        hours = values.get('not_connected_after_hours')
+        when = when.replace('{not_connected_after_hours}', format_hours_declension(hours) if hours else '—')
     return when
 
 
@@ -821,6 +868,8 @@ def _limits_for(entry: dict[str, Any]) -> dict[str, list[int]] | None:
             bounds[name] = [TRIGGER_DAYS_MIN.get(key, 1), MAX_TRIGGER_DAYS]
         elif name == 'warn_hours':
             bounds[name] = [MIN_WARN_HOURS, MAX_WARN_HOURS]
+        elif name == 'not_connected_after_hours':
+            bounds[name] = [MIN_NOT_CONNECTED_HOURS, MAX_NOT_CONNECTED_HOURS]
     return bounds
 
 
@@ -1035,6 +1084,13 @@ async def patch_auto_message(
     if 'trigger_days' in changes:
         min_days = TRIGGER_DAYS_MIN.get(settings_key, 1)
         _assert_in_range(changes['trigger_days'], min_days, MAX_TRIGGER_DAYS, FIELD_TITLES['trigger_days'])
+    if 'not_connected_after_hours' in changes:
+        _assert_in_range(
+            changes['not_connected_after_hours'],
+            MIN_NOT_CONNECTED_HOURS,
+            MAX_NOT_CONNECTED_HOURS,
+            FIELD_TITLES['not_connected_after_hours'],
+        )
 
     # 🔴 Включение — тоже опасное действие. Процент мог быть выставлен в сто из
     # чат-админки бота, где потолка нет; без этой проверки тумблер выпускал бы его

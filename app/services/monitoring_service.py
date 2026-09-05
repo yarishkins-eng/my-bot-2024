@@ -31,6 +31,7 @@ from app.database.crud.subscription import (
     get_subscriptions_grace_ended,
     reactivate_subscription,
 )
+from app.database.crud.tariff import get_trial_tariff
 from app.database.crud.user import (
     cleanup_expired_promo_offer_discounts,
     get_inactive_users,
@@ -214,6 +215,12 @@ logger = structlog.get_logger(__name__)
 
 
 LOGO_PATH = Path(settings.LOGO_FILE)
+
+# Сколько часов пробного должно ОСТАВАТЬСЯ, чтобы письмо имело смысл. Без этой границы
+# человек на 71-м часу теста получал бы за один проход сначала «пробный истекает через
+# час», а следом «поставьте приложение и добавьте подписку» — предложение начать
+# настройку, на которую времени уже нет.
+TRIAL_NOT_CONNECTED_MIN_HOURS_LEFT = 12
 
 
 class MonitoringService:
@@ -511,6 +518,7 @@ class MonitoringService:
                 await self._check_expired_subscriptions(db)
                 await self._check_expiring_subscriptions(db)
                 await self._check_trial_expiring_soon(db)
+                await self._check_trial_not_connected(db)
                 await self._check_trial_channel_subscriptions(db)
                 await self._check_expired_subscription_followups(db)
                 await self._check_trial_expired_discount(db)
@@ -1226,6 +1234,161 @@ class MonitoringService:
 
         except Exception as e:
             logger.error('Ошибка проверки истекающих тестовых подписок', error=e)
+
+    async def _fetch_connected_panel_uuids(self) -> set[str] | None:
+        """UUID клиентов панели, у которых БЫЛО первое подключение.
+
+        Возвращает None, когда панель не ответила. Это отличие принципиально:
+        пустое множество значит «никто не подключался», None значит «мы не знаем»,
+        и во втором случае письмо не отправляется вовсе.
+        """
+        if not self.subscription_service.is_configured:
+            return None
+        try:
+            async with self.subscription_service.get_api_client() as api:
+                panel_users = await api.get_all_users_stream(size=500)
+        except Exception as e:
+            logger.error('Не удалось прочитать первые подключения из панели', error=e)
+            return None
+        connected = {panel_user.uuid for panel_user in panel_users if panel_user.first_connected_at is not None}
+        if not connected:
+            # 🔴 Ни одного первого подключения — это сбой чтения, а не факт. Покрывает оба
+            # случая сразу: панель вернула ноль пользователей (оборванная выдача) и панель
+            # вернула людей, но `userTraffic` в ответе не пришёл (расхождение схемы после
+            # обновления RemnaWave). На живой панели с сотней учёток «никто никогда не
+            # подключался» невозможно, поэтому читаем это как «не знаем». Без проверки одно
+            # обновление панели разослало бы письмо всем, включая тех, у кого VPN работает.
+            # Число в логе различает эти два случая при разборе.
+            logger.warning(
+                'Панель не показала ни одного первого подключения — читаем это как «не знаем»',
+                panel_users=len(panel_users),
+            )
+            return None
+        return connected
+
+    async def _check_trial_not_connected(self, db: AsyncSession):
+        """Письмо тем, у кого идёт пробный период, а первого подключения так и не было.
+
+        🔴 Признак подключения берётся ТОЛЬКО из панели (`userTraffic.firstConnectedAt`).
+        `Subscription.traffic_used_gb` для этого негоден: он обновляется лишь тогда, когда
+        клиент сам открыл экран подписки в мини-приложении, фоновой синхронизации трафика
+        в проекте нет. У неподключившегося и у подключившегося, но не заходившего в кабинет,
+        там одинаковый ноль.
+        """
+        if not self.bot:
+            return
+        if not NotificationSettingsService.is_enabled('trial_not_connected'):
+            return
+
+        try:
+            trial_tariff = await get_trial_tariff(db)
+            if trial_tariff is None:
+                logger.debug('Пробный тариф не помечен — письма о неподключении не отбираются')
+                return
+
+            now = datetime.now(UTC)
+            # Число часов берём из настройки раздела «Автосообщения», а не из константы:
+            # владелец меняет его с карточки. Зажим и потолок сидят в самом геттере.
+            after_hours = NotificationSettingsService.get_trial_not_connected_after_hours()
+            result = await db.execute(
+                select(Subscription)
+                .join(Subscription.user)
+                .options(selectinload(Subscription.user))
+                .where(
+                    and_(
+                        Subscription.is_trial == True,
+                        Subscription.status == SubscriptionStatus.ACTIVE.value,
+                        # 🔴 Отбор по КАНОНИЧЕСКОМУ пробному тарифу, а не по одному флагу
+                        # `is_trial`: бесплатные подписки друзьям владельца (тариф Team) тоже
+                        # несут `is_trial=True`, живут годами (одна до 21.12.2031) и по флагу
+                        # неотличимы от трёхдневного теста. Им это письмо адресовано быть не может.
+                        Subscription.tariff_id == trial_tariff.id,
+                        Subscription.start_date <= now - timedelta(hours=after_hours),
+                        # Единственная граница по сроку: пробного должно ОСТАВАТЬСЯ столько,
+                        # чтобы письмо имело смысл. Она же покрывает `end_date > now`.
+                        #
+                        # 🔴 Верхней границы здесь СОЗНАТЕЛЬНО НЕТ. Ставил её вторым поясом
+                        # против тарифа Team — пояс оказался иллюзорным: подписка друга со
+                        # сроком 113 дней на 110-й день тоже «скоро кончается» и проходит.
+                        # Team не вечный, он длинный. А цена границы реальная: продление
+                        # пробного из кабинета не снимает `is_trial` и отодвигает срок, плюс
+                        # у тарифа есть своё `trial_duration_days`, перебивающее настройку, —
+                        # и живая цель письма молча выпадала бы из выборки.
+                        #
+                        # От Team защищает отбор по помеченному пробному тарифу выше, и
+                        # защищает полностью — ровно до тех пор, пока метку `is_trial_available`
+                        # не переставили на другой тариф. Переставят — письмо пойдёт за ней.
+                        Subscription.end_date > now + timedelta(hours=TRIAL_NOT_CONNECTED_MIN_HOURS_LEFT),
+                        User.status == UserStatus.ACTIVE.value,
+                    )
+                )
+            )
+            candidates = [subscription for subscription in result.scalars().all() if subscription.user]
+            # 🔴 Отсев уже написанных ДО обращения к панели. Пробный живёт 72 часа и остаётся
+            # кандидатом почти все из них, а письмо уходит на первом же обходе: без этого
+            # отсева бот обходил бы всю панель каждый час впустую. Обход стоит в цикле перед
+            # сверкой платежей, поэтому его зависание откладывает работу с деньгами.
+            pending = []
+            for subscription in candidates:
+                if not await notification_sent(db, subscription.user.id, subscription.id, 'trial_not_connected'):
+                    pending.append(subscription)
+            if not pending:
+                return
+
+            connected_uuids = await self._fetch_connected_panel_uuids()
+            if connected_uuids is None:
+                logger.warning('Панель не ответила: письма о неподключении пропущены до следующего обхода')
+                return
+
+            sent = 0
+            for subscription in pending:
+                user = subscription.user
+
+                uuids = {subscription.remnawave_uuid, user.remnawave_uuid} - {None, ''}
+                if not uuids:
+                    # 🔴 Сравнивать не с чем: у подписки нет учётки в панели. Это то же
+                    # «мы не знаем», что и молчание панели, и трактовать его как
+                    # «не подключался» нельзя — человек мог подключаться, а мог вообще
+                    # не иметь профиля, и тогда подключаться ему нечем.
+                    logger.warning(
+                        'У пробной подписки нет учётки в панели: письмо о неподключении не отправлено',
+                        subscription_id=subscription.id,
+                    )
+                    continue
+
+                if uuids & connected_uuids:
+                    continue
+
+                if not (subscription.connected_squads or []):
+                    # Подключаться не к чему: предлагать «настроить за пару минут» человеку,
+                    # у которого нет ни одного сервера, нельзя.
+                    logger.warning(
+                        'Пробная подписка без серверов: письмо о неподключении не отправлено',
+                        subscription_id=subscription.id,
+                    )
+                    continue
+
+                if await self._send_trial_not_connected_notification(user, subscription):
+                    await record_notification(db, user.id, subscription.id, 'trial_not_connected')
+                    logger.info(
+                        '📡 Отправлено письмо о неподключённом VPN',
+                        telegram_id=user.telegram_id,
+                    )
+                    sent += 1
+
+            # Числа прохода в журнал мониторинга: у этого письма счётчик отправок в кабинете
+            # стирается при продлении подписки, то есть ровно те, на ком оно сработало, из
+            # него исчезают. Эта запись — единственное место, где видно «смотрели N, написали M».
+            if sent:
+                await self._log_monitoring_event(
+                    db,
+                    'trial_not_connected_notifications_sent',
+                    f'Проверено {len(pending)} пробных без подключения, отправлено {sent}',
+                    {'checked': len(pending), 'sent': sent},
+                )
+
+        except Exception as e:
+            logger.error('Ошибка проверки неподключённых пробных подписок', error=e)
 
     async def _check_trial_channel_subscriptions(self, db: AsyncSession):
         """Background reconciliation of channel subscriptions (rate-limited).
@@ -2616,6 +2779,74 @@ class MonitoringService:
         except Exception as e:
             logger.error(
                 'Ошибка отправки уведомления об окончании тестовой подписки пользователю',
+                telegram_id=user.telegram_id,
+                e=e,
+            )
+            return False
+
+    async def _send_trial_not_connected_notification(self, user: User, subscription: Subscription) -> bool:
+        """Письмо о том, что пробный идёт, а VPN не подключён.
+
+        Текст намеренно допускает ОБА объяснения — «не дошли руки» и «не получилось при
+        настройке». По данным они неразличимы, и утверждать первое про человека, который
+        пытался и не смог, нельзя. Отсюда же вторая кнопка: если он споткнулся, это
+        единственный способ узнать, обо что.
+        """
+        try:
+            message = """
+🔔 <b>Пробный период идёт, а VPN ещё не подключён</b>
+
+Подключения мы пока не видим. Что-то помешало?
+
+Напишите — поможем.
+"""
+
+            from aiogram.types import InlineKeyboardMarkup
+
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        build_miniapp_or_callback_button(
+                            text='📲 Подключиться',
+                            callback_data='subscription_connect',
+                            # 🔴 Явный адрес: без него кабинет уводит с /subscription на Главную,
+                            # где под нужной кнопкой стоит предложение купить подписку. Письмо
+                            # помощи застрявшему человеку не должно первым делом продавать.
+                            cabinet_path='/connection',
+                        )
+                    ],
+                    [build_miniapp_or_callback_button(text='💬 Написать в поддержку', callback_data='menu_support')],
+                ]
+            )
+
+            await self._send_message_with_logo(
+                chat_id=user.telegram_id,
+                text=message,
+                parse_mode='HTML',
+                reply_markup=keyboard,
+                user=user,
+            )
+            return True
+
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            if await self._handle_unreachable_user(user, exc, 'письмо о неподключённом VPN'):
+                return True
+            logger.error(
+                'Ошибка Telegram API при отправке письма о неподключённом VPN',
+                telegram_id=user.telegram_id,
+                exc=exc,
+            )
+            return False
+        except TelegramNetworkError as e:
+            logger.warning(
+                'Таймаут отправки письма о неподключённом VPN',
+                telegram_id=user.telegram_id,
+                e=e,
+            )
+            return False
+        except Exception as e:
+            logger.error(
+                'Ошибка отправки письма о неподключённом VPN',
                 telegram_id=user.telegram_id,
                 e=e,
             )
