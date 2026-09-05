@@ -87,8 +87,12 @@ async def test_query_filters_by_the_trial_tariff_so_team_friends_are_excluded(wi
     await service._check_trial_not_connected(db)
 
     sql = str(captured['statement'])
-    assert 'subscriptions.tariff_id' in sql, 'отбор перестал ограничиваться тарифом — письмо уедет на Team'
-    assert 'subscriptions.start_date <=' in sql, 'пропала нижняя граница возраста пробного'
+    # 🔴 Смотреть надо ИМЕННО в условие: `tariff_id` встречается и в списке выбираемых
+    # колонок, поэтому проверка по всему тексту запроса ловила бы совпадение, а не защиту.
+    assert 'WHERE' in sql, 'у запроса пропало условие целиком'
+    where = sql.split('WHERE', 1)[1]
+    assert 'tariff_id' in where, 'отбор перестал ограничиваться пробным тарифом — письмо уедет на Team'
+    assert 'start_date <=' in where, 'пропала нижняя граница возраста пробного'
 
 
 @pytest.mark.asyncio
@@ -101,6 +105,10 @@ async def test_silent_panel_never_becomes_not_connected(wired) -> None:
 
     service._send_trial_not_connected_notification.assert_not_awaited()
     wired.assert_not_awaited()
+    # 🔴 Улика того, что сработал именно ВЫХОД, а не падение внутри цикла: до проверки
+    # «писали ли уже» дело дойти не должно. Без неё сторож зелен и когда выход снят —
+    # код просто падает на None, и общий except делает отсутствие письма неотличимым.
+    module.notification_sent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -200,3 +208,62 @@ async def test_letter_says_the_connection_is_missing_not_the_service(monkeypatch
     assert 'не подключён' in text
     callbacks = [button.callback_data for row in sent['reply_markup'].inline_keyboard for button in row]
     assert callbacks == ['subscription_connect', 'menu_support']
+
+
+class _FakeApi:
+    def __init__(self, users=None, error=None):
+        self._users = users or []
+        self._error = error
+
+    async def get_all_users_stream(self, size=500):
+        if self._error:
+            raise self._error
+        return self._users
+
+
+class _FakeClient:
+    def __init__(self, api):
+        self._api = api
+
+    async def __aenter__(self):
+        return self._api
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _service_with_panel(api, *, configured=True):
+    service = MonitoringService.__new__(MonitoringService)
+    service.subscription_service = SimpleNamespace(
+        is_configured=configured,
+        get_api_client=lambda: _FakeClient(api),
+    )
+    return service
+
+
+@pytest.mark.asyncio
+async def test_panel_read_returns_none_when_the_panel_raises() -> None:
+    """Сбой панели обязан быть отличим от ответа «никто не подключался»."""
+    service = _service_with_panel(_FakeApi(error=RuntimeError('панель недоступна')))
+
+    assert await service._fetch_connected_panel_uuids() is None
+
+
+@pytest.mark.asyncio
+async def test_panel_read_returns_none_when_panel_is_not_configured() -> None:
+    service = _service_with_panel(_FakeApi(), configured=False)
+
+    assert await service._fetch_connected_panel_uuids() is None
+
+
+@pytest.mark.asyncio
+async def test_panel_read_returns_only_those_who_actually_connected() -> None:
+    api = _FakeApi(
+        users=[
+            SimpleNamespace(uuid='connected-one', first_connected_at=datetime.now(UTC)),
+            SimpleNamespace(uuid='never-connected', first_connected_at=None),
+        ]
+    )
+    service = _service_with_panel(api)
+
+    assert await service._fetch_connected_panel_uuids() == {'connected-one'}
