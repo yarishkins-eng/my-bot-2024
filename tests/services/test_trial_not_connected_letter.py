@@ -364,3 +364,35 @@ async def test_connect_button_points_at_the_connection_screen(monkeypatch) -> No
 
     connect = next(call for call in calls if call['callback_data'] == 'subscription_connect')
     assert connect.get('cabinet_path') == '/connection', 'кнопка снова уводит на Главную с апселлом'
+
+
+def test_the_setting_actually_reaches_the_query() -> None:
+    """Настройка обязана доехать до запроса, а не остаться украшением экрана.
+
+    Фейковая сессия в тестах не исполняет WHERE, поэтому «число применилось» ею
+    не доказывается. Сторожим по исходнику — тем же приёмом, что у соседнего письма.
+    """
+    import inspect
+
+    source = inspect.getsource(module.MonitoringService._check_trial_not_connected)
+    assert 'get_trial_not_connected_after_hours()' in source, 'число часов снова зашито в код'
+    assert 'timedelta(hours=after_hours)' in source, 'настройка не доходит до условия отбора'
+
+
+def test_ceiling_leaves_a_working_window() -> None:
+    """Потолок настройки не должен убивать сообщение.
+
+    Окно кандидатности = длина пробного − запас до конца − N. При N, равном длине
+    пробного минус запас, окно схлопывается в точку, и письмо не уходит НИКОМУ,
+    а экран показывает «работает». Разрыв держим не меньше двух часов: часовой
+    обход плюс его собственная длительность.
+    """
+    from app.config import settings as app_settings
+    from app.services.notification_settings_service import NotificationSettingsService
+
+    trial_hours = app_settings.TRIAL_DURATION_DAYS * 24
+    window = (
+        trial_hours - module.TRIAL_NOT_CONNECTED_MIN_HOURS_LEFT - NotificationSettingsService.MAX_NOT_CONNECTED_HOURS
+    )
+    assert window >= 2, f'при потолке {NotificationSettingsService.MAX_NOT_CONNECTED_HOURS} окно осталось {window} ч'
+    assert NotificationSettingsService.MIN_NOT_CONNECTED_HOURS >= 1, 'ноль часов — письмо в момент активации'

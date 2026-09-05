@@ -19,6 +19,18 @@ class NotificationSettingsService:
     # мимо раздела (чат-админка потолка не имеет), и тогда сообщение молча не уходило бы
     # никогда. Лучше отправить на последний рабочий день, чем не отправить вовсе.
     MAX_TRIGGER_DAYS = 29
+
+    # Через сколько часов после начала пробного писать тому, кто не подключился.
+    # 🔴 Потолок держит АРИФМЕТИКА, а не вкус. Отбор требует, чтобы до конца пробного
+    # оставалось не меньше TRIAL_NOT_CONNECTED_MIN_HOURS_LEFT (12 ч), поэтому окно
+    # кандидатности = длина пробного − 12 − N. При трёхдневном пробном (72 ч) на N=60
+    # окно схлопывается в точку и сообщение не уходит НИКОМУ, а экран показывает
+    # «работает»; на 58–59 окно уже часового шага обхода и часть людей пропускается
+    # молча. 24 оставляет 36 часов запаса. Минимум 1, а не 2: окно здесь одностороннее
+    # (человек остаётся кандидатом до конца пробного), слепой полосы снизу нет. Ноль
+    # запрещён — письмо ушло бы человеку, который прямо сейчас ставит приложение.
+    MIN_NOT_CONNECTED_HOURS = 1
+    MAX_NOT_CONNECTED_HOURS = 24
     """Runtime-editable notification settings stored on disk."""
 
     _storage_path: Path = Path('data/notification_settings.json')
@@ -56,7 +68,7 @@ class NotificationSettingsService:
         # Письмо тем, у кого идёт пробный, а первого подключения не было.
         # По умолчанию ВЫКЛЮЧЕНО: появление ключа не должно начать рассылку само,
         # включается вручную в кабинете. Тот же порядок, что у 'trial_expired_discount'.
-        'trial_not_connected': {'enabled': False},
+        'trial_not_connected': {'enabled': False, 'not_connected_after_hours': 3},
         'subscription_expired': {'enabled': True},  # «пробный истёк» И «подписка истекла»
         'subscription_expiring': {'enabled': True},  # «истекает через 3 дня» И «истекает завтра»
         'traffic_warning': {'enabled': True},
@@ -341,6 +353,27 @@ class NotificationSettingsService:
             return max(2, min(48, int(cls._get('trial_2h').get('warn_hours', 2))))
         except (TypeError, ValueError):
             return 2
+
+    @classmethod
+    def get_trial_not_connected_after_hours(cls) -> int:
+        """Через сколько часов после начала пробного писать неподключившемуся.
+
+        Зажимаем ЗДЕСЬ, а не только на экране: в файл настроек можно попасть мимо
+        раздела, и значение выше потолка молча убило бы сообщение навсегда.
+        """
+        try:
+            stored = int(cls._get('trial_not_connected').get('not_connected_after_hours', 3))
+            return max(cls.MIN_NOT_CONNECTED_HOURS, min(cls.MAX_NOT_CONNECTED_HOURS, stored))
+        except (TypeError, ValueError):
+            return 3
+
+    @classmethod
+    def set_trial_not_connected_after_hours(cls, hours: int) -> bool:
+        try:
+            value = max(cls.MIN_NOT_CONNECTED_HOURS, min(cls.MAX_NOT_CONNECTED_HOURS, int(hours)))
+        except (TypeError, ValueError):
+            return False
+        return cls._set_field('trial_not_connected', 'not_connected_after_hours', value)
 
     @classmethod
     def set_trial_warn_hours(cls, hours: int) -> bool:
