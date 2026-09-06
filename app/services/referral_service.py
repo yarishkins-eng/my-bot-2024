@@ -4,6 +4,7 @@ import json
 import redis.asyncio as aioredis
 import structlog
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,9 +12,11 @@ from app.config import settings
 from app.database.crud.referral import create_referral_earning, get_commission_payment_count, get_user_campaign_id
 from app.database.crud.user import add_user_balance, get_user_by_id
 from app.database.models import ReferralEarning, TransactionType, User
+from app.localization.texts import get_texts
 from app.services.notification_delivery_service import (
     notification_delivery_service,
 )
+from app.utils.miniapp_buttons import build_miniapp_or_callback_button
 from app.utils.user_utils import get_effective_referral_commission_percent
 
 
@@ -506,6 +509,7 @@ async def send_referral_notification(
     user: User | None = None,
     bonus_kopeks: int = 0,
     referral_name: str = '',
+    reply_markup: InlineKeyboardMarkup | None = None,
 ):
     """
     Отправляет реферальное уведомление в Telegram или по email.
@@ -517,6 +521,7 @@ async def send_referral_notification(
         user: User object (для email-only пользователей)
         bonus_kopeks: Сумма бонуса в копейках
         referral_name: Имя реферала
+        reply_markup: Telegram-клавиатура (для email-only получателей игнорируется)
     """
     # Handle email-only users via notification delivery service
     if telegram_id is None:
@@ -536,7 +541,10 @@ async def send_referral_notification(
         return
 
     try:
-        await bot.send_message(telegram_id, message, parse_mode='HTML')
+        send_kwargs = {'parse_mode': 'HTML'}
+        if reply_markup is not None:
+            send_kwargs['reply_markup'] = reply_markup
+        await bot.send_message(telegram_id, message, **send_kwargs)
         logger.info('✅ Уведомление отправлено пользователю', telegram_id=telegram_id)
     except Exception as e:
         logger.error('❌ Ошибка отправки уведомления пользователю', telegram_id=telegram_id, error=e)
@@ -628,16 +636,80 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
 
         if bot:
             commission_percent = get_effective_referral_commission_percent(referrer)
-            referral_notification = (
-                f'🎉 <b>Добро пожаловать!</b>\n\n'
-                f'Вы перешли по реферальной ссылке пользователя <b>{html.escape(referrer.full_name)}</b>!'
-            )
-            if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
-                referral_notification += (
-                    f'\n\n💰 При первой оплате от {settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS)} '
-                    f'вы получите бонус {settings.format_price(settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS)}!'
+            if new_user.telegram_id is not None:
+                new_user_commission_percent = get_effective_referral_commission_percent(new_user)
+                texts = get_texts(new_user.language)
+                referral_notification_parts = [texts.REFERRAL_WELCOME_SOURCE]
+                referral_keyboard = None
+
+                if settings.is_referral_program_enabled():
+                    has_reward_terms = False
+                    if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
+                        referral_notification_parts.append(
+                            texts.REFERRAL_WELCOME_BONUS.format(
+                                minimum=settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS),
+                                bonus=settings.format_price(settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS),
+                            )
+                        )
+                        has_reward_terms = True
+
+                    first_payment_percent = _normalize_percent(
+                        settings.REFERRAL_FIRST_PAYMENT_COMMISSION_PERCENT,
+                        new_user_commission_percent,
+                    )
+                    recurring_tiers = _parse_recurring_commission_tiers(settings.REFERRAL_RECURRING_COMMISSION_TIERS)
+                    first_commission_exists = first_payment_percent > 0
+                    first_reward_advances_schedule = (
+                        first_commission_exists or settings.REFERRAL_INVITER_BONUS_KOPEKS > 0
+                    )
+                    recurring_commission_exists = False
+                    if first_reward_advances_schedule:
+                        recurring_commission_exists = (
+                            new_user_commission_percent > 0
+                            if not recurring_tiers
+                            else (recurring_tiers[0][0] > 0 and new_user_commission_percent > 0)
+                            or any(percent > 0 for _, percent in recurring_tiers)
+                        )
+                    configured_commission_exists = first_commission_exists or recurring_commission_exists
+                    has_earnings = configured_commission_exists or settings.REFERRAL_INVITER_BONUS_KOPEKS > 0
+                    simple_unlimited_commission = (
+                        new_user_commission_percent > 0
+                        and first_payment_percent == new_user_commission_percent
+                        and not recurring_tiers
+                        and settings.REFERRAL_MAX_COMMISSION_PAYMENTS <= 0
+                    )
+                    if simple_unlimited_commission:
+                        referral_notification_parts.append(
+                            texts.REFERRAL_WELCOME_INVITE.format(percent=new_user_commission_percent)
+                        )
+                        has_reward_terms = True
+                    elif has_earnings:
+                        referral_notification_parts.append(texts.REFERRAL_WELCOME_INVITE_VARIABLE)
+                        has_reward_terms = True
+
+                    if has_reward_terms:
+                        referral_notification_parts.append(texts.REFERRAL_WELCOME_TERMS_NOTICE)
+
+                    if has_earnings:
+                        referral_keyboard = InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [
+                                    build_miniapp_or_callback_button(
+                                        text=texts.REFERRAL_WELCOME_EARNINGS_BUTTON,
+                                        callback_data='menu_referrals',
+                                        cabinet_path='/referral',
+                                    )
+                                ]
+                            ]
+                        )
+
+                await send_referral_notification(
+                    bot,
+                    new_user.telegram_id,
+                    '\n\n'.join(referral_notification_parts),
+                    user=new_user,
+                    reply_markup=referral_keyboard,
                 )
-            await send_referral_notification(bot, new_user.telegram_id, referral_notification, user=new_user)
 
             inviter_notification = (
                 f'👥 <b>Новый реферал!</b>\n\n'
