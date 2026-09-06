@@ -386,7 +386,7 @@ class DailySubscriptionService:
         tariff_label = ''
         if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
             tariff_label = f'\n📦 Тариф: «{subscription.tariff.name}»'
-        message = DAILY_CHARGE_TEXT.format(
+        message = NotificationSettingsService.text_for('DAILY_CHARGE_TEXT', DAILY_CHARGE_TEXT).format(
             amount=f'{amount_rubles:.2f}',
             balance=f'{balance_rubles:.2f}',
             tariff_label=tariff_label,
@@ -419,7 +419,7 @@ class DailySubscriptionService:
         tariff_label = ''
         if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
             tariff_label = f' «{subscription.tariff.name}»'
-        message = DAILY_PAUSED_TEXT.format(
+        message = NotificationSettingsService.text_for('DAILY_PAUSED_TEXT', DAILY_PAUSED_TEXT).format(
             tariff_label=tariff_label,
             required=f'{required_rubles:.2f}',
             balance=f'{balance_rubles:.2f}',
@@ -772,7 +772,7 @@ class DailySubscriptionService:
         tariff_label = ''
         if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
             tariff_label = f'\n📦 Тариф: «{subscription.tariff.name}»'
-        message = TRAFFIC_RESET_TEXT.format(
+        message = NotificationSettingsService.text_for('TRAFFIC_RESET_TEXT', TRAFFIC_RESET_TEXT).format(
             reset_gb=reset_gb,
             tariff_label=tariff_label,
             limit_gb=subscription.traffic_limit_gb,

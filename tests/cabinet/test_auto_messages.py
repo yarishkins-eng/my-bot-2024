@@ -725,7 +725,10 @@ def test_numeric_fields_registry_covers_every_catalog_param() -> None:
 
     used = {field for entry in AUTO_MESSAGE_CATALOG for field in (entry.get('params') or ())}
     assert used <= set(_NUMERIC_FIELDS), f'поля вне общего набора: {sorted(used - set(_NUMERIC_FIELDS))}'
-    assert set(AutoMessagePatch.model_fields) - {'enabled'} == set(_NUMERIC_FIELDS)
+    # 🔴 Ожидание расширено этапом АС-11, и это заявление, а не подкрутка: смысл проверки —
+    # «каждое ЧИСЛОВОЕ поле запроса зарегистрировано», а `text`/`reset_text` не числовые и
+    # своей регистрации не требуют. Их собственные заборы живут в `_apply_text_change`.
+    assert set(AutoMessagePatch.model_fields) - {'enabled', 'text', 'reset_text'} == set(_NUMERIC_FIELDS)
 
 
 def test_subscriptions_declension() -> None:

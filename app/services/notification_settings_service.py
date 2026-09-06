@@ -34,8 +34,10 @@ class NotificationSettingsService:
     """Runtime-editable notification settings stored on disk."""
 
     _storage_path: Path = Path('data/notification_settings.json')
-    _data: dict[str, dict[str, Any]] = {}
+    _data: dict[str, Any] = {}
     _loaded: bool = False
+    # Файл прочитать не удалось — писать в него нельзя, иначе затрём чужое содержимое.
+    _readonly: bool = False
 
     _DEFAULTS: dict[str, dict[str, Any]] = {
         'trial_channel_unsubscribed': {'enabled': True},
@@ -102,8 +104,16 @@ class NotificationSettingsService:
             else:
                 cls._data = {}
         except Exception as exc:
-            logger.error('Failed to load notification settings', exc=exc)
+            # 🔴 Файл не прочитался — работаем на умолчаниях, но НЕ ПЕРЕЗАПИСЫВАЕМ его.
+            # Раньше следом шёл _save(), то есть испорченный файл молча затирался: сегодня
+            # это стоило бы выключателей, а с правкой текстов (АС-11) стёрло бы все письма,
+            # написанные владельцем. Пусть лучше останется как есть и починится руками.
+            logger.error('Failed to load notification settings, file left untouched', exc=exc)
             cls._data = {}
+            cls._apply_defaults()
+            cls._readonly = True
+            cls._loaded = True
+            return
 
         changed = cls._apply_defaults()
         if changed:
@@ -128,6 +138,9 @@ class NotificationSettingsService:
 
     @classmethod
     def _save(cls) -> bool:
+        if cls._readonly:
+            logger.error('Refusing to overwrite unreadable notification settings file')
+            return False
         cls._ensure_dir()
         try:
             cls._storage_path.write_text(
@@ -386,3 +399,82 @@ class NotificationSettingsService:
     @classmethod
     def are_notifications_globally_enabled(cls) -> bool:
         return bool(getattr(settings, 'ENABLE_NOTIFICATIONS', True))
+
+    # -----------------------------------------------------------------
+    # Тексты писем, правленные владельцем (этап АС-11)
+    # -----------------------------------------------------------------
+    #
+    # 🔴 Ключ — имя ИСТОЧНИКА текста: либо ключ словаря локалей, либо имя константы рядом с
+    # отправителем. Не `message_id`: у пары «за 3 дня / завтра» текст ОДИН, и ключ по письму
+    # заставил бы их разъехаться — а карточка прямо говорит человеку, что текст общий.
+    #
+    # Белый список нужен, чтобы крючок в `Texts._get_value` не мог подменить произвольный
+    # ключ локали: править разрешено ровно тексты раздела «Автосообщения» и ничего больше.
+
+    _TEXTS_NODE = 'message_texts'
+
+    EDITABLE_TEXT_NAMES: frozenset[str] = frozenset(
+        {
+            # 13 ключей словаря локалей
+            'TRIAL_EXPIRED_NOTIFICATION',
+            'TRIAL_EXPIRED_DISCOUNT',
+            'SUBSCRIPTION_EXPIRING_PAID',
+            'SUBSCRIPTION_EXPIRED_1D',
+            'SUBSCRIPTION_EXPIRED_SECOND_WAVE',
+            'SUBSCRIPTION_EXPIRED_THIRD_WAVE',
+            'TRAFFIC_WARNING_ALERT',
+            'TRIAL_CHANNEL_UNSUBSCRIBED',
+            'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE',
+            'LOW_BALANCE_ALERT',
+            'AUTOPAY_SUCCESS',
+            'AUTOPAY_FAILED',
+            'AUTOPAY_FAILED_FINAL',
+            # 8 констант рядом с отправителями
+            'GRACE_STARTED_TEXT',
+            'AUTOPAY_LEGACY_TEXT',
+            'SUBSCRIPTION_EXPIRED_TEXT',
+            'TRIAL_ENDING_TEXT',
+            'TRIAL_NOT_CONNECTED_TEXT',
+            'DAILY_CHARGE_TEXT',
+            'DAILY_PAUSED_TEXT',
+            'TRAFFIC_RESET_TEXT',
+        }
+    )
+
+    @classmethod
+    def get_text_override(cls, name: str) -> str | None:
+        """Текст, написанный владельцем вместо кодового. None — правки нет."""
+        if name not in cls.EDITABLE_TEXT_NAMES:
+            return None
+        cls._load()
+        node = cls._data.get(cls._TEXTS_NODE)
+        if not isinstance(node, dict):
+            return None
+        value = node.get(name)
+        return value if isinstance(value, str) and value.strip() else None
+
+    @classmethod
+    def text_for(cls, name: str, source: str) -> str:
+        """Текст письма: правка владельца, если она есть, иначе тот, что в коде."""
+        return cls.get_text_override(name) or source
+
+    @classmethod
+    def set_text_override(cls, name: str, text: str) -> bool:
+        if name not in cls.EDITABLE_TEXT_NAMES or not text.strip():
+            return False
+        cls._load()
+        node = cls._data.get(cls._TEXTS_NODE)
+        if not isinstance(node, dict):
+            node = {}
+            cls._data[cls._TEXTS_NODE] = node
+        node[name] = text
+        return cls._save()
+
+    @classmethod
+    def clear_text_override(cls, name: str) -> bool:
+        cls._load()
+        node = cls._data.get(cls._TEXTS_NODE)
+        if not isinstance(node, dict) or name not in node:
+            return True
+        node.pop(name)
+        return cls._save()

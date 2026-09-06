@@ -11,6 +11,7 @@ from app.localization.loader import (
     clear_locale_cache,
     load_locale,
 )
+from app.services.notification_settings_service import NotificationSettingsService
 
 
 _logger = structlog.get_logger(__name__)
@@ -184,6 +185,19 @@ class Texts:
     def _get_value(self, item: str, warn: bool = True) -> Any:
         if item == 'RULES_TEXT':
             return _get_cached_rules_value(self.language)
+
+        # 🔴 Тексты автосообщений владелец правит с карточки раздела (этап АС-11), и правка
+        # обязана доезжать до ОТПРАВКИ, а не только показываться. Крючок стоит здесь, потому
+        # что это единственная точка, через которую проходят все 13 ключей раздела и все 21
+        # место их чтения — включая тестовую отправку из чат-админки.
+        #
+        # Белый список в службе настроек не даёт подменить произвольный ключ локали, а
+        # русский язык — прямое решение владельца: английским клиентам уходит `en.json`,
+        # как и раньше, и карточка честно об этом пишет.
+        if self.language == DEFAULT_LANGUAGE and item in NotificationSettingsService.EDITABLE_TEXT_NAMES:
+            override = NotificationSettingsService.get_text_override(item)
+            if override:
+                return override
 
         if item in self._values:
             return self._values[item]

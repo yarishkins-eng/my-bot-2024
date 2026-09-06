@@ -14,10 +14,13 @@ import pytest
 
 from app.cabinet.routes.admin_auto_messages import (
     _CABINET_LINK_IDS,
+    _INSERT_KEYS,
     _LOCALE_TEXT_KEYS,
     AUTO_MESSAGE_CATALOG,
     _const_texts,
+    _source_text_of,
     _text_facts,
+    _validate_new_text,
 )
 
 
@@ -244,17 +247,39 @@ def test_every_template_is_filled_with_exactly_the_names_it_asks_for() -> None:
         }
         assert const_names, f'{module_name}: констант-текстов не найдено, сторож стал пустым'
 
+        def formatted_const(call: ast.Call) -> str | None:
+            """Имя константы, к которой применён `.format(...)`.
+
+            Форм две, и обе законные: голая константа и обёртка `text_for('ИМЯ', ИМЯ)`,
+            через которую с этапа АС-11 проходит правка владельца. Сторож обязан знать обе,
+            иначе после обёртки он молча перестал бы проверять что-либо.
+            """
+            if not (isinstance(call.func, ast.Attribute) and call.func.attr == 'format'):
+                return None
+            target = call.func.value
+            if isinstance(target, ast.Name) and target.id in const_names:
+                return target.id
+            if (
+                isinstance(target, ast.Call)
+                and isinstance(target.func, ast.Attribute)
+                and target.func.attr == 'text_for'
+                and len(target.args) == 2
+                and isinstance(target.args[1], ast.Name)
+                and target.args[1].id in const_names
+            ):
+                assert isinstance(target.args[0], ast.Constant) and target.args[0].value == target.args[1].id, (
+                    'имя в хранилище правок разошлось с именем константы'
+                )
+                return target.args[1].id
+            return None
+
         called_with: dict[str, list[set[str]]] = {name: [] for name in const_names}
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == 'format'
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in const_names
-            ):
-                assert not node.args, f'{node.func.value.id}: позиционная подстановка, имена не проверить'
-                called_with[node.func.value.id].append({kw.arg for kw in node.keywords if kw.arg})
+            if isinstance(node, ast.Call):
+                const = formatted_const(node)
+                if const:
+                    assert not node.args, f'{const}: позиционная подстановка, имена не проверить'
+                    called_with[const].append({kw.arg for kw in node.keywords if kw.arg})
 
         for name in sorted(const_names):
             wanted = {field for _, field, _, _ in string.Formatter().parse(getattr(module, name)) if field is not None}
@@ -273,12 +298,186 @@ def test_every_template_is_filled_with_exactly_the_names_it_asks_for() -> None:
     assert not problems, 'подстановка разошлась с текстом: ' + '; '.join(problems)
 
 
+@pytest.fixture
+def storage(tmp_path, monkeypatch):
+    """Хранилище правок в своей папке: боевой `data/notification_settings.json` не трогаем."""
+    from app.services.notification_settings_service import NotificationSettingsService as Settings
+
+    monkeypatch.setattr(Settings, '_storage_path', tmp_path / 'notification_settings.json')
+    monkeypatch.setattr(Settings, '_data', {}, raising=False)
+    monkeypatch.setattr(Settings, '_loaded', False, raising=False)
+    monkeypatch.setattr(Settings, '_readonly', False, raising=False)
+    from app.localization.loader import clear_locale_cache
+
+    clear_locale_cache()
+    return Settings
+
+
+@pytest.mark.asyncio
+async def test_an_edit_reaches_the_letter_that_is_actually_sent(storage) -> None:
+    """Правка владельца доезжает ДО ОТПРАВКИ, а не только показывается на карточке.
+
+    🔴 Это главный сторож этапа АС-11 и единственный, отвечающий на вопрос «доезжает ли».
+    Настоящий отправитель вызывается по-настоящему; проверяется письмо-константа, у которой
+    свой путь чтения, отличный от словарного.
+    """
+    from app.services.monitoring_service import MonitoringService
+
+    assert storage.set_text_override('TRIAL_ENDING_TEXT', '🎁 Пробный кончается через {hours_text}.')
+
+    service = MonitoringService.__new__(MonitoringService)
+    sent: dict[str, str] = {}
+
+    async def capture(**kwargs):
+        sent['text'] = kwargs['text']
+        return True
+
+    service._send_message_with_logo = capture
+    user = SimpleNamespace(id=907, telegram_id=5207068834, language='ru')
+    subscription = SimpleNamespace(id=233, end_date=datetime.now(UTC) + timedelta(hours=7), tariff=None)
+
+    assert await service._send_trial_ending_notification(user, subscription, warn_hours=9) is True
+    assert sent['text'].startswith('🎁 Пробный кончается через'), 'правка не доехала до отправки'
+    assert '{hours_text}' not in sent['text'], 'метка не подставилась'
+
+
+def test_an_edit_reaches_a_dictionary_letter_too(storage) -> None:
+    """Словарные письма читают правку через тот же `Texts`, что и отправитель."""
+    from app.localization.texts import get_texts
+
+    assert storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Свой текст про {end_date}.')
+    assert get_texts('ru').t('SUBSCRIPTION_EXPIRED_1D') == 'Свой текст про {end_date}.'
+
+
+def test_letters_nobody_edited_are_untouched(storage) -> None:
+    """Правка одного письма не задевает остальные — иначе один этап тихо перепишет два десятка."""
+    import json
+
+    ru = json.loads((_BOT_ROOT / 'app/localization/locales/ru.json').read_text(encoding='utf-8'))
+    storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Свой текст про {end_date}.')
+
+    from app.localization.texts import get_texts
+
+    texts = get_texts('ru')
+    for message_id, key in _LOCALE_TEXT_KEYS.items():
+        if key == 'SUBSCRIPTION_EXPIRED_1D':
+            continue
+        assert texts.t(key) == ru[key], f'{message_id}: письмо изменилось, хотя его не правили'
+
+
+def test_an_edit_does_not_leak_into_english(storage) -> None:
+    """Решение владельца: правится РУССКИЙ. Английским клиентам уходит `en.json`, как и было."""
+    from app.localization.texts import get_texts
+
+    before = get_texts('en').t('SUBSCRIPTION_EXPIRED_1D')
+    storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Свой русский текст про {end_date}.')
+    assert get_texts('en').t('SUBSCRIPTION_EXPIRED_1D') == before
+
+
+def test_only_letters_of_this_section_can_be_overridden(storage) -> None:
+    """Крючок стоит внутри `Texts` — без белого списка он подменял бы ЛЮБОЙ ключ локали."""
+    assert storage.set_text_override('BALANCE_TOPUP', 'чужой ключ') is False
+    assert storage.get_text_override('BALANCE_TOPUP') is None
+
+    from app.localization.texts import get_texts
+
+    assert get_texts('ru').t('BALANCE_TOPUP') != 'чужой ключ'
+
+
+def test_an_unreadable_settings_file_is_not_overwritten(storage, tmp_path) -> None:
+    """🔴 Испорченный файл раньше ЗАТИРАЛСЯ дефолтами: с правкой текстов это стёрло бы всё,
+    что владелец написал. Теперь такой файл остаётся нетронутым."""
+    broken = tmp_path / 'notification_settings.json'
+    broken.write_text('{это не json', encoding='utf-8')
+
+    assert storage.is_enabled('expired_1d') is True, 'служба обязана работать на умолчаниях'
+    assert broken.read_text(encoding='utf-8') == '{это не json', 'испорченный файл переписан'
+    assert storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'x') is False, 'запись в нечитаемый файл'
+
+
+def test_the_twins_share_one_edit(storage) -> None:
+    """У пары «за 3 дня / завтра» текст ОДИН — правка обязана быть общей, как и говорит карточка."""
+    storage.set_text_override('SUBSCRIPTION_EXPIRING_PAID', 'Общий текст про {days_text}.')
+    assert 'Общий текст' in (_text_facts('paid-3d')['text'] or '')
+    assert 'Общий текст' in (_text_facts('paid-1d')['text'] or '')
+    assert _text_facts('paid-3d')['text_source'] == 'custom'
+
+
+def test_every_marker_of_every_letter_is_explained() -> None:
+    """Значок без объяснения — это то, что мешает владельцу трогать текст.
+
+    Владелец сказал прямо: «метка может сбивать менеджера». Сторож требует, чтобы каждая
+    метка каждого из 22 писем была расшифрована — либо словами, либо списком вариантов.
+    """
+    import re as regex
+
+    unexplained: list[str] = []
+    for entry in AUTO_MESSAGE_CATALOG:
+        facts = _text_facts(entry['id'])
+        for name in regex.findall(r'\{([^{}]+)\}', facts['text'] or ''):
+            explained = name in _INSERT_KEYS or any(m.name == name for m in facts['text_markers'])
+            if not explained:
+                unexplained.append(f'{entry["id"]}: {{{name}}}')
+    assert not unexplained, 'метка без расшифровки: ' + ', '.join(sorted(set(unexplained)))
+
+
+@pytest.mark.parametrize(
+    ('broken', 'why'),
+    [
+        (lambda src: src.replace('{percent}', ''), 'стёртая метка'),
+        (lambda src: src + ' {выдумка}', 'незнакомая метка'),
+        (lambda src: src.replace('{percent}', '{percent:.0f}'), 'подменённый спецификатор'),
+        (lambda src: '   ', 'пустой текст'),
+    ],
+)
+def test_a_broken_edit_is_refused_with_a_reason(storage, broken, why) -> None:
+    """Метку легко задеть, правя соседнее слово. Стёртая даёт письмо с дырой, лишняя роняет
+    отправку целиком — `.format()` бросает `KeyError`, и письмо не уходит вовсе и молча."""
+    from fastapi import HTTPException
+
+    source = _source_text_of('trial-discount')
+    assert source and '{percent}' in source
+    with pytest.raises(HTTPException) as failure:
+        _validate_new_text(source, broken(source))
+    assert failure.value.status_code == 422, why
+    assert failure.value.detail, f'{why}: отказ без объяснения'
+
+
+def test_a_good_edit_is_accepted_and_broken_markup_is_repaired(storage) -> None:
+    """Незакрытый тег Телеграм не принял бы вовсе — сохраняем починенное, а не сырое."""
+    source = _source_text_of('paid-expired')
+    prepared, warning = _validate_new_text(source, '<b>Незакрытый ' + (source or ''))
+    assert prepared.count('<b>') == prepared.count('</b>'), 'тег не починен'
+    assert warning is None
+
+
+def test_a_long_edit_is_saved_but_warns_about_the_logo(storage) -> None:
+    """Выше 1024 письмо уходит без логотипа — это предупреждение, а не запрет."""
+    source = _source_text_of('trial-not-connected')
+    _, warning = _validate_new_text(source, (source or '') + 'я' * 1200)
+    assert warning and 'логотип' in warning
+
+
+def test_restoring_gives_back_the_text_from_the_code(storage) -> None:
+    from app.localization.texts import get_texts
+
+    original = get_texts('ru').t('SUBSCRIPTION_EXPIRED_1D')
+    storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Свой текст про {end_date}.')
+    assert get_texts('ru').t('SUBSCRIPTION_EXPIRED_1D') != original
+    assert storage.clear_text_override('SUBSCRIPTION_EXPIRED_1D')
+    assert get_texts('ru').t('SUBSCRIPTION_EXPIRED_1D') == original
+
+
 def test_a_shown_const_is_the_senders_own_object_not_a_copy_of_it() -> None:
     """Показанный текст — ТОТ ЖЕ объект, что у отправителя, а не равная ему строка.
 
     🔴 Прямой запрет владельца: копии текста быть не должно. Проверка на равенство
     его не держит — выдуманная копия, случайно совпавшая с оригиналом, равна ему.
     Держит только тождество объекта: подмени константу литералом — покраснеет.
+
+    🔴 С этапа АС-11 утверждение стало ДВУСТОРОННИМ: `_const_texts()` остаётся чистым
+    источником из кода, а правку владельца поверх него накладывает `_text_facts`. Здесь
+    проверяется первая сторона; вторую держит `test_the_twins_share_one_edit`.
     """
     from app.services import daily_subscription_service as daily, monitoring_service as monitoring
 
@@ -306,6 +505,10 @@ def test_a_dictionary_letter_shows_the_dictionary_value_not_the_inline_fallback(
 
     Клиенту уходит значение из ``ru.json``, а встроенный запасной мёртв. Показать
     запасной — значит показать текст, который никому не уходит.
+
+    🔴 С этапа АС-11 это утверждение верно ПОКА ПРАВКИ НЕТ; вторую сторону («есть правка —
+    показываем её») держит `test_an_edit_reaches_a_dictionary_letter_too`. Хранилище здесь
+    намеренно не подменяется: набор проверяет именно чистое состояние.
     """
     import json
 
