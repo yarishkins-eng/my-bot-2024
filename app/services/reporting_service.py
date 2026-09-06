@@ -305,7 +305,7 @@ class ReportingService:
         lines += [
             '👤 <b>Активность пользователей</b>',
             f'• Пользователей с активной платной подпиской: {usage["active_paid_users"]}',
-            f'• Пользователей, ни разу не подключившихся: {usage["never_connected_users"]}',
+            f'• Пользователей с подпиской без серверов (за всё время): {usage["users_without_servers"]}',
             '',
         ]
 
@@ -537,7 +537,12 @@ class ReportingService:
         )
         active_paid_users = int(active_paid_q.scalar() or 0)
 
-        never_connected_q = await session.execute(
+        # 🔴 Считает подписки, которым НЕ ВЫДАН ни один сервер, — это поломка выдачи, а не
+        # поведение человека. Фильтра по статусу и сроку тут нет: берутся все подписки за всю
+        # историю. Прежнее название строки («ни разу не подключившихся») обещало другое
+        # множество — то самое, которое ищет письмо `trial_not_connected` по данным панели.
+        # Не возвращать прежнее имя, не добавив сюда проверку подключений.
+        without_servers_q = await session.execute(
             select(func.count(func.distinct(Subscription.user_id))).where(
                 or_(
                     Subscription.connected_squads.is_(None),
@@ -546,11 +551,11 @@ class ReportingService:
                 )
             )
         )
-        never_connected_users = int(never_connected_q.scalar() or 0)
+        users_without_servers = int(without_servers_q.scalar() or 0)
 
         return {
             'active_paid_users': active_paid_users,
-            'never_connected_users': never_connected_users,
+            'users_without_servers': users_without_servers,
         }
 
     def _user_label(self, user: User) -> str:
