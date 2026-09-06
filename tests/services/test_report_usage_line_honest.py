@@ -23,6 +23,7 @@ from typing import Self
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from app.database.models import UserStatus
 from app.services import reporting_service as module
 from app.services.reporting_service import ReportingService, ReportPeriod
 
@@ -129,11 +130,37 @@ async def test_usage_query_measures_servers_and_not_connections() -> None:
     # после `\n` и не находится, а тест краснеет на исправном коде.
     where = ' '.join(sql.split()).split(' where ', 1)
     assert len(where) == 2, f'у запроса пропал отбор целиком: {sql}'
-    narrowed_by = set(re.findall(r'subscriptions\.(\w+)', where[1]))
+    # `user_id` — это ключ соединения с таблицей людей, а не сужение выборки: по нему
+    # вычитаются удалённые аккаунты (см. следующую проверку). Всё остальное запрещено.
+    narrowed_by = set(re.findall(r'subscriptions\.(\w+)', where[1])) - {'user_id'}
     assert narrowed_by == {'connected_squads'}, (
         f'запрос отбирает ещё и по {sorted(narrowed_by - {"connected_squads"})} — '
         '«накопительно за всю историю» в строке отчёта стало ложью'
     )
+    # 🔴 Удалённые аккаунты обязаны быть вычтены. Без этого починка сравнения с пустым
+    # списком превращает молчание в ежеутреннюю ложную тревогу: на боевом 06.09.2026 все
+    # три подписки без серверов принадлежали удалённым, а живых таких не было ни одной.
+    assert 'users.status' in where[1], (
+        'запрос перестал вычитать удалённые аккаунты — их подписки остаются в базе навсегда '
+        'и будут каждое утро изображать поломку выдачи, которой нет'
+    )
+    # 🔴 Сторож на ЗНАЧЕНИЕ, а не на текст запроса. Именно этот класс пропустили две линзы,
+    # скептик и критик полноты: все читали SQL и рассуждали, а сравнение с '[]' в базе
+    # разворачивалось в jsonb-СТРОКУ и не совпадало ни с чем — строка отчёта печатала ноль
+    # всегда (мина KJ2, найдена живым вызовом на боевом 06.09.2026).
+    params = list(session.statements[1].compile(dialect=postgresql.dialect()).params.values())
+    assert '[]' not in params, (
+        'пустой список серверов сравнивается со СТРОКОЙ "[]" — в базе это jsonb-строка, '
+        'а не пустой массив, и совпадения не будет ни с одной подпиской'
+    )
+    assert [] in params, 'сравнение с пустым списком серверов пропало из запроса'
+    # Мало проверить, что статус человека вообще участвует: мутация «вычитать заблокированных
+    # вместо удалённых» пережила проверку `'users.status' in where`. Стережём само значение.
+    assert UserStatus.DELETED.value in params, (
+        f'вычитается не {UserStatus.DELETED.value!r}, а что-то другое — удалённые аккаунты '
+        'снова попадут в число и будут изображать поломку выдачи'
+    )
+
     # Подключения живут в панели, а не в этих колонках: пока их тут нет, строка не имеет
     # права обещать «не подключился».
     for column in ('traffic_used', 'last_activity', 'lifetime_used_traffic'):

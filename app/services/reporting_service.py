@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import structlog
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from sqlalchemy import cast, func, not_, or_, select
+from sqlalchemy import cast, func, literal, not_, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import false, true
 
@@ -25,6 +25,7 @@ from app.database.models import (
     Transaction,
     TransactionType,
     User,
+    UserStatus,
 )
 
 
@@ -551,12 +552,26 @@ class ReportingService:
         # самое, которое ищет письмо `trial_not_connected` по данным панели. Не возвращать
         # прежнее имя, не добавив сюда проверку подключений.
         without_servers_q = await session.execute(
-            select(func.count(func.distinct(Subscription.user_id))).where(
+            select(func.count(func.distinct(Subscription.user_id)))
+            # 🔴 Удалённые аккаунты вычитаем: их подписки остаются в базе навсегда
+            # (`account_erasure_service`, «Обнулить тестовый аккаунт» — строку не удаляют,
+            # только чистят). Без этого вычитания починка сравнения выше превращает молчание
+            # в ежеутреннюю ЛОЖНУЮ тревогу: замер 06.09.2026 — все три попавших сюда человека
+            # удалены, а живых подписок без серверов ноль. Кабинет вычитает их так же
+            # (`cabinet/routes/admin_users.py`, `operational_user`).
+            .join(User, User.id == Subscription.user_id)
+            .where(
+                or_(User.status.is_(None), User.status != UserStatus.DELETED.value),
                 or_(
                     Subscription.connected_squads.is_(None),
-                    cast(Subscription.connected_squads, JSONB) == cast('[]', JSONB),
+                    # 🔴 Сравнивать надо с ПУСТЫМ СПИСКОМ, а не со строкой '[]'. Прежнее
+                    # `cast('[]', JSONB)` уезжало в базу как jsonb-строка "[]"
+                    # (`jsonb_typeof` = string), поэтому не совпадало ни с одной подпиской,
+                    # и вся строка отчёта печатала ноль всегда. Замер 06.09.2026: было 0,
+                    # правильный ответ 3. Мина KJ2.
+                    cast(Subscription.connected_squads, JSONB) == literal([], JSONB),
                     func.jsonb_typeof(cast(Subscription.connected_squads, JSONB)) != 'array',
-                )
+                ),
             )
         )
         users_without_servers = int(without_servers_q.scalar() or 0)
