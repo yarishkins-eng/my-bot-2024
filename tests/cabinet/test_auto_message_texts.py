@@ -461,10 +461,15 @@ def test_a_readable_file_lifts_the_refusal_to_write(storage, tmp_path) -> None:
     storage.is_enabled('expired_1d')
     assert storage._readonly is True
 
+    # 🔴 Отказ снимается только перечитыванием файла, а перечитывание внутри живого
+    # процесса запрещено: оно стирало бы откат памяти (сторож на возврат текста это
+    # поймал). Значит на живом процессе отказ держится до перезапуска — это осознанная
+    # цена за то, что нечитаемый файл не затирается. Здесь перезапуск изображается явно.
     path.write_text('{}', encoding='utf-8')
     storage._loaded = False
+    storage._readonly = False
     storage.is_enabled('expired_1d')
-    assert storage._readonly is False, 'отказ на запись не снялся после починки файла'
+    assert storage._readonly is False, 'после перезапуска на здоровом файле отказ обязан сняться'
     assert storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Про {end_date}, {price} и{tariff_label}.')
 
 
@@ -518,6 +523,23 @@ def test_a_failed_write_does_not_reach_clients(storage, tmp_path) -> None:
 
     assert storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Текст про {end_date}, {price}{tariff_label}.') is False
     assert storage.get_text_override('SUBSCRIPTION_EXPIRED_1D') is None, 'несохранённый текст ушёл бы клиентам'
+
+
+def test_a_failed_reset_does_not_reach_clients_either(storage, tmp_path) -> None:
+    """Тот же откат нужен и возврату: «не удалось вернуть» не должно означать «уже вернул»."""
+    text = 'Своё про {end_date}, {price}{tariff_label}.'
+    assert storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', text)
+
+    # Теперь ломаем файл и просим вернуть исходный.
+    (tmp_path / 'notification_settings.json').write_text('{сломано', encoding='utf-8')
+    storage._loaded = False
+    storage.is_enabled('expired_1d')
+    storage._data.setdefault('message_texts', {})['SUBSCRIPTION_EXPIRED_1D'] = text
+
+    assert storage.clear_text_override('SUBSCRIPTION_EXPIRED_1D') is False
+    assert storage.get_text_override('SUBSCRIPTION_EXPIRED_1D') == text, (
+        'возврат произошёл, хотя владельцу ответили «не удалось»'
+    )
 
 
 def test_a_conversion_cannot_sneak_into_a_letter(storage) -> None:
