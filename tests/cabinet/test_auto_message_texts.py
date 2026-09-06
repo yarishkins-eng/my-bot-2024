@@ -468,6 +468,42 @@ def test_a_readable_file_lifts_the_refusal_to_write(storage, tmp_path) -> None:
     assert storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Про {end_date}, {price} и{tariff_label}.')
 
 
+def test_saving_without_a_single_change_leaves_every_letter_alone() -> None:
+    """«Открыл и сохранил, ничего не меняя» не должно менять письмо НИ У ОДНОГО из 22.
+
+    🔴 До волны 1 срезался ведущий перенос строки у девяти писем, и у трёх это было видно
+    клиенту в середине письма — бот дописывает ссылку на кабинет с пустой строки. Проверял
+    это скриптом и сторож не написал; мутационный прогон поймал пробел.
+    """
+    changed: list[str] = []
+    for entry in AUTO_MESSAGE_CATALOG:
+        source = _source_text_of(entry['id'])
+        if not source:
+            continue
+        prepared, _ = _validate_new_text(source, source)
+        if prepared != source:
+            changed.append(entry['id'])
+    assert not changed, 'пустое сохранение меняет письмо: ' + ', '.join(changed)
+
+
+def test_a_foreign_key_planted_in_the_file_is_ignored_on_reading(storage) -> None:
+    """Белый список сторожит и ЧТЕНИЕ, а не только запись.
+
+    Файл лежит на томе и правится руками — забор только на записи оставлял бы подмену
+    любого ключа локали через файл. Мутационный прогон показал, что прежний сторож
+    проверял лишь путь сохранения.
+    """
+    storage._load()
+    storage._data.setdefault('message_texts', {})['BALANCE_TOPUP'] = 'подменённая кнопка'
+
+    assert storage.get_text_override('BALANCE_TOPUP') is None
+    assert storage.text_for('BALANCE_TOPUP', 'исходное') == 'исходное'
+
+    from app.localization.texts import get_texts
+
+    assert get_texts('ru').t('BALANCE_TOPUP') != 'подменённая кнопка'
+
+
 def test_a_failed_write_does_not_reach_clients(storage, tmp_path) -> None:
     """🔴 Память — это и есть то, что уходит клиентам: бот и кабинет один процесс.
 
