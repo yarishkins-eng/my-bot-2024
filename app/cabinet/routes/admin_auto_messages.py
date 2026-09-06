@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import re
-import string
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -1166,20 +1165,16 @@ _OPTIONAL_MARKER = 'tariff_label'
 
 
 def _marker_set(text: str) -> set[str]:
-    """Метки текста ВМЕСТЕ со спецификатором формата: `{used:.1f}` и `{used}` — разные вещи.
+    """Метки текста вместе со спецификатором и конверсией. Одна реализация на проект.
 
     🔴 Разбором format-строки, а НЕ регуляркой. Регулярка не знает грамматики: она молча
-    пропускала `{{метка}}` (клиент получал письмо с буквальными скобками вместо числа) и
-    одиночную `{` или `}` — а на них `.format()` бросает `ValueError`, и письмо не уходит
-    вовсе и молча. Нашли три линзы независимо, каждая сквозным прогоном отправки.
-    `Formatter.parse` сам падает на непарной скобке и считает `{{`/`}}` литералами.
+    пропускала `{{метка}}` (клиент получал буквальные скобки вместо числа), одиночную `{`
+    или `}` (письмо не уходило вовсе) и конверсию `!r` (клиент получал сумму в кавычках).
+    Все три поймали живыми прогонами отправки, каждую — своя проверка.
+    Метку тарифа исключаем ТОЛЬКО в голом виде: со спецификатором она обязана считаться
+    обычной, иначе `{tariff_label:d}` проходит сохранение и падает при отправке.
     """
-    found: set[str] = set()
-    for _, field, spec, _ in string.Formatter().parse(text or ''):
-        if field is None:
-            continue
-        found.add(f'{field}:{spec}' if spec else field)
-    return {name for name in found if name.split(':')[0] != _OPTIONAL_MARKER}
+    return NotificationSettingsService.marker_names(text)
 
 
 def _filtered(body: str | None, multi_tariff: bool) -> str | None:
@@ -1194,6 +1189,14 @@ def _filtered(body: str | None, multi_tariff: bool) -> str | None:
     if body and not multi_tariff:
         return body.replace('{tariff_label}', '')
     return body
+
+
+def _raw_source_text_of(message_id: str) -> str | None:
+    """Исходный текст из кода БЕЗ фильтра по настройкам — чтобы знать, бывает ли в нём тариф."""
+    from app.localization.loader import DEFAULT_LANGUAGE, load_locale
+
+    key = _LOCALE_TEXT_KEYS.get(message_id)
+    return load_locale(DEFAULT_LANGUAGE).get(key) if key else _const_texts().get(message_id)
 
 
 def _source_text_of(message_id: str) -> str | None:
@@ -1215,7 +1218,9 @@ def _describe(name: str) -> str:
     return f'{{{name}}} ({hint[0]})' if hint else '{' + name + '}'
 
 
-def _validate_new_text(source: str, incoming: str, *, suffix_length: int = 0) -> tuple[str, str | None]:
+def _validate_new_text(
+    source: str, incoming: str, *, suffix_length: int = 0, tariff_optional: bool = False
+) -> tuple[str, str | None]:
     """Проверяет правку владельца и возвращает (что сохранить, предупреждение).
 
     🔴 Набор меток обязан совпасть с исходным — ни стереть, ни добавить. Стёртая метка
@@ -1256,6 +1261,15 @@ def _validate_new_text(source: str, incoming: str, *, suffix_length: int = 0) ->
             ),
         ) from error
 
+    # Метку тарифа терпим в обе стороны — но ТОЛЬКО у писем, где она есть в исходнике.
+    # Экран её прячет (многотарифный режим выключен), поэтому владелец не может ни вернуть
+    # её, ни увидеть; а добавить её в чужое письмо нельзя: отправитель такого не подставит,
+    # и письмо не уйдёт вовсе. Первая редакция вычёркивала метку у всех — скептик показал,
+    # что так `{tariff_label}` пролезает в любое письмо.
+    if tariff_optional:
+        wanted = wanted - {_OPTIONAL_MARKER}
+        given = given - {_OPTIONAL_MARKER}
+
     lost = sorted(wanted - given)
     if lost:
         names = ', '.join(_describe(name) for name in lost)
@@ -1273,8 +1287,16 @@ def _validate_new_text(source: str, incoming: str, *, suffix_length: int = 0) ->
 
     # Последний забор: текст обязан СОБРАТЬСЯ. Совпадения набора мало — форма метки может
     # быть такой, что подстановка всё равно падает, а падает она уже у живого клиента.
+    # Значения подставляем ТАКИМИ, какими их даёт отправитель: почти всё это строки, и
+    # числовой ноль скрывал бы поломки вроде `{tariff_label:d}`. Числом подставляем только
+    # там, где спецификатор его требует.
+    sample: dict[str, Any] = {}
+    for name in _marker_set(prepared) | {_OPTIONAL_MARKER}:
+        field = name.split('!')[0].split(':')[0]
+        spec = name.split(':', 1)[1] if ':' in name else ''
+        sample[field] = 0.0 if spec and spec[-1] in 'eEfFgGn%' else (0 if spec and spec[-1] in 'bcdoxX' else '')
     try:
-        prepared.format(**{name.split(':')[0]: 0 for name in wanted | {_OPTIONAL_MARKER}})
+        prepared.format(**sample)
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1329,7 +1351,10 @@ def _text_facts(message_id: str, params: dict[str, int] | None = None) -> dict[s
     else:
         raw = _const_texts().get(message_id)
         body = NotificationSettingsService.text_for(source_name, raw) if (source_name and raw) else raw
-    edited = bool(source_name and NotificationSettingsService.get_text_override(source_name))
+    # 🔴 «Изменён» — это когда показанный текст ОТЛИЧАЕТСЯ от кодового, а не когда правка
+    # просто лежит в файле. Если она перестала применяться (метки разошлись с кодом после
+    # обновления), карточка обязана показать кодовый текст и НЕ называть его изменённым:
+    # иначе владелец видит свои слова исчезнувшими, а значок «изменён» висит. Нашёл скептик.
 
     # 🔴 Строка тарифа и метка {tariff_label} живут ТОЛЬКО в многотарифном режиме: у
     # отправителей КАЖДОЕ место, где они рождаются, стоит за `is_multi_tariff_enabled()`
@@ -1338,6 +1363,9 @@ def _text_facts(message_id: str, params: dict[str, int] | None = None) -> dict[s
     # письма, которого никто не получит. Ровно то, ради чего этап и делается.
     multi_tariff = settings.is_multi_tariff_enabled()
     body = _filtered(body, multi_tariff)
+    # Считается ПОСЛЕ фильтра: до него показанный и кодовый тексты различаются меткой
+    # тарифа у каждого письма, и значок «изменён» горел бы всегда.
+    edited = bool(source_name) and body is not None and body != _source_text_of(message_id)
 
     suffixes: list[str] = []
     if message_id in _CABINET_LINK_IDS:
@@ -1561,7 +1589,21 @@ def _apply_text_change(message_id: str, payload: AutoMessagePatch) -> str | None
             status_code=status.HTTP_409_CONFLICT,
             detail='У этого сообщения нет текста, который можно править.',
         )
-    prepared, warning = _validate_new_text(source, payload.text)
+    from app.services.monitoring_service import cabinet_link_suffix
+
+    # Хвост со ссылкой на кабинет бот дописывает ПОСЛЕ текста: без него потолок считался бы
+    # по телу, а Телеграм режет письмо целиком.
+    suffix = len(cabinet_link_suffix()) if message_id in _CABINET_LINK_IDS else 0
+    prepared, warning = _validate_new_text(
+        source,
+        payload.text,
+        suffix_length=suffix,
+        tariff_optional=_OPTIONAL_MARKER in _marker_set(_raw_source_text_of(message_id) or ''),
+    )
+    if message_id not in _WITH_LOGO_IDS:
+        # Обещать «уйдёт без логотипа» письму, которое логотипа не знает, — обещать потерю
+        # того, чего не бывает.
+        warning = None
     if not NotificationSettingsService.set_text_override(source_name, prepared):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

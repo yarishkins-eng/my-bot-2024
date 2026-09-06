@@ -1,4 +1,5 @@
 import json
+import os
 import string
 from copy import deepcopy
 from pathlib import Path
@@ -163,7 +164,9 @@ class NotificationSettingsService:
             # как в него что-то легло, и убийство контейнера в этот миг оставляет рваный
             # JSON. С правкой текстов цена такого файла — все письма владельца разом.
             payload = json.dumps(cls._data, ensure_ascii=False, indent=2)
-            tmp = cls._storage_path.with_suffix('.json.tmp')
+            # Имя уникально: осиротевший от прошлого падения `.tmp` иначе молча
+            # блокировал бы все будущие сохранения, и причину было бы неоткуда узнать.
+            tmp = cls._storage_path.with_suffix(f'.json.{os.getpid()}.tmp')
             tmp.write_text(payload, encoding='utf-8')
             tmp.replace(cls._storage_path)
             return True
@@ -461,6 +464,19 @@ class NotificationSettingsService:
     )
 
     @classmethod
+    def _restore(cls, node: dict[str, Any], name: str, before: str | None) -> None:
+        """Вернуть память в то состояние, в каком её застали: на диск лечь не удалось.
+
+        И заставить следующий доступ перечитать файл — иначе один сбой запирал сохранения
+        до перезапуска бота: `_load` при `_loaded=True` не делает ничего.
+        """
+        if before is None:
+            node.pop(name, None)
+        else:
+            node[name] = before
+        cls._loaded = False
+
+    @classmethod
     def get_text_override(cls, name: str) -> str | None:
         """Текст, написанный владельцем вместо кодового. None — правки нет."""
         if name not in cls.EDITABLE_TEXT_NAMES:
@@ -481,9 +497,18 @@ class NotificationSettingsService:
         буквальные скобки в письмо клиенту.
         """
         found: set[str] = set()
-        for _, field, spec, _ in string.Formatter().parse(text or ''):
-            if field is not None:
-                found.add(f'{field}:{spec}' if spec else field)
+        for _, field, spec, conversion in string.Formatter().parse(text or ''):
+            if field is None:
+                continue
+            # Конверсия (`!r`, `!s`) входит в имя: `{balance!r}` дописывает клиенту кавычки
+            # вокруг суммы, а набор меток при этом не меняется — скептик поймал живым
+            # прогоном, письмо приходило с «Ваш баланс: '340' ₽».
+            name = field
+            if conversion:
+                name = f'{name}!{conversion}'
+            if spec:
+                name = f'{name}:{spec}'
+            found.add(name)
         return found
 
     @classmethod
@@ -519,8 +544,16 @@ class NotificationSettingsService:
         if not isinstance(node, dict):
             node = {}
             cls._data[cls._TEXTS_NODE] = node
+        # 🔴 Память = то, что уходит клиентам: бот и кабинет — один процесс. Записать в
+        # неё ДО успешной записи на диск значит отправить клиентам текст, про который
+        # владельцу тут же ответят «не сохранено». Соседняя, числовая половина этого же
+        # обработчика ровно эту мину и чинит — текстовая её повторила.
+        before = node.get(name)
         node[name] = text
-        return cls._save()
+        if cls._save():
+            return True
+        cls._restore(node, name, before)
+        return False
 
     @classmethod
     def clear_text_override(cls, name: str) -> bool:
@@ -528,5 +561,8 @@ class NotificationSettingsService:
         node = cls._data.get(cls._TEXTS_NODE)
         if not isinstance(node, dict) or name not in node:
             return True
-        node.pop(name)
-        return cls._save()
+        before = node.pop(name)
+        if cls._save():
+            return True
+        cls._restore(node, name, before)
+        return False

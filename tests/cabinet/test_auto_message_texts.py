@@ -468,6 +468,73 @@ def test_a_readable_file_lifts_the_refusal_to_write(storage, tmp_path) -> None:
     assert storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Про {end_date}, {price} и{tariff_label}.')
 
 
+def test_a_failed_write_does_not_reach_clients(storage, tmp_path) -> None:
+    """🔴 Память — это и есть то, что уходит клиентам: бот и кабинет один процесс.
+
+    Записать правку в память ДО успешной записи на диск значит отправить клиентам текст,
+    про который владельцу тут же ответят «не сохранено». Нашли критик полноты и скептик
+    независимо, оба живым прогоном. Соседняя, числовая половина обработчика эту мину уже
+    чинила — текстовая её повторила.
+    """
+    (tmp_path / 'notification_settings.json').write_text('{сломано', encoding='utf-8')
+    storage._loaded = False
+    storage.is_enabled('expired_1d')  # выставит _readonly
+
+    assert storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Текст про {end_date}, {price}{tariff_label}.') is False
+    assert storage.get_text_override('SUBSCRIPTION_EXPIRED_1D') is None, 'несохранённый текст ушёл бы клиентам'
+
+
+def test_a_conversion_cannot_sneak_into_a_letter(storage) -> None:
+    """`{balance!r}` не меняет набора имён, а клиенту дописывает кавычки вокруг суммы."""
+    from fastapi import HTTPException
+
+    source = _source_text_of('low-balance')
+    assert source and '{balance}' in source
+    with pytest.raises(HTTPException):
+        _validate_new_text(source, source.replace('{balance}', '{balance!r}'))
+
+
+def test_the_tariff_marker_is_tolerated_only_where_the_code_has_it(storage) -> None:
+    """Метку тарифа терпим в обе стороны — но только у писем, где она есть в исходнике.
+
+    Первая редакция вычёркивала её у ВСЕХ, и `{tariff_label}` пролезал в любое письмо:
+    отправитель такого не подставляет, и письмо не уходит вовсе. Нашёл скептик.
+    """
+    from fastapi import HTTPException
+
+    from app.cabinet.routes.admin_auto_messages import (
+        _OPTIONAL_MARKER,
+        _marker_set,
+        _raw_source_text_of,
+    )
+
+    def optional(message_id: str) -> bool:
+        return _OPTIONAL_MARKER in _marker_set(_raw_source_text_of(message_id) or '')
+
+    own = _source_text_of('paid-expired')
+    assert _validate_new_text(own, own + ' {tariff_label}', tariff_optional=optional('paid-expired'))
+
+    alien = _source_text_of('trial-discount')
+    with pytest.raises(HTTPException):
+        _validate_new_text(alien, alien + ' {tariff_label}', tariff_optional=optional('trial-discount'))
+
+
+def test_a_dropped_edit_is_not_called_edited(storage) -> None:
+    """Правка перестала применяться — карточка обязана показать кодовый текст И снять значок.
+
+    Иначе владелец видит свои слова исчезнувшими, а метка «изменён» висит, и понять
+    случившееся неоткуда. Нашёл скептик.
+    """
+    storage.set_text_override('SUBSCRIPTION_EXPIRED_1D', 'Своё про {end_date}, {price}{tariff_label}.')
+    assert _text_facts('return-day1')['text_source'] == 'custom'
+
+    # Метки разошлись с кодом — правка отбрасывается на чтении.
+    storage._data['message_texts']['SUBSCRIPTION_EXPIRED_1D'] = 'Своё про {no_such_marker}.'
+    facts = _text_facts('return-day1')
+    assert facts['text'] == _source_text_of('return-day1'), 'показан не кодовый текст'
+    assert facts['text_source'] == 'code', 'значок «изменён» врёт'
+
+
 def test_the_storage_key_of_every_card_is_the_name_its_sender_uses() -> None:
     """Имя, под которым лежит правка, — то же, что читает отправитель.
 
