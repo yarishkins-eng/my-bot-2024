@@ -1,4 +1,5 @@
 import json
+import string
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -115,7 +116,22 @@ class NotificationSettingsService:
             cls._loaded = True
             return
 
-        changed = cls._apply_defaults()
+        # Файл прочитан — прежний отказ на запись снимается. Без этого одна неудача
+        # запирала ВСЕ сохранения раздела до перезапуска бота, и владелец видел только
+        # «сервер не принял изменение», без единого слова о причине.
+        cls._readonly = False
+        try:
+            changed = cls._apply_defaults()
+        except Exception as exc:
+            # Файл — валидный JSON, но не объект (список, число, строка). До АС-11 такая
+            # дверь открывалась только с путей уведомлений; крючок в `Texts` открыл её из
+            # каждого чтения правимого ключа, то есть из любого экрана бота.
+            logger.error('Notification settings file is not an object, file left untouched', exc=exc)
+            cls._data = {}
+            cls._apply_defaults()
+            cls._readonly = True
+            cls._loaded = True
+            return
         if changed:
             cls._save()
         cls._loaded = True
@@ -143,10 +159,13 @@ class NotificationSettingsService:
             return False
         cls._ensure_dir()
         try:
-            cls._storage_path.write_text(
-                json.dumps(cls._data, ensure_ascii=False, indent=2),
-                encoding='utf-8',
-            )
+            # 🔴 Через временный файл и `os.replace`: обычная запись усекает файл ДО того,
+            # как в него что-то легло, и убийство контейнера в этот миг оставляет рваный
+            # JSON. С правкой текстов цена такого файла — все письма владельца разом.
+            payload = json.dumps(cls._data, ensure_ascii=False, indent=2)
+            tmp = cls._storage_path.with_suffix('.json.tmp')
+            tmp.write_text(payload, encoding='utf-8')
+            tmp.replace(cls._storage_path)
             return True
         except Exception as exc:
             logger.error('Failed to save notification settings', exc=exc)
@@ -453,10 +472,43 @@ class NotificationSettingsService:
         value = node.get(name)
         return value if isinstance(value, str) and value.strip() else None
 
+    @staticmethod
+    def marker_names(text: str) -> set[str]:
+        """Метки текста вместе со спецификатором формата. Одна реализация на весь проект.
+
+        Разбором format-строки, а не регуляркой: регулярка не видит непарную скобку и
+        считает `{{метка}}` меткой, а `.format()` на первом падает, на втором подставляет
+        буквальные скобки в письмо клиенту.
+        """
+        found: set[str] = set()
+        for _, field, spec, _ in string.Formatter().parse(text or ''):
+            if field is not None:
+                found.add(f'{field}:{spec}' if spec else field)
+        return found
+
     @classmethod
     def text_for(cls, name: str, source: str) -> str:
-        """Текст письма: правка владельца, если она есть, иначе тот, что в коде."""
-        return cls.get_text_override(name) or source
+        """Текст письма: правка владельца, если она есть, иначе тот, что в коде.
+
+        🔴 Правка проверяется НА ЧТЕНИИ, а не только при сохранении. Она лежит в файле и
+        переживает код, против которого её проверяли: достаточно будущей правки исходного
+        текста, переименовавшей метку, — и `.format()` начнёт падать у живого клиента,
+        а у суточного списания успешное списание уйдёт в журнал как ошибка (мина KE).
+        Разошлись метки — отдаём текст из кода и говорим об этом в журнал.
+        """
+        override = cls.get_text_override(name)
+        if not override:
+            return source
+        try:
+            if cls.marker_names(override) - {'tariff_label'} != cls.marker_names(source) - {'tariff_label'}:
+                raise ValueError('markers drifted')
+        except (ValueError, IndexError, KeyError):
+            logger.error(
+                'Saved message text no longer matches the code it was checked against, falling back',
+                name=name,
+            )
+            return source
+        return override
 
     @classmethod
     def set_text_override(cls, name: str, text: str) -> bool:

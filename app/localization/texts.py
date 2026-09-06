@@ -142,6 +142,16 @@ def _build_dynamic_values(language: str) -> dict[str, Any]:
     return values
 
 
+def _base_language(value: str | None) -> str:
+    """Язык без региона: `ru-RU`, `RU`, `ru_RU` — всё это русский.
+
+    `_normalize_language_code` только опускает регистр, поэтому `Texts('ru-RU')` грузит
+    русский словарь, но по нему не опознавался бы как русский — и клиент молча получал бы
+    текст из кода вместо правки владельца. Тот же приём уже стоит в `_build_dynamic_values`.
+    """
+    return (value or DEFAULT_LANGUAGE).split('-')[0].split('_')[0].lower()
+
+
 class Texts:
     def __init__(self, language: str = DEFAULT_LANGUAGE):
         self.language = language or DEFAULT_LANGUAGE
@@ -194,10 +204,17 @@ class Texts:
         # Белый список в службе настроек не даёт подменить произвольный ключ локали, а
         # русский язык — прямое решение владельца: английским клиентам уходит `en.json`,
         # как и раньше, и карточка честно об этом пишет.
-        if self.language == DEFAULT_LANGUAGE and item in NotificationSettingsService.EDITABLE_TEXT_NAMES:
-            override = NotificationSettingsService.get_text_override(item)
-            if override:
-                return override
+        # Язык сравнивается ТАК ЖЕ, как грузится словарь: `Texts('ru-RU')` берёт русский
+        # словарь, и без нормализации такой клиент молча получал бы текст из кода вместо
+        # правки владельца.
+        if item in NotificationSettingsService.EDITABLE_TEXT_NAMES and (
+            _base_language(self.language) == _base_language(DEFAULT_LANGUAGE)
+        ):
+            source = self._values.get(item) or self._fallback_values.get(item)
+            if source is not None:
+                # Через `text_for`, а не напрямую: там же стоит проверка, что метки правки
+                # не разошлись с кодом (мина KE).
+                return NotificationSettingsService.text_for(item, source)
 
         if item in self._values:
             return self._values[item]
