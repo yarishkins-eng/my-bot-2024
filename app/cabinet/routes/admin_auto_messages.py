@@ -1130,9 +1130,14 @@ def _markers_of(message_id: str, body: str | None, params: dict[str, int] | None
     """Метки показанного текста с расшифровкой. Порядок — как в самом письме."""
     if not body:
         return []
+    # Тем же разбором, что и забор сохранения: регулярка считает `{{метка}}` меткой, а
+    # разбор — литералом, и расшифровка расходилась бы с проверкой. Порядок сохраняем
+    # по тексту, чтобы метки шли так же, как в письме.
+    known = _marker_set(body)
     seen: list[str] = []
-    for name in re.findall(r'\{([^{}]+)\}', body):
-        if name not in seen and name not in _INSERT_KEYS:
+    for match in re.finditer(r'\{([^{}]+)\}', body):
+        name = match.group(1)
+        if name in known and name not in seen and name not in _INSERT_KEYS:
             seen.append(name)
 
     markers: list[AutoMessageMarker] = []
