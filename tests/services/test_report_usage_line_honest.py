@@ -23,6 +23,7 @@ from typing import Self
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from app.database.models import UserStatus
 from app.services import reporting_service as module
 from app.services.reporting_service import ReportingService, ReportPeriod
 
@@ -153,6 +154,12 @@ async def test_usage_query_measures_servers_and_not_connections() -> None:
         'а не пустой массив, и совпадения не будет ни с одной подпиской'
     )
     assert [] in params, 'сравнение с пустым списком серверов пропало из запроса'
+    # Мало проверить, что статус человека вообще участвует: мутация «вычитать заблокированных
+    # вместо удалённых» пережила проверку `'users.status' in where`. Стережём само значение.
+    assert UserStatus.DELETED.value in params, (
+        f'вычитается не {UserStatus.DELETED.value!r}, а что-то другое — удалённые аккаунты '
+        'снова попадут в число и будут изображать поломку выдачи'
+    )
 
     # Подключения живут в панели, а не в этих колонках: пока их тут нет, строка не имеет
     # права обещать «не подключился».
