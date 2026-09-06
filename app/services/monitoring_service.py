@@ -967,7 +967,9 @@ class MonitoringService:
             from aiogram.types import InlineKeyboardMarkup
 
             until_str = format_local_datetime(grace_until, '%d.%m')
-            message = GRACE_STARTED_TEXT.format(until_str=until_str)
+            message = NotificationSettingsService.text_for('GRACE_STARTED_TEXT', GRACE_STARTED_TEXT).format(
+                until_str=until_str
+            )
             message += self._cabinet_link_suffix()
 
             extend_callback = f'se:{subscription.id}' if settings.is_multi_tariff_enabled() else 'subscription_extend'
@@ -2167,7 +2169,9 @@ class MonitoringService:
                             if user and user.telegram_id and self.bot:
                                 await self.bot.send_message(
                                     chat_id=user.telegram_id,
-                                    text=AUTOPAY_LEGACY_TEXT,
+                                    text=NotificationSettingsService.text_for(
+                                        'AUTOPAY_LEGACY_TEXT', AUTOPAY_LEGACY_TEXT
+                                    ),
                                     parse_mode='HTML',
                                 )
                             await cache.set(autopay_legacy_key, 1, expire=86400 * 7)
@@ -2538,7 +2542,9 @@ class MonitoringService:
                     tariff_label = f' «{tariff_name}»'
                 elif hasattr(subscription, 'tariff') and subscription.tariff:
                     tariff_label = f' «{subscription.tariff.name}»'
-            message = SUBSCRIPTION_EXPIRED_TEXT.format(tariff_label=tariff_label)
+            message = NotificationSettingsService.text_for(
+                'SUBSCRIPTION_EXPIRED_TEXT', SUBSCRIPTION_EXPIRED_TEXT
+            ).format(tariff_label=tariff_label)
             message += self._cabinet_link_suffix()
 
             from aiogram.types import InlineKeyboardMarkup
@@ -2782,7 +2788,9 @@ class MonitoringService:
             window_hours = warn_hours if warn_hours is not None else NotificationSettingsService.get_trial_warn_hours()
             hours = trial_hours_left(subscription.end_date, window_hours)
             hours_text = format_hours_declension(hours)
-            message = TRIAL_ENDING_TEXT.format(tariff_label=tariff_label, hours_text=hours_text)
+            message = NotificationSettingsService.text_for('TRIAL_ENDING_TEXT', TRIAL_ENDING_TEXT).format(
+                tariff_label=tariff_label, hours_text=hours_text
+            )
 
             from aiogram.types import InlineKeyboardMarkup
 
@@ -2835,7 +2843,7 @@ class MonitoringService:
         единственный способ узнать, обо что.
         """
         try:
-            message = TRIAL_NOT_CONNECTED_TEXT
+            message = NotificationSettingsService.text_for('TRIAL_NOT_CONNECTED_TEXT', TRIAL_NOT_CONNECTED_TEXT)
 
             from aiogram.types import InlineKeyboardMarkup
 

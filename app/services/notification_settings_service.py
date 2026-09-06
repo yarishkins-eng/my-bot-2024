@@ -1,4 +1,6 @@
 import json
+import os
+import string
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -34,8 +36,10 @@ class NotificationSettingsService:
     """Runtime-editable notification settings stored on disk."""
 
     _storage_path: Path = Path('data/notification_settings.json')
-    _data: dict[str, dict[str, Any]] = {}
+    _data: dict[str, Any] = {}
     _loaded: bool = False
+    # Файл прочитать не удалось — писать в него нельзя, иначе затрём чужое содержимое.
+    _readonly: bool = False
 
     _DEFAULTS: dict[str, dict[str, Any]] = {
         'trial_channel_unsubscribed': {'enabled': True},
@@ -102,10 +106,33 @@ class NotificationSettingsService:
             else:
                 cls._data = {}
         except Exception as exc:
-            logger.error('Failed to load notification settings', exc=exc)
+            # 🔴 Файл не прочитался — работаем на умолчаниях, но НЕ ПЕРЕЗАПИСЫВАЕМ его.
+            # Раньше следом шёл _save(), то есть испорченный файл молча затирался: сегодня
+            # это стоило бы выключателей, а с правкой текстов (АС-11) стёрло бы все письма,
+            # написанные владельцем. Пусть лучше останется как есть и починится руками.
+            logger.error('Failed to load notification settings, file left untouched', exc=exc)
             cls._data = {}
+            cls._apply_defaults()
+            cls._readonly = True
+            cls._loaded = True
+            return
 
-        changed = cls._apply_defaults()
+        # Файл прочитан — прежний отказ на запись снимается. Без этого одна неудача
+        # запирала ВСЕ сохранения раздела до перезапуска бота, и владелец видел только
+        # «сервер не принял изменение», без единого слова о причине.
+        cls._readonly = False
+        try:
+            changed = cls._apply_defaults()
+        except Exception as exc:
+            # Файл — валидный JSON, но не объект (список, число, строка). До АС-11 такая
+            # дверь открывалась только с путей уведомлений; крючок в `Texts` открыл её из
+            # каждого чтения правимого ключа, то есть из любого экрана бота.
+            logger.error('Notification settings file is not an object, file left untouched', exc=exc)
+            cls._data = {}
+            cls._apply_defaults()
+            cls._readonly = True
+            cls._loaded = True
+            return
         if changed:
             cls._save()
         cls._loaded = True
@@ -128,12 +155,20 @@ class NotificationSettingsService:
 
     @classmethod
     def _save(cls) -> bool:
+        if cls._readonly:
+            logger.error('Refusing to overwrite unreadable notification settings file')
+            return False
         cls._ensure_dir()
         try:
-            cls._storage_path.write_text(
-                json.dumps(cls._data, ensure_ascii=False, indent=2),
-                encoding='utf-8',
-            )
+            # 🔴 Через временный файл и `os.replace`: обычная запись усекает файл ДО того,
+            # как в него что-то легло, и убийство контейнера в этот миг оставляет рваный
+            # JSON. С правкой текстов цена такого файла — все письма владельца разом.
+            payload = json.dumps(cls._data, ensure_ascii=False, indent=2)
+            # Имя уникально: осиротевший от прошлого падения `.tmp` иначе молча
+            # блокировал бы все будущие сохранения, и причину было бы неоткуда узнать.
+            tmp = cls._storage_path.with_suffix(f'.json.{os.getpid()}.tmp')
+            tmp.write_text(payload, encoding='utf-8')
+            tmp.replace(cls._storage_path)
             return True
         except Exception as exc:
             logger.error('Failed to save notification settings', exc=exc)
@@ -386,3 +421,149 @@ class NotificationSettingsService:
     @classmethod
     def are_notifications_globally_enabled(cls) -> bool:
         return bool(getattr(settings, 'ENABLE_NOTIFICATIONS', True))
+
+    # -----------------------------------------------------------------
+    # Тексты писем, правленные владельцем (этап АС-11)
+    # -----------------------------------------------------------------
+    #
+    # 🔴 Ключ — имя ИСТОЧНИКА текста: либо ключ словаря локалей, либо имя константы рядом с
+    # отправителем. Не `message_id`: у пары «за 3 дня / завтра» текст ОДИН, и ключ по письму
+    # заставил бы их разъехаться — а карточка прямо говорит человеку, что текст общий.
+    #
+    # Белый список нужен, чтобы крючок в `Texts._get_value` не мог подменить произвольный
+    # ключ локали: править разрешено ровно тексты раздела «Автосообщения» и ничего больше.
+
+    _TEXTS_NODE = 'message_texts'
+
+    EDITABLE_TEXT_NAMES: frozenset[str] = frozenset(
+        {
+            # 13 ключей словаря локалей
+            'TRIAL_EXPIRED_NOTIFICATION',
+            'TRIAL_EXPIRED_DISCOUNT',
+            'SUBSCRIPTION_EXPIRING_PAID',
+            'SUBSCRIPTION_EXPIRED_1D',
+            'SUBSCRIPTION_EXPIRED_SECOND_WAVE',
+            'SUBSCRIPTION_EXPIRED_THIRD_WAVE',
+            'TRAFFIC_WARNING_ALERT',
+            'TRIAL_CHANNEL_UNSUBSCRIBED',
+            'SUBSCRIPTION_REACTIVATED_CHANNEL_SUBSCRIBE',
+            'LOW_BALANCE_ALERT',
+            'AUTOPAY_SUCCESS',
+            'AUTOPAY_FAILED',
+            'AUTOPAY_FAILED_FINAL',
+            # 8 констант рядом с отправителями
+            'GRACE_STARTED_TEXT',
+            'AUTOPAY_LEGACY_TEXT',
+            'SUBSCRIPTION_EXPIRED_TEXT',
+            'TRIAL_ENDING_TEXT',
+            'TRIAL_NOT_CONNECTED_TEXT',
+            'DAILY_CHARGE_TEXT',
+            'DAILY_PAUSED_TEXT',
+            'TRAFFIC_RESET_TEXT',
+        }
+    )
+
+    @classmethod
+    def _restore(cls, node: dict[str, Any], name: str, before: str | None) -> None:
+        """Вернуть память в то состояние, в каком её застали: на диск лечь не удалось.
+
+        🔴 Перечитывать файл здесь НЕЛЬЗЯ, хотя соблазн есть: перечитывание сломанного
+        файла стирает как раз то, что мы восстановили, — сторож поймал это на возврате
+        текста. Отказ на запись держится до перезапуска бота осознанно: он защищает файл,
+        который не удалось прочитать, от затирания. В журнал об этом пишется прямо.
+        """
+        if before is None:
+            node.pop(name, None)
+        else:
+            node[name] = before
+
+    @classmethod
+    def get_text_override(cls, name: str) -> str | None:
+        """Текст, написанный владельцем вместо кодового. None — правки нет."""
+        if name not in cls.EDITABLE_TEXT_NAMES:
+            return None
+        cls._load()
+        node = cls._data.get(cls._TEXTS_NODE)
+        if not isinstance(node, dict):
+            return None
+        value = node.get(name)
+        return value if isinstance(value, str) and value.strip() else None
+
+    @staticmethod
+    def marker_names(text: str) -> set[str]:
+        """Метки текста вместе со спецификатором формата. Одна реализация на весь проект.
+
+        Разбором format-строки, а не регуляркой: регулярка не видит непарную скобку и
+        считает `{{метка}}` меткой, а `.format()` на первом падает, на втором подставляет
+        буквальные скобки в письмо клиенту.
+        """
+        found: set[str] = set()
+        for _, field, spec, conversion in string.Formatter().parse(text or ''):
+            if field is None:
+                continue
+            # Конверсия (`!r`, `!s`) входит в имя: `{balance!r}` дописывает клиенту кавычки
+            # вокруг суммы, а набор меток при этом не меняется — скептик поймал живым
+            # прогоном, письмо приходило с «Ваш баланс: '340' ₽».
+            name = field
+            if conversion:
+                name = f'{name}!{conversion}'
+            if spec:
+                name = f'{name}:{spec}'
+            found.add(name)
+        return found
+
+    @classmethod
+    def text_for(cls, name: str, source: str) -> str:
+        """Текст письма: правка владельца, если она есть, иначе тот, что в коде.
+
+        🔴 Правка проверяется НА ЧТЕНИИ, а не только при сохранении. Она лежит в файле и
+        переживает код, против которого её проверяли: достаточно будущей правки исходного
+        текста, переименовавшей метку, — и `.format()` начнёт падать у живого клиента,
+        а у суточного списания успешное списание уйдёт в журнал как ошибка (мина KE).
+        Разошлись метки — отдаём текст из кода и говорим об этом в журнал.
+        """
+        override = cls.get_text_override(name)
+        if not override:
+            return source
+        try:
+            if cls.marker_names(override) - {'tariff_label'} != cls.marker_names(source) - {'tariff_label'}:
+                raise ValueError('markers drifted')
+        except (ValueError, IndexError, KeyError):
+            logger.error(
+                'Saved message text no longer matches the code it was checked against, falling back',
+                name=name,
+            )
+            return source
+        return override
+
+    @classmethod
+    def set_text_override(cls, name: str, text: str) -> bool:
+        if name not in cls.EDITABLE_TEXT_NAMES or not text.strip():
+            return False
+        cls._load()
+        node = cls._data.get(cls._TEXTS_NODE)
+        if not isinstance(node, dict):
+            node = {}
+            cls._data[cls._TEXTS_NODE] = node
+        # 🔴 Память = то, что уходит клиентам: бот и кабинет — один процесс. Записать в
+        # неё ДО успешной записи на диск значит отправить клиентам текст, про который
+        # владельцу тут же ответят «не сохранено». Соседняя, числовая половина этого же
+        # обработчика ровно эту мину и чинит — текстовая её повторила.
+        before = node.get(name)
+        node[name] = text
+        if cls._save():
+            return True
+        cls._restore(node, name, before)
+        return False
+
+    @classmethod
+    def clear_text_override(cls, name: str) -> bool:
+        cls._load()
+        node = cls._data.get(cls._TEXTS_NODE)
+        if not isinstance(node, dict) or name not in node:
+            return True
+        before = node.pop(name)
+        if cls._save():
+            return True
+        cls._restore(node, name, before)
+        return False

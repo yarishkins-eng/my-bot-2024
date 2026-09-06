@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -599,6 +600,8 @@ class AutoMessageItem(BaseModel):
     # Границы для каждого поля. Экран берёт их отсюда, а не зашивает у себя: пол
     # «через сколько дней» у разных сообщений разный, и зашитая единица врала бы.
     limits: dict[str, list[int]] | None = None
+    # Заполняется только ответом на сохранение текста: «сохранено, но письмо уйдёт без логотипа».
+    text_warning: str | None = None
 
 
 class AutoMessageSummary(BaseModel):
@@ -641,6 +644,14 @@ class AutoMessageInsert(BaseModel):
     variants: list[AutoMessageInsertVariant]
 
 
+class AutoMessageMarker(BaseModel):
+    """Метка простыми словами: что это и чем она станет у клиента."""
+
+    name: str
+    what: str
+    example: str
+
+
 class AutoMessageDetail(AutoMessageItem):
     buttons: list[AutoMessageButton]
     history: list[AutoMessageHistoryRow]
@@ -653,6 +664,18 @@ class AutoMessageDetail(AutoMessageItem):
     text_inserts: list[AutoMessageInsert] = []
     # Имя сообщения, у которого ТОТ ЖЕ текст. Выводится из общего ключа, не из руки.
     shares_text_with: str | None = None
+    # 'code' — текст как в коде, 'custom' — владелец его правил.
+    text_source: str = 'code'
+    # Каждая метка показанного текста простыми словами. Без этого значок остаётся загадкой,
+    # и человек боится трогать текст (прямое замечание владельца 06.09.2026).
+    text_markers: list[AutoMessageMarker] = []
+    # Есть ли у письма английская версия. У восьми писем её нет вовсе — они и сегодня
+    # уходят по-русски всем, и правка их изменит: обещать обратное было бы неправдой.
+    text_has_english: bool = False
+    # Уходит ли письмо фотографией с логотипом. Только у таких потолок подписи что-то значит.
+    text_with_logo: bool = False
+    # Пределы длины приезжают с сервера, а не зашиты в экране: правило раздела с этапа АС-1.
+    text_limits: dict[str, int] = {}
 
 
 class AutoMessagePatch(BaseModel):
@@ -666,6 +689,10 @@ class AutoMessagePatch(BaseModel):
     valid_hours: int | None = Field(default=None, ge=MIN_VALID_HOURS, le=MAX_VALID_HOURS)
     trigger_days: int | None = Field(default=None, ge=1, le=MAX_TRIGGER_DAYS)
     not_connected_after_hours: int | None = Field(default=None, ge=MIN_NOT_CONNECTED_HOURS, le=MAX_NOT_CONNECTED_HOURS)
+    # Новый текст письма. Пустая строка не принимается — чтобы стереть правку, есть reset_text.
+    text: str | None = None
+    # Вернуть текст, который лежит в коде.
+    reset_text: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1016,18 @@ _CABINET_LINK_IDS = frozenset({'grace-2d', 'paid-expired', 'paid-3d', 'paid-1d'}
 _TARIFF_LINE_IDS = frozenset({'autopay-ok', 'autopay-fail', 'autopay-final'})
 
 
+_CONST_SOURCE_NAMES: dict[str, str] = {
+    'grace-2d': 'GRACE_STARTED_TEXT',
+    'autopay-legacy': 'AUTOPAY_LEGACY_TEXT',
+    'paid-expired': 'SUBSCRIPTION_EXPIRED_TEXT',
+    'trial-2h': 'TRIAL_ENDING_TEXT',
+    'trial-not-connected': 'TRIAL_NOT_CONNECTED_TEXT',
+    'daily-charge': 'DAILY_CHARGE_TEXT',
+    'daily-paused': 'DAILY_PAUSED_TEXT',
+    'traffic-reset': 'TRAFFIC_RESET_TEXT',
+}
+
+
 def _const_texts() -> dict[str, str]:
     """Тексты, которых в словаре нет: берутся у самих отправителей, не копируются."""
     from app.services.daily_subscription_service import (
@@ -1016,6 +1055,276 @@ def _const_texts() -> dict[str, str]:
     }
 
 
+# Метка простыми словами. Владелец не программист: без этого значок остаётся загадкой, и он
+# боится трогать текст — прямое замечание 06.09.2026. Примеры НЕ выдуманы: это форма значения,
+# которую подставляет отправитель. Числа, зависящие от настроек, названы местом, а не цифрой,
+# чтобы не повторить историю «число из фикстуры ушло владельцу».
+# Кому отправитель прикладывает логотип: только эти письма уходят фотографией с подписью,
+# и только у них потолок подписи в 1024 символа что-то значит. Остальным обещать «уйдёт без
+# логотипа» — обещать потерю того, чего не бывает. Список закреплён сторожем по исходникам
+# отправителей, а не написан на глаз.
+_WITH_LOGO_IDS = frozenset(
+    {
+        'grace-2d',
+        'paid-expired',
+        'trial-2h',
+        'trial-not-connected',
+        'channel-left',
+        'return-day1',
+        'return-wave2',
+        'return-wave3',
+        'autopay-ok',
+        'autopay-fail',
+        'autopay-final',
+        'paid-3d',
+        'paid-1d',
+    }
+)
+
+
+_MARKER_HINTS: dict[str, tuple[str, str]] = {
+    'amount': ('сумма списания', '199.00'),
+    'balance': ('остаток на счету клиента', '340.00'),
+    'days': ('на сколько дней продлили', '30'),
+    'days_text': ('сколько осталось до конца подписки', '3 дня'),
+    'end_date': ('когда заканчивается подписка', '09.09.2026 14:30'),
+    'expires_at': ('до какого момента действует предложение', '07.09.2026 12:00'),
+    'hours_text': ('сколько часов осталось до конца пробного', '2 часа'),
+    'limit': ('сколько гигабайт всего в тарифе', '100'),
+    'limit_gb': ('текущий лимит трафика в гигабайтах', '200'),
+    'percent': ('размер скидки', '10'),
+    'percent:.0f': ('сколько процентов трафика израсходовано', '82'),
+    'price': ('цена продления', '299 ₽'),
+    'required': ('сколько нужно списать целиком, а не сколько не хватает', '199.00'),
+    'reset_gb': ('сколько докупленных гигабайт сбросили', '50'),
+    'threshold': ('порог низкого баланса, который клиент выставил себе сам', '100.00'),
+    'trigger_days': ('через сколько дней уходит письмо', '7'),
+    'until_str': ('до какого числа VPN ещё работает', '08.09'),
+    'used:.1f': ('сколько гигабайт израсходовано', '82.4'),
+}
+
+# 🔴 Одна и та же метка выглядит по-РАЗНОМУ в разных письмах: у автоплатежа деньги идут
+# через `format_price` («199 ₽», рубль внутри значения), у суточных — как «199.00», а у
+# низкого баланса — вовсе без копеек. Показать одну форму на всех значило бы подтолкнуть
+# владельца дописать «₽» там, где он уже есть, и клиент получил бы «199 ₽ ₽».
+# Нашла линза текстов, сверив КАЖДУЮ метку с её отправителем.
+_MARKER_HINTS_BY_MESSAGE: dict[tuple[str, str], tuple[str, str]] = {
+    ('autopay-ok', 'amount'): ('сумма списания вместе с рублём', '199 ₽'),
+    ('autopay-fail', 'balance'): ('остаток на счету вместе с рублём', '340 ₽'),
+    ('autopay-fail', 'required'): ('сколько нужно списать целиком, вместе с рублём', '199 ₽'),
+    ('autopay-final', 'balance'): ('остаток на счету вместе с рублём', '340 ₽'),
+    ('autopay-final', 'required'): ('сколько нужно списать целиком, вместе с рублём', '199 ₽'),
+    ('low-balance', 'balance'): ('остаток на счету, без копеек', '340'),
+    ('low-balance', 'threshold'): ('порог, который клиент выставил себе сам, без копеек', '100'),
+}
+
+# Метки, значение которых владелец задаёт ЗДЕСЬ ЖЕ, полем на этой карточке. Для них
+# показываем не пример, а его сегодняшнее число — прямая просьба владельца 06.09.2026.
+_MARKER_FROM_PARAM: dict[str, str] = {
+    'percent': 'discount_percent',
+    'trigger_days': 'trigger_days',
+}
+
+
+def _markers_of(message_id: str, body: str | None, params: dict[str, int] | None) -> list[AutoMessageMarker]:
+    """Метки показанного текста с расшифровкой. Порядок — как в самом письме."""
+    if not body:
+        return []
+    # Тем же разбором, что и забор сохранения: регулярка считает `{{метка}}` меткой, а
+    # разбор — литералом, и расшифровка расходилась бы с проверкой. Порядок сохраняем
+    # по тексту, чтобы метки шли так же, как в письме.
+    known = _marker_set(body)
+    seen: list[str] = []
+    for match in re.finditer(r'\{([^{}]+)\}', body):
+        name = match.group(1)
+        if name in known and name not in seen and name not in _INSERT_KEYS:
+            seen.append(name)
+
+    markers: list[AutoMessageMarker] = []
+    for name in seen:
+        hint = _MARKER_HINTS_BY_MESSAGE.get((message_id, name)) or _MARKER_HINTS.get(name)
+        if not hint:
+            # Метка без расшифровки — это значок-загадка на экране. Сторож обязан
+            # покраснеть здесь, а не оставить владельца гадать.
+            continue
+        what, example = hint
+        field = _MARKER_FROM_PARAM.get(name)
+        if field and params and params.get(field) is not None:
+            what = f'{what} — берётся из поля на этой карточке'
+            example = str(params[field])
+        markers.append(AutoMessageMarker(name=name, what=what, example=example))
+    return markers
+
+
+# Выше какой длины письмо уходит без логотипа. Не запрет, а предупреждение: отправитель сам
+# снимает картинку, когда подпись не влезает (`caption_exceeds_telegram_limit`).
+_CAPTION_LIMIT = 1024
+# Жёсткий предел Телеграма 4096; конвенция проекта для набранных руками текстов — 4000.
+_TEXT_LIMIT = 4000
+
+
+# Метка тарифа — единственная, чьё присутствие зависит от настройки бота, а не от текста.
+# Из сравнения она исключена намеренно: иначе включённый многотарифный режим запер бы
+# повторную правку уже правленого письма отказом «пропала метка», которой в поле не видно.
+_OPTIONAL_MARKER = 'tariff_label'
+
+
+def _marker_set(text: str) -> set[str]:
+    """Метки текста вместе со спецификатором и конверсией. Одна реализация на проект.
+
+    🔴 Разбором format-строки, а НЕ регуляркой. Регулярка не знает грамматики: она молча
+    пропускала `{{метка}}` (клиент получал буквальные скобки вместо числа), одиночную `{`
+    или `}` (письмо не уходило вовсе) и конверсию `!r` (клиент получал сумму в кавычках).
+    Все три поймали живыми прогонами отправки, каждую — своя проверка.
+    Метку тарифа исключаем ТОЛЬКО в голом виде: со спецификатором она обязана считаться
+    обычной, иначе `{tariff_label:d}` проходит сохранение и падает при отправке.
+    """
+    return NotificationSettingsService.marker_names(text)
+
+
+def _filtered(body: str | None, multi_tariff: bool) -> str | None:
+    """Текст в том виде, в каком он УХОДИТ при сегодняшних настройках.
+
+    🔴 Метка тарифа рождается у отправителя только в многотарифном режиме; пока он выключен,
+    она разворачивается в пустоту у каждого клиента. Владелец правит текст именно в этом виде
+    (его решение 06.09.2026: «меньше значков на экране — меньше поводов их задеть»), поэтому
+    и разрешённый набор меток считается отсюда же — иначе экран показывал бы одно, а требовал
+    другое.
+    """
+    if body and not multi_tariff:
+        return body.replace('{tariff_label}', '')
+    return body
+
+
+def _raw_source_text_of(message_id: str) -> str | None:
+    """Исходный текст из кода БЕЗ фильтра по настройкам — чтобы знать, бывает ли в нём тариф."""
+    from app.localization.loader import DEFAULT_LANGUAGE, load_locale
+
+    key = _LOCALE_TEXT_KEYS.get(message_id)
+    return load_locale(DEFAULT_LANGUAGE).get(key) if key else _const_texts().get(message_id)
+
+
+def _source_text_of(message_id: str) -> str | None:
+    """Исходный текст из КОДА — без правки владельца, но в том же отфильтрованном виде."""
+    from app.config import settings
+    from app.localization.loader import DEFAULT_LANGUAGE, load_locale
+
+    # 🔴 Читаем словарь НАПРЯМУЮ, минуя `Texts`: внутри него стоит крючок правки владельца,
+    # и через него «исходным» оказалась бы его же прошлая правка — набор меток поехал бы
+    # вслед за ней, и вторая правка могла бы стереть метку без единого отказа.
+    key = _LOCALE_TEXT_KEYS.get(message_id)
+    raw = load_locale(DEFAULT_LANGUAGE).get(key) if key else _const_texts().get(message_id)
+    return _filtered(raw, settings.is_multi_tariff_enabled())
+
+
+def _describe(name: str) -> str:
+    """Метка словами, чтобы отказ говорил на языке владельца, а не на языке кода."""
+    hint = _MARKER_HINTS.get(name, _MARKER_HINTS.get(name.split(':')[0]))
+    return f'{{{name}}} ({hint[0]})' if hint else '{' + name + '}'
+
+
+def _validate_new_text(
+    source: str, incoming: str, *, suffix_length: int = 0, tariff_optional: bool = False
+) -> tuple[str, str | None]:
+    """Проверяет правку владельца и возвращает (что сохранить, предупреждение).
+
+    🔴 Набор меток обязан совпасть с исходным — ни стереть, ни добавить. Стёртая метка
+    даёт клиенту письмо с дырой («Скидка % на продление»), а незнакомая или непарная
+    скобка роняет отправку целиком: письмо не уходит вовсе и молча. Владелец сказал, что
+    выдумывать метки менеджер не станет, — забор не про выдумки, а про то, что метку
+    легко задеть, правя соседнее слово.
+    """
+    from app.utils.telegram_html import prepare_telegram_broadcast, telegram_visible_length
+
+    body = (incoming or '').strip('\n')
+    if not body.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='Текст письма не может быть пустым. Наберите текст или закройте правку кнопкой «Отмена».',
+        )
+
+    # 🔴 Ведущие и хвостовые переносы восстанавливаются РОВНО такими, какие набрал человек.
+    # `prepare_telegram_broadcast` их срезает, и у девяти писем из 22 «открыл и сохранил,
+    # ничего не меняя» тихо меняло письмо: у трёх — прямо в середине, потому что бот
+    # дописывает ссылку на кабинет, начинающуюся с пустой строки.
+    lead = incoming[: len(incoming) - len(incoming.lstrip('\n'))]
+    trail = incoming[len(incoming.rstrip('\n')) :]
+
+    try:
+        prepared = lead + prepare_telegram_broadcast(body) + trail
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
+
+    try:
+        wanted, given = _marker_set(source), _marker_set(prepared)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                'В тексте осталась непарная фигурная скобка — с ней письмо не уйдёт никому. '
+                'Проверьте, что у каждой метки есть и открывающая, и закрывающая скобка.'
+            ),
+        ) from error
+
+    # Метку тарифа терпим в обе стороны — но ТОЛЬКО у писем, где она есть в исходнике.
+    # Экран её прячет (многотарифный режим выключен), поэтому владелец не может ни вернуть
+    # её, ни увидеть; а добавить её в чужое письмо нельзя: отправитель такого не подставит,
+    # и письмо не уйдёт вовсе. Первая редакция вычёркивала метку у всех — скептик показал,
+    # что так `{tariff_label}` пролезает в любое письмо.
+    if tariff_optional:
+        wanted = wanted - {_OPTIONAL_MARKER}
+        given = given - {_OPTIONAL_MARKER}
+
+    lost = sorted(wanted - given)
+    if lost:
+        names = ', '.join(_describe(name) for name in lost)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f'Не хватает метки {names}. Верните её в текст — без неё бот не подставит это значение.',
+        )
+    extra = sorted(given - wanted)
+    if extra:
+        names = ', '.join('{' + name + '}' for name in extra)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f'Метку {names} бот не знает — оставьте только те метки, что были в тексте. Ничего не сохранено.',
+        )
+
+    # Последний забор: текст обязан СОБРАТЬСЯ. Совпадения набора мало — форма метки может
+    # быть такой, что подстановка всё равно падает, а падает она уже у живого клиента.
+    # Значения подставляем ТАКИМИ, какими их даёт отправитель: почти всё это строки, и
+    # числовой ноль скрывал бы поломки вроде `{tariff_label:d}`. Числом подставляем только
+    # там, где спецификатор его требует.
+    sample: dict[str, Any] = {}
+    for name in _marker_set(prepared) | {_OPTIONAL_MARKER}:
+        field = name.split('!')[0].split(':')[0]
+        spec = name.split(':', 1)[1] if ':' in name else ''
+        sample[field] = 0.0 if spec and spec[-1] in 'eEfFgGn%' else (0 if spec and spec[-1] in 'bcdoxX' else '')
+    try:
+        prepared.format(**sample)
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='Бот не смог собрать письмо с этим текстом. Проверьте фигурные скобки и метки.',
+        ) from error
+
+    warning = None
+    if telegram_visible_length(prepared) + suffix_length > _CAPTION_LIMIT:
+        warning = f'Сохранено. Текст длиннее {_CAPTION_LIMIT} символов, поэтому письмо уйдёт без логотипа.'
+    return prepared, warning
+
+
+def _source_name_of(message_id: str) -> str | None:
+    """Имя ИСТОЧНИКА текста — ключ словаря или имя константы. Ключ хранения правок.
+
+    🔴 Не `message_id`: у пары «за 3 дня / завтра» текст ОДИН, и ключ по письму заставил бы
+    их разъехаться — а карточка прямо говорит человеку, что текст у них общий.
+    """
+    if message_id in _LOCALE_TEXT_KEYS:
+        return _LOCALE_TEXT_KEYS[message_id]
+    return _CONST_SOURCE_NAMES.get(message_id)
+
+
 def _shares_text_with(message_id: str) -> str | None:
     """Кто ещё шлёт ТОТ ЖЕ текст. Выводится из общего ключа, а не пишется рукой."""
     key = _LOCALE_TEXT_KEYS.get(message_id)
@@ -1029,16 +1338,28 @@ def _shares_text_with(message_id: str) -> str | None:
     return None
 
 
-def _text_facts(message_id: str) -> dict[str, Any]:
+def _text_facts(message_id: str, params: dict[str, int] | None = None) -> dict[str, Any]:
     """Текст письма и всё, без чего он на экране был бы неправдой."""
     from app.config import settings
-    from app.localization.loader import DEFAULT_LANGUAGE
+    from app.localization.loader import DEFAULT_LANGUAGE, load_locale
     from app.localization.texts import get_texts
     from app.services.monitoring_service import AUTOPAY_TARIFF_LINE, cabinet_link_suffix
 
     texts = get_texts(DEFAULT_LANGUAGE)
     key = _LOCALE_TEXT_KEYS.get(message_id)
-    body = texts.get(key) if key else _const_texts().get(message_id)
+    # Правку владельца отдаёт `texts.get` сам — крючок стоит внутри `Texts` (этап АС-11),
+    # поэтому словарные письма приходят уже с ней. У писем-констант источник читаем через
+    # ту же службу, чтобы карточка и отправитель брали текст из ОДНОГО места.
+    source_name = _source_name_of(message_id)
+    if key:
+        body = texts.get(key)
+    else:
+        raw = _const_texts().get(message_id)
+        body = NotificationSettingsService.text_for(source_name, raw) if (source_name and raw) else raw
+    # 🔴 «Изменён» — это когда показанный текст ОТЛИЧАЕТСЯ от кодового, а не когда правка
+    # просто лежит в файле. Если она перестала применяться (метки разошлись с кодом после
+    # обновления), карточка обязана показать кодовый текст и НЕ называть его изменённым:
+    # иначе владелец видит свои слова исчезнувшими, а значок «изменён» висит. Нашёл скептик.
 
     # 🔴 Строка тарифа и метка {tariff_label} живут ТОЛЬКО в многотарифном режиме: у
     # отправителей КАЖДОЕ место, где они рождаются, стоит за `is_multi_tariff_enabled()`
@@ -1046,8 +1367,10 @@ def _text_facts(message_id: str) -> dict[str, Any]:
     # пустоту у КАЖДОГО клиента — и показать их владельцу значило бы показать кусок
     # письма, которого никто не получит. Ровно то, ради чего этап и делается.
     multi_tariff = settings.is_multi_tariff_enabled()
-    if body and not multi_tariff:
-        body = body.replace('{tariff_label}', '')
+    body = _filtered(body, multi_tariff)
+    # Считается ПОСЛЕ фильтра: до него показанный и кодовый тексты различаются меткой
+    # тарифа у каждого письма, и значок «изменён» горел бы всегда.
+    edited = bool(source_name) and body is not None and body != _source_text_of(message_id)
 
     suffixes: list[str] = []
     if message_id in _CABINET_LINK_IDS:
@@ -1084,6 +1407,11 @@ def _text_facts(message_id: str) -> dict[str, Any]:
         'text_suffixes': suffixes,
         'text_inserts': inserts,
         'shares_text_with': _shares_text_with(message_id),
+        'text_source': 'custom' if edited else 'code',
+        'text_markers': _markers_of(message_id, body, params),
+        'text_has_english': bool(key and load_locale('en').get(key)),
+        'text_with_logo': message_id in _WITH_LOGO_IDS,
+        'text_limits': {'max': _TEXT_LIMIT, 'caption': _CAPTION_LIMIT},
     }
 
 
@@ -1138,7 +1466,7 @@ async def get_auto_message(
     history = await _history_for(db, entry, user, request)
     return AutoMessageDetail(
         **item.model_dump(),
-        **_text_facts(message_id),
+        **_text_facts(message_id, item.params),
         buttons=[AutoMessageButton(**button) for button in entry.get('buttons', [])],
         history=history,
         history_note=(
@@ -1226,6 +1554,69 @@ async def _history_for(
     return history
 
 
+def _has_numeric_change(payload: AutoMessagePatch) -> bool:
+    """Есть ли в запросе что-то, кроме правки текста."""
+    if payload.enabled is not None:
+        return True
+    return any(getattr(payload, field, None) is not None for field in _NUMERIC_FIELDS)
+
+
+def _apply_text_change(message_id: str, payload: AutoMessagePatch) -> str | None:
+    """Сохраняет или снимает правку текста. Возвращает предупреждение для экрана."""
+    if payload.text is None and not payload.reset_text:
+        return None
+
+    source_name = _source_name_of(message_id)
+    if not source_name:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='У этого сообщения нет текста, который можно править.',
+        )
+
+    if payload.reset_text:
+        if payload.text is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Нельзя одновременно сохранить новый текст и вернуть исходный.',
+            )
+        if not NotificationSettingsService.clear_text_override(source_name):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='Не удалось вернуть исходный текст: настройки не записались на диск.',
+            )
+        return None
+
+    # Сравниваем с ИСХОДНЫМ текстом из кода, а не с показанным: показанный уже может быть
+    # чужой правкой, и тогда набор меток поехал бы вслед за ней.
+    source = _source_text_of(message_id)
+    if source is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='У этого сообщения нет текста, который можно править.',
+        )
+    from app.services.monitoring_service import cabinet_link_suffix
+
+    # Хвост со ссылкой на кабинет бот дописывает ПОСЛЕ текста: без него потолок считался бы
+    # по телу, а Телеграм режет письмо целиком.
+    suffix = len(cabinet_link_suffix()) if message_id in _CABINET_LINK_IDS else 0
+    prepared, warning = _validate_new_text(
+        source,
+        payload.text,
+        suffix_length=suffix,
+        tariff_optional=_OPTIONAL_MARKER in _marker_set(_raw_source_text_of(message_id) or ''),
+    )
+    if message_id not in _WITH_LOGO_IDS:
+        # Обещать «уйдёт без логотипа» письму, которое логотипа не знает, — обещать потерю
+        # того, чего не бывает.
+        warning = None
+    if not NotificationSettingsService.set_text_override(source_name, prepared):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Не удалось сохранить текст: настройки не записались на диск.',
+        )
+    return warning
+
+
 @router.patch('/{message_id}', response_model=AutoMessageItem)
 async def patch_auto_message(
     message_id: str,
@@ -1237,7 +1628,35 @@ async def patch_auto_message(
     if not entry:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Сообщение не найдено')
 
+    # 🔴 Текст и настройки сохраняются ПО ОТДЕЛЬНОСТИ. Иначе запрос, упавший на числовой
+    # половине, оставлял бы текст уже записанным, а владелец видел бы отказ на изменение,
+    # которое легло. Кабинет их вместе и не шлёт — забор закрывает путь через API.
+    if (payload.text is not None or payload.reset_text) and _has_numeric_change(payload):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Текст письма и настройки сохраняются по отдельности.',
+        )
+
+    # Текст правится ДО забора «нет настроек в боте»: у бонусных дней выключателя нет
+    # вовсе (`control: 'server'`), но текст письма у них есть, и править его можно.
+    text_warning = _apply_text_change(message_id, payload)
+
     settings_key = entry.get('settings_key')
+    if payload.text is not None or payload.reset_text:
+        reasons, notes = await _quiet_facts(db)
+        item = _build_item(entry, reasons, notes, await _sent_counts(db), await _claimed_counts(db))
+        item.text_warning = text_warning
+        # Правка уходит живым клиентам — в журнале обязана остаться строка. Ранний возврат
+        # не доходит до общей записи ниже, и без этой строки след оставался бы только в
+        # журнале прав кабинета.
+        logger.info(
+            'auto_message_text_changed',
+            message_id=message_id,
+            reset=payload.reset_text,
+            length=len(payload.text or ''),
+        )
+        return item
+
     if entry['control'] != 'toggle' or not settings_key:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1245,7 +1664,14 @@ async def patch_auto_message(
         )
 
     allowed = set(entry.get('params') or ())
-    changes = payload.model_dump(exclude_none=True)
+    # Правка текста уже применена выше и в числовые изменения не входит. Без этого
+    # `reset_text=False` (это НЕ None) всегда попадал бы в `changes`, и пустой запрос
+    # переставал бы отбиваться — то есть экран говорил бы «сохранено» ни на чём.
+    changes = {
+        field: value
+        for field, value in payload.model_dump(exclude_none=True).items()
+        if field not in ('text', 'reset_text')
+    }
     if not changes:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
