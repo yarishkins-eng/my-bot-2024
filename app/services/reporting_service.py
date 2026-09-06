@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import structlog
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from sqlalchemy import cast, func, not_, or_, select
+from sqlalchemy import cast, func, literal, not_, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import false, true
 
@@ -554,7 +554,12 @@ class ReportingService:
             select(func.count(func.distinct(Subscription.user_id))).where(
                 or_(
                     Subscription.connected_squads.is_(None),
-                    cast(Subscription.connected_squads, JSONB) == cast('[]', JSONB),
+                    # 🔴 Сравнивать надо с ПУСТЫМ СПИСКОМ, а не со строкой '[]'. Прежнее
+                    # `cast('[]', JSONB)` уезжало в базу как jsonb-строка "[]"
+                    # (`jsonb_typeof` = string), поэтому не совпадало ни с одной подпиской,
+                    # и вся строка отчёта печатала ноль всегда. Замер 06.09.2026: было 0,
+                    # правильный ответ 3. Мина KJ2.
+                    cast(Subscription.connected_squads, JSONB) == literal([], JSONB),
                     func.jsonb_typeof(cast(Subscription.connected_squads, JSONB)) != 'array',
                 )
             )
