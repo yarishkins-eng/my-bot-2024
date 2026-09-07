@@ -209,3 +209,26 @@ async def test_the_followup_is_actually_wired_into_a_worker_that_runs_often_enou
 
     followup.assert_awaited_once()
     assert result == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ('minutes', 'expected'),
+    [
+        (10, 600),
+        (1, 60),
+        (0, 0),
+        (-5, 0),
+        (10_000, 24 * 60 * 60),
+        ('не число', 600),
+    ],
+)
+def test_followup_delay_setting_is_read_from_the_real_settings(minutes, expected, monkeypatch):
+    """🔴 Выключатель проверяем настоящим расчётом, а не подделкой.
+
+    Ноль минут обязан означать «добора нет вовсе», отрицательное — то же самое, а потолок
+    в сутки нужен, чтобы человек не получил экран онбординга, о котором давно забыл.
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, 'REFERRAL_ONBOARDING_FOLLOWUP_MINUTES', minutes)
+    assert settings.get_referral_onboarding_followup_seconds() == expected
