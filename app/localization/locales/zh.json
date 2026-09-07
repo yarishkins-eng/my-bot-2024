@@ -1285,6 +1285,7 @@
   "REFERRAL_WELCOME_INVITE_VARIABLE": "邀请好友，并按当前推荐计划条件获得奖励。",
   "REFERRAL_WELCOME_TERMS_NOTICE": "<i>计划条件以支付时为准。</i>",
   "REFERRAL_WELCOME_NEXT_BUTTON": "继续 →",
+  "REFERRAL_WELCOME_NEXT_ALREADY_SENT": "这一步已经发送在下方 👇",
   "REFERRAL_INFO": "\n🤝<b>推荐计划</b>\n\n👥<b>已邀请：</b>{referrals_count}位朋友\n💰<b>已赚取：</b>{earned_amount}\n\n🔗<b>您的推荐链接：</b>\n<code>{referral_link}</code>\n\n🎫<b>您的优惠码：</b>\n<code>{referral_code}</code>\n\n💰<b>条件：</b>\n•每位朋友：{registration_bonus}\n•充值百分比：{commission_percent}%\n",
   "REFERRAL_INVITE_BONUS": "💎首次充值{minimum}起，您将获得{bonus}余额奖励！",
   "REFERRAL_INVITE_CREATED_INSTRUCTION": "点击下方文本即可复制：",

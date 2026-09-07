@@ -48,8 +48,8 @@ async def test_button_is_stripped_only_after_the_next_step_was_sent() -> None:
 
     with (
         patch.object(start_handlers, 'get_user_by_telegram_id', AsyncMock(return_value=_user())),
-        patch.object(start_handlers, 'was_referral_onboarding_shown', AsyncMock(return_value=False)),
-        patch.object(start_handlers, 'mark_referral_onboarding_shown', AsyncMock()),
+        patch.object(start_handlers, 'claim_referral_onboarding', AsyncMock(return_value=True)),
+        patch.object(start_handlers, 'release_referral_onboarding', AsyncMock()),
         patch.object(start_handlers, 'send_onboarding_menu', AsyncMock(side_effect=send)),
     ):
         await start_handlers.handle_referral_welcome_next(callback, AsyncMock())
@@ -64,8 +64,8 @@ async def test_failed_send_keeps_the_button_and_says_so() -> None:
 
     with (
         patch.object(start_handlers, 'get_user_by_telegram_id', AsyncMock(return_value=_user())),
-        patch.object(start_handlers, 'was_referral_onboarding_shown', AsyncMock(return_value=False)),
-        patch.object(start_handlers, 'mark_referral_onboarding_shown', AsyncMock()),
+        patch.object(start_handlers, 'claim_referral_onboarding', AsyncMock(return_value=True)),
+        patch.object(start_handlers, 'release_referral_onboarding', AsyncMock()),
         patch.object(
             start_handlers,
             'send_onboarding_menu',
@@ -189,8 +189,8 @@ async def test_second_tap_does_not_send_a_second_menu() -> None:
 
     with (
         patch.object(start_handlers, 'get_user_by_telegram_id', AsyncMock(return_value=_user())),
-        patch.object(start_handlers, 'was_referral_onboarding_shown', AsyncMock(return_value=False)),
-        patch.object(start_handlers, 'mark_referral_onboarding_shown', AsyncMock()),
+        patch.object(start_handlers, 'claim_referral_onboarding', AsyncMock(return_value=True)),
+        patch.object(start_handlers, 'release_referral_onboarding', AsyncMock()),
         patch.object(start_handlers, 'send_onboarding_menu', AsyncMock()) as send_menu,
     ):
         await start_handlers.handle_referral_welcome_next(callback, AsyncMock())
@@ -201,13 +201,17 @@ async def test_second_tap_does_not_send_a_second_menu() -> None:
 
 @pytest.mark.asyncio
 async def test_press_after_the_timer_already_delivered_sends_no_copy() -> None:
-    """Добор сработал, а кнопка осталась: нажатие обязано снять её и промолчать."""
+    """Добор сработал, а кнопка осталась: нажатие снимает её и ОБЪЯСНЯЕТ, что произошло.
+
+    Молчание тут — самый частый путь: вернувшегося телеграм ставит на первое непрочитанное,
+    то есть на приветствие с живой кнопкой, и он её жмёт.
+    """
     callback = _callback(AsyncMock())
     callback.message.edit_reply_markup = AsyncMock()
 
     with (
         patch.object(start_handlers, 'get_user_by_telegram_id', AsyncMock(return_value=_user())),
-        patch.object(start_handlers, 'was_referral_onboarding_shown', AsyncMock(return_value=True)),
+        patch.object(start_handlers, 'claim_referral_onboarding', AsyncMock(return_value=False)),
         patch.object(start_handlers, 'send_onboarding_menu', AsyncMock()) as send_menu,
     ):
         await start_handlers.handle_referral_welcome_next(callback, AsyncMock())
@@ -215,3 +219,4 @@ async def test_press_after_the_timer_already_delivered_sends_no_copy() -> None:
     send_menu.assert_not_awaited()
     callback.message.edit_reply_markup.assert_awaited_once()
     callback.answer.assert_awaited_once()
+    assert callback.answer.await_args.args[0], 'человеку обязано быть сказано, почему ничего не пришло'

@@ -55,7 +55,11 @@ class DeviceFirstRecoveryService:
         try:
             from app.utils.funnel_notify import process_due_referral_onboarding_followups
 
-            await process_due_referral_onboarding_followups(bot=bot, limit=20)
+            # 🔴 Потолок обязателен. Один человек в очереди может стоить до 30 с ожидания
+            # соединения с базой плюс до 60 с на отправку в Telegram, а их за проход до
+            # двадцати — без потолка добор задержал бы сверку платежей на десятки минут.
+            async with asyncio.timeout(10):
+                await process_due_referral_onboarding_followups(bot=bot, limit=20)
         except Exception as error:
             logger.error('referral_onboarding_followup_failed', error=type(error).__name__)
 

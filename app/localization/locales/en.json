@@ -1350,6 +1350,7 @@
   "REFERRAL_WELCOME_INVITE_VARIABLE": "Invite your friends and earn rewards under the current referral program terms.",
   "REFERRAL_WELCOME_TERMS_NOTICE": "<i>Program terms are applied at the time of payment.</i>",
   "REFERRAL_WELCOME_NEXT_BUTTON": "Next →",
+  "REFERRAL_WELCOME_NEXT_ALREADY_SENT": "This step already arrived below 👇",
   "REFERRAL_INFO": "\n🤝 <b>Referral program</b>\n\n👥 <b>Invited:</b> {referrals_count} friends\n💰 <b>Earned:</b> {earned_amount}\n\n🔗 <b>Your referral link:</b>\n<code>{referral_link}</code>\n\n🎫 <b>Your promo code:</b>\n<code>{referral_code}</code>\n\n💰 <b>Terms:</b>\n• Per friend: {registration_bonus}\n• Top-up commission: {commission_percent}%\n",
   "REFERRAL_INVITE_BONUS": "💸 Pay from {minimum} and get {bonus} extra as a bonus!",
   "REFERRAL_INVITE_CREATED_INSTRUCTION": "Tap the text below to copy:",

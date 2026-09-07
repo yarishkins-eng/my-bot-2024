@@ -68,9 +68,9 @@ from app.services.support_settings_service import SupportSettingsService
 from app.services.web_auth_service import WEB_AUTH_TOKEN_MIN_LENGTH, link_web_auth_token
 from app.states import RegistrationStates
 from app.utils.funnel_notify import (
-    mark_referral_onboarding_shown,
+    claim_referral_onboarding,
+    release_referral_onboarding,
     schedule_referral_onboarding_followup,
-    was_referral_onboarding_shown,
 )
 from app.utils.long_messages import answer_long_text, edit_long_text, send_long_text
 from app.utils.user_utils import generate_unique_referral_code
@@ -3048,13 +3048,18 @@ async def handle_referral_welcome_next(callback: types.CallbackQuery, db: AsyncS
         await callback.answer()
         return
 
-    # Или его уже дослал таймер: кнопка на месте, а экран человек получил.
-    if await was_referral_onboarding_shown(callback.from_user.id):
+    # Право показа занимаем ДО отправки и атомарно: иначе нажатие в тот момент, когда
+    # таймер уже ждёт ответа Telegram, даёт человеку второй такой же экран.
+    texts = get_texts(user.language)
+    if not await claim_referral_onboarding(callback.from_user.id):
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception as exc:
             logger.debug('Не удалось снять кнопку «Дальше» после добора', error=str(exc))
-        await callback.answer()
+        await callback.answer(
+            texts.t('REFERRAL_WELCOME_NEXT_ALREADY_SENT', 'Этот шаг уже пришёл ниже 👇'),
+            show_alert=False,
+        )
         return
 
     # 🔴 Порядок важен: сначала отправляем, потом снимаем кнопку. Наоборот — и при отказе
@@ -3068,14 +3073,13 @@ async def handle_referral_welcome_next(callback: types.CallbackQuery, db: AsyncS
             telegram_id=callback.from_user.id,
             error=str(exc),
         )
-        texts = get_texts(user.language)
+        await release_referral_onboarding(callback.from_user.id)
         await callback.answer(
             texts.t('SOMETHING_WENT_WRONG', 'Что-то пошло не так. Попробуйте ещё раз.'),
             show_alert=True,
         )
         return
 
-    await mark_referral_onboarding_shown(callback.from_user.id)
     logger.info('Онбординг реферала: следующий шаг показан по кнопке', telegram_id=callback.from_user.id)
 
     # Кнопку снимаем только после успешной отправки: второе нажатие прислало бы второе меню.
