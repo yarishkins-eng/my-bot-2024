@@ -166,28 +166,39 @@ async def test_referrer_name_cannot_break_the_message_markup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_next_button_is_attached_even_when_the_program_is_disabled() -> None:
-    """Кнопка навигационная, а не денежная: без неё человек остаётся без следующего шага."""
-    for live_settings in (_settings(), _settings(enabled=False), _settings(bonus=0)):
-        _, send_notification = await _run_registration(
+async def test_next_button_appears_when_the_next_step_is_deferred_and_the_letter_has_substance() -> None:
+    _, send_notification = await _run_registration(live_settings=_settings(), commission_values=[25, 25])
+
+    markup = _welcome(send_notification).kwargs['reply_markup']
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert [b.callback_data for row in markup.inline_keyboard for b in row] == [REFERRAL_WELCOME_NEXT_CALLBACK]
+    assert markup.inline_keyboard[0][0].text == 'Дальше →'
+
+
+@pytest.mark.asyncio
+async def test_no_button_when_the_letter_says_nothing_but_that_a_friend_invited_you() -> None:
+    """🔴 За одной строкой нельзя прятать единственный вход в пробный период.
+
+    При выключенной программе и при нулевых наградах письмо схлопывается до факта перехода —
+    в этом случае следующий шаг обязан прийти сам, как раньше.
+    """
+    for live_settings in (_settings(enabled=False), _settings(bonus=0)):
+        result, send_notification = await _run_registration(
             live_settings=live_settings,
             commission_values=[25, 0],
         )
 
-        markup = _welcome(send_notification).kwargs['reply_markup']
-        assert isinstance(markup, InlineKeyboardMarkup)
-        assert [b.callback_data for row in markup.inline_keyboard for b in row] == [REFERRAL_WELCOME_NEXT_CALLBACK]
-        assert markup.inline_keyboard[0][0].text == 'Дальше →'
+        assert _welcome(send_notification).kwargs['reply_markup'] is None
+        assert result is False, 'без кнопки шаг не отложен — бот обязан показать его сам'
 
 
 @pytest.mark.asyncio
 async def test_disabled_program_promises_nothing_to_the_invited_user() -> None:
-    result, send_notification = await _run_registration(
+    _, send_notification = await _run_registration(
         live_settings=_settings(enabled=False),
         commission_values=[25, 25],
     )
 
-    assert result is True
     assert _welcome(send_notification).args[2] == '🎁 <b>Вы пришли по ссылке друга.</b>'
 
 
@@ -428,3 +439,47 @@ async def test_undelivered_welcome_reports_false_so_the_bot_shows_the_next_step_
     assert result is False
     # Пригласивший при этом письмо получил: одна осечка не отменяет вторую отправку.
     assert [call.args[0] for call in bot.send_message.await_args_list] == [1010, 2020]
+
+
+@pytest.mark.asyncio
+async def test_callers_that_do_not_defer_the_next_step_get_no_button() -> None:
+    """🔴 Кнопку гасят только три вызывающих из восьми.
+
+    Кабинет и ретроактивная привязка на `/start` показывают меню сами — кнопка дала бы
+    человеку его копию поверх уже пришедшего.
+    """
+    from app.services.referral_service import process_referral_registration
+
+    db = AsyncMock()
+    empty_row = AsyncMock()
+    empty_row.scalar_one_or_none = lambda: None
+    db.execute.return_value = empty_row
+
+    new_user = SimpleNamespace(id=10, telegram_id=1010, referred_by_id=20, language='ru', full_name='New User')
+    referrer = SimpleNamespace(
+        id=20, telegram_id=2020, language='ru', full_name='R', first_name='Сергей', last_name=None, username=None
+    )
+
+    with (
+        patch('app.services.referral_service.settings', _settings()),
+        patch('app.services.referral_service.get_user_by_id', AsyncMock(side_effect=[new_user, referrer])),
+        patch('app.services.referral_service.get_user_campaign_id', AsyncMock(return_value=None)),
+        patch('app.services.referral_service.create_referral_earning', AsyncMock()),
+        patch(
+            'app.services.referral_contest_service.referral_contest_service.on_referral_registration',
+            AsyncMock(),
+        ),
+        patch(
+            'app.services.referral_service.get_effective_referral_commission_percent',
+            side_effect=[25, 25],
+        ),
+        patch(
+            'app.services.referral_service.send_referral_notification',
+            AsyncMock(return_value=True),
+        ) as send_notification,
+    ):
+        # без report_welcome_delivery — прежний контракт вызывающего
+        result = await process_referral_registration(db, new_user_id=10, referrer_id=20, bot=AsyncMock())
+
+    assert result is True, 'прежний смысл возврата — «регистрация обработана»'
+    assert _welcome(send_notification).kwargs['reply_markup'] is None

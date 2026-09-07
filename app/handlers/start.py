@@ -2949,21 +2949,27 @@ async def _send_onboarding_menu(bot, tg_user, db: AsyncSession, user: User) -> N
     texts = get_texts(user.language)
     pinned_message = await get_active_pinned_message(db)
 
+    has_active_subscription, subscription_is_active = _calculate_subscription_flags(user.subscription)
+
     offer_text = await get_welcome_text_for_user(db, tg_user)
     if offer_text:
         if pinned_message and pinned_message.send_before_menu:
             await _send_pinned_message(bot, db, user, pinned_message)
+        # Сторож из автоматической ветки: подписчику не предлагаем бесплатный пробный.
+        offer_keyboard = (
+            get_back_keyboard(user.language)
+            if has_active_subscription
+            else get_post_registration_keyboard(user.language)
+        )
         await bot.send_message(
             chat_id=chat_id,
             text=offer_text,
-            reply_markup=get_post_registration_keyboard(user.language),
+            reply_markup=offer_keyboard,
             parse_mode='HTML',
         )
         if pinned_message and not pinned_message.send_before_menu:
             await _send_pinned_message(bot, db, user, pinned_message)
         return
-
-    has_active_subscription, subscription_is_active = _calculate_subscription_flags(user.subscription)
 
     menu_text = await get_main_menu_text(user, texts, db)
     is_admin = settings.is_admin(user.telegram_id)
@@ -3011,6 +3017,11 @@ async def handle_referral_welcome_next(callback: types.CallbackQuery, db: AsyncS
         await callback.answer()
         return
 
+    # Кнопки уже нет — значит шаг показан, второе нажатие копию не присылает.
+    if getattr(callback.message, 'reply_markup', None) is None:
+        await callback.answer()
+        return
+
     # 🔴 Порядок важен: сначала отправляем, потом снимаем кнопку. Наоборот — и при отказе
     # Telegram человек остаётся с приветствием без кнопки и без следующего шага, то есть
     # в тупике, из которого выход только повторный /start.
@@ -3028,6 +3039,8 @@ async def handle_referral_welcome_next(callback: types.CallbackQuery, db: AsyncS
             show_alert=True,
         )
         return
+
+    logger.info('Онбординг реферала: следующий шаг показан по кнопке', telegram_id=callback.from_user.id)
 
     # Кнопку снимаем только после успешной отправки: второе нажатие прислало бы второе меню.
     try:

@@ -147,12 +147,23 @@ def _referrer_display_name(referrer: User) -> str:
     return f'@{username}' if username else ''
 
 
-def _build_referral_welcome(new_user: User, referrer: User, texts) -> tuple[str, InlineKeyboardMarkup]:
-    """Собрать приветствие приглашённому и кнопку «Дальше» под ним.
+def _build_referral_welcome(
+    new_user: User,
+    referrer: User,
+    texts,
+    *,
+    with_next_button: bool,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Собрать приветствие приглашённому и, если нужно, кнопку «Дальше» под ним.
 
-    Кнопка НАВИГАЦИОННАЯ, а не денежная: она показывает следующее сообщение онбординга,
-    поэтому ставится всегда — в том числе при выключенной программе, когда обещаний в
-    письме нет вовсе. Вызывающий обязан не отправлять следующее сообщение сам.
+    Кнопка НАВИГАЦИОННАЯ, а не денежная: она показывает следующее сообщение онбординга.
+    🔴 И ставится она РОВНО ТАМ, где этот следующий шаг действительно отложен: из восьми
+    вызывающих его гасят только три (онбординг в боте). У остальных — кабинет, ретроактивная
+    привязка на `/start` — меню приходит само, и кнопка дала бы человеку его копию.
+
+    Второе условие: письму есть что сказать. При выключенной программе (и при нулевых
+    наградах) остаётся одна строка про переход по ссылке — прятать за ней единственный вход
+    в пробный период нельзя, пусть следующий шаг приходит сам.
     """
     name = _referrer_display_name(referrer)
     if name:
@@ -197,21 +208,23 @@ def _build_referral_welcome(new_user: User, referrer: User, texts) -> tuple[str,
         if has_reward_terms:
             parts.append(texts.REFERRAL_WELCOME_TERMS_NOTICE)
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=texts.REFERRAL_WELCOME_NEXT_BUTTON,
-                    callback_data=REFERRAL_WELCOME_NEXT_CALLBACK,
-                )
+    keyboard = None
+    if with_next_button and len(parts) > 1:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=texts.REFERRAL_WELCOME_NEXT_BUTTON,
+                        callback_data=REFERRAL_WELCOME_NEXT_CALLBACK,
+                    )
+                ]
             ]
-        ]
-    )
+        )
     return '\n\n'.join(parts), keyboard
 
 
-async def _send_referral_welcome(bot: Bot, new_user: User, referrer: User) -> bool:
-    """Отправить приветствие приглашённому. Возвращает True, только если оно УШЛО.
+async def _send_referral_welcome(bot: Bot, new_user: User, referrer: User, *, with_next_button: bool) -> bool:
+    """Отправить приветствие приглашённому. True — если оно ушло И несёт кнопку «Дальше».
 
     🔴 Своя страховка стоит здесь НАМЕРЕННО: письмо пригласившему отправляется ПОСЛЕ
     этого, в том же общем ``try``. Без локального перехвата любая ошибка приветствия
@@ -225,10 +238,15 @@ async def _send_referral_welcome(bot: Bot, new_user: User, referrer: User) -> bo
     try:
         if not bot or new_user.telegram_id is None:
             return False
-        message, keyboard = _build_referral_welcome(new_user, referrer, get_texts(new_user.language))
-        return await send_referral_notification(
+        message, keyboard = _build_referral_welcome(
+            new_user, referrer, get_texts(new_user.language), with_next_button=with_next_button
+        )
+        delivered = await send_referral_notification(
             bot, new_user.telegram_id, message, user=new_user, reply_markup=keyboard
         )
+        # Следующий шаг откладывается ТОЛЬКО если человек получил кнопку. Иначе он останется
+        # без единственного входа в пробный период, а бот ему больше не напишет.
+        return bool(delivered) and keyboard is not None
     except Exception as exc:
         logger.error(
             'Не удалось отправить приветствие приглашённому, письмо пригласившему не отменяем',
@@ -772,7 +790,9 @@ async def process_referral_registration(
         welcome_sent = False
         if bot:
             commission_percent = get_effective_referral_commission_percent(referrer)
-            welcome_sent = await _send_referral_welcome(bot, new_user, referrer)
+            welcome_sent = await _send_referral_welcome(
+                bot, new_user, referrer, with_next_button=report_welcome_delivery
+            )
 
             inviter_notification = (
                 f'👥 <b>Новый реферал!</b>\n\n'
