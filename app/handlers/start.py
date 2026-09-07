@@ -2961,12 +2961,26 @@ async def _send_onboarding_menu(bot, tg_user, db: AsyncSession, user: User) -> N
             if has_active_subscription
             else get_post_registration_keyboard(user.language)
         )
-        await bot.send_message(
-            chat_id=chat_id,
-            text=offer_text,
-            reply_markup=offer_keyboard,
-            parse_mode='HTML',
-        )
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=offer_text,
+                reply_markup=offer_keyboard,
+                parse_mode='HTML',
+            )
+        except TelegramBadRequest as e:
+            # 🔴 Повтор без разметки — из автоматической ветки. Без него несбалансированный
+            # HTML в приветственном тексте админки превращает «Дальше» в вечный тупик:
+            # отправка падает детерминированно, и человек жмёт кнопку до бесконечности.
+            if 'parse entities' not in str(e).lower() and "can't parse" not in str(e).lower():
+                raise
+            logger.warning('HTML parse error в приветственном сообщении, повтор без parse_mode', error=e)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=offer_text,
+                reply_markup=offer_keyboard,
+                parse_mode=None,
+            )
         if pinned_message and not pinned_message.send_before_menu:
             await _send_pinned_message(bot, db, user, pinned_message)
         return

@@ -483,3 +483,71 @@ async def test_callers_that_do_not_defer_the_next_step_get_no_button() -> None:
 
     assert result is True, 'прежний смысл возврата — «регистрация обработана»'
     assert _welcome(send_notification).kwargs['reply_markup'] is None
+
+
+@pytest.mark.asyncio
+async def test_real_name_wins_over_username_when_both_are_set() -> None:
+    """Порядок «имя, потом ник» — намеренный, и без этого сторожа он не застрахован.
+
+    У большинства людей в Telegram заполнено и то и другое; тесты по отдельности
+    перестановку приоритета не замечали.
+    """
+    _, send_notification = await _run_registration(
+        live_settings=_settings(),
+        commission_values=[25, 25],
+        referrer_first_name='Сергей',
+        referrer_username='seryoga',
+    )
+
+    welcome_text = _welcome(send_notification).args[2]
+    assert welcome_text.startswith('🎁 <b>Вы пришли по ссылке друга: Сергей</b>')
+    assert 'seryoga' not in welcome_text
+
+
+@pytest.mark.asyncio
+async def test_race_on_the_unique_index_sends_nothing_and_defers_nothing() -> None:
+    """Ветка гонки: проигравшая сессия ловит IntegrityError и откатывается.
+
+    Читать поля пользователя после отката нельзя — объекты сессии протухли. Поэтому
+    приветствие здесь не собирается вовсе, а в режиме отчёта возвращается False:
+    следующий шаг покажет вызывающий, как раньше.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from app.services.referral_service import process_referral_registration
+
+    db = AsyncMock()
+    empty_row = AsyncMock()
+    empty_row.scalar_one_or_none = lambda: None
+    db.execute.return_value = empty_row
+
+    new_user = SimpleNamespace(id=10, telegram_id=1010, referred_by_id=20, language='ru', full_name='New User')
+    referrer = SimpleNamespace(
+        id=20, telegram_id=2020, language='ru', full_name='R', first_name='Сергей', last_name=None, username=None
+    )
+
+    with (
+        patch('app.services.referral_service.settings', _settings()),
+        patch(
+            'app.services.referral_service.get_user_by_id',
+            AsyncMock(side_effect=[new_user, referrer, new_user, referrer]),
+        ),
+        patch('app.services.referral_service.get_user_campaign_id', AsyncMock(return_value=None)),
+        patch(
+            'app.services.referral_service.create_referral_earning',
+            AsyncMock(side_effect=IntegrityError('insert', {}, Exception('duplicate'))),
+        ),
+        patch(
+            'app.services.referral_service.send_referral_notification',
+            AsyncMock(return_value=True),
+        ) as send_notification,
+    ):
+        deferred = await process_referral_registration(
+            db, new_user_id=10, referrer_id=20, bot=AsyncMock(), report_welcome_delivery=True
+        )
+        handled = await process_referral_registration(db, new_user_id=10, referrer_id=20, bot=AsyncMock())
+
+    assert deferred is False, 'шаг не отложен — вызывающий обязан показать его сам'
+    assert handled is True, 'для прежнего контракта гонка — это успешно обработанный дубль'
+    send_notification.assert_not_awaited()
+    assert db.rollback.await_count == 2

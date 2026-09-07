@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 
 from app.handlers import start as start_handlers
 
@@ -127,3 +128,32 @@ async def test_next_step_shows_the_admin_welcome_text_when_it_is_configured() ->
     assert bot.send_message.await_args.kwargs['text'] == 'Привет от админки!'
     keyboard = bot.send_message.await_args.kwargs['reply_markup']
     assert any(b.callback_data == 'trial_activate' for row in keyboard.inline_keyboard for b in row)
+
+
+@pytest.mark.asyncio
+async def test_broken_html_in_the_admin_welcome_text_does_not_dead_end_the_button() -> None:
+    """🔴 Без повтора без разметки «Дальше» становится тупиком НАВСЕГДА.
+
+    Отправка падала бы детерминированно: человек жмёт кнопку, получает «попробуйте ещё раз»,
+    жмёт снова — и так до бесконечности. Повтор есть в обеих автоматических ветках.
+    """
+    bot = AsyncMock()
+    calls: list[str | None] = []
+
+    async def refuse_html(**kwargs):
+        calls.append(kwargs.get('parse_mode'))
+        if kwargs.get('parse_mode') == 'HTML':
+            raise TelegramBadRequest(method='sendMessage', message="Bad Request: can't parse entities")
+        return SimpleNamespace(message_id=1)
+
+    bot.send_message.side_effect = refuse_html
+    tg_user = SimpleNamespace(id=1010, first_name='Новичок', username='newbie')
+
+    with (
+        patch('app.database.crud.welcome_text.get_welcome_text_for_user', AsyncMock(return_value='<b>битый')),
+        patch.object(start_handlers, 'get_active_pinned_message', AsyncMock(return_value=None)),
+        patch.object(start_handlers, '_calculate_subscription_flags', lambda _sub: (False, False)),
+    ):
+        await start_handlers._send_onboarding_menu(bot, tg_user, AsyncMock(), _user())
+
+    assert calls == ['HTML', None], 'после отказа разметки текст обязан уйти без неё'
