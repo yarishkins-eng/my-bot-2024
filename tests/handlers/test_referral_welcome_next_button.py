@@ -157,3 +157,37 @@ async def test_broken_html_in_the_admin_welcome_text_does_not_dead_end_the_butto
         await start_handlers._send_onboarding_menu(bot, tg_user, AsyncMock(), _user())
 
     assert calls == ['HTML', None], 'после отказа разметки текст обязан уйти без неё'
+
+
+@pytest.mark.asyncio
+async def test_subscriber_is_not_offered_the_free_trial_again() -> None:
+    """Сторож из автоматической ветки: у кого подписка есть, тому пробный не предлагаем."""
+    bot = AsyncMock()
+    tg_user = SimpleNamespace(id=1010, first_name='Новичок', username='newbie')
+
+    with (
+        patch('app.database.crud.welcome_text.get_welcome_text_for_user', AsyncMock(return_value='Привет!')),
+        patch.object(start_handlers, 'get_active_pinned_message', AsyncMock(return_value=None)),
+        patch.object(start_handlers, '_calculate_subscription_flags', lambda _sub: (True, True)),
+    ):
+        await start_handlers._send_onboarding_menu(bot, tg_user, AsyncMock(), _user())
+
+    keyboard = bot.send_message.await_args.kwargs['reply_markup']
+    buttons = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert 'trial_activate' not in buttons
+
+
+@pytest.mark.asyncio
+async def test_second_tap_does_not_send_a_second_menu() -> None:
+    """Кнопки в сообщении уже нет — шаг показан, копию не шлём."""
+    callback = _callback(AsyncMock())
+    callback.message.reply_markup = None
+
+    with (
+        patch.object(start_handlers, 'get_user_by_telegram_id', AsyncMock(return_value=_user())),
+        patch.object(start_handlers, '_send_onboarding_menu', AsyncMock()) as send_menu,
+    ):
+        await start_handlers.handle_referral_welcome_next(callback, AsyncMock())
+
+    send_menu.assert_not_awaited()
+    callback.answer.assert_awaited_once()
