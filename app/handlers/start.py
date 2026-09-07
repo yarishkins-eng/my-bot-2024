@@ -1868,7 +1868,9 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
     if referrer_id and referrer_id != user.id:
         try:
             referral_welcome_sent = bool(
-                await process_referral_registration(db, user.id, referrer_id, callback.bot)
+                await process_referral_registration(
+                    db, user.id, referrer_id, callback.bot, report_welcome_delivery=True
+                )
             ) and (user.telegram_id is not None)
             logger.info('✅ Реферальная регистрация обработана для', user_id=user.id)
         except Exception as e:
@@ -2207,7 +2209,7 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
     if referrer_id and referrer_id != user.id:
         try:
             referral_welcome_sent = bool(
-                await process_referral_registration(db, user.id, referrer_id, message.bot)
+                await process_referral_registration(db, user.id, referrer_id, message.bot, report_welcome_delivery=True)
             ) and (user.telegram_id is not None)
             logger.info('✅ Реферальная регистрация обработана для', user_id=user.id)
         except Exception as e:
@@ -2753,7 +2755,9 @@ async def required_sub_channel_check(
                     if referrer_id and referrer_id != user.id:
                         try:
                             referral_welcome_sent = bool(
-                                await process_referral_registration(db, user.id, referrer_id, bot)
+                                await process_referral_registration(
+                                    db, user.id, referrer_id, bot, report_welcome_delivery=True
+                                )
                             ) and (user.telegram_id is not None)
                             logger.info('✅ CHANNEL CHECK: Реферальная регистрация обработана для', user_id=user.id)
                         except Exception as e:

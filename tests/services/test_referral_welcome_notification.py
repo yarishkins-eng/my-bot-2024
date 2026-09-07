@@ -89,7 +89,9 @@ async def _run_registration(
             AsyncMock(return_value=True),
         ) as send_notification,
     ):
-        result = await process_referral_registration(db, new_user_id=10, referrer_id=20, bot=AsyncMock())
+        result = await process_referral_registration(
+            db, new_user_id=10, referrer_id=20, bot=AsyncMock(), report_welcome_delivery=True
+        )
 
     return result, send_notification
 
@@ -370,7 +372,9 @@ async def test_repeated_registration_sends_nothing_and_reports_no_welcome() -> N
         patch('app.services.referral_service.get_user_by_id', AsyncMock(side_effect=[new_user, referrer])),
         patch('app.services.referral_service.send_referral_notification', AsyncMock()) as send_notification,
     ):
-        result = await process_referral_registration(db, new_user_id=10, referrer_id=20, bot=AsyncMock())
+        result = await process_referral_registration(
+            db, new_user_id=10, referrer_id=20, bot=AsyncMock(), report_welcome_delivery=True
+        )
 
     assert result is False
     send_notification.assert_not_awaited()
@@ -417,7 +421,9 @@ async def test_undelivered_welcome_reports_false_so_the_bot_shows_the_next_step_
             side_effect=[25, 25],
         ),
     ):
-        result = await process_referral_registration(db, new_user_id=10, referrer_id=20, bot=bot)
+        result = await process_referral_registration(
+            db, new_user_id=10, referrer_id=20, bot=bot, report_welcome_delivery=True
+        )
 
     assert result is False
     # Пригласивший при этом письмо получил: одна осечка не отменяет вторую отправку.

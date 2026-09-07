@@ -662,16 +662,26 @@ async def send_referral_notification(
         return False
 
 
-async def process_referral_registration(db: AsyncSession, new_user_id: int, referrer_id: int, bot: Bot = None) -> bool:
+async def process_referral_registration(
+    db: AsyncSession,
+    new_user_id: int,
+    referrer_id: int,
+    bot: Bot = None,
+    *,
+    report_welcome_delivery: bool = False,
+) -> bool:
     """Оформить реферальную привязку и поприветствовать приглашённого.
 
-    🔴 Возвращает True, ТОЛЬКО если приглашённому УШЛО приветствие с кнопкой «Дальше» —
-    это НЕ «регистрация удалась». На повторном вызове и в гонке регистрация в порядке, а
-    приветствия нет, и вернётся False. Так и задумано: вызывающий в боте гасит
-    автоматическую отправку следующего шага ровно тогда, когда его покажет кнопка.
-    Соврать здесь — оставить человека без единого сообщения.
+    По умолчанию возвращает «регистрация обработана» — прежний смысл, на него опирается
+    сторож `tests/services/test_attach_referrer_if_missing.py`, и менять его нельзя.
 
-    Остальные восемь вызывающих это значение не читают (проверено 07.09.2026).
+    🔴 ``report_welcome_delivery=True`` переключает возвращаемое значение на ФАКТ ДОСТАВКИ
+    приветствия. Это нужно ровно одному вызывающему — онбордингу в боте: он гасит
+    автоматическую отправку следующего шага, только если у человека появилась кнопка
+    «Дальше». Соврать там True — оставить его без единого сообщения: ни приветствия, ни
+    кнопки, ни меню, и бот больше не напишет (писем для человека без подписки у нас нет).
+    Повторный вызов и гонка регистрацию не портят, но приветствия НЕ шлют — значит в этом
+    режиме честный ответ False, и следующий шаг придёт сам, как раньше.
     """
     try:
         if new_user_id == referrer_id:
@@ -725,8 +735,7 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
                 referrer_id=referrer_id,
             )
             # Приветствие здесь НЕ шлём: его уже отправила первая обработка этой пары.
-            # Возвращаем False — вызывающий в боте покажет следующий шаг сам, как раньше.
-            return False
+            return not report_welcome_delivery
 
         campaign_id = await get_user_campaign_id(db, new_user_id)
         try:
@@ -751,7 +760,7 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
             )
             # Приветствие отправит победившая сессия. И читать поля после `rollback` нельзя:
             # объекты сессии протухли, обращение к ним даёт MissingGreenlet.
-            return False
+            return not report_welcome_delivery
 
         try:
             from app.services.referral_contest_service import referral_contest_service
@@ -804,7 +813,7 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
             referrer_id=referrer_id,
             welcome_sent=welcome_sent,
         )
-        return welcome_sent
+        return welcome_sent if report_welcome_delivery else True
 
     except Exception as e:
         logger.error('Ошибка обработки реферальной регистрации', error=e)
