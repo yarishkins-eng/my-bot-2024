@@ -24,6 +24,10 @@ from app.services.device_first_payment_service import reconcile_device_first_pay
 
 logger = structlog.get_logger(__name__)
 
+# Сколько секунд добор онбординга имеет право отнять у денежного воркера за один проход.
+# Вынесено в константу, чтобы сторож проверял потолок за доли секунды, а не за десять.
+ONBOARDING_FOLLOWUP_TIMEOUT_SECONDS = 10
+
 
 class DeviceFirstRecoveryService:
     """Recover direct receipts, provisioning and notifications without global polling."""
@@ -58,7 +62,7 @@ class DeviceFirstRecoveryService:
             # 🔴 Потолок обязателен. Один человек в очереди может стоить до 30 с ожидания
             # соединения с базой плюс до 60 с на отправку в Telegram, а их за проход до
             # двадцати — без потолка добор задержал бы сверку платежей на десятки минут.
-            async with asyncio.timeout(10):
+            async with asyncio.timeout(ONBOARDING_FOLLOWUP_TIMEOUT_SECONDS):
                 await process_due_referral_onboarding_followups(bot=bot, limit=20)
         except Exception as error:
             logger.error('referral_onboarding_followup_failed', error=type(error).__name__)

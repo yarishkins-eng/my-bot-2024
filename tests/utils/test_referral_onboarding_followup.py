@@ -330,3 +330,37 @@ async def test_money_work_runs_before_the_followup_and_is_not_hostage_to_it() ->
     assert order[-1] == 'добор', 'добор обязан идти ПОСЛЕ денежной работы'
     assert order.count('деньги') == 3
     assert result == (0, 0, 0), 'сбой добора не имеет права отменить денежный отчёт'
+
+
+@pytest.mark.asyncio
+async def test_followup_cannot_hold_the_money_worker_hostage(monkeypatch) -> None:
+    """🔴 Потолок времени. Без него один медленный поход в Telegram при занятом пуле базы
+
+    останавливал сверку платежей на десятки минут: людей за проход до двадцати, и время
+    складывается. Проверяем поведением: зависший добор обязан быть оборван.
+    """
+    import asyncio
+
+    from app.services import device_first_recovery_service as worker
+
+    monkeypatch.setattr(worker, 'ONBOARDING_FOLLOWUP_TIMEOUT_SECONDS', 0.05)
+
+    async def hangs(*_a, **_k):
+        await asyncio.sleep(5)
+
+    async def money(*_a, **_k):
+        return 0
+
+    started = time.monotonic()
+    with (
+        patch.object(worker, 'reconcile_device_first_payments', AsyncMock(side_effect=money)),
+        patch.object(worker, 'process_direct_provisioning_outbox', AsyncMock(side_effect=money)),
+        patch.object(worker, 'process_device_first_deposit_outbox', AsyncMock()),
+        patch.object(worker, 'process_device_first_notification_outbox', AsyncMock(side_effect=money)),
+        patch('app.database.database.AsyncSessionLocal'),
+        patch('app.utils.funnel_notify.process_due_referral_onboarding_followups', AsyncMock(side_effect=hangs)),
+    ):
+        result = await worker.device_first_recovery_service.run_once(bot=AsyncMock())
+
+    assert time.monotonic() - started < 1, 'проход обязан оборваться по потолку, а не ждать добор'
+    assert result == (0, 0, 0)

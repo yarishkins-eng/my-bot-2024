@@ -71,12 +71,16 @@ async def test_failed_send_keeps_the_button_and_says_so() -> None:
             'send_onboarding_menu',
             AsyncMock(side_effect=RuntimeError('Telegram refused')),
         ),
+        patch.object(start_handlers, 'release_referral_onboarding', AsyncMock()) as released,
     ):
         await start_handlers.handle_referral_welcome_next(callback, AsyncMock())
 
     callback.message.edit_reply_markup.assert_not_awaited()
     callback.answer.assert_awaited_once()
     assert callback.answer.await_args.kwargs.get('show_alert') is True
+    # 🔴 Право показа обязано вернуться: иначе ни повторное нажатие, ни таймер уже ничего
+    # не пришлют, и человек останется без экрана вовсе.
+    released.assert_awaited_once_with(callback.from_user.id)
 
 
 @pytest.mark.asyncio
