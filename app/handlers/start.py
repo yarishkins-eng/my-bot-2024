@@ -1,5 +1,6 @@
 import html
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -74,6 +75,33 @@ logger = structlog.get_logger(__name__)
 
 
 _SUBID_DELIMITER = '_subid_'
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignBonusNotification:
+    """Client-facing campaign notice plus its explicit reward type."""
+
+    bonus_type: str
+    text: str
+
+
+async def _send_campaign_bonus_notification(
+    *,
+    bot: Bot,
+    source_message: types.Message,
+    chat_id: int,
+    notification: CampaignBonusNotification,
+) -> None:
+    """Keep balance rewards compact while preserving media for other rewards."""
+    if notification.bonus_type == 'balance':
+        await bot.send_message(
+            chat_id=chat_id,
+            text=notification.text,
+            disable_web_page_preview=True,
+        )
+        return
+
+    await source_message.answer(notification.text)
 
 
 def _split_start_param_subid(param: str | None) -> tuple[str | None, str | None]:
@@ -358,7 +386,7 @@ async def _apply_campaign_bonus_if_needed(
     texts,
     *,
     bot=None,
-):
+) -> CampaignBonusNotification | None:
     campaign_id = state_data.get('campaign_id') if state_data else None
     if not campaign_id:
         return None
@@ -424,18 +452,24 @@ async def _apply_campaign_bonus_if_needed(
 
     if result.bonus_type == 'balance':
         amount_text = texts.format_price(result.balance_kopeks)
-        return texts.CAMPAIGN_BONUS_BALANCE.format(
-            amount=amount_text,
-            name=html.escape(campaign.name),
+        return CampaignBonusNotification(
+            bonus_type='balance',
+            text=texts.CAMPAIGN_BONUS_BALANCE.format(
+                amount=amount_text,
+                name=html.escape(campaign.name),
+            ),
         )
 
     if result.bonus_type == 'subscription':
         traffic_text = texts.format_traffic(result.subscription_traffic_gb or 0)
-        return texts.CAMPAIGN_BONUS_SUBSCRIPTION.format(
-            name=html.escape(campaign.name),
-            days=result.subscription_days,
-            traffic=traffic_text,
-            devices=result.subscription_device_limit,
+        return CampaignBonusNotification(
+            bonus_type='subscription',
+            text=texts.CAMPAIGN_BONUS_SUBSCRIPTION.format(
+                name=html.escape(campaign.name),
+                days=result.subscription_days,
+                traffic=traffic_text,
+                devices=result.subscription_device_limit,
+            ),
         )
 
     if result.bonus_type == 'none':
@@ -444,14 +478,17 @@ async def _apply_campaign_bonus_if_needed(
 
     if result.bonus_type == 'tariff':
         traffic_text = texts.format_traffic(result.subscription_traffic_gb or 0)
-        return texts.t(
-            'CAMPAIGN_BONUS_TARIFF',
-            "🎁 Вам выдан тариф '{tariff_name}' на {days} дней!\n📊 Трафик: {traffic}\n📱 Устройств: {devices}",
-        ).format(
-            tariff_name=result.tariff_name or 'Подарочный',
-            days=result.tariff_duration_days,
-            traffic=traffic_text,
-            devices=result.subscription_device_limit,
+        return CampaignBonusNotification(
+            bonus_type='tariff',
+            text=texts.t(
+                'CAMPAIGN_BONUS_TARIFF',
+                "🎁 Вам выдан тариф '{tariff_name}' на {days} дней!\n📊 Трафик: {traffic}\n📱 Устройств: {devices}",
+            ).format(
+                tariff_name=result.tariff_name or 'Подарочный',
+                days=result.tariff_duration_days,
+                traffic=traffic_text,
+                devices=result.subscription_device_limit,
+            ),
         )
 
     return None
@@ -1876,7 +1913,12 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
 
     if campaign_message:
         try:
-            await callback.message.answer(campaign_message)
+            await _send_campaign_bonus_notification(
+                bot=callback.bot,
+                source_message=callback.message,
+                chat_id=callback.from_user.id,
+                notification=campaign_message,
+            )
         except Exception as e:
             logger.error('Ошибка отправки сообщения о бонусе кампании', error=e)
 
@@ -2234,7 +2276,12 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
 
     if campaign_message:
         try:
-            await message.answer(campaign_message)
+            await _send_campaign_bonus_notification(
+                bot=message.bot,
+                source_message=message,
+                chat_id=message.from_user.id,
+                notification=campaign_message,
+            )
         except Exception as e:
             logger.error('Ошибка отправки сообщения о бонусе кампании', error=e)
 
@@ -2737,7 +2784,7 @@ async def required_sub_channel_check(
                         try:
                             await bot.send_message(
                                 chat_id=query.from_user.id,
-                                text=campaign_message,
+                                text=campaign_message.text,
                             )
                         except Exception as e:
                             logger.error('Ошибка отправки сообщения о бонусе кампании', error=e)
