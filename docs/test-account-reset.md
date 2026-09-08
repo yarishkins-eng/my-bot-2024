@@ -88,3 +88,22 @@ A git revert reverses code, never an already executed reset, remote identity
 deletion, spent balance or a tester's removed history. Do not restore a complete
 production DB merely to recover one tester; that would overwrite newer unrelated
 data. Any data recovery needs a separate, precise owner-approved plan.
+
+## Production compatibility findings (2026-09-08)
+
+Revision 0105 stores the retired UUID list as PostgreSQL `json`, which has no
+equality operator. Do not apply full-row `DISTINCT` to the mapped User. The
+ordinary low-balance monitor now selects eligible user IDs in a subquery, keeping
+one notification per user without comparing JSON. Its query uses a savepoint so
+a statement error does not roll back earlier work in the monitoring transaction.
+Real-PostgreSQL regression tests retain the deployed JSON representation and
+check two subscriptions / one notification and survival of an earlier pending
+write after an injected SQL error. A future JSONB conversion needs a new forward
+migration and its own approval; never rewrite the already-applied 0105.
+
+The existing `recover-after-migration.yml` must NOT be used in webhook mode: it
+incorrectly requires the `Aiogram polling запущен` log and would revert the
+recovery switch. This overrides the generic emergency-recovery paragraph above.
+The incident was stabilized through the normal code-only deploy path, not by
+bypassing recovery gates or restoring the production database. Rehearsal of a
+correct webhook-aware recovery is separate follow-up work.
