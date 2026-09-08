@@ -4,6 +4,7 @@ import json
 import redis.asyncio as aioredis
 import structlog
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,6 +12,7 @@ from app.config import settings
 from app.database.crud.referral import create_referral_earning, get_commission_payment_count, get_user_campaign_id
 from app.database.crud.user import add_user_balance, get_user_by_id
 from app.database.models import ReferralEarning, TransactionType, User
+from app.localization.texts import get_texts
 from app.services.notification_delivery_service import (
     notification_delivery_service,
 )
@@ -18,6 +20,12 @@ from app.utils.user_utils import get_effective_referral_commission_percent
 
 
 logger = structlog.get_logger(__name__)
+
+# Кнопка «Дальше» под приветствием приглашённого. Онбординг для пришедших по ссылке
+# ступенчатый: приветствие приходит само, а следующее сообщение — только по нажатию.
+# Обработчик живёт в app/handlers/start.py; строка общая, чтобы не разъехалась.
+REFERRAL_WELCOME_NEXT_CALLBACK = 'referral_welcome_next'
+
 
 # ---------------------------------------------------------------------------
 # Pending referral helpers (Redis)
@@ -124,6 +132,128 @@ def _parse_recurring_commission_tiers(raw_tiers: str | None) -> list[tuple[int, 
         tiers.append((threshold, percent))
 
     return sorted(tiers, key=lambda tier: tier[0])
+
+
+def _referrer_display_name(referrer: User) -> str:
+    """Имя пригласившего для приветствия; пустая строка — если показывать нечего.
+
+    ⛔ Намеренно НЕ ``referrer.full_name``: тот в последнюю очередь возвращает telegram_id,
+    а голый номер в письме хуже, чем отсутствие имени. Берём только настоящее имя или ник.
+    """
+    name = ' '.join(filter(None, [referrer.first_name, referrer.last_name])).strip()
+    if name:
+        return name
+    username = (referrer.username or '').strip().lstrip('@')
+    return f'@{username}' if username else ''
+
+
+def _build_referral_welcome(
+    new_user: User,
+    referrer: User,
+    texts,
+    *,
+    with_next_button: bool,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Собрать приветствие приглашённому и, если нужно, кнопку «Дальше» под ним.
+
+    Кнопка НАВИГАЦИОННАЯ, а не денежная: она показывает следующее сообщение онбординга.
+    🔴 И ставится она РОВНО ТАМ, где этот следующий шаг действительно отложен: из восьми
+    вызывающих его гасят только три (онбординг в боте). У остальных — кабинет, ретроактивная
+    привязка на `/start` — меню приходит само, и кнопка дала бы человеку его копию.
+
+    Второе условие: письму есть что сказать. При выключенной программе (и при нулевых
+    наградах) остаётся одна строка про переход по ссылке — прятать за ней единственный вход
+    в пробный период нельзя, пусть следующий шаг приходит сам.
+    """
+    name = _referrer_display_name(referrer)
+    if name:
+        parts = [texts.REFERRAL_WELCOME_SOURCE_NAMED.format(name=html.escape(name))]
+    else:
+        parts = [texts.REFERRAL_WELCOME_SOURCE]
+
+    if settings.is_referral_program_enabled():
+        has_reward_terms = False
+        new_user_commission_percent = get_effective_referral_commission_percent(new_user)
+
+        if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
+            parts.append(
+                texts.REFERRAL_WELCOME_BONUS.format(
+                    minimum=settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS),
+                    bonus=settings.format_price(settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS),
+                )
+            )
+            has_reward_terms = True
+
+        first_payment_percent = _normalize_percent(
+            settings.REFERRAL_FIRST_PAYMENT_COMMISSION_PERCENT,
+            new_user_commission_percent,
+        )
+        recurring_tiers = _parse_recurring_commission_tiers(settings.REFERRAL_RECURRING_COMMISSION_TIERS)
+        # Ступени отдельно НЕ проверяем: до повторных оплат доходят только те, у кого есть
+        # награда за первую, поэтому ступенчатая ветка ничего к этому условию не добавляла.
+        has_earnings = first_payment_percent > 0 or settings.REFERRAL_INVITER_BONUS_KOPEKS > 0
+        simple_unlimited_commission = (
+            new_user_commission_percent > 0
+            and first_payment_percent == new_user_commission_percent
+            and not recurring_tiers
+            and settings.REFERRAL_MAX_COMMISSION_PAYMENTS <= 0
+        )
+        if simple_unlimited_commission:
+            parts.append(texts.REFERRAL_WELCOME_INVITE.format(percent=new_user_commission_percent))
+            has_reward_terms = True
+        elif has_earnings:
+            parts.append(texts.REFERRAL_WELCOME_INVITE_VARIABLE)
+            has_reward_terms = True
+
+        if has_reward_terms:
+            parts.append(texts.REFERRAL_WELCOME_TERMS_NOTICE)
+
+    keyboard = None
+    if with_next_button and len(parts) > 1:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=texts.REFERRAL_WELCOME_NEXT_BUTTON,
+                        callback_data=REFERRAL_WELCOME_NEXT_CALLBACK,
+                    )
+                ]
+            ]
+        )
+    return '\n\n'.join(parts), keyboard
+
+
+async def _send_referral_welcome(bot: Bot, new_user: User, referrer: User, *, with_next_button: bool) -> bool:
+    """Отправить приветствие приглашённому. True — если оно ушло И несёт кнопку «Дальше».
+
+    🔴 Своя страховка стоит здесь НАМЕРЕННО: письмо пригласившему отправляется ПОСЛЕ
+    этого, в том же общем ``try``. Без локального перехвата любая ошибка приветствия
+    (пропавший ключ текста, съеденная метка, отказ Telegram) молча и НАВСЕГДА отменяла бы
+    письмо пригласившему — повторить его нечем, запись о регистрации уже закоммичена.
+
+    🔴 И ровно поэтому возвращать надо факт ДОСТАВКИ, а не факт попытки: по нему бот гасит
+    автоматическую отправку следующего шага. Соврём здесь — человек не увидит ни
+    приветствия, ни кнопки, ни меню, и бот больше ему не напишет.
+    """
+    try:
+        if not bot or new_user.telegram_id is None:
+            return False
+        message, keyboard = _build_referral_welcome(
+            new_user, referrer, get_texts(new_user.language), with_next_button=with_next_button
+        )
+        delivered = await send_referral_notification(
+            bot, new_user.telegram_id, message, user=new_user, reply_markup=keyboard
+        )
+        # Следующий шаг откладывается ТОЛЬКО если человек получил кнопку. Иначе он останется
+        # без единственного входа в пробный период, а бот ему больше не напишет.
+        return bool(delivered) and keyboard is not None
+    except Exception as exc:
+        logger.error(
+            'Не удалось отправить приветствие приглашённому, письмо пригласившему не отменяем',
+            new_user_id=getattr(new_user, 'id', None),
+            error=str(exc),
+        )
+        return False
 
 
 async def get_paid_referrals_count(db: AsyncSession, referrer_id: int) -> int:
@@ -506,7 +636,8 @@ async def send_referral_notification(
     user: User | None = None,
     bonus_kopeks: int = 0,
     referral_name: str = '',
-):
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> bool:
     """
     Отправляет реферальное уведомление в Telegram или по email.
 
@@ -517,6 +648,11 @@ async def send_referral_notification(
         user: User object (для email-only пользователей)
         bonus_kopeks: Сумма бонуса в копейках
         referral_name: Имя реферала
+        reply_markup: Telegram-клавиатура (для email-only получателей игнорируется)
+
+    Возвращает True, если сообщение УШЛО (или письмо принято почтовой доставкой).
+    🔴 По этому значению вызывающий решает, показывать ли следующий шаг онбординга сам:
+    молчаливый отказ Telegram раньше выглядел как успех, и человек оставался без экрана.
     """
     # Handle email-only users via notification delivery service
     if telegram_id is None:
@@ -533,16 +669,38 @@ async def send_referral_notification(
                 logger.warning('⚠️ Не удалось отправить email уведомление пользователю', user_id=user.id)
         else:
             logger.debug('Пропуск уведомления: пользователь без telegram_id и без User object')
-        return
+        return bool(success) if user is not None else False
 
     try:
-        await bot.send_message(telegram_id, message, parse_mode='HTML')
+        await bot.send_message(telegram_id, message, parse_mode='HTML', reply_markup=reply_markup)
         logger.info('✅ Уведомление отправлено пользователю', telegram_id=telegram_id)
+        return True
     except Exception as e:
         logger.error('❌ Ошибка отправки уведомления пользователю', telegram_id=telegram_id, error=e)
+        return False
 
 
-async def process_referral_registration(db: AsyncSession, new_user_id: int, referrer_id: int, bot: Bot = None):
+async def process_referral_registration(
+    db: AsyncSession,
+    new_user_id: int,
+    referrer_id: int,
+    bot: Bot = None,
+    *,
+    report_welcome_delivery: bool = False,
+) -> bool:
+    """Оформить реферальную привязку и поприветствовать приглашённого.
+
+    По умолчанию возвращает «регистрация обработана» — прежний смысл, на него опирается
+    сторож `tests/services/test_attach_referrer_if_missing.py`, и менять его нельзя.
+
+    🔴 ``report_welcome_delivery=True`` переключает возвращаемое значение на ФАКТ ДОСТАВКИ
+    приветствия. Это нужно ровно одному вызывающему — онбордингу в боте: он гасит
+    автоматическую отправку следующего шага, только если у человека появилась кнопка
+    «Дальше». Соврать там True — оставить его без единого сообщения: ни приветствия, ни
+    кнопки, ни меню, и бот больше не напишет (писем для человека без подписки у нас нет).
+    Повторный вызов и гонка регистрацию не портят, но приветствия НЕ шлют — значит в этом
+    режиме честный ответ False, и следующий шаг придёт сам, как раньше.
+    """
     try:
         if new_user_id == referrer_id:
             logger.warning('Self-referral blocked in process_referral_registration', user_id=new_user_id)
@@ -594,7 +752,8 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
                 new_user_id=new_user_id,
                 referrer_id=referrer_id,
             )
-            return True
+            # Приветствие здесь НЕ шлём: его уже отправила первая обработка этой пары.
+            return not report_welcome_delivery
 
         campaign_id = await get_user_campaign_id(db, new_user_id)
         try:
@@ -617,7 +776,9 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
                 new_user_id=new_user_id,
                 referrer_id=referrer_id,
             )
-            return True
+            # Приветствие отправит победившая сессия. И читать поля после `rollback` нельзя:
+            # объекты сессии протухли, обращение к ним даёт MissingGreenlet.
+            return not report_welcome_delivery
 
         try:
             from app.services.referral_contest_service import referral_contest_service
@@ -626,39 +787,42 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
         except Exception as exc:
             logger.debug('Не удалось записать конкурсную регистрацию', exc=exc)
 
+        welcome_sent = False
         if bot:
             commission_percent = get_effective_referral_commission_percent(referrer)
-            referral_notification = (
-                f'🎉 <b>Добро пожаловать!</b>\n\n'
-                f'Вы перешли по реферальной ссылке пользователя <b>{html.escape(referrer.full_name)}</b>!'
+            welcome_sent = await _send_referral_welcome(
+                bot, new_user, referrer, with_next_button=report_welcome_delivery
             )
-            if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
-                referral_notification += (
-                    f'\n\n💰 При первой оплате от {settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS)} '
-                    f'вы получите бонус {settings.format_price(settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS)}!'
-                )
-            await send_referral_notification(bot, new_user.telegram_id, referral_notification, user=new_user)
 
             inviter_notification = (
                 f'👥 <b>Новый реферал!</b>\n\n'
-                f'По вашей ссылке зарегистрировался пользователь <b>{html.escape(new_user.full_name)}</b>!\n\n'
-                f'💰 Когда он оплатит от {settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS)}, '
+                f'По вашей ссылке зарегистрировался пользователь <b>{html.escape(new_user.full_name)}</b>!'
             )
-            if settings.REFERRAL_INVITER_BONUS_KOPEKS > 0 and commission_percent > 0:
+            # 🔴 Деньги обещаем ТОЛЬКО при включённой программе. При выключенной
+            # `process_referral_topup` выходит до начисления, и прежний безусловный текст обещал
+            # пригласившему бонус и процент, которых он никогда не получит. Это была вторая
+            # половина рычага паузы продаж: приглашённому обещания уже гасились, пригласившему нет.
+            if settings.is_referral_program_enabled():
                 inviter_notification += (
-                    f'вы получите {settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)} + '
-                    f'{commission_percent}% от суммы оплаты.\n\n'
+                    f'\n\n💰 Когда он оплатит от {settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS)}, '
                 )
-            elif settings.REFERRAL_INVITER_BONUS_KOPEKS > 0:
-                inviter_notification += (
-                    f'вы получите {settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)}.\n\n'
-                )
-            elif commission_percent > 0:
-                inviter_notification += f'вы получите {commission_percent}% от суммы.\n\n'
-            else:
-                inviter_notification += 'вы получите уведомление.\n\n'
-            if commission_percent > 0:
-                inviter_notification += f'📈 С каждой следующей его оплаты вы будете получать {commission_percent}%.'
+                if settings.REFERRAL_INVITER_BONUS_KOPEKS > 0 and commission_percent > 0:
+                    inviter_notification += (
+                        f'вы получите {settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)} + '
+                        f'{commission_percent}% от суммы оплаты.'
+                    )
+                elif settings.REFERRAL_INVITER_BONUS_KOPEKS > 0:
+                    inviter_notification += (
+                        f'вы получите {settings.format_price(settings.REFERRAL_INVITER_BONUS_KOPEKS)}.'
+                    )
+                elif commission_percent > 0:
+                    inviter_notification += f'вы получите {commission_percent}% от суммы.'
+                else:
+                    inviter_notification += 'вы получите уведомление.'
+                if commission_percent > 0:
+                    inviter_notification += (
+                        f'\n\n📈 С каждой следующей его оплаты вы будете получать {commission_percent}%.'
+                    )
             await send_referral_notification(
                 bot, referrer.telegram_id, inviter_notification, user=referrer, referral_name=new_user.full_name
             )
@@ -667,8 +831,9 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
             '✅ Зарегистрирован реферал для . Бонусы будут выданы после пополнения.',
             new_user_id=new_user_id,
             referrer_id=referrer_id,
+            welcome_sent=welcome_sent,
         )
-        return True
+        return welcome_sent if report_welcome_delivery else True
 
     except Exception as e:
         logger.error('Ошибка обработки реферальной регистрации', error=e)

@@ -359,6 +359,9 @@ class Settings(BaseSettings):
 
     REFERRAL_PROGRAM_ENABLED: bool = True
     REFERRAL_NOTIFICATIONS_ENABLED: bool = True
+    # Через сколько минут прислать следующий шаг онбординга тому, кто не нажал «Дальше»
+    # под реферальным приветствием. 0 — не присылать вовсе, остаётся только кнопка.
+    REFERRAL_ONBOARDING_FOLLOWUP_MINUTES: int = 10
     REFERRAL_NOTIFICATION_RETRY_ATTEMPTS: int = 3
 
     # Настройки вывода реферального баланса
@@ -3244,6 +3247,20 @@ class Settings(BaseSettings):
 
     def is_referral_notifications_enabled(self) -> bool:
         return self.REFERRAL_NOTIFICATIONS_ENABLED
+
+    def get_referral_onboarding_followup_seconds(self) -> int:
+        """Задержка добора следующего шага онбординга, в секундах. 0 — добор выключен.
+
+        Потолок в сутки намеренный: список ожидающих живёт в Redis, и держать в нём запись
+        неделями — значит присылать человеку экран онбординга, о котором он давно забыл.
+        """
+        try:
+            minutes = int(self.REFERRAL_ONBOARDING_FOLLOWUP_MINUTES)
+        except (TypeError, ValueError):
+            minutes = 10
+        if minutes <= 0:
+            return 0
+        return min(minutes, 24 * 60) * 60
 
     def get_traffic_packages(self) -> list[dict]:
         try:

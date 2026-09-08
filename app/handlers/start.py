@@ -58,6 +58,7 @@ from app.services.pinned_message_service import (
 )
 from app.services.privacy_policy_service import PrivacyPolicyService
 from app.services.referral_service import (
+    REFERRAL_WELCOME_NEXT_CALLBACK,
     process_referral_registration,
     save_pending_campaign,
     save_pending_referral,
@@ -66,6 +67,11 @@ from app.services.subscription_service import SubscriptionService
 from app.services.support_settings_service import SupportSettingsService
 from app.services.web_auth_service import WEB_AUTH_TOKEN_MIN_LENGTH, link_web_auth_token
 from app.states import RegistrationStates
+from app.utils.funnel_notify import (
+    claim_referral_onboarding,
+    release_referral_onboarding,
+    schedule_referral_onboarding_followup,
+)
 from app.utils.long_messages import answer_long_text, edit_long_text, send_long_text
 from app.utils.user_utils import generate_unique_referral_code
 
@@ -1867,9 +1873,16 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
         await db.refresh(existing_user, ['subscriptions'])
         user = existing_user
 
+    referral_welcome_sent = False
     if referrer_id and referrer_id != user.id:
         try:
-            await process_referral_registration(db, user.id, referrer_id, callback.bot)
+            referral_welcome_sent = bool(
+                await process_referral_registration(
+                    db, user.id, referrer_id, callback.bot, report_welcome_delivery=True
+                )
+            ) and (user.telegram_id is not None)
+            if referral_welcome_sent:
+                await schedule_referral_onboarding_followup(user.telegram_id)
             logger.info('✅ Реферальная регистрация обработана для', user_id=user.id)
         except Exception as e:
             logger.error('Ошибка при обработке реферальной регистрации', error=e)
@@ -1918,7 +1931,14 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
     offer_text = await get_welcome_text_for_user(db, callback.from_user)
     pinned_message = await get_active_pinned_message(db)
 
-    if offer_text:
+    if referral_welcome_sent:
+        # Пришедшему по ссылке следующее сообщение показывает кнопка «Дальше» под
+        # приветствием: сначала он читает про бонус, потом сам открывает шаг про VPN.
+        logger.info(
+            'Онбординг реферала: следующий шаг ждёт нажатия «Дальше»',
+            telegram_id=user.telegram_id,
+        )
+    elif offer_text:
         try:
             if pinned_message and pinned_message.send_before_menu:
                 await _send_pinned_message(callback.bot, db, user, pinned_message)
@@ -2196,9 +2216,14 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
         await db.refresh(existing_user, ['subscriptions'])
         user = existing_user
 
+    referral_welcome_sent = False
     if referrer_id and referrer_id != user.id:
         try:
-            await process_referral_registration(db, user.id, referrer_id, message.bot)
+            referral_welcome_sent = bool(
+                await process_referral_registration(db, user.id, referrer_id, message.bot, report_welcome_delivery=True)
+            ) and (user.telegram_id is not None)
+            if referral_welcome_sent:
+                await schedule_referral_onboarding_followup(user.telegram_id)
             logger.info('✅ Реферальная регистрация обработана для', user_id=user.id)
         except Exception as e:
             logger.error('Ошибка при обработке реферальной регистрации', error=e)
@@ -2276,7 +2301,13 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
     offer_text = await get_welcome_text_for_user(db, message.from_user)
     pinned_message = await get_active_pinned_message(db)
 
-    if offer_text:
+    if referral_welcome_sent:
+        # См. комментарий в complete_registration_from_callback.
+        logger.info(
+            'Онбординг реферала: следующий шаг ждёт нажатия «Дальше»',
+            telegram_id=user.telegram_id,
+        )
+    elif offer_text:
         try:
             # Если у пользователя уже есть подписка (например, от промокода), не предлагаем триал
             _subs = getattr(user, 'subscriptions', None) or []
@@ -2733,9 +2764,16 @@ async def required_sub_channel_check(
                     logger.info('✅ CHANNEL CHECK: pending_start_payload удален из state после создания пользователя')
 
                     # Обрабатываем реферальную регистрацию
+                    referral_welcome_sent = False
                     if referrer_id and referrer_id != user.id:
                         try:
-                            await process_referral_registration(db, user.id, referrer_id, bot)
+                            referral_welcome_sent = bool(
+                                await process_referral_registration(
+                                    db, user.id, referrer_id, bot, report_welcome_delivery=True
+                                )
+                            ) and (user.telegram_id is not None)
+                            if referral_welcome_sent:
+                                await schedule_referral_onboarding_followup(user.telegram_id)
                             logger.info('✅ CHANNEL CHECK: Реферальная регистрация обработана для', user_id=user.id)
                         except Exception as e:
                             logger.error('Ошибка при обработке реферальной регистрации', error=e)
@@ -2798,10 +2836,16 @@ async def required_sub_channel_check(
                     )
 
                     pinned_message = await get_active_pinned_message(db)
-                    if pinned_message and pinned_message.send_before_menu:
+                    if pinned_message and pinned_message.send_before_menu and not referral_welcome_sent:
                         await _send_pinned_message(bot, db, user, pinned_message)
 
-                    if settings.ENABLE_LOGO_MODE and not caption_exceeds_telegram_limit(menu_text):
+                    if referral_welcome_sent:
+                        # См. комментарий в complete_registration_from_callback.
+                        logger.info(
+                            'Онбординг реферала: следующий шаг ждёт нажатия «Дальше»',
+                            telegram_id=user.telegram_id,
+                        )
+                    elif settings.ENABLE_LOGO_MODE and not caption_exceeds_telegram_limit(menu_text):
                         _result = await bot.send_photo(
                             chat_id=query.from_user.id,
                             photo=get_logo_media(),
@@ -2817,7 +2861,7 @@ async def required_sub_channel_check(
                             reply_markup=keyboard,
                             parse_mode='HTML',
                         )
-                    if pinned_message and not pinned_message.send_before_menu:
+                    if pinned_message and not pinned_message.send_before_menu and not referral_welcome_sent:
                         await _send_pinned_message(bot, db, user, pinned_message)
                 else:
                     await bot.send_message(
@@ -2904,11 +2948,161 @@ async def process_webauth_confirm(
         )
 
 
+async def send_onboarding_menu(bot, chat_id: int, db: AsyncSession, user: User) -> None:
+    """Отправить НОВЫМ сообщением тот экран онбординга, который раньше приходил сам.
+
+    Пришедшему по реферальной ссылке его показывает кнопка «Дальше» под приветствием,
+    а не автоматика: сначала человек читает про бонус, потом сам открывает шаг про VPN.
+
+    🔴 Развилок здесь ДВЕ, как и в автоматической ветке: если в админке задан приветственный
+    текст, показать надо его вместе с кнопкой бесплатного триала, а не главное меню. Иначе в
+    день, когда владелец включит приветствие, пришедшие по ссылке молча получат другой экран.
+    """
+    from app.database.crud.welcome_text import get_welcome_text_for_user
+
+    texts = get_texts(user.language)
+    pinned_message = await get_active_pinned_message(db)
+
+    has_active_subscription, subscription_is_active = _calculate_subscription_flags(user.subscription)
+
+    # Подстановки берём из нашей записи о человеке: у добора объекта Telegram нет,
+    # а `replace_placeholders` читает только имя и ник, которые у нас сохранены.
+    offer_text = await get_welcome_text_for_user(db, user)
+    if offer_text:
+        if pinned_message and pinned_message.send_before_menu:
+            await _send_pinned_message(bot, db, user, pinned_message)
+        # Сторож из автоматической ветки: подписчику не предлагаем бесплатный пробный.
+        offer_keyboard = (
+            get_back_keyboard(user.language)
+            if has_active_subscription
+            else get_post_registration_keyboard(user.language)
+        )
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=offer_text,
+                reply_markup=offer_keyboard,
+                parse_mode='HTML',
+            )
+        except TelegramBadRequest as e:
+            # 🔴 Повтор без разметки — из автоматической ветки. Без него несбалансированный
+            # HTML в приветственном тексте админки превращает «Дальше» в вечный тупик:
+            # отправка падает детерминированно, и человек жмёт кнопку до бесконечности.
+            if 'parse entities' not in str(e).lower() and "can't parse" not in str(e).lower():
+                raise
+            logger.warning('HTML parse error в приветственном сообщении, повтор без parse_mode', error=e)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=offer_text,
+                reply_markup=offer_keyboard,
+                parse_mode=None,
+            )
+        if pinned_message and not pinned_message.send_before_menu:
+            await _send_pinned_message(bot, db, user, pinned_message)
+        return
+
+    menu_text = await get_main_menu_text(user, texts, db)
+    is_admin = settings.is_admin(user.telegram_id)
+    is_moderator = (not is_admin) and SupportSettingsService.is_moderator(user.telegram_id)
+
+    custom_buttons = []
+    if not settings.is_text_main_menu_mode():
+        custom_buttons = await MainMenuButtonService.get_buttons_for_user(
+            db,
+            is_admin=is_admin,
+            has_active_subscription=has_active_subscription,
+            subscription_is_active=subscription_is_active,
+        )
+
+    keyboard = await get_main_menu_keyboard_async(
+        db=db,
+        user=user,
+        language=user.language,
+        is_admin=is_admin,
+        has_had_paid_subscription=user.has_had_paid_subscription,
+        has_active_subscription=has_active_subscription,
+        subscription_is_active=subscription_is_active,
+        balance_kopeks=user.balance_kopeks,
+        subscription=user.subscription,
+        is_moderator=is_moderator,
+        custom_buttons=custom_buttons,
+    )
+
+    if pinned_message and pinned_message.send_before_menu:
+        await _send_pinned_message(bot, db, user, pinned_message)
+
+    sent_menu = await bot.send_message(chat_id=chat_id, text=menu_text, reply_markup=keyboard, parse_mode='HTML')
+    from app.utils.funnel_notify import remember_funnel_menu_message
+
+    await remember_funnel_menu_message(user, sent_menu)
+
+    if pinned_message and not pinned_message.send_before_menu:
+        await _send_pinned_message(bot, db, user, pinned_message)
+
+
+async def handle_referral_welcome_next(callback: types.CallbackQuery, db: AsyncSession):
+    """Кнопка «Дальше» под реферальным приветствием: показать шаг про подключение VPN."""
+    user = await get_user_by_telegram_id(db, callback.from_user.id)
+    if user is None:
+        await callback.answer()
+        return
+
+    # Кнопки уже нет — значит шаг показан, второе нажатие копию не присылает.
+    if getattr(callback.message, 'reply_markup', None) is None:
+        await callback.answer()
+        return
+
+    # Право показа занимаем ДО отправки и атомарно: иначе нажатие в тот момент, когда
+    # таймер уже ждёт ответа Telegram, даёт человеку второй такой же экран.
+    texts = get_texts(user.language)
+    if not await claim_referral_onboarding(callback.from_user.id):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception as exc:
+            logger.debug('Не удалось снять кнопку «Дальше» после добора', error=str(exc))
+        await callback.answer(
+            texts.t('REFERRAL_WELCOME_NEXT_ALREADY_SENT', 'Этот шаг уже пришёл ниже 👇'),
+            show_alert=False,
+        )
+        return
+
+    # 🔴 Порядок важен: сначала отправляем, потом снимаем кнопку. Наоборот — и при отказе
+    # Telegram человек остаётся с приветствием без кнопки и без следующего шага, то есть
+    # в тупике, из которого выход только повторный /start.
+    try:
+        await send_onboarding_menu(callback.bot, callback.from_user.id, db, user)
+    except Exception as exc:
+        logger.error(
+            'Ошибка показа следующего шага по кнопке «Дальше»',
+            telegram_id=callback.from_user.id,
+            error=str(exc),
+        )
+        await release_referral_onboarding(callback.from_user.id)
+        await callback.answer(
+            texts.t('SOMETHING_WENT_WRONG', 'Что-то пошло не так. Попробуйте ещё раз.'),
+            show_alert=True,
+        )
+        return
+
+    logger.info('Онбординг реферала: следующий шаг показан по кнопке', telegram_id=callback.from_user.id)
+
+    # Кнопку снимаем только после успешной отправки: второе нажатие прислало бы второе меню.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception as exc:
+        logger.debug('Не удалось снять кнопку «Дальше»', error=str(exc))
+
+    await callback.answer()
+
+
 def register_handlers(dp: Dispatcher):
     logger.debug('=== НАЧАЛО регистрации обработчиков start.py ===')
 
     dp.message.register(cmd_start, Command('start'))
     logger.debug('Зарегистрирован cmd_start')
+
+    dp.callback_query.register(handle_referral_welcome_next, F.data == REFERRAL_WELCOME_NEXT_CALLBACK)
+    logger.debug('Зарегистрирован handle_referral_welcome_next')
 
     dp.callback_query.register(
         process_rules_accept,
