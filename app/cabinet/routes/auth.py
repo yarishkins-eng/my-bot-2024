@@ -44,6 +44,7 @@ from app.services.web_auth_service import (
     poll_web_auth_token,
 )
 from app.utils.cache import RateLimitCache, TokenReplayCache
+from app.utils.language import get_telegram_language
 from app.utils.subscription_utils import coerce_panel_device_limit
 from app.utils.timezone import panel_datetime_to_utc
 
@@ -571,8 +572,6 @@ async def auth_telegram(
     tg_username = user_data.get('username')
     tg_first_name = user_data.get('first_name')
     tg_last_name = user_data.get('last_name')
-    tg_language = user_data.get('language_code', 'ru')
-
     # Resolve referral code to referrer ID for new users
     referrer_id = None
     if request.referral_code and not user:
@@ -610,6 +609,9 @@ async def auth_telegram(
     is_new_user = not user
     if not user:
         # Create new user from Telegram initData
+        # initData contains an optional IETF language tag. It is only an
+        # onboarding hint: existing users retain their stored preference.
+        tg_language = get_telegram_language(user_data.get('language_code'))
         logger.info('Creating new user from cabinet (initData): telegram_id', telegram_id=telegram_id)
         user = await create_user(
             db=db,
@@ -815,7 +817,9 @@ async def auth_telegram_widget(
             username=request.username,
             first_name=request.first_name,
             last_name=request.last_name,
-            language='ru',
+            # Telegram Login Widget does not provide a language claim.  The
+            # shared resolver therefore applies the configured fallback.
+            language=get_telegram_language(None),
             referred_by_id=referrer_id,
         )
         logger.info('User created successfully: id=, telegram_id', user_id=user.id, telegram_id=user.telegram_id)
@@ -946,8 +950,6 @@ async def auth_telegram_oidc(
     first_name = claims.get('name', claims.get('given_name', ''))
     username = claims.get('preferred_username')
     last_name = claims.get('family_name')
-    language = claims.get('locale', 'ru')[:2] if claims.get('locale') else 'ru'
-
     user = await get_user_by_telegram_id(db, telegram_id)
 
     # Resolve referral code for new users.
@@ -990,6 +992,9 @@ async def auth_telegram_oidc(
 
     is_new_user = not user
     if not user:
+        # Telegram OIDC does not guarantee a locale claim. Resolve it only
+        # for account creation; otherwise retain the stored preference.
+        language = get_telegram_language(claims.get('locale'))
         logger.info('Creating new user from cabinet OIDC', telegram_id=telegram_id, username=username)
         user = await create_user(
             db=db,

@@ -92,10 +92,9 @@ def _patch_start(monkeypatch: pytest.MonkeyPatch, campaigns: dict[str, SimpleNam
         'AdminNotificationService',
         MagicMock(return_value=SimpleNamespace(send_campaign_link_visit_notification=send_mock)),
     )
-    # Новичок упирается в выбор языка и уходит — ровно та точка, где он бросает регистрацию.
-    # `settings` — pydantic-модель, метод подменяется на классе, а не на экземпляре.
-    monkeypatch.setattr(type(start_module.settings), 'is_language_selection_enabled', lambda _self: True)
-    monkeypatch.setattr(start_module, '_prompt_language_selection', AsyncMock(return_value=None))
+    # Останавливаем тест перед созданием пользователя. После автоматизации языка
+    # этой границей стал общий continuation, а не удалённый стартовый picker.
+    monkeypatch.setattr(start_module, '_continue_registration_after_language', AsyncMock(return_value=None))
     return send_mock
 
 

@@ -34,7 +34,6 @@ from app.database.models import (
 )
 from app.keyboards.inline import (
     get_back_keyboard,
-    get_language_selection_keyboard,
     get_main_menu_keyboard_async,
     get_post_registration_keyboard,
     get_privacy_policy_keyboard,
@@ -66,6 +65,7 @@ from app.services.subscription_service import SubscriptionService
 from app.services.support_settings_service import SupportSettingsService
 from app.services.web_auth_service import WEB_AUTH_TOKEN_MIN_LENGTH, link_web_auth_token
 from app.states import RegistrationStates
+from app.utils.language import get_telegram_language
 from app.utils.long_messages import answer_long_text, edit_long_text, send_long_text
 from app.utils.user_utils import generate_unique_referral_code
 
@@ -383,12 +383,18 @@ async def _apply_campaign_bonus_if_needed(
     except Exception:
         pass
 
+    # Concurrent /start and cabinet registration may both reach this helper.
+    # The service reports whether this call created the canonical registration
+    # marker; keep the user/admin messages on that winning edge as well.
+    if not result.is_new_registration:
+        return None
+
     # Отправить админу уведомление о РЕГИСТРАЦИИ ровно один раз — когда запись в
     # advertising_campaign_registrations реально создана (is_new_registration=True).
     # При повторном вызове record_campaign_registration возвращает существующую
     # запись с is_new_registration=False — тогда повторное уведомление не идёт,
     # и количество сообщений в чате == количеству регистраций в кабинете.
-    if result.is_new_registration and bot is not None and getattr(user, 'telegram_id', None):
+    if bot is not None and getattr(user, 'telegram_id', None):
         try:
             notification_service = AdminNotificationService(bot)
             await notification_service.send_campaign_registration_notification(
@@ -574,20 +580,6 @@ async def handle_potential_referral_code(message: types.Message, state: FSMConte
         )
     )
     return True
-
-
-def _get_language_prompt_text() -> str:
-    return '🌐 Выберите язык / Choose your language:'
-
-
-async def _prompt_language_selection(message: types.Message, state: FSMContext) -> None:
-    logger.info('🌐 LANGUAGE: Запрос выбора языка для пользователя', from_user_id=message.from_user.id)
-
-    await state.set_state(RegistrationStates.waiting_for_language)
-    await message.answer(
-        _get_language_prompt_text(),
-        reply_markup=get_language_selection_keyboard(),
-    )
 
 
 async def _continue_registration_after_language(
@@ -1185,22 +1177,18 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         logger.info('🆕 Новый пользователь, начинаем регистрацию')
 
     data = await state.get_data() or {}
-    if not data.get('language'):
-        if settings.is_language_selection_enabled():
-            await _prompt_language_selection(message, state)
-            return
-
-        default_language = (
-            (settings.DEFAULT_LANGUAGE or DEFAULT_LANGUAGE)
-            if isinstance(settings.DEFAULT_LANGUAGE, str)
-            else DEFAULT_LANGUAGE
-        )
-        normalized_default = default_language.split('-')[0].lower()
-        data['language'] = normalized_default
-        await state.set_data(data)
+    if user and user.status == UserStatus.DELETED.value:
+        # Automatic entrypoints never overwrite the language already chosen by
+        # an existing account.  Completion still reads the FSM value, so copy
+        # the persisted language there before reviving the row.
+        language = user.language or get_telegram_language(message.from_user.language_code)
+        await state.update_data(language=language)
+    elif user is None:
+        language = get_telegram_language(message.from_user.language_code)
+        await state.update_data(language=language)
         logger.info(
-            '🌐 LANGUAGE: выбор языка отключен, устанавливаем язык по умолчанию',
-            normalized_default=normalized_default,
+            '🌐 LANGUAGE: язык нового пользователя определён автоматически',
+            language=language,
         )
 
     await _continue_registration_after_language(
@@ -1220,36 +1208,15 @@ async def process_language_selection(
         '🌐 LANGUAGE: Пользователь выбрал язык', from_user_id=callback.from_user.id, callback_data=callback.data
     )
 
-    if not settings.is_language_selection_enabled():
-        data = await state.get_data() or {}
-        default_language = (
-            (settings.DEFAULT_LANGUAGE or DEFAULT_LANGUAGE)
-            if isinstance(settings.DEFAULT_LANGUAGE, str)
-            else DEFAULT_LANGUAGE
-        )
-        normalized_default = default_language.split('-')[0].lower()
-        data['language'] = normalized_default
-        await state.set_data(data)
-
-        texts = get_texts(normalized_default)
-
-        try:
-            await callback.message.edit_text(
-                texts.t(
-                    'LANGUAGE_SELECTION_DISABLED',
-                    '⚙️ Выбор языка временно недоступен. Используем язык по умолчанию.',
-                )
-            )
-        except Exception:
-            await callback.message.answer(
-                texts.t(
-                    'LANGUAGE_SELECTION_DISABLED',
-                    '⚙️ Выбор языка временно недоступен. Используем язык по умолчанию.',
-                )
-            )
-
+    existing_user = await get_user_by_telegram_id(db, callback.from_user.id)
+    if existing_user and existing_user.language:
+        # This handler is the compatibility route for a picker shown before
+        # deploy.  If another entrypoint already created/revived the account,
+        # its persisted language wins.  Normal manual changes use menu.py with
+        # StateFilter(None) and retain the runtime feature flag.
+        resolved_language = existing_user.language
+        await state.update_data(language=resolved_language)
         await callback.answer()
-
         await _continue_registration_after_language(
             message=None,
             callback=callback,
@@ -1260,27 +1227,22 @@ async def process_language_selection(
 
     selected_raw = (callback.data or '').split(':', 1)[-1]
     normalized_selected = selected_raw.strip().lower()
+    resolved_language = get_telegram_language(selected_raw)
 
-    available_map = {
-        lang.strip().lower(): lang.strip()
-        for lang in settings.get_available_languages()
-        if isinstance(lang, str) and lang.strip()
-    }
-
-    if normalized_selected not in available_map:
+    # A registration picker only emits canonical locale codes.  The automatic
+    # resolver deliberately falls back for malformed/unsupported Telegram
+    # values; an explicit callback must reject them instead of silently
+    # converting a stale or forged button into another language.
+    if normalized_selected != resolved_language:
         logger.warning(
             '⚠️ LANGUAGE: Выбран недоступный язык пользователем',
             normalized_selected=normalized_selected,
             from_user_id=callback.from_user.id,
         )
-        await callback.answer('❌ Unsupported language', show_alert=True)
+        await callback.answer('❌ Эта кнопка устарела. Нажмите /start, чтобы продолжить.', show_alert=True)
         return
 
-    resolved_language = available_map[normalized_selected].lower()
-
-    data = await state.get_data() or {}
-    data['language'] = resolved_language
-    await state.set_data(data)
+    await state.update_data(language=resolved_language)
 
     texts = get_texts(resolved_language)
 
@@ -1747,6 +1709,11 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
                 ).format(user_name=html.escape(existing_user.full_name or ''))
             )
 
+        # A Mini App registration can win while a pre-deploy language picker
+        # is still open. Drain the business context that only lives in this
+        # bot FSM before clearing it; durable helpers remain idempotent.
+        await _activate_pending_gift_after_registration(db, state, existing_user, callback.message.answer)
+        await _persist_pending_subid_after_registration(db, state, existing_user)
         await state.clear()
         return
 
@@ -2465,7 +2432,18 @@ async def required_sub_channel_check(
         if user and getattr(user, 'language', None):
             language = user.language
         elif state_data.get('language'):
-            language = state_data['language']
+            selected = state_data['language']
+            resolved = get_telegram_language(selected if isinstance(selected, str) else None)
+            language = (
+                resolved
+                if isinstance(selected, str) and selected.strip().lower() == resolved
+                else get_telegram_language(query.from_user.language_code)
+            )
+        else:
+            language = get_telegram_language(query.from_user.language_code)
+
+        state_data['language'] = language
+        await state.update_data(language=language)
 
         texts = get_texts(language)
 
@@ -2653,9 +2631,6 @@ async def required_sub_channel_check(
                 await _send_pinned_message(bot, db, user, pinned_message)
         else:
             from app.keyboards.inline import get_rules_keyboard
-
-            state_data['language'] = language
-            await state.set_data(state_data)
 
             if settings.SKIP_RULES_ACCEPT:
                 if settings.SKIP_REFERRAL_CODE or state_data.get('referral_code') or state_data.get('referrer_id'):

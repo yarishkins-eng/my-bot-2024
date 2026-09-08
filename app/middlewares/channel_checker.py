@@ -22,8 +22,9 @@ from app.services.admin_notification_service import AdminNotificationService
 from app.services.channel_subscription_service import channel_subscription_service
 from app.services.notification_settings_service import NotificationSettingsService
 from app.services.subscription_service import SubscriptionService
+from app.states import RegistrationStates
 from app.utils.cache import cache
-from app.utils.check_reg_process import is_registration_process
+from app.utils.language import get_telegram_language
 
 
 logger = structlog.get_logger(__name__)
@@ -31,6 +32,52 @@ logger = structlog.get_logger(__name__)
 # Redis key prefix and TTL for pending /start payload backup
 REDIS_PAYLOAD_KEY_PREFIX = 'pending_start_payload:'
 REDIS_PAYLOAD_TTL = 3600  # 1 hour
+
+
+async def _get_channel_prompt_language(user: types.User | None, state: FSMContext | None = None) -> str:
+    """Use the saved profile locale when it exists, Telegram only on first entry."""
+    if user:
+        try:
+            async with AsyncSessionLocal() as db:
+                db_user = await get_user_by_telegram_id(db, user.id)
+                if db_user and db_user.language:
+                    return db_user.language
+        except Exception as error:
+            logger.warning('Failed to load saved language for channel prompt', telegram_id=user.id, error=error)
+
+    if state:
+        state_data = await state.get_data() or {}
+        selected = state_data.get('language')
+        if isinstance(selected, str):
+            normalized = selected.strip().lower()
+            resolved = get_telegram_language(selected)
+            if normalized == resolved:
+                return resolved
+
+    return get_telegram_language(user.language_code if user else None)
+
+
+async def _capture_legacy_language_choice(
+    state: FSMContext | None,
+    event: TelegramObject,
+    current_state: str | None,
+) -> None:
+    """Keep a pre-deploy picker choice while the required-channel gate is shown."""
+    if (
+        not state
+        or current_state != RegistrationStates.waiting_for_language.state
+        or not isinstance(event, CallbackQuery)
+        or not event.data
+        or not event.data.startswith('language_select:')
+    ):
+        return
+
+    selected = event.data.split(':', 1)[-1].strip().lower()
+    resolved = get_telegram_language(selected)
+    if selected != resolved:
+        return
+
+    await state.update_data(language=resolved)
 
 
 async def save_pending_payload_to_redis(telegram_id: int, payload: str) -> bool:
@@ -128,8 +175,7 @@ class ChannelCheckerMiddleware(BaseMiddleware):
 
         state: FSMContext = data.get('state')
         current_state = await state.get_state() if state else None
-        if is_registration_process(event, current_state):
-            return await handler(event, data)
+        await _capture_legacy_language_choice(state, event, current_state)
 
         # Ensure service has bot reference for API fallback
         bot: Bot = data['bot']
@@ -177,11 +223,7 @@ class ChannelCheckerMiddleware(BaseMiddleware):
 
             # Still not all subscribed — update keyboard with colored buttons
             # (subscribed = green, unsubscribed = blue) via Bot API 9.4 style
-            user_lang = (
-                event.from_user.language_code.split('-')[0]
-                if event.from_user and event.from_user.language_code
-                else DEFAULT_LANGUAGE
-            )
+            user_lang = await _get_channel_prompt_language(event.from_user, state)
 
             normalized = _normalize_channels(all_channels_fresh)
             texts = get_texts(user_lang)
@@ -210,7 +252,7 @@ class ChannelCheckerMiddleware(BaseMiddleware):
                 pass
             return None
 
-        return await self._deny_message(event, bot, all_channels)
+        return await self._deny_message(event, bot, all_channels, state)
 
     # -- _deny_message (multi-channel) -----------------------------------------
 
@@ -219,6 +261,7 @@ class ChannelCheckerMiddleware(BaseMiddleware):
         event: TelegramObject,
         bot: Bot,
         channels: list[dict],
+        state: FSMContext | None = None,
     ):
         user = None
         if isinstance(event, (Message, CallbackQuery)):
@@ -229,9 +272,7 @@ class ChannelCheckerMiddleware(BaseMiddleware):
             elif event.callback_query and event.callback_query.from_user:
                 user = event.callback_query.from_user
 
-        language = DEFAULT_LANGUAGE
-        if user and user.language_code:
-            language = user.language_code.split('-')[0]
+        language = await _get_channel_prompt_language(user, state)
 
         normalized = _normalize_channels(channels)
 
