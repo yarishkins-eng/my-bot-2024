@@ -284,3 +284,61 @@ async def test_app_config_never_returns_raw_url_when_link_is_hidden(
     assert config['subscriptionUrl'] is None
     assert config['subscriptionCryptoLink'] == subscription.subscription_crypto_link
     assert config['hasSubscription'] is True
+
+
+@pytest.mark.parametrize('endpoint', ['get_connection_link', 'get_app_config'])
+@pytest.mark.parametrize(
+    ('enabled', 'reset_completed', 'expected_strict'),
+    [(True, False, True), (False, True, True), (False, False, False)],
+)
+@pytest.mark.anyio('asyncio')
+async def test_every_connection_endpoint_retains_reset_history_metadata(
+    monkeypatch, endpoint, enabled, reset_completed, expected_strict
+):
+    _configure_link_access(monkeypatch)
+    completed_at = datetime(2026, 9, 8, 12, tzinfo=UTC) if reset_completed else None
+    user = SimpleNamespace(
+        telegram_id=7749231138,
+        test_account_enabled=enabled,
+        test_reset_completed_at=completed_at,
+    )
+    subscription = _subscription()
+    # Avoid any on-demand Panel encryption: this is a response-contract test.
+    subscription.subscription_crypto_link = 'happ://crypt5/opaque-config'
+    monkeypatch.setattr(subscription_status, 'resolve_subscription', AsyncMock(return_value=subscription))
+    monkeypatch.setattr(subscription_status, '_load_app_config_async', AsyncMock(return_value={'platforms': {}}))
+
+    response = await getattr(subscription_status, endpoint)(user=user, db=SimpleNamespace(), subscription_id=None)
+
+    assert response['test_link_strict'] is expected_strict
+    assert response['test_reset_at'] == (completed_at.isoformat() if completed_at else None)
+
+
+@pytest.mark.anyio('asyncio')
+@pytest.mark.parametrize(
+    ('enabled', 'reset_completed', 'expected_strict'),
+    [(True, False, True), (False, True, True), (False, False, False)],
+)
+async def test_no_subscription_status_retains_exact_reset_metadata(
+    monkeypatch, enabled, reset_completed, expected_strict
+):
+    from app.database.crud import user as user_crud
+
+    user = SimpleNamespace(
+        id=1,
+        telegram_id=7749231138,
+        test_account_enabled=enabled,
+        test_reset_completed_at=datetime(2026, 9, 8, 12, tzinfo=UTC) if reset_completed else None,
+    )
+    monkeypatch.setattr(user_crud, 'get_user_by_id', AsyncMock(return_value=user))
+    monkeypatch.setattr(subscription_status, 'resolve_subscription', AsyncMock(return_value=None))
+
+    response = await subscription_status.get_subscription(user=user, db=SimpleNamespace(), subscription_id=None)
+
+    assert not response.has_subscription
+    assert response.test_link_strict is expected_strict
+    expected_epoch = user.test_reset_completed_at.isoformat() if reset_completed else None
+    assert response.test_reset_at == expected_epoch
+    # /info is a Pydantic model; the other two endpoints return dictionaries.
+    # Preserve identical strings on the wire rather than converting UTC to Z.
+    assert response.model_dump(mode='json')['test_reset_at'] == expected_epoch

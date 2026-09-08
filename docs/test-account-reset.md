@@ -45,7 +45,19 @@ Removing membership retains reset history and retired UUIDs to reject late event
   webhook, import and manual panel-sync snapshots reject retired identities.
   A completed reset bypasses the old destructive second wipe in `/start`.
 - No reset preserves a bearer subscription URL. The strict test-link flag also
-  forbids cached fallback when the current-link endpoint fails.
+  forbids cached fallback when the current-link endpoint fails. `/info`,
+  `/connection-link`, and `/app-config` share the same nullable `test_reset_at`
+  string and `test_link_strict` predicate (membership OR reset history). A tester
+  before their first reset legitimately has a null epoch. Removing membership
+  never removes the history predicate. Clients must wait for fresh metadata and
+  matching generations across all connection surfaces, including QR navigation
+  history and installation-guide deep links.
+- Delivered guest-purchase financial records survive, but their stored link,
+  crypto link, temporary cabinet password and auto-login credential are cleared
+  when this reset account is the delivery recipient (`user_id`). A gift merely
+  bought by the tester for someone else (`buyer_user_id`) is not redacted.
+  Preview does not clear anything; redaction runs inside the confirmed reset
+  transaction after verified panel deletion.
 
 This is a clean **subscription/onboarding test cycle**, not deletion of the
 person's identity: Telegram/email login, referral identity, external channel
