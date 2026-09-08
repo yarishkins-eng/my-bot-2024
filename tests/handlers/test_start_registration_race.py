@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -21,7 +21,7 @@ def _message() -> SimpleNamespace:
             first_name='Race',
             last_name=None,
         ),
-        bot=MagicMock(),
+        bot=SimpleNamespace(send_message=AsyncMock()),
         answer=AsyncMock(),
     )
 
@@ -137,9 +137,13 @@ async def test_two_completion_results_emit_canonical_campaign_message_once(
     assert user.balance_kopeks == 5000
     notifier.send_campaign_registration_notification.assert_awaited_once()
     bonus_messages = [
-        call.args[0]
+        call.kwargs['text']
         for message in messages
-        for call in message.answer.await_args_list
-        if call.args and str(call.args[0]).startswith('bonus:')
+        for call in message.bot.send_message.await_args_list
+        if str(call.kwargs.get('text', '')).startswith('bonus:')
     ]
     assert bonus_messages == ['bonus:Campaign 9:5000']
+    assert all(
+        not any(call.args and str(call.args[0]).startswith('bonus:') for call in message.answer.await_args_list)
+        for message in messages
+    )

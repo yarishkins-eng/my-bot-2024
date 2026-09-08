@@ -163,8 +163,36 @@ async def test_channel_prompt_uses_validated_fsm_choice_for_new_user(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('logo_mode', 'campaign_notification', 'expected_text', 'expected_photo_count'),
+    [
+        (False, None, 'menu', 0),
+        (
+            True,
+            start_module.CampaignBonusNotification(bonus_type='balance', text='campaign balance'),
+            'campaign balance',
+            1,
+        ),
+        (
+            True,
+            start_module.CampaignBonusNotification(bonus_type='tariff', text='campaign tariff'),
+            'campaign tariff',
+            1,
+        ),
+        (
+            True,
+            start_module.CampaignBonusNotification(bonus_type='subscription', text='campaign subscription'),
+            'campaign subscription',
+            1,
+        ),
+    ],
+)
 async def test_channel_check_creates_new_user_once_with_telegram_language(
     monkeypatch: pytest.MonkeyPatch,
+    logo_mode: bool,
+    campaign_notification: start_module.CampaignBonusNotification | None,
+    expected_text: str,
+    expected_photo_count: int,
 ) -> None:
     state = _state()
     query = SimpleNamespace(
@@ -198,12 +226,16 @@ async def test_channel_check_creates_new_user_once_with_telegram_language(
     monkeypatch.setattr(start_module, 'find_phantom_user_by_username', AsyncMock(return_value=None))
     monkeypatch.setattr(start_module, 'generate_unique_referral_code', AsyncMock(return_value='refChannel1'))
     monkeypatch.setattr(start_module, 'create_user', create)
-    monkeypatch.setattr(start_module, '_apply_campaign_bonus_if_needed', AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        start_module,
+        '_apply_campaign_bonus_if_needed',
+        AsyncMock(return_value=campaign_notification),
+    )
     monkeypatch.setattr(start_module, 'get_main_menu_text', AsyncMock(return_value='menu'))
     monkeypatch.setattr(start_module.MainMenuButtonService, 'get_buttons_for_user', AsyncMock(return_value=[]))
     monkeypatch.setattr(start_module, 'get_main_menu_keyboard_async', AsyncMock(return_value=None))
     monkeypatch.setattr(start_module, 'get_active_pinned_message', AsyncMock(return_value=None))
-    monkeypatch.setattr(start_module.settings, 'ENABLE_LOGO_MODE', False)
+    monkeypatch.setattr(start_module.settings, 'ENABLE_LOGO_MODE', logo_mode)
     monkeypatch.setattr(start_module.SupportSettingsService, 'is_moderator', lambda _telegram_id: False)
 
     await start_module.required_sub_channel_check(query, bot, state, db)
@@ -213,3 +245,5 @@ async def test_channel_check_creates_new_user_once_with_telegram_language(
     assert (await state.get_data())['language'] == 'en'
     resolver.assert_called_once_with('en-US')
     bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.kwargs['text'] == expected_text
+    assert bot.send_photo.await_count == expected_photo_count
