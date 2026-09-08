@@ -87,6 +87,10 @@ async def revive_deleted_user(
             should branch on status FIRST; this guard exists so misuse
             shows up loudly rather than silently no-op'ing.
     """
+    from app.services.test_account_reset_service import RESET_MESSAGE, reset_is_busy
+
+    if reset_is_busy(user):
+        raise AccountErasurePendingError(RESET_MESSAGE)
     if user.status != UserStatus.DELETED.value:
         raise NotDeletedError(
             f'revive_deleted_user called on user {user.id} with status={user.status!r}; '

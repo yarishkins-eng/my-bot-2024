@@ -168,7 +168,14 @@ async def get_subscription(
         ],
         redact_technical_access=is_access_point_subscription,
     )
-    return SubscriptionStatusResponse(has_subscription=True, subscription=subscription_data)
+    from app.services.test_account_reset_service import has_reset_history
+    from app.services.user_service import is_test_account
+
+    return SubscriptionStatusResponse(
+        has_subscription=True,
+        subscription=subscription_data,
+        test_link_strict=is_test_account(fresh_user) or has_reset_history(fresh_user),
+    )
 
 
 # ============ Connection Link ============
@@ -222,6 +229,10 @@ async def get_connection_link(
     connect_mode = settings.CONNECT_BUTTON_MODE
     hide_subscription_link = settings.should_hide_subscription_link()
 
+    from app.services.user_service import is_test_account
+
+    test_reset_at = user.test_reset_completed_at if is_test_account(user) else None
+
     return {
         'subscription_url': subscription_url if not hide_subscription_link else None,
         'display_link': display_link if not hide_subscription_link else None,
@@ -233,6 +244,7 @@ async def get_connection_link(
         'happ_crypto_link': subscription.subscription_crypto_link,
         'connect_mode': connect_mode,
         'hide_link': hide_subscription_link,
+        'test_reset_at': test_reset_at.isoformat() if test_reset_at else None,
         'instructions': {
             'steps': [
                 'Copy the subscription link',

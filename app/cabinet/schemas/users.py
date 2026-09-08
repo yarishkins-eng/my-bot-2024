@@ -255,6 +255,8 @@ class UserDetailResponse(BaseModel):
     # Тестовый стенд владельца: Телеграм стоит в TEST_ACCOUNT_TELEGRAM_IDS.
     # Только у такого аккаунта экран рисует кнопку обнуления.
     is_test_account: bool = False
+    can_manage_test_account: bool = False
+    test_reset_state: str | None = None
 
 
 # === Panel Info ===
@@ -525,6 +527,12 @@ class TestAccountResetRequest(BaseModel):
     """Запрос обнуления тестового аккаунта."""
 
     confirm: bool = Field(default=False, description='False — только показать, что будет снесено')
+    preview_token: str | None = Field(default=None, max_length=64)
+
+
+class TestAccountMembershipRequest(BaseModel):
+    enabled: bool
+    telegram_id: int = Field(gt=0)
 
 
 class TestAccountResetResponse(BaseModel):
@@ -543,6 +551,8 @@ class TestAccountResetResponse(BaseModel):
     panel_linked: bool = False
     panel_deleted: bool = False
     deleted_rows: dict[str, int] = Field(default_factory=dict)
+    preview_token: str | None = None
+    reset_state: str | None = None
 
 
 class DeleteUserRequest(BaseModel):

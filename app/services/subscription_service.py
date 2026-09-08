@@ -281,6 +281,10 @@ class SubscriptionService:
         )
         if user is None:
             return None
+        from app.services.test_account_reset_service import reset_is_busy
+
+        if reset_is_busy(user):
+            return None
         if getattr(user, 'account_erasure_requested_at', None) is not None:
             logger.warning(
                 'panel_write_blocked_for_financial_account_closure',
@@ -346,6 +350,7 @@ class SubscriptionService:
         api: RemnaWaveAPI,
         operation: Callable[[], Awaitable[RemnaWaveUser]],
         panel_uuid: str | None = None,
+        subscription_id: int | None = None,
     ) -> RemnaWaveUser | None:
         """Run a raw panel write behind the financial-erasure fence.
 
@@ -360,9 +365,17 @@ class SubscriptionService:
         # closer can set the marker; if the provider accepted a request but
         # its response was lost, closure then performs a stable-ID panel sweep
         # while the pre-erasure Telegram/email identifiers still exist.
-        if await self._load_user_for_panel_write(db, user_id) is None:
+        guarded_user = await self._load_user_for_panel_write(db, user_id)
+        if guarded_user is None:
             logger.warning('raw_panel_write_blocked_for_financial_account_closure', user_id=user_id)
             return None
+        if getattr(guarded_user, 'test_reset_state', None) is not None and subscription_id is None:
+            return None
+        if subscription_id is not None:
+            from app.services.test_account_reset_service import current_test_subscription
+
+            if not await current_test_subscription(db, guarded_user, subscription_id):
+                return None
 
         result = await operation()
         if await self._account_erasure_started(db, user_id):
@@ -494,6 +507,7 @@ class SubscriptionService:
                     user_id=subscription.user_id,
                     api=api,
                     operation=operation,
+                    subscription_id=subscription.id,
                 )
                 if updated_user is None:
                     return None
@@ -744,6 +758,10 @@ class SubscriptionService:
                     user_id=subscription.user_id,
                 )
                 return None
+            from app.services.test_account_reset_service import current_test_subscription
+
+            if not await current_test_subscription(db, user, subscription.id):
+                return None
 
             # Resolve the Remnawave UUID: prefer subscription-level in multi-tariff mode
             if settings.is_multi_tariff_enabled():
@@ -944,6 +962,10 @@ class SubscriptionService:
             user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
                 return False
+            from app.services.test_account_reset_service import current_test_subscription
+
+            if not await current_test_subscription(db, user, subscription.id):
+                return False
             if settings.is_multi_tariff_enabled():
                 remnawave_uuid = subscription.remnawave_uuid
             else:
@@ -1109,6 +1131,12 @@ class SubscriptionService:
             user = await get_user_by_id(db, subscription.user_id)
             if not user:
                 return None
+            if getattr(user, 'test_reset_state', None) is not None:
+                from app.services.test_account_reset_service import current_test_subscription
+
+                user = await self._load_user_for_panel_write(db, subscription.user_id)
+                if user is None or not await current_test_subscription(db, user, subscription.id):
+                    return None
             if settings.is_multi_tariff_enabled():
                 revoke_uuid = subscription.remnawave_uuid
                 if not revoke_uuid:
