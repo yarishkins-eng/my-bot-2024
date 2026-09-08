@@ -3463,8 +3463,6 @@ class MonitoringService:
             return
 
         try:
-            from datetime import UTC, datetime, timedelta
-
             from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
             from sqlalchemy import select
 
@@ -3480,19 +3478,24 @@ class MonitoringService:
             expiry_days = getattr(settings, 'LOW_BALANCE_ALERT_EXPIRY_DAYS', 3)
             expiry_threshold = datetime.now(UTC) + timedelta(days=expiry_days)
 
-            result = await db.execute(
-                select(User)
-                .join(Subscription, Subscription.user_id == User.id)
-                .where(
-                    Subscription.status.in_(['active', 'trial']),
-                    Subscription.autopay_enabled.is_(True),
-                    Subscription.end_date.isnot(None),
-                    Subscription.end_date <= expiry_threshold,
-                    User.telegram_id.isnot(None),
-                )
-                .distinct()
+            # Deduplicate by user identity, not the full mapped row: PostgreSQL
+            # cannot apply DISTINCT to User's nullable JSON reset history.
+            eligible_user_ids = select(Subscription.user_id).where(
+                Subscription.status.in_(['active', 'trial']),
+                Subscription.autopay_enabled.is_(True),
+                Subscription.end_date.isnot(None),
+                Subscription.end_date <= expiry_threshold,
             )
-            users = result.scalars().all()
+            # Keep a query failure local without rolling back earlier work
+            # in the monitoring cycle's shared transaction.
+            async with db.begin_nested():
+                result = await db.execute(
+                    select(User).where(
+                        User.id.in_(eligible_user_ids),
+                        User.telegram_id.isnot(None),
+                    )
+                )
+                users = result.scalars().all()
 
             sent_count = 0
             for user in users:
