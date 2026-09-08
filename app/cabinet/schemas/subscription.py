@@ -100,6 +100,7 @@ class SubscriptionStatusResponse(BaseModel):
     has_subscription: bool
     subscription: SubscriptionData | None = None
     test_link_strict: bool = False
+    test_reset_at: str | None = None
 
 
 class RenewalOptionResponse(BaseModel):

@@ -2041,6 +2041,37 @@ def _test_reset_delete_plan(scopes: dict[str, list[int]]) -> list[tuple[Any, Any
     return plan
 
 
+async def _test_reset_redact_guest_purchase_credentials(db: AsyncSession, user_id: int) -> int:
+    """Revoke historical guest-purchase bearer material for this recipient only.
+
+    ``GuestPurchase`` is a financial record and has ``SET NULL`` user links,
+    so the reset deliberately keeps it.  Its stored subscription URLs and
+    cabinet credentials are access material, though, not financial evidence.
+    ``user_id`` is assigned by guest fulfillment to the actual subscription
+    recipient; ``buyer_user_id`` is deliberately not a predicate here, since a
+    reset tester may have bought a gift which belongs to somebody else.
+    """
+    result = await db.execute(
+        update(GuestPurchase)
+        .where(
+            GuestPurchase.user_id == user_id,
+            or_(
+                GuestPurchase.subscription_url.is_not(None),
+                GuestPurchase.subscription_crypto_link.is_not(None),
+                GuestPurchase.cabinet_password.is_not(None),
+                GuestPurchase.auto_login_token.is_not(None),
+            ),
+        )
+        .values(
+            subscription_url=None,
+            subscription_crypto_link=None,
+            cabinet_password=None,
+            auto_login_token=None,
+        )
+    )
+    return int(result.rowcount or 0)
+
+
 async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None:
     """Первая причина, по которой обнулять нельзя. ``None`` — можно."""
     from app.database.models import AccountErasureRequest, DeviceFirstReconciliationCredit, UserRole
@@ -2448,6 +2479,13 @@ async def _reset_test_account_unlocked(
             .where(or_(ReferralEarning.user_id == user_id, ReferralEarning.referral_id == user_id))
             .values(referral_transaction_id=None)
         )
+
+        # Financial guest-purchase rows intentionally survive the reset (their
+        # two user links are SET NULL), but a completed delivery may retain a
+        # bearer subscription URL or temporary cabinet credential.  Redact
+        # those only when this test user is the delivery recipient; a resetter
+        # who merely bought a gift must not invalidate another person's access.
+        await _test_reset_redact_guest_purchase_credentials(db, user_id)
 
         for table, whereclause in _test_reset_delete_plan(scopes):
             result = await db.execute(delete(table).where(whereclause))
