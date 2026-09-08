@@ -2471,7 +2471,7 @@ class RemnaWaveService:
         if not isinstance(getattr(current, 'test_reset_started_at', None), datetime):
             return True
 
-        from app.services.test_account_reset_service import reset_is_busy
+        from app.services.account_test_reset_service import reset_is_busy
 
         panel_uuid = panel_user.get('uuid') if isinstance(panel_user, dict) else None
         if reset_is_busy(current) or not panel_uuid or panel_uuid in (current.test_reset_panel_uuids or []):

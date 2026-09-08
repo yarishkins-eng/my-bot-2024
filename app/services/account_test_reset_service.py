@@ -1,4 +1,4 @@
-"""Owner-only test fixtures: durable reset fence, no reusable VPN credentials."""
+"""Durable test-fixture reset fence with no reusable VPN credentials."""
 
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime

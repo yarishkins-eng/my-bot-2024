@@ -374,7 +374,7 @@ class RemnaWaveWebhookService:
             if isinstance(getattr(user, 'test_reset_started_at', None), datetime):
                 from sqlalchemy import select
 
-                from app.services.test_account_reset_service import reset_is_busy
+                from app.services.account_test_reset_service import reset_is_busy
 
                 if reset_is_busy(user):
                     return True

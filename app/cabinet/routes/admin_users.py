@@ -2818,7 +2818,7 @@ async def set_test_membership(
     if not _can_manage_test_accounts(admin):
         raise HTTPException(status_code=403, detail='Только владелец может менять список тестировщиков.')
     from app.database.models import AdminAuditLog
-    from app.services.test_account_reset_service import reset_is_busy
+    from app.services.account_test_reset_service import reset_is_busy
     from app.services.user_service import _test_reset_blocked_reason
 
     user = await db.scalar(

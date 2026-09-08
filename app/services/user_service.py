@@ -2230,7 +2230,7 @@ async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str], 
                         return False
                 user.test_reset_panel_uuids = sorted(found)
                 await db.commit()
-                from app.services.test_account_reset_service import reset_bypass
+                from app.services.account_test_reset_service import reset_bypass
 
                 await reset_bypass(db)
             if not found:
@@ -2266,7 +2266,7 @@ async def reset_test_account(
     confirm: bool,
     preview_token: str | None = None,
 ) -> TestAccountResetPlan:
-    from app.services.test_account_reset_service import run_reset
+    from app.services.account_test_reset_service import run_reset
 
     return await run_reset(db, user, admin_id, confirm=confirm, preview_token=preview_token)
 

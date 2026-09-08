@@ -281,7 +281,7 @@ class SubscriptionService:
         )
         if user is None:
             return None
-        from app.services.test_account_reset_service import reset_is_busy
+        from app.services.account_test_reset_service import reset_is_busy
 
         if reset_is_busy(user):
             return None
@@ -372,7 +372,7 @@ class SubscriptionService:
         if getattr(guarded_user, 'test_reset_state', None) is not None and subscription_id is None:
             return None
         if subscription_id is not None:
-            from app.services.test_account_reset_service import current_test_subscription
+            from app.services.account_test_reset_service import current_test_subscription
 
             if not await current_test_subscription(db, guarded_user, subscription_id):
                 return None
@@ -758,7 +758,7 @@ class SubscriptionService:
                     user_id=subscription.user_id,
                 )
                 return None
-            from app.services.test_account_reset_service import current_test_subscription
+            from app.services.account_test_reset_service import current_test_subscription
 
             if not await current_test_subscription(db, user, subscription.id):
                 return None
@@ -962,7 +962,7 @@ class SubscriptionService:
             user = await self._load_user_for_panel_write(db, subscription.user_id)
             if not user:
                 return False
-            from app.services.test_account_reset_service import current_test_subscription
+            from app.services.account_test_reset_service import current_test_subscription
 
             if not await current_test_subscription(db, user, subscription.id):
                 return False
@@ -1132,7 +1132,7 @@ class SubscriptionService:
             if not user:
                 return None
             if getattr(user, 'test_reset_state', None) is not None:
-                from app.services.test_account_reset_service import current_test_subscription
+                from app.services.account_test_reset_service import current_test_subscription
 
                 user = await self._load_user_for_panel_write(db, subscription.user_id)
                 if user is None or not await current_test_subscription(db, user, subscription.id):

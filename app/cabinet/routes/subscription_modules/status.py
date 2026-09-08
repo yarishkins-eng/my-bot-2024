@@ -168,7 +168,7 @@ async def get_subscription(
         ],
         redact_technical_access=is_access_point_subscription,
     )
-    from app.services.test_account_reset_service import has_reset_history
+    from app.services.account_test_reset_service import has_reset_history
     from app.services.user_service import is_test_account
 
     return SubscriptionStatusResponse(

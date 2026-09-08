@@ -92,7 +92,7 @@ async def get_current_cabinet_user(
             detail='User not found',
         )
 
-    from app.services.test_account_reset_service import RESET_MESSAGE, reset_is_busy
+    from app.services.account_test_reset_service import RESET_MESSAGE, reset_is_busy
 
     if reset_is_busy(user):
         raise HTTPException(status_code=409, detail={'code': 'test_account_reset', 'message': RESET_MESSAGE})

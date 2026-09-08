@@ -1071,7 +1071,7 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         await state.clear()
         return
 
-    from app.services.test_account_reset_service import has_reset_history
+    from app.services.account_test_reset_service import has_reset_history
 
     # A completed test reset already performed the child-first cleanup. Never
     # run the legacy second wipe: this User snapshot can predate a new trial.
