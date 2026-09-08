@@ -357,6 +357,7 @@ async def test_route_refuses_an_account_outside_the_list(monkeypatch) -> None:
         return SimpleNamespace(id=user_id, telegram_id=555000111)
 
     monkeypatch.setattr(route_module, 'get_user_by_id', _fake_get_user)
+    monkeypatch.setattr(route_module, '_can_manage_test_accounts', lambda admin: True)
 
     with pytest.raises(HTTPException) as exc:
         await route_module.reset_test_account_route(

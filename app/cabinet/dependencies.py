@@ -92,6 +92,11 @@ async def get_current_cabinet_user(
             detail='User not found',
         )
 
+    from app.services.account_test_reset_service import RESET_MESSAGE, reset_is_busy
+
+    if reset_is_busy(user):
+        raise HTTPException(status_code=409, detail={'code': 'test_account_reset', 'message': RESET_MESSAGE})
+
     # Validate Telegram initData first — we need its outcome both for the
     # cross-account guard (existing) and for the DELETED auto-revival
     # (new). Reading the header always; verification only when it's

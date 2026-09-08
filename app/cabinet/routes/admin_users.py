@@ -87,6 +87,7 @@ from ..schemas.users import (
     SyncFromPanelResponse,
     SyncToPanelRequest,
     SyncToPanelResponse,
+    TestAccountMembershipRequest,
     TestAccountResetRequest,
     TestAccountResetResponse,
     TrafficPurchaseItem,
@@ -143,6 +144,12 @@ def _is_test_account(user: User) -> bool:
     from app.services.user_service import is_test_account
 
     return is_test_account(user)
+
+
+def _can_manage_test_accounts(admin: User) -> bool:
+    from app.services.rbac_bootstrap_service import is_user_admin_by_env
+
+    return is_user_admin_by_env(admin).is_admin
 
 
 def _build_user_list_item(user: User, spending_stats: dict = None) -> UserListItem:
@@ -436,6 +443,7 @@ async def _sync_subscription_to_panel(
                     updated_panel_user = await SubscriptionService().run_guarded_panel_write(
                         db,
                         user_id=user.id,
+                        subscription_id=subscription.id,
                         api=api,
                         panel_uuid=panel_uuid,
                         operation=lambda: api.update_user(**update_kwargs),
@@ -480,6 +488,7 @@ async def _sync_subscription_to_panel(
                 new_panel_user = await SubscriptionService().run_guarded_panel_write(
                     db,
                     user_id=user.id,
+                    subscription_id=subscription.id,
                     api=api,
                     operation=lambda: api.create_user(**create_kwargs),
                 )
@@ -874,6 +883,8 @@ async def get_user_detail(
             else user.remnawave_uuid
         ),
         is_test_account=_is_test_account(user),
+        can_manage_test_account=_can_manage_test_accounts(admin),
+        test_reset_state=user.test_reset_state,
     )
 
 
@@ -2797,6 +2808,50 @@ async def resolve_financial_account_erasure(
     )
 
 
+@router.put('/{user_id}/test-membership')
+async def set_test_membership(
+    user_id: int,
+    request: TestAccountMembershipRequest,
+    admin: User = Depends(require_permission('users:delete')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    if not _can_manage_test_accounts(admin):
+        raise HTTPException(status_code=403, detail='Только владелец может менять список тестировщиков.')
+    from app.database.models import AdminAuditLog
+    from app.services.account_test_reset_service import reset_is_busy
+    from app.services.user_service import _test_reset_blocked_reason
+
+    user = await db.scalar(
+        select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if user is None:
+        raise HTTPException(status_code=404, detail='User not found')
+    if user.telegram_id != request.telegram_id:
+        raise HTTPException(status_code=409, detail='Выбранный Telegram не совпадает с карточкой. Обновите её.')
+    if reset_is_busy(user):
+        raise HTTPException(status_code=409, detail='Сначала завершите начатый сброс.')
+    if request.enabled:
+        reason = await _test_reset_blocked_reason(db, user)
+        if reason or user.account_erased_at is not None:
+            raise HTTPException(status_code=409, detail=reason or 'Закрытый аккаунт нельзя назначить тестовым.')
+    previous = _is_test_account(user)
+    user.test_account_enabled = request.enabled
+    if user.test_reset_state is None:
+        user.test_reset_state = 'idle'
+    db.add(
+        AdminAuditLog(
+            user_id=admin.id,
+            action='test_account.membership',
+            resource_type='user',
+            resource_id=str(user.id),
+            status='success',
+            details={'before': previous, 'enabled': request.enabled},
+        )
+    )
+    await db.commit()
+    return {'is_test_account': request.enabled}
+
+
 @router.post('/{user_id}/test-reset', response_model=TestAccountResetResponse)
 async def reset_test_account_route(
     user_id: int,
@@ -2810,6 +2865,8 @@ async def reset_test_account_route(
     денег, какая подписка, сколько заказов и можно ли вообще. Всё остальное —
     в ``app/services/user_service.py``, включая три забора.
     """
+    if not _can_manage_test_accounts(admin):
+        raise HTTPException(status_code=403, detail='Только владелец может сбрасывать тестовые аккаунты.')
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
@@ -2833,7 +2890,7 @@ async def reset_test_account_route(
     # вместо человеческого отказа увидел бы Internal Server Error.
     admin_id = admin.id
 
-    plan = await reset_test_account(db, user, admin_id, confirm=request.confirm)
+    plan = await reset_test_account(db, user, admin_id, confirm=request.confirm, preview_token=request.preview_token)
     logger.info(
         'Admin test account reset',
         admin_id=admin_id,
@@ -2856,6 +2913,8 @@ async def reset_test_account_route(
         panel_linked=plan.panel_linked,
         panel_deleted=plan.panel_deleted,
         deleted_rows=plan.deleted_rows,
+        preview_token=plan.preview_token,
+        reset_state=plan.reset_state,
     )
 
 
@@ -3535,6 +3594,19 @@ async def sync_user_from_panel(
                     errors=['No user found in Remnawave panel by UUID, telegram_id, or email'],
                 )
 
+            # A manual sync can outlive its Panel read: a test reset may have
+            # removed P1 and a new trial may already own P2 by the time this
+            # request would write local UUIDs/URLs.  Re-use the canonical
+            # fresh row fence before touching either object.
+            if not await service._accept_test_account_panel_snapshot(db, user, {'uuid': panel_user.uuid}):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        'code': 'test_account_reset_stale_panel_snapshot',
+                        'message': 'Panel snapshot belongs to a retired test-account identity. Retry the sync.',
+                    },
+                )
+
             # Build panel info. active_internal_squads is a list[dict] (see the
             # diagnostic in get_user_sync_status / auth.py); the previous .uuid/str
             # checks matched nothing, so panel squads were never extracted and the
@@ -3884,6 +3956,7 @@ async def sync_user_to_panel(
                     updated_panel_user = await SubscriptionService().run_guarded_panel_write(
                         db,
                         user_id=user.id,
+                        subscription_id=sub.id,
                         api=api,
                         panel_uuid=panel_uuid,
                         operation=lambda: api.update_user(**update_kwargs),
@@ -3929,6 +4002,7 @@ async def sync_user_to_panel(
                 new_panel_user = await SubscriptionService().run_guarded_panel_write(
                     db,
                     user_id=user.id,
+                    subscription_id=sub.id,
                     api=api,
                     operation=lambda: api.create_user(**create_kwargs),
                 )

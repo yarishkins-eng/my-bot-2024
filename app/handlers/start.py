@@ -1071,7 +1071,11 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         await state.clear()
         return
 
-    if user and user.status == UserStatus.DELETED.value:
+    from app.services.account_test_reset_service import has_reset_history
+
+    # A completed test reset already performed the child-first cleanup. Never
+    # run the legacy second wipe: this User snapshot can predate a new trial.
+    if user and user.status == UserStatus.DELETED.value and not has_reset_history(user):
         if user.account_erasure_requested_at is not None:
             await message.answer(
                 'Аккаунт закрывается. Ранее созданный счёт ещё сверяется; не создавайте новый платёж. '

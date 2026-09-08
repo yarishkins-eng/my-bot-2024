@@ -45,6 +45,10 @@ async def _assert_user_not_in_financial_closure(db: AsyncSession, user_id: int) 
     if not isawaitable(maybe_user):
         return
     user = await maybe_user
+    from app.services.account_test_reset_service import RESET_MESSAGE, reset_is_busy
+
+    if reset_is_busy(user):
+        raise AccountErasureClosureError(RESET_MESSAGE)
     if isinstance(getattr(user, 'account_erasure_requested_at', None), datetime):
         raise AccountErasureClosureError('Account closure is in progress; paid access cannot be created or revived.')
 

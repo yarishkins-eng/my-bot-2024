@@ -2202,6 +2202,11 @@ class RemnaWaveService:
             return {'created': 0, 'updated': 0, 'errors': 1, 'deleted': 0}
 
     async def _create_subscription_from_panel_data(self, db: AsyncSession, user, panel_user):
+        # Keep the fence outside the legacy best-effort fallback below: a
+        # database/locking error must fail closed, never turn a retired panel
+        # snapshot into the fallback subscription.
+        if not await self._accept_test_account_panel_snapshot(db, user, panel_user):
+            return
         try:
             from app.database.crud.subscription import create_subscription_no_commit
             from app.database.models import SubscriptionStatus
@@ -2283,6 +2288,9 @@ class RemnaWaveService:
         try:
             from app.database.crud.subscription import get_subscription_by_user_id, is_recently_updated_by_webhook
             from app.database.models import SubscriptionStatus
+
+            if not await self._accept_test_account_panel_snapshot(db, user, panel_user):
+                return
 
             # Всегда используем async CRUD запрос для получения подписки
             if settings.is_multi_tariff_enabled():
@@ -2439,6 +2447,52 @@ class RemnaWaveService:
             # Не делаем rollback, так как это может повлиять на другие операции
             # Ошибку прокидываем выше для корректной обработки в основном цикле
             raise
+
+    async def _accept_test_account_panel_snapshot(self, db: AsyncSession, user, panel_user: dict[str, Any]) -> bool:
+        """Accept only the live panel generation after a test-account reset.
+
+        Panel list/status synchronizers retain a page in memory while another
+        request may delete the test identity and provision a new one.  For an
+        ordinary user their existing reconciliation semantics are unchanged.
+        A configured test user is freshly locked so reset cannot pass between
+        this check and the local write; once a reset has started, a snapshot
+        must name the current UUID, never a durable retired UUID.
+        """
+        from app.services.user_service import is_test_account
+
+        if not (is_test_account(user) or isinstance(getattr(user, 'test_reset_started_at', None), datetime)):
+            return True
+
+        current = await db.scalar(
+            select(User).where(User.id == user.id).with_for_update().execution_options(populate_existing=True)
+        )
+        if current is None:
+            return False
+        if not isinstance(getattr(current, 'test_reset_started_at', None), datetime):
+            return True
+
+        from app.services.account_test_reset_service import reset_is_busy
+
+        panel_uuid = panel_user.get('uuid') if isinstance(panel_user, dict) else None
+        if reset_is_busy(current) or not panel_uuid or panel_uuid in (current.test_reset_panel_uuids or []):
+            logger.warning(
+                'test_account_retired_panel_snapshot_ignored',
+                user_id=current.id,
+                panel_uuid=panel_uuid,
+            )
+            return False
+
+        if not settings.is_multi_tariff_enabled():
+            return panel_uuid == current.remnawave_uuid
+
+        return bool(
+            await db.scalar(
+                select(Subscription.id).where(
+                    Subscription.user_id == current.id,
+                    Subscription.remnawave_uuid == panel_uuid,
+                )
+            )
+        )
 
     async def sync_users_to_panel(self, db: AsyncSession) -> dict[str, int]:
         from app.database.crud.subscription import get_subscriptions_batch
@@ -2633,6 +2687,7 @@ class RemnaWaveService:
                                     updated_user = await closure_guard.run_guarded_panel_write(
                                         db,
                                         user_id=user.id,
+                                        subscription_id=sub.id,
                                         api=api,
                                         panel_uuid=panel_uuid,
                                         operation=lambda: api.update_user(**update_kwargs),
@@ -2658,6 +2713,7 @@ class RemnaWaveService:
                                         new_user = await closure_guard.run_guarded_panel_write(
                                             db,
                                             user_id=user.id,
+                                            subscription_id=sub.id,
                                             api=api,
                                             operation=lambda: api.create_user(**create_kwargs),
                                         )
@@ -2671,6 +2727,7 @@ class RemnaWaveService:
                                 new_user = await closure_guard.run_guarded_panel_write(
                                     db,
                                     user_id=user.id,
+                                    subscription_id=sub.id,
                                     api=api,
                                     operation=lambda: api.create_user(**create_kwargs),
                                 )
@@ -3216,6 +3273,18 @@ class RemnaWaveService:
                             continue
 
                         if user.telegram_id not in panel_telegram_ids:
+                            # The list can predate a reset/new trial. Test
+                            # fixtures are cleaned only by their fenced reset.
+                            from app.services.user_service import is_test_account
+
+                            current = await db.scalar(
+                                select(User)
+                                .where(User.id == user.id)
+                                .with_for_update()
+                                .execution_options(populate_existing=True)
+                            )
+                            if current is None or is_test_account(current) or current.test_reset_state is not None:
+                                continue
                             logger.info(
                                 '🗑️ ПОЛНАЯ деактивация подписки пользователя (отсутствует в панели)',
                                 telegram_id=user.telegram_id,

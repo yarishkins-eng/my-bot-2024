@@ -1900,6 +1900,8 @@ class TestAccountResetPlan:
     done: bool = False
     panel_deleted: bool = False
     deleted_rows: dict[str, int] = dataclass_field(default_factory=dict)
+    preview_token: str | None = None
+    reset_state: str | None = None
 
 
 async def notify_balance_change(
@@ -1992,10 +1994,13 @@ def test_account_telegram_ids() -> frozenset[int]:
 
 
 def is_test_account(user: User) -> bool:
-    """Стенд опознаётся ТОЛЬКО по Телеграму из окружения."""
+    """Owner-managed membership overrides the legacy environment allowlist."""
     telegram_id = getattr(user, 'telegram_id', None)
     if not telegram_id:
         return False
+    override = getattr(user, 'test_account_enabled', None)
+    if isinstance(override, bool):
+        return override
     return int(telegram_id) in test_account_telegram_ids()
 
 
@@ -2179,7 +2184,7 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
     return None
 
 
-async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str]) -> bool:
+async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str], *, db=None) -> bool:
     """Удалить пользователя из панели RemnaWave. ``False`` — не удалось.
 
     Логика взята у штатного закрытия аккаунта (``account_erasure_service``), а
@@ -2204,6 +2209,30 @@ async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str]) 
                 )
             if user.email:
                 found.update(item.uuid for item in await api.get_user_by_email(user.email) if item.uuid)
+            if db is not None:
+                # Search can legitimately find multiple identities in multi-tariff.
+                # Verify ownership before any destructive request, never choose first.
+                for panel_uuid in sorted(found):
+                    panel_user = await api.get_user_by_uuid(panel_uuid)
+                    if panel_user is None:
+                        continue
+                    if str(panel_user.telegram_id) != str(user.telegram_id):
+                        return False
+                    other_owner = await db.scalar(
+                        select(User.id).where(User.remnawave_uuid == panel_uuid, User.id != user.id).limit(1)
+                    )
+                    other_sub = await db.scalar(
+                        select(Subscription.id)
+                        .where(Subscription.remnawave_uuid == panel_uuid, Subscription.user_id != user.id)
+                        .limit(1)
+                    )
+                    if other_owner or other_sub:
+                        return False
+                user.test_reset_panel_uuids = sorted(found)
+                await db.commit()
+                from app.services.account_test_reset_service import reset_bypass
+
+                await reset_bypass(db)
             if not found:
                 return True
 
@@ -2221,6 +2250,8 @@ async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str]) 
                 if not deleted:
                     logger.warning('test_account_reset_panel_delete_returned_false', remnawave_uuid=panel_uuid)
                     return False
+                if db is not None and await api.get_user_by_uuid(panel_uuid) is not None:
+                    return False
     except Exception as error:
         logger.error('test_account_reset_panel_delete_error', error=error)
         return False
@@ -2228,6 +2259,19 @@ async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str]) 
 
 
 async def reset_test_account(
+    db: AsyncSession,
+    user: User,
+    admin_id: int | None,
+    *,
+    confirm: bool,
+    preview_token: str | None = None,
+) -> TestAccountResetPlan:
+    from app.services.account_test_reset_service import run_reset
+
+    return await run_reset(db, user, admin_id, confirm=confirm, preview_token=preview_token)
+
+
+async def _reset_test_account_unlocked(
     db: AsyncSession,
     user: User,
     admin_id: int | None,
@@ -2308,11 +2352,34 @@ async def reset_test_account(
 
     plan.blocked_reason = await _test_reset_blocked_reason(db, user)
     plan.allowed = plan.blocked_reason is None
+    import hashlib
+    import json
+    from dataclasses import asdict
+
+    plan.reset_state = getattr(user, 'test_reset_state', None)
+    fingerprint = {
+        'plan': asdict(plan),
+        'user_id': user_id,
+        'subscriptions': sorted(
+            [[sub.id, sub.updated_at.isoformat() if sub.updated_at else None] for sub in subscriptions]
+        ),
+        'checkout_ids': sorted(checkout_ids),
+        'attempt_ids': sorted(attempt_ids),
+    }
+    plan.preview_token = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
     if not plan.allowed or not confirm:
         return plan
 
     panel_uuids = sorted(
-        {value for value in [user.remnawave_uuid, *(sub.remnawave_uuid for sub in subscriptions)] if value}
+        {
+            value
+            for value in [
+                user.remnawave_uuid,
+                *(sub.remnawave_uuid for sub in subscriptions),
+                *(user.test_reset_panel_uuids or []),
+            ]
+            if value
+        }
     )
     scopes = {
         'users.id': [user_id],
@@ -2330,13 +2397,28 @@ async def reset_test_account(
     #
     # Удаление в панели идемпотентно (404 = успех), поэтому повтор безопасен:
     # если база ниже не дастся, владелец нажмёт ещё раз и дойдёт до конца.
-    plan.panel_deleted = await _test_reset_delete_panel_identity(user, panel_uuids)
+    plan.panel_deleted = await _test_reset_delete_panel_identity(user, panel_uuids, db=db)
     if not plan.panel_deleted:
         plan.allowed = False
         plan.blocked_reason = 'Панель RemnaWave не ответила. В базе ничего не тронуто — нажмите ещё раз чуть позже.'
         return plan
 
     try:
+        # Channel membership itself belongs to Telegram and is not reset.
+        # Drop only this fixture's cached observations after the DB commit.
+        from app.database.models import RequiredChannel, UserChannelSubscription
+
+        channel_ids = set((await db.scalars(select(RequiredChannel.channel_id))).all())
+        if user.telegram_id is not None:
+            channel_ids.update(
+                (
+                    await db.scalars(
+                        select(UserChannelSubscription.channel_id).where(
+                            UserChannelSubscription.telegram_id == user.telegram_id
+                        )
+                    )
+                ).all()
+            )
         # Счётчики занятости серверов принадлежат ЧУЖИМ строкам: не уменьшив их
         # до удаления связок, мы испортим общий сервер для всех остальных.
         for subscription in subscriptions:
@@ -2406,11 +2488,18 @@ async def reset_test_account(
 
         user.balance_kopeks = 0
         user.remnawave_uuid = None
+        user.lifetime_used_traffic_bytes = 0
+        user.last_remnawave_sync = None
+        user.trojan_password = None
+        user.vless_uuid = None
+        user.ss_password = None
         user.has_had_paid_subscription = False
         user.referred_by_id = None
         user.used_promocodes = 0
         user.status = UserStatus.DELETED.value
         user.account_erasure_requested_at = None
+        user.test_reset_state = 'ready'
+        user.test_reset_completed_at = datetime.now(UTC)
         user.updated_at = datetime.now(UTC)
         await db.commit()
     except Exception as error:
@@ -2425,6 +2514,14 @@ async def reset_test_account(
         return plan
 
     plan.done = True
+    plan.reset_state = 'ready'
+    if user.telegram_id is not None:
+        from app.utils.cache import ChannelSubCache
+
+        try:
+            await ChannelSubCache.invalidate_user_channels(int(user.telegram_id), sorted(channel_ids))
+        except Exception:
+            logger.warning('test_reset_channel_cache_invalidation_failed', user_id=user_id)
     logger.info(
         'test_account_reset_done',
         user_id=user_id,

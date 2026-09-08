@@ -1934,6 +1934,14 @@ class User(Base):
     last_activity = Column(AwareDateTime(), default=func.now())
     remnawave_uuid = Column(String(255), nullable=True, unique=True)
 
+    # NULL preserves the original environment allowlist. Explicit False also
+    # removes an environment-listed stand through the owner-only cabinet UI.
+    test_account_enabled = Column(Boolean, nullable=True)
+    test_reset_state = Column(String(20), nullable=True)
+    test_reset_started_at = Column(AwareDateTime(), nullable=True)
+    test_reset_completed_at = Column(AwareDateTime(), nullable=True)
+    test_reset_panel_uuids = Column(JSON, nullable=True)
+
     # Cabinet authentication fields
     email = Column(String(255), unique=True, nullable=True, index=True)
     email_verified = Column(Boolean, default=False, nullable=False)
