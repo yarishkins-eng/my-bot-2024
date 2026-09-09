@@ -275,6 +275,14 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     except Exception as e:
         logger.error('Ошибка запуска boundary-проектора access-point term', error=e)
 
+    try:
+        from app.services.device_addon_worker import device_addon_worker
+
+        await device_addon_worker.start(bot=bot)
+        logger.info('Воркер выдачи докупленных устройств запущен')
+    except Exception as e:
+        logger.error('Ошибка запуска воркера докупленных устройств', error=e)
+
     logger.info('🛡️ GlobalErrorMiddleware активирован - бот защищен от устаревших callback queries')
 
     # Validate CONNECT_BUTTON_MODE dependencies
@@ -377,6 +385,14 @@ async def shutdown_bot():
         logger.info('Boundary-проектор access-point entitlement terms остановлен')
     except Exception as e:
         logger.error('Ошибка остановки boundary-проектора access-point term', error=e)
+
+    try:
+        from app.services.device_addon_worker import device_addon_worker
+
+        device_addon_worker.stop()
+        logger.info('Воркер выдачи докупленных устройств остановлен')
+    except Exception as e:
+        logger.error('Ошибка остановки воркера докупленных устройств', error=e)
 
     try:
         await cache.close()

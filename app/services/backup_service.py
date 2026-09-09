@@ -49,6 +49,8 @@ from app.database.models import (
     ContestRound,
     ContestTemplate,
     CryptoBotPayment,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
     DeviceFirstDepositOutbox,
     DeviceFirstMutation,
     DeviceFirstNotificationOutbox,
@@ -283,6 +285,10 @@ class BackupService:
             HeleketPayment,
             WataPayment,
             PlategaPayment,
+            # Durable add-on graph follows its User/Subscription/Transaction
+            # and provider payment parents so restore retains late payments.
+            DeviceAddonIntent,
+            DeviceAddonTopupAttempt,
             CloudPaymentsPayment,
             FreekassaPayment,
             KassaAiPayment,

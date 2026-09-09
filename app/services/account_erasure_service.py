@@ -14,7 +14,7 @@ attempt -> checkout.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import structlog
@@ -25,6 +25,8 @@ from app.database.models import (
     AccountErasureRequest,
     CabinetRefreshToken,
     CheckoutPaymentAttempt,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
     DeviceFirstDepositOutbox,
     DeviceFirstMutation,
     DeviceFirstNotificationOutbox,
@@ -75,6 +77,8 @@ class _ErasureContext:
     checkouts: list[SubscriptionCheckout]
     payments: list[PlategaPayment]
     subscriptions: list[Subscription]
+    addon_attempts: list[DeviceAddonTopupAttempt] = field(default_factory=list)
+    addon_intents: list[DeviceAddonIntent] = field(default_factory=list)
 
 
 def _queued_panel_cleanup_uuids(request: AccountErasureRequest | None) -> set[str]:
@@ -124,9 +128,8 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
         (
             await db.execute(
                 select(PlategaPayment)
-                .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
-                .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-                .where(SubscriptionCheckout.user_id == user_id)
+                .where(PlategaPayment.user_id == user_id)
+                .order_by(PlategaPayment.id)
                 .with_for_update(of=PlategaPayment)
                 .execution_options(populate_existing=True)
             )
@@ -168,6 +171,24 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
         .scalars()
         .all()
     )
+    addon_attempts = list(
+        await db.scalars(
+            select(DeviceAddonTopupAttempt)
+            .where(DeviceAddonTopupAttempt.user_id == user_id)
+            .order_by(DeviceAddonTopupAttempt.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    addon_intents = list(
+        await db.scalars(
+            select(DeviceAddonIntent)
+            .where(DeviceAddonIntent.user_id == user_id)
+            .order_by(DeviceAddonIntent.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
     request = (
         await db.execute(
             select(AccountErasureRequest)
@@ -195,6 +216,8 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
         checkouts=checkouts,
         payments=payments,
         subscriptions=subscriptions,
+        addon_attempts=addon_attempts,
+        addon_intents=addon_intents,
     )
 
 
@@ -259,6 +282,18 @@ def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
             return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
         if not _safe_terminal_attempt(attempt, payment):
             return ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved'
+    for attempt in getattr(context, 'addon_attempts', []):
+        payment = payments_by_id.get(attempt.platega_payment_id)
+        if attempt.status in {'paid', 'operator_review'} or (payment is not None and payment.is_paid):
+            return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
+        if not (
+            attempt.status == 'terminal'
+            and payment is not None
+            and str(payment.status).upper() in _PROVIDER_TERMINAL_PAYMENT_STATUSES
+        ):
+            return ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved'
+    if any(getattr(intent, 'receipt_json', None) for intent in getattr(context, 'addon_intents', [])):
+        return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
     return ERASURE_READY, None
 
 
@@ -683,6 +718,17 @@ async def _complete_ready_financial_account_erasure(
         payment.description = 'account erased; financial evidence retained'
     for attempt in context.attempts:
         attempt.redirect_url = None
+    for attempt in getattr(context, 'addon_attempts', []):
+        attempt.payment_url = None
+    for intent in getattr(context, 'addon_intents', []):
+        intent.panel_uuid = None
+        intent.price_snapshot = {
+            key: value for key, value in (intent.price_snapshot or {}).items() if key != 'panel_uuid'
+        }
+        intent.fulfillment_state = 'needs_attention'
+        intent.fulfillment_error_code = 'account_erased'
+        intent.lease_token = None
+        intent.lease_expires_at = None
 
     # These records are operational/user-content data, not immutable money
     # evidence. Leaving them reachable through the retained user FK would

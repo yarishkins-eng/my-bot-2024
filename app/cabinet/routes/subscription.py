@@ -16,6 +16,7 @@ from ..schemas.subscription import SubscriptionStatusResponse
 from .subscription_modules import (
     autopay_router,
     daily_router,
+    device_addon_router,
     devices_router,
     purchase_router,
     renewal_router,
@@ -47,6 +48,7 @@ router.include_router(renewal_router)
 router.include_router(purchase_router)
 router.include_router(traffic_router)
 router.include_router(devices_router)
+router.include_router(device_addon_router)
 router.include_router(servers_router)
 router.include_router(autopay_router)
 router.include_router(daily_router)

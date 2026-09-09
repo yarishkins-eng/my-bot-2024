@@ -38,6 +38,8 @@ from app.database.models import (
     CheckoutPaymentAttempt,
     CloudPaymentsPayment,
     CryptoBotPayment,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
     DonutPayment,
     EtoplatezhiPayment,
     FreekassaPayment,
@@ -129,6 +131,10 @@ class UserService:
             )
         )
 
+        has_device_addon = bool(
+            await db.scalar(select(DeviceAddonIntent.id).where(DeviceAddonIntent.user_id == user_id).limit(1))
+        )
+
         legacy_models = (
             AppleTransaction,
             # An Apple account token can receive a delayed StoreKit event even
@@ -183,7 +189,12 @@ class UserService:
                     CheckoutPaymentAttempt,
                     CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id,
                 )
-                .where(PlategaPayment.user_id == user_id, CheckoutPaymentAttempt.id.is_(None))
+                .outerjoin(DeviceAddonTopupAttempt, DeviceAddonTopupAttempt.platega_payment_id == PlategaPayment.id)
+                .where(
+                    PlategaPayment.user_id == user_id,
+                    CheckoutPaymentAttempt.id.is_(None),
+                    DeviceAddonTopupAttempt.id.is_(None),
+                )
                 .limit(1)
             )
         )
@@ -193,12 +204,23 @@ class UserService:
         has_legacy_transaction = bool(
             await db.scalar(
                 select(Transaction.id)
-                .where(Transaction.user_id == user_id, Transaction.device_first_checkout_id.is_(None))
+                .where(
+                    Transaction.user_id == user_id,
+                    Transaction.device_first_checkout_id.is_(None),
+                    Transaction.id.not_in(
+                        select(DeviceAddonIntent.transaction_id).where(DeviceAddonIntent.transaction_id.is_not(None))
+                    ),
+                    Transaction.id.not_in(
+                        select(PlategaPayment.transaction_id)
+                        .join(DeviceAddonTopupAttempt, DeviceAddonTopupAttempt.platega_payment_id == PlategaPayment.id)
+                        .where(PlategaPayment.transaction_id.is_not(None))
+                    ),
+                )
                 .limit(1)
             )
         )
         has_legacy_history = has_legacy_provider or has_guest_purchase or has_legacy_platega or has_legacy_transaction
-        return has_device_first or has_legacy_history, has_legacy_history
+        return has_device_first or has_device_addon or has_legacy_history, has_legacy_history
 
     async def send_balance_change_notification(
         self, bot: Bot, user: User, amount_kopeks: int, reason: str | None = None
@@ -983,9 +1005,8 @@ class UserService:
             # callback which has already locked a provider payment.
             await db.execute(
                 select(PlategaPayment)
-                .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
-                .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-                .where(SubscriptionCheckout.user_id == user_id)
+                .where(PlategaPayment.user_id == user_id)
+                .order_by(PlategaPayment.id)
                 .with_for_update(of=PlategaPayment)
             )
             user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one_or_none()
@@ -2090,6 +2111,20 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
     if user.telegram_id is not None and SupportSettingsService.is_moderator(int(user.telegram_id)):
         return 'Этот человек — модератор поддержки. Обнулять его нельзя.'
 
+    # Even terminal provider invoices can be confirmed late. The reset must
+    # retain their immutable binding; v1 refuses instead of deleting evidence.
+    if await db.scalar(select(DeviceAddonTopupAttempt.id).where(DeviceAddonTopupAttempt.user_id == user.id).limit(1)):
+        return 'На аккаунте есть счёт докупки устройств. Сброс требует отдельной финансовой сверки; история платежа сохранена.'
+    if await db.scalar(
+        select(DeviceAddonIntent.id)
+        .where(
+            DeviceAddonIntent.user_id == user.id,
+            DeviceAddonIntent.purchase_state == 'purchased',
+        )
+        .limit(1)
+    ):
+        return 'На аккаунте есть выполненная докупка устройств. Перед сбросом нужна отдельная проверка её выдачи.'
+
     # Забор №3: деньги. Каждая проверка спрашивает своё.
     #
     # 🔴 Везде спрашивается СОСТОЯНИЕ строки, а не её наличие. Строка заявки на
@@ -2396,8 +2431,25 @@ async def _reset_test_account_unlocked(
         ),
         'checkout_ids': sorted(checkout_ids),
         'attempt_ids': sorted(attempt_ids),
+        'addon_intents': [
+            list(row)
+            for row in (
+                await db.execute(
+                    select(DeviceAddonIntent.id, DeviceAddonIntent.updated_at)
+                    .where(DeviceAddonIntent.user_id == user_id)
+                    .order_by(DeviceAddonIntent.id)
+                )
+            ).all()
+        ],
+        'addon_attempt_ids': list(
+            await db.scalars(
+                select(DeviceAddonTopupAttempt.id)
+                .where(DeviceAddonTopupAttempt.user_id == user_id)
+                .order_by(DeviceAddonTopupAttempt.id)
+            )
+        ),
     }
-    plan.preview_token = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
+    plan.preview_token = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, default=str).encode()).hexdigest()
     if not plan.allowed or not confirm:
         return plan
 

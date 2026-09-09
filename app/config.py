@@ -330,6 +330,12 @@ class Settings(BaseSettings):
     # handles only v2 rows, each protected by its own database lease.
     DEVICE_FIRST_RECOVERY_WORKER_INTERVAL_SECONDS: int = 10
 
+    # Stops only new device add-on intents, invoices and wallet debits.  Receipt
+    # reads, late-payment reconciliation and already-paid Panel fulfillment
+    # deliberately continue while it is off.
+    DEVICE_ADDON_PURCHASE_ENABLED: bool = True
+    DEVICE_ADDON_WORKER_INTERVAL_SECONDS: int = 10
+
     # ID тарифа для триала в режиме тарифов (0 = использовать стандартные настройки триала)
     # Если указан ID тарифа, параметры триала берутся из тарифа (traffic_limit_gb, device_limit, allowed_squads)
     # Длительность триала всё равно берётся из TRIAL_DURATION_DAYS
