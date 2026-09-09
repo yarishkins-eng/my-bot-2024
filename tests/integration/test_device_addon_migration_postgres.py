@@ -43,6 +43,7 @@ async def test_upgrade_guard_empty_downgrade_and_reupgrade():
             await connection.execute(text('DROP TABLE device_addon_topup_attempts'))
             await connection.execute(text('DROP TABLE device_addon_intents'))
             await connection.execute(text('ALTER TABLE users DROP COLUMN device_addon_generation'))
+            await connection.run_sync(run_migration, '0098_account_erasure_financial_tombstone', 'upgrade')
             await connection.run_sync(run_migration, '0105_test_account_reset_fence', 'install_guards')
             await connection.run_sync(run_migration, '0106_device_addon_intents', 'upgrade')
             names = await connection.run_sync(lambda conn: inspect(conn).get_table_names())
@@ -64,7 +65,20 @@ async def test_upgrade_guard_empty_downgrade_and_reupgrade():
                 )
             )
             assert guards == 2
+            await connection.execute(
+                User.__table__.insert().values(
+                    id=9000,
+                    telegram_id=7788800000,
+                    balance_kopeks=0,
+                    status='deleted',
+                    account_erasure_requested_at=text('now()'),
+                )
+            )
             await connection.run_sync(run_migration, '0106_device_addon_intents', 'downgrade')
+            # Downgrade must leave 0098 operational after dropping both addon
+            # tables. An ordinary late credit remains blocked by its trigger.
+            await connection.execute(text('UPDATE users SET balance_kopeks=777 WHERE id=9000'))
+            assert await connection.scalar(text('SELECT balance_kopeks FROM users WHERE id=9000')) == 0
             await connection.run_sync(run_migration, '0106_device_addon_intents', 'upgrade')
             await connection.execute(
                 User.__table__.insert().values(

@@ -14,6 +14,117 @@ branch_labels = None
 depends_on = None
 
 
+def _install_addon_referral_balance_fence() -> None:
+    """Extend 0098 with one evidence-backed deferred reward exception."""
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION account_erasure_fence_user_balance()
+        RETURNS trigger AS $$
+        DECLARE
+            addon_reward_claimed boolean := FALSE;
+        BEGIN
+            IF OLD.account_erasure_requested_at IS NOT NULL
+               AND NEW.balance_kopeks > OLD.balance_kopeks
+               AND OLD.account_erased_at IS NULL THEN
+                WITH eligible AS (
+                    SELECT addon.id
+                      FROM device_addon_topup_attempts addon
+                      JOIN transactions source
+                        ON source.id = addon.deposit_transaction_id
+                       AND source.user_id = addon.user_id
+                       AND source.type = 'deposit'
+                       AND source.is_completed IS TRUE
+                      JOIN platega_payments payment
+                        ON payment.id = addon.platega_payment_id
+                       AND payment.is_paid IS TRUE
+                       AND payment.transaction_id = source.id
+                      JOIN transactions reward
+                        ON reward.device_first_ledger_key = (
+                            'deposit-side-effect:' || addon.deposit_transaction_id::text ||
+                            ':' || 'referred-first-bonus'
+                        )
+                     WHERE addon.user_id = OLD.id
+                       AND addon.status = 'paid'
+                       AND addon.referral_status = 'pending'
+                       AND addon.deposit_transaction_id IS NOT NULL
+                       AND addon.credited_amount_kopeks = addon.requested_amount_kopeks
+                       AND reward.user_id = OLD.id
+                       AND reward.type = 'referral_reward'
+                       AND reward.is_completed IS TRUE
+                       AND reward.amount_kopeks = NEW.balance_kopeks - OLD.balance_kopeks
+                     ORDER BY addon.id
+                     FOR UPDATE OF addon
+                     LIMIT 1
+                ), claimed AS (
+                    UPDATE device_addon_topup_attempts addon
+                       SET referral_status = 'processing',
+                           updated_at = NOW()
+                      FROM eligible
+                     WHERE addon.id = eligible.id
+                       AND addon.referral_status = 'pending'
+                    RETURNING addon.id
+                )
+                SELECT EXISTS (SELECT 1 FROM claimed) INTO addon_reward_claimed;
+            END IF;
+            IF OLD.account_erasure_requested_at IS NOT NULL
+               AND NEW.balance_kopeks IS DISTINCT FROM OLD.balance_kopeks
+               AND NOT (
+                   current_setting('app.account_erasure_resolution', true) = 'on'
+                   AND NEW.balance_kopeks = 0
+                   AND NEW.balance_kopeks < OLD.balance_kopeks
+               )
+               AND NOT addon_reward_claimed THEN
+                NEW.balance_kopeks := OLD.balance_kopeks;
+                UPDATE account_erasure_requests
+                   SET last_late_payment_blocked_at = NOW(),
+                       updated_at = NOW(),
+                       state = CASE WHEN state = 'completed' THEN state ELSE 'awaiting_manual_resolution' END,
+                       resolution_code = CASE WHEN state = 'completed' THEN resolution_code ELSE 'late_legacy_payment_callback' END,
+                       financial_resolution_at = CASE WHEN state = 'completed' THEN financial_resolution_at ELSE NULL END,
+                       financial_resolved_by_user_id = CASE WHEN state = 'completed' THEN financial_resolved_by_user_id ELSE NULL END,
+                       financial_resolution_code = CASE WHEN state = 'completed' THEN financial_resolution_code ELSE NULL END,
+                       financial_resolution_note = CASE WHEN state = 'completed' THEN financial_resolution_note ELSE NULL END
+                 WHERE user_id = OLD.id;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+
+
+def _restore_0098_balance_fence() -> None:
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION account_erasure_fence_user_balance()
+        RETURNS trigger AS $$
+        BEGIN
+            IF OLD.account_erasure_requested_at IS NOT NULL
+               AND NEW.balance_kopeks IS DISTINCT FROM OLD.balance_kopeks
+               AND NOT (
+                   current_setting('app.account_erasure_resolution', true) = 'on'
+                   AND NEW.balance_kopeks = 0
+                   AND NEW.balance_kopeks < OLD.balance_kopeks
+               ) THEN
+                NEW.balance_kopeks := OLD.balance_kopeks;
+                UPDATE account_erasure_requests
+                   SET last_late_payment_blocked_at = NOW(),
+                       updated_at = NOW(),
+                       state = CASE WHEN state = 'completed' THEN state ELSE 'awaiting_manual_resolution' END,
+                       resolution_code = CASE WHEN state = 'completed' THEN resolution_code ELSE 'late_legacy_payment_callback' END,
+                       financial_resolution_at = CASE WHEN state = 'completed' THEN financial_resolution_at ELSE NULL END,
+                       financial_resolved_by_user_id = CASE WHEN state = 'completed' THEN financial_resolved_by_user_id ELSE NULL END,
+                       financial_resolution_code = CASE WHEN state = 'completed' THEN financial_resolution_code ELSE NULL END,
+                       financial_resolution_note = CASE WHEN state = 'completed' THEN financial_resolution_note ELSE NULL END
+                 WHERE user_id = OLD.id;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+
+
 def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '2s'")
     op.execute("SET LOCAL statement_timeout = '20s'")
@@ -165,6 +276,7 @@ def upgrade() -> None:
         unique=True,
         postgresql_where=sa.text('holds_invoice_slot'),
     )
+    _install_addon_referral_balance_fence()
 
     # 0105 dynamically guarded the then-existing financial relations.  These
     # tables arrive later, so attach the same fail-closed reset guard explicitly.
@@ -187,6 +299,7 @@ def downgrade() -> None:
     ).scalar()
     if has_rows:
         raise RuntimeError('Unsafe 0106 downgrade refused: device add-on financial history exists.')
+    _restore_0098_balance_fence()
     op.drop_index('uq_device_addon_attempt_one_active', table_name='device_addon_topup_attempts')
     op.drop_index('ix_device_addon_attempt_recovery', table_name='device_addon_topup_attempts')
     op.drop_index('ix_device_addon_attempt_intent_created', table_name='device_addon_topup_attempts')

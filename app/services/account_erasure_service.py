@@ -269,6 +269,8 @@ def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
         return ERASURE_AWAITING_MANUAL, 'active_subscription'
     if int(context.user.balance_kopeks or 0) > 0:
         return ERASURE_AWAITING_MANUAL, 'positive_balance'
+    if any(attempt.referral_status == 'operator_review' for attempt in getattr(context, 'addon_attempts', [])):
+        return ERASURE_AWAITING_MANUAL, 'device_addon_referral_review'
 
     payments_by_id = {payment.id: payment for payment in context.payments}
     for attempt in context.attempts:
@@ -310,6 +312,10 @@ def _message_for_state(state: str, resolution_code: str | None) -> str:
         return 'Аккаунт закрыт для входа; платёж ожидает ручной финансовой сверки.'
     if resolution_code == 'legacy_financial_history':
         return 'Аккаунт закрыт для входа; архивные платёжные записи требуют ручной финансовой сверки.'
+    if resolution_code == 'device_addon_referral_pending':
+        return 'Аккаунт закрыт для входа. Завершаем начисления по оплаченному счёту перед удалением данных.'
+    if resolution_code == 'device_addon_referral_review':
+        return 'Аккаунт закрыт для входа. Невыполненная реферальная выплата требует отдельного финансового решения.'
     return 'Аккаунт закрыт для входа. Проверяем ранее созданный счёт; новые платежи и новые заказы недоступны.'
 
 
@@ -321,6 +327,13 @@ def _legacy_requires_manual_resolution(request: AccountErasureRequest | None) ->
     )
 
 
+def _pending_device_addon_referrals(context: _ErasureContext) -> bool:
+    return any(
+        attempt.deposit_transaction_id is not None and attempt.referral_status in {'pending', 'processing'}
+        for attempt in getattr(context, 'addon_attempts', [])
+    )
+
+
 def _target_state_after_financial_resolution(
     context: _ErasureContext, request: AccountErasureRequest | None
 ) -> tuple[str, str | None]:
@@ -329,6 +342,15 @@ def _target_state_after_financial_resolution(
     A late Device-First or legacy callback clears ``financial_resolution_at``
     before this function can run, so the ordinary strict classifier resumes.
     """
+    # Manual approval cannot erase the referrer relationship before the
+    # committed deposit's monetary effects finish. The worker owns that
+    # durable step and continues draining even after the account is closed.
+    if _pending_device_addon_referrals(context):
+        return ERASURE_AWAITING_RECONCILIATION, 'device_addon_referral_pending'
+    if any(attempt.referral_status == 'operator_review' for attempt in getattr(context, 'addon_attempts', [])):
+        return ERASURE_AWAITING_MANUAL, 'device_addon_referral_review'
+    if int(context.user.balance_kopeks or 0) > 0:
+        return ERASURE_AWAITING_MANUAL, 'positive_balance'
     if request is not None and getattr(request, 'financial_resolution_at', None) is not None:
         return ERASURE_READY, None
     return _target_state(context)
@@ -852,6 +874,14 @@ async def resolve_financial_account_erasure(
         return AccountErasureResult(
             state=ERASURE_COMPLETED, message=_message_for_state(ERASURE_COMPLETED, None), completed=True
         )
+    if _pending_device_addon_referrals(context):
+        request.state = ERASURE_AWAITING_RECONCILIATION
+        request.resolution_code = 'device_addon_referral_pending'
+        await db.commit()
+        return AccountErasureResult(
+            state=ERASURE_AWAITING_RECONCILIATION,
+            message=_message_for_state(ERASURE_AWAITING_RECONCILIATION, 'device_addon_referral_pending'),
+        )
     current_state, current_reason = _target_state(context)
     requires_settlement = current_state == ERASURE_AWAITING_MANUAL or _legacy_requires_manual_resolution(request)
     if not requires_settlement:
@@ -869,7 +899,9 @@ async def resolve_financial_account_erasure(
     # ``provider_terminal_verified`` is proof of a negative provider outcome,
     # not settlement for a payment already observed as paid/reviewable.
     if (
-        current_reason == 'paid_or_review_payment' or has_balance or has_active_subscription
+        current_reason in {'paid_or_review_payment', 'device_addon_referral_review'}
+        or has_balance
+        or has_active_subscription
     ) and resolution_code not in settlement_resolution_codes:
         return AccountErasureResult(
             state='settlement_required',
@@ -901,6 +933,11 @@ async def resolve_financial_account_erasure(
     request.financial_resolved_by_user_id = resolved_by_user_id
     request.financial_resolution_code = resolution_code
     request.financial_resolution_note = resolution_note.strip()
+    for attempt in getattr(context, 'addon_attempts', []):
+        if attempt.referral_status == 'operator_review':
+            # The operator resolved the held liability through the audited
+            # closure action. This is not a claim that a reward hit a wallet.
+            attempt.referral_status = 'resolved_manually'
     request.state = ERASURE_READY
     request.resolution_code = None
     await db.commit()

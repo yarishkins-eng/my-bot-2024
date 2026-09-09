@@ -37,7 +37,10 @@ from app.services.device_addon_service import (
     calculate_device_addon,
     quote_for_calculation,
 )
-from app.services.device_first_deposit_outbox_service import apply_deposit_referral_money
+from app.services.device_first_deposit_outbox_service import (
+    ReferralRewardBalanceFencedError,
+    apply_deposit_referral_money,
+)
 from app.services.device_first_payment_service import (
     PLATEGA_METHODS,
     _provider_method_code,
@@ -871,8 +874,36 @@ async def _run_paid_effects(
     attempt = await db.get(DeviceAddonTopupAttempt, attempt_id, populate_existing=True)
     if attempt.status != 'paid' or not attempt.deposit_transaction_id:
         return
-    if attempt.referral_status != 'done':
-        await apply_deposit_referral_money(db, source_transaction_id=attempt.deposit_transaction_id)
+    if attempt.referral_status in {'pending', 'processing'}:
+        try:
+            await apply_deposit_referral_money(db, source_transaction_id=attempt.deposit_transaction_id)
+        except ReferralRewardBalanceFencedError:
+            await db.rollback()
+            attempt = (
+                await db.execute(
+                    select(DeviceAddonTopupAttempt)
+                    .where(
+                        DeviceAddonTopupAttempt.id == attempt_id,
+                        DeviceAddonTopupAttempt.lease_token == lease_token,
+                        DeviceAddonTopupAttempt.lease_epoch == lease_epoch,
+                        DeviceAddonTopupAttempt.lease_expires_at >= datetime.now(UTC),
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if attempt is None:
+                raise DeviceAddonError('recovery_lease_lost', 'Платёж уже проверяется.')
+            attempt.referral_status = 'operator_review'
+            attempt.reconciliation_reason = 'referral_reward_recipient_account_closed'
+            attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=365)
+            attempt.lease_token = None
+            attempt.lease_expires_at = None
+            from app.services.account_erasure_service import invalidate_financial_resolution_for_late_payment
+
+            await invalidate_financial_resolution_for_late_payment(db, attempt.user_id)
+            await db.commit()
+            return
         attempt = (
             await db.execute(
                 select(DeviceAddonTopupAttempt)
@@ -892,6 +923,31 @@ async def _run_paid_effects(
         attempt.referral_status = 'done'
         attempt.effects_attempts = int(attempt.effects_attempts or 0) + 1
         await db.commit()
+    user = await db.get(User, attempt.user_id, populate_existing=True)
+    if user is not None and getattr(user, 'account_erasure_requested_at', None) is not None:
+        # The immutable deposit/referral ledgers are sufficient evidence for a
+        # closing account. Deferred emission also runs promo-group assignment,
+        # which must not recreate operational state after erasure begins.
+        attempt = (
+            await db.execute(
+                select(DeviceAddonTopupAttempt)
+                .where(
+                    DeviceAddonTopupAttempt.id == attempt_id,
+                    DeviceAddonTopupAttempt.lease_token == lease_token,
+                    DeviceAddonTopupAttempt.lease_epoch == lease_epoch,
+                    DeviceAddonTopupAttempt.lease_expires_at >= datetime.now(UTC),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if attempt is None:
+            raise DeviceAddonError('recovery_lease_lost', 'Платёж уже проверяется.')
+        attempt.event_status = 'done'
+        attempt.lease_token = None
+        attempt.lease_expires_at = None
+        await db.commit()
+        return
     if attempt.event_status == 'done':
         attempt.lease_token = None
         attempt.lease_expires_at = None
@@ -982,9 +1038,10 @@ async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bo
                         ),
                         and_(
                             DeviceAddonTopupAttempt.status == 'paid',
+                            DeviceAddonTopupAttempt.referral_status.in_(['pending', 'processing', 'done']),
                             DeviceAddonTopupAttempt.next_reconcile_at <= now,
                             or_(
-                                DeviceAddonTopupAttempt.referral_status != 'done',
+                                DeviceAddonTopupAttempt.referral_status.in_(['pending', 'processing']),
                                 DeviceAddonTopupAttempt.event_status != 'done',
                             ),
                         ),

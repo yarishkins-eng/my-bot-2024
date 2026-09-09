@@ -4,6 +4,7 @@ import asyncio
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -13,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database.models import (
+    AccountErasureRequest,
     Base,
     DeviceAddonIntent,
     DeviceAddonTopupAttempt,
@@ -21,7 +23,15 @@ from app.database.models import (
     Transaction,
     User,
 )
-from app.services.account_erasure_service import ERASURE_AWAITING_MANUAL, ERASURE_READY, _lock_context, _target_state
+from app.services.account_erasure_service import (
+    ERASURE_AWAITING_MANUAL,
+    ERASURE_AWAITING_RECONCILIATION,
+    ERASURE_READY,
+    _lock_context,
+    _target_state,
+    _target_state_after_financial_resolution,
+    resolve_financial_account_erasure,
+)
 from app.services.account_merge_service import _guard_device_addon_merge
 from app.services.device_addon_service import (
     DeviceAddonError,
@@ -31,6 +41,7 @@ from app.services.device_addon_service import (
     quote_for_calculation,
 )
 from app.services.user_service import UserService, _test_reset_blocked_reason, _test_reset_delete_plan
+from tests.integration.test_device_addon_migration_postgres import run_migration
 
 
 DATABASE_URL = os.getenv('DEVICE_ADDON_TEST_DATABASE_URL')
@@ -52,6 +63,14 @@ async def sessions():
     try:
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            # Install actual production safety fences, then execute the new
+            # migration. Base.metadata alone cannot prove trigger behavior.
+            await connection.execute(text('DROP TABLE device_addon_topup_attempts'))
+            await connection.execute(text('DROP TABLE device_addon_intents'))
+            await connection.execute(text('ALTER TABLE users DROP COLUMN device_addon_generation'))
+            await connection.run_sync(run_migration, '0098_account_erasure_financial_tombstone', 'upgrade')
+            await connection.run_sync(run_migration, '0105_test_account_reset_fence', 'install_guards')
+            await connection.run_sync(run_migration, '0106_device_addon_intents', 'upgrade')
         yield async_sessionmaker(engine, expire_on_commit=False)
     finally:
         await engine.dispose()
@@ -240,6 +259,94 @@ async def test_erasure_locks_and_classifies_addon_graph(sessions, status, expect
         assert [row.id for row in context.addon_intents] == [intent.id]
         assert [row.id for row in context.addon_attempts] == [attempt.id]
         assert _target_state(context)[0] == expected
+
+
+async def test_manual_erasure_approval_cannot_discard_pending_referral_money(sessions):
+    async with sessions() as db:
+        user, _, _, payment, attempt = await seed(db, status='paid')
+        deposit = Transaction(user_id=user.id, type='deposit', amount_kopeks=166, is_completed=True)
+        db.add(deposit)
+        await db.flush()
+        attempt.deposit_transaction_id = deposit.id
+        attempt.referral_status = 'pending'
+        payment.transaction_id = deposit.id
+        request = AccountErasureRequest(
+            user_id=user.id,
+            state='awaiting_manual_resolution',
+            financial_resolution_at=datetime.now(UTC),
+            financial_resolution_code='owner_approved',
+        )
+        db.add(request)
+        await db.commit()
+        context = await _lock_context(db, user_id=user.id)
+        assert _target_state_after_financial_resolution(context, context.request) == (
+            ERASURE_AWAITING_RECONCILIATION,
+            'device_addon_referral_pending',
+        )
+        # The outbox's single money transaction marks this only after all
+        # rewards are durable. Existing approval may then finish redaction.
+        context.addon_attempts[0].referral_status = 'done'
+        await db.commit()
+        context = await _lock_context(db, user_id=user.id)
+        assert _target_state_after_financial_resolution(context, context.request) == (ERASURE_READY, None)
+
+
+@pytest.mark.parametrize('referral_status', ['pending', 'processing', 'operator_review'])
+async def test_held_referral_requires_explicit_settlement_before_erasure(sessions, monkeypatch, referral_status):
+    panel = AsyncMock(return_value=True)
+    monkeypatch.setattr('app.services.account_erasure_service._remove_panel_identity', panel)
+    async with sessions() as db:
+        user, _, _, payment, attempt = await seed(db, status='paid')
+        operator = User(telegram_id=7788800333)
+        deposit = Transaction(user_id=user.id, type='deposit', amount_kopeks=166, is_completed=True)
+        db.add_all([operator, deposit])
+        await db.flush()
+        attempt.deposit_transaction_id = deposit.id
+        attempt.referral_status = referral_status
+        payment.transaction_id = deposit.id
+        user.account_erasure_requested_at = datetime.now(UTC)
+        request = AccountErasureRequest(
+            user_id=user.id,
+            state=ERASURE_AWAITING_MANUAL,
+            financial_resolution_at=datetime.now(UTC),
+            financial_resolution_code='balance_writeoff_approved',
+        )
+        db.add(request)
+        await db.commit()
+        user_id, operator_id, attempt_id = user.id, operator.id, attempt.id
+        result = await resolve_financial_account_erasure(
+            db,
+            user_id=user_id,
+            resolved_by_user_id=operator_id,
+            resolution_code='provider_terminal_verified',
+            resolution_note='Provider status verified during reconciliation.',
+        )
+        assert result.state == (
+            ERASURE_AWAITING_RECONCILIATION if referral_status != 'operator_review' else 'settlement_required'
+        )
+        panel.assert_not_awaited()
+        await db.refresh(user)
+        assert user.account_erased_at is None
+        if referral_status == 'operator_review':
+            context = await _lock_context(db, user_id=user_id)
+            assert _target_state_after_financial_resolution(context, context.request) == (
+                ERASURE_AWAITING_MANUAL,
+                'device_addon_referral_review',
+            )
+            result = await resolve_financial_account_erasure(
+                db,
+                user_id=user_id,
+                resolved_by_user_id=operator_id,
+                resolution_code='balance_writeoff_approved',
+                resolution_note='Held referral liability settled with the owner.',
+            )
+            assert result.completed
+            panel.assert_awaited_once()
+            await db.refresh(user)
+            stored_attempt = await db.get(DeviceAddonTopupAttempt, attempt_id, populate_existing=True)
+            assert user.account_erased_at is not None
+            assert stored_attempt.referral_status == 'resolved_manually'
+            assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.type == 'referral_reward')) == 0
 
 
 async def test_expired_subscription_cannot_be_quoted(sessions):

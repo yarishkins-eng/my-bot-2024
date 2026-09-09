@@ -39,6 +39,10 @@ from app.services.referral_service import (
 logger = structlog.get_logger(__name__)
 
 
+class ReferralRewardBalanceFencedError(RuntimeError):
+    """A reward ledger could not produce its exact wallet balance delta."""
+
+
 async def ensure_deposit_outbox(
     db: AsyncSession,
     *,
@@ -106,8 +110,8 @@ async def _add_reward(
     ).scalar_one_or_none()
     if existing is not None:
         return existing
-    recipient.balance_kopeks += amount_kopeks
-    recipient.updated_at = datetime.now(UTC)
+    previous_balance = int(recipient.balance_kopeks or 0)
+    expected_balance = previous_balance + amount_kopeks
     reward = Transaction(
         user_id=recipient.id,
         type=TransactionType.REFERRAL_REWARD.value,
@@ -119,7 +123,20 @@ async def _add_reward(
         completed_at=datetime.now(UTC),
     )
     db.add(reward)
+    # Insert the immutable reward evidence first.  The account-erasure balance
+    # trigger can then verify an add-on owner's exact source, recipient and
+    # delta inside this same transaction before allowing the wallet update.
     await db.flush()
+    recipient.balance_kopeks = expected_balance
+    recipient.updated_at = datetime.now(UTC)
+    await db.flush()
+    await db.refresh(recipient, attribute_names=['balance_kopeks'])
+    if int(recipient.balance_kopeks or 0) != expected_balance:
+        # The 0098 fence deliberately suppresses unauthorized closing-account
+        # credits instead of raising.  Never leave a reward ledger that falsely
+        # claims money reached the wallet: the caller rolls this transaction
+        # back and keeps its durable referral step unresolved.
+        raise ReferralRewardBalanceFencedError('referral reward balance credit was fenced')
     return reward
 
 

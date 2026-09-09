@@ -36,6 +36,7 @@ async def test_reward_ledger_key_prevents_duplicate_balance_credit():
         execute=AsyncMock(return_value=Result(None)),
         add=MagicMock(),
         flush=AsyncMock(),
+        refresh=AsyncMock(),
     )
 
     created = await service._add_reward(
