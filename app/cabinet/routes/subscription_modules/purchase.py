@@ -669,6 +669,12 @@ async def get_purchase_options(
             tariff_responses = []
             for tariff in tariffs:
                 tariff_data = await _build_tariff_response(db, tariff, current_tariff_id, language, user, subscription)
+                # The legacy endpoint independently refuses AP-managed tariffs,
+                # including when the public Device-First rollout is disabled.
+                tariff_data['legacy_purchase_allowed'] = (
+                    not settings.DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED
+                    and getattr(tariff, 'entitlement_mode', None) != 'access_point_managed'
+                )
                 # In multi-tariff mode: mark purchased tariffs so frontend can filter them
                 if settings.is_multi_tariff_enabled() and tariff.id in purchased_tariff_ids:
                     tariff_data['is_purchased'] = True
