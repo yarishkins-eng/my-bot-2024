@@ -2,7 +2,7 @@
 delivered" bug.
 
 The cabinet balance-pay endpoints (traffic top-up, renewal, subscription/tariff
-purchase, devices) commit the product and THEN sync RemnaWave inline. A slow or
+purchase) commit the product and THEN sync RemnaWave inline. A slow or
 unavailable panel used to hold the HTTP response open, so the cabinet pay button
 (bound to the in-flight request) spun far past delivery and, on the 30s axios
 timeout, errored instead of showing the delivered product.
@@ -20,11 +20,13 @@ import time
 
 import pytest
 
-from app.cabinet.routes.subscription_modules import devices, purchase, traffic
+from app.cabinet.routes.subscription_modules import purchase, traffic
 from app.services import subscription_renewal_service
 
 
-MODULES = [traffic, devices, purchase, subscription_renewal_service]
+# Device add-ons now commit a durable intent and return before any Panel IO.
+# Their recovery contract is exercised against PostgreSQL in the addon tests.
+MODULES = [traffic, purchase, subscription_renewal_service]
 
 # The cabinet axios client aborts at 30s (TIMEOUT_MS); the inline sync budget must
 # stay safely under that so the response (and the spinner) resolves first.

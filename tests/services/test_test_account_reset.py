@@ -105,6 +105,10 @@ _PINNED_WIPED_TABLES = frozenset(
         'checkout_payment_attempts',
         'cloudpayments_payments',
         'cryptobot_payments',
+        # Only clean draft intents are removable. The runtime preflight
+        # refuses any attempt (including terminal) or purchased receipt.
+        'device_addon_intents',
+        'device_addon_topup_attempts',
         'device_first_deposit_outbox',
         'device_first_mutations',
         'device_first_notification_outbox',
@@ -205,6 +209,9 @@ def test_plan_ignores_columns_that_only_point_at_a_person() -> None:
         ('subscription_entitlement_term_projection_outbox', 'subscription_entitlement_terms'),
         ('device_first_provider_events', 'checkout_payment_attempts'),
         ('checkout_payment_attempts', 'subscription_checkouts'),
+        ('device_addon_topup_attempts', 'device_addon_intents'),
+        ('device_addon_topup_attempts', 'platega_payments'),
+        ('device_addon_intents', 'subscriptions'),
         ('subscription_servers', 'subscriptions'),
         ('platega_payments', 'transactions'),
         ('referral_earnings', 'transactions'),

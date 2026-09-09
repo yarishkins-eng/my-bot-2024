@@ -139,6 +139,7 @@ async def run_reset(db, user, admin_id, *, confirm: bool, preview_token: str | N
             if value
         )
         current.test_reset_panel_uuids = sorted(panel_ids)
+        current.device_addon_generation = int(current.device_addon_generation or 0) + 1
         current.test_reset_state = 'resetting'
         current.test_reset_started_at = datetime.now(UTC)
         await db.commit()

@@ -14,7 +14,7 @@ attempt -> checkout.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import structlog
@@ -25,6 +25,8 @@ from app.database.models import (
     AccountErasureRequest,
     CabinetRefreshToken,
     CheckoutPaymentAttempt,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
     DeviceFirstDepositOutbox,
     DeviceFirstMutation,
     DeviceFirstNotificationOutbox,
@@ -75,6 +77,8 @@ class _ErasureContext:
     checkouts: list[SubscriptionCheckout]
     payments: list[PlategaPayment]
     subscriptions: list[Subscription]
+    addon_attempts: list[DeviceAddonTopupAttempt] = field(default_factory=list)
+    addon_intents: list[DeviceAddonIntent] = field(default_factory=list)
 
 
 def _queued_panel_cleanup_uuids(request: AccountErasureRequest | None) -> set[str]:
@@ -124,9 +128,8 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
         (
             await db.execute(
                 select(PlategaPayment)
-                .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
-                .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-                .where(SubscriptionCheckout.user_id == user_id)
+                .where(PlategaPayment.user_id == user_id)
+                .order_by(PlategaPayment.id)
                 .with_for_update(of=PlategaPayment)
                 .execution_options(populate_existing=True)
             )
@@ -168,6 +171,24 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
         .scalars()
         .all()
     )
+    addon_attempts = list(
+        await db.scalars(
+            select(DeviceAddonTopupAttempt)
+            .where(DeviceAddonTopupAttempt.user_id == user_id)
+            .order_by(DeviceAddonTopupAttempt.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    addon_intents = list(
+        await db.scalars(
+            select(DeviceAddonIntent)
+            .where(DeviceAddonIntent.user_id == user_id)
+            .order_by(DeviceAddonIntent.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
     request = (
         await db.execute(
             select(AccountErasureRequest)
@@ -195,6 +216,8 @@ async def _lock_context(db: AsyncSession, *, user_id: int) -> _ErasureContext | 
         checkouts=checkouts,
         payments=payments,
         subscriptions=subscriptions,
+        addon_attempts=addon_attempts,
+        addon_intents=addon_intents,
     )
 
 
@@ -246,6 +269,8 @@ def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
         return ERASURE_AWAITING_MANUAL, 'active_subscription'
     if int(context.user.balance_kopeks or 0) > 0:
         return ERASURE_AWAITING_MANUAL, 'positive_balance'
+    if any(attempt.referral_status == 'operator_review' for attempt in getattr(context, 'addon_attempts', [])):
+        return ERASURE_AWAITING_MANUAL, 'device_addon_referral_review'
 
     payments_by_id = {payment.id: payment for payment in context.payments}
     for attempt in context.attempts:
@@ -259,6 +284,18 @@ def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
             return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
         if not _safe_terminal_attempt(attempt, payment):
             return ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved'
+    for attempt in getattr(context, 'addon_attempts', []):
+        payment = payments_by_id.get(attempt.platega_payment_id)
+        if attempt.status in {'paid', 'operator_review'} or (payment is not None and payment.is_paid):
+            return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
+        if not (
+            attempt.status == 'terminal'
+            and payment is not None
+            and str(payment.status).upper() in _PROVIDER_TERMINAL_PAYMENT_STATUSES
+        ):
+            return ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved'
+    if any(getattr(intent, 'receipt_json', None) for intent in getattr(context, 'addon_intents', [])):
+        return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
     return ERASURE_READY, None
 
 
@@ -275,6 +312,10 @@ def _message_for_state(state: str, resolution_code: str | None) -> str:
         return 'Аккаунт закрыт для входа; платёж ожидает ручной финансовой сверки.'
     if resolution_code == 'legacy_financial_history':
         return 'Аккаунт закрыт для входа; архивные платёжные записи требуют ручной финансовой сверки.'
+    if resolution_code == 'device_addon_referral_pending':
+        return 'Аккаунт закрыт для входа. Завершаем начисления по оплаченному счёту перед удалением данных.'
+    if resolution_code == 'device_addon_referral_review':
+        return 'Аккаунт закрыт для входа. Невыполненная реферальная выплата требует отдельного финансового решения.'
     return 'Аккаунт закрыт для входа. Проверяем ранее созданный счёт; новые платежи и новые заказы недоступны.'
 
 
@@ -286,6 +327,13 @@ def _legacy_requires_manual_resolution(request: AccountErasureRequest | None) ->
     )
 
 
+def _pending_device_addon_referrals(context: _ErasureContext) -> bool:
+    return any(
+        attempt.deposit_transaction_id is not None and attempt.referral_status in {'pending', 'processing'}
+        for attempt in getattr(context, 'addon_attempts', [])
+    )
+
+
 def _target_state_after_financial_resolution(
     context: _ErasureContext, request: AccountErasureRequest | None
 ) -> tuple[str, str | None]:
@@ -294,6 +342,15 @@ def _target_state_after_financial_resolution(
     A late Device-First or legacy callback clears ``financial_resolution_at``
     before this function can run, so the ordinary strict classifier resumes.
     """
+    # Manual approval cannot erase the referrer relationship before the
+    # committed deposit's monetary effects finish. The worker owns that
+    # durable step and continues draining even after the account is closed.
+    if _pending_device_addon_referrals(context):
+        return ERASURE_AWAITING_RECONCILIATION, 'device_addon_referral_pending'
+    if any(attempt.referral_status == 'operator_review' for attempt in getattr(context, 'addon_attempts', [])):
+        return ERASURE_AWAITING_MANUAL, 'device_addon_referral_review'
+    if int(context.user.balance_kopeks or 0) > 0:
+        return ERASURE_AWAITING_MANUAL, 'positive_balance'
     if request is not None and getattr(request, 'financial_resolution_at', None) is not None:
         return ERASURE_READY, None
     return _target_state(context)
@@ -683,6 +740,17 @@ async def _complete_ready_financial_account_erasure(
         payment.description = 'account erased; financial evidence retained'
     for attempt in context.attempts:
         attempt.redirect_url = None
+    for attempt in getattr(context, 'addon_attempts', []):
+        attempt.payment_url = None
+    for intent in getattr(context, 'addon_intents', []):
+        intent.panel_uuid = None
+        intent.price_snapshot = {
+            key: value for key, value in (intent.price_snapshot or {}).items() if key != 'panel_uuid'
+        }
+        intent.fulfillment_state = 'needs_attention'
+        intent.fulfillment_error_code = 'account_erased'
+        intent.lease_token = None
+        intent.lease_expires_at = None
 
     # These records are operational/user-content data, not immutable money
     # evidence. Leaving them reachable through the retained user FK would
@@ -806,6 +874,14 @@ async def resolve_financial_account_erasure(
         return AccountErasureResult(
             state=ERASURE_COMPLETED, message=_message_for_state(ERASURE_COMPLETED, None), completed=True
         )
+    if _pending_device_addon_referrals(context):
+        request.state = ERASURE_AWAITING_RECONCILIATION
+        request.resolution_code = 'device_addon_referral_pending'
+        await db.commit()
+        return AccountErasureResult(
+            state=ERASURE_AWAITING_RECONCILIATION,
+            message=_message_for_state(ERASURE_AWAITING_RECONCILIATION, 'device_addon_referral_pending'),
+        )
     current_state, current_reason = _target_state(context)
     requires_settlement = current_state == ERASURE_AWAITING_MANUAL or _legacy_requires_manual_resolution(request)
     if not requires_settlement:
@@ -823,7 +899,9 @@ async def resolve_financial_account_erasure(
     # ``provider_terminal_verified`` is proof of a negative provider outcome,
     # not settlement for a payment already observed as paid/reviewable.
     if (
-        current_reason == 'paid_or_review_payment' or has_balance or has_active_subscription
+        current_reason in {'paid_or_review_payment', 'device_addon_referral_review'}
+        or has_balance
+        or has_active_subscription
     ) and resolution_code not in settlement_resolution_codes:
         return AccountErasureResult(
             state='settlement_required',
@@ -855,6 +933,11 @@ async def resolve_financial_account_erasure(
     request.financial_resolved_by_user_id = resolved_by_user_id
     request.financial_resolution_code = resolution_code
     request.financial_resolution_note = resolution_note.strip()
+    for attempt in getattr(context, 'addon_attempts', []):
+        if attempt.referral_status == 'operator_review':
+            # The operator resolved the held liability through the audited
+            # closure action. This is not a claim that a reward hit a wallet.
+            attempt.referral_status = 'resolved_manually'
     request.state = ERASURE_READY
     request.resolution_code = None
     await db.commit()

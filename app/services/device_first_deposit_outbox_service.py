@@ -39,6 +39,10 @@ from app.services.referral_service import (
 logger = structlog.get_logger(__name__)
 
 
+class ReferralRewardBalanceFencedError(RuntimeError):
+    """A reward ledger could not produce its exact wallet balance delta."""
+
+
 async def ensure_deposit_outbox(
     db: AsyncSession,
     *,
@@ -106,8 +110,8 @@ async def _add_reward(
     ).scalar_one_or_none()
     if existing is not None:
         return existing
-    recipient.balance_kopeks += amount_kopeks
-    recipient.updated_at = datetime.now(UTC)
+    previous_balance = int(recipient.balance_kopeks or 0)
+    expected_balance = previous_balance + amount_kopeks
     reward = Transaction(
         user_id=recipient.id,
         type=TransactionType.REFERRAL_REWARD.value,
@@ -119,7 +123,20 @@ async def _add_reward(
         completed_at=datetime.now(UTC),
     )
     db.add(reward)
+    # Insert the immutable reward evidence first.  The account-erasure balance
+    # trigger can then verify an add-on owner's exact source, recipient and
+    # delta inside this same transaction before allowing the wallet update.
     await db.flush()
+    recipient.balance_kopeks = expected_balance
+    recipient.updated_at = datetime.now(UTC)
+    await db.flush()
+    await db.refresh(recipient, attribute_names=['balance_kopeks'])
+    if int(recipient.balance_kopeks or 0) != expected_balance:
+        # The 0098 fence deliberately suppresses unauthorized closing-account
+        # credits instead of raising.  Never leave a reward ledger that falsely
+        # claims money reached the wallet: the caller rolls this transaction
+        # back and keeps its durable referral step unresolved.
+        raise ReferralRewardBalanceFencedError('referral reward balance credit was fenced')
     return reward
 
 
@@ -155,24 +172,25 @@ async def _add_referral_earning(
     )
 
 
-async def _apply_referral_step(
+async def apply_deposit_referral_money(
     db: AsyncSession,
     *,
-    job_id: int,
-) -> None:
-    """Apply every monetary referral effect and complete the step atomically."""
-    job = (
-        await db.execute(
-            select(DeviceFirstDepositOutbox).where(DeviceFirstDepositOutbox.id == job_id).with_for_update()
-        )
-    ).scalar_one()
-    if job.referral_status == 'done':
-        return
+    source_transaction_id: int,
+) -> list[int]:
+    """Apply referral money for one completed provider deposit exactly once.
+
+    The caller owns the surrounding transaction and its durable job status.  A
+    reward is keyed by the immutable source transaction, so repeating this
+    helper after a crash returns the same result without crediting a wallet a
+    second time.  Checkout-specific notifications deliberately stay in the
+    checkout outbox wrapper below; other deposit flows may use this monetary
+    core without manufacturing a checkout.
+    """
     source = (
         await db.execute(
             select(Transaction)
             .where(
-                Transaction.id == job.transaction_id,
+                Transaction.id == source_transaction_id,
                 # РФ-1 п.1.2: источником комиссии стал не только кошельковый депозит, но и
                 # приход от банка по прямой продаже (`PROVIDER_RECEIPT`). Это ЕДИНСТВЕННОЕ
                 # место, где тип источника проверяется, — всё остальное в шаге универсально.
@@ -184,6 +202,23 @@ async def _apply_referral_step(
             .with_for_update()
         )
     ).scalar_one()
+    # The old outbox status used to be the retry guard.  This public helper is
+    # also called by the add-on attempt outbox, so defend the monetary core by
+    # the immutable source key itself.  All rewards are committed atomically;
+    # seeing any source-keyed reward means the whole previous application won.
+    existing_rewards = list(
+        (
+            await db.execute(
+                select(Transaction)
+                .where(Transaction.device_first_ledger_key.like(f'deposit-side-effect:{source.id}:%'))
+                .order_by(Transaction.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if existing_rewards:
+        return list(dict.fromkeys(int(reward.user_id) for reward in existing_rewards))
     user_row = await db.get(User, source.user_id)
     if user_row is None:
         raise RuntimeError('credited deposit owner no longer exists')
@@ -212,10 +247,7 @@ async def _apply_referral_step(
     if user.referred_by_id is None:
         if not user.has_made_first_topup:
             user.has_made_first_topup = True
-        job.referral_status = 'done'
-        job.updated_at = datetime.now(UTC)
-        await db.commit()
-        return
+        return []
 
     referrer = users_by_id.get(user.referred_by_id)
     if referrer is None:
@@ -229,6 +261,7 @@ async def _apply_referral_step(
         is_first_payment=prior_reward_payments == 0,
     )
     commission_amount = int(source.amount_kopeks * commission_percent / 100) if commission_percent > 0 else 0
+    reward_recipient_ids: list[int] = []
     if _qualifies_for_first_payment_bonus(user, source.amount_kopeks):
         user.has_made_first_topup = True
         await db.execute(
@@ -238,7 +271,7 @@ async def _apply_referral_step(
                 ReferralEarning.reason == 'referral_registration_pending',
             )
         )
-        await _add_reward(
+        referred_reward = await _add_reward(
             db,
             recipient=user,
             source=source,
@@ -246,8 +279,10 @@ async def _apply_referral_step(
             ledger_suffix='referred-first-bonus',
             description='Бонус новичка за первую оплату',
         )
+        if referred_reward is not None:
+            reward_recipient_ids.append(int(referred_reward.user_id))
         inviter_bonus = settings.REFERRAL_INVITER_BONUS_KOPEKS + commission_amount
-        await _add_reward(
+        inviter_reward = await _add_reward(
             db,
             recipient=referrer,
             source=source,
@@ -259,6 +294,8 @@ async def _apply_referral_step(
                 f' + {commission_percent}% от {settings.format_price(source.amount_kopeks)}'
             ),
         )
+        if inviter_reward is not None:
+            reward_recipient_ids.append(int(inviter_reward.user_id))
         if inviter_bonus > 0:
             await _add_referral_earning(
                 db,
@@ -270,7 +307,7 @@ async def _apply_referral_step(
                 campaign_id=campaign_id,
             )
     elif commission_amount > 0 and not await _is_commission_limit_reached(db, referrer.id, user.id):
-        await _add_reward(
+        recurring_reward = await _add_reward(
             db,
             recipient=referrer,
             source=source,
@@ -283,6 +320,8 @@ async def _apply_referral_step(
                 f'{commission_percent}% от {settings.format_price(source.amount_kopeks)}'
             ),
         )
+        if recurring_reward is not None:
+            reward_recipient_ids.append(int(recurring_reward.user_id))
         await _add_referral_earning(
             db,
             referrer=referrer,
@@ -292,6 +331,25 @@ async def _apply_referral_step(
             reason='referral_commission_topup',
             campaign_id=campaign_id,
         )
+
+    return list(dict.fromkeys(reward_recipient_ids))
+
+
+async def _apply_referral_step(
+    db: AsyncSession,
+    *,
+    job_id: int,
+) -> None:
+    """Apply every monetary referral effect and complete the step atomically."""
+    job = (
+        await db.execute(
+            select(DeviceFirstDepositOutbox).where(DeviceFirstDepositOutbox.id == job_id).with_for_update()
+        )
+    ).scalar_one()
+    if job.referral_status == 'done':
+        return
+
+    await apply_deposit_referral_money(db, source_transaction_id=job.transaction_id)
 
     # РФ-1 п.1.3: сказать партнёру о деньгах. Ставим строку в ту же очередь сообщений, что
     # обслуживает клиентские уведомления: у неё уже есть бот и защита «ровно один раз».

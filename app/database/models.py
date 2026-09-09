@@ -1941,6 +1941,11 @@ class User(Base):
     test_reset_started_at = Column(AwareDateTime(), nullable=True)
     test_reset_completed_at = Column(AwareDateTime(), nullable=True)
     test_reset_panel_uuids = Column(JSON, nullable=True)
+    # Monotonic lifecycle fence for durable device add-on work.  Test-reset
+    # increments this before it starts deleting panel identities, so a worker
+    # that was already holding an old intent cannot mark a later account
+    # generation as provisioned.
+    device_addon_generation = Column(BigInteger, nullable=False, default=0, server_default='0')
 
     # Cabinet authentication fields
     email = Column(String(255), unique=True, nullable=True, index=True)
@@ -2761,6 +2766,155 @@ class Transaction(Base):
     @property
     def amount_rubles(self) -> float:
         return self.amount_kopeks / 100
+
+
+class DeviceAddonIntent(Base):
+    """One explicit, manually confirmed purchase of extra device slots.
+
+    This is intentionally separate from ``SubscriptionCheckout``: an add-on
+    changes an existing subscription and must remain recoverable after an
+    external balance top-up without becoming a subscription sale.
+    """
+
+    __tablename__ = 'device_addon_intents'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'idempotency_key', name='uq_device_addon_intent_user_key'),
+        CheckConstraint('devices_to_add > 0', name='ck_device_addon_intent_devices_positive'),
+        CheckConstraint('original_device_limit > 0', name='ck_device_addon_intent_original_limit_positive'),
+        CheckConstraint('quoted_price_kopeks >= 0', name='ck_device_addon_intent_quote_nonnegative'),
+        CheckConstraint('base_price_kopeks >= 0', name='ck_device_addon_intent_base_nonnegative'),
+        CheckConstraint('monthly_price_kopeks >= 0', name='ck_device_addon_intent_monthly_nonnegative'),
+        CheckConstraint('discount_percent >= 0 AND discount_percent <= 100', name='ck_device_addon_intent_discount'),
+        CheckConstraint("purchase_state IN ('draft', 'purchased')", name='ck_device_addon_intent_purchase_state'),
+        CheckConstraint(
+            "fulfillment_state IN ('pending', 'ready', 'needs_attention')",
+            name='ck_device_addon_intent_fulfillment_state',
+        ),
+        Index('ix_device_addon_intent_user_created', 'user_id', 'created_at'),
+        Index('ix_device_addon_intent_fulfillment', 'fulfillment_state', 'next_attempt_at'),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    public_id = Column(String(36), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False, index=True)
+    # Live target can be removed by older administrative subscription-delete
+    # flows.  Preserve the immutable original id separately for financial
+    # evidence; no operation may treat a NULL live relation as a target.
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='SET NULL'), nullable=True, index=True)
+    target_subscription_id = Column(Integer, nullable=False, index=True)
+    # Historical pricing snapshot.  The subscription's live tariff remains
+    # authoritative, so this evidence must not block tariff administration.
+    tariff_id = Column(Integer, nullable=True, index=True)
+    idempotency_key = Column(String(128), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    calculator_revision = Column(String(32), nullable=False, default='v1')
+    devices_to_add = Column(Integer, nullable=False)
+    original_device_limit = Column(Integer, nullable=False)
+    panel_uuid = Column(String(255), nullable=True)
+    end_date = Column(AwareDateTime(), nullable=False)
+    device_addon_generation = Column(BigInteger, nullable=False)
+    days_left = Column(Integer, nullable=False)
+    monthly_price_kopeks = Column(Integer, nullable=False)
+    base_price_kopeks = Column(Integer, nullable=False)
+    quoted_price_kopeks = Column(Integer, nullable=False)
+    discount_percent = Column(Integer, nullable=False, default=0)
+    price_snapshot = Column(JSON, nullable=False, default=dict)
+    purchase_state = Column(String(32), nullable=False, default='draft')
+    transaction_id = Column(Integer, ForeignKey('transactions.id', ondelete='RESTRICT'), nullable=True, unique=True)
+    receipt_json = Column(JSON, nullable=True)
+    fulfillment_state = Column(String(32), nullable=False, default='pending')
+    fulfillment_error_code = Column(String(96), nullable=True)
+    fulfillment_attempts = Column(Integer, nullable=False, default=0, server_default='0')
+    next_attempt_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    lease_token = Column(String(64), nullable=True, index=True)
+    lease_expires_at = Column(AwareDateTime(), nullable=True, index=True)
+    lease_epoch = Column(Integer, nullable=False, default=0, server_default='0')
+    purchased_at = Column(AwareDateTime(), nullable=True)
+    fulfilled_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    updated_at = Column(
+        AwareDateTime(), nullable=False, default=func.now(), server_default=func.now(), onupdate=func.now()
+    )
+
+    user = relationship('User', foreign_keys=[user_id])
+    subscription = relationship('Subscription', foreign_keys=[subscription_id])
+    transaction = relationship('Transaction', foreign_keys=[transaction_id])
+
+
+class DeviceAddonTopupAttempt(Base):
+    """A single durable Platega invoice bound to a device add-on intent."""
+
+    __tablename__ = 'device_addon_topup_attempts'
+    __table_args__ = (
+        UniqueConstraint('intent_id', 'idempotency_key', name='uq_device_addon_attempt_intent_key'),
+        CheckConstraint('requested_amount_kopeks > 0', name='ck_device_addon_attempt_requested_positive'),
+        CheckConstraint('expected_amount_kopeks >= 0', name='ck_device_addon_attempt_expected_nonnegative'),
+        CheckConstraint('credited_amount_kopeks >= 0', name='ck_device_addon_attempt_credited_nonnegative'),
+        CheckConstraint(
+            "status IN ('prepared', 'dispatching', 'creation_unknown', 'pending', 'reconciling', 'paid', 'terminal', 'operator_review')",
+            name='ck_device_addon_attempt_status',
+        ),
+        Index('ix_device_addon_attempt_intent_created', 'intent_id', 'created_at'),
+        Index('ix_device_addon_attempt_recovery', 'status', 'next_reconcile_at'),
+        Index(
+            'uq_device_addon_attempt_one_active',
+            'intent_id',
+            unique=True,
+            # Terminal invoices may be observed late as CONFIRMED.  Their
+            # status can then change for audit/reconciliation, but they must
+            # never reclaim the slot of a newer invoice for this intent.
+            postgresql_where=text('holds_invoice_slot'),
+        ),
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    public_id = Column(String(36), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False, index=True)
+    intent_id = Column(
+        BigInteger, ForeignKey('device_addon_intents.id', ondelete='RESTRICT'), nullable=False, index=True
+    )
+    idempotency_key = Column(String(128), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    payment_method = Column(String(32), nullable=False, default='platega')
+    method_key = Column(String(32), nullable=False)
+    provider_method_code = Column(Integer, nullable=False)
+    currency = Column(String(3), nullable=False, default='RUB')
+    expected_amount_kopeks = Column(Integer, nullable=False)
+    requested_amount_kopeks = Column(Integer, nullable=False)
+    credited_amount_kopeks = Column(Integer, nullable=False, default=0, server_default='0')
+    status = Column(String(32), nullable=False, default='prepared')
+    holds_invoice_slot = Column(Boolean, nullable=False, default=True, server_default='true')
+    platega_payment_id = Column(
+        Integer, ForeignKey('platega_payments.id', ondelete='RESTRICT'), nullable=False, unique=True
+    )
+    provider_payment_id = Column(String(255), nullable=True, unique=True)
+    correlation_id = Column(String(64), nullable=False, unique=True)
+    payment_url = Column(Text, nullable=True)
+    reconciliation_reason = Column(Text, nullable=True)
+    provider_returned_amount_kopeks = Column(Integer, nullable=True)
+    provider_returned_currency = Column(String(3), nullable=True)
+    deposit_transaction_id = Column(
+        Integer, ForeignKey('transactions.id', ondelete='RESTRICT'), nullable=True, unique=True
+    )
+    referral_status = Column(String(24), nullable=False, default='pending')
+    event_status = Column(String(24), nullable=False, default='pending')
+    referral_enabled_at_credit = Column(Boolean, nullable=True)
+    effects_attempts = Column(Integer, nullable=False, default=0, server_default='0')
+    reconcile_attempts = Column(Integer, nullable=False, default=0, server_default='0')
+    next_reconcile_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    lease_token = Column(String(64), nullable=True, index=True)
+    lease_expires_at = Column(AwareDateTime(), nullable=True, index=True)
+    lease_epoch = Column(Integer, nullable=False, default=0, server_default='0')
+    paid_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now(), server_default=func.now())
+    updated_at = Column(
+        AwareDateTime(), nullable=False, default=func.now(), server_default=func.now(), onupdate=func.now()
+    )
+
+    user = relationship('User', foreign_keys=[user_id])
+    intent = relationship('DeviceAddonIntent', foreign_keys=[intent_id])
+    platega_payment = relationship('PlategaPayment', foreign_keys=[platega_payment_id])
+    deposit_transaction = relationship('Transaction', foreign_keys=[deposit_transaction_id])
 
 
 class SubscriptionCheckout(Base):

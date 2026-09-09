@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import html
-import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import structlog
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -1609,336 +1607,10 @@ async def _auto_add_devices(
     *,
     bot: Bot | None = None,
 ) -> bool:
-    """Auto-purchase devices from saved cart after balance topup."""
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
-    from app.database.crud.user import lock_user_for_pricing, subtract_user_balance
-    from app.database.models import PaymentMethod
-    from app.utils.pricing_utils import apply_percentage_discount
-
-    devices_to_add = _safe_int(cart_data.get('devices_to_add'))
-    cart_price_kopeks = _safe_int(cart_data.get('price_kopeks'))
-
-    if devices_to_add <= 0 or cart_price_kopeks <= 0:
-        logger.warning(
-            '🔁 Автопокупка устройств: некорректные данные корзины для пользователя',
-            format_user_id=_format_user_id(user),
-            devices_to_add=devices_to_add,
-            cart_price_kopeks=cart_price_kopeks,
-        )
-        return False
-
-    # Проверяем подписку (with lock to prevent concurrent device modifications)
-    _cart_sub_id_devices = _safe_int(cart_data.get('subscription_id'))
-    if settings.is_multi_tariff_enabled() and _cart_sub_id_devices:
-        locked_result = await db.execute(
-            select(Subscription)
-            .where(Subscription.id == _cart_sub_id_devices, Subscription.user_id == user.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-    else:
-        locked_result = await db.execute(
-            select(Subscription)
-            .where(Subscription.user_id == user.id)
-            .order_by(Subscription.created_at.desc())
-            .limit(1)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-    subscription = locked_result.scalar_one_or_none()
-    if not subscription:
-        logger.warning('🔁 Автопокупка устройств: у пользователя нет подписки', format_user_id=_format_user_id(user))
-        await _delete_cart_for_subscription(user.id, cart_data)
-        return False
-
-    if subscription.status not in ('active', 'trial', 'disabled', 'limited', 'ACTIVE', 'TRIAL', 'DISABLED', 'LIMITED'):
-        logger.warning(
-            '🔁 Автопокупка устройств: подписка пользователя не активна',
-            format_user_id=_format_user_id(user),
-            subscription_status=subscription.status,
-        )
-        await _delete_cart_for_subscription(user.id, cart_data)
-        return False
-
-    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
-
-    try:
-        await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
-    except AccessPointPolicyError:
-        logger.info(
-            '🔁 Автопокупка устройств: access-point тариф не поддерживает add-on',
-            format_user_id=_format_user_id(user),
-        )
-        await _delete_cart_for_subscription(user.id, cart_data)
-        return False
-
-    # Load tariff for device price and max limit
-    tariff = None
-    if subscription.tariff_id:
-        from app.database.crud.tariff import get_tariff_by_id
-
-        tariff = await get_tariff_by_id(db, subscription.tariff_id)
-
-    if tariff and tariff.device_price_kopeks is not None:
-        tariff_device_price = tariff.device_price_kopeks
-        tariff_max_device_limit = tariff.max_device_limit
-    else:
-        tariff_device_price = settings.PRICE_PER_DEVICE
-        tariff_max_device_limit = settings.MAX_DEVICES_LIMIT if settings.MAX_DEVICES_LIMIT > 0 else None
-
-    # Block purchase if device price is 0 or negative (purchase unavailable for this tariff)
-    if not tariff_device_price or tariff_device_price <= 0:
-        logger.warning(
-            '🔁 Автопокупка устройств: докупка устройств недоступна для тарифа, корзина удалена',
-            format_user_id=_format_user_id(user),
-            tariff_id=subscription.tariff_id,
-            tariff_device_price=tariff_device_price,
-        )
-        await _delete_cart_for_subscription(user.id, cart_data)
-        return False
-
-    # Check max device limit before charging
-    old_device_limit = subscription.device_limit or 1
-    new_device_limit = old_device_limit + devices_to_add
-    if tariff_max_device_limit and new_device_limit > tariff_max_device_limit:
-        logger.warning(
-            '🔁 Автопокупка устройств: превышен лимит устройств',
-            format_user_id=_format_user_id(user),
-            current=old_device_limit,
-            requested=new_device_limit,
-            tariff_max_device_limit=tariff_max_device_limit,
-        )
-        await _delete_cart_for_subscription(user.id, cart_data)
-        return False
-
-    # Lock user BEFORE price computation to prevent TOCTOU on promo-offer/group discount
-    user = await lock_user_for_pricing(db, user.id)
-
-    # Recompute price fresh under lock (pricing config may have changed since cart was saved)
-    devices_price_per_month = devices_to_add * tariff_device_price
-    days_left = max(1, math.ceil((subscription.end_date - datetime.now(UTC)).total_seconds() / 86400))
-    devices_discount_percent = PricingEngine.get_addon_discount_percent(
-        user,
-        'devices',
-        days_left,
-    )
-    discounted_per_month, _ = apply_percentage_discount(
-        devices_price_per_month,
-        devices_discount_percent,
-    )
-    price_kopeks = int(discounted_per_month * days_left / 30)
-    price_kopeks = max(100, price_kopeks)
-
-    if price_kopeks != cart_price_kopeks:
-        logger.warning(
-            '🔁 Автопокупка устройств: пересчитанная цена отличается от корзины',
-            format_user_id=_format_user_id(user),
-            cart_price_kopeks=cart_price_kopeks,
-            recomputed_price_kopeks=price_kopeks,
-            devices_discount_percent=devices_discount_percent,
-            days_left=days_left,
-        )
-
-    # Проверяем баланс (при 100% скидке — пропускаем)
-    if price_kopeks > 0 and user.balance_kopeks < price_kopeks:
-        logger.info(
-            '🔁 Автопокупка устройств: у пользователя недостаточно средств (<)',
-            format_user_id=_format_user_id(user),
-            balance_kopeks=user.balance_kopeks,
-            price_kopeks=price_kopeks,
-        )
-        return False
-
-    # Списываем баланс
-    description = f'Покупка {devices_to_add} доп. устройств'
-    try:
-        success = await subtract_user_balance(
-            db,
-            user,
-            price_kopeks,
-            description,
-            create_transaction=True,
-            payment_method=PaymentMethod.BALANCE,
-            transaction_type=TransactionType.SUBSCRIPTION_PAYMENT,
-        )
-        if not success:
-            logger.warning(
-                '❌ Автопокупка устройств: не удалось списать баланс пользователя', format_user_id=_format_user_id(user)
-            )
-            return False
-    except Exception as error:
-        logger.error(
-            '❌ Автопокупка устройств: ошибка списания баланса пользователя',
-            format_user_id=_format_user_id(user),
-            error=error,
-            exc_info=True,
-        )
-        return False
-
-    # Re-lock subscription after subtract_user_balance committed (released locks)
-    relock_result = await db.execute(
-        select(Subscription)
-        .where(Subscription.id == subscription.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    subscription = relock_result.scalar_one()
-
-    old_device_limit = subscription.device_limit or 1
-    new_device_limit = old_device_limit + devices_to_add
-
-    if tariff_max_device_limit and new_device_limit > tariff_max_device_limit:
-        # Concurrent modification exceeded limit — refund
-        user_refund = await db.execute(
-            select(User).where(User.id == user.id).with_for_update().execution_options(populate_existing=True)
-        )
-        refund_user = user_refund.scalar_one()
-        refund_user.balance_kopeks += price_kopeks
-        await db.commit()
-        logger.warning(
-            '🔁 Автопокупка устройств: лимит превышен после оплаты, баланс возвращён',
-            format_user_id=_format_user_id(user),
-        )
-        await _delete_cart_for_subscription(user.id, cart_data)
-        return False
-
-    # Добавляем устройства (under lock)
-    subscription.device_limit = new_device_limit
-
-    try:
-        await db.commit()
-        await db.refresh(subscription)
-    except Exception as error:
-        logger.error(
-            '❌ Автопокупка устройств: ошибка сохранения подписки пользователя',
-            format_user_id=_format_user_id(user),
-            error=error,
-            exc_info=True,
-        )
-        await db.rollback()
-        return False
-
-    # Реактивируем подписку если она была DISABLED/EXPIRED (например, после LIMITED/EXPIRED в RemnaWave)
-    from app.database.crud.subscription import reactivate_subscription
-
-    await reactivate_subscription(db, subscription)
-
-    # Синхронизация с RemnaWave
-    try:
-        subscription_service = SubscriptionService()
-        await subscription_service.update_remnawave_user(db, subscription)
-        # Явно включаем пользователя на панели (PATCH может не снять LIMITED-статус)
-        _panel_uuid = (
-            subscription.remnawave_uuid
-            if settings.is_multi_tariff_enabled() and subscription.remnawave_uuid
-            else getattr(user, 'remnawave_uuid', None)
-        )
-        if _panel_uuid and subscription.status == 'active':
-            await subscription_service.enable_remnawave_user(_panel_uuid, db=db)
-    except Exception as error:
-        logger.warning(
-            '⚠️ Автопокупка устройств: не удалось обновить Remnawave для пользователя',
-            format_user_id=_format_user_id(user),
-            error=error,
-        )
-        from app.services.remnawave_retry_queue import remnawave_retry_queue
-
-        if hasattr(subscription, 'id') and hasattr(subscription, 'user_id'):
-            remnawave_retry_queue.enqueue(
-                subscription_id=subscription.id,
-                user_id=subscription.user_id,
-                action='update',
-            )
-
-    # Очищаем корзину (транзакция уже создана в subtract_user_balance)
-    await _delete_cart_for_subscription(user.id, cart_data)
-
-    logger.info(
-        '✅ Автопокупка устройств: пользователь добавил устройства',
-        format_user_id=_format_user_id(user),
-        devices_to_add=devices_to_add,
-        old_device_limit=old_device_limit,
-        device_limit=subscription.device_limit,
-        price_kopeks=price_kopeks,
-    )
-
-    # WebSocket уведомление для кабинета
-    try:
-        from app.cabinet.routes.websocket import notify_user_devices_purchased
-
-        await notify_user_devices_purchased(
-            user_id=user.id,
-            devices_added=devices_to_add,
-            new_device_limit=subscription.device_limit,
-            amount_kopeks=price_kopeks,
-        )
-    except Exception as ws_error:
-        logger.warning('⚠️ Автопокупка устройств: не удалось отправить WebSocket уведомление', ws_error=ws_error)
-
-    # Уведомление пользователю
-    if bot and user.telegram_id:
-        texts = get_texts(getattr(user, 'language', 'ru'))
-        try:
-            message = texts.t(
-                'AUTO_PURCHASE_DEVICES_SUCCESS',
-                (
-                    '✅ <b>Устройства добавлены автоматически!</b>\n\n'
-                    '📱 Добавлено: {devices_to_add} устройств\n'
-                    '📊 Новый лимит: {new_limit} устройств\n'
-                    '💰 Списано: {price}'
-                ),
-            ).format(
-                devices_to_add=devices_to_add,
-                new_limit=subscription.device_limit,
-                price=texts.format_price(price_kopeks),
-            )
-
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text=texts.t('MY_SUBSCRIPTION_BUTTON', '📱 Моя подписка'),
-                            callback_data='menu_subscription',
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text=texts.t('BACK_TO_MAIN_MENU_BUTTON', '🏠 Главное меню'),
-                            callback_data='back_to_menu',
-                        )
-                    ],
-                ]
-            )
-
-            await bot.send_message(
-                chat_id=user.telegram_id,
-                text=message,
-                reply_markup=keyboard,
-                parse_mode='HTML',
-            )
-        except Exception as error:
-            logger.warning(
-                '⚠️ Автопокупка устройств: не удалось уведомить пользователя', telegram_id=user.telegram_id, error=error
-            )
-
-    # Уведомление админам
-    if bot:
-        try:
-            notification_service = AdminNotificationService(bot)
-            await notification_service.send_subscription_update_notification(
-                db,
-                user,
-                subscription,
-                'devices',
-                old_device_limit,
-                subscription.device_limit,
-                price_kopeks,
-            )
-        except Exception as error:
-            logger.warning('⚠️ Автопокупка устройств: не удалось уведомить админов', error=error)
-
-    return True
+    """Legacy device carts never authorize a new monetary operation."""
+    # Keep the cart as a non-executable pointer: deleting it would expose an
+    # unrelated expired-subscription auto-renewal on the next generic topup.
+    return False
 
 
 async def _auto_add_traffic(
@@ -3208,6 +2880,9 @@ async def _process_single_cart(
     from app.database.crud.transaction import get_user_transactions
 
     cart_mode = cart_data.get('cart_mode') or cart_data.get('mode')
+    if cart_mode == 'add_devices':
+        # This guard precedes every subscription lock and state mutation.
+        return False
     cart_sub_id = _safe_int(cart_data.get('subscription_id'))
 
     # Guard: DISABLED subscription -- stale cart
@@ -3271,8 +2946,6 @@ async def _process_single_cart(
         return await _auto_purchase_tariff(db, user, cart_data, bot=bot)
     if cart_mode == 'daily_tariff_purchase':
         return await _auto_purchase_daily_tariff(db, user, cart_data, bot=bot)
-    if cart_mode == 'add_devices':
-        return await _auto_add_devices(db, user, cart_data, bot=bot)
     if cart_mode == 'add_traffic':
         return await _auto_add_traffic(db, user, cart_data, bot=bot)
 

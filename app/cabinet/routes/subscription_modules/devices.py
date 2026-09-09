@@ -13,8 +13,6 @@ POST /subscription/devices/save-cart
 
 from __future__ import annotations
 
-import asyncio
-import math
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,29 +24,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cabinet.utils.device_ownership import verify_hwid_belongs_to_user
 from app.config import settings
-from app.database.crud.tariff import get_tariff_by_id
 from app.database.crud.user_device_alias import (
     delete_alias,
     get_aliases_for_user,
     normalize_alias,
     set_alias,
 )
-from app.database.models import Subscription, TransactionType, User
+from app.database.models import Subscription, User
 from app.services.subscription_service import SubscriptionService
-from app.services.user_cart_service import user_cart_service
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from ...schemas.subscription import DevicePurchaseRequest
-from .helpers import _apply_addon_discount, _resolve_device_addon_price, resolve_subscription
+from .helpers import resolve_subscription
 
 
 logger = structlog.get_logger(__name__)
-
-# Cap inline RemnaWave panel sync on user-facing cabinet requests. The product is
-# committed before the sync, so a slow/unavailable panel must not hold the HTTP
-# response open (the cabinet pay button is bound to the request and would spin
-# after delivery). Past this budget the sync is deferred to remnawave_retry_queue.
-REMNAWAVE_SYNC_TIMEOUT = 10.0
 
 router = APIRouter()
 
@@ -73,275 +63,15 @@ async def purchase_devices_legacy(
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Purchase additional device slots (legacy endpoint).
-
-    DEPRECATED: Use /devices/purchase instead for full tariff and discount support.
-    Now uses tariff-aware pricing when subscription has a tariff_id.
-    """
-    if getattr(user, 'restriction_subscription', False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail='Subscription purchases are restricted for this account',
-        )
-
-    # Resolve subscription (ownership validated), then lock the row for concurrent safety
-    resolved = await resolve_subscription(db, user, subscription_id)
-    if not resolved:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='No subscription found')
-
-    result = await db.execute(
-        select(Subscription)
-        .where(and_(Subscription.id == resolved.id, Subscription.user_id == user.id))
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    """Old clients must reload the signed-quote device purchase flow."""
+    raise HTTPException(
+        status_code=409,
+        detail={
+            'code': 'quote_required',
+            'message': 'Обновите кабинет и подтвердите актуальную цену докупки устройств.',
+            'continuation_path': '/subscription/device-topup/new',
+        },
     )
-    subscription = result.scalar_one_or_none()
-
-    if not subscription:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail='No subscription found',
-        )
-
-    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
-
-    try:
-        await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
-    except AccessPointPolicyError as error:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
-        ) from error
-
-    if subscription.status not in ['active', 'trial']:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Ваша подписка неактивна',
-        )
-
-    # Get tariff for device price (if exists)
-    tariff = None
-    if subscription.tariff_id:
-        from app.database.crud.tariff import get_tariff_by_id
-
-        tariff = await get_tariff_by_id(db, subscription.tariff_id)
-
-    # Determine device price and max limit from tariff or settings
-    if tariff and tariff.device_price_kopeks is not None:
-        device_price = tariff.device_price_kopeks
-        max_device_limit = tariff.max_device_limit
-    else:
-        device_price = settings.PRICE_PER_DEVICE
-        max_device_limit = settings.MAX_DEVICES_LIMIT if settings.MAX_DEVICES_LIMIT > 0 else None
-
-    if not device_price or device_price <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Докупка устройств недоступна',
-        )
-
-    # Устройства в пределах тарифного лимита — бесплатные
-    current_devices = subscription.device_limit or 1
-    if tariff:
-        tariff_included = tariff.device_limit or 0
-        if current_devices < tariff_included:
-            free_devices = tariff_included - current_devices
-            chargeable_devices = max(0, request.devices - free_devices)
-        else:
-            chargeable_devices = request.devices
-    else:
-        free_baseline = settings.DEFAULT_DEVICE_LIMIT
-        if current_devices < free_baseline:
-            free_devices = free_baseline - current_devices
-            chargeable_devices = max(0, request.devices - free_devices)
-        else:
-            chargeable_devices = request.devices
-
-    # Прорейт по фактическому остатку подписки — как трафик/серверы, без потолка.
-    now = datetime.now(UTC)
-    end_date = subscription.end_date
-    if end_date.tzinfo is None:
-        end_date = end_date.replace(tzinfo=UTC)
-    days_left = max(1, math.ceil((end_date - now).total_seconds() / 86400))
-    base_total_price = int(device_price * chargeable_devices * days_left / 30)
-    if chargeable_devices > 0:
-        base_total_price = max(100, base_total_price)  # Минимум 1 рубль
-
-    # Lock user row to prevent TOCTOU on promo-offer state
-    from app.database.crud.user import lock_user_for_pricing
-
-    user = await lock_user_for_pricing(db, user.id)
-
-    # Apply discount from promo group
-    discount_result = _apply_addon_discount(user, 'devices', base_total_price, days_left)
-    total_price = discount_result['discounted']
-    devices_discount_percent = discount_result['percent']
-
-    # Ensure minimum price after discount (except for 100% discount)
-    if devices_discount_percent < 100 and total_price > 0:
-        total_price = max(100, total_price)
-
-    # Check max devices limit (under row lock — prevents concurrent purchases exceeding limit)
-    current_devices = subscription.device_limit or 1
-    new_devices = current_devices + request.devices
-
-    if max_device_limit and new_devices > max_device_limit:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Максимальное количество устройств: {max_device_limit}',
-        )
-
-    # Check balance (skip for 100% discount)
-    if total_price > 0 and user.balance_kopeks < total_price:
-        missing = total_price - user.balance_kopeks
-
-        # Сохраняем корзину для автопокупки после пополнения
-        try:
-            cart_data = {
-                'cart_mode': 'add_devices',
-                'devices_to_add': request.devices,
-                'price_kopeks': total_price,
-                'base_price_kopeks': base_total_price,
-                'discount_percent': devices_discount_percent,
-                'source': 'cabinet',
-            }
-            await user_cart_service.save_user_cart(user.id, cart_data)
-            logger.info(
-                'Cart saved for device purchase (cabinet /devices) user + devices',
-                user_id=user.id,
-                devices=request.devices,
-            )
-        except Exception as e:
-            logger.error('Error saving cart for device purchase (cabinet /devices)', error=e)
-
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                'code': 'insufficient_funds',
-                'error': 'Insufficient balance',
-                'required_kopeks': total_price,
-                'current_kopeks': user.balance_kopeks,
-                'missing_kopeks': missing,
-                'cart_saved': True,
-            },
-        )
-
-    # Deduct balance and create transaction
-    from app.database.crud.user import subtract_user_balance
-    from app.database.models import PaymentMethod
-
-    # Build description with discount info
-    if devices_discount_percent > 0:
-        description = f'Покупка {request.devices} доп. устройств (скидка {devices_discount_percent}%)'
-    else:
-        description = f'Покупка {request.devices} доп. устройств'
-
-    success = await subtract_user_balance(
-        db=db,
-        user=user,
-        amount_kopeks=total_price,
-        description=description,
-        create_transaction=True,
-        payment_method=PaymentMethod.BALANCE,
-        transaction_type=TransactionType.SUBSCRIPTION_PAYMENT,
-    )
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail='Insufficient funds',
-        )
-
-    # Re-lock subscription after subtract_user_balance committed (which released all locks).
-    # Re-validate max device limit to prevent concurrent purchases exceeding the limit.
-    relock_result = await db.execute(
-        select(Subscription)
-        .where(Subscription.id == subscription.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    subscription = relock_result.scalar_one()
-
-    actual_current = subscription.device_limit or 1
-    actual_new = actual_current + request.devices
-    if max_device_limit and actual_new > max_device_limit:
-        # Concurrent purchase already exceeded limit — refund balance
-        user_refund = await db.execute(
-            select(User).where(User.id == user.id).with_for_update().execution_options(populate_existing=True)
-        )
-        refund_user = user_refund.scalar_one()
-        refund_user.balance_kopeks += total_price
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f'Максимальное количество устройств: {max_device_limit}. Баланс возвращён.',
-        )
-
-    # Add devices (under lock)
-    subscription.device_limit = actual_new
-    await db.commit()
-    await db.refresh(subscription)
-    await db.refresh(user)
-
-    # Sync with RemnaWave (time-bounded — see REMNAWAVE_SYNC_TIMEOUT; product is
-    # already committed, defer slow syncs to remnawave_retry_queue).
-    try:
-        service = SubscriptionService()
-        if settings.is_multi_tariff_enabled():
-            _should_create = not subscription.remnawave_uuid
-        else:
-            _should_create = not getattr(user, 'remnawave_uuid', None)
-
-        async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
-            if _should_create:
-                await service.create_remnawave_user(db, subscription)
-            else:
-                await service.update_remnawave_user(db, subscription)
-    except Exception as e:
-        logger.error('Failed to sync devices with RemnaWave (legacy endpoint)', error=e)
-        from app.services.remnawave_retry_queue import remnawave_retry_queue
-
-        remnawave_retry_queue.enqueue(
-            subscription_id=subscription.id,
-            user_id=user.id,
-            action='create' if _should_create else 'update',
-        )
-
-    # Отправляем уведомление админам
-    try:
-        from app.bot_factory import create_bot
-        from app.services.admin_notification_service import AdminNotificationService
-
-        if getattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', False):
-            bot = create_bot()
-            try:
-                notification_service = AdminNotificationService(bot)
-                await notification_service.send_subscription_update_notification(
-                    db=db,
-                    user=user,
-                    subscription=subscription,
-                    update_type='devices',
-                    old_value=current_devices,
-                    new_value=actual_new,
-                    price_paid=total_price,
-                )
-            finally:
-                await bot.session.close()
-    except Exception as e:
-        logger.error('Failed to send admin notification for device purchase', error=e)
-
-    response: dict[str, Any] = {
-        'message': 'Devices added successfully',
-        'devices_added': request.devices,
-        'new_device_limit': actual_new,
-        'amount_paid_kopeks': total_price,
-    }
-
-    if devices_discount_percent > 0:
-        response['discount_percent'] = devices_discount_percent
-        response['discount_kopeks'] = discount_result['discount']
-        response['base_price_kopeks'] = base_total_price
-
-    return response
 
 
 @router.post('/devices/purchase')
@@ -351,324 +81,15 @@ async def purchase_devices(
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Purchase additional device slots for subscription."""
-    if getattr(user, 'restriction_subscription', False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail='Subscription purchases are restricted for this account',
-        )
-
-    try:
-        # Resolve subscription (ownership validated), then lock the row for concurrent safety
-        resolved = await resolve_subscription(db, user, subscription_id)
-        if not resolved:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='У вас нет активной подписки')
-
-        result = await db.execute(
-            select(Subscription)
-            .where(and_(Subscription.id == resolved.id, Subscription.user_id == user.id))
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        subscription = result.scalar_one_or_none()
-
-        if not subscription:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='У вас нет активной подписки',
-            )
-
-        from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
-
-        try:
-            await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
-        except AccessPointPolicyError as error:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
-            ) from error
-
-        if subscription.status not in ['active', 'trial']:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Ваша подписка неактивна',
-            )
-
-        # Get tariff for device price (if exists)
-        tariff = None
-        if subscription.tariff_id:
-            from app.database.crud.tariff import get_tariff_by_id
-
-            tariff = await get_tariff_by_id(db, subscription.tariff_id)
-
-        # Determine device price and max limit from tariff or settings
-        if tariff and tariff.device_price_kopeks is not None:
-            device_price = tariff.device_price_kopeks
-            max_device_limit = tariff.max_device_limit
-        else:
-            # Classic mode - use settings
-            device_price = settings.PRICE_PER_DEVICE
-            max_device_limit = settings.MAX_DEVICES_LIMIT if settings.MAX_DEVICES_LIMIT > 0 else None
-
-        if not device_price or device_price <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Докупка устройств недоступна',
-            )
-
-        # Check max device limit (under row lock — prevents concurrent purchases exceeding limit)
-        current_devices = subscription.device_limit or 1
-        new_device_count = current_devices + request.devices
-        if max_device_limit and new_device_count > max_device_limit:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f'Максимальное количество устройств: {max_device_limit}',
-            )
-
-        # Calculate prorated price based on remaining days
-        now = datetime.now(UTC)
-        end_date = subscription.end_date
-        if end_date.tzinfo is None:
-            end_date = end_date.replace(tzinfo=UTC)
-
-        days_left = max(1, math.ceil((end_date - now).total_seconds() / 86400))
-        total_days = 30  # Base period for device price calculation
-        # Прорейт по фактическому остатку подписки — как трафик/серверы, без потолка.
-        # Устройство активно до конца подписки; на продлении доначисляется через
-        # pricing_engine. (Раньше тут был потолок в 1 месяц — #596757/#587412.)
-        effective_days = days_left
-
-        # Устройства в пределах тарифного лимита — бесплатные
-        if tariff:
-            tariff_included = tariff.device_limit or 0
-            if current_devices < tariff_included:
-                free_devices = tariff_included - current_devices
-                chargeable_devices = max(0, request.devices - free_devices)
-            else:
-                chargeable_devices = request.devices
-        else:
-            free_baseline = settings.DEFAULT_DEVICE_LIMIT
-            if current_devices < free_baseline:
-                free_devices = free_baseline - current_devices
-                chargeable_devices = max(0, request.devices - free_devices)
-            else:
-                chargeable_devices = request.devices
-
-        # Calculate base price before discount
-        base_price_per_month = device_price * chargeable_devices
-        base_price_prorated = int(base_price_per_month * effective_days / total_days)
-        if chargeable_devices > 0:
-            base_price_prorated = max(100, base_price_prorated)  # Minimum 1 ruble
-
-        # Lock user BEFORE discount computation to prevent TOCTOU on promo group
-        from app.database.crud.user import lock_user_for_pricing
-
-        user = await lock_user_for_pricing(db, user.id)
-
-        # Apply discount from promo group
-        period_hint_days = days_left
-        discount_result = _apply_addon_discount(user, 'devices', base_price_prorated, period_hint_days)
-        price_kopeks = discount_result['discounted']
-        devices_discount_percent = discount_result['percent']
-        discount_value = discount_result['discount']
-
-        # Ensure minimum price after discount (except for 100% discount)
-        if devices_discount_percent < 100:
-            price_kopeks = max(100, price_kopeks)
-
-        # Check balance (skip for 100% discount)
-        if price_kopeks > 0 and user.balance_kopeks < price_kopeks:
-            missing = price_kopeks - user.balance_kopeks
-
-            # Сохраняем корзину для автопокупки после пополнения
-            try:
-                cart_data = {
-                    'cart_mode': 'add_devices',
-                    'devices_to_add': request.devices,
-                    'price_kopeks': price_kopeks,
-                    'base_price_kopeks': base_price_prorated,
-                    'discount_percent': devices_discount_percent,
-                    'source': 'cabinet',
-                }
-                await user_cart_service.save_user_cart(user.id, cart_data)
-                logger.info(
-                    'Cart saved for device purchase (cabinet) user + devices, discount',
-                    user_id=user.id,
-                    devices=request.devices,
-                    devices_discount_percent=devices_discount_percent,
-                )
-            except Exception as e:
-                logger.error('Error saving cart for device purchase (cabinet)', error=e)
-
-            raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail={
-                    'code': 'insufficient_funds',
-                    'error': 'Insufficient balance',
-                    'required_kopeks': price_kopeks,
-                    'current_kopeks': user.balance_kopeks,
-                    'missing_kopeks': missing,
-                    'cart_saved': True,
-                },
-            )
-
-        # Deduct balance and create transaction
-        from app.database.crud.user import subtract_user_balance
-        from app.database.models import PaymentMethod
-
-        # Build description with discount info
-        if devices_discount_percent > 0:
-            description = f'Покупка {request.devices} доп. устройств (скидка {devices_discount_percent}%)'
-        else:
-            description = f'Покупка {request.devices} доп. устройств'
-
-        success = await subtract_user_balance(
-            db=db,
-            user=user,
-            amount_kopeks=price_kopeks,
-            description=description,
-            create_transaction=True,
-            payment_method=PaymentMethod.BALANCE,
-            transaction_type=TransactionType.SUBSCRIPTION_PAYMENT,
-        )
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail='Insufficient funds',
-            )
-
-        # Re-lock subscription after subtract_user_balance committed (which released all locks).
-        # Re-validate max device limit to prevent concurrent purchases exceeding the limit.
-        relock_result = await db.execute(
-            select(Subscription)
-            .where(Subscription.id == subscription.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        subscription = relock_result.scalar_one()
-
-        actual_current = subscription.device_limit or 1
-        actual_new = actual_current + request.devices
-        if max_device_limit and actual_new > max_device_limit:
-            # Concurrent purchase already exceeded limit — refund balance
-            user_refund = await db.execute(
-                select(User).where(User.id == user.id).with_for_update().execution_options(populate_existing=True)
-            )
-            refund_user = user_refund.scalar_one()
-            refund_user.balance_kopeks += price_kopeks
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f'Максимальное количество устройств: {max_device_limit}. Баланс возвращён.',
-            )
-
-        # Increase device limit (under lock)
-        subscription.device_limit = actual_new
-        await db.commit()
-        await db.refresh(subscription)
-
-        # Sync with RemnaWave (time-bounded — see REMNAWAVE_SYNC_TIMEOUT; product is
-        # already committed, defer slow syncs to remnawave_retry_queue).
-        service = SubscriptionService()
-        try:
-            if settings.is_multi_tariff_enabled():
-                _should_create = not subscription.remnawave_uuid
-            else:
-                _should_create = not getattr(user, 'remnawave_uuid', None)
-
-            async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
-                if _should_create:
-                    await service.create_remnawave_user(db, subscription)
-                else:
-                    await service.update_remnawave_user(db, subscription)
-        except Exception as e:
-            logger.error('Failed to sync devices with RemnaWave', error=e)
-            from app.services.remnawave_retry_queue import remnawave_retry_queue
-
-            remnawave_retry_queue.enqueue(
-                subscription_id=subscription.id,
-                user_id=user.id,
-                action='create' if _should_create else 'update',
-            )
-
-        await db.refresh(user)
-
-        if devices_discount_percent > 0:
-            logger.info(
-                'User purchased devices for kopeks (discount saved kopeks)',
-                user_id=user.id,
-                devices=request.devices,
-                price_kopeks=price_kopeks,
-                devices_discount_percent=devices_discount_percent,
-                discount_value=discount_value,
-            )
-        else:
-            logger.info(
-                'User purchased devices for kopeks', user_id=user.id, devices=request.devices, price_kopeks=price_kopeks
-            )
-
-        # Отправляем уведомление админам
-        try:
-            from app.bot_factory import create_bot
-            from app.services.admin_notification_service import AdminNotificationService
-
-            if getattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', False):
-                bot = create_bot()
-                try:
-                    notification_service = AdminNotificationService(bot)
-                    await notification_service.send_subscription_update_notification(
-                        db=db,
-                        user=user,
-                        subscription=subscription,
-                        update_type='devices',
-                        old_value=current_devices,
-                        new_value=subscription.device_limit,
-                        price_paid=price_kopeks,
-                    )
-                finally:
-                    await bot.session.close()
-        except Exception as e:
-            logger.error('Failed to send admin notification for device purchase', error=e)
-
-        # Yandex.Metrika offline conversion (#558449).
-        try:
-            from app.services import yandex_offline_conv_service as yandex_conv
-
-            # Purchase event fires centrally from create_transaction; here we
-            # only persist the request-body CID synchronously (#558449).
-            await yandex_conv.store_cid_only(
-                user.id,
-                request.yandex_cid,
-            )
-        except Exception as yconv_err:
-            logger.debug('yandex_conv purchase hook failed (non-fatal)', user_id=user.id, error=str(yconv_err))
-
-        response: dict[str, Any] = {
-            'success': True,
-            'message': f'Добавлено {request.devices} устройств',
-            'devices_added': request.devices,
-            'new_device_limit': subscription.device_limit,
-            'price_kopeks': price_kopeks,
-            'price_label': settings.format_price(price_kopeks),
-            'balance_kopeks': user.balance_kopeks,
-            'balance_label': settings.format_price(user.balance_kopeks),
-        }
-
-        if devices_discount_percent > 0:
-            response['discount_percent'] = devices_discount_percent
-            response['discount_kopeks'] = discount_value
-            response['base_price_kopeks'] = base_price_prorated
-
-        return response
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error('Failed to purchase devices for user', user_id=user.id, error=e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Не удалось обработать покупку устройств',
-        )
+    """Old clients must reload the signed-quote device purchase flow."""
+    raise HTTPException(
+        status_code=409,
+        detail={
+            'code': 'quote_required',
+            'message': 'Обновите кабинет и подтвердите актуальную цену докупки устройств.',
+            'continuation_path': '/subscription/device-topup/new',
+        },
+    )
 
 
 @router.post('/devices/save-cart')
@@ -678,116 +99,15 @@ async def save_devices_cart(
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> dict[str, bool]:
-    """Save cart for device purchase (for insufficient balance flow)."""
-    subscription = await resolve_subscription(db, user, subscription_id)
-
-    if not subscription:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='У вас нет активной подписки',
-        )
-
-    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
-
-    try:
-        await assert_no_manual_access_point_grant(db, subscription, action='device add-on')
-    except AccessPointPolicyError as error:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
-        ) from error
-
-    if subscription.status not in ['active', 'trial']:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Ваша подписка неактивна',
-        )
-
-    # Get tariff for device price (if exists)
-    tariff = None
-    if subscription.tariff_id:
-        tariff = await get_tariff_by_id(db, subscription.tariff_id)
-
-    # Determine device price and max limit from tariff or settings
-    if tariff and tariff.device_price_kopeks is not None:
-        device_price = tariff.device_price_kopeks
-        max_device_limit = tariff.max_device_limit
-    else:
-        device_price = settings.PRICE_PER_DEVICE
-        max_device_limit = settings.MAX_DEVICES_LIMIT if settings.MAX_DEVICES_LIMIT > 0 else None
-
-    if not device_price or device_price <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Докупка устройств недоступна',
-        )
-
-    # Check max device limit
-    current_devices = subscription.device_limit or 1
-    new_device_count = current_devices + request.devices
-    if max_device_limit and new_device_count > max_device_limit:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Максимальное количество устройств: {max_device_limit}',
-        )
-
-    # Calculate prorated price based on remaining days
-    now = datetime.now(UTC)
-    end_date = subscription.end_date
-    if end_date.tzinfo is None:
-        end_date = end_date.replace(tzinfo=UTC)
-
-    days_left = max(1, math.ceil((end_date - now).total_seconds() / 86400))
-    total_days = 30
-    # Прорейт по фактическому остатку подписки — как трафик/серверы, без потолка
-    # (раньше был потолок в 1 месяц — #596757). Доначисление за устройства — на продлении.
-    effective_days = days_left
-
-    # Устройства в пределах тарифного лимита — бесплатные
-    if tariff:
-        tariff_included = tariff.device_limit or 0
-        if current_devices < tariff_included:
-            free_devices = tariff_included - current_devices
-            chargeable_devices = max(0, request.devices - free_devices)
-        else:
-            chargeable_devices = request.devices
-    else:
-        free_baseline = settings.DEFAULT_DEVICE_LIMIT
-        if current_devices < free_baseline:
-            free_devices = free_baseline - current_devices
-            chargeable_devices = max(0, request.devices - free_devices)
-        else:
-            chargeable_devices = request.devices
-
-    base_total_price = int(device_price * chargeable_devices * effective_days / total_days)
-    if chargeable_devices > 0:
-        base_total_price = max(100, base_total_price)  # Minimum 1 ruble
-
-    # Apply discount from promo group
-    period_hint_days = days_left
-    discount_result = _apply_addon_discount(user, 'devices', base_total_price, period_hint_days)
-    price_kopeks = discount_result['discounted']
-    devices_discount_percent = discount_result['percent']
-
-    # Ensure minimum price after discount (except for 100% discount)
-    if devices_discount_percent < 100 and price_kopeks > 0:
-        price_kopeks = max(100, price_kopeks)
-
-    # Save cart for auto-purchase after balance top-up
-    cart_data = {
-        'cart_mode': 'add_devices',
-        'devices_to_add': request.devices,
-        'price_kopeks': price_kopeks,
-        'base_price_kopeks': base_total_price,
-        'discount_percent': devices_discount_percent,
-        'source': 'cabinet',
-    }
-    await user_cart_service.save_user_cart(user.id, cart_data)
-    logger.info(
-        'Cart saved for device purchase (cabinet save-cart) user + devices', user_id=user.id, devices=request.devices
+    """Old clients must reload the signed-quote device purchase flow."""
+    raise HTTPException(
+        status_code=409,
+        detail={
+            'code': 'quote_required',
+            'message': 'Обновите кабинет и подтвердите актуальную цену докупки устройств.',
+            'continuation_path': '/subscription/device-topup/new',
+        },
     )
-
-    return {'success': True, 'cart_saved': True}
 
 
 @router.get('/devices/price')
@@ -797,119 +117,44 @@ async def get_device_price(
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Get price for additional devices."""
-    subscription = await resolve_subscription(db, user, subscription_id)
+    """Compatibility projection of the authoritative device add-on calculator."""
+    from app.services.device_addon_service import DeviceAddonError, calculate_device_addon
 
-    if not subscription or subscription.status not in ['active', 'trial']:
-        return {
-            'available': False,
-            'reason': 'Нет активной подписки',
-        }
-
-    tariff = None
-    if subscription.tariff_id:
-        from app.database.crud.tariff import get_tariff_by_id
-
-        tariff = await get_tariff_by_id(db, subscription.tariff_id)
-
-    # Determine device price and max limit from tariff or settings. Shared with
-    # the subscription-response top-up gate (helpers) so the two never drift.
-    device_price, max_device_limit = _resolve_device_addon_price(tariff)
-
-    if not device_price or device_price <= 0:
-        return {
-            'available': False,
-            'reason': 'Докупка устройств недоступна',
-        }
-
-    # Check max device limit
-    current_devices = subscription.device_limit or 1
-    can_add = max_device_limit - current_devices if max_device_limit else None
-
-    if max_device_limit and current_devices >= max_device_limit:
-        return {
-            'available': False,
-            'reason': f'Достигнут максимум устройств ({max_device_limit})',
-            'current_device_limit': current_devices,
-            'max_device_limit': max_device_limit,
-        }
-
-    if max_device_limit and current_devices + devices > max_device_limit:
-        return {
-            'available': False,
-            'reason': f'Можно добавить максимум {can_add} устройств',
-            'current_device_limit': current_devices,
-            'max_device_limit': max_device_limit,
-            'can_add': can_add,
-        }
-
-    # Calculate prorated price
-    now = datetime.now(UTC)
-    end_date = subscription.end_date
-    if end_date.tzinfo is None:
-        end_date = end_date.replace(tzinfo=UTC)
-
-    days_left = max(1, math.ceil((end_date - now).total_seconds() / 86400))
-    total_days = 30
-    # Прорейт по фактическому остатку подписки — как трафик/серверы, без потолка
-    # (раньше был потолок в 1 месяц — #596757). Доначисление за устройства — на продлении.
-    effective_days = days_left
-
-    # Устройства в пределах тарифного лимита — бесплатные
-    if tariff:
-        tariff_included = tariff.device_limit or 0
-        if current_devices < tariff_included:
-            free_devices = tariff_included - current_devices
-            chargeable_devices = max(0, devices - free_devices)
-        else:
-            chargeable_devices = devices
-    else:
-        free_baseline = settings.DEFAULT_DEVICE_LIMIT
-        if current_devices < free_baseline:
-            free_devices = free_baseline - current_devices
-            chargeable_devices = max(0, devices - free_devices)
-        else:
-            chargeable_devices = devices
-
-    # Calculate base price before discount (total first, then floor)
-    base_total_price = int(device_price * chargeable_devices * effective_days / total_days)
-    if chargeable_devices > 0:
-        base_total_price = max(100, base_total_price)
-
-    # Apply discount from promo group
-    period_hint_days = days_left
-    discount_result = _apply_addon_discount(user, 'devices', base_total_price, period_hint_days)
-    total_price_kopeks = discount_result['discounted']
-    devices_discount_percent = discount_result['percent']
-    discount_value = discount_result['discount']
-
-    # Ensure minimum price after discount (except for 100% discount)
-    if devices_discount_percent < 100 and total_price_kopeks > 0:
-        total_price_kopeks = max(100, total_price_kopeks)
-    price_per_device_kopeks = total_price_kopeks // devices if devices > 0 else 0
-
-    response: dict[str, Any] = {
+    try:
+        calculation = await calculate_device_addon(
+            db,
+            user=user,
+            subscription_id=subscription_id,
+            devices_to_add=devices,
+        )
+    except DeviceAddonError as error:
+        return {'available': False, 'reason': str(error), 'code': error.code}
+    total = calculation.price_kopeks
+    current = calculation.original_device_limit
+    maximum = calculation.max_device_limit
+    result = {
         'available': True,
         'devices': devices,
-        'price_per_device_kopeks': price_per_device_kopeks,
-        'price_per_device_label': settings.format_price(price_per_device_kopeks),
-        'total_price_kopeks': total_price_kopeks,
-        'total_price_label': settings.format_price(total_price_kopeks),
-        'current_device_limit': current_devices,
-        'max_device_limit': max_device_limit,
-        'can_add': can_add,
-        'days_left': days_left,
-        'base_device_price_kopeks': device_price,
+        'price_per_device_kopeks': total // devices,
+        'price_per_device_label': settings.format_price(total // devices),
+        'total_price_kopeks': total,
+        'total_price_label': settings.format_price(total),
+        'current_device_limit': current,
+        'max_device_limit': maximum,
+        'can_add': maximum - current if maximum is not None else None,
+        'days_left': calculation.days_left,
+        'base_device_price_kopeks': calculation.monthly_price_kopeks,
     }
-
-    # Add discount info if applicable
-    if devices_discount_percent > 0:
-        response['discount_percent'] = devices_discount_percent
-        response['discount_kopeks'] = discount_value
-        response['base_total_price_kopeks'] = base_total_price
-        response['original_price_per_device_kopeks'] = base_total_price // devices if devices > 0 else 0
-
-    return response
+    if calculation.discount_percent:
+        result.update(
+            {
+                'discount_percent': calculation.discount_percent,
+                'discount_kopeks': max(0, calculation.base_price_kopeks - total),
+                'base_total_price_kopeks': calculation.base_price_kopeks,
+                'original_price_per_device_kopeks': calculation.base_price_kopeks // devices,
+            }
+        )
+    return result
 
 
 # ============ Device Management (list/delete) ============

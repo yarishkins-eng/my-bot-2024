@@ -1,0 +1,809 @@
+"""Real PostgreSQL regressions for add-on Platega settlement."""
+
+import uuid
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from sqlalchemy import func, select
+
+from app.config import settings
+from app.database.models import (
+    AccountErasureRequest,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
+    PaymentMethod,
+    PlategaPayment,
+    Subscription,
+    Tariff,
+    Transaction,
+    TransactionType,
+    User,
+)
+from app.services import device_addon_payment_service as payments
+from app.services.device_addon_payment_service import (
+    create_device_addon_topup,
+    reconcile_device_addon_payment,
+)
+from app.services.device_addon_service import DeviceAddonError
+from app.services.device_first_deposit_outbox_service import apply_deposit_referral_money
+from app.services.payment.platega import PlategaPaymentMixin
+from app.services.platega_service import PlategaService
+from tests.integration.test_device_addon_lifecycle_postgres import DATABASE_URL, sessions  # noqa: F401
+
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.skipif(not DATABASE_URL, reason='Requires isolated addon PostgreSQL')]
+
+
+async def _late_payment_graph(db):
+    user = User(
+        telegram_id=7_781_000_000 + int(uuid.uuid4().hex[:5], 16),
+        balance_kopeks=0,
+        status='active',
+        language='ru',
+        referral_code=uuid.uuid4().hex[:12],
+        remnawave_uuid=str(uuid.uuid4()),
+    )
+    db.add(user)
+    await db.flush()
+    subscription = Subscription(
+        user_id=user.id,
+        end_date=datetime.now(UTC) + timedelta(days=30),
+        status='active',
+        is_trial=False,
+        device_limit=2,
+        remnawave_short_id=uuid.uuid4().hex[:16],
+    )
+    db.add(subscription)
+    await db.flush()
+    intent = DeviceAddonIntent(
+        public_id=str(uuid.uuid4()),
+        user_id=user.id,
+        subscription_id=subscription.id,
+        target_subscription_id=subscription.id,
+        idempotency_key=uuid.uuid4().hex,
+        request_hash='a' * 64,
+        devices_to_add=1,
+        original_device_limit=2,
+        end_date=subscription.end_date,
+        device_addon_generation=0,
+        days_left=30,
+        monthly_price_kopeks=10_000,
+        base_price_kopeks=10_000,
+        quoted_price_kopeks=10_000,
+    )
+    db.add(intent)
+    await db.flush()
+
+    async def add_attempt(*, status: str, holds_slot: bool):
+        correlation = uuid.uuid4().hex
+        provider_id = str(uuid.uuid4())
+        payment = PlategaPayment(
+            user_id=user.id,
+            correlation_id=correlation,
+            amount_kopeks=10_000,
+            currency='RUB',
+            payment_method_code=2,
+            status='CANCELED' if status == 'terminal' else 'PENDING',
+            platega_transaction_id=provider_id,
+            payload=f'platega:{correlation}',
+            metadata_json={},
+        )
+        db.add(payment)
+        await db.flush()
+        attempt = DeviceAddonTopupAttempt(
+            public_id=str(uuid.uuid4()),
+            user_id=user.id,
+            intent_id=intent.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash=uuid.uuid4().hex * 2,
+            method_key='2',
+            provider_method_code=2,
+            expected_amount_kopeks=10_000,
+            requested_amount_kopeks=10_000,
+            status=status,
+            holds_invoice_slot=holds_slot,
+            platega_payment_id=payment.id,
+            provider_payment_id=provider_id,
+            correlation_id=correlation,
+        )
+        db.add(attempt)
+        await db.flush()
+        return payment, attempt
+
+    old_payment, old_attempt = await add_attempt(status='terminal', holds_slot=False)
+    _, current_attempt = await add_attempt(status='pending', holds_slot=True)
+    await db.commit()
+    return user, intent, old_payment, old_attempt, current_attempt
+
+
+async def _active_intent_graph(db):
+    user = User(
+        telegram_id=7_783_000_000 + int(uuid.uuid4().hex[:5], 16),
+        balance_kopeks=0,
+        status='active',
+        language='ru',
+        referral_code=uuid.uuid4().hex[:12],
+        remnawave_uuid=str(uuid.uuid4()),
+    )
+    db.add(user)
+    await db.flush()
+    tariff = Tariff(
+        name='addon payment race',
+        device_limit=1,
+        max_device_limit=10,
+        device_price_kopeks=5000,
+    )
+    db.add(tariff)
+    await db.flush()
+    subscription = Subscription(
+        user_id=user.id,
+        tariff_id=tariff.id,
+        end_date=datetime.now(UTC) + timedelta(days=30),
+        status='active',
+        is_trial=False,
+        device_limit=1,
+        remnawave_short_id=uuid.uuid4().hex[:16],
+    )
+    db.add(subscription)
+    await db.flush()
+    intent = DeviceAddonIntent(
+        public_id=str(uuid.uuid4()),
+        user_id=user.id,
+        subscription_id=subscription.id,
+        target_subscription_id=subscription.id,
+        tariff_id=tariff.id,
+        idempotency_key=uuid.uuid4().hex,
+        request_hash='a' * 64,
+        devices_to_add=1,
+        original_device_limit=1,
+        panel_uuid=user.remnawave_uuid,
+        end_date=subscription.end_date,
+        device_addon_generation=0,
+        days_left=30,
+        monthly_price_kopeks=5000,
+        base_price_kopeks=5000,
+        quoted_price_kopeks=5000,
+    )
+    db.add(intent)
+    await db.commit()
+    return user, subscription, intent
+
+
+async def _closing_referred_paid_graph(db, *, referrer_erased: bool = False):
+    now = datetime.now(UTC)
+    referrer = User(
+        telegram_id=7_784_000_000 + int(uuid.uuid4().hex[:5], 16),
+        balance_kopeks=0,
+        status='deleted' if referrer_erased else 'active',
+        language='ru',
+        referral_code=uuid.uuid4().hex[:12],
+        account_erasure_requested_at=now if referrer_erased else None,
+        account_erased_at=now if referrer_erased else None,
+    )
+    db.add(referrer)
+    await db.flush()
+    buyer = User(
+        telegram_id=7_785_000_000 + int(uuid.uuid4().hex[:5], 16),
+        balance_kopeks=0,
+        status='deleted',
+        language='ru',
+        referral_code=uuid.uuid4().hex[:12],
+        referred_by_id=referrer.id,
+        has_made_first_topup=False,
+        account_erasure_requested_at=now,
+    )
+    db.add(buyer)
+    await db.flush()
+    subscription = Subscription(
+        user_id=buyer.id,
+        end_date=now + timedelta(days=30),
+        status='disabled',
+        is_trial=False,
+        device_limit=2,
+        remnawave_short_id=uuid.uuid4().hex[:16],
+    )
+    db.add(subscription)
+    await db.flush()
+    intent = DeviceAddonIntent(
+        public_id=str(uuid.uuid4()),
+        user_id=buyer.id,
+        subscription_id=subscription.id,
+        target_subscription_id=subscription.id,
+        idempotency_key=uuid.uuid4().hex,
+        request_hash='d' * 64,
+        devices_to_add=1,
+        original_device_limit=2,
+        end_date=subscription.end_date,
+        device_addon_generation=0,
+        days_left=30,
+        monthly_price_kopeks=10_000,
+        base_price_kopeks=10_000,
+        quoted_price_kopeks=10_000,
+    )
+    db.add(intent)
+    await db.flush()
+    source = Transaction(
+        user_id=buyer.id,
+        type=TransactionType.DEPOSIT.value,
+        amount_kopeks=10_000,
+        payment_method=PaymentMethod.PLATEGA.value,
+        external_id=str(uuid.uuid4()),
+        device_first_ledger_key=f'device-addon-deposit:{uuid.uuid4()}',
+        is_completed=True,
+        completed_at=now,
+    )
+    db.add(source)
+    await db.flush()
+    correlation = uuid.uuid4().hex
+    payment = PlategaPayment(
+        user_id=buyer.id,
+        correlation_id=correlation,
+        amount_kopeks=10_000,
+        currency='RUB',
+        payment_method_code=2,
+        status='CONFIRMED',
+        is_paid=True,
+        transaction_id=source.id,
+        platega_transaction_id=source.external_id,
+        payload=f'platega:{correlation}',
+    )
+    db.add(payment)
+    await db.flush()
+    attempt = DeviceAddonTopupAttempt(
+        public_id=str(uuid.uuid4()),
+        user_id=buyer.id,
+        intent_id=intent.id,
+        idempotency_key=uuid.uuid4().hex,
+        request_hash='e' * 64,
+        method_key='2',
+        provider_method_code=2,
+        expected_amount_kopeks=10_000,
+        requested_amount_kopeks=10_000,
+        credited_amount_kopeks=10_000,
+        status='paid',
+        holds_invoice_slot=False,
+        platega_payment_id=payment.id,
+        provider_payment_id=source.external_id,
+        correlation_id=correlation,
+        deposit_transaction_id=source.id,
+        referral_status='pending',
+        event_status='pending',
+        next_reconcile_at=now,
+        paid_at=now,
+    )
+    db.add(attempt)
+    db.add(
+        AccountErasureRequest(
+            user_id=buyer.id,
+            requested_by_user_id=buyer.id,
+            state='awaiting_reconciliation',
+        )
+    )
+    if referrer_erased:
+        db.add(
+            AccountErasureRequest(
+                user_id=referrer.id,
+                requested_by_user_id=referrer.id,
+                state='completed',
+                finalized_at=now,
+            )
+        )
+    await db.commit()
+    return buyer, referrer, source, payment, attempt
+
+
+def _configure_referral_money(monkeypatch):
+    from app.services import device_first_deposit_outbox_service as referral_money
+
+    monkeypatch.setattr(referral_money, 'get_user_campaign_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(referral_money, 'get_referral_reward_payment_count', AsyncMock(return_value=0))
+    monkeypatch.setattr(referral_money, 'calculate_referral_commission_percent', AsyncMock(return_value=10))
+    monkeypatch.setattr(referral_money, '_is_commission_limit_reached', AsyncMock(return_value=False))
+    monkeypatch.setattr(settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 1)
+    monkeypatch.setattr(settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 100)
+    monkeypatch.setattr(settings, 'REFERRAL_INVITER_BONUS_KOPEKS', 200)
+
+
+async def test_terminal_old_invoice_can_settle_after_new_invoice_without_reclaiming_slot(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+    async with sessions() as db:
+        user, _, _, old_attempt, current_attempt = await _late_payment_graph(db)
+        payload = {
+            'id': old_attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=old_attempt.id, payload=payload)
+        await reconcile_device_addon_payment(db, attempt_id=old_attempt.id, payload=payload)
+        await db.refresh(user)
+        await db.refresh(old_attempt)
+        await db.refresh(current_attempt)
+        assert user.balance_kopeks == 10_000
+        assert old_attempt.status == 'paid'
+        assert old_attempt.holds_invoice_slot is False
+        assert current_attempt.status == 'pending'
+        assert current_attempt.holds_invoice_slot is True
+        assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 1
+
+
+async def test_wrong_currency_on_old_invoice_holds_only_that_invoice(sessions):
+    async with sessions() as db:
+        user, _, old_payment, old_attempt, current_attempt = await _late_payment_graph(db)
+        payload = {
+            'id': old_attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'USD'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=old_attempt.id, payload=payload)
+        await db.refresh(user)
+        await db.refresh(old_payment)
+        await db.refresh(old_attempt)
+        await db.refresh(current_attempt)
+        assert user.balance_kopeks == 0
+        assert old_payment.status == 'OPERATOR_REVIEW'
+        assert old_attempt.status == 'operator_review'
+        assert old_attempt.holds_invoice_slot is False
+        assert current_attempt.status == 'pending'
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+
+@pytest.mark.parametrize(
+    'mutation',
+    [
+        {'id': 'wrong-provider-id'},
+        {'paymentDetails': {'amount': '99.99', 'currency': 'RUB'}},
+        {'payload': 'platega:wrong-correlation'},
+    ],
+    ids=['provider-id', 'amount', 'correlation-payload'],
+)
+async def test_canonical_identity_amount_and_present_payload_must_all_match(sessions, mutation):
+    async with sessions() as db:
+        user, _, old_payment, old_attempt, current_attempt = await _late_payment_graph(db)
+        payload = {
+            'id': old_attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+            'payload': f'platega:{old_attempt.correlation_id}',
+        }
+        payload.update(mutation)
+        await reconcile_device_addon_payment(db, attempt_id=old_attempt.id, payload=payload)
+        await db.refresh(user)
+        await db.refresh(old_payment)
+        await db.refresh(old_attempt)
+        await db.refresh(current_attempt)
+        assert user.balance_kopeks == 0
+        assert old_payment.status == 'OPERATOR_REVIEW'
+        assert old_attempt.status == 'operator_review'
+        assert old_attempt.holds_invoice_slot is False
+        assert current_attempt.status == 'pending'
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+
+async def test_unproven_crypto_method_is_rejected_before_any_financial_write(sessions, monkeypatch):
+    globally_available = AsyncMock(return_value=[{'key': 'crypto', 'provider_code': 13}])
+    provider_factory = MagicMock()
+    monkeypatch.setattr(payments, 'available_platega_methods_for_db', globally_available)
+    monkeypatch.setattr(payments, 'PlategaService', provider_factory)
+
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        with pytest.raises(DeviceAddonError) as error:
+            await create_device_addon_topup(
+                db,
+                intent_public_id=intent.public_id,
+                user_id=user.id,
+                idempotency_key=uuid.uuid4().hex,
+                request_hash='f' * 64,
+                method_key='13',
+                expected_amount_kopeks=5_000,
+                return_url=None,
+                failed_url=None,
+            )
+
+        assert error.value.code == 'payment_method_unavailable'
+        globally_available.assert_awaited_once()
+        provider_factory.assert_not_called()
+        assert await db.scalar(select(func.count(DeviceAddonTopupAttempt.id))) == 0
+        assert await db.scalar(select(func.count(PlategaPayment.id))) == 0
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+
+async def test_early_exact_webhook_during_lost_create_response_never_uses_generic_finalizer(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'DEVICE_ADDON_PURCHASE_ENABLED', True)
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test')
+    monkeypatch.setattr(settings, 'PLATEGA_MIN_AMOUNT_KOPEKS', 10_000)
+    monkeypatch.setattr(settings, 'PLATEGA_MAX_AMOUNT_KOPEKS', 10_000_000)
+    monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(
+        payments,
+        'available_platega_methods_for_db',
+        AsyncMock(return_value=[{'provider_code': 2}]),
+    )
+    provider_id = str(uuid.uuid4())
+    provider_posts = 0
+
+    class EarlyWebhookThenLostResponse(PlategaService):
+        def __init__(self):
+            self._max_retries = 3
+
+        async def create_payment(self, **kwargs):
+            nonlocal provider_posts
+            provider_posts += 1
+            assert self._max_retries == 1
+            async with sessions() as callback_db:
+                handled = await PlategaPaymentMixin().process_platega_webhook(
+                    callback_db,
+                    {
+                        'id': provider_id,
+                        'status': 'CONFIRMED',
+                        'paymentMethod': 'SBPQR',
+                        'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+                        'payload': kwargs['payload'],
+                    },
+                )
+                assert handled is True
+            # The invoice was created remotely, but the POST response was lost.
+
+    monkeypatch.setattr(payments, 'PlategaService', EarlyWebhookThenLostResponse)
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        attempt = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='b' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        await db.refresh(user)
+        await db.refresh(attempt)
+        local_payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+        assert provider_posts == 1
+        assert attempt.status == 'reconciling'
+        assert attempt.provider_payment_id == provider_id
+        assert local_payment.is_paid is False
+        assert local_payment.transaction_id is None
+        assert user.balance_kopeks == 0
+        assert await db.scalar(select(func.count(DeviceAddonTopupAttempt.id))) == 1
+        assert await db.scalar(select(func.count(PlategaPayment.id))) == 1
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+        with pytest.raises(DeviceAddonError) as active_error:
+            await create_device_addon_topup(
+                db,
+                intent_public_id=intent.public_id,
+                user_id=user.id,
+                idempotency_key=uuid.uuid4().hex,
+                request_hash='c' * 64,
+                method_key='2',
+                expected_amount_kopeks=10_000,
+                return_url=None,
+                failed_url=None,
+            )
+        assert active_error.value.code == 'payment_attempt_active'
+        assert provider_posts == 1
+
+        canonical = {
+            'id': provider_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+            'payload': f'platega:{attempt.correlation_id}',
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=canonical)
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=canonical)
+        await db.refresh(user)
+        assert user.balance_kopeks == 10_000
+        assert await db.scalar(select(func.count(Transaction.id))) == 1
+
+
+async def test_post_paid_provider_regressions_preserve_receipt_and_effect_progress(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+    async with sessions() as db:
+        user, _, payment, attempt, _ = await _late_payment_graph(db)
+        confirmed = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=confirmed)
+        attempt.referral_status = 'done'
+        attempt.event_status = 'done'
+        await db.commit()
+        deposit_id = attempt.deposit_transaction_id
+        paid_at = attempt.paid_at
+
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=None)
+        pending = {**confirmed, 'status': 'PENDING'}
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=pending)
+        wrong = {
+            **confirmed,
+            'paymentDetails': {'amount': '101.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=wrong)
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=confirmed)
+        await db.refresh(user)
+        await db.refresh(payment)
+        await db.refresh(attempt)
+        assert user.balance_kopeks == 10_000
+        assert attempt.status == 'paid'
+        assert attempt.holds_invoice_slot is False
+        assert attempt.deposit_transaction_id == deposit_id
+        assert attempt.paid_at == paid_at
+        assert attempt.referral_status == 'done'
+        assert attempt.event_status == 'done'
+        assert payment.is_paid is True
+        assert payment.transaction_id == deposit_id
+        assert await db.scalar(select(func.count(Transaction.id))) == 1
+
+
+async def test_paid_effect_recovery_respects_next_reconcile_backoff(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+    run_effects = AsyncMock()
+    monkeypatch.setattr(payments, '_run_paid_effects', run_effects)
+    async with sessions() as db:
+        _, _, _, attempt, current_attempt = await _late_payment_graph(db)
+        confirmed = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=confirmed)
+        future = datetime.now(UTC) + timedelta(minutes=5)
+        attempt.event_status = 'pending'
+        attempt.next_reconcile_at = future
+        current_attempt.next_reconcile_at = future
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 0
+        run_effects.assert_not_awaited()
+
+
+async def test_redacted_erasure_binding_still_fences_late_confirmed_money(sessions):
+    async with sessions() as db:
+        user, _, payment, attempt, _ = await _late_payment_graph(db)
+        now = datetime.now(UTC)
+        user.account_erasure_requested_at = now
+        payment.payload = None
+        payment.metadata_json = {}
+        request = AccountErasureRequest(
+            user_id=user.id,
+            requested_by_user_id=user.id,
+            state='ready_for_anonymization',
+            financial_resolution_at=now,
+            financial_resolved_by_user_id=user.id,
+            financial_resolution_code='owner_approved',
+            financial_resolution_note='resolved before late provider observation',
+        )
+        db.add(request)
+        await db.commit()
+        canonical = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=canonical)
+        await db.refresh(user)
+        await db.refresh(payment)
+        await db.refresh(attempt)
+        await db.refresh(request)
+        assert user.balance_kopeks == 0
+        assert payment.status == 'OPERATOR_REVIEW'
+        assert attempt.status == 'operator_review'
+        assert attempt.reconciliation_reason == 'paid_after_account_lifecycle_change'
+        assert request.state == 'awaiting_manual_resolution'
+        assert request.resolution_code == 'late_device_first_payment_callback'
+        assert request.financial_resolution_at is None
+        assert request.financial_resolved_by_user_id is None
+        assert request.financial_resolution_code is None
+        assert request.last_late_payment_blocked_at is not None
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+
+async def test_redacted_payload_does_not_relax_internal_correlation_binding(sessions):
+    async with sessions() as db:
+        user, _, payment, attempt, _ = await _late_payment_graph(db)
+        payment.payload = None
+        payment.correlation_id = uuid.uuid4().hex
+        await db.commit()
+        canonical = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=canonical)
+        await db.refresh(user)
+        await db.refresh(payment)
+        await db.refresh(attempt)
+        assert user.balance_kopeks == 0
+        assert payment.status == 'OPERATOR_REVIEW'
+        assert attempt.status == 'operator_review'
+        assert attempt.reconciliation_reason == 'durable_payment_binding_mismatch'
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+
+async def test_closing_owner_referral_is_credited_once_then_event_is_skipped(sessions, monkeypatch):
+    _configure_referral_money(monkeypatch)
+    async with sessions() as db:
+        buyer, referrer, source, _, attempt = await _closing_referred_paid_graph(db)
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await db.refresh(buyer)
+        await db.refresh(referrer)
+        await db.refresh(attempt)
+        rewards = list(
+            (
+                await db.execute(
+                    select(Transaction)
+                    .where(Transaction.device_first_ledger_key.like(f'deposit-side-effect:{source.id}:%'))
+                    .order_by(Transaction.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [(row.user_id, row.amount_kopeks) for row in rewards] == [
+            (buyer.id, 100),
+            (referrer.id, 1_200),
+        ]
+        assert buyer.balance_kopeks == 100
+        assert referrer.balance_kopeks == 1_200
+        assert attempt.referral_status == 'done'
+        assert attempt.event_status == 'done'
+
+        # Replays find no work and cannot award either wallet twice.
+        assert await payments.recover_device_addon_payments(db, limit=1) == 0
+        await db.refresh(buyer)
+        await db.refresh(referrer)
+        assert buyer.balance_kopeks == 100
+        assert referrer.balance_kopeks == 1_200
+        assert (
+            await db.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.device_first_ledger_key.like(f'deposit-side-effect:{source.id}:%')
+                )
+            )
+            == 2
+        )
+
+        # The evidence is single-use. A later ordinary increase with the same
+        # delta is still suppressed by the production 0098/0106 fence.
+        buyer.balance_kopeks += 100
+        await db.commit()
+        await db.refresh(buyer)
+        assert buyer.balance_kopeks == 100
+
+
+async def test_trigger_consumes_pending_reward_evidence_before_second_same_delta_update(sessions, monkeypatch):
+    _configure_referral_money(monkeypatch)
+    async with sessions() as db:
+        buyer, referrer, source, _, attempt = await _closing_referred_paid_graph(db)
+        recipients = await apply_deposit_referral_money(db, source_transaction_id=source.id)
+        await db.refresh(buyer)
+        await db.refresh(referrer)
+        await db.refresh(attempt)
+        assert recipients == [buyer.id, referrer.id]
+        assert attempt.referral_status == 'processing'
+        assert buyer.balance_kopeks == 100
+
+        buyer.balance_kopeks += 100
+        await db.flush()
+        await db.refresh(buyer)
+        assert buyer.balance_kopeks == 100
+        await db.rollback()
+
+
+async def test_erased_referrer_never_gets_false_reward_ledger(sessions, monkeypatch):
+    _configure_referral_money(monkeypatch)
+    async with sessions() as db:
+        buyer, referrer, source, _, attempt = await _closing_referred_paid_graph(db, referrer_erased=True)
+        source_id = source.id
+        request = await db.scalar(select(AccountErasureRequest).where(AccountErasureRequest.user_id == buyer.id))
+        request.state = 'ready_for_anonymization'
+        request.financial_resolution_at = datetime.now(UTC)
+        request.financial_resolved_by_user_id = buyer.id
+        request.financial_resolution_code = 'balance_writeoff_approved'
+        request.financial_resolution_note = 'Previously approved before deferred referral processing.'
+        await db.commit()
+
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await db.refresh(buyer)
+        await db.refresh(referrer)
+        await db.refresh(attempt)
+        await db.refresh(request)
+        assert buyer.balance_kopeks == 0
+        assert referrer.balance_kopeks == 0
+        assert attempt.referral_status == 'operator_review'
+        assert attempt.reconciliation_reason == 'referral_reward_recipient_account_closed'
+        assert request.state == 'awaiting_manual_resolution'
+        assert request.resolution_code == 'late_device_first_payment_callback'
+        assert request.last_late_payment_blocked_at is not None
+        assert request.financial_resolution_at is None
+        assert request.financial_resolved_by_user_id is None
+        assert request.financial_resolution_code is None
+        assert request.financial_resolution_note is None
+        assert (
+            await db.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.device_first_ledger_key.like(f'deposit-side-effect:{source_id}:%')
+                )
+            )
+            == 0
+        )
+        # A held liability is not retried by a timer, even if its event is
+        # pending. Explicit audited resolution must not restart it either.
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(days=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 0
+        attempt.referral_status = 'resolved_manually'
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 0
+
+
+async def test_referral_money_helper_replay_cannot_turn_first_payment_into_recurring_commission(sessions, monkeypatch):
+    _configure_referral_money(monkeypatch)
+
+    async with sessions() as db:
+        referrer = User(
+            telegram_id=7_782_000_001,
+            balance_kopeks=0,
+            status='active',
+            language='ru',
+            referral_code=uuid.uuid4().hex[:12],
+        )
+        db.add(referrer)
+        await db.flush()
+        buyer = User(
+            telegram_id=7_782_000_002,
+            balance_kopeks=10_000,
+            status='active',
+            language='ru',
+            referral_code=uuid.uuid4().hex[:12],
+            referred_by_id=referrer.id,
+            has_made_first_topup=False,
+        )
+        db.add(buyer)
+        await db.flush()
+        source = Transaction(
+            user_id=buyer.id,
+            type=TransactionType.DEPOSIT.value,
+            amount_kopeks=10_000,
+            payment_method=PaymentMethod.PLATEGA.value,
+            external_id=str(uuid.uuid4()),
+            device_first_ledger_key=f'device-addon-deposit:{uuid.uuid4()}',
+            is_completed=True,
+            completed_at=datetime.now(UTC),
+        )
+        db.add(source)
+        await db.commit()
+
+        first = await apply_deposit_referral_money(db, source_transaction_id=source.id)
+        await db.commit()
+        second = await apply_deposit_referral_money(db, source_transaction_id=source.id)
+        await db.commit()
+        await db.refresh(buyer)
+        await db.refresh(referrer)
+        rewards = list(
+            (
+                await db.execute(
+                    select(Transaction).where(
+                        Transaction.device_first_ledger_key.like(f'deposit-side-effect:{source.id}:%')
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert first == second == [buyer.id, referrer.id]
+        assert len(rewards) == 2
+        assert buyer.balance_kopeks == 10_100
+        assert referrer.balance_kopeks == 1_200

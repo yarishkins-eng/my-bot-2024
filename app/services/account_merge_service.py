@@ -21,6 +21,8 @@ from app.database.models import (
     CloudPaymentsPayment,
     ContestAttempt,
     CryptoBotPayment,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
     DiscountOffer,
     FreekassaPayment,
     GuestPurchase,
@@ -529,6 +531,35 @@ async def _handle_subscription_merge(
         )
 
 
+async def _guard_device_addon_merge(db: AsyncSession, user_ids: list[int]) -> None:
+    """Keep late provider bindings and fulfilled targets out of destructive merge.
+
+    A single-tariff merge physically removes the losing subscription. Only
+    selections with no invoice and no receipt can be safely revoked first.
+    Caller holds payment rows, then both User rows in ID order.
+    """
+    if await db.scalar(
+        select(DeviceAddonTopupAttempt.id).where(DeviceAddonTopupAttempt.user_id.in_(user_ids)).limit(1)
+    ):
+        raise ValueError('На аккаунте есть счёт докупки устройств. Перед объединением требуется финансовая сверка.')
+    intents = list(
+        await db.scalars(
+            select(DeviceAddonIntent)
+            .where(DeviceAddonIntent.user_id.in_(user_ids))
+            .order_by(DeviceAddonIntent.id)
+            .with_for_update()
+        )
+    )
+    if any(intent.purchase_state == 'purchased' or intent.transaction_id is not None for intent in intents):
+        raise ValueError(
+            'На аккаунте есть выполненная докупка устройств. Перед объединением требуется проверка её выдачи.'
+        )
+    for intent in intents:
+        await db.delete(intent)
+    if intents:
+        await db.flush()
+
+
 async def execute_merge(
     db: AsyncSession,
     primary_user_id: int,
@@ -561,6 +592,22 @@ async def execute_merge(
 
     if primary_user_id == secondary_user_id:
         raise ValueError('primary_user_id и secondary_user_id не могут совпадать')
+
+    merge_user_ids = sorted([primary_user_id, secondary_user_id])
+    await db.execute(
+        select(PlategaPayment.id)
+        .where(PlategaPayment.user_id.in_(merge_user_ids))
+        .order_by(PlategaPayment.id)
+        .with_for_update()
+    )
+    await db.execute(
+        select(User)
+        .where(User.id.in_(merge_user_ids))
+        .order_by(User.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    await _guard_device_addon_merge(db, merge_user_ids)
 
     primary = await get_user_by_id(db, primary_user_id)
     secondary = await get_user_by_id(db, secondary_user_id)

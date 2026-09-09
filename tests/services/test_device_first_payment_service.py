@@ -344,6 +344,7 @@ async def test_signed_terminal_callback_routes_redacted_direct_payment_away_from
         raise AssertionError(f'unexpected module: {name}')
 
     monkeypatch.setattr('app.services.payment.platega.import_module', import_module)
+    monkeypatch.setattr(PlategaPaymentMixin, '_get_durable_device_addon_attempt', AsyncMock(return_value=None))
     monkeypatch.setattr(PlategaPaymentMixin, '_get_durable_direct_attempt', AsyncMock(return_value=attempt))
     monkeypatch.setattr(
         'app.services.device_first_payment_service._queue_direct_callback_for_canonical_reconciliation', queue

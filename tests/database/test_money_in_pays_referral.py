@@ -68,6 +68,10 @@ KNOWN_MONEY_IN = {
     ('app/services/device_first_payment_service.py', 'settle_device_first_platega_payment'): (
         'платит через ensure_deposit_outbox — довнесение недостачи к кошельку'
     ),
+    ('app/services/device_addon_payment_service.py', '_settle_locked'): (
+        'платит через durable DeviceAddonTopupAttempt: recovery вызывает '
+        'apply_deposit_referral_money по неизменному deposit transaction id'
+    ),
     ('app/services/device_first_checkout_service.py', 'refund_operator_review_checkout'): (
         'ПЛАТИТ через ensure_deposit_outbox: оператор кладёт проверенные деньги клиенту НА '
         'БАЛАНС — это приход, а не возврат на карту (РФ-4, 29.08.2026). '
