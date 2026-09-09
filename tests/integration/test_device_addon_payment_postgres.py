@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import func, select
@@ -380,6 +380,35 @@ async def test_canonical_identity_amount_and_present_payload_must_all_match(sess
         assert old_attempt.status == 'operator_review'
         assert old_attempt.holds_invoice_slot is False
         assert current_attempt.status == 'pending'
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+
+async def test_unproven_crypto_method_is_rejected_before_any_financial_write(sessions, monkeypatch):
+    globally_available = AsyncMock(return_value=[{'key': 'crypto', 'provider_code': 13}])
+    provider_factory = MagicMock()
+    monkeypatch.setattr(payments, 'available_platega_methods_for_db', globally_available)
+    monkeypatch.setattr(payments, 'PlategaService', provider_factory)
+
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        with pytest.raises(DeviceAddonError) as error:
+            await create_device_addon_topup(
+                db,
+                intent_public_id=intent.public_id,
+                user_id=user.id,
+                idempotency_key=uuid.uuid4().hex,
+                request_hash='f' * 64,
+                method_key='13',
+                expected_amount_kopeks=5_000,
+                return_url=None,
+                failed_url=None,
+            )
+
+        assert error.value.code == 'payment_method_unavailable'
+        globally_available.assert_awaited_once()
+        provider_factory.assert_not_called()
+        assert await db.scalar(select(func.count(DeviceAddonTopupAttempt.id))) == 0
+        assert await db.scalar(select(func.count(PlategaPayment.id))) == 0
         assert await db.scalar(select(func.count(Transaction.id))) == 0
 
 

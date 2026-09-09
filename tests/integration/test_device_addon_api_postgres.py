@@ -14,8 +14,8 @@ from app.cabinet.dependencies import get_cabinet_db, get_current_cabinet_user
 from app.cabinet.routes.subscription_modules.device_addon import router
 from app.config import settings
 from app.database.crud.user import get_user_by_id
-from app.database.models import DeviceAddonTopupAttempt, PlategaPayment, Tariff, Transaction, User
-from app.services import device_addon_payment_service as payments
+from app.database.models import DeviceAddonIntent, DeviceAddonTopupAttempt, PlategaPayment, Tariff, Transaction, User
+from app.services import device_addon_payment_service as payments, device_addon_worker as worker_module
 from app.services.device_addon_service import (
     calculate_device_addon,
     create_intent,
@@ -23,7 +23,7 @@ from app.services.device_addon_service import (
     quote_for_calculation,
 )
 from app.services.platega_service import PlategaService
-from tests.integration.test_device_addon_core_postgres import _active_target
+from tests.integration.test_device_addon_core_postgres import _active_target, _fake_remnawave_service
 from tests.integration.test_device_addon_lifecycle_postgres import DATABASE_URL, seed, sessions  # noqa: F401
 
 
@@ -268,6 +268,32 @@ async def test_http_quote_invoice_owned_return_and_manual_purchase(sessions, mon
         assert bought.json()['receipt'] == repeated.json()['receipt']
         assert bought.json()['receipt']['new_device_limit'] == 4
         assert bought.json()['fulfillment_status'] == 'pending'
+        # Continue the same HTTP purchase through failed external delivery and
+        # a fresh worker process object. The durable receipt must survive both.
+        panel_calls = []
+        monkeypatch.setattr(worker_module, 'AsyncSessionLocal', sessions)
+        _fake_remnawave_service(monkeypatch, calls=panel_calls, result=None)
+        worker = worker_module.DeviceAddonWorker()
+        claim = await worker._claim_one()
+        assert claim is not None
+        await worker._fulfill_claim(*claim)
+        pending = await client.get(f'/cabinet/subscription/devices/intents/{intent_id}')
+        assert pending.json()['fulfillment_status'] == 'pending'
+        assert pending.json()['receipt'] == bought.json()['receipt']
+        async with sessions() as db:
+            stored = await db.scalar(select(DeviceAddonIntent).where(DeviceAddonIntent.public_id == intent_id))
+            stored.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+            await db.commit()
+        _fake_remnawave_service(monkeypatch, calls=panel_calls, result=True)
+        restarted_worker = worker_module.DeviceAddonWorker()
+        claim = await restarted_worker._claim_one()
+        assert claim is not None
+        await restarted_worker._fulfill_claim(*claim)
+        ready = await client.get(f'/cabinet/subscription/devices/intents/{intent_id}')
+        assert ready.json()['fulfillment_status'] == 'ready'
+        assert ready.json()['receipt'] == bought.json()['receipt']
+        assert await restarted_worker._claim_one() is None
+        assert len(panel_calls) == 2
         async with sessions() as db:
             assert await db.scalar(select(func.count(Transaction.id))) == 2
             current = await db.get(User, user_id)

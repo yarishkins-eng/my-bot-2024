@@ -42,7 +42,6 @@ from app.services.device_first_deposit_outbox_service import (
     apply_deposit_referral_money,
 )
 from app.services.device_first_payment_service import (
-    PLATEGA_METHODS,
     _provider_method_code,
     _provider_transaction_id,
     available_platega_methods_for_db,
@@ -60,7 +59,11 @@ _ACTIVE_ATTEMPTS = frozenset(
 )
 _NO_ID_REVIEW_DELAY = timedelta(minutes=5)
 _TERMINAL_RECHECK_DELAY = timedelta(hours=6)
-_PLATEGA_OPTION_CODES = {**PLATEGA_METHODS, '2': 2, '11': 11, '13': 13}
+# The first add-on release is proven against live canonical invoices only for
+# SBP and Russian cards.  Other globally enabled Platega methods remain
+# available to their existing flows, but cannot create an add-on invoice until
+# their provider contract has equivalent evidence.
+_PLATEGA_OPTION_CODES = {'sbp': 2, 'cards_ru': 11, '2': 2, '11': 11}
 
 
 def _safe_https_url(value: Any) -> str | None:
