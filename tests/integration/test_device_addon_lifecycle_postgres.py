@@ -13,6 +13,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.config import settings
 from app.database.models import (
     AccountErasureRequest,
     Base,
@@ -49,9 +50,10 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.skipif(not DATABASE_URL, reason='
 
 
 @pytest_asyncio.fixture
-async def sessions():
+async def sessions(monkeypatch):
     if not DATABASE_URL:
         pytest.skip('Requires isolated addon PostgreSQL')
+    monkeypatch.setattr(settings, 'DEVICE_ADDON_PURCHASE_ENABLED', True)
     url = make_url(DATABASE_URL)
     if url.host not in {'localhost', '127.0.0.1'} or not url.database.startswith('teplo_device_test_'):
         raise RuntimeError('Only a disposable local teplo_device_test_* database is allowed')

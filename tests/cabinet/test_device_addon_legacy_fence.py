@@ -7,7 +7,14 @@ import pytest
 from fastapi import HTTPException
 
 from app.cabinet.routes.subscription_modules import devices
+from app.config import Settings
 from app.services import subscription_auto_purchase_service as carts
+
+
+def test_device_purchase_requires_explicit_release_activation(monkeypatch):
+    monkeypatch.delenv('DEVICE_ADDON_PURCHASE_ENABLED', raising=False)
+    configured = Settings(_env_file=None, BOT_TOKEN='123456789:TEST_ONLY_DEVICE_DEFAULT')
+    assert configured.DEVICE_ADDON_PURCHASE_ENABLED is False
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-"""HTTP contract + real PostgreSQL; only the external payment provider is fake."""
+"""HTTP contract + real PostgreSQL; auth, payment provider and VPN panel are controlled fakes."""
 
 import asyncio
 import uuid
@@ -247,6 +247,7 @@ async def test_http_quote_invoice_owned_return_and_manual_purchase(sessions, mon
             assert f'attempt={attempt_id}' in provider_posts[0]['return_url']
 
         observed['status'] = 'CONFIRMED'
+        monkeypatch.setattr(settings, 'DEVICE_ADDON_PURCHASE_ENABLED', False)
         async with sessions() as db:
             attempt = await db.scalar(
                 select(DeviceAddonTopupAttempt).where(DeviceAddonTopupAttempt.public_id == attempt_id)
@@ -258,6 +259,7 @@ async def test_http_quote_invoice_owned_return_and_manual_purchase(sessions, mon
         assert owned.json()['purchase_state'] == 'draft'
         assert owned.json()['devices_to_add'] == 2
         assert owned.json()['quote']['balance_kopeks'] == 10000
+        monkeypatch.setattr(settings, 'DEVICE_ADDON_PURCHASE_ENABLED', True)
         purchase_payload = {'quote_token': owned.json()['quote']['quote_token']}
         bought = await client.post(f'/cabinet/subscription/devices/intents/{intent_id}/purchase', json=purchase_payload)
         assert bought.status_code == 200, bought.text
@@ -268,6 +270,7 @@ async def test_http_quote_invoice_owned_return_and_manual_purchase(sessions, mon
         assert bought.json()['receipt'] == repeated.json()['receipt']
         assert bought.json()['receipt']['new_device_limit'] == 4
         assert bought.json()['fulfillment_status'] == 'pending'
+        monkeypatch.setattr(settings, 'DEVICE_ADDON_PURCHASE_ENABLED', False)
         # Continue the same HTTP purchase through failed external delivery and
         # a fresh worker process object. The durable receipt must survive both.
         panel_calls = []

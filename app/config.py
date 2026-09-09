@@ -332,8 +332,9 @@ class Settings(BaseSettings):
 
     # Stops only new device add-on intents, invoices and wallet debits.  Receipt
     # reads, late-payment reconciliation and already-paid Panel fulfillment
-    # deliberately continue while it is off.
-    DEVICE_ADDON_PURCHASE_ENABLED: bool = True
+    # deliberately continue while it is off. Enable explicitly after release
+    # verification; installing the migration must not open new money actions.
+    DEVICE_ADDON_PURCHASE_ENABLED: bool = False
     DEVICE_ADDON_WORKER_INTERVAL_SECONDS: int = 10
 
     # ID тарифа для триала в режиме тарифов (0 = использовать стандартные настройки триала)
