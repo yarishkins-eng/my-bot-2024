@@ -428,6 +428,30 @@ async def test_customer_receipt_failure_keeps_the_single_credit_retryable(sessio
         retry_bot.send_message.assert_awaited_once()
 
 
+async def test_manual_canonical_get_failure_logs_payment_attempt_and_exception_type(sessions, monkeypatch):
+    class FailingProvider:
+        def __init__(self):
+            self._max_retries = 3
+
+        async def get_transaction(self, transaction_id):
+            assert transaction_id
+            raise TimeoutError('provider timed out')
+
+    monkeypatch.setattr(payments, 'PlategaService', FailingProvider)
+    async with sessions() as db:
+        _, _, payment, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        await db.commit()
+
+        with capture_logs() as logs:
+            await payments.check_device_addon_payment_now(db, platega_payment_id=int(payment.id))
+
+        failure = next(entry for entry in logs if entry.get('event') == 'device_addon_manual_canonical_get_failed')
+        assert failure['platega_payment_id'] == payment.id
+        assert failure['attempt_id'] == attempt.id
+        assert failure['error_type'] == 'TimeoutError'
+
+
 @pytest.mark.parametrize('error_type', [TelegramForbiddenError, TelegramBadRequest])
 async def test_customer_receipt_terminal_failure_finishes_without_retry(sessions, monkeypatch, error_type):
     monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)

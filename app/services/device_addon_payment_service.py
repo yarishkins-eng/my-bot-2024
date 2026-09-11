@@ -1480,7 +1480,13 @@ async def check_device_addon_payment_now(
     service._max_retries = 1
     try:
         payload = await service.get_transaction(attempt_provider_id)
-    except Exception:
+    except Exception as error:
+        logger.warning(
+            'device_addon_manual_canonical_get_failed',
+            platega_payment_id=platega_payment_id,
+            attempt_id=attempt.id,
+            error_type=type(error).__name__,
+        )
         payload = None
     return await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=payload)
 
