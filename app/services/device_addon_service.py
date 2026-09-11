@@ -150,6 +150,7 @@ def _quote_response(calculation: DeviceAddonCalculation, *, user_id: int) -> dic
         },
         'balance_kopeks': calculation.balance_kopeks,
         'missing_kopeks': calculation.missing_kopeks,
+        'purchase_enabled': bool(settings.DEVICE_ADDON_PURCHASE_ENABLED),
         'quote_token': _encode_quote(payload),
         'quote_expires_at': datetime.fromtimestamp(payload['exp'], UTC).isoformat(),
     }
@@ -475,6 +476,7 @@ async def serialize_intent(
         'receipt': intent.receipt_json,
         'fulfillment_status': intent.fulfillment_state,
         'fulfillment_error_code': intent.fulfillment_error_code,
+        'purchase_enabled': bool(settings.DEVICE_ADDON_PURCHASE_ENABLED),
     }
     can_create_topup = False
     if include_quote and intent.purchase_state != 'purchased':

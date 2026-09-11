@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from app.cabinet.routes.subscription_modules import devices
 from app.config import Settings
+from app.handlers.subscription import devices as bot_devices
 from app.services import subscription_auto_purchase_service as carts
 from app.webapi.routes import miniapp
 from app.webapi.schemas.miniapp import MiniAppSubscriptionDevicesUpdateRequest
@@ -17,6 +18,24 @@ def test_device_purchase_requires_explicit_release_activation(monkeypatch):
     monkeypatch.delenv('DEVICE_ADDON_PURCHASE_ENABLED', raising=False)
     configured = Settings(_env_file=None, BOT_TOKEN='123456789:TEST_ONLY_DEVICE_DEFAULT')
     assert configured.DEVICE_ADDON_PURCHASE_ENABLED is False
+
+
+@pytest.mark.asyncio
+async def test_bot_device_addon_entry_hides_button_while_purchase_is_disabled(monkeypatch):
+    monkeypatch.setattr(bot_devices.settings, 'DEVICE_ADDON_PURCHASE_ENABLED', False)
+    monkeypatch.setattr(type(bot_devices.settings), 'get_cabinet_link', lambda self: 'https://cabinet.example.test')
+    callback = SimpleNamespace(
+        answer=AsyncMock(),
+        message=SimpleNamespace(answer=AsyncMock()),
+    )
+    await bot_devices._open_device_addon_cabinet(
+        callback,
+        SimpleNamespace(language='ru'),
+        SimpleNamespace(id=99),
+        2,
+    )
+    callback.answer.assert_awaited_once_with('Докупка устройств временно недоступна.', show_alert=True)
+    callback.message.answer.assert_not_awaited()
 
 
 @pytest.mark.asyncio
