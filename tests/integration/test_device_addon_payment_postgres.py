@@ -1130,7 +1130,7 @@ async def test_live_poll_without_safe_redirect_preserves_operator_review_retry_b
         await db.refresh(payment)
         assert attempt.status == 'operator_review'
         assert attempt.reconcile_attempts == 24
-        assert attempt.reconciliation_reason == 'canonical_invoice_missing_safe_redirect'
+        assert attempt.reconciliation_reason == 'provider_terminal_status_regressed'
         assert payment.status == 'OPERATOR_REVIEW'
 
         attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
