@@ -194,6 +194,14 @@ def _binding_is_exact(*, payment: PlategaPayment, attempt: DeviceAddonTopupAttem
     )
 
 
+def _provider_identity_is_exact(*, payment: PlategaPayment, attempt: DeviceAddonTopupAttempt) -> bool:
+    attempt_provider_id = str(attempt.provider_payment_id) if attempt.provider_payment_id else None
+    payment_provider_id = str(payment.platega_transaction_id) if payment.platega_transaction_id else None
+    return bool(
+        attempt_provider_id and payment_provider_id and hmac.compare_digest(attempt_provider_id, payment_provider_id)
+    )
+
+
 def _mark_operator_review(
     *,
     payment: PlategaPayment,
@@ -930,6 +938,18 @@ async def reconcile_device_addon_payment(
         )
         await db.commit()
         return attempt
+    if not _provider_identity_is_exact(payment=payment, attempt=attempt):
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason='durable_provider_identity_mismatch',
+        )
+        attempt.reconcile_attempts = int(attempt.reconcile_attempts or 0) + 1
+        attempt.lease_token = None
+        attempt.lease_expires_at = None
+        await db.commit()
+        return attempt
     financially_settled = attempt.deposit_transaction_id is not None
     was_terminal = attempt.status == 'terminal'
     if not isinstance(payload, dict):
@@ -1393,19 +1413,18 @@ async def check_device_addon_payment_now(
     if attempt is None:
         raise DeviceAddonError('attempt_not_found', 'Платёж докупки не найден.', status_code=404)
     payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
-    attempt_provider_id = str(attempt.provider_payment_id) if attempt.provider_payment_id else None
-    payment_provider_id = str(payment.platega_transaction_id) if payment and payment.platega_transaction_id else None
-    if not attempt_provider_id or not payment_provider_id:
+    if payment is None or not attempt.provider_payment_id or not payment.platega_transaction_id:
         raise DeviceAddonError(
             'provider_identity_unknown',
             'У платежа нет ID провайдера; его нельзя проверить автоматически.',
         )
-    if not hmac.compare_digest(attempt_provider_id, payment_provider_id):
+    if not _provider_identity_is_exact(payment=payment, attempt=attempt):
         raise DeviceAddonError(
             'provider_identity_mismatch',
             'ID провайдера в платеже не совпадает; нужна проверка оператора.',
             status_code=409,
         )
+    attempt_provider_id = str(attempt.provider_payment_id)
     service = PlategaService()
     service._max_retries = 1
     try:

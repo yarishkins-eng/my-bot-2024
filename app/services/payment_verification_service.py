@@ -434,6 +434,7 @@ def _device_addon_reason_text(attempt: DeviceAddonTopupAttempt) -> str | None:
         return 'Сумма у провайдера не совпала — проверьте настройку комиссии Platega.'
     messages = {
         'provider_identity_unknown_no_retry': 'Провайдер не вернул ID счёта; нужно решение оператора.',
+        'durable_provider_identity_mismatch': 'ID счёта сохранён неполно или не совпадает; нужна проверка.',
         'canonical_invoice_mismatch': 'Данные счёта у провайдера не совпали с ожидаемыми.',
         'closed_by_operator': 'Попытка закрыта оператором без зачисления.',
         'canonical_status_unavailable': 'Не удалось получить канонический статус Platega.',

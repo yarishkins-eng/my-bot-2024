@@ -488,6 +488,61 @@ async def test_canonical_identity_amount_and_present_payload_must_all_match(
         assert await db.scalar(select(func.count(Transaction.id))) == 0
 
 
+@pytest.mark.parametrize('payment_provider_id', [None, 'conflicting-provider-id'], ids=['missing', 'conflicting'])
+async def test_automatic_recovery_requires_matching_provider_identity_mirrors(
+    sessions,
+    monkeypatch,
+    payment_provider_id,
+):
+    async with sessions() as db:
+        user, _, _, old_attempt, attempt = await _late_payment_graph(db)
+        payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+        attempt_provider_id = str(attempt.provider_payment_id)
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        payment.status = 'RECONCILING'
+        payment.platega_transaction_id = payment_provider_id
+        old_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        await db.commit()
+
+        class ConfirmedProvider(PlategaService):
+            def __init__(self):
+                self._max_retries = 1
+
+            async def get_transaction(self, transaction_id):
+                assert transaction_id == attempt_provider_id
+                return {
+                    'id': attempt_provider_id,
+                    'status': 'CONFIRMED',
+                    'paymentMethod': 'SBPQR',
+                    'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+                    'payload': f'platega:{attempt.correlation_id}',
+                }
+
+        monkeypatch.setattr(payments, 'PlategaService', ConfirmedProvider)
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await db.refresh(user)
+        await db.refresh(payment)
+        await db.refresh(attempt)
+        assert user.balance_kopeks == 0
+        assert payment.status == 'OPERATOR_REVIEW'
+        assert attempt.status == 'operator_review'
+        assert attempt.holds_invoice_slot is True
+        assert attempt.reconciliation_reason == 'durable_provider_identity_mismatch'
+        assert attempt.reconcile_attempts == 1
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+        attempt.reconcile_attempts = 23
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await db.refresh(attempt)
+        assert attempt.reconcile_attempts == 24
+
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 0
+
+
 async def test_unproven_crypto_method_is_rejected_before_any_financial_write(sessions, monkeypatch):
     globally_available = AsyncMock(return_value=[{'key': 'crypto', 'provider_code': 13}])
     provider_factory = MagicMock()
