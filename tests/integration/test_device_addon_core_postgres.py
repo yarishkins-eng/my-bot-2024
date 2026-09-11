@@ -3,13 +3,16 @@
 import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import func, select
+from structlog.testing import capture_logs
 
+from app.cabinet.routes import admin_users
 from app.config import settings
 from app.database.models import (
+    AdminAuditLog,
     DeviceAddonIntent,
     DeviceAddonTopupAttempt,
     PlategaPayment,
@@ -234,7 +237,7 @@ async def test_worker_marks_deleted_target_for_review_without_any_panel_call(ses
         stored = await verify.get(DeviceAddonIntent, intent_id)
         assert stored.subscription_id is None
         assert stored.fulfillment_state == 'needs_attention'
-        assert stored.fulfillment_error_code == 'stale_or_reset_target'
+        assert stored.fulfillment_error_code == 'subscription_target_changed'
         owner = await verify.get(User, stored.user_id)
         replay = await purchase_intent(
             verify, user=owner, public_id=stored.public_id, quote_token='expired-or-lost-original-quote'
@@ -365,6 +368,372 @@ async def test_worker_rejects_panel_response_for_a_different_uuid(sessions, monk
         stored = await db.get(DeviceAddonIntent, intent_id)
         assert stored.fulfillment_state == 'pending'
         assert stored.fulfillment_error_code == 'panel_patch_failed'
+
+
+async def test_worker_keeps_retrying_after_three_panel_failures(sessions, monkeypatch):
+    async with sessions() as db:
+        user, subscription = await _active_target(db)
+        intent, quote = await _intent_for(db, user, subscription, devices=1, key='three-panel-failures')
+        await purchase_intent(db, user=user, public_id=intent.public_id, quote_token=quote['quote_token'])
+        intent_id = int(intent.id)
+
+    calls: list[dict] = []
+    _fake_remnawave_service(monkeypatch, calls=calls, result=RuntimeError('panel unavailable'))
+    monkeypatch.setattr(worker_module, 'AsyncSessionLocal', sessions)
+    worker = worker_module.DeviceAddonWorker()
+    for index in range(3):
+        claim = await worker._claim_one()
+        assert claim is not None
+        await worker._fulfill_claim(*claim)
+        async with sessions() as db:
+            stored = await db.get(DeviceAddonIntent, intent_id)
+            assert stored.fulfillment_state == 'pending'
+            assert stored.fulfillment_attempts == index + 1
+            assert stored.fulfillment_error_code == 'panel_patch_failed'
+            stored.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+            await db.commit()
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    ('temporary_state', 'expected_reason'),
+    [('limited', 'subscription_limited'), ('resetting', 'account_reset_busy')],
+)
+async def test_worker_reschedules_temporary_target_states(
+    sessions,
+    monkeypatch,
+    temporary_state,
+    expected_reason,
+):
+    async with sessions() as db:
+        user, subscription = await _active_target(db)
+        intent, quote = await _intent_for(db, user, subscription, devices=1, key=f'temporary-{temporary_state}')
+        await purchase_intent(db, user=user, public_id=intent.public_id, quote_token=quote['quote_token'])
+        if temporary_state == 'limited':
+            subscription.status = 'limited'
+        else:
+            user.test_reset_state = 'resetting'
+        intent_id = int(intent.id)
+        await db.commit()
+
+    calls: list[dict] = []
+    _fake_remnawave_service(monkeypatch, calls=calls, result=True)
+    monkeypatch.setattr(worker_module, 'AsyncSessionLocal', sessions)
+    worker = worker_module.DeviceAddonWorker()
+    if temporary_state == 'resetting':
+        claim = await worker._claim_one()
+        assert claim is None
+    else:
+        for index in range(3):
+            claim = await worker._claim_one()
+            assert claim is not None
+            await worker._fulfill_claim(*claim)
+            async with sessions() as db:
+                stored = await db.get(DeviceAddonIntent, intent_id)
+                assert stored.fulfillment_state == 'pending'
+                assert stored.fulfillment_attempts == 0
+                if index < 2:
+                    stored.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+                    await db.commit()
+
+    async with sessions() as db:
+        stored = await db.get(DeviceAddonIntent, intent_id)
+        assert stored.fulfillment_state == 'pending'
+        if temporary_state == 'resetting':
+            assert stored.fulfillment_attempts == 0
+            assert stored.fulfillment_error_code is None
+        else:
+            assert stored.fulfillment_attempts == 0
+            assert stored.fulfillment_error_code == expected_reason
+        assert stored.lease_token is None
+        if temporary_state != 'resetting':
+            assert stored.next_attempt_at > datetime.now(UTC)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ('permanent_state', 'expected_reason'),
+    [
+        ('deleted_subscription', 'subscription_target_changed'),
+        ('expired_subscription', 'subscription_expired'),
+        ('generation_changed', 'device_addon_generation_changed'),
+        ('anonymization', 'account_anonymization_started'),
+        ('panel_identity_changed', 'panel_identity_changed'),
+    ],
+)
+async def test_worker_reports_distinct_permanent_target_failures(
+    sessions,
+    monkeypatch,
+    permanent_state,
+    expected_reason,
+):
+    async with sessions() as db:
+        user, subscription = await _active_target(db)
+        intent, quote = await _intent_for(db, user, subscription, devices=1, key=f'permanent-{permanent_state}')
+        await purchase_intent(db, user=user, public_id=intent.public_id, quote_token=quote['quote_token'])
+        intent_id = int(intent.id)
+        intent_public_id = str(intent.public_id)
+        user_id = int(user.id)
+        if permanent_state == 'deleted_subscription':
+            await db.delete(subscription)
+        elif permanent_state == 'expired_subscription':
+            subscription.end_date = datetime.now(UTC) - timedelta(seconds=1)
+        elif permanent_state == 'generation_changed':
+            user.device_addon_generation = int(user.device_addon_generation or 0) + 1
+        elif permanent_state == 'anonymization':
+            user.account_erasure_requested_at = datetime.now(UTC)
+        else:
+            user.remnawave_uuid = str(uuid.uuid4())
+        await db.commit()
+
+    calls: list[dict] = []
+    _fake_remnawave_service(monkeypatch, calls=calls, result=True)
+    monkeypatch.setattr(worker_module, 'AsyncSessionLocal', sessions)
+    worker = worker_module.DeviceAddonWorker()
+    claim = await worker._claim_one()
+    assert claim is not None
+    with capture_logs() as logs:
+        await worker._fulfill_claim(*claim)
+
+    async with sessions() as db:
+        stored = await db.get(DeviceAddonIntent, intent_id)
+        assert stored.fulfillment_state == 'needs_attention'
+        assert stored.fulfillment_error_code == expected_reason
+    assert calls == []
+    alert = next(entry for entry in logs if entry.get('event') == 'device_addon_fulfillment_needs_attention')
+    assert alert['intent_public_id'] == intent_public_id
+    assert alert['user_id'] == user_id
+    assert alert['reason'] == expected_reason
+
+
+async def test_exhausted_intent_preserves_reason_and_does_not_block_next_claim(sessions, monkeypatch):
+    async with sessions() as db:
+        first_user, first_subscription = await _active_target(db, balance=100_000)
+        first, first_quote = await _intent_for(
+            db,
+            first_user,
+            first_subscription,
+            devices=1,
+            key='exhausted-first',
+        )
+        await purchase_intent(
+            db,
+            user=first_user,
+            public_id=first.public_id,
+            quote_token=first_quote['quote_token'],
+        )
+        second_user, second_subscription = await _active_target(db, balance=100_000)
+        second, second_quote = await _intent_for(
+            db,
+            second_user,
+            second_subscription,
+            devices=1,
+            key='ready-second',
+        )
+        await purchase_intent(
+            db,
+            user=second_user,
+            public_id=second.public_id,
+            quote_token=second_quote['quote_token'],
+        )
+        first.fulfillment_attempts = worker_module._MAX_AUTOMATIC_ATTEMPTS
+        first.fulfillment_error_code = 'panel_patch_failed'
+        first.next_attempt_at = datetime.now(UTC) - timedelta(seconds=2)
+        second.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        first_id, second_id = int(first.id), int(second.id)
+        await db.commit()
+
+    calls: list[dict] = []
+    _fake_remnawave_service(monkeypatch, calls=calls, result=True)
+    monkeypatch.setattr(worker_module, 'AsyncSessionLocal', sessions)
+    worker = worker_module.DeviceAddonWorker()
+    with capture_logs() as logs:
+        claim = await worker._claim_one()
+    assert claim is not None and claim[0] == second_id
+    await worker._fulfill_claim(*claim)
+
+    async with sessions() as db:
+        exhausted = await db.get(DeviceAddonIntent, first_id)
+        fulfilled = await db.get(DeviceAddonIntent, second_id)
+        assert exhausted.fulfillment_state == 'needs_attention'
+        assert exhausted.fulfillment_error_code == 'panel_patch_failed|automatic_attempts_exhausted'
+        assert fulfilled.fulfillment_state == 'ready'
+    assert len(calls) == 1
+    alert = next(entry for entry in logs if entry.get('event') == 'device_addon_fulfillment_needs_attention')
+    assert alert['reason'] == 'panel_patch_failed|automatic_attempts_exhausted'
+
+
+async def test_worker_reschedules_unexpected_error_outside_panel_patch(sessions, monkeypatch):
+    async with sessions() as db:
+        user, subscription = await _active_target(db)
+        intent, quote = await _intent_for(db, user, subscription, devices=1, key='unexpected-db-error')
+        await purchase_intent(db, user=user, public_id=intent.public_id, quote_token=quote['quote_token'])
+        intent_id = int(intent.id)
+
+    monkeypatch.setattr(worker_module, 'AsyncSessionLocal', sessions)
+    worker = worker_module.DeviceAddonWorker()
+    claim = await worker._claim_one()
+    assert claim is not None
+    monkeypatch.setattr(worker, '_load_target', AsyncMock(side_effect=RuntimeError('db unavailable once')))
+    await worker._fulfill_claim(*claim)
+
+    async with sessions() as db:
+        stored = await db.get(DeviceAddonIntent, intent_id)
+        assert stored.fulfillment_state == 'pending'
+        assert stored.fulfillment_error_code == 'fulfillment_unexpected:RuntimeError'
+        assert stored.lease_token is None
+
+
+async def test_worker_finalizes_after_successful_compensation(sessions, monkeypatch):
+    async with sessions() as db:
+        user, subscription = await _active_target(db)
+        intent, quote = await _intent_for(db, user, subscription, devices=1, key='worker-compensation')
+        await purchase_intent(db, user=user, public_id=intent.public_id, quote_token=quote['quote_token'])
+        intent_id = int(intent.id)
+        subscription_id = int(subscription.id)
+        panel_uuid = str(user.remnawave_uuid)
+
+    calls: list[dict] = []
+
+    class CompensatingPanelClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def update_user(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                async with sessions() as admin_db:
+                    current_subscription = await admin_db.get(Subscription, subscription_id)
+                    current_subscription.device_limit = 1
+                    await admin_db.commit()
+            return type(
+                'PanelUser',
+                (),
+                {'uuid': kwargs['uuid'], 'hwid_device_limit': kwargs['hwid_device_limit']},
+            )()
+
+    class CompensatingRemnaWaveService:
+        def get_api_client(self):
+            return CompensatingPanelClient()
+
+    from app.services import remnawave_service
+
+    monkeypatch.setattr(remnawave_service, 'RemnaWaveService', CompensatingRemnaWaveService)
+    monkeypatch.setattr(worker_module, 'AsyncSessionLocal', sessions)
+    worker = worker_module.DeviceAddonWorker()
+    claim = await worker._claim_one()
+    assert claim is not None
+    await worker._fulfill_claim(*claim)
+
+    assert calls == [
+        {'uuid': panel_uuid, 'hwid_device_limit': 2},
+        {'uuid': panel_uuid, 'hwid_device_limit': 1},
+    ]
+    async with sessions() as db:
+        stored = await db.get(DeviceAddonIntent, intent_id)
+        assert stored.fulfillment_state == 'ready'
+        assert stored.fulfillment_error_code is None
+
+
+async def test_admin_retry_requeues_only_owned_needs_attention_without_money_changes(sessions, monkeypatch):
+    async with sessions() as db:
+        user, subscription = await _active_target(db)
+        intent, quote = await _intent_for(db, user, subscription, devices=1, key='admin-retry')
+        await purchase_intent(db, user=user, public_id=intent.public_id, quote_token=quote['quote_token'])
+        await _add_topup_attempt(db, intent=intent, user=user, status='terminal', holds_slot=False)
+        intent.fulfillment_state = 'needs_attention'
+        intent.fulfillment_attempts = worker_module._MAX_AUTOMATIC_ATTEMPTS
+        intent.fulfillment_error_code = 'panel_patch_failed|automatic_attempts_exhausted'
+        intent.lease_token = 'stale-lease'
+        intent.lease_expires_at = datetime.now(UTC) + timedelta(days=1)
+        other_user, _ = await _active_target(db)
+        user_id = int(user.id)
+        other_user_id = int(other_user.id)
+        intent_id = int(intent.id)
+        public_id = str(intent.public_id)
+        balance_before = int(user.balance_kopeks)
+        limit_before = int(subscription.device_limit)
+        transaction_count = await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id))
+        await db.commit()
+
+        history = await admin_users.get_user_device_addons(user_id, admin=user, db=db)
+        assert history['items'][0]['public_id'] == public_id
+        assert history['items'][0]['devices_to_add'] == 1
+        assert history['items'][0]['fulfillment_state'] == 'needs_attention'
+        assert history['items'][0]['attempts'][0]['status'] == 'terminal'
+
+        with pytest.raises(Exception) as not_owned:
+            await admin_users.retry_user_device_addon_fulfillment(
+                other_user_id,
+                public_id,
+                admin=other_user,
+                db=db,
+            )
+        assert getattr(not_owned.value, 'status_code', None) == 404
+
+        wake = MagicMock()
+        monkeypatch.setattr(worker_module.device_addon_worker, 'wake', wake)
+        response = await admin_users.retry_user_device_addon_fulfillment(
+            user_id,
+            public_id,
+            admin=user,
+            db=db,
+        )
+        assert response['fulfillment_state'] == 'pending'
+        wake.assert_called_once_with()
+
+        await db.refresh(user)
+        await db.refresh(subscription)
+        await db.refresh(intent)
+        assert user.balance_kopeks == balance_before
+        assert subscription.device_limit == limit_before
+        assert (
+            await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id))
+            == transaction_count
+        )
+        assert intent.fulfillment_attempts == 0
+        assert intent.fulfillment_error_code is None
+        assert intent.lease_token is None
+        audit = await db.scalar(
+            select(AdminAuditLog).where(
+                AdminAuditLog.action == 'retry_device_addon_fulfillment',
+                AdminAuditLog.resource_id == public_id,
+            )
+        )
+        assert audit is not None
+
+    calls: list[dict] = []
+    _fake_remnawave_service(monkeypatch, calls=calls, result=True)
+    monkeypatch.setattr(worker_module, 'AsyncSessionLocal', sessions)
+    worker = worker_module.DeviceAddonWorker()
+    claim = await worker._claim_one()
+    assert claim is not None and claim[0] == intent_id
+    await worker._fulfill_claim(*claim)
+    async with sessions() as db:
+        stored = await db.get(DeviceAddonIntent, intent_id)
+        assert stored.fulfillment_state == 'ready'
+        assert (
+            await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user_id))
+            == transaction_count
+        )
+
+
+async def test_worker_window_lease_and_stop_contract():
+    retry_window = sum(min(300, 2 ** min(epoch, 8)) for epoch in range(1, worker_module._MAX_AUTOMATIC_ATTEMPTS + 1))
+    assert retry_window >= 90 * 60
+    assert worker_module._PANEL_PATCH_TIMEOUT_SECONDS > settings.REMNAWAVE_API_TOTAL_TIMEOUT * 4
+    assert worker_module._LEASE_SECONDS > worker_module._PANEL_PATCH_TIMEOUT_SECONDS * 2
+
+    worker = worker_module.DeviceAddonWorker()
+    task = asyncio.create_task(asyncio.Event().wait())
+    worker._running = True
+    worker._task = task
+    await worker.stop()
+    assert task.cancelled()
+    assert worker._task is None
 
 
 async def test_topup_action_flags_use_full_graph_and_live_guards(sessions, monkeypatch):
