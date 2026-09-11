@@ -24,6 +24,7 @@ from app.database.models import (
     Transaction,
     User,
 )
+from app.services import account_merge_service
 from app.services.account_erasure_service import (
     ERASURE_AWAITING_MANUAL,
     ERASURE_AWAITING_RECONCILIATION,
@@ -91,6 +92,8 @@ async def seed(
     fulfillment_state='pending',
     provider_payment_id=True,
     quoted_price_kopeks=166,
+    referral_status='done',
+    event_status='done',
 ):
     user = User(
         telegram_id=7788012249,
@@ -162,6 +165,8 @@ async def seed(
             platega_payment_id=payment.id,
             correlation_id=correlation,
             provider_payment_id=payment.platega_transaction_id if provider_payment_id else None,
+            referral_status=referral_status,
+            event_status=event_status,
         )
         db.add(attempt)
     await db.commit()
@@ -260,6 +265,117 @@ async def test_settled_attempt_allows_account_change_and_retains_history(session
         assert await db.get(DeviceAddonIntent, intent.id) is not None
         assert await db.get(DeviceAddonTopupAttempt, attempt.id) is not None
         assert await UserService._get_financial_history_kind(db, user.id) == (True, False)
+
+
+@pytest.mark.parametrize(
+    'referral_status,event_status',
+    [
+        ('pending', 'done'),
+        ('processing', 'done'),
+        ('operator_review', 'done'),
+        ('unknown_future_state', 'done'),
+        ('done', 'pending'),
+        ('done', 'processing'),
+        ('done', 'unknown_future_state'),
+    ],
+)
+async def test_paid_attempt_blocks_account_change_until_durable_effects_finish(
+    sessions,
+    referral_status,
+    event_status,
+):
+    async with sessions() as db:
+        user, _, intent, _, attempt = await seed(
+            db,
+            status='paid',
+            referral_status=referral_status,
+            event_status=event_status,
+        )
+        assert 'обязательные действия' in await _test_reset_blocked_reason(db, user)
+        with pytest.raises(ValueError, match='обязательные действия'):
+            await _guard_device_addon_merge(db, [user.id])
+        assert await db.get(DeviceAddonIntent, intent.id) is not None
+        assert await db.get(DeviceAddonTopupAttempt, attempt.id) is not None
+
+
+async def test_manually_resolved_paid_referral_allows_account_change(sessions):
+    async with sessions() as db:
+        user, _, _, _, _ = await seed(
+            db,
+            status='paid',
+            referral_status='resolved_manually',
+            event_status='done',
+        )
+        assert await _test_reset_blocked_reason(db, user) is None
+        await _guard_device_addon_merge(db, [user.id])
+
+
+async def test_paid_effect_guard_breaks_transaction_user_lock_cycle(sessions, monkeypatch):
+    async with sessions() as seed_db:
+        primary = User(
+            telegram_id=7788012260,
+            balance_kopeks=0,
+            status='active',
+            language='ru',
+            referral_code=uuid.uuid4().hex[:12],
+        )
+        seed_db.add(primary)
+        await seed_db.commit()
+        secondary, _, _, payment, attempt = await seed(
+            seed_db,
+            status='paid',
+            referral_status='pending',
+            event_status='done',
+        )
+        deposit = Transaction(
+            user_id=secondary.id,
+            type='deposit',
+            amount_kopeks=166,
+            is_completed=True,
+        )
+        seed_db.add(deposit)
+        await seed_db.flush()
+        payment.transaction_id = deposit.id
+        attempt.deposit_transaction_id = deposit.id
+        await seed_db.commit()
+        primary_id = primary.id
+        secondary_id = secondary.id
+        deposit_id = deposit.id
+
+    merge_reached_guard = asyncio.Event()
+    effects_started_user_lock = asyncio.Event()
+    real_guard = account_merge_service._guard_device_addon_merge
+
+    async def coordinated_guard(db, user_ids):
+        merge_reached_guard.set()
+        await effects_started_user_lock.wait()
+        await real_guard(db, user_ids)
+
+    monkeypatch.setattr(account_merge_service, '_guard_device_addon_merge', coordinated_guard)
+
+    async with sessions() as effects_db, sessions() as merge_db:
+        await effects_db.execute(select(Transaction).where(Transaction.id == deposit_id).with_for_update())
+
+        async def continue_paid_effect_lock_order():
+            await merge_reached_guard.wait()
+            effects_started_user_lock.set()
+            await effects_db.execute(select(User).where(User.id == secondary_id).with_for_update())
+
+        async def attempt_merge():
+            with pytest.raises(ValueError, match='обязательные действия'):
+                await execute_merge(
+                    merge_db,
+                    primary_id,
+                    secondary_id,
+                    deferred_remnawave_deletions=[],
+                )
+            await merge_db.rollback()
+
+        await asyncio.wait_for(
+            asyncio.gather(attempt_merge(), continue_paid_effect_lock_order()),
+            timeout=5,
+        )
+        await effects_db.rollback()
 
 
 async def test_purchased_pending_entitlement_blocks_account_change(sessions):
