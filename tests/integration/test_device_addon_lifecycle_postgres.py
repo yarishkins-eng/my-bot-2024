@@ -645,7 +645,7 @@ async def test_merge_rekeys_colliding_per_user_intent_history(sessions):
     async with sessions() as db:
         primary = User(
             telegram_id=7788012251,
-            balance_kopeks=0,
+            balance_kopeks=100_000,
             status='active',
             language='ru',
             referral_code=uuid.uuid4().hex[:12],
@@ -684,14 +684,94 @@ async def test_merge_rekeys_colliding_per_user_intent_history(sessions):
         )
         db.add(primary_intent)
         await db.commit()
-        secondary, _, secondary_intent, _, _ = await seed(db, status='terminal')
+        secondary, secondary_sub, secondary_intent, _, _ = await seed(db, status='terminal')
+        secondary_sub.status = 'active'
+        secondary_sub.end_date = datetime.now(UTC) + timedelta(days=30)
+        secondary_sub.device_limit = 2
         secondary_intent.idempotency_key = collision_key
         secondary_intent.price_snapshot = {'source': 'secondary'}
         await db.commit()
         primary_id, secondary_id = primary.id, secondary.id
         primary_intent_id, secondary_intent_id = primary_intent.id, secondary_intent.id
 
-        await execute_merge(db, primary_id, secondary_id, deferred_remnawave_deletions=[])
+        await execute_merge(
+            db,
+            primary_id,
+            secondary_id,
+            keep_subscription_from='secondary',
+            deferred_remnawave_deletions=[],
+        )
+        await db.commit()
+
+        merged_primary = await db.get(User, primary_id, populate_existing=True)
+        calculation = await calculate_device_addon(
+            db,
+            user=merged_primary,
+            subscription_id=secondary_sub.id,
+            devices_to_add=1,
+        )
+        purchased = await purchase_intent(
+            db,
+            user=merged_primary,
+            public_id=secondary_intent.public_id,
+            quote_token=quote_for_calculation(calculation, user_id=primary_id)['quote_token'],
+        )
+        first_merged_key = purchased.idempotency_key
+        assert purchased.price_snapshot['merge_idempotency_history'] == [
+            {'user_id': secondary_id, 'idempotency_key': collision_key}
+        ]
+        purchased.fulfillment_state = 'ready'
+        await db.commit()
+
+        next_primary = User(
+            telegram_id=7788012252,
+            balance_kopeks=0,
+            status='active',
+            language='ru',
+            referral_code=uuid.uuid4().hex[:12],
+        )
+        db.add(next_primary)
+        await db.flush()
+        next_primary_sub = Subscription(
+            user_id=next_primary.id,
+            end_date=datetime.now(UTC) - timedelta(days=1),
+            status='expired',
+            is_trial=False,
+            device_limit=2,
+            remnawave_short_id=uuid.uuid4().hex[:16],
+        )
+        db.add(next_primary_sub)
+        await db.flush()
+        next_primary_intent = DeviceAddonIntent(
+            public_id=str(uuid.uuid4()),
+            user_id=next_primary.id,
+            subscription_id=next_primary_sub.id,
+            target_subscription_id=next_primary_sub.id,
+            idempotency_key=first_merged_key,
+            request_hash='d' * 64,
+            devices_to_add=1,
+            original_device_limit=2,
+            end_date=next_primary_sub.end_date,
+            device_addon_generation=0,
+            days_left=1,
+            monthly_price_kopeks=5000,
+            base_price_kopeks=0,
+            quoted_price_kopeks=0,
+            purchase_state='purchased',
+            receipt_json={'devices_added': 1},
+            fulfillment_state='ready',
+        )
+        db.add(next_primary_intent)
+        await db.commit()
+        next_primary_id = next_primary.id
+
+        await execute_merge(
+            db,
+            next_primary_id,
+            primary_id,
+            keep_subscription_from='secondary',
+            deferred_remnawave_deletions=[],
+        )
         await db.commit()
 
     async with sessions() as verify_db:
@@ -703,15 +783,16 @@ async def test_merge_rekeys_colliding_per_user_intent_history(sessions):
             )
         )
         assert len(rows) == 2
-        assert {row.user_id for row in rows} == {primary_id}
+        assert {row.user_id for row in rows} == {next_primary_id}
         assert len({row.idempotency_key for row in rows}) == 2
         stored_primary = next(row for row in rows if row.id == primary_intent_id)
         stored_secondary = next(row for row in rows if row.id == secondary_intent_id)
         assert stored_primary.idempotency_key == collision_key
-        assert stored_secondary.idempotency_key.startswith(f'merged:{secondary_id}:')
-        assert stored_secondary.price_snapshot['source'] == 'secondary'
+        assert stored_secondary.idempotency_key.startswith(f'merged:{primary_id}:')
+        assert stored_secondary.purchase_state == 'purchased'
         assert stored_secondary.price_snapshot['merge_idempotency_history'] == [
-            {'user_id': secondary_id, 'idempotency_key': collision_key}
+            {'user_id': secondary_id, 'idempotency_key': collision_key},
+            {'user_id': primary_id, 'idempotency_key': first_merged_key},
         ]
 
 

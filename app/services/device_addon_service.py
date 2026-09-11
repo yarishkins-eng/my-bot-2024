@@ -694,7 +694,15 @@ async def purchase_intent(db: AsyncSession, *, user: User, public_id: str, quote
     intent.base_price_kopeks = calculation.base_price_kopeks
     intent.quoted_price_kopeks = calculation.price_kopeks
     intent.discount_percent = calculation.discount_percent
-    intent.price_snapshot = _quote_payload(calculation, user_id=user.id)
+    refreshed_snapshot = _quote_payload(calculation, user_id=user.id)
+    # Account merge may have re-keyed a row when two formerly independent
+    # per-user idempotency namespaces collided.  A later explicit purchase is
+    # allowed to refresh pricing, but must not erase that forensic history.
+    previous_snapshot = dict(intent.price_snapshot or {})
+    merge_history = previous_snapshot.get('merge_idempotency_history')
+    if isinstance(merge_history, list) and merge_history:
+        refreshed_snapshot['merge_idempotency_history'] = list(merge_history)
+    intent.price_snapshot = refreshed_snapshot
     transaction: Transaction | None = None
     if calculation.price_kopeks:
         locked_user.balance_kopeks -= calculation.price_kopeks
