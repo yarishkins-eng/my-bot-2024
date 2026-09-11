@@ -511,6 +511,32 @@ async def test_wrong_currency_on_old_invoice_holds_only_that_invoice(sessions):
         assert await db.scalar(select(func.count(Transaction.id))) == 0
 
 
+async def test_first_terminal_observation_with_amount_mismatch_releases_invoice_slot(sessions):
+    async with sessions() as db:
+        _, _, _, old_attempt, attempt = await _late_payment_graph(db)
+        payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+        old_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        payload = {
+            'id': attempt.provider_payment_id,
+            'status': 'CANCELED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '108.00', 'currency': 'RUB'},
+            'payload': f'platega:{attempt.correlation_id}',
+        }
+
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=payload)
+        await db.refresh(payment)
+        await db.refresh(attempt)
+
+        assert payment.status == 'CANCELED'
+        assert attempt.status == 'terminal'
+        assert attempt.holds_invoice_slot is False
+        assert attempt.reconciliation_reason == 'provider_terminal:canceled:canonical_invoice_mismatch'
+        assert await db.scalar(
+            select(func.count(DeviceAddonTopupAttempt.id)).where(DeviceAddonTopupAttempt.holds_invoice_slot.is_(True))
+        ) == 0
+
+
 @pytest.mark.parametrize(
     ('mutation', 'expected_attempt_status', 'expected_payment_status'),
     [

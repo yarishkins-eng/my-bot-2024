@@ -988,7 +988,9 @@ async def reconcile_device_addon_payment(
         amount_currency != (int(attempt.requested_amount_kopeks), 'RUB')
         or _provider_method_code(payload) != int(attempt.provider_method_code)
     )
-    if not _exact_provider_invoice(attempt, payload):
+    status = str(payload.get('status') or '').upper()
+    provider_invoice_exact = _exact_provider_invoice(attempt, payload)
+    if not provider_invoice_exact and (financially_settled or status not in _PROVIDER_TERMINAL):
         if financially_settled:
             attempt.status = 'paid'
             attempt.holds_invoice_slot = False
@@ -1009,7 +1011,6 @@ async def reconcile_device_addon_payment(
         attempt.lease_expires_at = None
         await db.commit()
         return attempt
-    status = str(payload.get('status') or '').upper()
     if status == 'CONFIRMED':
         return await _settle_locked(db, payment=payment, user=user, attempt=attempt, intent=intent, payload=payload)
     if financially_settled:
@@ -1028,6 +1029,8 @@ async def reconcile_device_addon_payment(
         attempt.status = 'terminal'
         attempt.holds_invoice_slot = False
         attempt.reconciliation_reason = f'provider_terminal:{status.lower()}'
+        if not provider_invoice_exact:
+            attempt.reconciliation_reason += ':canonical_invoice_mismatch'
         attempt.next_reconcile_at = datetime.now(UTC) + _TERMINAL_RECHECK_DELAY
         payment.status = status
     elif status in _PROVIDER_LIVE:
