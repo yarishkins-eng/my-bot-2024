@@ -77,6 +77,10 @@ from app.database.models import (
     YooKassaPayment,
 )
 from app.localization.texts import get_texts
+from app.services.device_addon_service import (
+    device_addon_attempt_blocks_account_change,
+    device_addon_intent_blocks_account_change,
+)
 from app.services.notification_delivery_service import (
     NotificationType,
     notification_delivery_service,
@@ -2111,19 +2115,24 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
     if user.telegram_id is not None and SupportSettingsService.is_moderator(int(user.telegram_id)):
         return 'Этот человек — модератор поддержки. Обнулять его нельзя.'
 
-    # Even terminal provider invoices can be confirmed late. The reset must
-    # retain their immutable binding; v1 refuses instead of deleting evidence.
-    if await db.scalar(select(DeviceAddonTopupAttempt.id).where(DeviceAddonTopupAttempt.user_id == user.id).limit(1)):
-        return 'На аккаунте есть счёт докупки устройств. Сброс требует отдельной финансовой сверки; история платежа сохранена.'
-    if await db.scalar(
-        select(DeviceAddonIntent.id)
-        .where(
-            DeviceAddonIntent.user_id == user.id,
-            DeviceAddonIntent.purchase_state == 'purchased',
+    addon_attempts = list(
+        await db.scalars(
+            select(DeviceAddonTopupAttempt)
+            .where(DeviceAddonTopupAttempt.user_id == user.id)
+            .order_by(DeviceAddonTopupAttempt.id)
         )
-        .limit(1)
-    ):
-        return 'На аккаунте есть выполненная докупка устройств. Перед сбросом нужна отдельная проверка её выдачи.'
+    )
+    if any(device_addon_attempt_blocks_account_change(attempt) for attempt in addon_attempts):
+        return 'Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите сброс.'
+    addon_intents = list(
+        await db.scalars(
+            select(DeviceAddonIntent)
+            .where(DeviceAddonIntent.user_id == user.id)
+            .order_by(DeviceAddonIntent.id)
+        )
+    )
+    if any(device_addon_intent_blocks_account_change(intent) for intent in addon_intents):
+        return 'Выдача докупленных устройств ещё в работе. Дождитесь её завершения и повторите сброс.'
 
     # Забор №3: деньги. Каждая проверка спрашивает своё.
     #
@@ -2217,6 +2226,7 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
             select(PlategaPayment.amount_kopeks)
             .where(
                 PlategaPayment.user_id == user.id,
+                ~exists().where(DeviceAddonTopupAttempt.platega_payment_id == PlategaPayment.id),
                 func.upper(PlategaPayment.status).not_in(sorted(_TEST_RESET_SETTLED_PROVIDER_STATUSES)),
             )
             .limit(1)

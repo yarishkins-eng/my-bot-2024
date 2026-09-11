@@ -33,7 +33,8 @@ from app.services.account_erasure_service import (
     _target_state_after_financial_resolution,
     resolve_financial_account_erasure,
 )
-from app.services.account_merge_service import _guard_device_addon_merge
+from app.services.account_merge_service import _guard_device_addon_merge, execute_merge
+from app.services.device_addon_payment_service import reconcile_device_addon_payment
 from app.services.device_addon_service import (
     DeviceAddonError,
     calculate_device_addon,
@@ -81,7 +82,16 @@ async def sessions(monkeypatch):
         await bootstrap.dispose()
 
 
-async def seed(db, *, with_attempt=True, status='terminal', purchased=False):
+async def seed(
+    db,
+    *,
+    with_attempt=True,
+    status='terminal',
+    purchased=False,
+    fulfillment_state='pending',
+    provider_payment_id=True,
+    quoted_price_kopeks=166,
+):
     user = User(
         telegram_id=7788012249,
         balance_kopeks=0,
@@ -117,9 +127,10 @@ async def seed(db, *, with_attempt=True, status='terminal', purchased=False):
         days_left=1,
         monthly_price_kopeks=5000,
         base_price_kopeks=166,
-        quoted_price_kopeks=166,
+        quoted_price_kopeks=quoted_price_kopeks,
         purchase_state='purchased' if purchased else 'draft',
         receipt_json={'devices_added': 1} if purchased else None,
+        fulfillment_state=fulfillment_state,
     )
     db.add(intent)
     await db.flush()
@@ -150,7 +161,7 @@ async def seed(db, *, with_attempt=True, status='terminal', purchased=False):
             status=status,
             platega_payment_id=payment.id,
             correlation_id=correlation,
-            provider_payment_id=payment.platega_transaction_id,
+            provider_payment_id=payment.platega_transaction_id if provider_payment_id else None,
         )
         db.add(attempt)
     await db.commit()
@@ -210,23 +221,68 @@ async def test_money_graph_cannot_be_physically_deleted(sessions, target):
         assert await db.get(DeviceAddonTopupAttempt, attempt_id) is not None
 
 
-async def test_terminal_attempt_blocks_reset_and_merge_but_remains_canonical_history(sessions):
+@pytest.mark.parametrize('attempt_status', ['prepared', 'dispatching', 'creation_unknown', 'pending', 'reconciling'])
+async def test_in_flight_attempt_blocks_reset_and_merge(sessions, attempt_status):
     async with sessions() as db:
-        user, _, intent, _, attempt = await seed(db)
-        assert 'счёт докупки' in await _test_reset_blocked_reason(db, user)
-        with pytest.raises(ValueError, match='финансовая сверка'):
+        user, _, intent, _, attempt = await seed(db, status=attempt_status)
+        assert 'Счёт докупки устройств ещё в работе' in await _test_reset_blocked_reason(db, user)
+        with pytest.raises(ValueError, match='Счёт докупки устройств ещё в работе'):
             await _guard_device_addon_merge(db, [user.id])
+        assert await db.get(DeviceAddonIntent, intent.id) is not None
+        assert await db.get(DeviceAddonTopupAttempt, attempt.id) is not None
+
+
+async def test_operator_review_blocks_only_after_provider_invoice_is_known(sessions):
+    async with sessions() as db:
+        blocked_user, _, intent, payment, attempt = await seed(db, status='operator_review')
+        assert 'Счёт докупки устройств ещё в работе' in await _test_reset_blocked_reason(db, blocked_user)
+        with pytest.raises(ValueError, match='Счёт докупки устройств ещё в работе'):
+            await _guard_device_addon_merge(db, [blocked_user.id])
+
+        attempt.provider_payment_id = None
+        payment.status = 'OPERATOR_REVIEW'
+        await db.commit()
+        assert await _test_reset_blocked_reason(db, blocked_user) is None
+        await _guard_device_addon_merge(db, [blocked_user.id])
+        assert await db.get(DeviceAddonIntent, intent.id) is not None
+        assert await db.get(DeviceAddonTopupAttempt, attempt.id) is not None
+
+
+@pytest.mark.parametrize('attempt_status', ['terminal', 'paid'])
+async def test_settled_attempt_allows_account_change_and_retains_history(sessions, attempt_status):
+    async with sessions() as db:
+        user, _, intent, payment, attempt = await seed(db, status=attempt_status)
+        if attempt_status == 'paid':
+            payment.status = 'OPERATOR_REVIEW'
+            await db.commit()
+        assert await _test_reset_blocked_reason(db, user) is None
+        await _guard_device_addon_merge(db, [user.id])
         assert await db.get(DeviceAddonIntent, intent.id) is not None
         assert await db.get(DeviceAddonTopupAttempt, attempt.id) is not None
         assert await UserService._get_financial_history_kind(db, user.id) == (True, False)
 
 
-async def test_paid_free_purchase_also_preserves_its_pending_entitlement(sessions):
+async def test_purchased_pending_entitlement_blocks_account_change(sessions):
     async with sessions() as db:
         user, _, _, _, _ = await seed(db, with_attempt=False, purchased=True)
-        assert 'выполненная докупка' in await _test_reset_blocked_reason(db, user)
-        with pytest.raises(ValueError, match='проверка её выдачи'):
+        assert 'Выдача докупленных устройств ещё в работе' in await _test_reset_blocked_reason(db, user)
+        with pytest.raises(ValueError, match='Выдача докупленных устройств ещё в работе'):
             await _guard_device_addon_merge(db, [user.id])
+
+
+@pytest.mark.parametrize('fulfillment_state', ['ready', 'needs_attention'])
+async def test_completed_or_held_entitlement_allows_account_change(sessions, fulfillment_state):
+    async with sessions() as db:
+        user, _, intent, _, _ = await seed(
+            db,
+            with_attempt=False,
+            purchased=True,
+            fulfillment_state=fulfillment_state,
+            quoted_price_kopeks=0,
+        )
+        assert await _test_reset_blocked_reason(db, user) is None
+        await _guard_device_addon_merge(db, [user.id])
+        assert await db.get(DeviceAddonIntent, intent.id) is not None
 
 
 async def test_clean_draft_can_be_revoked_before_merge(sessions):
@@ -251,6 +307,94 @@ async def test_clean_draft_is_in_reset_child_first_delete_plan(sessions):
         await db.commit()
         assert await db.scalar(select(DeviceAddonIntent.id)) is None
         assert await db.get(User, user_id) is not None
+
+
+async def test_paid_completed_graph_is_in_reset_child_first_delete_plan(sessions):
+    async with sessions() as db:
+        user, sub, intent, payment, attempt = await seed(
+            db,
+            status='paid',
+            purchased=True,
+            fulfillment_state='ready',
+        )
+        deposit = Transaction(user_id=user.id, type='deposit', amount_kopeks=166, is_completed=True)
+        debit = Transaction(user_id=user.id, type='subscription_payment', amount_kopeks=166, is_completed=True)
+        db.add_all([deposit, debit])
+        await db.flush()
+        payment.transaction_id = deposit.id
+        attempt.deposit_transaction_id = deposit.id
+        intent.transaction_id = debit.id
+        await db.commit()
+
+        assert await _test_reset_blocked_reason(db, user) is None
+        plan = _test_reset_delete_plan({'users.id': [user.id], 'subscriptions.id': [sub.id]})
+        names = [table.name for table, _ in plan]
+        assert names.index('device_addon_topup_attempts') < names.index('device_addon_intents')
+        assert names.index('device_addon_intents') < names.index('platega_payments')
+        assert names.index('device_addon_intents') < names.index('transactions')
+
+        for table, whereclause in plan:
+            await db.execute(delete(table).where(whereclause))
+        await db.commit()
+        assert await db.scalar(select(DeviceAddonTopupAttempt.id).where(DeviceAddonTopupAttempt.id == attempt.id)) is None
+        assert await db.scalar(select(DeviceAddonIntent.id).where(DeviceAddonIntent.id == intent.id)) is None
+        assert await db.scalar(select(PlategaPayment.id).where(PlategaPayment.id == payment.id)) is None
+        assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 0
+
+
+async def test_merge_transfers_terminal_graph_and_late_confirmation_credits_primary(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+    async with sessions() as db:
+        primary = User(
+            telegram_id=7788012250,
+            balance_kopeks=0,
+            status='active',
+            language='ru',
+            referral_code=uuid.uuid4().hex[:12],
+        )
+        db.add(primary)
+        await db.commit()
+        secondary, _, intent, payment, attempt = await seed(db, status='terminal')
+        primary_id, secondary_id = primary.id, secondary.id
+        intent_id, payment_id, attempt_id = intent.id, payment.id, attempt.id
+
+        async with sessions() as callback_db:
+            # Model the callback's initial non-locking lookup happening before
+            # merge: its identity map still remembers the secondary owner.
+            stale_attempt = await callback_db.get(DeviceAddonTopupAttempt, attempt_id)
+            assert stale_attempt.user_id == secondary_id
+            await callback_db.commit()
+
+            await execute_merge(db, primary_id, secondary_id, deferred_remnawave_deletions=[])
+            await db.commit()
+            stored_intent = await db.get(DeviceAddonIntent, intent_id, populate_existing=True)
+            stored_payment = await db.get(PlategaPayment, payment_id, populate_existing=True)
+            stored_attempt = await db.get(DeviceAddonTopupAttempt, attempt_id, populate_existing=True)
+            assert stored_intent.user_id == stored_payment.user_id == stored_attempt.user_id == primary_id
+
+            confirmed = {
+                'id': stored_attempt.provider_payment_id,
+                'status': 'CONFIRMED',
+                'paymentMethod': 'SBPQR',
+                'paymentDetails': {'amount': '1.66', 'currency': 'RUB'},
+                'payload': f'platega:{stored_attempt.correlation_id}',
+            }
+            await reconcile_device_addon_payment(callback_db, attempt_id=attempt_id, payload=confirmed)
+
+        async with sessions() as verify_db:
+            merged_primary = await verify_db.get(User, primary_id)
+            merged_secondary = await verify_db.get(User, secondary_id)
+            stored_attempt = await verify_db.get(DeviceAddonTopupAttempt, attempt_id)
+            assert merged_primary.balance_kopeks == 166
+            assert merged_secondary.balance_kopeks == 0
+            assert stored_attempt.user_id == primary_id
+            assert stored_attempt.status == 'paid'
+            assert await verify_db.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.user_id == primary_id,
+                    Transaction.type == 'deposit',
+                )
+            ) == 1
 
 
 @pytest.mark.parametrize('status, expected', [('terminal', ERASURE_READY), ('paid', ERASURE_AWAITING_MANUAL)])

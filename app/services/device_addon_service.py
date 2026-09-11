@@ -37,6 +37,26 @@ from app.database.models import (
 QUOTE_TTL = timedelta(minutes=15)
 CALCULATOR_REVISION = 'v1'
 
+# Account merge and test reset must make the same lifecycle decision.  Keep
+# this positive list next to the add-on state machine: a newly introduced
+# attempt state is allowed until it is deliberately classified here, while an
+# entitlement already being issued remains protected by the intent predicate.
+ACCOUNT_CHANGE_BLOCKING_ATTEMPT_STATES = frozenset(
+    {'prepared', 'dispatching', 'creation_unknown', 'pending', 'reconciling'}
+)
+
+
+def device_addon_attempt_blocks_account_change(attempt: DeviceAddonTopupAttempt) -> bool:
+    """Whether merge/reset could detach an invoice that is still in flight."""
+    return attempt.status in ACCOUNT_CHANGE_BLOCKING_ATTEMPT_STATES or (
+        attempt.status == 'operator_review' and bool(attempt.provider_payment_id)
+    )
+
+
+def device_addon_intent_blocks_account_change(intent: DeviceAddonIntent) -> bool:
+    """Whether merge/reset could lose a purchased entitlement still being issued."""
+    return intent.purchase_state == 'purchased' and intent.fulfillment_state == 'pending'
+
 
 class DeviceAddonError(Exception):
     """A user-safe, structured rejection for cabinet routes."""

@@ -155,13 +155,9 @@ async def _lock_payment_graph(
             .execution_options(populate_existing=True)
         )
     ).scalar_one()
-    attempt_stub = await db.get(DeviceAddonTopupAttempt, attempt_id)
     user = (
         await db.execute(
-            select(User)
-            .where(User.id == attempt_stub.user_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+            select(User).where(User.id == payment.user_id).with_for_update().execution_options(populate_existing=True)
         )
     ).scalar_one()
     attempt = (
@@ -799,7 +795,7 @@ async def reconcile_device_addon_payment(
     ).scalar_one()
     user = (
         await db.execute(
-            select(User).where(User.id == stub.user_id).with_for_update().execution_options(populate_existing=True)
+            select(User).where(User.id == payment.user_id).with_for_update().execution_options(populate_existing=True)
         )
     ).scalar_one()
     attempt_query = select(DeviceAddonTopupAttempt).where(DeviceAddonTopupAttempt.id == attempt_id)
