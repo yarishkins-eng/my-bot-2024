@@ -640,6 +640,81 @@ async def test_merge_transfers_terminal_graph_and_late_confirmation_credits_prim
             )
 
 
+async def test_merge_rekeys_colliding_per_user_intent_history(sessions):
+    collision_key = 'same-client-key-on-two-accounts'
+    async with sessions() as db:
+        primary = User(
+            telegram_id=7788012251,
+            balance_kopeks=0,
+            status='active',
+            language='ru',
+            referral_code=uuid.uuid4().hex[:12],
+        )
+        db.add(primary)
+        await db.flush()
+        primary_sub = Subscription(
+            user_id=primary.id,
+            end_date=datetime.now(UTC) - timedelta(days=1),
+            status='expired',
+            is_trial=False,
+            device_limit=2,
+            remnawave_short_id=uuid.uuid4().hex[:16],
+        )
+        db.add(primary_sub)
+        await db.flush()
+        primary_intent = DeviceAddonIntent(
+            public_id=str(uuid.uuid4()),
+            user_id=primary.id,
+            subscription_id=primary_sub.id,
+            target_subscription_id=primary_sub.id,
+            idempotency_key=collision_key,
+            request_hash='c' * 64,
+            devices_to_add=1,
+            original_device_limit=2,
+            end_date=primary_sub.end_date,
+            device_addon_generation=0,
+            days_left=1,
+            monthly_price_kopeks=5000,
+            base_price_kopeks=0,
+            quoted_price_kopeks=0,
+            purchase_state='purchased',
+            receipt_json={'devices_added': 1},
+            fulfillment_state='ready',
+            price_snapshot={'source': 'primary'},
+        )
+        db.add(primary_intent)
+        await db.commit()
+        secondary, _, secondary_intent, _, _ = await seed(db, status='terminal')
+        secondary_intent.idempotency_key = collision_key
+        secondary_intent.price_snapshot = {'source': 'secondary'}
+        await db.commit()
+        primary_id, secondary_id = primary.id, secondary.id
+        primary_intent_id, secondary_intent_id = primary_intent.id, secondary_intent.id
+
+        await execute_merge(db, primary_id, secondary_id, deferred_remnawave_deletions=[])
+        await db.commit()
+
+    async with sessions() as verify_db:
+        rows = list(
+            await verify_db.scalars(
+                select(DeviceAddonIntent)
+                .where(DeviceAddonIntent.id.in_([primary_intent_id, secondary_intent_id]))
+                .order_by(DeviceAddonIntent.id)
+            )
+        )
+        assert len(rows) == 2
+        assert {row.user_id for row in rows} == {primary_id}
+        assert len({row.idempotency_key for row in rows}) == 2
+        stored_primary = next(row for row in rows if row.id == primary_intent_id)
+        stored_secondary = next(row for row in rows if row.id == secondary_intent_id)
+        assert stored_primary.idempotency_key == collision_key
+        assert stored_secondary.idempotency_key.startswith(f'merged:{secondary_id}:')
+        assert stored_secondary.price_snapshot['source'] == 'secondary'
+        assert stored_secondary.price_snapshot['merge_idempotency_history'] == [
+            {'user_id': secondary_id, 'idempotency_key': collision_key}
+        ]
+
+
 @pytest.mark.parametrize('status, expected', [('terminal', ERASURE_READY), ('paid', ERASURE_AWAITING_MANUAL)])
 async def test_erasure_locks_and_classifies_addon_graph(sessions, status, expected):
     async with sessions() as db:
