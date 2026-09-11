@@ -942,7 +942,7 @@ async def test_terminal_and_operator_review_rechecks_are_bounded_and_delayed(ses
 
 
 async def test_live_poll_without_safe_redirect_preserves_operator_review_retry_budget(sessions, monkeypatch):
-    class LiveWithoutRedirectProvider:
+    class LiveWithoutRedirectProvider(PlategaService):
         def __init__(self):
             self._max_retries = 3
 
