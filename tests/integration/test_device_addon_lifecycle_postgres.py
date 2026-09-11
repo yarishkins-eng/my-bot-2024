@@ -336,7 +336,9 @@ async def test_paid_completed_graph_is_in_reset_child_first_delete_plan(sessions
         for table, whereclause in plan:
             await db.execute(delete(table).where(whereclause))
         await db.commit()
-        assert await db.scalar(select(DeviceAddonTopupAttempt.id).where(DeviceAddonTopupAttempt.id == attempt.id)) is None
+        assert (
+            await db.scalar(select(DeviceAddonTopupAttempt.id).where(DeviceAddonTopupAttempt.id == attempt.id)) is None
+        )
         assert await db.scalar(select(DeviceAddonIntent.id).where(DeviceAddonIntent.id == intent.id)) is None
         assert await db.scalar(select(PlategaPayment.id).where(PlategaPayment.id == payment.id)) is None
         assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 0
@@ -389,12 +391,15 @@ async def test_merge_transfers_terminal_graph_and_late_confirmation_credits_prim
             assert merged_secondary.balance_kopeks == 0
             assert stored_attempt.user_id == primary_id
             assert stored_attempt.status == 'paid'
-            assert await verify_db.scalar(
-                select(func.count(Transaction.id)).where(
-                    Transaction.user_id == primary_id,
-                    Transaction.type == 'deposit',
+            assert (
+                await verify_db.scalar(
+                    select(func.count(Transaction.id)).where(
+                        Transaction.user_id == primary_id,
+                        Transaction.type == 'deposit',
+                    )
                 )
-            ) == 1
+                == 1
+            )
 
 
 @pytest.mark.parametrize('status, expected', [('terminal', ERASURE_READY), ('paid', ERASURE_AWAITING_MANUAL)])

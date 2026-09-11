@@ -2126,9 +2126,7 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
         return 'Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите сброс.'
     addon_intents = list(
         await db.scalars(
-            select(DeviceAddonIntent)
-            .where(DeviceAddonIntent.user_id == user.id)
-            .order_by(DeviceAddonIntent.id)
+            select(DeviceAddonIntent).where(DeviceAddonIntent.user_id == user.id).order_by(DeviceAddonIntent.id)
         )
     )
     if any(device_addon_intent_blocks_account_change(intent) for intent in addon_intents):
