@@ -708,6 +708,50 @@ async def test_trusted_create_rejection_frees_slot_and_allows_a_new_invoice(sess
         assert await db.scalar(select(func.count(Transaction.id))) == 0
 
 
+async def test_uninformative_create_response_keeps_the_only_invoice_slot(sessions, monkeypatch):
+    _configure_addon_topup(monkeypatch)
+
+    class UninformativeProvider:
+        def __init__(self):
+            self._max_retries = 3
+
+        async def create_device_addon_payment(self, **kwargs):
+            # PlategaService maps an empty/non-error JSON body to this ambiguous
+            # result: the HTTP response does not prove that no invoice exists.
+            del kwargs
+
+    monkeypatch.setattr(payments, 'PlategaService', UninformativeProvider)
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        attempt = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='0' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        assert attempt.status == 'creation_unknown'
+        assert attempt.holds_invoice_slot is True
+        assert attempt.reconciliation_reason == 'provider_create_missing_identity'
+        with pytest.raises(DeviceAddonError) as error:
+            await create_device_addon_topup(
+                db,
+                intent_public_id=intent.public_id,
+                user_id=user.id,
+                idempotency_key=uuid.uuid4().hex,
+                request_hash='9' * 64,
+                method_key='2',
+                expected_amount_kopeks=10_000,
+                return_url=None,
+                failed_url=None,
+            )
+        assert error.value.code == 'payment_attempt_active'
+
+
 async def test_unknown_create_requires_logged_review_then_audited_close_without_credit(sessions, monkeypatch):
     _configure_addon_topup(monkeypatch)
 

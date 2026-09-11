@@ -17,10 +17,28 @@ from app.config import settings
 logger = structlog.get_logger(__name__)
 
 _TERMINAL_CREATE_REJECTION_STATUSES = frozenset({400, 401, 403, 404, 422})
+_PROVIDER_ERROR_KEYS = frozenset({'code', 'description', 'detail', 'error', 'errors', 'message', 'reason'})
+
+
+def _has_meaningful_provider_error(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_has_meaningful_provider_error(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_meaningful_provider_error(item) for item in value)
+    if isinstance(value, bool):
+        return value
+    return value is not None
 
 
 def _is_trustworthy_create_rejection(status_code: int, data: Any) -> bool:
-    return status_code in _TERMINAL_CREATE_REJECTION_STATUSES and isinstance(data, dict)
+    if status_code not in _TERMINAL_CREATE_REJECTION_STATUSES or not isinstance(data, dict) or not data:
+        return False
+    return any(
+        str(key).lower() in _PROVIDER_ERROR_KEYS and _has_meaningful_provider_error(value)
+        for key, value in data.items()
+    )
 
 
 class PlategaCreateRejected(Exception):
@@ -263,7 +281,7 @@ class PlategaService:
     @staticmethod
     async def _deserialize_response(
         response: aiohttp.ClientResponse,
-    ) -> tuple[dict[str, Any] | None, str]:
+    ) -> tuple[Any | None, str]:
         raw_text = await response.text()
         if not raw_text:
             return None, ''

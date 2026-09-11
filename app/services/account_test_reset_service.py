@@ -7,6 +7,9 @@ from sqlalchemy import select, text
 
 from app.database.models import (
     CheckoutPaymentAttempt,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
+    PlategaPayment,
     Subscription,
     SubscriptionCheckout,
     SubscriptionEntitlementTerm,
@@ -91,6 +94,33 @@ async def lock_reset_rows(db, user_id: int) -> None:
         await db.execute(select(*table.primary_key.columns).where(whereclause).with_for_update())
 
 
+async def lock_reset_platega_rows(db, user_id: int) -> None:
+    """Enter the shared financial graph before taking the user row.
+
+    Every Platega callback takes ``Payment -> User``.  Reset must do the same,
+    including for non-add-on payments, or a callback can deadlock with cleanup.
+    """
+    await db.execute(
+        select(PlategaPayment.id).where(PlategaPayment.user_id == user_id).order_by(PlategaPayment.id).with_for_update()
+    )
+
+
+async def lock_reset_device_addon_rows(db, user_id: int) -> None:
+    """Continue the published add-on order: ``Payment -> User -> Attempt -> Intent``."""
+    await db.execute(
+        select(DeviceAddonTopupAttempt.id)
+        .where(DeviceAddonTopupAttempt.user_id == user_id)
+        .order_by(DeviceAddonTopupAttempt.id)
+        .with_for_update()
+    )
+    await db.execute(
+        select(DeviceAddonIntent.id)
+        .where(DeviceAddonIntent.user_id == user_id)
+        .order_by(DeviceAddonIntent.id)
+        .with_for_update()
+    )
+
+
 async def run_reset(db, user, admin_id, *, confirm: bool, preview_token: str | None = None):
     from app.services.user_service import (
         TestAccountResetPlan,
@@ -109,17 +139,22 @@ async def run_reset(db, user, admin_id, *, confirm: bool, preview_token: str | N
         if not acquired:
             return TestAccountResetPlan(blocked_reason='Сброс уже выполняется. Обновите карточку через минуту.')
         await reset_bypass(db)
+        await lock_reset_platega_rows(db, user_id)
         current = await db.scalar(
             select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
         )
         if current is None or not is_test_account(current):
             await db.rollback()
             return TestAccountResetPlan(blocked_reason='Этот аккаунт больше не отмечен как тестовый.')
-        await lock_reset_rows(db, user_id)
+        await lock_reset_device_addon_rows(db, user_id)
         reason = await _test_reset_blocked_reason(db, current)
         if reason:
             await db.rollback()
             return TestAccountResetPlan(blocked_reason=reason)
+        # Only a fully settled graph reaches the broad child-row lock.  In
+        # particular, a paid-effect worker may hold Transaction while waiting
+        # for User; checking its attempt first prevents the inverse U -> T wait.
+        await lock_reset_rows(db, user_id)
         preview = await _reset_test_account_unlocked(db, current, admin_id, confirm=False)
         if not preview_token or preview.preview_token != preview_token:
             await db.rollback()

@@ -24,7 +24,7 @@ from app.database.models import (
     Transaction,
     User,
 )
-from app.services import account_merge_service
+from app.services import account_merge_service, account_test_reset_service, user_service
 from app.services.account_erasure_service import (
     ERASURE_AWAITING_MANUAL,
     ERASURE_AWAITING_RECONCILIATION,
@@ -35,7 +35,10 @@ from app.services.account_erasure_service import (
     resolve_financial_account_erasure,
 )
 from app.services.account_merge_service import _guard_device_addon_merge, execute_merge
-from app.services.device_addon_payment_service import reconcile_device_addon_payment
+from app.services.device_addon_payment_service import (
+    handle_device_addon_platega_callback,
+    reconcile_device_addon_payment,
+)
 from app.services.device_addon_service import (
     DeviceAddonError,
     calculate_device_addon,
@@ -376,6 +379,125 @@ async def test_paid_effect_guard_breaks_transaction_user_lock_cycle(sessions, mo
             timeout=5,
         )
         await effects_db.rollback()
+
+
+async def test_reset_enters_platega_graph_before_user_lock(sessions, monkeypatch):
+    async with sessions() as seed_db:
+        user, _, _, payment, attempt = await seed(seed_db, status='pending')
+        user_id = user.id
+        payment_id = payment.id
+        provider_payment_id = str(attempt.provider_payment_id)
+        correlation_id = attempt.correlation_id
+
+    reset_reached_payment_lock = asyncio.Event()
+    allow_reset_payment_lock = asyncio.Event()
+    real_payment_lock = account_test_reset_service.lock_reset_platega_rows
+
+    async def coordinated_payment_lock(db, locked_user_id):
+        reset_reached_payment_lock.set()
+        await allow_reset_payment_lock.wait()
+        await real_payment_lock(db, locked_user_id)
+
+    monkeypatch.setattr(account_test_reset_service, 'lock_reset_platega_rows', coordinated_payment_lock)
+
+    async with sessions() as callback_db, sessions() as reset_db:
+        locked_payment = (
+            await callback_db.execute(select(PlategaPayment).where(PlategaPayment.id == payment_id).with_for_update())
+        ).scalar_one()
+
+        async def attempt_reset():
+            current = await reset_db.get(User, user_id)
+            result = await user_service.reset_test_account(
+                reset_db,
+                current,
+                admin_id=1,
+                confirm=True,
+                preview_token='blocked-before-preview-check',
+            )
+            assert 'Счёт докупки устройств ещё в работе' in (result.blocked_reason or '')
+
+        reset_task = asyncio.create_task(attempt_reset())
+        await asyncio.wait_for(reset_reached_payment_lock.wait(), 5)
+        try:
+            assert await asyncio.wait_for(
+                handle_device_addon_platega_callback(
+                    callback_db,
+                    payment=locked_payment,
+                    payload={
+                        'id': provider_payment_id,
+                        'payload': f'platega:{correlation_id}',
+                        'status': 'PENDING',
+                        'amount': '1.66',
+                        'currency': 'RUB',
+                        'paymentMethod': 2,
+                    },
+                ),
+                5,
+            )
+        finally:
+            allow_reset_payment_lock.set()
+        await asyncio.wait_for(reset_task, 5)
+
+
+async def test_reset_checks_paid_effects_before_transaction_locks(sessions, monkeypatch):
+    async with sessions() as seed_db:
+        user, _, _, payment, attempt = await seed(
+            seed_db,
+            status='paid',
+            referral_status='processing',
+            event_status='done',
+        )
+        deposit = Transaction(
+            user_id=user.id,
+            type='deposit',
+            amount_kopeks=166,
+            is_completed=True,
+        )
+        seed_db.add(deposit)
+        await seed_db.flush()
+        payment.transaction_id = deposit.id
+        attempt.deposit_transaction_id = deposit.id
+        await seed_db.commit()
+        user_id = user.id
+        deposit_id = deposit.id
+
+    reset_reached_effect_guard = asyncio.Event()
+    effect_started_user_lock = asyncio.Event()
+    allow_effect_guard = asyncio.Event()
+    real_blocked_reason = user_service._test_reset_blocked_reason
+
+    async def coordinated_blocked_reason(db, current):
+        reset_reached_effect_guard.set()
+        await allow_effect_guard.wait()
+        return await real_blocked_reason(db, current)
+
+    monkeypatch.setattr(user_service, '_test_reset_blocked_reason', coordinated_blocked_reason)
+
+    async with sessions() as effects_db, sessions() as reset_db:
+        await effects_db.execute(select(Transaction).where(Transaction.id == deposit_id).with_for_update())
+
+        async def continue_effect_lock_order():
+            effect_started_user_lock.set()
+            await effects_db.execute(select(User).where(User.id == user_id).with_for_update())
+            await effects_db.rollback()
+
+        async def attempt_reset():
+            current = await reset_db.get(User, user_id)
+            result = await user_service.reset_test_account(
+                reset_db,
+                current,
+                admin_id=1,
+                confirm=True,
+                preview_token='blocked-before-preview-check',
+            )
+            assert 'обязательные действия' in (result.blocked_reason or '')
+
+        reset_task = asyncio.create_task(attempt_reset())
+        await asyncio.wait_for(reset_reached_effect_guard.wait(), 5)
+        effect_task = asyncio.create_task(continue_effect_lock_order())
+        await asyncio.wait_for(effect_started_user_lock.wait(), 5)
+        allow_effect_guard.set()
+        await asyncio.wait_for(asyncio.gather(reset_task, effect_task), 5)
 
 
 async def test_purchased_pending_entitlement_blocks_account_change(sessions):
