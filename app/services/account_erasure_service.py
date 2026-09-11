@@ -286,8 +286,14 @@ def _target_state(context: _ErasureContext) -> tuple[str, str | None]:
             return ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved'
     for attempt in getattr(context, 'addon_attempts', []):
         payment = payments_by_id.get(attempt.platega_payment_id)
-        if attempt.status in {'paid', 'operator_review'} or (payment is not None and payment.is_paid):
+        if (
+            attempt.status in {'paid', 'operator_review'}
+            or attempt.deposit_transaction_id is not None
+            or (payment is not None and payment.is_paid)
+        ):
             return ERASURE_AWAITING_MANUAL, 'paid_or_review_payment'
+        if attempt.status == 'terminal' and attempt.provider_payment_id is None:
+            continue
         if not (
             attempt.status == 'terminal'
             and payment is not None

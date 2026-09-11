@@ -1167,6 +1167,27 @@ async def test_erasure_locks_and_classifies_addon_graph(sessions, status, expect
         assert _target_state(context)[0] == expected
 
 
+@pytest.mark.parametrize(
+    ('payment_status', 'reason'),
+    [
+        ('REJECTED_400', 'provider_create_rejected:400'),
+        ('CLOSED_BY_OPERATOR', 'closed_by_operator'),
+        ('PREPARED', 'local_not_dispatched'),
+    ],
+)
+async def test_erasure_accepts_local_terminal_addon_without_provider_id(sessions, payment_status, reason):
+    async with sessions() as db:
+        user, _, _, payment, attempt = await seed(db, status='terminal', provider_payment_id=False)
+        payment.platega_transaction_id = None
+        payment.status = payment_status
+        attempt.reconciliation_reason = reason
+        await db.commit()
+
+        context = await _lock_context(db, user_id=user.id)
+
+        assert _target_state(context) == (ERASURE_READY, None)
+
+
 async def test_manual_erasure_approval_cannot_discard_pending_referral_money(sessions):
     async with sessions() as db:
         user, _, _, payment, attempt = await seed(db, status='paid')
