@@ -48,24 +48,12 @@ logger = structlog.get_logger(__name__)
 ACCOUNT_CHANGE_BLOCKING_ATTEMPT_STATES = frozenset(
     {'prepared', 'dispatching', 'creation_unknown', 'pending', 'reconciling'}
 )
-ACCOUNT_CHANGE_SETTLED_REFERRAL_STATES = frozenset({'done', 'resolved_manually'})
-ACCOUNT_CHANGE_SETTLED_EVENT_STATES = frozenset({'done'})
-
-
-def device_addon_paid_effects_block_account_change(attempt: DeviceAddonTopupAttempt) -> bool:
-    """Protect durable post-credit work until every required effect is settled."""
-    return attempt.status == 'paid' and (
-        attempt.referral_status not in ACCOUNT_CHANGE_SETTLED_REFERRAL_STATES
-        or attempt.event_status not in ACCOUNT_CHANGE_SETTLED_EVENT_STATES
-    )
 
 
 def device_addon_attempt_blocks_account_change(attempt: DeviceAddonTopupAttempt) -> bool:
     """Whether merge/reset could detach an invoice that is still in flight."""
-    return (
-        attempt.status in ACCOUNT_CHANGE_BLOCKING_ATTEMPT_STATES
-        or (attempt.status == 'operator_review' and bool(attempt.provider_payment_id))
-        or device_addon_paid_effects_block_account_change(attempt)
+    return attempt.status in ACCOUNT_CHANGE_BLOCKING_ATTEMPT_STATES or (
+        attempt.status == 'operator_review' and bool(attempt.provider_payment_id)
     )
 
 
@@ -549,7 +537,7 @@ async def serialize_intent(
             can_create_new_attempt=(
                 can_create_topup
                 and intent.purchase_state == 'draft'
-                and attempt.status in {'terminal', 'paid'}
+                and attempt.status in {'terminal', 'paid', 'operator_review'}
                 and not attempt.holds_invoice_slot
                 and not any(other.holds_invoice_slot for other in attempts)
                 and not any(other.holds_invoice_slot and other.status in unresolved_states for other in attempts)

@@ -24,7 +24,12 @@ from app.database.models import (
     Transaction,
     User,
 )
-from app.services import account_merge_service, account_test_reset_service, user_service
+from app.services import (
+    account_test_reset_service,
+    device_addon_payment_service as addon_payments,
+    device_first_deposit_outbox_service as referral_money,
+    user_service,
+)
 from app.services.account_erasure_service import (
     ERASURE_AWAITING_MANUAL,
     ERASURE_AWAITING_RECONCILIATION,
@@ -282,7 +287,7 @@ async def test_settled_attempt_allows_account_change_and_retains_history(session
         ('done', 'unknown_future_state'),
     ],
 )
-async def test_paid_attempt_blocks_account_change_until_durable_effects_finish(
+async def test_paid_attempt_allows_account_change_while_durable_effects_are_unfinished(
     sessions,
     referral_status,
     event_status,
@@ -294,9 +299,8 @@ async def test_paid_attempt_blocks_account_change_until_durable_effects_finish(
             referral_status=referral_status,
             event_status=event_status,
         )
-        assert 'обязательные действия' in await _test_reset_blocked_reason(db, user)
-        with pytest.raises(ValueError, match='обязательные действия'):
-            await _guard_device_addon_merge(db, [user.id])
+        assert await _test_reset_blocked_reason(db, user) is None
+        await _guard_device_addon_merge(db, [user.id])
         assert await db.get(DeviceAddonIntent, intent.id) is not None
         assert await db.get(DeviceAddonTopupAttempt, attempt.id) is not None
 
@@ -313,8 +317,22 @@ async def test_manually_resolved_paid_referral_allows_account_change(sessions):
         await _guard_device_addon_merge(db, [user.id])
 
 
-async def test_paid_effect_guard_breaks_transaction_user_lock_cycle(sessions, monkeypatch):
+async def test_paid_effect_and_merge_serialize_on_payment_without_deadlock(sessions, monkeypatch):
+    monkeypatch.setattr(referral_money, 'get_user_campaign_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(referral_money, 'get_referral_reward_payment_count', AsyncMock(return_value=0))
+    monkeypatch.setattr(referral_money, 'calculate_referral_commission_percent', AsyncMock(return_value=10))
+    monkeypatch.setattr(referral_money, '_is_commission_limit_reached', AsyncMock(return_value=False))
+    monkeypatch.setattr(settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 1)
+    monkeypatch.setattr(settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 100)
+    monkeypatch.setattr(settings, 'REFERRAL_INVITER_BONUS_KOPEKS', 200)
     async with sessions() as seed_db:
+        referrer = User(
+            telegram_id=7788012259,
+            balance_kopeks=0,
+            status='active',
+            language='ru',
+            referral_code=uuid.uuid4().hex[:12],
+        )
         primary = User(
             telegram_id=7788012260,
             balance_kopeks=0,
@@ -322,7 +340,7 @@ async def test_paid_effect_guard_breaks_transaction_user_lock_cycle(sessions, mo
             language='ru',
             referral_code=uuid.uuid4().hex[:12],
         )
-        seed_db.add(primary)
+        seed_db.add_all([referrer, primary])
         await seed_db.commit()
         secondary, _, _, payment, attempt = await seed(
             seed_db,
@@ -330,55 +348,105 @@ async def test_paid_effect_guard_breaks_transaction_user_lock_cycle(sessions, mo
             referral_status='pending',
             event_status='done',
         )
+        secondary.referred_by_id = referrer.id
         deposit = Transaction(
             user_id=secondary.id,
             type='deposit',
             amount_kopeks=166,
+            device_first_ledger_key=f'device-addon-deposit:{uuid.uuid4()}',
             is_completed=True,
         )
         seed_db.add(deposit)
         await seed_db.flush()
         payment.transaction_id = deposit.id
         attempt.deposit_transaction_id = deposit.id
+        attempt.lease_token = 'merge-paid-effect'
+        attempt.lease_epoch = 1
+        attempt.lease_expires_at = datetime.now(UTC) + timedelta(minutes=2)
         await seed_db.commit()
         primary_id = primary.id
         secondary_id = secondary.id
         deposit_id = deposit.id
+        payment_id = payment.id
+        attempt_id = attempt.id
+        referrer_id = referrer.id
 
-    merge_reached_guard = asyncio.Event()
-    effects_started_user_lock = asyncio.Event()
-    real_guard = account_merge_service._guard_device_addon_merge
+    effect_reached_money = asyncio.Event()
+    release_effect = asyncio.Event()
+    real_apply = addon_payments.apply_deposit_referral_money
 
-    async def coordinated_guard(db, user_ids):
-        merge_reached_guard.set()
-        await effects_started_user_lock.wait()
-        await real_guard(db, user_ids)
+    async def coordinated_apply(db, *, source_transaction_id):
+        effect_reached_money.set()
+        await release_effect.wait()
+        return await real_apply(db, source_transaction_id=source_transaction_id)
 
-    monkeypatch.setattr(account_merge_service, '_guard_device_addon_merge', coordinated_guard)
+    monkeypatch.setattr(addon_payments, 'apply_deposit_referral_money', coordinated_apply)
 
     async with sessions() as effects_db, sessions() as merge_db:
-        await effects_db.execute(select(Transaction).where(Transaction.id == deposit_id).with_for_update())
-
-        async def continue_paid_effect_lock_order():
-            await merge_reached_guard.wait()
-            effects_started_user_lock.set()
-            await effects_db.execute(select(User).where(User.id == secondary_id).with_for_update())
-
-        async def attempt_merge():
-            with pytest.raises(ValueError, match='обязательные действия'):
-                await execute_merge(
-                    merge_db,
-                    primary_id,
-                    secondary_id,
-                    deferred_remnawave_deletions=[],
-                )
-            await merge_db.rollback()
-
-        await asyncio.wait_for(
-            asyncio.gather(attempt_merge(), continue_paid_effect_lock_order()),
-            timeout=5,
+        effect_task = asyncio.create_task(
+            addon_payments._run_paid_effects(
+                effects_db,
+                attempt_id=attempt_id,
+                lease_token='merge-paid-effect',
+                lease_epoch=1,
+                bot=None,
+            )
         )
-        await effects_db.rollback()
+        await asyncio.wait_for(effect_reached_money.wait(), 5)
+
+        async def merge_accounts():
+            await execute_merge(
+                merge_db,
+                primary_id,
+                secondary_id,
+                deferred_remnawave_deletions=[],
+            )
+            await merge_db.commit()
+
+        merge_task = asyncio.create_task(merge_accounts())
+        await asyncio.sleep(0.1)
+        merge_waited_for_effect = not merge_task.done()
+        release_effect.set()
+        await asyncio.wait_for(asyncio.gather(effect_task, merge_task), timeout=5)
+        assert merge_waited_for_effect
+
+    async with sessions() as verify_db:
+        stored_payment = await verify_db.get(PlategaPayment, payment_id)
+        stored_attempt = await verify_db.get(DeviceAddonTopupAttempt, attempt_id)
+        stored_deposit = await verify_db.get(Transaction, deposit_id)
+        assert stored_payment.user_id == stored_attempt.user_id == stored_deposit.user_id == primary_id
+        assert stored_attempt.referral_status == 'done'
+        rewards = list(
+            await verify_db.scalars(
+                select(Transaction)
+                .where(Transaction.device_first_ledger_key.like(f'deposit-side-effect:{deposit_id}:%'))
+                .order_by(Transaction.id)
+            )
+        )
+        assert [(reward.user_id, reward.amount_kopeks) for reward in rewards] == [
+            (primary_id, 100),
+            (referrer_id, 216),
+        ]
+        balances_before = {
+            primary_id: (await verify_db.get(User, primary_id)).balance_kopeks,
+            referrer_id: (await verify_db.get(User, referrer_id)).balance_kopeks,
+        }
+        assert await real_apply(verify_db, source_transaction_id=deposit_id) == [primary_id, referrer_id]
+        await verify_db.commit()
+        assert (
+            await verify_db.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.device_first_ledger_key.like(f'deposit-side-effect:{deposit_id}:%')
+                )
+            )
+            == 2
+        )
+        assert (await verify_db.get(User, primary_id, populate_existing=True)).balance_kopeks == balances_before[
+            primary_id
+        ]
+        assert (await verify_db.get(User, referrer_id, populate_existing=True)).balance_kopeks == balances_before[
+            referrer_id
+        ]
 
 
 async def test_reset_enters_platega_graph_before_user_lock(sessions, monkeypatch):
@@ -439,65 +507,93 @@ async def test_reset_enters_platega_graph_before_user_lock(sessions, monkeypatch
         await asyncio.wait_for(reset_task, 5)
 
 
-async def test_reset_checks_paid_effects_before_transaction_locks(sessions, monkeypatch):
+async def test_reset_waits_for_claimed_paid_effect_then_deletes_graph(sessions, monkeypatch):
     async with sessions() as seed_db:
-        user, _, _, payment, attempt = await seed(
+        user, _, intent, payment, attempt = await seed(
             seed_db,
             status='paid',
-            referral_status='processing',
+            referral_status='pending',
             event_status='done',
         )
         deposit = Transaction(
             user_id=user.id,
             type='deposit',
             amount_kopeks=166,
+            device_first_ledger_key=f'device-addon-deposit:{uuid.uuid4()}',
             is_completed=True,
         )
         seed_db.add(deposit)
         await seed_db.flush()
         payment.transaction_id = deposit.id
         attempt.deposit_transaction_id = deposit.id
+        attempt.lease_token = 'reset-paid-effect'
+        attempt.lease_epoch = 1
+        attempt.lease_expires_at = datetime.now(UTC) + timedelta(minutes=2)
         await seed_db.commit()
+        preview = await user_service.reset_test_account(seed_db, user, admin_id=1, confirm=False)
+        assert preview.allowed
         user_id = user.id
+        intent_id = intent.id
+        payment_id = payment.id
+        attempt_id = attempt.id
         deposit_id = deposit.id
+        preview_token = preview.preview_token
 
-    reset_reached_effect_guard = asyncio.Event()
-    effect_started_user_lock = asyncio.Event()
-    allow_effect_guard = asyncio.Event()
-    real_blocked_reason = user_service._test_reset_blocked_reason
+    effect_reached_money = asyncio.Event()
+    release_effect = asyncio.Event()
+    reset_reached_payment_fence = asyncio.Event()
+    real_apply = addon_payments.apply_deposit_referral_money
+    real_payment_lock = account_test_reset_service.lock_reset_platega_rows
 
-    async def coordinated_blocked_reason(db, current):
-        reset_reached_effect_guard.set()
-        await allow_effect_guard.wait()
-        return await real_blocked_reason(db, current)
+    async def coordinated_apply(db, *, source_transaction_id):
+        effect_reached_money.set()
+        await release_effect.wait()
+        return await real_apply(db, source_transaction_id=source_transaction_id)
 
-    monkeypatch.setattr(user_service, '_test_reset_blocked_reason', coordinated_blocked_reason)
+    async def observed_payment_lock(db, locked_user_id):
+        reset_reached_payment_fence.set()
+        await real_payment_lock(db, locked_user_id)
+
+    monkeypatch.setattr(addon_payments, 'apply_deposit_referral_money', coordinated_apply)
+    monkeypatch.setattr(account_test_reset_service, 'lock_reset_platega_rows', observed_payment_lock)
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', AsyncMock(return_value=True))
 
     async with sessions() as effects_db, sessions() as reset_db:
-        await effects_db.execute(select(Transaction).where(Transaction.id == deposit_id).with_for_update())
+        effect_task = asyncio.create_task(
+            addon_payments._run_paid_effects(
+                effects_db,
+                attempt_id=attempt_id,
+                lease_token='reset-paid-effect',
+                lease_epoch=1,
+                bot=None,
+            )
+        )
+        await asyncio.wait_for(effect_reached_money.wait(), 5)
 
-        async def continue_effect_lock_order():
-            effect_started_user_lock.set()
-            await effects_db.execute(select(User).where(User.id == user_id).with_for_update())
-            await effects_db.rollback()
-
-        async def attempt_reset():
+        async def reset_account():
             current = await reset_db.get(User, user_id)
-            result = await user_service.reset_test_account(
+            return await user_service.reset_test_account(
                 reset_db,
                 current,
                 admin_id=1,
                 confirm=True,
-                preview_token='blocked-before-preview-check',
+                preview_token=preview_token,
             )
-            assert 'обязательные действия' in (result.blocked_reason or '')
 
-        reset_task = asyncio.create_task(attempt_reset())
-        await asyncio.wait_for(reset_reached_effect_guard.wait(), 5)
-        effect_task = asyncio.create_task(continue_effect_lock_order())
-        await asyncio.wait_for(effect_started_user_lock.wait(), 5)
-        allow_effect_guard.set()
-        await asyncio.wait_for(asyncio.gather(reset_task, effect_task), 5)
+        reset_task = asyncio.create_task(reset_account())
+        await asyncio.wait_for(reset_reached_payment_fence.wait(), 5)
+        await asyncio.sleep(0.1)
+        reset_waited_for_effect = not reset_task.done()
+        release_effect.set()
+        result, _ = await asyncio.wait_for(asyncio.gather(reset_task, effect_task), 10)
+        assert reset_waited_for_effect
+        assert result.done
+
+    async with sessions() as verify_db:
+        assert await verify_db.get(DeviceAddonIntent, intent_id) is None
+        assert await verify_db.get(DeviceAddonTopupAttempt, attempt_id) is None
+        assert await verify_db.get(PlategaPayment, payment_id) is None
+        assert await verify_db.get(Transaction, deposit_id) is None
 
 
 async def test_purchased_pending_entitlement_blocks_account_change(sessions):

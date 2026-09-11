@@ -28,7 +28,7 @@ from app.services.device_addon_payment_service import (
     create_device_addon_topup,
     reconcile_device_addon_payment,
 )
-from app.services.device_addon_service import DeviceAddonError
+from app.services.device_addon_service import DeviceAddonError, serialize_intent
 from app.services.device_first_deposit_outbox_service import apply_deposit_referral_money
 from app.services.payment.platega import PlategaPaymentMixin
 from app.services.payment_search_service import (
@@ -983,6 +983,120 @@ async def test_terminal_and_operator_review_rechecks_are_bounded_and_delayed(ses
         attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
         await db.commit()
         assert await payments.recover_device_addon_payments(db, limit=1) == 0
+
+
+async def test_terminal_live_regression_stays_bounded_and_allows_replacement(sessions, monkeypatch):
+    _configure_addon_topup(monkeypatch)
+    canonical_calls = 0
+    replacement_provider_id = None
+    replacement_payload = None
+
+    class PendingProvider(PlategaService):
+        def __init__(self):
+            self._max_retries = 3
+
+        async def get_transaction(self, transaction_id):
+            nonlocal canonical_calls
+            canonical_calls += 1
+            if transaction_id == provider_id:
+                return canonical
+            assert transaction_id == replacement_provider_id
+            return {
+                'id': replacement_provider_id,
+                'status': 'PENDING',
+                'paymentMethod': 'SBPQR',
+                'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+                'payload': replacement_payload,
+                'redirect': 'https://pay.example.test/replacement',
+            }
+
+        async def create_device_addon_payment(self, **kwargs):
+            nonlocal replacement_provider_id, replacement_payload
+            replacement_provider_id = str(uuid.uuid4())
+            replacement_payload = kwargs['payload']
+            return {
+                'id': replacement_provider_id,
+                'redirect': 'https://pay.example.test/replacement',
+            }
+
+    monkeypatch.setattr(payments, 'PlategaService', PendingProvider)
+    async with sessions() as db:
+        user, intent, payment, attempt, current_attempt = await _late_payment_graph(db)
+        subscription = await db.get(Subscription, intent.subscription_id)
+        tariff = Tariff(
+            name='terminal regression replacement',
+            device_limit=2,
+            max_device_limit=10,
+            device_price_kopeks=10_000,
+        )
+        db.add(tariff)
+        await db.flush()
+        subscription.tariff_id = tariff.id
+        current_attempt.status = 'terminal'
+        current_attempt.holds_invoice_slot = False
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        provider_id = str(attempt.provider_payment_id)
+        canonical = {
+            'id': provider_id,
+            'status': 'PENDING',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+            'payload': f'platega:{attempt.correlation_id}',
+            'redirect': 'https://pay.example.test/old-terminal',
+        }
+        await db.commit()
+
+        before_first = datetime.now(UTC)
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=canonical)
+        await db.refresh(attempt)
+        await db.refresh(payment)
+        assert attempt.status == 'operator_review'
+        assert attempt.holds_invoice_slot is False
+        assert attempt.reconcile_attempts == 1
+        assert attempt.reconciliation_reason == 'provider_terminal_status_regressed'
+        assert attempt.next_reconcile_at >= before_first + timedelta(minutes=59)
+        assert payment.status == 'OPERATOR_REVIEW'
+
+        before_second = datetime.now(UTC)
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=canonical)
+        await db.refresh(attempt)
+        assert attempt.status == 'operator_review'
+        assert attempt.holds_invoice_slot is False
+        assert attempt.reconcile_attempts == 2
+        assert attempt.next_reconcile_at >= before_second + timedelta(minutes=59)
+
+        attempt.reconcile_attempts = 23
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await db.refresh(attempt)
+        assert attempt.status == 'operator_review'
+        assert attempt.holds_invoice_slot is False
+        assert attempt.reconcile_attempts == 24
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 0
+        assert canonical_calls == 1
+
+        serialized = await serialize_intent(db, intent=intent, user=user, include_quote=True)
+        old_attempt = next(item for item in serialized['topup_attempts'] if item['id'] == attempt.public_id)
+        assert old_attempt['action_required'] is True
+        assert old_attempt['can_open_payment'] is False
+        assert old_attempt['can_create_new_attempt'] is True
+
+        replacement = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='9' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        assert replacement.status == 'pending'
+        assert replacement.holds_invoice_slot is True
 
 
 async def test_live_poll_without_safe_redirect_preserves_operator_review_retry_budget(sessions, monkeypatch):

@@ -80,7 +80,6 @@ from app.localization.texts import get_texts
 from app.services.device_addon_service import (
     device_addon_attempt_blocks_account_change,
     device_addon_intent_blocks_account_change,
-    device_addon_paid_effects_block_account_change,
 )
 from app.services.notification_delivery_service import (
     NotificationType,
@@ -2123,8 +2122,6 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
             .order_by(DeviceAddonTopupAttempt.id)
         )
     )
-    if any(device_addon_paid_effects_block_account_change(attempt) for attempt in addon_attempts):
-        return 'После оплаты докупки ещё завершаются обязательные действия. Дождитесь их завершения и повторите сброс.'
     if any(device_addon_attempt_blocks_account_change(attempt) for attempt in addon_attempts):
         return 'Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите сброс.'
     addon_intents = list(

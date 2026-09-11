@@ -72,7 +72,6 @@ from app.external.remnawave_api import RemnaWaveAPI
 from app.services.device_addon_service import (
     device_addon_attempt_blocks_account_change,
     device_addon_intent_blocks_account_change,
-    device_addon_paid_effects_block_account_change,
 )
 
 
@@ -551,11 +550,6 @@ async def _guard_device_addon_merge(db: AsyncSession, user_ids: list[int]) -> li
             .with_for_update()
         )
     )
-    if any(device_addon_paid_effects_block_account_change(attempt) for attempt in attempts):
-        raise ValueError(
-            'После оплаты докупки ещё завершаются обязательные действия. '
-            'Дождитесь их завершения и повторите объединение.'
-        )
     if any(device_addon_attempt_blocks_account_change(attempt) for attempt in attempts):
         raise ValueError('Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите объединение.')
     intents = list(

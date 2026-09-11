@@ -996,10 +996,11 @@ async def reconcile_device_addon_payment(
         attempt.next_reconcile_at = datetime.now(UTC) + _TERMINAL_RECHECK_DELAY
         payment.status = status
     elif status in _PROVIDER_LIVE:
-        if attempt.status == 'terminal':
+        if attempt.status == 'terminal' or (attempt.status == 'operator_review' and not attempt.holds_invoice_slot):
             # A terminal invoice never reclaims the one-invoice slot.  A
-            # contradictory later PENDING remains visible for operator review
-            # and cannot become a second customer-facing payment URL.
+            # contradictory later PENDING remains in the bounded hourly review
+            # lane on every subsequent observation and cannot become a second
+            # customer-facing payment URL.
             _mark_operator_review(
                 payment=payment,
                 attempt=attempt,
@@ -1054,9 +1055,50 @@ async def _run_paid_effects(
     bot: Any | None,
 ) -> None:
     attempt = await db.get(DeviceAddonTopupAttempt, attempt_id, populate_existing=True)
-    if attempt.status != 'paid' or not attempt.deposit_transaction_id:
+    if attempt is None or attempt.status != 'paid' or not attempt.deposit_transaction_id:
         return
     if attempt.referral_status in {'pending', 'processing'}:
+        # The monetary helper locks Transaction -> Users.  Enter the same
+        # Platega row that merge/reset lock first, then revalidate the claimed
+        # attempt.  This serializes account ownership changes without making a
+        # durable ``paid`` row a lifecycle blocker or changing P -> U -> A -> I
+        # in provider settlement paths.
+        payment_lock = (
+            await db.execute(
+                select(PlategaPayment)
+                .where(PlategaPayment.id == attempt.platega_payment_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        attempt = (
+            await db.execute(
+                select(DeviceAddonTopupAttempt)
+                .where(
+                    DeviceAddonTopupAttempt.id == attempt_id,
+                    DeviceAddonTopupAttempt.lease_token == lease_token,
+                    DeviceAddonTopupAttempt.lease_epoch == lease_epoch,
+                    DeviceAddonTopupAttempt.lease_expires_at >= datetime.now(UTC),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if payment_lock is None or attempt is None:
+            await db.rollback()
+            raise DeviceAddonError('recovery_lease_lost', 'Платёж уже проверяется.')
+        owner = await db.get(User, payment_lock.user_id, populate_existing=True)
+        if owner is None:
+            await db.rollback()
+            raise RuntimeError('device add-on payment owner disappeared')
+        if reset_is_busy(owner):
+            # Reset already won the payment-first fence.  Relinquish this
+            # claim; cleanup may now remove the complete graph without a stale
+            # worker recreating any state after its marker commit.
+            attempt.lease_token = None
+            attempt.lease_expires_at = None
+            await db.commit()
+            return
         try:
             await apply_deposit_referral_money(db, source_transaction_id=attempt.deposit_transaction_id)
         except ReferralRewardBalanceFencedError:
