@@ -136,6 +136,49 @@ async def test_legacy_webapi_device_decrease_keeps_existing_update_path(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_legacy_webapi_rechecks_device_increase_after_subscription_lock(monkeypatch):
+    stale_subscription = SimpleNamespace(
+        id=99,
+        actual_status='active',
+        is_active=True,
+        is_trial=False,
+        device_limit=3,
+        tariff_id=None,
+    )
+    locked_subscription = SimpleNamespace(id=99, device_limit=2)
+    user = SimpleNamespace(id=1, subscriptions=[stale_subscription])
+    monkeypatch.setattr(miniapp, '_authorize_miniapp_user', AsyncMock(return_value=user))
+    monkeypatch.setattr(miniapp.settings, 'PRICE_PER_DEVICE', 5000)
+    monkeypatch.setattr(miniapp.settings, 'MAX_DEVICES_LIMIT', 10)
+
+    from app.services import public_access_point_service
+
+    access_check = AsyncMock()
+    monkeypatch.setattr(public_access_point_service, 'assert_no_manual_access_point_grant', access_check)
+    panel_service = Mock()
+    monkeypatch.setattr(miniapp, 'SubscriptionService', panel_service)
+    locked_result = SimpleNamespace(scalar_one=lambda: locked_subscription)
+    db = SimpleNamespace(execute=AsyncMock(return_value=locked_result), commit=AsyncMock())
+
+    with pytest.raises(HTTPException) as error:
+        await miniapp.update_subscription_devices_endpoint(
+            payload=MiniAppSubscriptionDevicesUpdateRequest(
+                initData='signed',
+                subscription_id=99,
+                devices=3,
+            ),
+            db=db,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail['code'] == 'quote_required'
+    access_check.assert_awaited_once()
+    db.execute.assert_awaited_once()
+    db.commit.assert_not_awaited()
+    panel_service.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_legacy_device_cart_does_not_lock_or_reactivate_subscription(monkeypatch):
     check_subscription = AsyncMock()
     monkeypatch.setattr(carts, '_is_subscription_disabled', check_subscription)

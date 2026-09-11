@@ -6359,6 +6359,16 @@ async def update_subscription_devices_endpoint(
     current_devices = int(current_devices_value)
     old_devices = current_devices
 
+    if new_devices > current_devices:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                'code': 'quote_required',
+                'message': 'Обновите кабинет и подтвердите актуальную цену докупки устройств.',
+                'continuation_path': '/subscription/device-topup/new',
+            },
+        )
+
     if new_devices == current_devices:
         return MiniAppSubscriptionUpdateResponse(success=True, message='No changes')
 
