@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy import func, select
 from structlog.testing import capture_logs
 
@@ -425,6 +426,66 @@ async def test_customer_receipt_failure_keeps_the_single_credit_retryable(sessio
         assert attempt.event_status == 'done'
         assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 1
         retry_bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.parametrize('error_type', [TelegramForbiddenError, TelegramBadRequest])
+async def test_customer_receipt_terminal_failure_finishes_without_retry(sessions, monkeypatch, error_type):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', False)
+    monkeypatch.setattr(settings, 'MINIAPP_CUSTOM_URL', 'https://cabinet.example')
+    bot = MagicMock()
+    bot.send_message = AsyncMock(side_effect=error_type(method=MagicMock(), message='recipient unavailable'))
+
+    async with sessions() as db:
+        user, _, _, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        payload = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=payload)
+
+        assert await payments.recover_device_addon_payments(db, limit=1, bot=bot) == 1
+        await db.refresh(attempt)
+        assert attempt.event_status == 'done'
+        assert attempt.reconciliation_reason == 'customer_receipt_undeliverable'
+        assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 1
+
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1, bot=bot) == 0
+        bot.send_message.assert_awaited_once()
+
+
+async def test_paid_effect_attempt_ceiling_finishes_without_another_delivery(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', False)
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+
+    async with sessions() as db:
+        _, _, _, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        payload = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=payload)
+        attempt.referral_status = 'done'
+        attempt.event_status = 'pending'
+        attempt.effects_attempts = payments._MAX_PAID_EFFECT_ATTEMPTS
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+
+        assert await payments.recover_device_addon_payments(db, limit=1, bot=bot) == 1
+        await db.refresh(attempt)
+        assert attempt.event_status == 'done'
+        assert attempt.reconciliation_reason == 'paid_effects_attempts_exhausted'
+        bot.send_message.assert_not_awaited()
 
 
 async def test_wrong_currency_on_old_invoice_holds_only_that_invoice(sessions):

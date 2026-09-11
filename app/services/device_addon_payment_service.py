@@ -16,6 +16,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import structlog
 from aiogram import types
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,6 +63,7 @@ _NO_ID_REVIEW_DELAY = timedelta(minutes=5)
 _TERMINAL_RECHECK_DELAY = timedelta(hours=6)
 _OPERATOR_RECHECK_DELAY = timedelta(hours=1)
 _MAX_TERMINAL_RECONCILE_ATTEMPTS = 4
+_MAX_PAID_EFFECT_ATTEMPTS = 12
 # The first add-on release is proven against live canonical invoices only for
 # SBP and Russian cards.  Other globally enabled Platega methods remain
 # available to their existing flows, but cannot create an add-on invoice until
@@ -1275,6 +1277,19 @@ async def _run_paid_effects_under_account_activity(
     ).scalar_one_or_none()
     if attempt is None:
         raise DeviceAddonError('recovery_lease_lost', 'Платёж уже проверяется.')
+    if int(attempt.effects_attempts or 0) >= _MAX_PAID_EFFECT_ATTEMPTS:
+        attempt.event_status = 'done'
+        attempt.reconciliation_reason = 'paid_effects_attempts_exhausted'
+        attempt.lease_token = None
+        attempt.lease_expires_at = None
+        await db.commit()
+        logger.warning(
+            'device_addon_paid_effects_attempts_exhausted',
+            attempt_id=attempt_id,
+            user_id=attempt.user_id,
+            effects_attempts=attempt.effects_attempts,
+        )
+        return
     attempt.event_status = 'processing'
     attempt.effects_attempts = int(attempt.effects_attempts or 0) + 1
     await db.commit()
@@ -1298,14 +1313,42 @@ async def _run_paid_effects_under_account_activity(
     payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
     if user is None or intent is None or payment is None:
         raise RuntimeError('device add-on notification graph disappeared')
-    await _send_paid_effect_notifications(
-        db,
-        bot=bot,
-        user=user,
-        transaction=transaction,
-        intent=intent,
-        payment=payment,
-    )
+    try:
+        await _send_paid_effect_notifications(
+            db,
+            bot=bot,
+            user=user,
+            transaction=transaction,
+            intent=intent,
+            payment=payment,
+        )
+    except (TelegramForbiddenError, TelegramBadRequest) as error:
+        attempt = (
+            await db.execute(
+                select(DeviceAddonTopupAttempt)
+                .where(
+                    DeviceAddonTopupAttempt.id == attempt_id,
+                    DeviceAddonTopupAttempt.lease_token == lease_token,
+                    DeviceAddonTopupAttempt.lease_epoch == lease_epoch,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if attempt is None:
+            raise DeviceAddonError('recovery_lease_lost', 'Платёж уже проверяется.') from error
+        attempt.event_status = 'done'
+        attempt.reconciliation_reason = 'customer_receipt_undeliverable'
+        attempt.lease_token = None
+        attempt.lease_expires_at = None
+        await db.commit()
+        logger.warning(
+            'device_addon_customer_receipt_undeliverable',
+            attempt_id=attempt_id,
+            user_id=user.id,
+            error_type=type(error).__name__,
+        )
+        return
 
     attempt = (
         await db.execute(
