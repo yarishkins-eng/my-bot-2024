@@ -494,11 +494,7 @@ class DeviceAddonWorker:
                     if current.disposition == 'lost':
                         return
                     if current.disposition == 'temporary':
-                        delay = (
-                            _LIMITED_RETRY_DELAY
-                            if current.error_code == 'subscription_limited'
-                            else _RETRY_DELAY
-                        )
+                        delay = _LIMITED_RETRY_DELAY if current.error_code == 'subscription_limited' else _RETRY_DELAY
                         await self._mark_claim(
                             intent_id,
                             token,
