@@ -6269,16 +6269,6 @@ async def update_subscription_devices_endpoint(
     )
     _validate_subscription_id(payload.subscription_id, subscription)
 
-    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
-
-    try:
-        await assert_no_manual_access_point_grant(db, subscription, action='device change')
-    except AccessPointPolicyError as error:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
-        ) from error
-
     raw_value = payload.devices if payload.devices is not None else payload.device_limit
     if raw_value is None:
         raise HTTPException(
@@ -6299,6 +6289,29 @@ async def update_subscription_devices_endpoint(
             status.HTTP_400_BAD_REQUEST,
             detail={'code': 'validation_error', 'message': 'Device limit must be positive'},
         )
+
+    current_devices_value = subscription.device_limit
+    if current_devices_value is None:
+        current_devices_value = settings.DEFAULT_DEVICE_LIMIT or 1
+    if new_devices > int(current_devices_value):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                'code': 'quote_required',
+                'message': 'Обновите кабинет и подтвердите актуальную цену докупки устройств.',
+                'continuation_path': '/subscription/device-topup/new',
+            },
+        )
+
+    from app.services.public_access_point_service import AccessPointPolicyError, assert_no_manual_access_point_grant
+
+    try:
+        await assert_no_manual_access_point_grant(db, subscription, action='device change')
+    except AccessPointPolicyError as error:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={'code': 'access_point_addon_unsupported', 'message': str(error)},
+        ) from error
 
     # Load tariff for device price and max limit
     tariff = None
