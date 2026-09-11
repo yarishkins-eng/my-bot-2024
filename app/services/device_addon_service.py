@@ -514,7 +514,7 @@ async def serialize_intent(
                 and attempt.status in {'terminal', 'paid'}
                 and not attempt.holds_invoice_slot
                 and not any(other.holds_invoice_slot for other in attempts)
-                and not any(other.status in unresolved_states for other in attempts)
+                and not any(other.holds_invoice_slot and other.status in unresolved_states for other in attempts)
             ),
         )
         for attempt in attempts

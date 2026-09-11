@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,6 +22,7 @@ from app.database.models import (
     AuraPayPayment,
     CloudPaymentsPayment,
     CryptoBotPayment,
+    DeviceAddonTopupAttempt,
     DonutPayment,
     EtoplatezhiPayment,
     FreekassaPayment,
@@ -65,6 +66,11 @@ class PendingPayment:
     user: User
     payment: Any
     expires_at: datetime | None = None
+    is_device_addon: bool = False
+    device_addon_reason: str | None = None
+    device_addon_reason_text: str | None = None
+    device_addon_can_check: bool = False
+    device_addon_can_close: bool = False
 
     def is_recent(self, max_age: timedelta = PENDING_MAX_AGE) -> bool:
         return (datetime.now(UTC) - self.created_at) <= max_age
@@ -294,7 +300,11 @@ class AutoPaymentVerificationService:
         async with AsyncSessionLocal() as session:
             try:
                 pending = await list_recent_pending_payments(session)
-                candidates = [record for record in pending if record.method in methods and not record.is_paid]
+                candidates = [
+                    record
+                    for record in pending
+                    if record.method in methods and not record.is_paid and not record.is_device_addon
+                ]
 
                 if not candidates:
                     logger.debug('Автопроверка пополнений: подходящих ожидающих платежей нет')
@@ -401,7 +411,63 @@ def _is_platega_pending(payment: PlategaPayment) -> bool:
     if payment.is_paid:
         return False
     status = (payment.status or '').lower()
-    return status in {'pending', 'inprogress', 'in_progress'}
+    return status in {
+        'pending',
+        'inprogress',
+        'in_progress',
+        'creation_unknown',
+        'reconciling',
+        'operator_review',
+    }
+
+
+def _device_addon_reason_text(attempt: DeviceAddonTopupAttempt) -> str | None:
+    reason = str(attempt.reconciliation_reason or '')
+    if not reason:
+        return None
+    if (
+        'invoice_mismatch' in reason
+        and attempt.provider_returned_amount_kopeks is not None
+        and int(attempt.provider_returned_amount_kopeks) != int(attempt.requested_amount_kopeks)
+    ):
+        return 'Сумма у провайдера не совпала — проверьте настройку комиссии Platega.'
+    messages = {
+        'provider_identity_unknown_no_retry': 'Провайдер не вернул ID счёта; нужно решение оператора.',
+        'canonical_invoice_mismatch': 'Данные счёта у провайдера не совпали с ожидаемыми.',
+        'closed_by_operator': 'Попытка закрыта оператором без зачисления.',
+        'canonical_status_unavailable': 'Не удалось получить канонический статус Platega.',
+    }
+    return messages.get(reason, f'Требуется проверка: {reason}.')
+
+
+async def attach_device_addon_payment_metadata(
+    db: AsyncSession,
+    records: Iterable[PendingPayment],
+) -> None:
+    """Add operator-only add-on context without changing generic payment rows."""
+    platega_records = {record.local_id: record for record in records if record.method == PaymentMethod.PLATEGA}
+    if not platega_records:
+        return
+    attempts = (
+        await db.execute(
+            select(DeviceAddonTopupAttempt).where(
+                DeviceAddonTopupAttempt.platega_payment_id.in_(platega_records),
+            )
+        )
+    ).scalars()
+    for attempt in attempts:
+        record = platega_records.get(int(attempt.platega_payment_id))
+        if record is None:
+            continue
+        record.is_device_addon = True
+        record.device_addon_reason = attempt.reconciliation_reason
+        record.device_addon_reason_text = _device_addon_reason_text(attempt)
+        record.device_addon_can_check = bool(attempt.provider_payment_id)
+        record.device_addon_can_close = bool(
+            attempt.status == 'operator_review'
+            and attempt.provider_payment_id is None
+            and attempt.deposit_transaction_id is None
+        )
 
 
 def _is_heleket_pending(payment: HeleketPayment) -> bool:
@@ -648,10 +714,20 @@ async def _fetch_wata_payments(db: AsyncSession, cutoff: datetime) -> list[Pendi
 
 
 async def _fetch_platega_payments(db: AsyncSession, cutoff: datetime) -> list[PendingPayment]:
+    unresolved_addon_payments = select(DeviceAddonTopupAttempt.platega_payment_id).where(
+        DeviceAddonTopupAttempt.status.in_(
+            {'creation_unknown', 'pending', 'reconciling', 'operator_review'},
+        )
+    )
     stmt = (
         select(PlategaPayment)
         .options(selectinload(PlategaPayment.user))
-        .where(PlategaPayment.created_at >= cutoff)
+        .where(
+            or_(
+                PlategaPayment.created_at >= cutoff,
+                PlategaPayment.id.in_(unresolved_addon_payments),
+            )
+        )
         .order_by(desc(PlategaPayment.created_at))
     )
     result = await db.execute(stmt)
@@ -1155,6 +1231,7 @@ async def list_recent_pending_payments(
     for batch in tasks:
         records.extend(batch)
 
+    await attach_device_addon_payment_metadata(db, records)
     records.sort(key=lambda item: item.created_at, reverse=True)
     return records
 
@@ -1505,8 +1582,19 @@ async def run_manual_check(
             result = await payment_service.get_wata_payment_status(db, local_payment_id)
             payment = result.get('payment') if result else None
         elif method == PaymentMethod.PLATEGA:
-            result = await payment_service.get_platega_payment_status(db, local_payment_id)
-            payment = result.get('payment') if result else None
+            addon_attempt = await db.scalar(
+                select(DeviceAddonTopupAttempt).where(
+                    DeviceAddonTopupAttempt.platega_payment_id == local_payment_id,
+                )
+            )
+            if addon_attempt is not None:
+                from app.services.device_addon_payment_service import check_device_addon_payment_now
+
+                await check_device_addon_payment_now(db, platega_payment_id=local_payment_id)
+                payment = await db.get(PlategaPayment, local_payment_id, populate_existing=True)
+            else:
+                result = await payment_service.get_platega_payment_status(db, local_payment_id)
+                payment = result.get('payment') if result else None
         elif method == PaymentMethod.HELEKET:
             payment = await payment_service.sync_heleket_payment_status(db, local_payment_id=local_payment_id)
         elif method == PaymentMethod.YOOKASSA:
@@ -1566,7 +1654,10 @@ async def run_manual_check(
         if not payment:
             return None
 
-        return await get_payment_record(db, method, local_payment_id)
+        record = await get_payment_record(db, method, local_payment_id)
+        if record is not None:
+            await attach_device_addon_payment_metadata(db, [record])
+        return record
 
     except Exception as error:  # pragma: no cover - defensive logging
         logger.error(

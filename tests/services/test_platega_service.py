@@ -2,7 +2,12 @@ import pytest
 import structlog
 
 from app.config import settings
-from app.services.platega_service import PlategaService
+from app.services import platega_service as platega_module
+from app.services.platega_service import (
+    PlategaCreateRejected,
+    PlategaService,
+    _is_trustworthy_create_rejection,
+)
 
 
 def _configure_platega(monkeypatch: pytest.MonkeyPatch, **overrides) -> None:
@@ -74,6 +79,73 @@ async def test_create_payment_uses_v2_endpoint_when_configured(monkeypatch: pyte
 
     assert service.api_version == 'v2'
     assert await _captured_create_endpoint(monkeypatch, service) == '/v2/transaction/process'
+
+
+@pytest.mark.parametrize('status_code', [400, 401, 403, 404, 422])
+def test_device_addon_create_recognizes_trustworthy_provider_rejection(status_code: int) -> None:
+    assert _is_trustworthy_create_rejection(status_code, {'error': 'rejected'}) is True
+
+
+@pytest.mark.parametrize('status_code', [408, 409, 429, 500, 502, 503, 504])
+def test_device_addon_create_keeps_ambiguous_failures_unknown(status_code: int) -> None:
+    assert _is_trustworthy_create_rejection(status_code, {'error': 'ambiguous'}) is False
+
+
+def test_device_addon_create_requires_parseable_json_object_body() -> None:
+    assert _is_trustworthy_create_rejection(422, None) is False
+    assert _is_trustworthy_create_rejection(422, {}) is True
+
+
+async def test_only_device_addon_create_requests_terminal_rejection_details(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_platega(monkeypatch)
+    service = PlategaService()
+    calls: list[bool] = []
+
+    async def fake_request(method, endpoint, **kwargs):
+        calls.append(bool(kwargs.get('raise_terminal_create_rejection')))
+
+    monkeypatch.setattr(service, '_request', fake_request)
+    await service.create_payment(payment_method=2, amount=100.0, currency='RUB')
+    await service.create_device_addon_payment(payment_method=2, amount=100.0, currency='RUB')
+
+    assert calls == [False, True]
+
+
+async def test_device_addon_create_accepts_parseable_json_despite_wrong_content_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_platega(monkeypatch)
+
+    class Response:
+        status = 422
+        headers = {'Content-Type': 'text/plain'}
+        url = 'https://app.platega.io/transaction/process'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+        async def text(self):
+            return '{}'
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+        def request(self, *args, **kwargs):
+            del args, kwargs
+            return Response()
+
+    monkeypatch.setattr(platega_module.aiohttp, 'ClientSession', lambda **kwargs: Session())
+
+    with pytest.raises(PlategaCreateRejected) as error:
+        await PlategaService().create_device_addon_payment(payment_method=2, amount=100.0, currency='RUB')
+    assert error.value.status_code == 422
 
 
 async def test_base_url_version_suffix_forces_version_and_is_stripped(monkeypatch: pytest.MonkeyPatch) -> None:

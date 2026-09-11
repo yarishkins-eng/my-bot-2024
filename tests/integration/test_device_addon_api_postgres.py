@@ -164,7 +164,7 @@ async def test_http_quote_invoice_owned_return_and_manual_purchase(sessions, mon
         def __init__(self):
             self._max_retries = 3
 
-        async def create_payment(self, **kwargs):
+        async def create_device_addon_payment(self, **kwargs):
             assert self._max_retries == 1
             provider_posts.append(kwargs)
             async with sessions() as check:

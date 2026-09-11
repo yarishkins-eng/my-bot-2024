@@ -19,6 +19,7 @@ from app.database.models import (
     AuraPayPayment,
     CloudPaymentsPayment,
     CryptoBotPayment,
+    DeviceAddonTopupAttempt,
     DonutPayment,
     EtoplatezhiPayment,
     FreekassaPayment,
@@ -109,6 +110,7 @@ _CANCELLED_STATUSES: frozenset[str] = frozenset(
         'fail',
         'failed',
         'amount_mismatch',
+        'closed_by_operator',
     }
 )
 
@@ -179,7 +181,7 @@ def _classify_status(record: PendingPayment) -> StatusFilter:
     status_lower = (record.status or '').lower()
     if status_lower in _PAID_STATUSES:
         return StatusFilter.PAID
-    if status_lower in _CANCELLED_STATUSES:
+    if status_lower in _CANCELLED_STATUSES or status_lower.startswith('rejected_'):
         return StatusFilter.CANCELLED
     return StatusFilter.PENDING
 
@@ -449,7 +451,22 @@ async def _search_wata(db: AsyncSession, params: SearchParams) -> list[PendingPa
 
 async def _search_platega(db: AsyncSession, params: SearchParams) -> list[PendingPayment]:
     stmt = select(PlategaPayment).options(selectinload(PlategaPayment.user)).order_by(desc(PlategaPayment.created_at))
-    stmt = _apply_date_filter(stmt, PlategaPayment.created_at, params.cutoff, params.upper_bound)
+    unresolved_addon_payments = select(DeviceAddonTopupAttempt.platega_payment_id).where(
+        DeviceAddonTopupAttempt.status.in_(
+            {'creation_unknown', 'pending', 'reconciling', 'operator_review'},
+        )
+    )
+    if params.date_from is None and params.date_to is None:
+        # Unresolved add-on invoices remain on the operator's normal payment
+        # screen after their bounded automatic polling window has ended.
+        stmt = stmt.where(
+            or_(
+                PlategaPayment.created_at >= params.cutoff,
+                PlategaPayment.id.in_(unresolved_addon_payments),
+            )
+        )
+    else:
+        stmt = _apply_date_filter(stmt, PlategaPayment.created_at, params.cutoff, params.upper_bound)
 
     if params.search:
         kind = _detect_user_search_kind(params.search)

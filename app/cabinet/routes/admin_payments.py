@@ -9,7 +9,9 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot_factory import create_bot
-from app.database.models import PaymentMethod, User
+from app.database.models import AdminAuditLog, PaymentMethod, User
+from app.services.device_addon_payment_service import close_device_addon_attempt_without_credit
+from app.services.device_addon_service import DeviceAddonError
 from app.services.payment_search_service import (
     MAX_ALL_TIME_DAYS,
     PeriodPreset,
@@ -22,6 +24,7 @@ from app.services.payment_service import PaymentService
 from app.services.payment_verification_service import (
     SUPPORTED_MANUAL_CHECK_METHODS,
     PendingPayment,
+    attach_device_addon_payment_metadata,
     get_payment_record,
     list_recent_pending_payments,
     method_display_name,
@@ -60,6 +63,10 @@ class PendingPaymentResponse(BaseModel):
     user_telegram_id: int | None = None
     user_username: str | None = None
     user_email: str | None = None
+    is_device_addon: bool = False
+    device_addon_reason: str | None = None
+    device_addon_reason_text: str | None = None
+    can_close_device_addon_attempt: bool = False
 
     class Config:
         from_attributes = True
@@ -148,6 +155,8 @@ def _get_status_info(record: PendingPayment) -> tuple[str, str]:
         return mapping.get(status_str, ('❓', 'Неизвестно'))
 
     if record.method == PaymentMethod.PLATEGA:
+        if status_str.startswith('rejected_'):
+            return '❌', 'Отклонено провайдером'
         mapping = {
             'pending': ('⏳', 'Ожидает оплаты'),
             'inprogress': ('⌛', 'Обрабатывается'),
@@ -155,6 +164,7 @@ def _get_status_info(record: PendingPayment) -> tuple[str, str]:
             'failed': ('❌', 'Ошибка'),
             'canceled': ('❌', 'Отменено'),
             'expired': ('⌛', 'Истёк'),
+            'closed_by_operator': ('❌', 'Закрыто оператором'),
         }
         return mapping.get(status_str, ('❓', 'Неизвестно'))
 
@@ -208,6 +218,8 @@ def _get_status_info(record: PendingPayment) -> tuple[str, str]:
 
 def _is_checkable(record: PendingPayment) -> bool:
     """Check if payment can be manually checked."""
+    if record.is_device_addon:
+        return record.device_addon_can_check
     if record.method not in SUPPORTED_MANUAL_CHECK_METHODS:
         return False
     if not record.is_recent():
@@ -284,6 +296,10 @@ def _record_to_response(record: PendingPayment) -> PendingPaymentResponse:
         user_telegram_id=record.user.telegram_id if record.user else None,
         user_username=record.user.username if record.user else None,
         user_email=record.user.email if record.user else None,
+        is_device_addon=record.is_device_addon,
+        device_addon_reason=record.device_addon_reason,
+        device_addon_reason_text=record.device_addon_reason_text,
+        can_close_device_addon_attempt=record.device_addon_can_close,
     )
 
 
@@ -406,6 +422,7 @@ async def search_payments_endpoint(
     )
 
     page_items, total = await search_payments(db, params)
+    await attach_device_addon_payment_metadata(db, page_items)
     pages = math.ceil(total / per_page) if total > 0 else 1
     items = [_record_to_response(p) for p in page_items]
 
@@ -506,6 +523,7 @@ async def get_pending_payment_details(
             detail='Payment not found',
         )
 
+    await attach_device_addon_payment_metadata(db, [record])
     return _record_to_response(record)
 
 
@@ -533,6 +551,8 @@ async def check_payment_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Payment not found',
         )
+
+    await attach_device_addon_payment_metadata(db, [record])
 
     # Check if manual check is available
     if not _is_checkable(record):
@@ -585,4 +605,46 @@ async def check_payment_status(
         status_changed=status_changed,
         old_status=old_status,
         new_status=updated.status,
+    )
+
+
+@router.post('/{method}/{payment_id}/close-device-addon-attempt', response_model=ManualCheckResponse)
+async def close_device_addon_attempt(
+    method: str,
+    payment_id: int,
+    admin: User = Depends(require_permission('payments:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Release one operator-reviewed add-on invoice which has no provider ID."""
+    if method != PaymentMethod.PLATEGA.value:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid payment method')
+    db.add(
+        AdminAuditLog(
+            user_id=admin.id,
+            action='device_addon.payment_attempt_closed',
+            resource_type='platega_payment',
+            resource_id=str(payment_id),
+            status='success',
+            details={'resolution': 'closed_by_operator', 'credited': False},
+        )
+    )
+    try:
+        await close_device_addon_attempt_without_credit(db, platega_payment_id=payment_id)
+    except DeviceAddonError as error:
+        await db.rollback()
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={'code': error.code, 'message': str(error)},
+        ) from error
+    record = await get_payment_record(db, PaymentMethod.PLATEGA, payment_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Payment not found')
+    await attach_device_addon_payment_metadata(db, [record])
+    return ManualCheckResponse(
+        success=True,
+        message='Попытка закрыта без зачисления.',
+        payment=_record_to_response(record),
+        status_changed=True,
+        old_status='operator_review',
+        new_status='terminal',
     )

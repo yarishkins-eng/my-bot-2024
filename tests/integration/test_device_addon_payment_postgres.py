@@ -6,10 +6,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import func, select
+from structlog.testing import capture_logs
 
+from app.cabinet.routes import admin_payments
 from app.config import settings
 from app.database.models import (
     AccountErasureRequest,
+    AdminAuditLog,
     DeviceAddonIntent,
     DeviceAddonTopupAttempt,
     PaymentMethod,
@@ -28,7 +31,19 @@ from app.services.device_addon_payment_service import (
 from app.services.device_addon_service import DeviceAddonError
 from app.services.device_first_deposit_outbox_service import apply_deposit_referral_money
 from app.services.payment.platega import PlategaPaymentMixin
-from app.services.platega_service import PlategaService
+from app.services.payment_search_service import (
+    PeriodPreset,
+    SearchParams,
+    StatusFilter,
+    _classify_status,
+    search_payments,
+)
+from app.services.payment_verification_service import (
+    attach_device_addon_payment_metadata,
+    get_payment_record,
+    list_recent_pending_payments,
+)
+from app.services.platega_service import PlategaCreateRejected, PlategaService
 from tests.integration.test_device_addon_lifecycle_postgres import DATABASE_URL, sessions  # noqa: F401
 
 
@@ -168,6 +183,19 @@ async def _active_intent_graph(db):
     db.add(intent)
     await db.commit()
     return user, subscription, intent
+
+
+def _configure_addon_topup(monkeypatch):
+    monkeypatch.setattr(settings, 'DEVICE_ADDON_PURCHASE_ENABLED', True)
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test')
+    monkeypatch.setattr(settings, 'PLATEGA_MIN_AMOUNT_KOPEKS', 10_000)
+    monkeypatch.setattr(settings, 'PLATEGA_MAX_AMOUNT_KOPEKS', 10_000_000)
+    monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(
+        payments,
+        'available_platega_methods_for_db',
+        AsyncMock(return_value=[{'provider_code': 2}]),
+    )
 
 
 async def _closing_referred_paid_graph(db, *, referrer_erased: bool = False):
@@ -343,23 +371,29 @@ async def test_wrong_currency_on_old_invoice_holds_only_that_invoice(sessions):
         await db.refresh(old_attempt)
         await db.refresh(current_attempt)
         assert user.balance_kopeks == 0
-        assert old_payment.status == 'OPERATOR_REVIEW'
-        assert old_attempt.status == 'operator_review'
+        assert old_payment.status == 'CANCELED'
+        assert old_attempt.status == 'terminal'
         assert old_attempt.holds_invoice_slot is False
+        assert old_attempt.reconciliation_reason == 'terminal_recheck_canonical_invoice_mismatch'
         assert current_attempt.status == 'pending'
         assert await db.scalar(select(func.count(Transaction.id))) == 0
 
 
 @pytest.mark.parametrize(
-    'mutation',
+    ('mutation', 'expected_attempt_status', 'expected_payment_status'),
     [
-        {'id': 'wrong-provider-id'},
-        {'paymentDetails': {'amount': '99.99', 'currency': 'RUB'}},
-        {'payload': 'platega:wrong-correlation'},
+        ({'id': 'wrong-provider-id'}, 'operator_review', 'OPERATOR_REVIEW'),
+        ({'paymentDetails': {'amount': '99.99', 'currency': 'RUB'}}, 'terminal', 'CANCELED'),
+        ({'payload': 'platega:wrong-correlation'}, 'operator_review', 'OPERATOR_REVIEW'),
     ],
     ids=['provider-id', 'amount', 'correlation-payload'],
 )
-async def test_canonical_identity_amount_and_present_payload_must_all_match(sessions, mutation):
+async def test_canonical_identity_amount_and_present_payload_must_all_match(
+    sessions,
+    mutation,
+    expected_attempt_status,
+    expected_payment_status,
+):
     async with sessions() as db:
         user, _, old_payment, old_attempt, current_attempt = await _late_payment_graph(db)
         payload = {
@@ -376,8 +410,8 @@ async def test_canonical_identity_amount_and_present_payload_must_all_match(sess
         await db.refresh(old_attempt)
         await db.refresh(current_attempt)
         assert user.balance_kopeks == 0
-        assert old_payment.status == 'OPERATOR_REVIEW'
-        assert old_attempt.status == 'operator_review'
+        assert old_payment.status == expected_payment_status
+        assert old_attempt.status == expected_attempt_status
         assert old_attempt.holds_invoice_slot is False
         assert current_attempt.status == 'pending'
         assert await db.scalar(select(func.count(Transaction.id))) == 0
@@ -430,7 +464,7 @@ async def test_early_exact_webhook_during_lost_create_response_never_uses_generi
         def __init__(self):
             self._max_retries = 3
 
-        async def create_payment(self, **kwargs):
+        async def create_device_addon_payment(self, **kwargs):
             nonlocal provider_posts
             provider_posts += 1
             assert self._max_retries == 1
@@ -502,6 +536,426 @@ async def test_early_exact_webhook_during_lost_create_response_never_uses_generi
         await db.refresh(user)
         assert user.balance_kopeks == 10_000
         assert await db.scalar(select(func.count(Transaction.id))) == 1
+
+
+async def test_trusted_create_rejection_frees_slot_and_allows_a_new_invoice(sessions, monkeypatch):
+    _configure_addon_topup(monkeypatch)
+
+    class RejectedProvider:
+        def __init__(self):
+            self._max_retries = 3
+
+        async def create_device_addon_payment(self, **kwargs):
+            del kwargs
+            raise PlategaCreateRejected(422)
+
+    monkeypatch.setattr(payments, 'PlategaService', RejectedProvider)
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        first = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='e' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        second = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='f' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        await db.refresh(first)
+        await db.refresh(second)
+        assert first.status == second.status == 'terminal'
+        assert first.holds_invoice_slot is second.holds_invoice_slot is False
+        assert first.reconciliation_reason == second.reconciliation_reason == 'provider_create_rejected:422'
+        assert await db.scalar(select(func.count(DeviceAddonTopupAttempt.id))) == 2
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+
+async def test_unknown_create_requires_logged_review_then_audited_close_without_credit(sessions, monkeypatch):
+    _configure_addon_topup(monkeypatch)
+
+    class UnknownProvider:
+        def __init__(self):
+            self._max_retries = 3
+
+        async def create_device_addon_payment(self, **kwargs):
+            del kwargs
+            raise TimeoutError('response lost after POST')
+
+    monkeypatch.setattr(payments, 'PlategaService', UnknownProvider)
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        attempt = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='1' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        assert attempt.status == 'creation_unknown'
+        assert attempt.holds_invoice_slot is True
+        assert attempt.provider_payment_id is None
+
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        with capture_logs() as logs:
+            assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await db.refresh(attempt)
+        assert attempt.status == 'operator_review'
+        assert attempt.holds_invoice_slot is True
+        review_log = next(entry for entry in logs if entry.get('event') == 'device_addon_payment_operator_review')
+        assert review_log['reason'] == 'provider_identity_unknown_no_retry'
+        assert review_log['intent_public_id'] == intent.public_id
+        assert review_log['attempt_public_id'] == attempt.public_id
+        assert review_log['amount_kopeks'] == 10_000
+
+        with pytest.raises(DeviceAddonError, match='уже проверяется'):
+            await create_device_addon_topup(
+                db,
+                intent_public_id=intent.public_id,
+                user_id=user.id,
+                idempotency_key=uuid.uuid4().hex,
+                request_hash='2' * 64,
+                method_key='2',
+                expected_amount_kopeks=10_000,
+                return_url=None,
+                failed_url=None,
+            )
+
+        record = await get_payment_record(db, PaymentMethod.PLATEGA, int(attempt.platega_payment_id))
+        assert record is not None
+        await attach_device_addon_payment_metadata(db, [record])
+        assert record.is_device_addon is True
+        assert record.device_addon_can_check is False
+        assert record.device_addon_can_close is True
+        assert record.device_addon_reason_text
+
+        response = await admin_payments.close_device_addon_attempt(
+            PaymentMethod.PLATEGA.value,
+            int(attempt.platega_payment_id),
+            admin=user,
+            db=db,
+        )
+        await db.refresh(user)
+        await db.refresh(attempt)
+        local_payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
+        audit = await db.scalar(
+            select(AdminAuditLog).where(
+                AdminAuditLog.action == 'device_addon.payment_attempt_closed',
+                AdminAuditLog.resource_id == str(attempt.platega_payment_id),
+            )
+        )
+        assert response.success is True
+        assert response.payment is not None and response.payment.is_device_addon is True
+        assert attempt.status == 'terminal'
+        assert attempt.holds_invoice_slot is False
+        assert attempt.reconciliation_reason == 'closed_by_operator'
+        assert local_payment.status == 'CLOSED_BY_OPERATOR'
+        assert audit is not None and audit.details == {'resolution': 'closed_by_operator', 'credited': False}
+        assert user.balance_kopeks == 0
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+        replacement = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='3' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        assert replacement.id != attempt.id
+        assert replacement.status == 'creation_unknown'
+
+
+async def test_operator_close_rejects_attempt_with_provider_identity(sessions):
+    async with sessions() as db:
+        _, _, _, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=1)
+        attempt.status = 'operator_review'
+        attempt.holds_invoice_slot = False
+        await db.commit()
+        with pytest.raises(DeviceAddonError) as error:
+            await payments.close_device_addon_attempt_without_credit(
+                db,
+                platega_payment_id=int(attempt.platega_payment_id),
+            )
+        assert error.value.code == 'attempt_cannot_be_closed'
+
+
+async def test_late_confirmed_callback_after_operator_close_still_credits_exactly_once(sessions, monkeypatch):
+    _configure_addon_topup(monkeypatch)
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+
+    class UnknownProvider(PlategaService):
+        def __init__(self):
+            self._max_retries = 3
+
+        async def create_device_addon_payment(self, **kwargs):
+            del kwargs
+            raise TimeoutError('response lost after POST')
+
+    monkeypatch.setattr(payments, 'PlategaService', UnknownProvider)
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        attempt = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='4' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await payments.close_device_addon_attempt_without_credit(
+            db,
+            platega_payment_id=int(attempt.platega_payment_id),
+        )
+        provider_id = str(uuid.uuid4())
+        canonical = {
+            'id': provider_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+            'payload': f'platega:{attempt.correlation_id}',
+        }
+        local_payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
+        assert await payments.handle_device_addon_platega_callback(
+            db,
+            payment=local_payment,
+            payload=canonical,
+        )
+
+        class CanonicalProvider(PlategaService):
+            def __init__(self):
+                self._max_retries = 3
+
+            async def get_transaction(self, transaction_id):
+                assert transaction_id == provider_id
+                return canonical
+
+        monkeypatch.setattr(payments, 'PlategaService', CanonicalProvider)
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await payments.check_device_addon_payment_now(
+            db,
+            platega_payment_id=int(attempt.platega_payment_id),
+        )
+        await db.refresh(user)
+        await db.refresh(intent)
+        await db.refresh(attempt)
+        assert user.balance_kopeks == 10_000
+        assert attempt.status == 'paid'
+        assert attempt.holds_invoice_slot is False
+        assert intent.purchase_state == 'draft'
+        assert await db.scalar(select(func.count(Transaction.id))) == 1
+
+
+async def test_terminal_and_operator_review_rechecks_are_bounded_and_delayed(sessions, monkeypatch):
+    class MissingCanonicalProvider:
+        def __init__(self):
+            self._max_retries = 3
+
+        async def get_transaction(self, transaction_id):
+            assert transaction_id
+
+    monkeypatch.setattr(payments, 'PlategaService', MissingCanonicalProvider)
+    async with sessions() as db:
+        _, _, payment, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        attempt.reconcile_attempts = 3
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        before_terminal = datetime.now(UTC)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await db.refresh(attempt)
+        assert attempt.status == 'terminal'
+        assert attempt.reconcile_attempts == 4
+        assert before_terminal + timedelta(hours=5, minutes=59) < attempt.next_reconcile_at
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 0
+
+        attempt.status = 'operator_review'
+        attempt.holds_invoice_slot = False
+        attempt.reconcile_attempts = 23
+        attempt.created_at = datetime.now(UTC) - timedelta(days=30)
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        payment.status = 'OPERATOR_REVIEW'
+        before_review = datetime.now(UTC)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await db.refresh(attempt)
+        assert attempt.status == 'operator_review'
+        assert attempt.reconcile_attempts == 24
+        assert before_review + timedelta(minutes=59) < attempt.next_reconcile_at
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 0
+
+
+async def test_old_operator_review_remains_visible_after_automatic_polling_stops(sessions):
+    async with sessions() as db:
+        _, _, payment, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        attempt.status = 'operator_review'
+        attempt.reconcile_attempts = 24
+        attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        attempt.created_at = datetime.now(UTC) - timedelta(days=30)
+        payment.status = 'OPERATOR_REVIEW'
+        payment.created_at = datetime.now(UTC) - timedelta(days=30)
+        await db.commit()
+
+        recent = await list_recent_pending_payments(db)
+        page, total = await search_payments(
+            db,
+            SearchParams(
+                period=PeriodPreset.H24,
+                method_filter=PaymentMethod.PLATEGA,
+                per_page=100,
+            ),
+        )
+
+        assert int(payment.id) in {record.local_id for record in recent}
+        assert int(payment.id) in {record.local_id for record in page}
+        assert total >= 1
+
+
+async def test_admin_manual_check_credits_confirmed_addon_exactly_once(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+
+    class CanonicalProvider(PlategaService):
+        def __init__(self):
+            self._max_retries = 1
+
+        async def get_transaction(self, transaction_id):
+            return {
+                'id': transaction_id,
+                'status': 'CONFIRMED',
+                'paymentMethod': 'SBPQR',
+                'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+            }
+
+    bot = MagicMock()
+    bot.session.close = AsyncMock()
+    monkeypatch.setattr(payments, 'PlategaService', CanonicalProvider)
+    monkeypatch.setattr(admin_payments, 'create_bot', lambda: bot)
+
+    async with sessions() as db:
+        user, _, payment, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        current_attempt.status = 'terminal'
+        current_attempt.holds_invoice_slot = False
+        await db.commit()
+        attempt.status = 'operator_review'
+        attempt.holds_invoice_slot = True
+        payment.status = 'OPERATOR_REVIEW'
+        await db.commit()
+
+        first = await admin_payments.check_payment_status(
+            PaymentMethod.PLATEGA.value,
+            int(payment.id),
+            admin=user,
+            db=db,
+        )
+        second = await admin_payments.check_payment_status(
+            PaymentMethod.PLATEGA.value,
+            int(payment.id),
+            admin=user,
+            db=db,
+        )
+        await db.refresh(user)
+        await db.refresh(attempt)
+
+        assert first.success is True and first.payment is not None
+        assert second.success is True and second.payment is not None
+        assert user.balance_kopeks == 10_000
+        assert attempt.status == 'paid'
+        assert attempt.deposit_transaction_id is not None
+        assert await db.scalar(select(func.count(Transaction.id))) == 1
+        assert bot.session.close.await_count == 2
+
+
+async def test_admin_manual_check_keeps_amount_mismatch_for_operator(sessions, monkeypatch):
+    class CanonicalProvider(PlategaService):
+        def __init__(self):
+            self._max_retries = 1
+
+        async def get_transaction(self, transaction_id):
+            return {
+                'id': transaction_id,
+                'status': 'CONFIRMED',
+                'paymentMethod': 'SBPQR',
+                'paymentDetails': {'amount': '101.00', 'currency': 'RUB'},
+            }
+
+    bot = MagicMock()
+    bot.session.close = AsyncMock()
+    monkeypatch.setattr(payments, 'PlategaService', CanonicalProvider)
+    monkeypatch.setattr(admin_payments, 'create_bot', lambda: bot)
+
+    async with sessions() as db:
+        user, _, payment, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        current_attempt.status = 'terminal'
+        current_attempt.holds_invoice_slot = False
+        await db.commit()
+        attempt.status = 'operator_review'
+        attempt.holds_invoice_slot = True
+        payment.status = 'OPERATOR_REVIEW'
+        await db.commit()
+
+        response = await admin_payments.check_payment_status(
+            PaymentMethod.PLATEGA.value,
+            int(payment.id),
+            admin=user,
+            db=db,
+        )
+        await db.refresh(user)
+        await db.refresh(attempt)
+
+        assert response.success is True and response.payment is not None
+        assert response.payment.device_addon_reason_text == (
+            'Сумма у провайдера не совпала — проверьте настройку комиссии Platega.'
+        )
+        assert user.balance_kopeks == 0
+        assert attempt.status == 'operator_review'
+        assert attempt.reconciliation_reason == 'canonical_invoice_mismatch'
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+
+@pytest.mark.parametrize('provider_status', ['CLOSED_BY_OPERATOR', 'REJECTED_400', 'REJECTED_422'])
+async def test_addon_terminal_payment_statuses_are_cancelled_not_pending(sessions, provider_status):
+    async with sessions() as db:
+        _, _, payment, _, _ = await _late_payment_graph(db)
+        payment.status = provider_status
+        await db.commit()
+        record = await get_payment_record(db, PaymentMethod.PLATEGA, int(payment.id))
+        assert record is not None
+        assert _classify_status(record) == StatusFilter.CANCELLED
+        assert admin_payments._get_status_info(record)[0] == '❌'
 
 
 async def test_post_paid_provider_regressions_preserve_receipt_and_effect_progress(sessions, monkeypatch):
