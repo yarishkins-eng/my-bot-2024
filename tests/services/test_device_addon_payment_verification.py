@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.cabinet.routes import admin_payments
 from app.database.models import PaymentMethod
 from app.services import payment_verification_service as verification
 from app.services.payment_verification_service import AutoPaymentVerificationService, PendingPayment
@@ -92,3 +93,30 @@ def test_operator_review_and_mismatch_keep_actionable_reason() -> None:
     assert verification._device_addon_reason_text(terminal_mismatch) == (
         'Сумма у провайдера не совпала — проверьте настройку комиссии Platega.'
     )
+
+
+@pytest.mark.parametrize(
+    ('status', 'expected'),
+    [
+        ('PREPARED', ('⏳', 'Готовится счёт')),
+        ('DISPATCHING', ('⌛', 'Создаётся счёт')),
+        ('CREATION_UNKNOWN', ('⚠️', 'Создание счёта не подтверждено')),
+        ('RECONCILING', ('🔄', 'Сверяется')),
+        ('OPERATOR_REVIEW', ('⚠️', 'Требует проверки')),
+    ],
+)
+def test_admin_platega_statuses_describe_device_addon_lifecycle(status: str, expected: tuple[str, str]) -> None:
+    record = PendingPayment(
+        method=PaymentMethod.PLATEGA,
+        local_id=41,
+        identifier='addon-provider-id',
+        amount_kopeks=10_000,
+        status=status,
+        is_paid=False,
+        created_at=datetime.now(UTC),
+        user=SimpleNamespace(id=7),
+        payment=SimpleNamespace(id=41),
+        is_device_addon=True,
+    )
+
+    assert admin_payments._get_status_info(record) == expected

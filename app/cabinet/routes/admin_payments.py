@@ -159,8 +159,13 @@ def _get_status_info(record: PendingPayment) -> tuple[str, str]:
         if status_str.startswith('rejected_'):
             return '❌', 'Отклонено провайдером'
         mapping = {
+            'prepared': ('⏳', 'Готовится счёт'),
+            'dispatching': ('⌛', 'Создаётся счёт'),
+            'creation_unknown': ('⚠️', 'Создание счёта не подтверждено'),
             'pending': ('⏳', 'Ожидает оплаты'),
             'inprogress': ('⌛', 'Обрабатывается'),
+            'reconciling': ('🔄', 'Сверяется'),
+            'operator_review': ('⚠️', 'Требует проверки'),
             'confirmed': ('✅', 'Оплачено'),
             'failed': ('❌', 'Ошибка'),
             'canceled': ('❌', 'Отменено'),
