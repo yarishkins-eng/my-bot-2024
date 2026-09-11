@@ -447,7 +447,9 @@ async def test_worker_reschedules_temporary_target_states(
             assert stored.fulfillment_error_code == expected_reason
         assert stored.lease_token is None
         if temporary_state != 'resetting':
-            assert stored.next_attempt_at > datetime.now(UTC)
+            now = datetime.now(UTC)
+            assert stored.next_attempt_at >= now + timedelta(minutes=2)
+            assert stored.next_attempt_at <= now + timedelta(minutes=5)
     assert calls == []
 
 

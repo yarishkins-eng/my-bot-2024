@@ -2123,14 +2123,20 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
         )
     )
     if any(device_addon_attempt_blocks_account_change(attempt) for attempt in addon_attempts):
-        return 'Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите сброс.'
+        return (
+            'Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите сброс. '
+            'Если ожидание длится больше суток, напишите в поддержку.'
+        )
     addon_intents = list(
         await db.scalars(
             select(DeviceAddonIntent).where(DeviceAddonIntent.user_id == user.id).order_by(DeviceAddonIntent.id)
         )
     )
     if any(device_addon_intent_blocks_account_change(intent) for intent in addon_intents):
-        return 'Выдача докупленных устройств ещё в работе. Дождитесь её завершения и повторите сброс.'
+        return (
+            'Выдача докупленных устройств ещё в работе. Дождитесь её завершения и повторите сброс. '
+            'Если ожидание длится больше суток, напишите в поддержку.'
+        )
 
     # Забор №3: деньги. Каждая проверка спрашивает своё.
     #

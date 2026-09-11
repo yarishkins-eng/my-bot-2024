@@ -29,6 +29,7 @@ _PANEL_PATCH_TIMEOUT_SECONDS = max(90, int(settings.REMNAWAVE_API_TOTAL_TIMEOUT)
 _LEASE_SECONDS = _PANEL_PATCH_TIMEOUT_SECONDS * 2 + 30
 _MAX_AUTOMATIC_ATTEMPTS = 30
 _RETRY_DELAY = timedelta(seconds=10)
+_LIMITED_RETRY_DELAY = timedelta(minutes=3)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +125,7 @@ class DeviceAddonWorker:
                             or_(User.test_reset_state.is_(None), User.test_reset_state.not_in(RESET_BUSY)),
                         )
                         .order_by(DeviceAddonIntent.next_attempt_at, DeviceAddonIntent.id)
-                        .with_for_update(skip_locked=True)
+                        .with_for_update(skip_locked=True, of=DeviceAddonIntent)
                         .limit(1)
                         .execution_options(populate_existing=True)
                     )
@@ -279,16 +280,6 @@ class DeviceAddonWorker:
                 int(subscription.device_limit or 1),
             )
 
-    async def _target_still_current(
-        self, *, intent_id: int, token: str, epoch: int, expected_uuid: str, expected_limit: int
-    ) -> bool:
-        target = await self._load_target(intent_id=intent_id, token=token, epoch=epoch)
-        return bool(
-            target.disposition == 'ready'
-            and target.panel_uuid == expected_uuid
-            and target.device_limit == expected_limit
-        )
-
     async def _finalize_ready(
         self, *, intent_id: int, token: str, epoch: int, expected_uuid: str, expected_limit: int
     ) -> bool:
@@ -391,13 +382,14 @@ class DeviceAddonWorker:
         if target.disposition == 'lost':
             return
         if target.disposition == 'temporary':
+            delay = _LIMITED_RETRY_DELAY if target.error_code == 'subscription_limited' else _RETRY_DELAY
             await self._mark_claim(
                 intent_id,
                 token,
                 epoch,
                 state='pending',
                 error_code=target.error_code,
-                delay=_RETRY_DELAY,
+                delay=delay,
                 restore_attempt=True,
             )
             return
@@ -427,7 +419,7 @@ class DeviceAddonWorker:
                         epoch,
                         state='pending',
                         error_code='reset_lock_busy',
-                        delay=timedelta(seconds=10),
+                        delay=_RETRY_DELAY,
                         restore_attempt=True,
                     )
                     return
@@ -435,13 +427,18 @@ class DeviceAddonWorker:
                 if current_before_patch.disposition == 'lost':
                     return
                 if current_before_patch.disposition == 'temporary':
+                    delay = (
+                        _LIMITED_RETRY_DELAY
+                        if current_before_patch.error_code == 'subscription_limited'
+                        else _RETRY_DELAY
+                    )
                     await self._mark_claim(
                         intent_id,
                         token,
                         epoch,
                         state='pending',
                         error_code=current_before_patch.error_code,
-                        delay=_RETRY_DELAY,
+                        delay=delay,
                         restore_attempt=True,
                     )
                     return
@@ -497,13 +494,18 @@ class DeviceAddonWorker:
                     if current.disposition == 'lost':
                         return
                     if current.disposition == 'temporary':
+                        delay = (
+                            _LIMITED_RETRY_DELAY
+                            if current.error_code == 'subscription_limited'
+                            else _RETRY_DELAY
+                        )
                         await self._mark_claim(
                             intent_id,
                             token,
                             epoch,
                             state='pending',
                             error_code=current.error_code,
-                            delay=_RETRY_DELAY,
+                            delay=delay,
                             restore_attempt=True,
                         )
                         return

@@ -527,10 +527,6 @@ async def serialize_intent(
         except DeviceAddonError as error:
             response['quote'] = None
             response['quote_error'] = {'code': error.code, 'message': str(error)}
-    # This is deliberately derived from the full intent graph, not from a
-    # single attempt status.  A late observation can move an old terminal
-    # invoice into reconciliation while a newer invoice owns the slot.
-    unresolved_states = {'creation_unknown', 'reconciling', 'operator_review'}
     response['topup_attempts'] = [
         serialize_topup_attempt(
             attempt,
@@ -540,7 +536,6 @@ async def serialize_intent(
                 and attempt.status in {'terminal', 'paid', 'operator_review'}
                 and not attempt.holds_invoice_slot
                 and not any(other.holds_invoice_slot for other in attempts)
-                and not any(other.holds_invoice_slot and other.status in unresolved_states for other in attempts)
             ),
         )
         for attempt in attempts

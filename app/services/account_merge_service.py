@@ -552,7 +552,10 @@ async def _guard_device_addon_merge(db: AsyncSession, user_ids: list[int]) -> li
         )
     )
     if any(device_addon_attempt_blocks_account_change(attempt) for attempt in attempts):
-        raise ValueError('Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите объединение.')
+        raise ValueError(
+            'Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите объединение. '
+            'Если ожидание длится больше суток, напишите в поддержку.'
+        )
     intents = list(
         await db.scalars(
             select(DeviceAddonIntent)
@@ -562,7 +565,10 @@ async def _guard_device_addon_merge(db: AsyncSession, user_ids: list[int]) -> li
         )
     )
     if any(device_addon_intent_blocks_account_change(intent) for intent in intents):
-        raise ValueError('Выдача докупленных устройств ещё в работе. Дождитесь её завершения и повторите объединение.')
+        raise ValueError(
+            'Выдача докупленных устройств ещё в работе. Дождитесь её завершения и повторите объединение. '
+            'Если ожидание длится больше суток, напишите в поддержку.'
+        )
     bound_intent_ids = {attempt.intent_id for attempt in attempts}
     transferable_intents: list[DeviceAddonIntent] = []
     for intent in intents:
