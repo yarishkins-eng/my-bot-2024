@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import structlog
+from aiogram import types
 from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -690,6 +691,8 @@ async def _settle_locked(
         await db.commit()
         return attempt
 
+    balance_before_kopeks = int(user.balance_kopeks or 0)
+    was_first_topup = not bool(user.has_made_first_topup)
     external_id = str(attempt.provider_payment_id)
     transaction = await db.scalar(
         select(Transaction).where(
@@ -755,6 +758,8 @@ async def _settle_locked(
         'settlement_mode': 'device_addon_topup_v1',
         'device_addon_attempt_id': attempt.id,
         'balance_credited': True,
+        'balance_before_kopeks': balance_before_kopeks,
+        'was_first_topup': was_first_topup,
     }
     attempt.deposit_transaction_id = transaction.id
     attempt.credited_amount_kopeks = attempt.requested_amount_kopeks
@@ -771,6 +776,91 @@ async def _settle_locked(
     await db.commit()
     await db.refresh(attempt)
     return attempt
+
+
+async def _send_paid_effect_notifications(
+    db: AsyncSession,
+    *,
+    bot: Any | None,
+    user: User,
+    transaction: Transaction,
+    intent: DeviceAddonIntent,
+    payment: PlategaPayment,
+) -> None:
+    """Send the retryable admin/client receipts for one credited top-up."""
+    metadata = payment.metadata_json if isinstance(payment.metadata_json, dict) else {}
+    user_id = int(user.id)
+    telegram_id = user.telegram_id
+    language = user.language
+    amount_kopeks = int(transaction.amount_kopeks)
+    intent_public_id = str(intent.public_id)
+    subscription = await db.get(Subscription, intent.subscription_id) if intent.subscription_id is not None else None
+
+    if bot is not None:
+        try:
+            from app.services.admin_notification_service import AdminNotificationService
+
+            notification_service = AdminNotificationService(bot)
+            referrer_info = await notification_service._get_referrer_info(db, user.referred_by_id)
+            promo_group = await notification_service._get_user_promo_group(db, user)
+            old_balance = int(
+                metadata.get(
+                    'balance_before_kopeks',
+                    max(0, int(user.balance_kopeks or 0) - amount_kopeks),
+                )
+            )
+            topup_status = '🆕 Первое пополнение' if metadata.get('was_first_topup') else '🔄 Пополнение'
+            await notification_service.send_balance_topup_notification(
+                user,
+                transaction,
+                old_balance,
+                topup_status=topup_status,
+                referrer_info=referrer_info,
+                subscription=subscription,
+                promo_group=promo_group,
+                db=db,
+            )
+        except Exception as error:
+            logger.error(
+                'device_addon_topup_admin_notification_failed',
+                attempt_id=metadata.get('device_addon_attempt_id'),
+                user_id=user_id,
+                error=error,
+            )
+
+    if not telegram_id:
+        return
+    if bot is None:
+        raise RuntimeError('device add-on top-up customer notification requires bot')
+
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    return_url = build_cabinet_url(f'/subscription/device-topup/{intent_public_id}')
+    if not return_url:
+        raise RuntimeError('device add-on top-up customer return URL is unavailable')
+    if language == 'en':
+        text = (
+            '✅ <b>Top-up successful!</b>\n\n'
+            f'💰 Amount: {settings.format_price(amount_kopeks)}\n\n'
+            'To add devices, return and confirm the purchase.'
+        )
+        button_text = 'Return to purchase'
+    else:
+        text = (
+            '✅ <b>Пополнение успешно!</b>\n\n'
+            f'💰 Сумма: {settings.format_price(amount_kopeks)}\n\n'
+            'Чтобы добавить устройства, вернитесь и подтвердите покупку.'
+        )
+        button_text = 'Вернуться к покупке'
+    keyboard = types.InlineKeyboardMarkup(
+        inline_keyboard=[[types.InlineKeyboardButton(text=button_text, web_app=types.WebAppInfo(url=return_url))]]
+    )
+    await bot.send_message(
+        telegram_id,
+        text,
+        parse_mode='HTML',
+        reply_markup=keyboard,
+    )
 
 
 async def reconcile_device_addon_payment(
@@ -1071,12 +1161,19 @@ async def _run_paid_effects(
         description=transaction.description or '',
         raise_on_error=True,
     )
-
-    # Cabinet status is the durable customer receipt.  Transaction events carry
-    # the immutable transaction id and are safe for at-least-once consumers.
-    # Telegram/referral messages need a per-recipient durable outbox; sending
-    # them inline here would duplicate some recipients after a mid-loop crash.
-    del bot
+    user = await db.get(User, attempt.user_id, populate_existing=True)
+    intent = await db.get(DeviceAddonIntent, attempt.intent_id, populate_existing=True)
+    payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
+    if user is None or intent is None or payment is None:
+        raise RuntimeError('device add-on notification graph disappeared')
+    await _send_paid_effect_notifications(
+        db,
+        bot=bot,
+        user=user,
+        transaction=transaction,
+        intent=intent,
+        payment=payment,
+    )
 
     attempt = (
         await db.execute(

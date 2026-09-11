@@ -356,6 +356,77 @@ async def test_terminal_old_invoice_can_settle_after_new_invoice_without_reclaim
         assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 1
 
 
+async def test_paid_addon_topup_creates_one_deposit_and_one_customer_receipt(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', False)
+    monkeypatch.setattr(settings, 'MINIAPP_CUSTOM_URL', 'https://cabinet.example')
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+
+    async with sessions() as db:
+        user, intent, _, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        payload = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=payload)
+
+        assert await payments.recover_device_addon_payments(db, limit=1, bot=bot) == 1
+        await db.refresh(user)
+        await db.refresh(attempt)
+        assert user.balance_kopeks == 10_000
+        assert attempt.event_status == 'done'
+        assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 1
+        bot.send_message.assert_awaited_once()
+        assert bot.send_message.await_args.args[0] == user.telegram_id
+        assert 'Пополнение успешно!' in bot.send_message.await_args.args[1]
+        button = bot.send_message.await_args.kwargs['reply_markup'].inline_keyboard[0][0]
+        assert button.web_app.url == f'https://cabinet.example/subscription/device-topup/{intent.public_id}'
+
+        assert await payments.recover_device_addon_payments(db, limit=1, bot=bot) == 0
+        assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 1
+        bot.send_message.assert_awaited_once()
+
+
+async def test_customer_receipt_failure_keeps_the_single_credit_retryable(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', False)
+    monkeypatch.setattr(settings, 'MINIAPP_CUSTOM_URL', 'https://cabinet.example')
+    failing_bot = MagicMock()
+    failing_bot.send_message = AsyncMock(side_effect=RuntimeError('telegram unavailable'))
+
+    async with sessions() as db:
+        user, _, _, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        payload = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+        }
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=payload)
+
+        assert await payments.recover_device_addon_payments(db, limit=1, bot=failing_bot) == 0
+        await db.refresh(user)
+        await db.refresh(attempt)
+        assert user.balance_kopeks == 10_000
+        assert attempt.event_status == 'processing'
+        assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 1
+
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        retry_bot = MagicMock()
+        retry_bot.send_message = AsyncMock()
+        assert await payments.recover_device_addon_payments(db, limit=1, bot=retry_bot) == 1
+        await db.refresh(attempt)
+        assert attempt.event_status == 'done'
+        assert await db.scalar(select(func.count(Transaction.id)).where(Transaction.user_id == user.id)) == 1
+        retry_bot.send_message.assert_awaited_once()
+
+
 async def test_wrong_currency_on_old_invoice_holds_only_that_invoice(sessions):
     async with sessions() as db:
         user, _, old_payment, old_attempt, current_attempt = await _late_payment_graph(db)

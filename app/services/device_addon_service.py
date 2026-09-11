@@ -1,7 +1,8 @@
 """Durable, manually confirmed device add-on pricing and wallet purchase.
 
 Provider invoices and their settlement live in ``device_addon_payment_service``.
-This module deliberately contains no provider, Redis, notification or Panel IO.
+The wallet mutation stays independent of provider, Redis and Panel IO; its
+notifications and transaction events run only after the atomic commit.
 """
 
 from __future__ import annotations
@@ -17,18 +18,20 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+import structlog
 from sqlalchemy import and_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database.crud.transaction import create_transaction
+from app.database.crud.transaction import create_transaction, emit_transaction_side_effects
 from app.database.models import (
     DeviceAddonIntent,
     DeviceAddonTopupAttempt,
     PaymentMethod,
     Subscription,
     Tariff,
+    Transaction,
     TransactionType,
     User,
 )
@@ -36,6 +39,7 @@ from app.database.models import (
 
 QUOTE_TTL = timedelta(minutes=15)
 CALCULATOR_REVISION = 'v1'
+logger = structlog.get_logger(__name__)
 
 # Account merge and test reset must make the same lifecycle decision.  Keep
 # this positive list next to the add-on state machine: a newly introduced
@@ -564,6 +568,62 @@ def serialize_topup_attempt(
     }
 
 
+async def _run_purchase_post_commit_effects(
+    db: AsyncSession,
+    *,
+    transaction: Transaction,
+    user: User,
+    subscription: Subscription,
+    old_device_limit: int,
+    new_device_limit: int,
+    price_kopeks: int,
+) -> None:
+    """Emit non-atomic purchase effects without invalidating its receipt."""
+    try:
+        await emit_transaction_side_effects(
+            db,
+            transaction,
+            amount_kopeks=price_kopeks,
+            user_id=user.id,
+            type=TransactionType.SUBSCRIPTION_PAYMENT,
+            payment_method=PaymentMethod.BALANCE,
+            description=transaction.description or '',
+        )
+    except Exception as error:
+        logger.error(
+            'device_addon_purchase_side_effects_failed',
+            transaction_id=transaction.id,
+            user_id=user.id,
+            error=error,
+        )
+
+    try:
+        from app.bot_factory import create_bot
+        from app.services.admin_notification_service import AdminNotificationService
+
+        if settings.ADMIN_NOTIFICATIONS_ENABLED:
+            bot = create_bot()
+            try:
+                await AdminNotificationService(bot).send_subscription_update_notification(
+                    db=db,
+                    user=user,
+                    subscription=subscription,
+                    update_type='devices',
+                    old_value=old_device_limit,
+                    new_value=new_device_limit,
+                    price_paid=price_kopeks,
+                )
+            finally:
+                await bot.session.close()
+    except Exception as error:
+        logger.error(
+            'device_addon_purchase_admin_notification_failed',
+            transaction_id=transaction.id,
+            user_id=user.id,
+            error=error,
+        )
+
+
 async def purchase_intent(db: AsyncSession, *, user: User, public_id: str, quote_token: str) -> DeviceAddonIntent:
     locked_user = await _locked_user(db, user.id)
     # U -> S -> I is the published wallet lock order.
@@ -623,6 +683,7 @@ async def purchase_intent(db: AsyncSession, *, user: User, public_id: str, quote
     intent.quoted_price_kopeks = calculation.price_kopeks
     intent.discount_percent = calculation.discount_percent
     intent.price_snapshot = _quote_payload(calculation, user_id=user.id)
+    transaction: Transaction | None = None
     if calculation.price_kopeks:
         locked_user.balance_kopeks -= calculation.price_kopeks
         transaction = await create_transaction(
@@ -647,6 +708,16 @@ async def purchase_intent(db: AsyncSession, *, user: User, public_id: str, quote
     }
     await db.commit()
     await db.refresh(intent)
+    if transaction is not None:
+        await _run_purchase_post_commit_effects(
+            db,
+            transaction=transaction,
+            user=locked_user,
+            subscription=subscription,
+            old_device_limit=calculation.original_device_limit,
+            new_device_limit=calculation.new_device_limit,
+            price_kopeks=calculation.price_kopeks,
+        )
     return intent
 
 
