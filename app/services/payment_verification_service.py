@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import re
 from collections import Counter
 from collections.abc import Iterable
@@ -459,13 +460,23 @@ async def attach_device_addon_payment_metadata(
         record = platega_records.get(int(attempt.platega_payment_id))
         if record is None:
             continue
+        attempt_provider_id = str(attempt.provider_payment_id) if attempt.provider_payment_id else None
+        payment_provider_id = (
+            str(record.payment.platega_transaction_id) if record.payment.platega_transaction_id else None
+        )
+        provider_identity_exact = bool(
+            attempt_provider_id
+            and payment_provider_id
+            and hmac.compare_digest(attempt_provider_id, payment_provider_id)
+        )
         record.is_device_addon = True
         record.device_addon_reason = attempt.reconciliation_reason
         record.device_addon_reason_text = _device_addon_reason_text(attempt)
-        record.device_addon_can_check = bool(attempt.provider_payment_id)
+        record.device_addon_can_check = provider_identity_exact
         record.device_addon_can_close = bool(
             attempt.status == 'operator_review'
-            and attempt.provider_payment_id is None
+            and attempt_provider_id is None
+            and payment_provider_id is None
             and attempt.deposit_transaction_id is None
         )
 

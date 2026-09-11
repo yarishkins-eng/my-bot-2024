@@ -69,6 +69,7 @@ from app.database.models import (
     YooKassaPayment,
 )
 from app.external.remnawave_api import RemnaWaveAPI
+from app.services.account_test_reset_service import lock_device_addon_account_activity_for_merge
 from app.services.device_addon_service import (
     device_addon_attempt_blocks_account_change,
     device_addon_intent_blocks_account_change,
@@ -647,6 +648,7 @@ async def execute_merge(
         raise ValueError('primary_user_id и secondary_user_id не могут совпадать')
 
     merge_user_ids = sorted([primary_user_id, secondary_user_id])
+    await lock_device_addon_account_activity_for_merge(db, merge_user_ids)
     await db.execute(
         select(PlategaPayment.id)
         .where(PlategaPayment.user_id.in_(merge_user_ids))

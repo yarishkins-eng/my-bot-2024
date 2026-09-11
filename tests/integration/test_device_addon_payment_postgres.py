@@ -752,6 +752,130 @@ async def test_uninformative_create_response_keeps_the_only_invoice_slot(session
         assert error.value.code == 'payment_attempt_active'
 
 
+async def test_exact_mismatched_callback_binds_provider_identity_before_review(sessions, monkeypatch):
+    _configure_addon_topup(monkeypatch)
+
+    class UninformativeProvider(PlategaService):
+        def __init__(self):
+            self._max_retries = 3
+
+        async def create_device_addon_payment(self, **kwargs):
+            del kwargs
+
+    monkeypatch.setattr(payments, 'PlategaService', UninformativeProvider)
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        attempt = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='d' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        provider_id = str(uuid.uuid4())
+        local_payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
+
+        assert await payments.handle_device_addon_platega_callback(
+            db,
+            payment=local_payment,
+            payload={
+                'id': provider_id,
+                'payload': f'platega:{attempt.correlation_id}',
+                'status': 'PENDING',
+                'paymentMethod': 'SBPQR',
+                'paymentDetails': {'amount': '99.99', 'currency': 'RUB'},
+            },
+        )
+
+        await db.refresh(attempt)
+        await db.refresh(local_payment)
+        assert attempt.status == 'operator_review'
+        assert attempt.provider_payment_id == provider_id
+        assert local_payment.platega_transaction_id == provider_id
+        record = await get_payment_record(db, PaymentMethod.PLATEGA, int(local_payment.id))
+        assert record is not None
+        await attach_device_addon_payment_metadata(db, [record])
+        assert record.device_addon_can_check is True
+        assert record.device_addon_can_close is False
+        with pytest.raises(DeviceAddonError) as error:
+            await payments.close_device_addon_attempt_without_credit(db, platega_payment_id=int(local_payment.id))
+        assert error.value.code == 'attempt_cannot_be_closed'
+        assert user.balance_kopeks == 0
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+
+
+async def test_sparse_exact_callback_binds_identity_then_credits_only_from_canonical_get(sessions, monkeypatch):
+    _configure_addon_topup(monkeypatch)
+
+    class UninformativeProvider(PlategaService):
+        def __init__(self):
+            self._max_retries = 3
+
+        async def create_device_addon_payment(self, **kwargs):
+            del kwargs
+
+    monkeypatch.setattr(payments, 'PlategaService', UninformativeProvider)
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        attempt = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='e' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        provider_id = str(uuid.uuid4())
+        local_payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
+        assert await payments.handle_device_addon_platega_callback(
+            db,
+            payment=local_payment,
+            payload={
+                'id': provider_id,
+                'payload': f'platega:{attempt.correlation_id}',
+                'status': 'PENDING',
+            },
+        )
+        await db.refresh(attempt)
+        await db.refresh(local_payment)
+        assert attempt.status == 'reconciling'
+        assert attempt.provider_payment_id == provider_id
+        assert local_payment.platega_transaction_id == provider_id
+        assert user.balance_kopeks == 0
+
+        canonical = {
+            'id': provider_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+            'payload': f'platega:{attempt.correlation_id}',
+        }
+
+        class CanonicalProvider(PlategaService):
+            def __init__(self):
+                self._max_retries = 1
+
+            async def get_transaction(self, transaction_id):
+                assert transaction_id == provider_id
+                return canonical
+
+        monkeypatch.setattr(payments, 'PlategaService', CanonicalProvider)
+        await payments.check_device_addon_payment_now(db, platega_payment_id=int(local_payment.id))
+        await payments.check_device_addon_payment_now(db, platega_payment_id=int(local_payment.id))
+        await db.refresh(user)
+        await db.refresh(attempt)
+        assert user.balance_kopeks == 10_000
+        assert attempt.status == 'paid'
+        assert await db.scalar(select(func.count(Transaction.id))) == 1
+
+
 async def test_unknown_create_requires_logged_review_then_audited_close_without_credit(sessions, monkeypatch):
     _configure_addon_topup(monkeypatch)
 
@@ -861,7 +985,13 @@ async def test_operator_close_rejects_attempt_with_provider_identity(sessions):
         current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=1)
         attempt.status = 'operator_review'
         attempt.holds_invoice_slot = False
+        attempt.provider_payment_id = None
         await db.commit()
+        record = await get_payment_record(db, PaymentMethod.PLATEGA, int(attempt.platega_payment_id))
+        assert record is not None
+        await attach_device_addon_payment_metadata(db, [record])
+        assert record.device_addon_can_check is False
+        assert record.device_addon_can_close is False
         with pytest.raises(DeviceAddonError) as error:
             await payments.close_device_addon_attempt_without_credit(
                 db,
