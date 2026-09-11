@@ -1028,7 +1028,13 @@ async def test_unknown_create_requires_logged_review_then_audited_close_without_
         await db.refresh(attempt)
         assert attempt.status == 'operator_review'
         assert attempt.holds_invoice_slot is True
-        review_log = next(entry for entry in logs if entry.get('event') == 'device_addon_payment_operator_review')
+        review_log = next(
+            entry for entry in logs if str(entry.get('event', '')).startswith('device_addon_payment_operator_review ')
+        )
+        assert f'user_id={user.id}' in review_log['event']
+        assert 'reason=provider_identity_unknown_no_retry' in review_log['event']
+        assert 'amount_kopeks=10000' in review_log['event']
+        assert review_log['user_id'] == user.id
         assert review_log['reason'] == 'provider_identity_unknown_no_retry'
         assert review_log['intent_public_id'] == intent.public_id
         assert review_log['attempt_public_id'] == attempt.public_id

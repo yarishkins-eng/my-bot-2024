@@ -220,8 +220,13 @@ def _mark_operator_review(
             attempt.reconcile_attempts = 0
         attempt.status = 'operator_review'
         attempt.next_reconcile_at = datetime.now(UTC) + _OPERATOR_RECHECK_DELAY
+        event = (
+            'device_addon_payment_operator_review '
+            f'user_id={payment.user_id} reason={reason} amount_kopeks={int(attempt.requested_amount_kopeks)}'
+        )
         logger.error(
-            'device_addon_payment_operator_review',
+            event,
+            user_id=payment.user_id,
             reason=reason,
             intent_public_id=intent.public_id,
             attempt_public_id=attempt.public_id,
