@@ -426,6 +426,11 @@ def _device_addon_reason_text(attempt: DeviceAddonTopupAttempt) -> str | None:
     reason = str(attempt.reconciliation_reason or '')
     if not reason:
         return None
+    attempt_status = str(attempt.status or '').lower()
+    if attempt_status in {'paid', 'reconciling'}:
+        return None
+    if attempt_status not in {'creation_unknown', 'operator_review'} and 'mismatch' not in reason:
+        return None
     if (
         'invoice_mismatch' in reason
         and attempt.provider_returned_amount_kopeks is not None

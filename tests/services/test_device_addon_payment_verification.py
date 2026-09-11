@@ -47,3 +47,48 @@ async def test_generic_auto_check_excludes_device_addon_platega(monkeypatch: pyt
     await service._run_checks([PaymentMethod.PLATEGA])
 
     manual_check.assert_not_awaited()
+
+
+@pytest.mark.parametrize('attempt_status', ['paid', 'reconciling'])
+def test_paid_and_reconciling_attempts_hide_stale_operator_reason(attempt_status: str) -> None:
+    attempt = SimpleNamespace(
+        status=attempt_status,
+        reconciliation_reason='canonical_invoice_mismatch',
+        provider_returned_amount_kopeks=10_800,
+        requested_amount_kopeks=10_000,
+    )
+
+    assert verification._device_addon_reason_text(attempt) is None
+
+
+def test_terminal_provider_rejection_hides_internal_reason() -> None:
+    attempt = SimpleNamespace(
+        status='terminal',
+        reconciliation_reason='provider_terminal:canceled',
+        provider_returned_amount_kopeks=None,
+        requested_amount_kopeks=10_000,
+    )
+
+    assert verification._device_addon_reason_text(attempt) is None
+
+
+def test_operator_review_and_mismatch_keep_actionable_reason() -> None:
+    operator_review = SimpleNamespace(
+        status='operator_review',
+        reconciliation_reason='canonical_status_unavailable',
+        provider_returned_amount_kopeks=None,
+        requested_amount_kopeks=10_000,
+    )
+    terminal_mismatch = SimpleNamespace(
+        status='terminal',
+        reconciliation_reason='provider_terminal:canceled:canonical_invoice_mismatch',
+        provider_returned_amount_kopeks=10_800,
+        requested_amount_kopeks=10_000,
+    )
+
+    assert verification._device_addon_reason_text(operator_review) == (
+        'Не удалось получить канонический статус Platega.'
+    )
+    assert verification._device_addon_reason_text(terminal_mismatch) == (
+        'Сумма у провайдера не совпала — проверьте настройку комиссии Platega.'
+    )
