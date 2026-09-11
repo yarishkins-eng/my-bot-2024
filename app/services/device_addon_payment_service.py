@@ -990,7 +990,18 @@ async def reconcile_device_addon_payment(
     )
     status = str(payload.get('status') or '').upper()
     provider_invoice_exact = _exact_provider_invoice(attempt, payload)
-    if not provider_invoice_exact and (financially_settled or status not in _PROVIDER_TERMINAL):
+    correlation = payload.get('payload')
+    terminal_binding_exact = (
+        _provider_transaction_id(payload) == str(attempt.provider_payment_id or '')
+        and _provider_method_code(payload) == int(attempt.provider_method_code)
+        and (correlation is None or hmac.compare_digest(str(correlation), f'platega:{attempt.correlation_id}'))
+    )
+    terminal_amount_mismatch = (
+        status in _PROVIDER_TERMINAL
+        and terminal_binding_exact
+        and amount_currency != (int(attempt.requested_amount_kopeks), 'RUB')
+    )
+    if not provider_invoice_exact and (financially_settled or not terminal_amount_mismatch):
         if financially_settled:
             attempt.status = 'paid'
             attempt.holds_invoice_slot = False

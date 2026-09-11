@@ -566,6 +566,29 @@ async def test_first_terminal_observation_with_amount_mismatch_releases_invoice_
         )
 
 
+async def test_first_terminal_observation_with_wrong_provider_id_keeps_invoice_for_review(sessions):
+    async with sessions() as db:
+        _, _, _, old_attempt, attempt = await _late_payment_graph(db)
+        payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+        old_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        payload = {
+            'id': str(uuid.uuid4()),
+            'status': 'CANCELED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '108.00', 'currency': 'RUB'},
+            'payload': f'platega:{attempt.correlation_id}',
+        }
+
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=payload)
+        await db.refresh(payment)
+        await db.refresh(attempt)
+
+        assert payment.status == 'OPERATOR_REVIEW'
+        assert attempt.status == 'operator_review'
+        assert attempt.holds_invoice_slot is True
+        assert attempt.reconciliation_reason == 'canonical_invoice_mismatch'
+
+
 @pytest.mark.parametrize(
     ('mutation', 'expected_attempt_status', 'expected_payment_status'),
     [
