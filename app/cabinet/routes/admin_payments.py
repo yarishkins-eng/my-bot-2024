@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot_factory import create_bot
-from app.database.models import AdminAuditLog, PaymentMethod, User
+from app.database.models import PaymentMethod, User
 from app.services.device_addon_payment_service import close_device_addon_attempt_without_credit
 from app.services.device_addon_service import DeviceAddonError
 from app.services.payment_search_service import (
@@ -30,6 +30,7 @@ from app.services.payment_verification_service import (
     method_display_name,
     run_manual_check,
 )
+from app.services.permission_service import PermissionService
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -584,6 +585,23 @@ async def check_payment_status(
 
     status_changed = updated.status != old_status or updated.is_paid != old_is_paid
 
+    if record.is_device_addon:
+        await PermissionService.log_action(
+            db,
+            user_id=admin.id,
+            action='device_addon.payment_checked',
+            resource_type='platega_payment',
+            resource_id=str(payment_id),
+            details={
+                'old_status': old_status,
+                'new_status': updated.status,
+                'old_is_paid': old_is_paid,
+                'new_is_paid': updated.is_paid,
+                'status_changed': status_changed,
+            },
+        )
+        await db.commit()
+
     if status_changed:
         _, new_status_text = _get_status_info(updated)
         message = f'Статус обновлён: {new_status_text}'
@@ -618,16 +636,6 @@ async def close_device_addon_attempt(
     """Release one operator-reviewed add-on invoice which has no provider ID."""
     if method != PaymentMethod.PLATEGA.value:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid payment method')
-    db.add(
-        AdminAuditLog(
-            user_id=admin.id,
-            action='device_addon.payment_attempt_closed',
-            resource_type='platega_payment',
-            resource_id=str(payment_id),
-            status='success',
-            details={'resolution': 'closed_by_operator', 'credited': False},
-        )
-    )
     try:
         await close_device_addon_attempt_without_credit(db, platega_payment_id=payment_id)
     except DeviceAddonError as error:
@@ -636,6 +644,15 @@ async def close_device_addon_attempt(
             status_code=error.status_code,
             detail={'code': error.code, 'message': str(error)},
         ) from error
+    await PermissionService.log_action(
+        db,
+        user_id=admin.id,
+        action='device_addon.payment_attempt_closed',
+        resource_type='platega_payment',
+        resource_id=str(payment_id),
+        details={'resolution': 'closed_by_operator', 'credited': False},
+    )
+    await db.commit()
     record = await get_payment_record(db, PaymentMethod.PLATEGA, payment_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Payment not found')

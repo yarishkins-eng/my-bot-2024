@@ -1495,6 +1495,12 @@ async def test_admin_manual_check_credits_confirmed_addon_exactly_once(sessions,
         assert attempt.status == 'paid'
         assert attempt.deposit_transaction_id is not None
         assert await db.scalar(select(func.count(Transaction.id))) == 1
+        assert await db.scalar(
+            select(func.count(AdminAuditLog.id)).where(
+                AdminAuditLog.action == 'device_addon.payment_checked',
+                AdminAuditLog.resource_id == str(payment.id),
+            )
+        ) == 2
         assert bot.session.close.await_count == 2
 
 
