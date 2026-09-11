@@ -507,9 +507,6 @@ async def create_device_addon_topup(
         )
         await db.commit()
         return attempt
-    if attempt.status in {'paid', 'operator_review'}:
-        await db.commit()
-        return attempt
     if attempt.provider_payment_id and not hmac.compare_digest(str(attempt.provider_payment_id), provider_id):
         _mark_operator_review(
             payment=payment,
@@ -519,11 +516,19 @@ async def create_device_addon_topup(
         )
         await db.commit()
         return attempt
-    attempt.provider_payment_id = provider_id
-    payment.platega_transaction_id = provider_id
+    if not attempt.provider_payment_id:
+        attempt.provider_payment_id = provider_id
+        payment.platega_transaction_id = provider_id
     if redirect is not None:
         attempt.payment_url = redirect
         payment.redirect_url = redirect
+    if attempt.status in {'paid', 'operator_review'}:
+        # A signed callback may race the provider POST response.  Preserve its
+        # review/paid decision, but retain the trusted identity returned by the
+        # create call so an operator cannot close a known remote invoice and
+        # accidentally allow a second one.
+        await db.commit()
+        return attempt
     attempt.status = 'reconciling'
     attempt.reconciliation_reason = 'canonical_verification_pending'
     attempt.next_reconcile_at = datetime.now(UTC)
@@ -1002,10 +1007,6 @@ async def reconcile_device_addon_payment(
                 reason='provider_terminal_status_regressed',
             )
         else:
-            attempt.status = 'pending'
-            attempt.reconciliation_reason = None
-            attempt.next_reconcile_at = datetime.now(UTC) + timedelta(minutes=2)
-            payment.status = status
             redirect = _safe_https_url(PlategaService.parse_redirect_url(payload))
             if redirect is not None:
                 attempt.payment_url = redirect
@@ -1017,6 +1018,11 @@ async def reconcile_device_addon_payment(
                     intent=intent,
                     reason='canonical_invoice_missing_safe_redirect',
                 )
+            else:
+                attempt.status = 'pending'
+                attempt.reconciliation_reason = None
+                attempt.next_reconcile_at = datetime.now(UTC) + timedelta(minutes=2)
+                payment.status = status
     elif status in _PROVIDER_REVERSAL:
         _mark_operator_review(
             payment=payment,

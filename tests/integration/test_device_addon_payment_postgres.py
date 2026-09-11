@@ -609,6 +609,60 @@ async def test_early_exact_webhook_during_lost_create_response_never_uses_generi
         assert await db.scalar(select(func.count(Transaction.id))) == 1
 
 
+async def test_early_mismatched_webhook_cannot_hide_provider_identity_from_create_response(sessions, monkeypatch):
+    _configure_addon_topup(monkeypatch)
+    provider_id = str(uuid.uuid4())
+
+    class EarlyMismatchThenSuccessfulResponse(PlategaService):
+        def __init__(self):
+            self._max_retries = 3
+
+        async def create_device_addon_payment(self, **kwargs):
+            async with sessions() as callback_db:
+                handled = await PlategaPaymentMixin().process_platega_webhook(
+                    callback_db,
+                    {
+                        'id': provider_id,
+                        'status': 'PENDING',
+                        'paymentMethod': 'SBPQR',
+                        'paymentDetails': {'amount': '99.99', 'currency': 'RUB'},
+                        'payload': kwargs['payload'],
+                    },
+                )
+                assert handled is True
+            return {'id': provider_id, 'redirect': 'https://pay.example.test/invoice'}
+
+    monkeypatch.setattr(payments, 'PlategaService', EarlyMismatchThenSuccessfulResponse)
+    async with sessions() as db:
+        user, _, intent = await _active_intent_graph(db)
+        attempt = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='d' * 64,
+            method_key='2',
+            expected_amount_kopeks=10_000,
+            return_url=None,
+            failed_url=None,
+        )
+        payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
+
+        assert attempt.status == 'operator_review'
+        assert attempt.holds_invoice_slot is True
+        assert attempt.reconciliation_reason == 'callback_correlation_or_invoice_mismatch'
+        assert attempt.provider_payment_id == provider_id
+        assert attempt.payment_url == 'https://pay.example.test/invoice'
+        assert payment.platega_transaction_id == provider_id
+        assert payment.status == 'OPERATOR_REVIEW'
+        with pytest.raises(DeviceAddonError) as error:
+            await payments.close_device_addon_attempt_without_credit(
+                db,
+                platega_payment_id=int(attempt.platega_payment_id),
+            )
+        assert error.value.code == 'attempt_cannot_be_closed'
+
+
 async def test_trusted_create_rejection_frees_slot_and_allows_a_new_invoice(sessions, monkeypatch):
     _configure_addon_topup(monkeypatch)
 
@@ -882,6 +936,45 @@ async def test_terminal_and_operator_review_rechecks_are_bounded_and_delayed(ses
         assert attempt.status == 'operator_review'
         assert attempt.reconcile_attempts == 24
         assert before_review + timedelta(minutes=59) < attempt.next_reconcile_at
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1) == 0
+
+
+async def test_live_poll_without_safe_redirect_preserves_operator_review_retry_budget(sessions, monkeypatch):
+    class LiveWithoutRedirectProvider:
+        def __init__(self):
+            self._max_retries = 3
+
+        async def get_transaction(self, transaction_id):
+            return {
+                'id': transaction_id,
+                'status': 'PENDING',
+                'paymentMethod': 'SBPQR',
+                'paymentDetails': {'amount': '100.00', 'currency': 'RUB'},
+            }
+
+    monkeypatch.setattr(payments, 'PlategaService', LiveWithoutRedirectProvider)
+    async with sessions() as db:
+        _, _, payment, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        attempt.status = 'operator_review'
+        attempt.holds_invoice_slot = False
+        attempt.reconcile_attempts = 23
+        attempt.payment_url = None
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        payment.status = 'OPERATOR_REVIEW'
+        payment.redirect_url = None
+        await db.commit()
+
+        assert await payments.recover_device_addon_payments(db, limit=1) == 1
+        await db.refresh(attempt)
+        await db.refresh(payment)
+        assert attempt.status == 'operator_review'
+        assert attempt.reconcile_attempts == 24
+        assert attempt.reconciliation_reason == 'canonical_invoice_missing_safe_redirect'
+        assert payment.status == 'OPERATOR_REVIEW'
+
         attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
         await db.commit()
         assert await payments.recover_device_addon_payments(db, limit=1) == 0
