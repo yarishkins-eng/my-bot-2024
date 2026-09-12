@@ -1154,6 +1154,7 @@ async def test_unknown_create_requires_logged_review_then_audited_close_without_
                 )
         await db.rollback()
         await db.refresh(attempt)
+        await db.refresh(user)
         local_payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
         assert attempt.status == 'operator_review'
         assert attempt.holds_invoice_slot is True
@@ -1595,6 +1596,7 @@ async def test_admin_manual_check_does_not_credit_when_audit_insert_fails(sessio
         current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
         current_attempt.status = 'terminal'
         current_attempt.holds_invoice_slot = False
+        await db.commit()
         attempt.status = 'operator_review'
         attempt.holds_invoice_slot = True
         payment.status = 'OPERATOR_REVIEW'
