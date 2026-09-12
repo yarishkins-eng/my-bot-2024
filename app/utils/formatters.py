@@ -98,6 +98,27 @@ def format_days_declension(days: int, language: str = 'ru') -> str:
     return f'{days} дней'
 
 
+def format_devices_declension(count: int, language: str = 'ru') -> str:
+    language_code = (language or 'ru').split('-')[0].split('_')[0].lower()
+    if language_code == 'fa':
+        return f'{count} دستگاه'
+    if language_code == 'zh':
+        return f'{count} 台设备'
+    if language_code in {'ua', 'uk'}:
+        if count % 10 == 1 and count % 100 != 11:
+            return f'{count} пристрій'
+        if count % 10 in [2, 3, 4] and count % 100 not in [12, 13, 14]:
+            return f'{count} пристрої'
+        return f'{count} пристроїв'
+    if language_code != 'ru':
+        return f'{count} device{"s" if count != 1 else ""}'
+    if count % 10 == 1 and count % 100 != 11:
+        return f'{count} устройство'
+    if count % 10 in [2, 3, 4] and count % 100 not in [12, 13, 14]:
+        return f'{count} устройства'
+    return f'{count} устройств'
+
+
 def format_hours_declension(hours: int, language: str = 'ru') -> str:
     """«1 час» / «2 часа» / «5 часов». Рядом с format_days_declension и по её образцу."""
     language_code = (language or 'ru').split('-')[0].lower()

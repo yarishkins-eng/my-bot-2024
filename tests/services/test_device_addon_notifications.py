@@ -13,12 +13,24 @@ from app.services import (
 )
 
 
+@pytest.mark.parametrize(
+    ('count', 'expected'),
+    [
+        (1, 'Покупка доп. устройств: 1 устройство'),
+        (2, 'Покупка доп. устройств: 2 устройства'),
+        (5, 'Покупка доп. устройств: 5 устройств'),
+    ],
+)
+def test_device_addon_transaction_description_uses_correct_form(count: int, expected: str) -> None:
+    assert addon_service._device_addon_transaction_description(count) == expected
+
+
 @pytest.mark.asyncio
 async def test_purchase_post_commit_effects_emit_transaction_and_admin_notification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = MagicMock()
-    transaction = SimpleNamespace(id=41, description='Покупка 2 доп. устройств')
+    transaction = SimpleNamespace(id=41, description='Покупка доп. устройств: 2 устройства')
     user = SimpleNamespace(id=17)
     subscription = SimpleNamespace(id=29)
     emit = AsyncMock()

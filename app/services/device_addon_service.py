@@ -35,6 +35,7 @@ from app.database.models import (
     TransactionType,
     User,
 )
+from app.utils.formatters import format_devices_declension
 
 
 QUOTE_TTL = timedelta(minutes=15)
@@ -60,6 +61,10 @@ def device_addon_attempt_blocks_account_change(attempt: DeviceAddonTopupAttempt)
 def device_addon_intent_blocks_account_change(intent: DeviceAddonIntent) -> bool:
     """Whether merge/reset could lose a purchased entitlement still being issued."""
     return intent.purchase_state == 'purchased' and intent.fulfillment_state == 'pending'
+
+
+def _device_addon_transaction_description(devices_to_add: int) -> str:
+    return f'Покупка доп. устройств: {format_devices_declension(devices_to_add)}'
 
 
 class DeviceAddonError(Exception):
@@ -699,7 +704,7 @@ async def purchase_intent(db: AsyncSession, *, user: User, public_id: str, quote
             user_id=locked_user.id,
             type=TransactionType.SUBSCRIPTION_PAYMENT,
             amount_kopeks=calculation.price_kopeks,
-            description=f'Покупка {intent.devices_to_add} доп. устройств',
+            description=_device_addon_transaction_description(intent.devices_to_add),
             payment_method=PaymentMethod.BALANCE,
             commit=False,
         )

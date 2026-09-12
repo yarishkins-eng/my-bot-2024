@@ -1717,14 +1717,6 @@ def get_devices_keyboard(current: int, language: str = DEFAULT_LANGUAGE) -> Inli
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def _get_device_declension(count: int) -> str:
-    if count % 10 == 1 and count % 100 != 11:
-        return 'устройство'
-    if count % 10 in [2, 3, 4] and count % 100 not in [12, 13, 14]:
-        return 'устройства'
-    return 'устройств'
-
-
 def get_subscription_confirm_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
     texts = get_texts(language)
     return InlineKeyboardMarkup(
