@@ -588,6 +588,8 @@ class UsersStatsResponse(BaseModel):
     users_with_active_subscription: int = 0
     users_with_trial: int = 0
     users_with_expired_subscription: int = 0
+    users_on_trial: int = 0  # Live canonical-trial users, counted once and excluding test stands.
+    users_paying: int = 0  # Live non-free users with at least one confirmed external payment.
 
     # Financial stats
     total_balance_kopeks: int = 0
