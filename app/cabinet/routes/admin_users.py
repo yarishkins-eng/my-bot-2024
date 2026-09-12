@@ -12,9 +12,10 @@ from app.cabinet.utils.device_ownership import verify_hwid_belongs_to_user
 from app.config import settings
 from app.database.crud.campaign import get_campaign_registration_by_user
 from app.database.crud.subscription import (
+    ALIVE_SUBSCRIPTION_STATUSES,
     extend_subscription,
 )
-from app.database.crud.tariff import get_tariff_by_id
+from app.database.crud.tariff import get_all_tariffs, get_tariff_by_id, get_trial_tariff
 from app.database.crud.user import (
     add_user_balance,
     get_referrals,
@@ -54,6 +55,7 @@ from app.database.models import (
 from app.services.permission_service import PermissionService
 from app.utils.subscription_utils import coerce_panel_device_limit
 from app.utils.timezone import panel_datetime_to_utc
+from app.utils.user_utils import real_payment_user_ids
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.users import (
@@ -625,6 +627,71 @@ async def list_users(
     )
 
 
+async def _count_trial_and_paying_users(db: AsyncSession) -> dict[str, int]:
+    """Count people on the canonical trial and people with proven external payments."""
+    from app.services.user_service import test_account_telegram_ids
+
+    now = datetime.now(UTC)
+    test_telegram_ids = tuple(test_account_telegram_ids())
+
+    # Erased accounts belong to the archive, not to operational statistics.
+    operational_user = or_(User.status.is_(None), User.status != UserStatus.DELETED.value)
+    # A DB override wins over the legacy environment list; email-only users are never stands.
+    non_test_user_conditions = [
+        User.telegram_id.is_(None),
+        User.test_account_enabled.is_(False),
+    ]
+    if test_telegram_ids:
+        non_test_user_conditions.append(
+            and_(User.test_account_enabled.is_(None), User.telegram_id.not_in(test_telegram_ids))
+        )
+    else:
+        non_test_user_conditions.append(User.test_account_enabled.is_(None))
+    non_test_user = or_(*non_test_user_conditions)
+
+    # Limited access is still a live purchased entitlement; an expired date is not.
+    live_subscription = and_(
+        Subscription.status.in_(sorted(ALIVE_SUBSCRIPTION_STATUSES)),
+        Subscription.end_date > now,
+    )
+    common_conditions = (operational_user, non_test_user, live_subscription)
+
+    trial_tariff = await get_trial_tariff(db)
+    users_on_trial = 0
+    if trial_tariff is not None:
+        trial_result = await db.execute(
+            select(func.count(func.distinct(Subscription.user_id)))
+            .join(User, Subscription.user_id == User.id)
+            .where(
+                *common_conditions,
+                # The flag alone also marks relabelled/free subscriptions; require the canonical trial tariff.
+                Subscription.is_trial.is_(True),
+                Subscription.tariff_id == trial_tariff.id,
+            )
+        )
+        users_on_trial = int(trial_result.scalar() or 0)
+
+    tariffs = await get_all_tariffs(db, include_inactive=True)
+    excluded_tariff_ids = [tariff.id for tariff in tariffs if tariff.is_free or tariff.is_trial_available]
+    paying_conditions = [
+        *common_conditions,
+        # NULL is a legacy non-trial value in production, so only explicit True is excluded.
+        Subscription.is_trial.is_not(True),
+    ]
+    if excluded_tariff_ids:
+        # Legacy NULL tariffs may be paid; known free and trial tariffs never prove a paid entitlement.
+        paying_conditions.append(
+            or_(Subscription.tariff_id.is_(None), Subscription.tariff_id.not_in(excluded_tariff_ids))
+        )
+
+    paying_result = await db.execute(
+        select(Subscription.user_id).join(User, Subscription.user_id == User.id).where(*paying_conditions).distinct()
+    )
+    candidate_ids = set(paying_result.scalars().all())
+    paid_ids = await real_payment_user_ids(db, candidate_ids) if candidate_ids else set()
+    return {'on_trial': users_on_trial, 'paying': len(paid_ids)}
+
+
 @router.get('/stats', response_model=UsersStatsResponse)
 async def get_users_stats(
     admin: User = Depends(require_permission('users:read')),
@@ -632,6 +699,7 @@ async def get_users_stats(
 ):
     """Get overall users statistics."""
     stats = await get_users_statistics(db)
+    truthful_stats = await _count_trial_and_paying_users(db)
 
     # Get subscription stats
     operational_user = or_(User.status.is_(None), User.status != UserStatus.DELETED.value)
@@ -722,6 +790,8 @@ async def get_users_stats(
         users_with_active_subscription=users_with_active,
         users_with_trial=users_with_trial,
         users_with_expired_subscription=users_with_expired,
+        users_on_trial=truthful_stats['on_trial'],
+        users_paying=truthful_stats['paying'],
         total_balance_kopeks=total_balance,
         total_balance_rubles=total_balance / 100,
         avg_balance_kopeks=avg_balance,
