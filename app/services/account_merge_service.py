@@ -69,6 +69,11 @@ from app.database.models import (
     YooKassaPayment,
 )
 from app.external.remnawave_api import RemnaWaveAPI
+from app.services.account_test_reset_service import lock_device_addon_account_activity_for_merge
+from app.services.device_addon_service import (
+    device_addon_attempt_blocks_account_change,
+    device_addon_intent_blocks_account_change,
+)
 
 
 logger = structlog.get_logger(__name__)
@@ -531,17 +536,26 @@ async def _handle_subscription_merge(
         )
 
 
-async def _guard_device_addon_merge(db: AsyncSession, user_ids: list[int]) -> None:
-    """Keep late provider bindings and fulfilled targets out of destructive merge.
+async def _guard_device_addon_merge(db: AsyncSession, user_ids: list[int]) -> list[DeviceAddonIntent]:
+    """Block only in-flight add-ons and revoke only unbound draft selections.
 
-    A single-tariff merge physically removes the losing subscription. Only
-    selections with no invoice and no receipt can be safely revoked first.
-    Caller holds payment rows, then both User rows in ID order.
+    Terminal/paid history is transferred later by ``execute_merge``.  A plain
+    draft with no attempt is the sole disposable row.  Caller locks in the
+    global P -> U -> A -> I order: payment rows and Users are already held.
     """
-    if await db.scalar(
-        select(DeviceAddonTopupAttempt.id).where(DeviceAddonTopupAttempt.user_id.in_(user_ids)).limit(1)
-    ):
-        raise ValueError('На аккаунте есть счёт докупки устройств. Перед объединением требуется финансовая сверка.')
+    attempts = list(
+        await db.scalars(
+            select(DeviceAddonTopupAttempt)
+            .where(DeviceAddonTopupAttempt.user_id.in_(user_ids))
+            .order_by(DeviceAddonTopupAttempt.id)
+            .with_for_update()
+        )
+    )
+    if any(device_addon_attempt_blocks_account_change(attempt) for attempt in attempts):
+        raise ValueError(
+            'Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите объединение. '
+            'Если ожидание длится больше суток, напишите в поддержку.'
+        )
     intents = list(
         await db.scalars(
             select(DeviceAddonIntent)
@@ -550,14 +564,60 @@ async def _guard_device_addon_merge(db: AsyncSession, user_ids: list[int]) -> No
             .with_for_update()
         )
     )
-    if any(intent.purchase_state == 'purchased' or intent.transaction_id is not None for intent in intents):
+    if any(device_addon_intent_blocks_account_change(intent) for intent in intents):
         raise ValueError(
-            'На аккаунте есть выполненная докупка устройств. Перед объединением требуется проверка её выдачи.'
+            'Выдача докупленных устройств ещё в работе. Дождитесь её завершения и повторите объединение. '
+            'Если ожидание длится больше суток, напишите в поддержку.'
         )
+    bound_intent_ids = {attempt.intent_id for attempt in attempts}
+    transferable_intents: list[DeviceAddonIntent] = []
     for intent in intents:
-        await db.delete(intent)
-    if intents:
+        if intent.purchase_state == 'draft' and intent.id not in bound_intent_ids:
+            await db.delete(intent)
+        else:
+            transferable_intents.append(intent)
+    if any(intent.purchase_state == 'draft' and intent.id not in bound_intent_ids for intent in intents):
         await db.flush()
+    return transferable_intents
+
+
+def _rekey_secondary_device_addon_intent_collisions(
+    intents: list[DeviceAddonIntent],
+    *,
+    primary_user_id: int,
+    secondary_user_id: int,
+) -> bool:
+    """Make two per-account idempotency namespaces safe to combine.
+
+    A client key is unique only within one account, so both accounts may
+    legitimately contain terminal history under the same value.  The durable
+    public intent id remains the recovery authority after a merge.  Preserve
+    the displaced key in the immutable pricing evidence and give the secondary
+    row a collision-free internal key before changing its owner.
+    """
+    primary_keys = {intent.idempotency_key for intent in intents if intent.user_id == primary_user_id}
+    used_keys = {intent.idempotency_key for intent in intents}
+    changed = False
+    for intent in intents:
+        if intent.user_id != secondary_user_id or intent.idempotency_key not in primary_keys:
+            continue
+        previous_key = intent.idempotency_key
+        base = f'merged:{secondary_user_id}:{intent.public_id}'
+        candidate = base[:128]
+        suffix = 1
+        while candidate in used_keys:
+            marker = f':{suffix}'
+            candidate = f'{base[: 128 - len(marker)]}{marker}'
+            suffix += 1
+        snapshot = dict(intent.price_snapshot or {})
+        history = list(snapshot.get('merge_idempotency_history') or [])
+        history.append({'user_id': secondary_user_id, 'idempotency_key': previous_key})
+        snapshot['merge_idempotency_history'] = history
+        intent.price_snapshot = snapshot
+        intent.idempotency_key = candidate
+        used_keys.add(candidate)
+        changed = True
+    return changed
 
 
 async def execute_merge(
@@ -594,6 +654,7 @@ async def execute_merge(
         raise ValueError('primary_user_id и secondary_user_id не могут совпадать')
 
     merge_user_ids = sorted([primary_user_id, secondary_user_id])
+    await lock_device_addon_account_activity_for_merge(db, merge_user_ids)
     await db.execute(
         select(PlategaPayment.id)
         .where(PlategaPayment.user_id.in_(merge_user_ids))
@@ -607,7 +668,7 @@ async def execute_merge(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    await _guard_device_addon_merge(db, merge_user_ids)
+    addon_intents = await _guard_device_addon_merge(db, merge_user_ids)
 
     primary = await get_user_by_id(db, primary_user_id)
     secondary = await get_user_by_id(db, secondary_user_id)
@@ -742,6 +803,28 @@ async def execute_merge(
     # 7. Переназначение всех платёжных таблиц
     for payment_model in _PAYMENT_MODELS:
         await db.execute(update(payment_model).where(payment_model.user_id == secondary.id).values(user_id=primary.id))
+
+    # 7a. Add-on history follows its ledger/provider rows in the same DB
+    # transaction.  Intent precedes attempt so every committed graph satisfies
+    # attempt.user_id == payment.user_id == intent.user_id.  The locks acquired
+    # by the guard keep a late CONFIRMED callback on the old owner until this
+    # transfer is complete.
+    if _rekey_secondary_device_addon_intent_collisions(
+        addon_intents,
+        primary_user_id=primary.id,
+        secondary_user_id=secondary.id,
+    ):
+        # Release the secondary account's per-user key namespace before the
+        # bulk owner update can meet the primary account's identical key.
+        await db.flush()
+    await db.execute(
+        update(DeviceAddonIntent).where(DeviceAddonIntent.user_id == secondary.id).values(user_id=primary.id)
+    )
+    await db.execute(
+        update(DeviceAddonTopupAttempt)
+        .where(DeviceAddonTopupAttempt.user_id == secondary.id)
+        .values(user_id=primary.id)
+    )
 
     # 7b. Переназначение saved_payment_methods (FK без ondelete)
     await db.execute(

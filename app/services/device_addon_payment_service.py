@@ -15,6 +15,8 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import structlog
+from aiogram import types
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,7 +33,7 @@ from app.database.models import (
     TransactionType,
     User,
 )
-from app.services.account_test_reset_service import reset_is_busy
+from app.services.account_test_reset_service import device_addon_account_activity_lock, reset_is_busy
 from app.services.device_addon_service import (
     DeviceAddonError,
     calculate_device_addon,
@@ -46,7 +48,7 @@ from app.services.device_first_payment_service import (
     _provider_transaction_id,
     available_platega_methods_for_db,
 )
-from app.services.platega_service import PlategaService
+from app.services.platega_service import PlategaCreateRejected, PlategaService
 
 
 logger = structlog.get_logger(__name__)
@@ -59,6 +61,9 @@ _ACTIVE_ATTEMPTS = frozenset(
 )
 _NO_ID_REVIEW_DELAY = timedelta(minutes=5)
 _TERMINAL_RECHECK_DELAY = timedelta(hours=6)
+_OPERATOR_RECHECK_DELAY = timedelta(hours=1)
+_MAX_TERMINAL_RECONCILE_ATTEMPTS = 4
+_MAX_PAID_EFFECT_ATTEMPTS = 12
 # The first add-on release is proven against live canonical invoices only for
 # SBP and Russian cards.  Other globally enabled Platega methods remain
 # available to their existing flows, but cannot create an add-on invoice until
@@ -153,13 +158,9 @@ async def _lock_payment_graph(
             .execution_options(populate_existing=True)
         )
     ).scalar_one()
-    attempt_stub = await db.get(DeviceAddonTopupAttempt, attempt_id)
     user = (
         await db.execute(
-            select(User)
-            .where(User.id == attempt_stub.user_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+            select(User).where(User.id == payment.user_id).with_for_update().execution_options(populate_existing=True)
         )
     ).scalar_one()
     attempt = (
@@ -195,13 +196,42 @@ def _binding_is_exact(*, payment: PlategaPayment, attempt: DeviceAddonTopupAttem
     )
 
 
-def _mark_operator_review(*, payment: PlategaPayment, attempt: DeviceAddonTopupAttempt, reason: str) -> None:
+def _provider_identity_is_exact(*, payment: PlategaPayment, attempt: DeviceAddonTopupAttempt) -> bool:
+    attempt_provider_id = str(attempt.provider_payment_id) if attempt.provider_payment_id else None
+    payment_provider_id = str(payment.platega_transaction_id) if payment.platega_transaction_id else None
+    return bool(
+        attempt_provider_id and payment_provider_id and hmac.compare_digest(attempt_provider_id, payment_provider_id)
+    )
+
+
+def _mark_operator_review(
+    *,
+    payment: PlategaPayment,
+    attempt: DeviceAddonTopupAttempt,
+    intent: DeviceAddonIntent,
+    reason: str,
+) -> None:
     """Hold an ambiguity without erasing an already-owned deposit receipt."""
     if attempt.deposit_transaction_id is not None:
         attempt.status = 'paid'
         attempt.holds_invoice_slot = False
     else:
+        if attempt.status != 'operator_review':
+            attempt.reconcile_attempts = 0
         attempt.status = 'operator_review'
+        attempt.next_reconcile_at = datetime.now(UTC) + _OPERATOR_RECHECK_DELAY
+        event = (
+            'device_addon_payment_operator_review '
+            f'user_id={payment.user_id} reason={reason} amount_kopeks={int(attempt.requested_amount_kopeks)}'
+        )
+        logger.error(
+            event,
+            user_id=payment.user_id,
+            reason=reason,
+            intent_public_id=intent.public_id,
+            attempt_public_id=attempt.public_id,
+            amount_kopeks=int(attempt.requested_amount_kopeks),
+        )
     attempt.reconciliation_reason = reason
     payment.status = 'OPERATOR_REVIEW'
 
@@ -226,6 +256,7 @@ async def _active_attempt(db: AsyncSession, *, intent_id: int) -> DeviceAddonTop
         .where(
             DeviceAddonTopupAttempt.intent_id == intent_id,
             DeviceAddonTopupAttempt.status.in_(_ACTIVE_ATTEMPTS),
+            DeviceAddonTopupAttempt.holds_invoice_slot.is_(True),
         )
         .order_by(DeviceAddonTopupAttempt.id.desc())
         .limit(1)
@@ -441,7 +472,7 @@ async def create_device_addon_topup(
     service = PlategaService()
     service._max_retries = 1
     try:
-        response = await service.create_payment(
+        response = await service.create_device_addon_payment(
             payment_method=method_code,
             amount=float(Decimal(requested_amount) / Decimal(100)),
             currency='RUB',
@@ -450,6 +481,16 @@ async def create_device_addon_topup(
             failed_url=effective_failed_url,
             payload=f'platega:{correlation_id}',
         )
+    except PlategaCreateRejected as error:
+        payment, _, attempt, _ = await _lock_payment_graph(db, payment_id=payment.id, attempt_id=attempt.id)
+        if attempt.status == 'dispatching' and not attempt.provider_payment_id:
+            attempt.status = 'terminal'
+            attempt.holds_invoice_slot = False
+            attempt.reconciliation_reason = f'provider_create_rejected:{error.status_code}'
+            attempt.next_reconcile_at = datetime.now(UTC) + _TERMINAL_RECHECK_DELAY
+            payment.status = f'REJECTED_{error.status_code}'
+        await db.commit()
+        return attempt
     except Exception as error:
         payment, _, attempt, _ = await _lock_payment_graph(db, payment_id=payment.id, attempt_id=attempt.id)
         if attempt.status == 'dispatching' and not attempt.provider_payment_id:
@@ -473,25 +514,36 @@ async def create_device_addon_topup(
     # Re-lock the full graph because the signed callback can race the POST.
     payment, _, attempt, bound_intent = await _lock_payment_graph(db, payment_id=payment.id, attempt_id=attempt.id)
     if not _binding_is_exact(payment=payment, attempt=attempt, intent=bound_intent):
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'durable_payment_binding_mismatch'
-        payment.status = 'OPERATOR_REVIEW'
-        await db.commit()
-        return attempt
-    if attempt.status in {'paid', 'operator_review'}:
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=bound_intent,
+            reason='durable_payment_binding_mismatch',
+        )
         await db.commit()
         return attempt
     if attempt.provider_payment_id and not hmac.compare_digest(str(attempt.provider_payment_id), provider_id):
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'provider_identity_conflict'
-        payment.status = 'OPERATOR_REVIEW'
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=bound_intent,
+            reason='provider_identity_conflict',
+        )
         await db.commit()
         return attempt
-    attempt.provider_payment_id = provider_id
-    payment.platega_transaction_id = provider_id
+    if not attempt.provider_payment_id:
+        attempt.provider_payment_id = provider_id
+        payment.platega_transaction_id = provider_id
     if redirect is not None:
         attempt.payment_url = redirect
         payment.redirect_url = redirect
+    if attempt.status in {'paid', 'operator_review'}:
+        # A signed callback may race the provider POST response.  Preserve its
+        # review/paid decision, but retain the trusted identity returned by the
+        # create call so an operator cannot close a known remote invoice and
+        # accidentally allow a second one.
+        await db.commit()
+        return attempt
     attempt.status = 'reconciling'
     attempt.reconciliation_reason = 'canonical_verification_pending'
     attempt.next_reconcile_at = datetime.now(UTC)
@@ -542,6 +594,7 @@ async def handle_device_addon_platega_callback(
         _mark_operator_review(
             payment=payment,
             attempt=attempt,
+            intent=intent,
             reason='durable_payment_binding_mismatch',
         )
         await db.commit()
@@ -560,30 +613,40 @@ async def handle_device_addon_platega_callback(
     financial_mismatch = (amount_present and amount_currency != (int(attempt.requested_amount_kopeks), 'RUB')) or (
         method_present and method_code != int(attempt.provider_method_code)
     )
-    if not exact_correlation or not provider_id or financial_mismatch:
+    if not exact_correlation or not provider_id:
         _mark_operator_review(
             payment=payment,
             attempt=attempt,
+            intent=intent,
             reason='callback_correlation_or_invoice_mismatch',
         )
         await db.commit()
         return True
-    if attempt.provider_payment_id and not hmac.compare_digest(str(attempt.provider_payment_id), provider_id):
+    known_provider_ids = tuple(
+        str(value) for value in (attempt.provider_payment_id, payment.platega_transaction_id) if value
+    )
+    if any(not hmac.compare_digest(known_id, provider_id) for known_id in known_provider_ids):
         _mark_operator_review(
             payment=payment,
             attempt=attempt,
+            intent=intent,
             reason='callback_provider_identity_conflict',
         )
         await db.commit()
         return True
-    full_exact_evidence = amount_present and method_present
-    if not attempt.provider_payment_id and full_exact_evidence:
-        attempt.provider_payment_id = provider_id
-        payment.platega_transaction_id = provider_id
-    elif not attempt.provider_payment_id:
-        attempt.status = 'creation_unknown'
-        attempt.reconciliation_reason = 'sparse_callback_before_provider_identity_binding'
-        attempt.next_reconcile_at = datetime.now(UTC) + _NO_ID_REVIEW_DELAY
+    # Exact signed correlation is enough to bind the remote identity, but not
+    # enough to credit. Persist both mirrors before validating optional invoice
+    # fields so every known remote invoice remains canonical-GET-only and can
+    # never be closed as an unknown-ID attempt.
+    attempt.provider_payment_id = provider_id
+    payment.platega_transaction_id = provider_id
+    if financial_mismatch:
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason='callback_correlation_or_invoice_mismatch',
+        )
         await db.commit()
         return True
     status = str(payload.get('status') or '').upper()
@@ -620,9 +683,12 @@ async def _settle_locked(
     attempt.provider_returned_amount_kopeks = amount_kopeks or None
     attempt.provider_returned_currency = currency or None
     if not _exact_provider_invoice(attempt, payload):
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'canonical_invoice_mismatch'
-        payment.status = 'OPERATOR_REVIEW'
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason='canonical_invoice_mismatch',
+        )
         await db.commit()
         return attempt
     if attempt.deposit_transaction_id is not None:
@@ -644,12 +710,17 @@ async def _settle_locked(
             from app.services.account_erasure_service import invalidate_financial_resolution_for_late_payment
 
             await invalidate_financial_resolution_for_late_payment(db, user.id)
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'paid_after_account_lifecycle_change'
-        payment.status = 'OPERATOR_REVIEW'
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason='paid_after_account_lifecycle_change',
+        )
         await db.commit()
         return attempt
 
+    balance_before_kopeks = int(user.balance_kopeks or 0)
+    was_first_topup = not bool(user.has_made_first_topup)
     external_id = str(attempt.provider_payment_id)
     transaction = await db.scalar(
         select(Transaction).where(
@@ -660,15 +731,21 @@ async def _settle_locked(
     ledger_key = f'device-addon-deposit:{attempt.id}'
     ledger_transaction = await db.scalar(select(Transaction).where(Transaction.device_first_ledger_key == ledger_key))
     if transaction is not None and ledger_transaction is None:
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'provider_transaction_without_owned_ledger'
-        payment.status = 'OPERATOR_REVIEW'
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason='provider_transaction_without_owned_ledger',
+        )
         await db.commit()
         return attempt
     if transaction is not None and transaction.id != getattr(ledger_transaction, 'id', None):
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'provider_transaction_already_bound'
-        payment.status = 'OPERATOR_REVIEW'
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason='provider_transaction_already_bound',
+        )
         await db.commit()
         return attempt
     transaction = ledger_transaction or transaction
@@ -677,9 +754,12 @@ async def _settle_locked(
         or transaction.type != TransactionType.DEPOSIT.value
         or int(transaction.amount_kopeks) != int(attempt.requested_amount_kopeks)
     ):
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'existing_deposit_mismatch'
-        payment.status = 'OPERATOR_REVIEW'
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason='existing_deposit_mismatch',
+        )
         await db.commit()
         return attempt
     if transaction is None:
@@ -706,6 +786,8 @@ async def _settle_locked(
         'settlement_mode': 'device_addon_topup_v1',
         'device_addon_attempt_id': attempt.id,
         'balance_credited': True,
+        'balance_before_kopeks': balance_before_kopeks,
+        'was_first_topup': was_first_topup,
     }
     attempt.deposit_transaction_id = transaction.id
     attempt.credited_amount_kopeks = attempt.requested_amount_kopeks
@@ -722,6 +804,91 @@ async def _settle_locked(
     await db.commit()
     await db.refresh(attempt)
     return attempt
+
+
+async def _send_paid_effect_notifications(
+    db: AsyncSession,
+    *,
+    bot: Any | None,
+    user: User,
+    transaction: Transaction,
+    intent: DeviceAddonIntent,
+    payment: PlategaPayment,
+) -> None:
+    """Send the retryable admin/client receipts for one credited top-up."""
+    metadata = payment.metadata_json if isinstance(payment.metadata_json, dict) else {}
+    user_id = int(user.id)
+    telegram_id = user.telegram_id
+    language = user.language
+    amount_kopeks = int(transaction.amount_kopeks)
+    intent_public_id = str(intent.public_id)
+    subscription = await db.get(Subscription, intent.subscription_id) if intent.subscription_id is not None else None
+
+    if bot is not None:
+        try:
+            from app.services.admin_notification_service import AdminNotificationService
+
+            notification_service = AdminNotificationService(bot)
+            referrer_info = await notification_service._get_referrer_info(db, user.referred_by_id)
+            promo_group = await notification_service._get_user_promo_group(db, user)
+            old_balance = int(
+                metadata.get(
+                    'balance_before_kopeks',
+                    max(0, int(user.balance_kopeks or 0) - amount_kopeks),
+                )
+            )
+            topup_status = '🆕 Первое пополнение' if metadata.get('was_first_topup') else '🔄 Пополнение'
+            await notification_service.send_balance_topup_notification(
+                user,
+                transaction,
+                old_balance,
+                topup_status=topup_status,
+                referrer_info=referrer_info,
+                subscription=subscription,
+                promo_group=promo_group,
+                db=db,
+            )
+        except Exception as error:
+            logger.error(
+                'device_addon_topup_admin_notification_failed',
+                attempt_id=metadata.get('device_addon_attempt_id'),
+                user_id=user_id,
+                error=error,
+            )
+
+    if not telegram_id:
+        return
+    if bot is None:
+        raise RuntimeError('device add-on top-up customer notification requires bot')
+
+    from app.utils.miniapp_buttons import build_cabinet_url
+
+    return_url = build_cabinet_url(f'/subscription/device-topup/{intent_public_id}')
+    if not return_url:
+        raise RuntimeError('device add-on top-up customer return URL is unavailable')
+    if language == 'en':
+        text = (
+            '✅ <b>Top-up successful!</b>\n\n'
+            f'💰 Amount: {settings.format_price(amount_kopeks)}\n\n'
+            'To add devices, return and confirm the purchase.'
+        )
+        button_text = 'Return to purchase'
+    else:
+        text = (
+            '✅ <b>Пополнение успешно!</b>\n\n'
+            f'💰 Сумма: {settings.format_price(amount_kopeks)}\n\n'
+            'Чтобы добавить устройства, вернитесь и подтвердите покупку.'
+        )
+        button_text = 'Вернуться к покупке'
+    keyboard = types.InlineKeyboardMarkup(
+        inline_keyboard=[[types.InlineKeyboardButton(text=button_text, web_app=types.WebAppInfo(url=return_url))]]
+    )
+    await bot.send_message(
+        telegram_id,
+        text,
+        parse_mode='HTML',
+        reply_markup=keyboard,
+    )
 
 
 async def reconcile_device_addon_payment(
@@ -746,7 +913,7 @@ async def reconcile_device_addon_payment(
     ).scalar_one()
     user = (
         await db.execute(
-            select(User).where(User.id == stub.user_id).with_for_update().execution_options(populate_existing=True)
+            select(User).where(User.id == payment.user_id).with_for_update().execution_options(populate_existing=True)
         )
     ).scalar_one()
     attempt_query = select(DeviceAddonTopupAttempt).where(DeviceAddonTopupAttempt.id == attempt_id)
@@ -773,11 +940,25 @@ async def reconcile_device_addon_payment(
         _mark_operator_review(
             payment=payment,
             attempt=attempt,
+            intent=intent,
             reason='durable_payment_binding_mismatch',
         )
         await db.commit()
         return attempt
+    if not _provider_identity_is_exact(payment=payment, attempt=attempt):
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason='durable_provider_identity_mismatch',
+        )
+        attempt.reconcile_attempts = int(attempt.reconcile_attempts or 0) + 1
+        attempt.lease_token = None
+        attempt.lease_expires_at = None
+        await db.commit()
+        return attempt
     financially_settled = attempt.deposit_transaction_id is not None
+    was_terminal = attempt.status == 'terminal'
     if not isinstance(payload, dict):
         if financially_settled:
             attempt.status = 'paid'
@@ -786,9 +967,16 @@ async def reconcile_device_addon_payment(
             attempt.lease_expires_at = None
             await db.commit()
             return attempt
-        attempt.status = 'reconciling' if attempt.status != 'terminal' else 'terminal'
+        if attempt.status not in {'terminal', 'operator_review'}:
+            attempt.status = 'reconciling'
         attempt.reconciliation_reason = 'canonical_status_unavailable'
-        attempt.next_reconcile_at = datetime.now(UTC) + timedelta(minutes=5)
+        if attempt.status == 'terminal':
+            attempt.next_reconcile_at = datetime.now(UTC) + _TERMINAL_RECHECK_DELAY
+        elif attempt.status == 'operator_review':
+            attempt.next_reconcile_at = datetime.now(UTC) + _OPERATOR_RECHECK_DELAY
+        else:
+            attempt.next_reconcile_at = datetime.now(UTC) + timedelta(minutes=5)
+        attempt.reconcile_attempts = int(attempt.reconcile_attempts or 0) + 1
         attempt.lease_token = None
         attempt.lease_expires_at = None
         await db.commit()
@@ -796,20 +984,44 @@ async def reconcile_device_addon_payment(
     amount_currency = PlategaService.parse_amount_currency(payload)
     if amount_currency is not None:
         attempt.provider_returned_amount_kopeks, attempt.provider_returned_currency = amount_currency
-    if not _exact_provider_invoice(attempt, payload):
+    terminal_financial_mismatch = was_terminal and (
+        amount_currency != (int(attempt.requested_amount_kopeks), 'RUB')
+        or _provider_method_code(payload) != int(attempt.provider_method_code)
+    )
+    status = str(payload.get('status') or '').upper()
+    provider_invoice_exact = _exact_provider_invoice(attempt, payload)
+    correlation = payload.get('payload')
+    terminal_binding_exact = (
+        _provider_transaction_id(payload) == str(attempt.provider_payment_id or '')
+        and _provider_method_code(payload) == int(attempt.provider_method_code)
+        and (correlation is None or hmac.compare_digest(str(correlation), f'platega:{attempt.correlation_id}'))
+    )
+    terminal_amount_mismatch = (
+        status in _PROVIDER_TERMINAL
+        and terminal_binding_exact
+        and amount_currency != (int(attempt.requested_amount_kopeks), 'RUB')
+    )
+    if not provider_invoice_exact and (financially_settled or not terminal_amount_mismatch):
         if financially_settled:
             attempt.status = 'paid'
             attempt.holds_invoice_slot = False
             attempt.reconciliation_reason = 'post_paid_canonical_invoice_mismatch'
+            payment.status = 'OPERATOR_REVIEW'
+        elif terminal_financial_mismatch:
+            attempt.reconciliation_reason = 'terminal_recheck_canonical_invoice_mismatch'
+            attempt.next_reconcile_at = datetime.now(UTC) + _TERMINAL_RECHECK_DELAY
         else:
-            attempt.status = 'operator_review'
-            attempt.reconciliation_reason = 'canonical_invoice_mismatch'
-        payment.status = 'OPERATOR_REVIEW'
+            _mark_operator_review(
+                payment=payment,
+                attempt=attempt,
+                intent=intent,
+                reason='canonical_invoice_mismatch',
+            )
+        attempt.reconcile_attempts = int(attempt.reconcile_attempts or 0) + 1
         attempt.lease_token = None
         attempt.lease_expires_at = None
         await db.commit()
         return attempt
-    status = str(payload.get('status') or '').upper()
     if status == 'CONFIRMED':
         return await _settle_locked(db, payment=payment, user=user, attempt=attempt, intent=intent, payload=payload)
     if financially_settled:
@@ -823,41 +1035,58 @@ async def reconcile_device_addon_payment(
         await db.commit()
         return attempt
     if status in _PROVIDER_TERMINAL:
+        if attempt.status != 'terminal':
+            attempt.reconcile_attempts = 0
         attempt.status = 'terminal'
         attempt.holds_invoice_slot = False
         attempt.reconciliation_reason = f'provider_terminal:{status.lower()}'
+        if not provider_invoice_exact:
+            attempt.reconciliation_reason += ':canonical_invoice_mismatch'
         attempt.next_reconcile_at = datetime.now(UTC) + _TERMINAL_RECHECK_DELAY
         payment.status = status
     elif status in _PROVIDER_LIVE:
-        if attempt.status == 'terminal':
+        if attempt.status == 'terminal' or (attempt.status == 'operator_review' and not attempt.holds_invoice_slot):
             # A terminal invoice never reclaims the one-invoice slot.  A
-            # contradictory later PENDING remains visible for operator review
-            # and cannot become a second customer-facing payment URL.
-            attempt.status = 'operator_review'
-            attempt.reconciliation_reason = 'provider_terminal_status_regressed'
-            attempt.next_reconcile_at = datetime.now(UTC) + _TERMINAL_RECHECK_DELAY
-            payment.status = 'OPERATOR_REVIEW'
+            # contradictory later PENDING remains in the bounded hourly review
+            # lane on every subsequent observation and cannot become a second
+            # customer-facing payment URL.
+            _mark_operator_review(
+                payment=payment,
+                attempt=attempt,
+                intent=intent,
+                reason='provider_terminal_status_regressed',
+            )
         else:
-            attempt.status = 'pending'
-            attempt.reconciliation_reason = None
-            attempt.next_reconcile_at = datetime.now(UTC) + timedelta(minutes=2)
-            payment.status = status
             redirect = _safe_https_url(PlategaService.parse_redirect_url(payload))
             if redirect is not None:
                 attempt.payment_url = redirect
                 payment.redirect_url = redirect
             if attempt.payment_url is None:
-                attempt.status = 'operator_review'
-                attempt.reconciliation_reason = 'canonical_invoice_missing_safe_redirect'
-                payment.status = 'OPERATOR_REVIEW'
+                _mark_operator_review(
+                    payment=payment,
+                    attempt=attempt,
+                    intent=intent,
+                    reason='canonical_invoice_missing_safe_redirect',
+                )
+            else:
+                attempt.status = 'pending'
+                attempt.reconciliation_reason = None
+                attempt.next_reconcile_at = datetime.now(UTC) + timedelta(minutes=2)
+                payment.status = status
     elif status in _PROVIDER_REVERSAL:
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = 'provider_chargeback_before_credit'
-        payment.status = 'OPERATOR_REVIEW'
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason='provider_chargeback_before_credit',
+        )
     else:
-        attempt.status = 'operator_review'
-        attempt.reconciliation_reason = f'provider_unknown_status:{status.lower() or "empty"}'
-        payment.status = 'OPERATOR_REVIEW'
+        _mark_operator_review(
+            payment=payment,
+            attempt=attempt,
+            intent=intent,
+            reason=f'provider_unknown_status:{status.lower() or "empty"}',
+        )
     attempt.reconcile_attempts = int(attempt.reconcile_attempts or 0) + 1
     attempt.lease_token = None
     attempt.lease_expires_at = None
@@ -874,10 +1103,106 @@ async def _run_paid_effects(
     lease_epoch: int,
     bot: Any | None,
 ) -> None:
+    """Run paid effects while account ownership/reset is stable across IO."""
+    while True:
+        attempt = await db.get(DeviceAddonTopupAttempt, attempt_id, populate_existing=True)
+        if attempt is None or attempt.status != 'paid' or not attempt.deposit_transaction_id:
+            return
+        owner_id = int(attempt.user_id)
+        await db.rollback()
+        async with device_addon_account_activity_lock(db, owner_id):
+            attempt = await db.get(DeviceAddonTopupAttempt, attempt_id, populate_existing=True)
+            if attempt is None or attempt.status != 'paid' or not attempt.deposit_transaction_id:
+                return
+            if int(attempt.user_id) != owner_id:
+                await db.rollback()
+                continue
+            await _run_paid_effects_under_account_activity(
+                db,
+                attempt_id=attempt_id,
+                lease_token=lease_token,
+                lease_epoch=lease_epoch,
+                bot=bot,
+                allow_reset_busy=False,
+            )
+            return
+
+
+async def _run_paid_effects_under_account_activity(
+    db: AsyncSession,
+    *,
+    attempt_id: int,
+    lease_token: str,
+    lease_epoch: int,
+    bot: Any | None,
+    allow_reset_busy: bool,
+) -> None:
     attempt = await db.get(DeviceAddonTopupAttempt, attempt_id, populate_existing=True)
-    if attempt.status != 'paid' or not attempt.deposit_transaction_id:
+    if attempt is None or attempt.status != 'paid' or not attempt.deposit_transaction_id:
+        return
+    current_owner = await db.get(User, attempt.user_id, populate_existing=True)
+    if current_owner is None:
+        raise RuntimeError('device add-on payment owner disappeared')
+    if reset_is_busy(current_owner) and not allow_reset_busy:
+        attempt = (
+            await db.execute(
+                select(DeviceAddonTopupAttempt)
+                .where(
+                    DeviceAddonTopupAttempt.id == attempt_id,
+                    DeviceAddonTopupAttempt.lease_token == lease_token,
+                    DeviceAddonTopupAttempt.lease_epoch == lease_epoch,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if attempt is not None:
+            attempt.lease_token = None
+            attempt.lease_expires_at = None
+            await db.commit()
         return
     if attempt.referral_status in {'pending', 'processing'}:
+        # The monetary helper locks Transaction -> Users.  Enter the same
+        # Platega row that merge/reset lock first, then revalidate the claimed
+        # attempt.  This serializes account ownership changes without making a
+        # durable ``paid`` row a lifecycle blocker or changing P -> U -> A -> I
+        # in provider settlement paths.
+        payment_lock = (
+            await db.execute(
+                select(PlategaPayment)
+                .where(PlategaPayment.id == attempt.platega_payment_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        attempt = (
+            await db.execute(
+                select(DeviceAddonTopupAttempt)
+                .where(
+                    DeviceAddonTopupAttempt.id == attempt_id,
+                    DeviceAddonTopupAttempt.lease_token == lease_token,
+                    DeviceAddonTopupAttempt.lease_epoch == lease_epoch,
+                    DeviceAddonTopupAttempt.lease_expires_at >= datetime.now(UTC),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if payment_lock is None or attempt is None:
+            await db.rollback()
+            raise DeviceAddonError('recovery_lease_lost', 'Платёж уже проверяется.')
+        owner = await db.get(User, payment_lock.user_id, populate_existing=True)
+        if owner is None:
+            await db.rollback()
+            raise RuntimeError('device add-on payment owner disappeared')
+        if reset_is_busy(owner):
+            # Reset already won the payment-first fence.  Relinquish this
+            # claim; cleanup may now remove the complete graph without a stale
+            # worker recreating any state after its marker commit.
+            attempt.lease_token = None
+            attempt.lease_expires_at = None
+            await db.commit()
+            return
         try:
             await apply_deposit_referral_money(db, source_transaction_id=attempt.deposit_transaction_id)
         except ReferralRewardBalanceFencedError:
@@ -971,9 +1296,23 @@ async def _run_paid_effects(
     ).scalar_one_or_none()
     if attempt is None:
         raise DeviceAddonError('recovery_lease_lost', 'Платёж уже проверяется.')
+    if int(attempt.effects_attempts or 0) >= _MAX_PAID_EFFECT_ATTEMPTS:
+        attempt.event_status = 'done'
+        attempt.reconciliation_reason = 'paid_effects_attempts_exhausted'
+        attempt.lease_token = None
+        attempt.lease_expires_at = None
+        await db.commit()
+        logger.warning(
+            'device_addon_paid_effects_attempts_exhausted',
+            attempt_id=attempt_id,
+            user_id=attempt.user_id,
+            effects_attempts=attempt.effects_attempts,
+        )
+        return
     attempt.event_status = 'processing'
     attempt.effects_attempts = int(attempt.effects_attempts or 0) + 1
     await db.commit()
+
     transaction = await db.get(Transaction, attempt.deposit_transaction_id)
     if transaction is None:
         raise RuntimeError('device add-on deposit transaction disappeared')
@@ -988,12 +1327,47 @@ async def _run_paid_effects(
         description=transaction.description or '',
         raise_on_error=True,
     )
-
-    # Cabinet status is the durable customer receipt.  Transaction events carry
-    # the immutable transaction id and are safe for at-least-once consumers.
-    # Telegram/referral messages need a per-recipient durable outbox; sending
-    # them inline here would duplicate some recipients after a mid-loop crash.
-    del bot
+    user = await db.get(User, attempt.user_id, populate_existing=True)
+    intent = await db.get(DeviceAddonIntent, attempt.intent_id, populate_existing=True)
+    payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
+    if user is None or intent is None or payment is None:
+        raise RuntimeError('device add-on notification graph disappeared')
+    try:
+        await _send_paid_effect_notifications(
+            db,
+            bot=bot,
+            user=user,
+            transaction=transaction,
+            intent=intent,
+            payment=payment,
+        )
+    except (TelegramForbiddenError, TelegramBadRequest) as error:
+        attempt = (
+            await db.execute(
+                select(DeviceAddonTopupAttempt)
+                .where(
+                    DeviceAddonTopupAttempt.id == attempt_id,
+                    DeviceAddonTopupAttempt.lease_token == lease_token,
+                    DeviceAddonTopupAttempt.lease_epoch == lease_epoch,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if attempt is None:
+            raise DeviceAddonError('recovery_lease_lost', 'Платёж уже проверяется.') from error
+        attempt.event_status = 'done'
+        attempt.reconciliation_reason = 'customer_receipt_undeliverable'
+        attempt.lease_token = None
+        attempt.lease_expires_at = None
+        await db.commit()
+        logger.warning(
+            'device_addon_customer_receipt_undeliverable',
+            attempt_id=attempt_id,
+            user_id=user.id,
+            error_type=type(error).__name__,
+        )
+        return
 
     attempt = (
         await db.execute(
@@ -1013,6 +1387,161 @@ async def _run_paid_effects(
     attempt.lease_token = None
     attempt.lease_expires_at = None
     await db.commit()
+
+
+async def drain_device_addon_paid_effects_for_reset(db: AsyncSession, *, user_id: int) -> bool:
+    """Finish claimed/orphan paid effects before reset deletes their graph.
+
+    The caller owns the account activity lock, so replacing a stale worker
+    lease cannot race live external IO. Any failure leaves the reset marker
+    untouched and the complete graph available for a retry.
+    """
+    own_bot = None
+    try:
+        while True:
+            now = datetime.now(UTC)
+            attempt = (
+                await db.execute(
+                    select(DeviceAddonTopupAttempt)
+                    .where(
+                        DeviceAddonTopupAttempt.user_id == user_id,
+                        DeviceAddonTopupAttempt.status == 'paid',
+                        DeviceAddonTopupAttempt.deposit_transaction_id.is_not(None),
+                        DeviceAddonTopupAttempt.referral_status.in_(['pending', 'processing', 'done']),
+                        or_(
+                            DeviceAddonTopupAttempt.referral_status.in_(['pending', 'processing']),
+                            DeviceAddonTopupAttempt.event_status != 'done',
+                        ),
+                    )
+                    .order_by(DeviceAddonTopupAttempt.id)
+                    .limit(1)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if attempt is None:
+                return True
+            attempt.lease_token = uuid.uuid4().hex
+            attempt.lease_epoch = int(attempt.lease_epoch or 0) + 1
+            attempt.lease_expires_at = now + timedelta(minutes=2)
+            attempt.next_reconcile_at = now
+            attempt_id = int(attempt.id)
+            lease_token = str(attempt.lease_token)
+            lease_epoch = int(attempt.lease_epoch)
+            await db.commit()
+            try:
+                if own_bot is None:
+                    from app.bot_factory import create_bot
+
+                    own_bot = create_bot()
+                await _run_paid_effects_under_account_activity(
+                    db,
+                    attempt_id=attempt_id,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                    bot=own_bot,
+                    allow_reset_busy=True,
+                )
+            except Exception as error:
+                await db.rollback()
+                attempt = await db.get(DeviceAddonTopupAttempt, attempt_id, populate_existing=True)
+                if attempt is not None and attempt.lease_token == lease_token and attempt.lease_epoch == lease_epoch:
+                    attempt.reconciliation_reason = f'reset_paid_effect_drain_error:{type(error).__name__}'
+                    attempt.next_reconcile_at = datetime.now(UTC) + timedelta(minutes=5)
+                    attempt.lease_token = None
+                    attempt.lease_expires_at = None
+                await db.commit()
+                logger.error('device_addon_reset_paid_effect_drain_failed', attempt_id=attempt_id, error=str(error))
+                return False
+    finally:
+        if own_bot is not None:
+            try:
+                await own_bot.session.close()
+            except Exception as error:
+                logger.warning('device_addon_reset_drain_bot_close_failed', error=str(error))
+
+
+async def check_device_addon_payment_now(
+    db: AsyncSession,
+    *,
+    platega_payment_id: int,
+) -> DeviceAddonTopupAttempt:
+    """Run one canonical GET and reconcile through the ordinary locked path."""
+    attempt = await db.scalar(
+        select(DeviceAddonTopupAttempt).where(
+            DeviceAddonTopupAttempt.platega_payment_id == platega_payment_id,
+        )
+    )
+    if attempt is None:
+        raise DeviceAddonError('attempt_not_found', 'Платёж докупки не найден.', status_code=404)
+    payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
+    if payment is None or not attempt.provider_payment_id or not payment.platega_transaction_id:
+        raise DeviceAddonError(
+            'provider_identity_unknown',
+            'У платежа нет ID провайдера; его нельзя проверить автоматически.',
+        )
+    if not _provider_identity_is_exact(payment=payment, attempt=attempt):
+        raise DeviceAddonError(
+            'provider_identity_mismatch',
+            'ID провайдера в платеже не совпадает; нужна проверка оператора.',
+            status_code=409,
+        )
+    attempt_provider_id = str(attempt.provider_payment_id)
+    service = PlategaService()
+    service._max_retries = 1
+    try:
+        payload = await service.get_transaction(attempt_provider_id)
+    except Exception as error:
+        logger.warning(
+            'device_addon_manual_canonical_get_failed',
+            platega_payment_id=platega_payment_id,
+            attempt_id=attempt.id,
+            error_type=type(error).__name__,
+        )
+        payload = None
+    return await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=payload)
+
+
+async def close_device_addon_attempt_without_credit(
+    db: AsyncSession,
+    *,
+    platega_payment_id: int,
+) -> DeviceAddonTopupAttempt:
+    """Release one no-ID operator hold without touching wallet or ledger."""
+    stub = await db.scalar(
+        select(DeviceAddonTopupAttempt).where(
+            DeviceAddonTopupAttempt.platega_payment_id == platega_payment_id,
+        )
+    )
+    if stub is None:
+        raise DeviceAddonError('attempt_not_found', 'Платёж докупки не найден.', status_code=404)
+    payment, _, attempt, intent = await _lock_payment_graph(
+        db,
+        payment_id=platega_payment_id,
+        attempt_id=stub.id,
+    )
+    if not _binding_is_exact(payment=payment, attempt=attempt, intent=intent):
+        raise DeviceAddonError('payment_binding_mismatch', 'Связь платежа повреждена.', status_code=409)
+    if (
+        attempt.status != 'operator_review'
+        or attempt.provider_payment_id is not None
+        or payment.platega_transaction_id is not None
+        or attempt.deposit_transaction_id is not None
+    ):
+        raise DeviceAddonError(
+            'attempt_cannot_be_closed',
+            'Эту попытку нельзя закрыть без проверки.',
+            status_code=409,
+        )
+    attempt.status = 'terminal'
+    attempt.holds_invoice_slot = False
+    attempt.reconciliation_reason = 'closed_by_operator'
+    attempt.lease_token = None
+    attempt.lease_expires_at = None
+    payment.status = 'CLOSED_BY_OPERATOR'
+    await db.commit()
+    await db.refresh(attempt)
+    return attempt
 
 
 async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bot: Any | None = None) -> int:
@@ -1037,6 +1566,13 @@ async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bo
                         and_(
                             DeviceAddonTopupAttempt.status == 'terminal',
                             DeviceAddonTopupAttempt.provider_payment_id.is_not(None),
+                            DeviceAddonTopupAttempt.reconcile_attempts < _MAX_TERMINAL_RECONCILE_ATTEMPTS,
+                            DeviceAddonTopupAttempt.next_reconcile_at <= now,
+                        ),
+                        and_(
+                            DeviceAddonTopupAttempt.status == 'operator_review',
+                            DeviceAddonTopupAttempt.provider_payment_id.is_not(None),
+                            DeviceAddonTopupAttempt.reconcile_attempts < 24,
                             DeviceAddonTopupAttempt.next_reconcile_at <= now,
                         ),
                         and_(
@@ -1091,8 +1627,16 @@ async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bo
                 processed += 1
                 continue
             if not attempt.provider_payment_id:
-                attempt.status = 'operator_review'
-                attempt.reconciliation_reason = 'provider_identity_unknown_no_retry'
+                payment = await db.get(PlategaPayment, attempt.platega_payment_id)
+                intent = await db.get(DeviceAddonIntent, attempt.intent_id)
+                if payment is None or intent is None:
+                    raise RuntimeError('device add-on payment graph disappeared')
+                _mark_operator_review(
+                    payment=payment,
+                    attempt=attempt,
+                    intent=intent,
+                    reason='provider_identity_unknown_no_retry',
+                )
                 attempt.lease_token = None
                 attempt.lease_expires_at = None
                 await db.commit()

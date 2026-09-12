@@ -35,6 +35,8 @@ from app.database.crud.user_device_alias import (
 from app.database.crud.user_promo_group import sync_user_primary_promo_group
 from app.database.models import (
     AccountErasureRequest,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
     GuestPurchase,
     PaymentMethod,
     PromoGroup,
@@ -1243,6 +1245,127 @@ async def _reject_manual_access_point_grant(db: AsyncSession, subscription: Subs
 
 
 # === Subscription Management ===
+
+
+@router.get('/{user_id}/device-addons')
+async def get_user_device_addons(
+    user_id: int,
+    admin: User = Depends(require_permission('users:read')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Return the durable add-on purchase and fulfillment history for one owner."""
+    del admin
+    if await db.get(User, user_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
+    intents = (
+        (
+            await db.execute(
+                select(DeviceAddonIntent)
+                .where(DeviceAddonIntent.user_id == user_id)
+                .order_by(DeviceAddonIntent.created_at.desc(), DeviceAddonIntent.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    intent_ids = [int(intent.id) for intent in intents]
+    attempts_by_intent: dict[int, list[dict]] = {}
+    if intent_ids:
+        attempts = (
+            (
+                await db.execute(
+                    select(DeviceAddonTopupAttempt)
+                    .where(DeviceAddonTopupAttempt.intent_id.in_(intent_ids))
+                    .order_by(DeviceAddonTopupAttempt.created_at.desc(), DeviceAddonTopupAttempt.id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for attempt in attempts:
+            attempts_by_intent.setdefault(int(attempt.intent_id), []).append(
+                {
+                    'public_id': attempt.public_id,
+                    'status': attempt.status,
+                    'amount_kopeks': int(attempt.requested_amount_kopeks),
+                    'reason': attempt.reconciliation_reason,
+                    'created_at': attempt.created_at,
+                }
+            )
+    return {
+        'items': [
+            {
+                'public_id': intent.public_id,
+                'devices_to_add': int(intent.devices_to_add),
+                'price_kopeks': int(intent.quoted_price_kopeks),
+                'purchase_state': intent.purchase_state,
+                'fulfillment_state': intent.fulfillment_state,
+                'reason': intent.fulfillment_error_code,
+                'purchased_at': intent.purchased_at,
+                'fulfilled_at': intent.fulfilled_at,
+                'created_at': intent.created_at,
+                'attempts': attempts_by_intent.get(int(intent.id), []),
+            }
+            for intent in intents
+        ]
+    }
+
+
+@router.post('/{user_id}/device-addons/{intent_public_id}/retry-fulfillment')
+async def retry_user_device_addon_fulfillment(
+    user_id: int,
+    intent_public_id: str,
+    admin: User = Depends(require_permission('users:subscription')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Release only a reviewed fulfillment back to the existing worker."""
+    intent = (
+        await db.execute(
+            select(DeviceAddonIntent)
+            .where(
+                DeviceAddonIntent.public_id == intent_public_id,
+                DeviceAddonIntent.user_id == user_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if intent is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Device add-on intent not found')
+    if intent.purchase_state != 'purchased' or intent.fulfillment_state != 'needs_attention':
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                'code': 'device_addon_retry_not_allowed',
+                'message': 'Повтор доступен только для застрявшей выдачи оплаченной докупки.',
+            },
+        )
+    previous_reason = intent.fulfillment_error_code
+    intent.fulfillment_state = 'pending'
+    intent.fulfillment_attempts = 0
+    intent.fulfillment_error_code = None
+    intent.next_attempt_at = datetime.now(UTC)
+    intent.lease_token = None
+    intent.lease_expires_at = None
+    await PermissionService.log_action(
+        db,
+        user_id=admin.id,
+        action='retry_device_addon_fulfillment',
+        resource_type='device_addon_intent',
+        resource_id=intent.public_id,
+        details={'target_user_id': user_id, 'previous_reason': previous_reason},
+    )
+    await db.commit()
+
+    from app.services.device_addon_worker import device_addon_worker
+
+    device_addon_worker.wake()
+    return {
+        'success': True,
+        'message': 'Повтор выдачи поставлен в очередь.',
+        'public_id': intent.public_id,
+        'fulfillment_state': intent.fulfillment_state,
+    }
 
 
 @router.post('/{user_id}/subscription', response_model=UpdateSubscriptionResponse)

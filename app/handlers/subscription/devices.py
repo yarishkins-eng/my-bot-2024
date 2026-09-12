@@ -266,7 +266,7 @@ async def _open_device_addon_cabinet(callback, user, subscription, devices: int)
 
     english = user.language == 'en'
     cabinet_url = settings.get_cabinet_link()
-    if not cabinet_url:
+    if not settings.DEVICE_ADDON_PURCHASE_ENABLED or not cabinet_url:
         await callback.answer(
             'Device purchases are temporarily unavailable.' if english else 'Докупка устройств временно недоступна.',
             show_alert=True,

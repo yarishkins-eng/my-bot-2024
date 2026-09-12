@@ -100,7 +100,7 @@ async def test_kill_switch_preserves_receipt_and_blocks_new_money_actions(sessio
             await calculate_device_addon(db, user=user, subscription_id=sub.id, devices_to_add=1), user_id=user.id
         )
         draft = await create_intent(db, user=user, quote_token=fresh['quote_token'], idempotency_key='draft')
-        user_id, bought_id, draft_id = user.id, bought.public_id, draft.public_id
+        user_id, sub_id, bought_id, draft_id = user.id, sub.id, bought.public_id, draft.public_id
         before_balance = user.balance_kopeks
         ledger_count = await db.scalar(select(func.count(Transaction.id)))
     monkeypatch.setattr(settings, 'DEVICE_ADDON_PURCHASE_ENABLED', False)
@@ -108,10 +108,20 @@ async def test_kill_switch_preserves_receipt_and_blocks_new_money_actions(sessio
     monkeypatch.setattr(payments, 'available_platega_methods_for_db', AsyncMock(return_value=[{'provider_code': 2}]))
     app = owned_app(sessions, user_id)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        quote_read = await client.get(
+            '/cabinet/subscription/devices/quote', params={'subscription_id': sub_id, 'devices': 1}
+        )
+        assert quote_read.status_code == 200
+        assert quote_read.json()['purchase_enabled'] is False
+        draft_read = await client.get(f'/cabinet/subscription/devices/intents/{draft_id}')
+        assert draft_read.status_code == 200
+        assert draft_read.json()['purchase_enabled'] is False
+        assert draft_read.json()['quote']['purchase_enabled'] is False
         replay = await client.post(
             f'/cabinet/subscription/devices/intents/{bought_id}/purchase', json={'quote_token': quote['quote_token']}
         )
         assert replay.status_code == 200 and replay.json()['purchase_state'] == 'purchased'
+        assert replay.json()['purchase_enabled'] is False
         actions = [
             await client.post(
                 '/cabinet/subscription/devices/intents',
@@ -164,7 +174,7 @@ async def test_http_quote_invoice_owned_return_and_manual_purchase(sessions, mon
         def __init__(self):
             self._max_retries = 3
 
-        async def create_payment(self, **kwargs):
+        async def create_device_addon_payment(self, **kwargs):
             assert self._max_retries == 1
             provider_posts.append(kwargs)
             async with sessions() as check:

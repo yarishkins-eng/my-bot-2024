@@ -389,7 +389,7 @@ async def shutdown_bot():
     try:
         from app.services.device_addon_worker import device_addon_worker
 
-        device_addon_worker.stop()
+        await device_addon_worker.stop()
         logger.info('Воркер выдачи докупленных устройств остановлен')
     except Exception as e:
         logger.error('Ошибка остановки воркера докупленных устройств', error=e)

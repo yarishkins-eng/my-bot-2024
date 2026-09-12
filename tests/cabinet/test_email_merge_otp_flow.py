@@ -136,3 +136,40 @@ async def test_execute_rejects_non_initiator() -> None:
             )
     assert exc.value.status_code == status.HTTP_403_FORBIDDEN
     restore.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_returns_structured_merge_blocker() -> None:
+    consumed = {'primary_user_id': 1, 'secondary_user_id': 2, 'provider': 'email', 'provider_id': 'x'}
+    restore = AsyncMock()
+    db = AsyncMock()
+    with ExitStack() as s:
+        s.enter_context(patch('app.cabinet.routes.account_linking.get_client_ip', MagicMock(return_value='1.2.3.4')))
+        s.enter_context(
+            patch('app.cabinet.routes.account_linking.RateLimitCache.is_ip_rate_limited', AsyncMock(return_value=False))
+        )
+        s.enter_context(
+            patch('app.cabinet.routes.account_linking.consume_merge_token', AsyncMock(return_value=consumed))
+        )
+        s.enter_context(patch('app.cabinet.routes.account_linking.restore_merge_token', restore))
+        s.enter_context(
+            patch(
+                'app.cabinet.routes.account_linking.execute_merge',
+                AsyncMock(side_effect=ValueError('Счёт докупки устройств ещё в работе.')),
+            )
+        )
+        with pytest.raises(HTTPException) as exc:
+            await execute_merge_endpoint(
+                request=MergeRequest(keep_subscription_from=1),
+                raw_request=MagicMock(),
+                merge_token='x' * 40,
+                user=SimpleNamespace(id=1),
+                db=db,
+            )
+    assert exc.value.status_code == status.HTTP_400_BAD_REQUEST
+    assert exc.value.detail == {
+        'code': 'account_merge_blocked',
+        'message': 'Счёт докупки устройств ещё в работе.',
+    }
+    db.rollback.assert_awaited_once()
+    restore.assert_awaited_once_with('x' * 40, consumed)

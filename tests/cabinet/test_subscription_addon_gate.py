@@ -36,6 +36,11 @@ from app.config import settings
 from app.database.models import Subscription, Tariff, User
 
 
+@pytest.fixture(autouse=True)
+def _device_addon_purchase_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, 'DEVICE_ADDON_PURCHASE_ENABLED', True)
+
+
 # ----------------------------- device price resolution -----------------------
 
 
@@ -102,6 +107,17 @@ def test_device_gate_open_when_no_max_limit() -> None:
     sub = SimpleNamespace(device_limit=99)
     can_topup, price = compute_device_topup_gate(sub, tariff)
     assert can_topup is True
+    assert price == 5000
+
+
+def test_device_gate_closed_by_purchase_switch_but_keeps_effective_price(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, 'DEVICE_ADDON_PURCHASE_ENABLED', False)
+    tariff = SimpleNamespace(device_price_kopeks=5000, max_device_limit=5)
+    sub = SimpleNamespace(device_limit=2)
+    can_topup, price = compute_device_topup_gate(sub, tariff)
+    assert can_topup is False
     assert price == 5000
 
 
