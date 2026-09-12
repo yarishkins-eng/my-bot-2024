@@ -102,7 +102,7 @@ def _invoice_expiry_label(user: User, expires_at: datetime | None) -> str:
 
 
 def _device_label(user: User, limit: int) -> str:
-    return format_devices_declension(limit, user.language)
+    return format_devices_declension(limit, 'en' if _en(user) else 'ru')
 
 
 def _days_label(user: User, days: int) -> str:

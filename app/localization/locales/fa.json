@@ -1992,7 +1992,7 @@
   "DEVICES_LIMIT_EXCEEDED_DETAIL": "⚠️ از حداکثر سقف دستگاه ({limit}) عبور کردید. شما: {current}، در حال افزودن: {adding}",
   "DEVICE_RENAME_CANCEL_BTN": "✖️ لغو",
   "DEVICE_RENAME_SAVED": "✅ نام دستگاه به‌روزرسانی شد: <code>{name}</code>",
-  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>توجه!</b>\nشما {connected_devices_label} متصل دارید.\nاگر سقف به {new_devices_label} کاهش یابد، همه دستگاه‌ها بازنشانی می‌شوند.\nباید دستگاه‌های موردنیاز را دوباره متصل کنید.\n",
+  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>توجه!</b>\nشما {connected_devices_label} متصل دارید.\nاگر سقف به {new} کاهش یابد، همه دستگاه‌ها بازنشانی می‌شوند.\nباید دستگاه‌های موردنیاز را دوباره متصل کنید.\n",
   "DEVICE_RENAME_TOO_LONG": "⚠️ نام بیش از حد طولانی است، به {max_len} نویسه کوتاه شد.",
   "AUTOPAY_NOT_AVAILABLE_FOR_DAILY": "پرداخت خودکار برای طرح‌های روزانه در دسترس نیست. کسر مبلغ روزی یک‌بار به‌طور خودکار انجام می‌شود.",
   "AUTOPAY_NOT_AVAILABLE_TRIAL": "پرداخت خودکار برای اشتراک‌های آزمایشی در دسترس نیست.",

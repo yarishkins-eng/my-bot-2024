@@ -49,7 +49,7 @@ def _device_purchase_options_conflict(tariff: Tariff, **changes: object) -> str 
         return (
             f'Варианты покупки устройств {list(options)} не согласуются с новым значением.\n'
             'Измените варианты вместе с базой в кабинете: Тарифы → Редактировать.\n'
-            f'Причина: {error}'
+            f'Причина: настройки устройств противоречат друг другу — {html.escape(str(error))}'
         )
     return None
 

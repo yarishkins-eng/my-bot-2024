@@ -503,7 +503,7 @@
   Функции: `admin_required`, `error_handler`, `_extract_event`, `state_cleanup`, `typing_action`, `rate_limit`
 - `app/utils/formatters.py` — Python-модуль
   Классы: нет
-  Функции: `format_datetime`, `format_date`, `format_time_ago`, `format_days_declension`, `format_duration`, `format_bytes`, `format_percentage`, `format_number`, `format_price_range`, `truncate_text`, `format_username`, `format_subscription_status`, `format_traffic_usage`, `format_boolean`
+  Функции: `format_datetime`, `format_date`, `format_time_ago`, `format_days_declension`, `format_devices_declension`, `format_duration`, `format_bytes`, `format_percentage`, `format_number`, `format_price_range`, `truncate_text`, `format_username`, `format_subscription_status`, `format_traffic_usage`, `format_boolean`
 - `app/utils/message_patch.py` — Python-модуль
   Классы: нет
   Функции: `is_qr_message`, `_get_language`, `_default_privacy_hint`, `append_privacy_hint`, `prepare_privacy_safe_kwargs`, `is_privacy_restricted_error`, `patch_message_methods`

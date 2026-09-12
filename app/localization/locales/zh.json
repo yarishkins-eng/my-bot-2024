@@ -1858,7 +1858,7 @@
   "DEVICES_LIMIT_EXCEEDED_DETAIL": "⚠️ 超过最大设备上限（{limit}）。您当前有：{current}，正在添加：{adding}",
   "DEVICE_RENAME_CANCEL_BTN": "✖️ 取消",
   "DEVICE_RENAME_SAVED": "✅ 设备名称已更新：<code>{name}</code>",
-  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>注意！</b>\n您已连接 {connected_devices_label}。\n若将上限降至 {new_devices_label}，所有设备都将被重置。\n您需要重新连接所需的设备。\n",
+  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>注意！</b>\n您已连接 {connected_devices_label}。\n若将上限降至 {new}，所有设备都将被重置。\n您需要重新连接所需的设备。\n",
   "DEVICE_RENAME_TOO_LONG": "⚠️ 名称过长，已截断为 {max_len} 个字符。",
   "AUTOPAY_NOT_AVAILABLE_FOR_DAILY": "每日套餐不支持自动扣费。系统每天自动扣费一次。",
   "AUTOPAY_NOT_AVAILABLE_TRIAL": "试用订阅不支持自动扣费。",

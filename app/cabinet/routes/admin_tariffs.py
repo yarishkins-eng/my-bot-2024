@@ -20,6 +20,7 @@ from app.database.crud.tariff import (
     update_tariff,
 )
 from app.database.models import PromoGroup, Subscription, Tariff, Transaction, TransactionType, User
+from app.handlers.admin.tariffs import _device_purchase_options_conflict
 from app.services.device_first_checkout_service import find_tariff_operator_review_order
 from app.services.subscription_service import SubscriptionService
 
@@ -447,6 +448,14 @@ async def update_existing_tariff(
     # Показывать в подарках
     if request.show_in_gift is not None:
         updates['show_in_gift'] = request.show_in_gift
+
+    guarded_device_fields = {'device_limit', 'device_price_kopeks', 'max_device_limit'}
+    if 'device_purchase_options' not in request.model_fields_set and guarded_device_fields & updates.keys():
+        if conflict := _device_purchase_options_conflict(tariff, **updates):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=conflict,
+            )
 
     if updates:
         try:

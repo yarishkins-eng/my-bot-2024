@@ -59,7 +59,7 @@ from app.services.trial_activation_service import (
 )
 from app.services.user_cart_service import user_cart_service
 from app.utils.decorators import error_handler
-from app.utils.formatters import format_devices_declension
+from app.utils.formatters import format_days_declension, format_devices_declension
 
 
 logger = structlog.get_logger(__name__)
@@ -95,7 +95,7 @@ async def _show_trial_checkout_resolution(
             '🧾 <b>Есть незавершённый заказ</b>\n\n'
             f'{html.escape(context.checkout.tariff_name)} · '
             f'{format_devices_declension(context.checkout.device_limit, db_user.language)} · '
-            f'{context.checkout.period_days} дней\n'
+            f'{format_days_declension(context.checkout.period_days, db_user.language)}\n'
             f'К оплате: {settings.format_price(context.checkout.amount_kopeks)}\n\n'
             'Откройте кабинет: там можно вернуться к оплате или начать пробный период.'
         )

@@ -399,12 +399,12 @@ async def confirm_change_devices(
                             (
                                 '\n⚠️ <b>Внимание!</b>\n'
                                 'У вас подключено {connected_devices_label}.\n'
-                                'Новый лимит: {new_devices_label}. Все устройства будут сброшены.\n'
+                                'При уменьшении лимита до {new} все устройства будут сброшены.\n'
                                 'Вам нужно будет заново подключить нужные устройства.\n'
                             ),
                         ).format(
                             connected_devices_label=format_devices_declension(connected_count, db_user.language),
-                            new_devices_label=format_devices_declension(new_devices_count, db_user.language),
+                            new=new_devices_count,
                         )
         except Exception as e:
             logger.error('Ошибка проверки устройств', error=e)

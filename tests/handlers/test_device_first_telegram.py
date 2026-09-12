@@ -256,6 +256,11 @@ def test_device_labels_use_correct_russian_plural_forms(limit: int, label: str) 
     assert _device_label(_user(), limit) == label
 
 
+@pytest.mark.parametrize(('language', 'label'), [('en', '1 device'), ('ua', '1 устройство')])
+def test_device_labels_use_only_the_checkout_supported_languages(language: str, label: str) -> None:
+    assert _device_label(_user(language), 1) == label
+
+
 @pytest.mark.parametrize(
     ('language', 'days', 'label'),
     [

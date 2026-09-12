@@ -2,8 +2,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 
+from app.cabinet.routes import admin_tariffs as cabinet_admin_tariffs
+from app.cabinet.schemas.tariffs import TariffUpdateRequest
 from app.handlers.admin import tariffs as admin_tariffs
+from app.services.device_first_eligibility import DeviceFirstConfigurationError
 
 
 def _tariff(**overrides):
@@ -13,6 +17,7 @@ def _tariff(**overrides):
         'device_price_kopeks': 5_000,
         'max_device_limit': 10,
         'device_purchase_options': [2, 3, 10],
+        'allowed_squads': [],
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -44,6 +49,47 @@ def test_device_purchase_options_guard_accepts_consistent_or_legacy_tariff():
         )
         is None
     )
+
+
+def test_device_purchase_options_guard_escapes_the_technical_reason(monkeypatch):
+    def fail_validation(*_args, **_kwargs):
+        raise DeviceFirstConfigurationError('<b>unsafe reason</b>')
+
+    monkeypatch.setattr(admin_tariffs, 'normalize_device_purchase_options', fail_validation)
+
+    conflict = admin_tariffs._device_purchase_options_conflict(_tariff(), device_limit=1)
+
+    assert 'Причина: настройки устройств противоречат друг другу — ' in conflict
+    assert '&lt;b&gt;unsafe reason&lt;/b&gt;' in conflict
+    assert '<b>unsafe reason</b>' not in conflict
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'changes',
+    [
+        {'device_limit': 1},
+        {'max_device_limit': 8},
+        {'device_price_kopeks': 0},
+    ],
+)
+async def test_cabinet_rejects_inconsistent_device_field_without_replacement_options(monkeypatch, changes):
+    tariff = _tariff()
+    update_tariff = AsyncMock()
+    monkeypatch.setattr(cabinet_admin_tariffs, 'get_tariff_by_id', AsyncMock(return_value=tariff))
+    monkeypatch.setattr(cabinet_admin_tariffs, 'update_tariff', update_tariff)
+
+    with pytest.raises(HTTPException) as error:
+        await cabinet_admin_tariffs.update_existing_tariff(
+            tariff.id,
+            TariffUpdateRequest(**changes),
+            admin=SimpleNamespace(id=1),
+            db=AsyncMock(),
+        )
+
+    assert error.value.status_code == 422
+    assert error.value.detail == admin_tariffs._device_purchase_options_conflict(tariff, **changes)
+    update_tariff.assert_not_awaited()
 
 
 @pytest.mark.asyncio

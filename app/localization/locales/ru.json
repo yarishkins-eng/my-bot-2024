@@ -1992,7 +1992,7 @@
   "DEVICES_LIMIT_EXCEEDED_DETAIL": "⚠️ Превышен максимальный лимит устройств ({limit}). У вас: {current}, добавляете: {adding}",
   "DEVICE_RENAME_CANCEL_BTN": "✖️ Отмена",
   "DEVICE_RENAME_SAVED": "✅ Имя устройства обновлено: <code>{name}</code>",
-  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>Внимание!</b>\nУ вас подключено {connected_devices_label}.\nНовый лимит: {new_devices_label}. Все устройства будут сброшены.\nВам нужно будет заново подключить нужные устройства.\n",
+  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>Внимание!</b>\nУ вас подключено {connected_devices_label}.\nПри уменьшении лимита до {new} все устройства будут сброшены.\nВам нужно будет заново подключить нужные устройства.\n",
   "DEVICE_RENAME_TOO_LONG": "⚠️ Имя слишком длинное, сократили до {max_len} символов.",
   "AUTOPAY_NOT_AVAILABLE_FOR_DAILY": "Автоплатеж недоступен для суточных тарифов. Списание происходит автоматически раз в сутки.",
   "AUTOPAY_NOT_AVAILABLE_TRIAL": "Автоплатеж недоступен для пробных подписок.",

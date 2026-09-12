@@ -1969,7 +1969,7 @@
   "DEVICES_LIMIT_EXCEEDED_DETAIL": "⚠️ The maximum device limit ({limit}) is exceeded. You have: {current}, adding: {adding}",
   "DEVICE_RENAME_CANCEL_BTN": "✖️ Cancel",
   "DEVICE_RENAME_SAVED": "✅ Device name updated: <code>{name}</code>",
-  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>Attention!</b>\nYou have {connected_devices_label} connected.\nIf the limit is reduced to {new_devices_label}, all devices will be reset.\nYou will need to reconnect the devices you need.\n",
+  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>Attention!</b>\nYou have {connected_devices_label} connected.\nIf the limit is reduced to {new}, all devices will be reset.\nYou will need to reconnect the devices you need.\n",
   "DEVICE_RENAME_TOO_LONG": "⚠️ The name is too long, trimmed to {max_len} characters.",
   "AUTOPAY_NOT_AVAILABLE_FOR_DAILY": "Auto-payment is unavailable for daily plans. The charge happens automatically once a day.",
   "AUTOPAY_NOT_AVAILABLE_TRIAL": "Auto-payment is unavailable for trial subscriptions.",

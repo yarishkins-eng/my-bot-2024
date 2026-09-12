@@ -1860,7 +1860,7 @@
   "DEVICES_LIMIT_EXCEEDED_DETAIL": "⚠️ Перевищено максимальний ліміт пристроїв ({limit}). У вас: {current}, додаєте: {adding}",
   "DEVICE_RENAME_CANCEL_BTN": "✖️ Скасувати",
   "DEVICE_RENAME_SAVED": "✅ Ім'я пристрою оновлено: <code>{name}</code>",
-  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>Увага!</b>\nУ вас підключено {connected_devices_label}.\nНовий ліміт: {new_devices_label}. Усі пристрої буде скинуто.\nВам потрібно буде заново підключити потрібні пристрої.\n",
+  "DEVICE_CHANGE_RESET_WARNING": "\n⚠️ <b>Увага!</b>\nУ вас підключено {connected_devices_label}.\nПри зменшенні ліміту до {new} всі пристрої буде скинуто.\nВам потрібно буде заново підключити потрібні пристрої.\n",
   "DEVICE_RENAME_TOO_LONG": "⚠️ Ім'я надто довге, скоротили до {max_len} символів.",
   "AUTOPAY_NOT_AVAILABLE_FOR_DAILY": "Автоплатіж недоступний для добових тарифів. Списання відбувається автоматично раз на добу.",
   "AUTOPAY_NOT_AVAILABLE_TRIAL": "Автоплатіж недоступний для пробних підписок.",
