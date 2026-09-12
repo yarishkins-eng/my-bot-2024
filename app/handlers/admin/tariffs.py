@@ -23,6 +23,7 @@ from app.database.crud.tariff import (
 )
 from app.database.models import Tariff, User
 from app.localization.texts import get_texts
+from app.services.device_first_eligibility import DeviceFirstConfigurationError, normalize_device_purchase_options
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
 from app.utils.formatting import format_period, format_price_kopeks, format_traffic
@@ -31,6 +32,26 @@ from app.utils.formatting import format_period, format_price_kopeks, format_traf
 logger = structlog.get_logger(__name__)
 
 ITEMS_PER_PAGE = 10
+
+
+def _device_purchase_options_conflict(tariff: Tariff, **changes: object) -> str | None:
+    options = tariff.device_purchase_options
+    if options is None:
+        return None
+    try:
+        normalize_device_purchase_options(
+            list(options),
+            base_device_limit=int(changes.get('device_limit', tariff.device_limit) or 1),
+            max_device_limit=changes.get('max_device_limit', tariff.max_device_limit),
+            device_price_kopeks=changes.get('device_price_kopeks', tariff.device_price_kopeks),
+        )
+    except DeviceFirstConfigurationError as error:
+        return (
+            f'Варианты покупки устройств {list(options)} не согласуются с новым значением.\n'
+            'Измените варианты вместе с базой в кабинете: Тарифы → Редактировать.\n'
+            f'Причина: настройки устройств противоречат друг другу — {html.escape(str(error))}'
+        )
+    return None
 
 
 def _parse_period_prices(text: str) -> dict[str, int]:
@@ -1275,6 +1296,10 @@ async def process_edit_tariff_devices(
         await message.answer('Введите корректное число (1 или больше)')
         return
 
+    if conflict := _device_purchase_options_conflict(tariff, device_limit=devices):
+        await message.answer(conflict)
+        return
+
     tariff = await update_tariff(db, tariff, device_limit=devices)
     await state.clear()
 
@@ -1510,6 +1535,10 @@ async def process_edit_tariff_device_price(
             )
             return
 
+    if conflict := _device_purchase_options_conflict(tariff, device_price_kopeks=device_price):
+        await message.answer(conflict)
+        return
+
     tariff = await update_tariff(db, tariff, device_price_kopeks=device_price)
     await state.clear()
 
@@ -1600,6 +1629,10 @@ async def process_edit_tariff_max_devices(
                 parse_mode='HTML',
             )
             return
+
+    if conflict := _device_purchase_options_conflict(tariff, max_device_limit=max_devices):
+        await message.answer(conflict)
+        return
 
     tariff = await update_tariff(db, tariff, max_device_limit=max_devices)
     await state.clear()

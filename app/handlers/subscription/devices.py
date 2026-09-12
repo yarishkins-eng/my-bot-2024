@@ -33,6 +33,7 @@ from app.services.pricing_engine import PricingEngine
 from app.services.remnawave_service import RemnaWaveService
 from app.services.subscription_service import SubscriptionService
 from app.states import SubscriptionStates
+from app.utils.formatters import format_devices_declension
 from app.utils.pagination import paginate_list
 from app.utils.subscription_utils import (
     get_display_subscription_link,
@@ -221,26 +222,29 @@ async def handle_change_devices(
             'CHANGE_DEVICES_PROMPT_TARIFF',
             (
                 '📱 <b>Изменение количества устройств</b>\n\n'
-                'Текущий лимит: {current_devices} устройств\n'
+                'Текущий лимит: {current_devices_label}\n'
                 'Цена за доп. устройство: {price}/мес\n'
                 'Выберите новое количество устройств:\n\n'
                 '💡 <b>Важно:</b>\n'
                 '• При увеличении - доплата пропорционально оставшемуся времени\n'
                 '• При уменьшении - возврат средств не производится'
             ),
-        ).format(current_devices=current_devices, price=price_text)
+        ).format(
+            current_devices_label=format_devices_declension(current_devices, db_user.language),
+            price=price_text,
+        )
     else:
         prompt_text = texts.t(
             'CHANGE_DEVICES_PROMPT',
             (
                 '📱 <b>Изменение количества устройств</b>\n\n'
-                'Текущий лимит: {current_devices} устройств\n'
+                'Текущий лимит: {current_devices_label}\n'
                 'Выберите новое количество устройств:\n\n'
                 '💡 <b>Важно:</b>\n'
                 '• При увеличении - доплата пропорционально оставшемуся времени\n'
                 '• При уменьшении - возврат средств не производится'
             ),
-        ).format(current_devices=current_devices)
+        ).format(current_devices_label=format_devices_declension(current_devices, db_user.language))
 
     # В мульти-тарифе кнопка "назад" ведёт к детальному виду подписки
     back_cb = f'sm:{sub_id}' if settings.is_multi_tariff_enabled() and sub_id else 'subscription_settings'
@@ -394,11 +398,14 @@ async def confirm_change_devices(
                             'DEVICE_CHANGE_RESET_WARNING',
                             (
                                 '\n⚠️ <b>Внимание!</b>\n'
-                                'У вас подключено {connected} устройств.\n'
+                                'У вас подключено {connected_devices_label}.\n'
                                 'При уменьшении лимита до {new} все устройства будут сброшены.\n'
                                 'Вам нужно будет заново подключить нужные устройства.\n'
                             ),
-                        ).format(connected=connected_count, new=new_devices_count)
+                        ).format(
+                            connected_devices_label=format_devices_declension(connected_count, db_user.language),
+                            new=new_devices_count,
+                        )
         except Exception as e:
             logger.error('Ошибка проверки устройств', error=e)
 
@@ -406,15 +413,15 @@ async def confirm_change_devices(
         'DEVICE_CHANGE_CONFIRMATION',
         (
             '📱 <b>Подтверждение изменения</b>\n\n'
-            'Текущее количество: {current} устройств\n'
-            'Новое количество: {new} устройств\n\n'
+            'Текущее количество: {current_devices_label}\n'
+            'Новое количество: {new_devices_label}\n\n'
             'Действие: {action}\n'
             '💰 {cost}\n\n'
             'Подтвердить изменение?'
         ),
     ).format(
-        current=current_devices,
-        new=new_devices_count,
+        current_devices_label=format_devices_declension(current_devices, db_user.language),
+        new_devices_label=format_devices_declension(new_devices_count, db_user.language),
         action=action_text,
         cost=cost_text,
     )
@@ -726,10 +733,14 @@ async def show_devices_page(
         'DEVICE_MANAGEMENT_OVERVIEW',
         (
             '🔄 <b>Управление устройствами</b>\n\n'
-            '📊 Всего подключено: {total} устройств\n'
+            '📊 Всего подключено: {total_devices_label}\n'
             '📄 Страница {page} из {pages}\n\n'
         ),
-    ).format(total=len(devices_list), page=pagination.page, pages=pagination.total_pages)
+    ).format(
+        total_devices_label=format_devices_declension(len(devices_list), db_user.language),
+        page=pagination.page,
+        pages=pagination.total_pages,
+    )
 
     if pagination.items:
         devices_text += texts.t(
@@ -1219,11 +1230,13 @@ async def handle_all_devices_reset_from_management(
                             'DEVICE_RESET_ALL_SUCCESS_MESSAGE',
                             (
                                 '✅ <b>Все устройства успешно сброшены!</b>\n\n'
-                                '🔄 Сброшено: {count} устройств\n'
+                                '🔄 Сброшено: {count_devices_label}\n'
                                 '📱 Теперь вы можете заново подключить свои устройства\n\n'
                                 "💡 Используйте ссылку из раздела 'Моя подписка' для повторного подключения"
                             ),
-                        ).format(count=success_count),
+                        ).format(
+                            count_devices_label=format_devices_declension(success_count, db_user.language),
+                        ),
                         reply_markup=get_back_keyboard(db_user.language),
                         parse_mode='HTML',
                     )
@@ -1238,11 +1251,14 @@ async def handle_all_devices_reset_from_management(
                             'DEVICE_RESET_PARTIAL_MESSAGE',
                             (
                                 '⚠️ <b>Частичный сброс устройств</b>\n\n'
-                                '✅ Удалено: {success} устройств\n'
-                                '❌ Не удалось удалить: {failed} устройств\n\n'
+                                '✅ Удалено: {success_devices_label}\n'
+                                '❌ Не удалось удалить: {failed_devices_label}\n\n'
                                 'Попробуйте еще раз или обратитесь в поддержку.'
                             ),
-                        ).format(success=success_count, failed=failed_count),
+                        ).format(
+                            success_devices_label=format_devices_declension(success_count, db_user.language),
+                            failed_devices_label=format_devices_declension(failed_count, db_user.language),
+                        ),
                         reply_markup=get_back_keyboard(db_user.language),
                         parse_mode='HTML',
                     )

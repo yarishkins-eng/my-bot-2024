@@ -299,20 +299,31 @@ async def test_trial_fallback_without_cabinet_url_never_builds_invalid_webapp_bu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('language', 'device_label', 'broken_label'),
+    [
+        ('ru', '1 устройство', '1 устройств ·'),
+        ('en', '1 device', '1 devices ·'),
+    ],
+)
 async def test_pending_trial_checkout_resolution_opens_dedicated_trial_decision(
     trial_callback_query,
     trial_user,
     trial_db,
+    language,
+    device_label,
+    broken_label,
 ):
     """A free-trial intent must never be redirected to the generic dashboard."""
 
+    trial_user.language = language
     context = TrialCheckoutContext(
         'pending_invoice',
         TrialCheckoutSummary(
             public_id='checkout-9',
             tariff_name='Базовый',
             period_days=30,
-            device_limit=2,
+            device_limit=1,
             amount_kopeks=24_900,
         ),
     )
@@ -333,6 +344,8 @@ async def test_pending_trial_checkout_resolution_opens_dedicated_trial_decision(
         shown = await _show_trial_checkout_resolution(trial_callback_query, trial_user, trial_db)
 
     assert shown is True
+    assert device_label in trial_callback_query.message.edit_text.call_args.args[0]
+    assert broken_label not in trial_callback_query.message.edit_text.call_args.args[0]
     build_cabinet_url.assert_called_once_with('/trial')
     keyboard = trial_callback_query.message.edit_text.call_args.kwargs['reply_markup']
     assert keyboard.inline_keyboard[0][0].web_app.url == 'https://cabinet.example/trial?startapp=signed'

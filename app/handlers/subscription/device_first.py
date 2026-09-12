@@ -45,6 +45,7 @@ from app.services.device_first_payment_service import (
     get_pending_platega_attempt,
     platega_method_label,
 )
+from app.utils.formatters import format_devices_declension
 from app.utils.photo_message import edit_or_answer_photo
 from app.utils.timezone import format_local_datetime
 
@@ -101,19 +102,7 @@ def _invoice_expiry_label(user: User, expires_at: datetime | None) -> str:
 
 
 def _device_label(user: User, limit: int) -> str:
-    if _en(user):
-        return f'{limit} device' if limit == 1 else f'{limit} devices'
-    remainder_100 = limit % 100
-    remainder_10 = limit % 10
-    if 11 <= remainder_100 <= 14:
-        word = 'устройств'
-    elif remainder_10 == 1:
-        word = 'устройство'
-    elif 2 <= remainder_10 <= 4:
-        word = 'устройства'
-    else:
-        word = 'устройств'
-    return f'{limit} {word}'
+    return format_devices_declension(limit, 'en' if _en(user) else 'ru')
 
 
 def _days_label(user: User, days: int) -> str:
