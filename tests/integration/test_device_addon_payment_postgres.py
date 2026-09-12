@@ -1139,6 +1139,26 @@ async def test_unknown_create_requires_logged_review_then_audited_close_without_
         assert record.device_addon_can_close is True
         assert record.device_addon_reason_text
 
+        with monkeypatch.context() as audit_patch:
+            audit_patch.setattr(
+                admin_payments.PermissionService,
+                'log_action',
+                AsyncMock(side_effect=RuntimeError('audit unavailable')),
+            )
+            with pytest.raises(RuntimeError, match='audit unavailable'):
+                await admin_payments.close_device_addon_attempt(
+                    PaymentMethod.PLATEGA.value,
+                    int(attempt.platega_payment_id),
+                    admin=user,
+                    db=db,
+                )
+        await db.rollback()
+        await db.refresh(attempt)
+        local_payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
+        assert attempt.status == 'operator_review'
+        assert attempt.holds_invoice_slot is True
+        assert local_payment.status == 'OPERATOR_REVIEW'
+
         response = await admin_payments.close_device_addon_attempt(
             PaymentMethod.PLATEGA.value,
             int(attempt.platega_payment_id),
@@ -1557,6 +1577,48 @@ async def test_admin_manual_check_credits_confirmed_addon_exactly_once(sessions,
             == 2
         )
         assert bot.session.close.await_count == 2
+
+
+async def test_admin_manual_check_does_not_credit_when_audit_insert_fails(sessions, monkeypatch):
+    monkeypatch.setattr(settings, 'REFERRAL_PROGRAM_ENABLED', False)
+    bot = MagicMock()
+    bot.session.close = AsyncMock()
+    monkeypatch.setattr(admin_payments, 'create_bot', lambda: bot)
+    monkeypatch.setattr(
+        admin_payments.PermissionService,
+        'log_action',
+        AsyncMock(side_effect=RuntimeError('audit unavailable')),
+    )
+
+    async with sessions() as db:
+        user, _, payment, attempt, current_attempt = await _late_payment_graph(db)
+        current_attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        current_attempt.status = 'terminal'
+        current_attempt.holds_invoice_slot = False
+        attempt.status = 'operator_review'
+        attempt.holds_invoice_slot = True
+        payment.status = 'OPERATOR_REVIEW'
+        await db.commit()
+
+        with pytest.raises(RuntimeError, match='audit unavailable'):
+            await admin_payments.check_payment_status(
+                PaymentMethod.PLATEGA.value,
+                int(payment.id),
+                admin=user,
+                db=db,
+            )
+        await db.rollback()
+        await db.refresh(user)
+        await db.refresh(attempt)
+        await db.refresh(payment)
+
+        assert user.balance_kopeks == 0
+        assert attempt.status == 'operator_review'
+        assert attempt.holds_invoice_slot is True
+        assert attempt.deposit_transaction_id is None
+        assert payment.status == 'OPERATOR_REVIEW'
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+        assert bot.session.close.await_count == 0
 
 
 async def test_admin_manual_check_keeps_amount_mismatch_for_operator(sessions, monkeypatch):

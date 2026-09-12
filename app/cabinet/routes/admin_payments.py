@@ -572,6 +572,23 @@ async def check_payment_status(
     old_status = record.status
     old_is_paid = record.is_paid
 
+    # Stage the money-sensitive audit row before the add-on service reaches
+    # its own commit.  That commit then persists the audit and any status or
+    # balance change atomically; an audit insert failure prevents the action.
+    if record.is_device_addon:
+        await PermissionService.log_action(
+            db,
+            user_id=admin.id,
+            action='device_addon.payment_checked',
+            resource_type='platega_payment',
+            resource_id=str(payment_id),
+            details={
+                'old_status': old_status,
+                'old_is_paid': old_is_paid,
+                'requested': True,
+            },
+        )
+
     # Run manual check
     bot = create_bot()
     try:
@@ -589,23 +606,6 @@ async def check_payment_status(
         )
 
     status_changed = updated.status != old_status or updated.is_paid != old_is_paid
-
-    if record.is_device_addon:
-        await PermissionService.log_action(
-            db,
-            user_id=admin.id,
-            action='device_addon.payment_checked',
-            resource_type='platega_payment',
-            resource_id=str(payment_id),
-            details={
-                'old_status': old_status,
-                'new_status': updated.status,
-                'old_is_paid': old_is_paid,
-                'new_is_paid': updated.is_paid,
-                'status_changed': status_changed,
-            },
-        )
-        await db.commit()
 
     if status_changed:
         _, new_status_text = _get_status_info(updated)
@@ -641,14 +641,8 @@ async def close_device_addon_attempt(
     """Release one operator-reviewed add-on invoice which has no provider ID."""
     if method != PaymentMethod.PLATEGA.value:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid payment method')
-    try:
-        await close_device_addon_attempt_without_credit(db, platega_payment_id=payment_id)
-    except DeviceAddonError as error:
-        await db.rollback()
-        raise HTTPException(
-            status_code=error.status_code,
-            detail={'code': error.code, 'message': str(error)},
-        ) from error
+    # The service commits the status transition.  Stage its audit first so
+    # both rows are committed together and audit failure leaves the hold intact.
     await PermissionService.log_action(
         db,
         user_id=admin.id,
@@ -657,7 +651,14 @@ async def close_device_addon_attempt(
         resource_id=str(payment_id),
         details={'resolution': 'closed_by_operator', 'credited': False},
     )
-    await db.commit()
+    try:
+        await close_device_addon_attempt_without_credit(db, platega_payment_id=payment_id)
+    except DeviceAddonError as error:
+        await db.rollback()
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={'code': error.code, 'message': str(error)},
+        ) from error
     record = await get_payment_record(db, PaymentMethod.PLATEGA, payment_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Payment not found')
