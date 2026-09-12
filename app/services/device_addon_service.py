@@ -546,6 +546,10 @@ async def serialize_intent(
 def serialize_topup_attempt(
     attempt: DeviceAddonTopupAttempt, *, can_create_new_attempt: bool = False
 ) -> dict[str, Any]:
+    terminal_category: str | None = None
+    if attempt.status == 'terminal':
+        reason = attempt.reconciliation_reason or ''
+        terminal_category = 'rejected' if reason.startswith('provider_create_rejected:') else 'not_paid'
     return {
         'id': attempt.public_id,
         'intent_id': None,  # Routes insert the public intent ID; internal FK stays private.
@@ -553,6 +557,7 @@ def serialize_topup_attempt(
         'payment_method': attempt.payment_method,
         'payment_option': attempt.method_key,
         'status': attempt.status,
+        'terminal_category': terminal_category,
         'credited_amount_kopeks': attempt.credited_amount_kopeks,
         # An external URL is actionable only for the one durable invoice that
         # still owns this intent's slot.  ``payment_url`` itself stays at the
