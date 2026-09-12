@@ -458,13 +458,9 @@ def _apply_extension_updates(context: AutoExtendContext) -> None:
         # subscription.is_trial = False  # УДАЛЕНО: преждевременное удаление триала
         if context.traffic_limit_gb is not None:
             subscription.traffic_limit_gb = context.traffic_limit_gb
-        # При конвертации триала device_limit должен быть не ниже DEFAULT_DEVICE_LIMIT
+        # При конвертации триала сохраняем ровно оплаченный выбор, без глобального пола.
         if context.device_limit is not None:
-            subscription.device_limit = max(
-                subscription.device_limit or 0, context.device_limit, settings.DEFAULT_DEVICE_LIMIT
-            )
-        else:
-            subscription.device_limit = max(subscription.device_limit or 0, settings.DEFAULT_DEVICE_LIMIT)
+            subscription.device_limit = max(subscription.device_limit or 0, context.device_limit)
         if context.squad_uuid and context.squad_uuid not in (subscription.connected_squads or []):
             subscription.connected_squads = (subscription.connected_squads or []) + [context.squad_uuid]
     else:
