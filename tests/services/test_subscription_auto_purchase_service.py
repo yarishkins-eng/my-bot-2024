@@ -385,7 +385,10 @@ async def test_auto_purchase_saved_cart_after_topup_extension(monkeypatch):
         consume_promo_offer=True,
         mark_as_paid_subscription=True,
     )
-    assert subscription.device_limit == 2
+    # 🔴 Этап ДУ-3 (14.09.2026). Прежнее ожидание здесь было `== 2`: оно ЗАКРЕПЛЯЛО дефект 3
+    # внешнего ревью — цена посчитана по подписке с лимитом 1, а корзина возвращала 2
+    # устройства. Выдаётся ровно оплаченное число.
+    assert subscription.device_limit == 1
     assert subscription.traffic_limit_gb == 500
     # Legacy raw cart data must not widen an existing entitlement.
     assert subscription.connected_squads == ['squad-a']

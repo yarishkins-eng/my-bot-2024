@@ -407,9 +407,25 @@ async def _prepare_auto_extend_context(
     else:
         description = cart_data.get('description') or f'Продление подписки на {format_days_declension(period_days)}'
 
+    # 🔴 Этап ДУ-3. Цена продления только что посчитана по ТЕКУЩЕМУ лимиту подписки
+    # (`calculate_renewal_price` выше), а лимит из корзины — снимок на момент нехватки
+    # денег. Если человек после этого уменьшил устройства (2 → 1), корзина возвращала 2 за
+    # цену одного: дефект 3 внешнего ревью 13.09.2026. Выдаём ровно то, за что взяли деньги,
+    # одинаково для платной и пробной (у пробной старый лимит тоже не пол: ОУ-1.3 снял только
+    # глобальный DEFAULT_DEVICE_LIMIT). `0` по контракту проекта — «безлимит», его не трогаем.
     device_limit = cart_data.get('device_limit')
     if device_limit is not None:
-        device_limit = _safe_int(device_limit, subscription.device_limit)
+        priced_device_limit = int(subscription.device_limit or 0)
+        cart_device_limit = _safe_int(device_limit, priced_device_limit)
+        if cart_device_limit != priced_device_limit:
+            logger.warning(
+                'cart_device_limit_differs_from_priced',
+                format_user_id=_format_user_id(user),
+                subscription_id=subscription.id,
+                cart_device_limit=cart_device_limit,
+                priced_device_limit=priced_device_limit,
+            )
+        device_limit = priced_device_limit if priced_device_limit > 0 else None
 
     traffic_limit_gb = cart_data.get('traffic_limit_gb')
     if traffic_limit_gb is not None:
