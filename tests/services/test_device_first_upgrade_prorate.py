@@ -118,8 +118,10 @@ def test_prorate_basis_is_zero_for_trial_expired_or_missing_subscription():
 
 def test_prorate_basis_takes_the_larger_of_current_and_base_like_the_addon_does():
     """Паритет с докупкой: у неё бесплатны устройства до базы тарифа (free = included − current)."""
+    # Подписка строится ДО снятия `now`: иначе остаток чуть больше 365 суток и ceil даст 366.
+    paid = _paid(device_limit=2, days_left=365)
     now = datetime.now(UTC)
-    assert service._upgrade_prorate_basis(_paid(device_limit=2, days_left=365), _tariff(), now=now) == (2, 365)
+    assert service._upgrade_prorate_basis(paid, _tariff(), now=now) == (2, 365)
     assert (
         service._upgrade_prorate_basis(_paid(device_limit=1, days_left=365), _tariff(device_limit=2), now=now)[0] == 2
     )
@@ -128,6 +130,20 @@ def test_prorate_basis_takes_the_larger_of_current_and_base_like_the_addon_does(
         id=1, is_trial=False, device_limit=2, end_date=(datetime.now(UTC) + timedelta(hours=3)).replace(tzinfo=None)
     )
     assert service._upgrade_prorate_basis(naive, _tariff(), now=now) == (2, 1)
+
+
+def test_prorate_basis_edges_match_the_addon_on_the_second_boundary():
+    """Граничные секунды (мутации M16/M21): конец ровно сейчас — доплаты нет; доли секунды — сутки."""
+    now = datetime.now(UTC)
+    ends_now = SimpleNamespace(id=1, is_trial=False, device_limit=2, end_date=now)
+    assert service._upgrade_prorate_basis(ends_now, _tariff(), now=now) == (None, 0)
+    half_second = SimpleNamespace(id=1, is_trial=False, device_limit=2, end_date=now + timedelta(milliseconds=500))
+    assert service._upgrade_prorate_basis(half_second, _tariff(), now=now) == (2, 1)
+    # Ровно сутки и полсекунды: как у докупки (ceil по дробным секундам) — двое суток.
+    day_and_a_bit = SimpleNamespace(
+        id=1, is_trial=False, device_limit=2, end_date=now + timedelta(days=1, milliseconds=500)
+    )
+    assert service._upgrade_prorate_basis(day_and_a_bit, _tariff(), now=now) == (2, 2)
 
 
 @pytest.mark.asyncio
@@ -242,6 +258,7 @@ def test_frozen_days_reader_survives_stubs_and_garbage():
     assert service._frozen_upgrade_remaining_days(SimpleNamespace(price_breakdown=None)) == 0
     assert service._frozen_upgrade_remaining_days(SimpleNamespace(price_breakdown={'upgrade_remaining_days': 'x'})) == 0
     assert service._frozen_upgrade_remaining_days(SimpleNamespace(price_breakdown={'upgrade_remaining_days': 12})) == 12
+    assert service._frozen_upgrade_remaining_days(SimpleNamespace(price_breakdown='not-a-dict')) == 0
 
 
 # --- (г) две двери называют одну сумму ----------------------------------------------------

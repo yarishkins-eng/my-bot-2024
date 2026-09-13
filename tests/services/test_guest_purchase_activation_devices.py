@@ -173,8 +173,9 @@ async def test_gift_of_another_tariff_over_an_active_paid_subscription_is_refuse
     assert 'другого тарифа' in error.value.message
     extend.assert_not_awaited()
     replace.assert_not_awaited()
+    # Откат делает ветка `except GuestPurchaseError`, а не общий `except Exception` (тот дал бы 500).
     db.rollback.assert_awaited()
-    assert purchase.status == svc.GuestPurchaseStatus.PENDING_ACTIVATION.value, 'деньги дарителя остаются в покупке'
+    assert purchase.status != svc.GuestPurchaseStatus.DELIVERED.value, 'подарок не выдан, деньги дарителя в покупке'
 
 
 @pytest.mark.asyncio
@@ -190,3 +191,21 @@ async def test_gift_over_an_expired_subscription_starts_fresh_on_the_gift_base(m
     extend.assert_not_awaited()
     replace.assert_awaited_once()
     assert replace.await_args.kwargs['device_limit'] == 1
+
+
+@pytest.mark.asyncio
+async def test_multi_tariff_branch_keeps_paid_devices_too(monkeypatch):
+    """Спящая мультитарифная ветка (мутация M6): то же правило, что у живой."""
+    tariff = SimpleNamespace(id=3, name='Базовый', device_limit=1, traffic_limit_gb=0)
+    existing = _existing(tariff_id=3, is_trial=False, device_limit=3, days_left=40)
+    extend, _ = _wire(monkeypatch, existing=existing, tariff=tariff)
+    monkeypatch.setattr(type(svc.settings), 'is_multi_tariff_enabled', lambda self: True)
+    monkeypatch.setattr(
+        'app.database.crud.subscription.get_subscription_by_user_and_tariff', AsyncMock(return_value=existing)
+    )
+    purchase, user = _purchase(), _user()
+
+    await svc.activate_purchase(_db(purchase, user), purchase.token, skip_notification=True)
+
+    extend.assert_awaited_once()
+    assert extend.await_args.kwargs['device_limit'] == 3

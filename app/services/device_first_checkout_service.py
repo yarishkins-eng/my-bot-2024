@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import html
 import json
+import math
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
@@ -560,7 +561,9 @@ def _upgrade_prorate_basis(
     if remaining_seconds <= 0:
         return None, 0
     upgrade_from = max(int(subscription.device_limit or 0), int(tariff.device_limit or 0))
-    remaining_days = max(1, -(-int(remaining_seconds) // 86400))
+    # Буквально как у докупки: ceil по дробным секундам, а не по целым (иначе на
+    # суточной границе две двери расходились бы на день — 1,67 ₽/устр.).
+    remaining_days = max(1, math.ceil(remaining_seconds / 86400))
     return upgrade_from, remaining_days
 
 
@@ -576,8 +579,15 @@ def _frozen_upgrade_remaining_days(checkout: SubscriptionCheckout) -> int:
     breakdown = getattr(checkout, 'price_breakdown', None) or {}
     try:
         return max(0, int(breakdown.get('upgrade_remaining_days', 0) or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
         return 0
+
+
+def _live_upgrade_from(subscription: Subscription | None, tariff: Tariff, frozen_days: int) -> int | None:
+    """«От какого лимита» для перепроверки — ЖИВОЙ лимит подписки и база тарифа (ДУ-2)."""
+    if not frozen_days or subscription is None or subscription.is_trial:
+        return None
+    return max(int(subscription.device_limit or 0), int(tariff.device_limit or 0))
 
 
 def _subscription_snapshot(subscription: Subscription | None) -> dict[str, Any]:
@@ -1791,11 +1801,7 @@ async def _validate_direct_pre_commit(
     # ДУ-2: дни остатка — замороженные в котировке, «от какого лимита» — живой (см.
     # `_frozen_upgrade_remaining_days`). Обе перепроверки ниже обязаны считать одинаково.
     frozen_upgrade_days = _frozen_upgrade_remaining_days(checkout)
-    live_upgrade_from = (
-        max(int(target.device_limit or 0), int(tariff.device_limit or 0))
-        if frozen_upgrade_days and target is not None and not target.is_trial
-        else None
-    )
+    live_upgrade_from = _live_upgrade_from(target, tariff, frozen_upgrade_days)
     current_price = await pricing_engine.calculate_tariff_purchase_price(
         tariff,
         checkout.period_days,
@@ -1838,6 +1844,9 @@ async def _validate_direct_pre_commit(
         if locked_tariff is None:
             raise EntitlementResolutionError('tariff disappeared during final quote validation')
         tariff = locked_tariff
+        # База тарифа перечитана под замком — основание доплаты считаем от неё же, а не
+        # от строки, загруженной до FOR UPDATE.
+        live_upgrade_from = _live_upgrade_from(target, tariff, frozen_upgrade_days)
         locked_price = await pricing_engine.calculate_tariff_purchase_price(
             tariff,
             checkout.period_days,

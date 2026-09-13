@@ -1343,6 +1343,8 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                 existing_subscription is not None
                 and _sub_has_time
                 and not existing_subscription.is_trial
+                # Классическую подписку без тарифа (tariff_id IS NULL) забор пропускает:
+                # для неё подарок — переход на тариф с переносом остатка, как и до этапа.
                 and existing_subscription.tariff_id is not None
                 and existing_subscription.tariff_id != tariff.id
             ):
@@ -1352,9 +1354,17 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                 # сгорает (`TARIFF_SWITCH_RESET_FREE_DAYS`). Друг на Team «до 2031» после
                 # подарка «Базового» остался бы с 30 днями. Пробную подписку не запираем:
                 # её конверсия подарком — штатный путь.
+                # Отказ виден владельцу только здесь: деньги дарителя остаются в покупке
+                # (PAID), автовозврата в проекте нет — разбирать руками по этой строке.
+                logger.warning(
+                    'gift_refused_other_tariff',
+                    purchase_id=purchase.id,
+                    user_id=user.id,
+                    existing_tariff_id=existing_subscription.tariff_id,
+                    gift_tariff_id=tariff.id,
+                )
                 raise GuestPurchaseError(
-                    'Подарок нельзя применить к действующей подписке другого тарифа. '
-                    'Дождитесь её окончания или напишите в поддержку.',
+                    'Подарок нельзя применить к действующей подписке другого тарифа. Напишите в поддержку.',
                     status_code=409,
                 )
             if existing_subscription is not None and _sub_has_time:

@@ -387,7 +387,9 @@ async def test_auto_purchase_saved_cart_after_topup_extension(monkeypatch):
     )
     # 🔴 Этап ДУ-3 (14.09.2026). Прежнее ожидание здесь было `== 2`: оно ЗАКРЕПЛЯЛО дефект 3
     # внешнего ревью — цена посчитана по подписке с лимитом 1, а корзина возвращала 2
-    # устройства. Выдаётся ровно оплаченное число.
+    # устройства. Выдаётся ровно оплаченное число. Цена в этом тесте — мока (31 000);
+    # что она считается по лимиту подписки, а не корзины, закреплено в
+    # test_auto_extend_trial_device_limit.py::test_extend_cart_device_limit_follows_the_priced_subscription.
     assert subscription.device_limit == 1
     assert subscription.traffic_limit_gb == 500
     # Legacy raw cart data must not widen an existing entitlement.
