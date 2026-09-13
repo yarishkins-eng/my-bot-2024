@@ -1356,7 +1356,9 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                 # её конверсия подарком — штатный путь.
                 # Отказ виден владельцу только здесь: деньги дарителя остаются в покупке
                 # (PAID), автовозврата в проекте нет — разбирать руками по этой строке.
-                logger.warning(
+                # Уровень error, а не warning: в Telegram-тему «ошибки» уходят только
+                # error-события (`app/logging_handler.py`, TelegramNotifierProcessor).
+                logger.error(
                     'gift_refused_other_tariff',
                     purchase_id=purchase.id,
                     user_id=user.id,

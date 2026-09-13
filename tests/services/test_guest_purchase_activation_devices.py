@@ -209,3 +209,53 @@ async def test_multi_tariff_branch_keeps_paid_devices_too(monkeypatch):
 
     extend.assert_awaited_once()
     assert extend.await_args.kwargs['device_limit'] == 3
+
+
+# --- диплинк /start GIFT_… показывает причину отказа (волна 2 на дифф, DF6) ------------------
+
+
+async def _run_deep_link(monkeypatch, *, error):
+    """Гоняем настоящий `_activate_pending_gift_after_registration` с подставной покупкой."""
+    from app.handlers import start as start_handler
+
+    purchase = SimpleNamespace(
+        token='T' * 64,
+        is_gift=True,
+        buyer_user_id=1,
+        status=svc.GuestPurchaseStatus.PAID.value,
+        user_id=None,
+        tariff=SimpleNamespace(name='Базовый'),
+        period_days=30,
+    )
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: purchase)))
+    db.flush = AsyncMock()
+    state = SimpleNamespace(get_data=AsyncMock(return_value={'pending_gift_token': 'T' * 64}))
+    monkeypatch.setattr(svc, 'activate_purchase', AsyncMock(side_effect=error))
+    answers: list[str] = []
+
+    async def answer_func(text, **_kwargs):
+        answers.append(text)
+
+    await start_handler._activate_pending_gift_after_registration(db, state, SimpleNamespace(id=206), answer_func)
+    return answers
+
+
+@pytest.mark.asyncio
+async def test_deep_link_shows_the_refusal_reason_instead_of_a_generic_error(monkeypatch):
+    answers = await _run_deep_link(
+        monkeypatch,
+        error=svc.GuestPurchaseError('Подарок нельзя применить к действующей подписке другого тарифа.', 409),
+    )
+    assert answers == [
+        'Не удалось активировать подарок: Подарок нельзя применить к действующей подписке другого тарифа.'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deep_link_keeps_the_generic_text_for_server_failures(monkeypatch):
+    answers = await _run_deep_link(
+        monkeypatch, error=svc.GuestPurchaseError('Activation failed, please try again', 500)
+    )
+    assert len(answers) == 1
+    assert 'Произошла ошибка при активации подарка' in answers[0]

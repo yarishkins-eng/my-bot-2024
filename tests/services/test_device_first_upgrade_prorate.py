@@ -291,3 +291,12 @@ async def test_upgrade_at_renewal_costs_the_same_as_addon_then_renewal(current, 
     two_doors = addon_kopeks + renew_after_addon.final_total
     assert abs(renew_with_upgrade.final_total - two_doors) <= 50, 'двери расходятся больше, чем округление до рубля'
     assert days == max(1, math.ceil(days_left))
+
+
+def test_live_upgrade_from_takes_the_tariff_base_when_it_is_above_the_subscription_limit():
+    """Мутация M22: база тарифа поднята выше лимита подписки — считаем от базы, как докупка."""
+    subscription = SimpleNamespace(is_trial=False, device_limit=2)
+    assert service._live_upgrade_from(subscription, _tariff(device_limit=3), 365) == 3
+    assert service._live_upgrade_from(subscription, _tariff(device_limit=1), 365) == 2
+    assert service._live_upgrade_from(subscription, _tariff(device_limit=3), 0) is None
+    assert service._live_upgrade_from(SimpleNamespace(is_trial=True, device_limit=2), _tariff(), 365) is None
