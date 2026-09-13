@@ -128,7 +128,7 @@ def _sent(service: AdminNotificationService) -> tuple[str, NotificationCategory]
 
 def _assert_card_shape(text: str) -> list[str]:
     lines = text.split('\n')
-    assert 4 <= len(lines) <= 6, text
+    assert 4 <= len(lines) <= 7, text  # 3 строки + до 3 хвостов + дата
     assert lines[0].startswith('<b>') and lines[0].endswith('</b>'), lines[0]
     assert lines[1].strip(), text  # строка «кто» не бывает пустой
     assert re.fullmatch(r'<i>\d{2}\.\d{2} \d{2}:\d{2}</i>', lines[-1]), lines[-1]
@@ -157,7 +157,7 @@ async def test_addon_card_explains_prorated_price() -> None:
     assert category is NotificationCategory.ADDONS
     assert lines[0] == '<b>📱 Докупка устройств — 7 ₽</b>'
     assert lines[1] == 'nikitaa @lilgaandelf · Базовый'
-    assert lines[2] == '+1 устройство, стало 3 · 7 ₽ = 70 ₽/мес × 3 дня до конца подписки (16.09)'
+    assert lines[2] == '+1 устройство, стало 3 · 7 ₽ — это 70 ₽/мес за 3 дня до конца подписки (16.09)'
     assert '2 → 3' not in text
 
 
@@ -187,7 +187,7 @@ async def test_addon_card_survives_naive_end_date_and_explains_long_terms() -> N
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>📱 Докупка устройств — 140 ₽</b>'
-    assert lines[2] == '+2 устройства, стало 3 · 140 ₽ = 2 × 70 ₽/мес × 30 дней до конца подписки (13.10)'
+    assert lines[2] == '+2 устройства, стало 3 · 140 ₽ — это 2 × 70 ₽/мес за 30 дней до конца подписки (13.10)'
 
 
 @pytest.mark.asyncio
@@ -501,7 +501,9 @@ async def test_client_without_username_gets_id_so_he_can_be_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_discount_from_description_explains_odd_sum_and_renewal_gets_plus() -> None:
+async def test_renewal_via_purchase_path_gets_plus_and_stays_quiet_about_odd_sum() -> None:
+    # 134 ₽ при тарифе 149 ₽ — скидка, которой карточка не знает (К-2 передаст её явно):
+    # разложение цены молчит, а не выдумывает; у продления на этом пути тот же «+», что у extension
     service = _service()
     transaction = _transaction(amount_kopeks=-13400, description='Продление подписки: 1 месяц (скидка 10%)')
     with _patched_tariff(_tariff(device_limit=3)):
@@ -512,4 +514,175 @@ async def test_discount_from_description_explains_odd_sum_and_renewal_gets_plus(
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>⏰ Продление — 134 ₽</b>'
     assert lines[2] == '+30 дней, до 16.10 · 3 устройства'
-    assert lines[3] == 'Со скидкой 10 %'
+    assert 'Цена:' not in text and 'скидк' not in text.lower()
+
+
+# ── дыры, найденные мутационным скептиком волны 2 ───────────────────────────────
+# Имя клиента, имя тарифа и комментарий админа приходят от людей: без экранирования Telegram
+# отвергнет карточку целиком, сборщик проглотит исключение — и владелец МОЛЧА не узнает о деньгах.
+
+
+@pytest.mark.asyncio
+async def test_html_in_name_tariff_and_admin_comment_is_escaped_everywhere() -> None:
+    service = _service()
+    evil_tariff = _tariff(name='Базовый <VIP> & Co')
+    await service.send_balance_topup_notification(
+        _user(balance_kopeks=10000, first_name='Анна & <Co>'),
+        _transaction(amount_kopeks=10000, payment_method='manual', description='  см. <тикет> & чек  '),
+        0,
+        topup_status='🔄 Пополнение',
+        referrer_info='Нет',
+        subscription=_subscription(tariff=evil_tariff),
+        promo_group=None,
+    )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[1] == 'Анна &amp; &lt;Co&gt; @lilgaandelf · Базовый &lt;VIP&gt; &amp; Co до 16.09'
+    assert 'Комментарий: см. &lt;тикет&gt; &amp; чек' in lines  # и без пробелов по краям
+    assert '<Co>' not in text and '<VIP>' not in text and '<тикет>' not in text
+
+
+@pytest.mark.asyncio
+async def test_renewal_breakdown_uses_engine_month_rounding_and_int_period_keys() -> None:
+    # 50 дней: движок считает round(50/30) = 2 месяца (calculate_months_from_days), а не 50 // 30 = 1;
+    # ключ периода в JSON тарифа может прийти и числом — разложение обязано сойтись в обоих случаях.
+    service = _service()
+    tariff = _tariff(period_prices={50: 25000})
+    with _patched_tariff(tariff):
+        await service.send_subscription_extension_notification(
+            AsyncMock(),
+            _user(),
+            _subscription(),
+            _transaction(amount_kopeks=-(25000 + 2 * 7000 * 2)),
+            50,
+            END_DATE,
+            new_end_date=datetime(2026, 11, 5, 12, 26, tzinfo=UTC),
+        )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[0] == '<b>⏰ Продление — 530 ₽</b>'
+    assert lines[3] == 'Цена: тариф 250 ₽ + устройства 2 × 70 ₽ × 2 мес.'
+
+
+@pytest.mark.asyncio
+async def test_addon_explanation_truncates_kopeks_like_the_calculator() -> None:
+    # 70 ₽ × 5 дней / 30 = 1166,67 коп.: калькулятор берёт int (1166), не round (1167)
+    service = _service()
+    subscription = _subscription(end_date=NOW + timedelta(days=4, hours=12))
+    with _patched_tariff(_tariff()):
+        await service.send_subscription_update_notification(
+            AsyncMock(), _user(), subscription, 'devices', 2, 3, price_paid=1166
+        )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[2] == '+1 устройство, стало 3 · 12 ₽ — это 70 ₽/мес за 5 дней до конца подписки (18.09)'
+
+
+@pytest.mark.asyncio
+async def test_trial_that_ends_this_very_second_is_already_expired() -> None:
+    service = _service()
+    await service.send_balance_topup_notification(
+        _user(balance_kopeks=14900),
+        _transaction(amount_kopeks=14900, payment_method='platega', description='Пополнение через Platega (СБП (QR))'),
+        0,
+        topup_status='🔄 Пополнение',
+        referrer_info='Нет',
+        subscription=_subscription(is_trial=True, end_date=NOW),
+        promo_group=None,
+    )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[1] == 'nikitaa @lilgaandelf · пробный истёк 13.09'
+
+
+@pytest.mark.asyncio
+async def test_tariff_switch_stays_in_purchases_even_for_an_old_client() -> None:
+    service = _service()
+    with _patched_tariff(_tariff()):
+        await service.send_subscription_purchase_notification(
+            AsyncMock(),
+            _user(has_had_paid_subscription=True),
+            _subscription(end_date=NEW_END_DATE),
+            _transaction(),
+            30,
+            purchase_type='tariff_switch',
+        )
+    text, category = _sent(service)
+    _assert_card_shape(text)
+    assert category is NotificationCategory.PURCHASES  # маршрутизация как была: не 'renewal' и не авто-детект
+
+
+@pytest.mark.parametrize(
+    ('subscription', 'expected'),
+    [
+        (_subscription(is_trial=True, status='disabled', is_active=False), 'пробный выключен'),
+        (_subscription(tariff=_tariff(), is_trial=False, status='disabled', is_active=False), 'Базовый, выключена'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_disabled_trial_with_future_end_is_not_called_running(subscription, expected: str) -> None:
+    service = _service()
+    await service.send_balance_topup_notification(
+        _user(balance_kopeks=14900),
+        _transaction(amount_kopeks=14900, payment_method='platega', description='Пополнение через Platega (СБП (QR))'),
+        0,
+        topup_status='🔄 Пополнение',
+        referrer_info='Нет',
+        subscription=subscription,
+        promo_group=None,
+    )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[1] == f'nikitaa @lilgaandelf · {expected}'
+
+
+@pytest.mark.asyncio
+async def test_unchanged_device_count_is_neither_purchase_nor_free() -> None:
+    service = _service()
+    with _patched_tariff(_tariff()):
+        await service.send_subscription_update_notification(
+            AsyncMock(), _user(), _subscription(), 'devices', 3, 3, price_paid=None
+        )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[0] == '<b>📱 Устройства не изменились</b>'
+    assert lines[2] == 'Устройств: 3 → 3'
+
+
+@pytest.mark.asyncio
+async def test_long_admin_comment_is_cut_with_an_ellipsis() -> None:
+    service = _service()
+    await service.send_balance_topup_notification(
+        _user(balance_kopeks=10000),
+        _transaction(amount_kopeks=10000, payment_method='manual', description='х' * 500),
+        0,
+        topup_status='🔄 Пополнение',
+        referrer_info='Нет',
+        subscription=None,
+        promo_group=None,
+    )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert 'Комментарий: ' + 'х' * 120 + '…' in lines
+
+
+@pytest.mark.asyncio
+async def test_first_purchase_with_everything_is_seven_lines_at_most() -> None:
+    service = _service()
+    with _patched_tariff(_tariff()):
+        await service.send_subscription_purchase_notification(
+            AsyncMock(),
+            _user(has_had_paid_subscription=False, balance_kopeks=5100),
+            _subscription(end_date=NEW_END_DATE),
+            _transaction(),
+            30,
+            purchase_type='first_purchase',
+        )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert len(lines) == 7
+    assert lines[3:6] == [
+        'Цена: тариф 149 ₽ + устройства 2 × 70 ₽',
+        'На балансе осталось 51 ₽',
+        'По приглашению @kozyr20',
+    ]

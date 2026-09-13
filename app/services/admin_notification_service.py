@@ -456,8 +456,8 @@ class AdminNotificationService:
         """«до 16.09»; год дописывается только когда он не текущий — короче некуда, и не врёт."""
         if moment is None:
             return 'N/A'
-        fmt = '%d.%m' if moment.year == datetime.now(UTC).year else '%d.%m.%Y'
-        return format_local_datetime(moment, fmt)
+        same_year = format_local_datetime(moment, '%Y') == format_local_datetime(datetime.now(UTC), '%Y')
+        return format_local_datetime(moment, '%d.%m' if same_year else '%d.%m.%Y')
 
     def _owner_card(self, title: str, who: str, what: str, *extra: str | None) -> str:
         lines = [f'<b>{title}</b>', who, what, *[line for line in extra if line]]
@@ -499,7 +499,8 @@ class AdminNotificationService:
         if method == 'manual':
             return 'вручную'
         label = re.sub(r'^[^\w(&]+', '', self._get_payment_method_display(method)).strip()
-        return f'через {html.escape(label, quote=False)}'
+        # у части имён экранирование уже стоит, у части нет — снимаем и ставим ровно один раз
+        return f'через {html.escape(html.unescape(label), quote=False)}'
 
     @staticmethod
     def _owner_balance_line(balance_kopeks: int | None) -> str | None:
@@ -520,14 +521,6 @@ class AdminNotificationService:
         return f'По приглашению {re.sub(r" \(ID: \d+\)$", "", info)}'
 
     @staticmethod
-    def _owner_discount_line(transaction: Transaction | None) -> str | None:
-        """«Со скидкой 10 %» — из хвоста описания транзакции «(скидка 10%)» / «(промо -10%)».
-        Описание пишет наш же код кассы; формат сменится — строка пропадёт, но не соврёт."""
-        description = getattr(transaction, 'description', None) if transaction else None
-        match = re.search(r'(?:скидк\w*|промо)\s*-?\s*(\d{1,3})\s*%', description or '', re.IGNORECASE)
-        return f'Со скидкой {match.group(1)} %' if match else None
-
-    @staticmethod
     def _owner_subscription_label(subscription: Subscription | None, tariff: Tariff | None) -> str:
         if subscription is None:
             return 'без подписки'
@@ -537,14 +530,18 @@ class AdminNotificationService:
         until = AdminNotificationService._owner_until(end_date)
         expired = end_date is not None and end_date <= datetime.now(UTC)
         name = html.escape(tariff.name) if tariff else None
+        status = getattr(subscription, 'status', None)
+        if status == 'disabled':
+            if subscription.is_trial:
+                return 'пробный выключен'
+            return f'{name}, выключена' if name else 'подписка выключена'
         if subscription.is_trial:
             return f'пробный истёк {until}' if expired else f'пробный до {until}'
         if subscription.is_active:
             return f'{name or "подписка"} до {until}'
-        status = getattr(subscription, 'status', None)
         if status == 'limited' and not expired:
             return f'{name or "подписка"} до {until}, трафик исчерпан'
-        tail = {'disabled': 'выключена', 'pending': 'ждёт оплаты'}.get(status, f'истекла {until}')
+        tail = 'ждёт оплаты' if status == 'pending' else f'истекла {until}'
         return f'{name}, {tail}' if name else f'подписка {tail}'
 
     @staticmethod
@@ -579,7 +576,7 @@ class AdminNotificationService:
     def _owner_devices_addon_line(
         cls, subscription: Subscription, tariff: Tariff | None, old_value: Any, new_value: Any, price_paid: int
     ) -> str:
-        """«+1 устройство, стало 3 · 5 ₽ = 50 ₽/мес × 3 дня до конца подписки (16.09)».
+        """«+1 устройство, стало 3 · 5 ₽ — это 50 ₽/мес за 3 дня до конца подписки (16.09)».
         Цену объясняем только когда она сходится с формулой докупки (цена за месяц × дней до
         конца / 30, как в device_addon_service — срок может быть и больше месяца); иначе
         называем лишь срок, но не выдумываем."""
@@ -607,7 +604,7 @@ class AdminNotificationService:
                 settings.format_price(per_device) if added == 1 else f'{added} × {settings.format_price(per_device)}'
             )
             return (
-                f'{head} · {settings.format_price(price_paid)} = {monthly}/мес × '
+                f'{head} · {settings.format_price(price_paid)} — это {monthly}/мес за '
                 f'{format_days_declension(days_left)} до конца подписки ({until})'
             )
         return f'{head}. Подписка до {until}'
@@ -666,12 +663,11 @@ class AdminNotificationService:
                 f'{"+" if is_renewal else ""}{format_days_declension(period_days)}, до {self._owner_until(subscription.end_date)}'
                 f' · {format_devices_declension(subscription.device_limit or 0)}'
             )
-            breakdown = self._owner_price_breakdown(tariff, period_days, subscription.device_limit, total_amount)
             message = self._owner_card(
                 self._owner_title(title, total_amount, self._owner_pay_label(transaction)),
                 self._owner_who(user, html.escape(tariff.name) if tariff else None),
                 what,
-                breakdown or self._owner_discount_line(transaction),
+                self._owner_price_breakdown(tariff, period_days, subscription.device_limit, total_amount),
                 self._owner_balance_line(user.balance_kopeks),
                 await self._owner_referrer_line(db, user) if was_trial_conversion or not is_renewal else None,
             )
@@ -796,7 +792,7 @@ class AdminNotificationService:
         description = (getattr(transaction, 'description', None) or '').strip()
         if getattr(transaction, 'payment_method', None) == 'manual' and description:
             # У ручного начисления описание — это комментарий админа, единственное «за что»
-            comment_line = f'Комментарий: {html.escape(description[:120])}'
+            comment_line = f'Комментарий: {html.escape(description[:120] + ("…" if len(description) > 120 else ""))}'
         return self._owner_card(
             self._owner_title(
                 '💰 Первое пополнение' if is_first else '💰 Пополнение', amount, self._owner_pay_label(transaction)
@@ -997,12 +993,11 @@ class AdminNotificationService:
                 f'+{format_days_declension(extended_days)}, до {self._owner_until(current_end_date)}'
                 f' · {format_devices_declension(subscription.device_limit or 0)}'
             )
-            breakdown = self._owner_price_breakdown(tariff, extended_days, subscription.device_limit, amount)
             message = self._owner_card(
                 self._owner_title('⏰ Продление', amount, self._owner_pay_label(transaction)),
                 self._owner_who(user, html.escape(tariff.name) if tariff else None),
                 what,
-                breakdown or self._owner_discount_line(transaction),
+                self._owner_price_breakdown(tariff, extended_days, subscription.device_limit, amount),
                 self._owner_balance_line(current_balance),
             )
             return await self._send_message(message, category=NotificationCategory.RENEWALS)
@@ -1966,6 +1961,7 @@ class AdminNotificationService:
             return False
 
         try:
+            price_paid = int(price_paid or 0)
             titles = {
                 'traffic': '📊 Докупка трафика',
                 'devices': '📱 Докупка устройств',
@@ -1975,6 +1971,8 @@ class AdminNotificationService:
             if update_type == 'devices' and str(new_value).isdigit() and str(old_value).isdigit():
                 if int(new_value) < int(old_value):
                     title = '📱 Устройств стало меньше'
+                elif int(new_value) == int(old_value):
+                    title = '📱 Устройства не изменились'
             tariff = await self._get_tariff(db, subscription)
 
             if update_type == 'servers':
@@ -1990,7 +1988,7 @@ class AdminNotificationService:
 
             if price_paid > 0:
                 headline = self._owner_title(title, price_paid)
-            elif title == '📱 Устройств стало меньше':
+            elif title in ('📱 Устройств стало меньше', '📱 Устройства не изменились'):
                 headline = title
             else:
                 headline = f'{title} — бесплатно'
