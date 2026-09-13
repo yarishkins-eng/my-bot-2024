@@ -557,6 +557,8 @@ class PricingEngine:
         *,
         custom_traffic_gb: int | None = None,
         user: User | None = None,
+        upgrade_from_device_limit: int | None = None,
+        upgrade_remaining_days: int = 0,
     ) -> RenewalPricing:
         """Core tariff pricing logic (raw params, no Subscription needed).
 
@@ -565,6 +567,13 @@ class PricingEngine:
         - 'devices' → extra device cost
         Promo-offer discount applied on the discounted subtotal.
         Device cost is monthly × months_in_period.
+
+        🔴 Этап ДУ-2 (14.09.2026). ``upgrade_from_device_limit`` + ``upgrade_remaining_days`` —
+        продление ПЛАТНОЙ подписки с ростом числа устройств: добавленные устройства вступают
+        сразу и действуют на остаток старого срока, поэтому за этот остаток берётся доплата по
+        той же ставке и формуле, что докупка посреди срока (``device_addon_service``):
+        ``ставка × добавленные × дни // 30``, округлённая до рубля. Без этих параметров (старые
+        кассы, новые продажи, пробные) формула прежняя до копейки.
         """
         months = calculate_months_from_days(period_days)
 
@@ -591,6 +600,19 @@ class PricingEngine:
             devices_price = extra_devices * device_price_per_unit
         else:
             devices_price = extra_devices * device_price_per_unit * months
+
+        # --- ДУ-2: доплата за добавленные устройства на остаток старого срока ---
+        # Считается ДО скидок, чтобы скидка промогруппы на устройства и промо-оффер легли на
+        # неё так же, как на остальную цену устройств. Округление до рубля — правило кассы
+        # device-first (см. round_device_first_quote_kopeks): полтинник вверх.
+        upgrade_prorate = 0
+        upgraded_devices = 0
+        if upgrade_from_device_limit is not None and upgrade_remaining_days > 0 and not (is_daily and period_days <= 1):
+            upgraded_devices = max(0, (device_limit or 0) - int(upgrade_from_device_limit))
+            if upgraded_devices:
+                raw_prorate = device_price_per_unit * upgraded_devices * int(upgrade_remaining_days) // 30
+                upgrade_prorate = ((raw_prorate + 50) // 100) * 100
+                devices_price += upgrade_prorate
 
         # --- Custom traffic (tariff add-on, uses addon discount path) ---
         traffic_price = 0
@@ -639,6 +661,13 @@ class PricingEngine:
                 months_in_period=months,
             )
         )
+        if upgrade_prorate:
+            # Дописываем в словарь, а не в замороженный TariffBreakdown: ключи нужны только
+            # кассе device-first, которая перепроверяет цену по замороженным дням.
+            breakdown['upgrade_from_device_limit'] = int(upgrade_from_device_limit)
+            breakdown['upgrade_remaining_days'] = int(upgrade_remaining_days)
+            breakdown['upgrade_devices'] = upgraded_devices
+            breakdown['upgrade_prorate_kopeks'] = upgrade_prorate
 
         if final_total < 0:
             logger.warning(
@@ -671,11 +700,14 @@ class PricingEngine:
         device_limit: int | None = None,
         custom_traffic_gb: int | None = None,
         user: User | None = None,
+        upgrade_from_device_limit: int | None = None,
+        upgrade_remaining_days: int = 0,
     ) -> RenewalPricing:
         """Calculate price for a tariff purchase (new or renewal).
 
         Public method that delegates to _calculate_tariff_core.
         If device_limit is None, uses the tariff's included limit (no extra devices).
+        ``upgrade_*`` — доплата за рост устройств на остаток срока (ДУ-2), см. ядро.
         """
         effective_device_limit = device_limit if device_limit is not None else (tariff.device_limit or 0)
         return await self._calculate_tariff_core(
@@ -684,6 +716,8 @@ class PricingEngine:
             effective_device_limit,
             custom_traffic_gb=custom_traffic_gb,
             user=user,
+            upgrade_from_device_limit=upgrade_from_device_limit,
+            upgrade_remaining_days=upgrade_remaining_days,
         )
 
     # ------------------------------------------------------------------

@@ -532,6 +532,54 @@ async def _require_no_legacy_pending_trial(
     )
 
 
+def _upgrade_prorate_basis(
+    subscription: Subscription | None,
+    tariff: Tariff,
+    *,
+    now: datetime,
+) -> tuple[int | None, int]:
+    """Основание доплаты за рост устройств при продлении (этап ДУ-2): (от какого лимита, дней остатка).
+
+    Только для ПЛАТНОЙ подписки с неистёкшим сроком: добавленные при продлении устройства
+    вступают сразу и действуют на остаток старого срока, а цена ячейки матрицы считала их
+    только на покупаемый период — третье устройство на год доставалось бесплатно
+    (дефект 1 внешнего ревью 13.09.2026). Пробная, истёкшая или отсутствующая подписка —
+    доплаты нет: у пробной устройства не оплачены и не пол, у истёкшей остатка нет.
+    «От какого лимита» — `max(текущий, база тарифа)`: докупка посреди срока считает бесплатными
+    устройства до базы (`device_addon_service`), и обе двери обязаны называть одну сумму.
+    Дни — как у докупки: `max(1, ceil(остаток / сутки))`.
+    """
+    if subscription is None or subscription.is_trial:
+        return None, 0
+    end_date = getattr(subscription, 'end_date', None)
+    if end_date is None:
+        return None, 0
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=UTC)
+    remaining_seconds = (end_date - now).total_seconds()
+    if remaining_seconds <= 0:
+        return None, 0
+    upgrade_from = max(int(subscription.device_limit or 0), int(tariff.device_limit or 0))
+    remaining_days = max(1, -(-int(remaining_seconds) // 86400))
+    return upgrade_from, remaining_days
+
+
+def _frozen_upgrade_remaining_days(checkout: SubscriptionCheckout) -> int:
+    """Дни остатка, замороженные в котировке заказа (ДУ-2).
+
+    Перепроверка цены берёт дни из `price_breakdown` ячейки, а не от `now`: иначе каждое
+    продление с ростом устройств ловило бы `reprice_required` на тике суток между котировкой
+    и оплатой. «От какого лимита» при этом берётся ЖИВОЙ: докупил устройство в окне
+    котировки — цена разойдётся, и заказ уйдёт на перекотировку вместо двойной оплаты.
+    У заказов, созданных до этого этапа, ключа нет → 0 → цена та же, что была заморожена.
+    """
+    breakdown = getattr(checkout, 'price_breakdown', None) or {}
+    try:
+        return max(0, int(breakdown.get('upgrade_remaining_days', 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _subscription_snapshot(subscription: Subscription | None) -> dict[str, Any]:
     if subscription is None:
         return {}
@@ -792,6 +840,9 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
     if not eligibility.eligible or eligibility.tariff is None:
         return {'eligible': False, 'reason': eligibility.reason}
     tariff = eligibility.tariff
+    # ДУ-2: основание доплаты считается ОДИН раз на запрос — все ячейки матрицы и
+    # заказ, рождённый из неё, видят одни и те же дни остатка.
+    upgrade_from, upgrade_days = _upgrade_prorate_basis(subscription, tariff, now=datetime.now(UTC))
     matrix = []
     for days in eligibility.period_options:
         prices = []
@@ -801,11 +852,14 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
                 days,
                 device_limit=devices,
                 user=user,
+                upgrade_from_device_limit=upgrade_from,
+                upgrade_remaining_days=upgrade_days,
             )
             if price.final_total <= 0:
                 # A full promo/free period must retain the established trial or
                 # gift semantics, never be mistaken for a paid checkout.
                 return {'eligible': False, 'reason': 'non_positive_quote'}
+            price_breakdown = getattr(price, 'breakdown', None) or {}
             prices.append(
                 {
                     'device_limit': devices,
@@ -815,6 +869,9 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
                         'devices_price_kopeks': price.devices_price,
                         'promo_group_discount_kopeks': price.promo_group_discount,
                         'promo_offer_discount_kopeks': price.promo_offer_discount,
+                        'upgrade_from_device_limit': upgrade_from,
+                        'upgrade_remaining_days': upgrade_days,
+                        'upgrade_prorate_kopeks': int(price_breakdown.get('upgrade_prorate_kopeks', 0) or 0),
                     },
                 }
             )
@@ -1731,11 +1788,21 @@ async def _validate_direct_pre_commit(
         checkout.terminal_reason = 'tariff_no_longer_eligible'
         await db.commit()
         return None
+    # ДУ-2: дни остатка — замороженные в котировке, «от какого лимита» — живой (см.
+    # `_frozen_upgrade_remaining_days`). Обе перепроверки ниже обязаны считать одинаково.
+    frozen_upgrade_days = _frozen_upgrade_remaining_days(checkout)
+    live_upgrade_from = (
+        max(int(target.device_limit or 0), int(tariff.device_limit or 0))
+        if frozen_upgrade_days and target is not None and not target.is_trial
+        else None
+    )
     current_price = await pricing_engine.calculate_tariff_purchase_price(
         tariff,
         checkout.period_days,
         device_limit=checkout.selected_device_limit,
         user=user,
+        upgrade_from_device_limit=live_upgrade_from,
+        upgrade_remaining_days=frozen_upgrade_days,
     )
     if (
         int(tariff.pricing_revision or 1) != checkout.pricing_revision
@@ -1776,6 +1843,8 @@ async def _validate_direct_pre_commit(
             checkout.period_days,
             device_limit=checkout.selected_device_limit,
             user=user,
+            upgrade_from_device_limit=live_upgrade_from,
+            upgrade_remaining_days=frozen_upgrade_days,
         )
         if (
             int(tariff.pricing_revision or 1) != checkout.pricing_revision
