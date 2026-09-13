@@ -235,6 +235,35 @@ async def _find_subscription(db: AsyncSession, *, user: User, subscription_id: i
     return subscription
 
 
+async def _assert_no_pending_upgrade_invoice(db: AsyncSession, *, user_id: int) -> None:
+    """Этап ДУ-2б: пока висит неоплаченный счёт на продление с добавленными устройствами — докупка закрыта.
+
+    Счёт Platega на продление с ростом устройств уже содержит доплату за те же устройства на
+    остаток срока (`upgrade_prorate_kopeks`). Он живёт у провайдера часами и исполняется по
+    своему снимку без пересчёта, а лимит подписки для него — терпимый ключ слепка: докупив
+    то же устройство с баланса в это окно, человек заплатил бы за пересечение дважды, молча.
+    Кошелёк такого окна не имеет (списание проходит перепроверку по живому лимиту).
+    """
+    from app.services.device_first_checkout_service import get_open_checkout_for_user
+
+    checkout = await get_open_checkout_for_user(db, user_id=user_id)
+    if checkout is None or getattr(checkout, 'lifecycle_state', None) != 'awaiting_funds':
+        return
+    breakdown = getattr(checkout, 'price_breakdown', None) or {}
+    try:
+        prorate = int(breakdown.get('upgrade_prorate_kopeks', 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        prorate = 0
+    if prorate <= 0:
+        return
+    raise DeviceAddonError(
+        'renewal_invoice_pending',
+        'У вас есть неоплаченный счёт на продление, в котором добавленные устройства уже учтены. '
+        'Оплатите его или сделайте новый расчёт продления.',
+        status_code=409,
+    )
+
+
 async def calculate_device_addon(
     db: AsyncSession,
     *,
@@ -268,6 +297,7 @@ async def calculate_device_addon(
     subscription = await _find_subscription(db, user=user, subscription_id=subscription_id, lock=lock)
     if subscription.status not in {'active', 'trial'}:
         raise DeviceAddonError('subscription_inactive', 'Подписка неактивна.', status_code=409)
+    await _assert_no_pending_upgrade_invoice(db, user_id=user.id)
     tariff = await db.get(Tariff, subscription.tariff_id) if subscription.tariff_id else None
     if tariff is not None and lock:
         tariff = await db.get(Tariff, tariff.id, with_for_update=True, populate_existing=True)
