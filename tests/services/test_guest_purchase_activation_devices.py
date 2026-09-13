@@ -20,22 +20,33 @@ import pytest
 from app.services import guest_purchase_service as svc
 
 
+TRIAL_TARIFF_ID = 5
+
+
 @pytest.mark.parametrize(
-    ('is_trial', 'current', 'base', 'expected'),
+    ('is_trial', 'tariff_id', 'current', 'base', 'expected'),
     [
-        (False, 3, 1, 3),  # платная с 3 устройствами: подарок «Базового» не режет
-        (False, 1, 1, 1),
-        (False, 2, 4, 4),  # база подарка выше текущего — растём до базы
-        (False, None, 1, 1),  # лимит не записан — база
-        (None, 3, 1, 3),  # is_trial = NULL считается платной, как в кассе
-        (True, 3, 1, 1),  # пробная: строго база подарка, старые устройства не пол
-        (True, 1, 1, 1),
+        (False, 3, 3, 1, 3),  # платная с 3 устройствами: подарок «Базового» не режет
+        (False, 3, 1, 1, 1),
+        (False, 3, 2, 4, 4),  # база подарка выше текущего — растём до базы
+        (False, 3, None, 1, 1),  # лимит не записан — база
+        (None, 3, 3, 1, 3),  # is_trial = NULL считается платной, как в кассе
+        (True, TRIAL_TARIFF_ID, 3, 1, 1),  # настоящая пробная: строго база, старые устройства не пол
+        (True, TRIAL_TARIFF_ID, 1, 1, 1),
+        (True, 4, 5, 1, 5),  # «пробная» по флагу на Team — друг владельца, не режем
+        (True, 3, 4, 1, 4),  # «пробная» по флагу на «Базовом» (выдана руками) — не режем
     ],
 )
-def test_gift_extend_device_limit_never_lowers_a_paid_subscription(is_trial, current, base, expected):
+def test_gift_extend_device_limit_never_lowers_a_paid_subscription(is_trial, tariff_id, current, base, expected):
     tariff = SimpleNamespace(device_limit=base)
-    existing = SimpleNamespace(is_trial=is_trial, device_limit=current)
-    assert svc._gift_extend_device_limit(tariff, existing) == expected
+    existing = SimpleNamespace(is_trial=is_trial, tariff_id=tariff_id, device_limit=current)
+    assert svc._gift_extend_device_limit(tariff, existing, trial_tariff_id=TRIAL_TARIFF_ID) == expected
+
+
+def test_without_a_trial_tariff_nobody_counts_as_a_trial():
+    """Нет пробного тарифа — никого не считаем пробным (безопасная сторона: устройства не режем)."""
+    existing = SimpleNamespace(is_trial=True, tariff_id=5, device_limit=3)
+    assert svc._gift_extend_device_limit(SimpleNamespace(device_limit=1), existing, trial_tariff_id=None) == 3
 
 
 # --- через настоящую activate_purchase, с подставной базой ---------------------------
@@ -106,6 +117,7 @@ def _wire(monkeypatch, *, existing, tariff):
     # Метод pydantic-настроек подменяется на классе (поле — на экземпляре), урок 19.08.
     monkeypatch.setattr(type(svc.settings), 'is_multi_tariff_enabled', lambda self: False)
     monkeypatch.setattr(svc, 'get_tariff_by_id', AsyncMock(return_value=tariff))
+    monkeypatch.setattr(svc, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=TRIAL_TARIFF_ID)))
     monkeypatch.setattr(svc, '_purchase_touches_financially_closing_account', AsyncMock(return_value=False))
     monkeypatch.setattr(svc, 'get_subscription_by_user_id', AsyncMock(return_value=existing))
     monkeypatch.setattr(
@@ -209,6 +221,52 @@ async def test_multi_tariff_branch_keeps_paid_devices_too(monkeypatch):
 
     extend.assert_awaited_once()
     assert extend.await_args.kwargs['device_limit'] == 3
+
+
+@pytest.mark.asyncio
+async def test_team_friend_flagged_as_trial_is_refused_too(monkeypatch):
+    """Критик полноты: 21 из 31 подписки Team несёт is_trial=True «до 2031» — флаг не критерий."""
+    tariff = SimpleNamespace(id=3, name='Базовый', device_limit=1, traffic_limit_gb=0)
+    existing = _existing(tariff_id=4, is_trial=True, device_limit=3, days_left=1500)
+    extend, replace = _wire(monkeypatch, existing=existing, tariff=tariff)
+    purchase, user = _purchase(), _user()
+
+    with pytest.raises(svc.GuestPurchaseError) as error:
+        await svc.activate_purchase(_db(purchase, user), purchase.token, skip_notification=True)
+
+    assert error.value.status_code == 409
+    extend.assert_not_awaited()
+    replace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_classic_subscription_without_a_tariff_still_takes_the_gift(monkeypatch):
+    """Мутация MX1: классическую подписку (tariff_id IS NULL) забор пропускает — как до этапа."""
+    tariff = SimpleNamespace(id=3, name='Базовый', device_limit=1, traffic_limit_gb=0)
+    existing = _existing(tariff_id=None, is_trial=False, device_limit=2, days_left=40)
+    extend, _ = _wire(monkeypatch, existing=existing, tariff=tariff)
+    purchase, user = _purchase(), _user()
+
+    await svc.activate_purchase(_db(purchase, user), purchase.token, skip_notification=True)
+
+    extend.assert_awaited_once()
+    assert extend.await_args.kwargs['tariff_id'] == 3
+    assert extend.await_args.kwargs['device_limit'] == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_subscription_of_another_tariff_is_replaced_not_refused(monkeypatch):
+    """Мутация MX19: истёкшая подписка другого тарифа — свежий месяц на базе (решение 1А), не 409."""
+    tariff = SimpleNamespace(id=3, name='Базовый', device_limit=1, traffic_limit_gb=0)
+    existing = _existing(tariff_id=4, is_trial=False, device_limit=3, days_left=-5)
+    extend, replace = _wire(monkeypatch, existing=existing, tariff=tariff)
+    purchase, user = _purchase(), _user()
+
+    await svc.activate_purchase(_db(purchase, user), purchase.token, skip_notification=True)
+
+    extend.assert_not_awaited()
+    replace.assert_awaited_once()
+    assert replace.await_args.kwargs['device_limit'] == 1
 
 
 # --- диплинк /start GIFT_… показывает причину отказа (волна 2 на дифф, DF6) ------------------
