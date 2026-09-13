@@ -386,7 +386,12 @@ class AdminNotificationService:
             if not self._is_enabled():
                 return False
 
-            tariff_name = await self._get_tariff_name(db, subscription)
+            tariff = await self._get_tariff(db, subscription)
+            # Тариф самого пробного («⏰Пробный») дублировал бы заголовок; показываем только чужой —
+            # если пробный выдан на платном тарифе, это владельцу как раз важно.
+            tariff_name = (
+                html.escape(tariff.name) if tariff and not getattr(tariff, 'is_trial_available', False) else None
+            )
             device_limit = subscription.device_limit
             if device_limit is None:
                 device_limit = settings.get_disabled_mode_device_limit()
@@ -403,13 +408,13 @@ class AdminNotificationService:
             what = f'{format_days_declension(duration_days)}, {format_devices_declension(device_limit)}'
             if traffic_gb:
                 what += f', {traffic_gb} ГБ'
-            what += f', до {format_local_datetime(subscription.end_date, "%d.%m")}'
+            what += f', до {self._owner_until(subscription.end_date)}'
 
             message = self._owner_card(
                 self._owner_title('🎁 Пробный период', charged_amount_kopeks),
                 self._owner_who(user, tariff_name),
                 what,
-                'Раньше уже платил' if user.has_had_paid_subscription else None,
+                '⚠️ Раньше уже платил(а) — пробный выдан повторно' if user.has_had_paid_subscription else None,
                 await self._owner_referrer_line(db, user),
             )
             return await self._send_message(message, category=NotificationCategory.TRIALS)
@@ -427,7 +432,10 @@ class AdminNotificationService:
             from app.database.crud.tariff import get_tariff_by_id
 
             return await get_tariff_by_id(db, subscription.tariff_id)
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                'Не удалось загрузить тариф для карточки владельцу', tariff_id=subscription.tariff_id, error=e
+            )
             return None
 
     async def _get_tariff_name(self, db: AsyncSession, subscription: Subscription) -> str | None:
@@ -440,7 +448,16 @@ class AdminNotificationService:
     # изменилось, с объяснением неочевидной цифры; дальше — только если есть что сказать;
     # дата без секунд нужна, когда владелец пересылает карточку. Telegram ID, ID транзакции,
     # промогруппа, коды серверов и трафик убраны сознательно: решений по ним владелец не
-    # принимает, а всё это есть в карточке клиента в кабинете.
+    # принимает, а всё это есть в карточке клиента в кабинете. Исключение — пробный: его
+    # лимит трафика (5 ГБ) — параметр самого пробного, и он остаётся в строке 3.
+
+    @staticmethod
+    def _owner_until(moment: datetime | None) -> str:
+        """«до 16.09»; год дописывается только когда он не текущий — короче некуда, и не врёт."""
+        if moment is None:
+            return 'N/A'
+        fmt = '%d.%m' if moment.year == datetime.now(UTC).year else '%d.%m.%Y'
+        return format_local_datetime(moment, fmt)
 
     def _owner_card(self, title: str, who: str, what: str, *extra: str | None) -> str:
         lines = [f'<b>{title}</b>', who, what, *[line for line in extra if line]]
@@ -448,10 +465,17 @@ class AdminNotificationService:
         return '\n'.join(lines)
 
     def _owner_who(self, user: User, tariff_name: str | None = None) -> str:
-        name = html.escape(getattr(user, 'first_name', None) or '')
+        name = html.escape((getattr(user, 'first_name', None) or '').strip())
         username = getattr(user, 'username', None)
-        handle = f'@{html.escape(username)}' if username else ''
-        who = ' '.join(part for part in (name, handle) if part) or self._get_user_display(user)
+        telegram_id = getattr(user, 'telegram_id', None)
+        if username:
+            who = f'{name} @{html.escape(username)}'.strip()
+        elif telegram_id:
+            # Без @username по имени не найти (у четверти клиентов его нет, тёзок много) —
+            # ID здесь единственная справка, ради которой владелец или менеджер откроет кабинет.
+            who = f'{name} · ID {telegram_id}' if name else f'ID {telegram_id}'
+        else:
+            who = name or self._get_user_display(user)
         return f'{who} · {tariff_name}' if tariff_name else who
 
     @staticmethod
@@ -471,15 +495,19 @@ class AdminNotificationService:
             for code, info in settings.get_platega_method_definitions().items():
                 if f'({info["name"]})' in description and code in _PLATEGA_METHOD_LABELS:
                     return _PLATEGA_METHOD_LABELS[code]
-            return f'через {settings.get_platega_display_name()}'
+            return f'через {html.escape(settings.get_platega_display_name())}'
         if method == 'manual':
             return 'вручную'
-        return f'через {re.sub(r"^[^\w(]+", "", self._get_payment_method_display(method)).strip()}'
+        label = re.sub(r'^[^\w(&]+', '', self._get_payment_method_display(method)).strip()
+        return f'через {html.escape(label, quote=False)}'
 
     @staticmethod
     def _owner_balance_line(balance_kopeks: int | None) -> str | None:
         balance = int(balance_kopeks or 0)
-        return f'На балансе осталось {settings.format_price(balance)}' if balance > 0 else None
+        shown = settings.format_price(balance)
+        if balance <= 0 or shown.startswith('0 ₽'):
+            return None
+        return f'На балансе осталось {shown}'
 
     async def _owner_referrer_line(self, db: AsyncSession, user: User) -> str | None:
         if not getattr(user, 'referred_by_id', None):
@@ -487,18 +515,37 @@ class AdminNotificationService:
         info = await self._get_referrer_info(db, user.referred_by_id)
         if info == 'Нет':
             return None
-        return f'Пришёл по ссылке {re.sub(r" \(ID: \d+\)$", "", info)}'
+        # «По приглашению», а не «пришёл по ссылке»: реферера может назначить и админ рукой,
+        # а форма без рода подходит и клиенту, и пригласившему любого пола.
+        return f'По приглашению {re.sub(r" \(ID: \d+\)$", "", info)}'
+
+    @staticmethod
+    def _owner_discount_line(transaction: Transaction | None) -> str | None:
+        """«Со скидкой 10 %» — из хвоста описания транзакции «(скидка 10%)» / «(промо -10%)».
+        Описание пишет наш же код кассы; формат сменится — строка пропадёт, но не соврёт."""
+        description = getattr(transaction, 'description', None) if transaction else None
+        match = re.search(r'(?:скидк\w*|промо)\s*-?\s*(\d{1,3})\s*%', description or '', re.IGNORECASE)
+        return f'Со скидкой {match.group(1)} %' if match else None
 
     @staticmethod
     def _owner_subscription_label(subscription: Subscription | None, tariff: Tariff | None) -> str:
         if subscription is None:
             return 'без подписки'
-        until = format_local_datetime(subscription.end_date, '%d.%m') if subscription.end_date else '?'
+        end_date = getattr(subscription, 'end_date', None)
+        if end_date is not None and end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=UTC)
+        until = AdminNotificationService._owner_until(end_date)
+        expired = end_date is not None and end_date <= datetime.now(UTC)
+        name = html.escape(tariff.name) if tariff else None
         if subscription.is_trial:
-            return f'пробный до {until}'
+            return f'пробный истёк {until}' if expired else f'пробный до {until}'
         if subscription.is_active:
-            return f'{html.escape(tariff.name) if tariff else "подписка"} до {until}'
-        return 'подписка истекла'
+            return f'{name or "подписка"} до {until}'
+        status = getattr(subscription, 'status', None)
+        if status == 'limited' and not expired:
+            return f'{name or "подписка"} до {until}, трафик исчерпан'
+        tail = {'disabled': 'выключена', 'pending': 'ждёт оплаты'}.get(status, f'истекла {until}')
+        return f'{name}, {tail}' if name else f'подписка {tail}'
 
     @staticmethod
     def _owner_device_price(tariff: Tariff | None) -> int:
@@ -510,7 +557,7 @@ class AdminNotificationService:
     def _owner_price_breakdown(
         cls, tariff: Tariff | None, period_days: int, device_limit: int | None, total_kopeks: int
     ) -> str | None:
-        """«Цена: 149 ₽ тариф + 2 × 50 ₽ устройства» — только когда сумма сходится до копейки.
+        """«Цена: тариф 149 ₽ + устройства 2 × 50 ₽» — только когда сумма сходится до копейки.
         При скидке, промокоде или старой цене объяснение было бы ложью, и его лучше не показывать."""
         if tariff is None or not device_limit or not total_kopeks or total_kopeks <= 0:
             return None
@@ -526,39 +573,44 @@ class AdminNotificationService:
         devices = f'{extra} × {settings.format_price(per_device)}'
         if months > 1:
             devices += f' × {months} мес.'
-        return f'Цена: {settings.format_price(base)} тариф + {devices} устройства'
+        return f'Цена: тариф {settings.format_price(base)} + устройства {devices}'
 
     @classmethod
     def _owner_devices_addon_line(
         cls, subscription: Subscription, tariff: Tariff | None, old_value: Any, new_value: Any, price_paid: int
     ) -> str:
-        """«+1 устройство, стало 3. Подписка до 16.09, осталось 3 дня — поэтому 5 ₽, а не 50 ₽».
-        Дробную цену объясняем только когда она сходится с формулой докупки (цена за месяц ×
-        дней до конца / 30, как в device_addon_service); иначе называем лишь срок."""
+        """«+1 устройство, стало 3 · 5 ₽ = 50 ₽/мес × 3 дня до конца подписки (16.09)».
+        Цену объясняем только когда она сходится с формулой докупки (цена за месяц × дней до
+        конца / 30, как в device_addon_service — срок может быть и больше месяца); иначе
+        называем лишь срок, но не выдумываем."""
         try:
-            old_limit, new_limit = int(old_value), int(new_value)
+            old_limit, new_limit, price_paid = int(old_value), int(new_value), int(price_paid or 0)
         except (TypeError, ValueError):
             return f'{old_value} → {new_value}'
         added = new_limit - old_limit
         if added <= 0:
             return f'Устройств: {old_limit} → {new_limit}'
-        head = f'+{format_devices_declension(added)}, стало {new_limit}.'
+        head = f'+{format_devices_declension(added)}, стало {new_limit}'
         end_date = getattr(subscription, 'end_date', None)
         if not end_date:
             return head
-        until = f'Подписка до {format_local_datetime(end_date, "%d.%m")}'
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=UTC)
+        until = cls._owner_until(end_date)
         if price_paid <= 0:
-            return f'{head} {until}'
-        full = cls._owner_device_price(tariff) * added
-        days_left = max(1, math.ceil((end_date - datetime.now(UTC)).total_seconds() / 86400))
-        if price_paid < full and price_paid == int(full * days_left / 30):
-            return (
-                f'{head} {until}, осталось {format_days_declension(days_left)} — '
-                f'поэтому {settings.format_price(price_paid)}, а не {settings.format_price(full)}'
+            return f'{head}. Подписка до {until}'
+        per_device = cls._owner_device_price(tariff)
+        seconds_left = (end_date - datetime.now(UTC)).total_seconds()
+        days_left = max(1, math.ceil(seconds_left / 86400))
+        if seconds_left > 0 and price_paid == int(per_device * added * days_left / 30):
+            monthly = (
+                settings.format_price(per_device) if added == 1 else f'{added} × {settings.format_price(per_device)}'
             )
-        if price_paid == full:
-            return f'{head} {until}. {settings.format_price(full // added)} в месяц за устройство'
-        return f'{head} {until}'
+            return (
+                f'{head} · {settings.format_price(price_paid)} = {monthly}/мес × '
+                f'{format_days_declension(days_left)} до конца подписки ({until})'
+            )
+        return f'{head}. Подписка до {until}'
 
     async def send_subscription_purchase_notification(
         self,
@@ -611,16 +663,17 @@ class AdminNotificationService:
 
             tariff = await self._get_tariff(db, subscription)
             what = (
-                f'{format_days_declension(period_days)}, до {format_local_datetime(subscription.end_date, "%d.%m.%Y")}'
+                f'{"+" if is_renewal else ""}{format_days_declension(period_days)}, до {self._owner_until(subscription.end_date)}'
                 f' · {format_devices_declension(subscription.device_limit or 0)}'
             )
+            breakdown = self._owner_price_breakdown(tariff, period_days, subscription.device_limit, total_amount)
             message = self._owner_card(
                 self._owner_title(title, total_amount, self._owner_pay_label(transaction)),
                 self._owner_who(user, html.escape(tariff.name) if tariff else None),
                 what,
-                self._owner_price_breakdown(tariff, period_days, subscription.device_limit, total_amount),
+                breakdown or self._owner_discount_line(transaction),
                 self._owner_balance_line(user.balance_kopeks),
-                None if is_renewal else await self._owner_referrer_line(db, user),
+                await self._owner_referrer_line(db, user) if was_trial_conversion or not is_renewal else None,
             )
 
             # Маршрутизация по категориям (зеркалит логику заголовков выше)
@@ -730,17 +783,27 @@ class AdminNotificationService:
         # ради названия тарифа ходить в базу из этого сборщика нельзя.
         tariff = subscription.__dict__.get('tariff') if subscription is not None else None
         is_first = 'перво' in (topup_status or '').lower()
+        amount = int(transaction.amount_kopeks or 0)
+        what = f'Баланс: {settings.format_price(old_balance)} → {settings.format_price(user.balance_kopeks)}'
+        bonus = int(user.balance_kopeks or 0) - int(old_balance or 0) - amount
+        if bonus > 0:
+            # Баланс вырос больше, чем пришло денег: бонус новичку за первое пополнение
+            what += f' (в т.ч. бонус {settings.format_price(bonus)})'
         referrer_line = None
         if is_first and referrer_info and referrer_info != 'Нет':
-            referrer_line = f'Пришёл по ссылке {re.sub(r" \(ID: \d+\)$", "", referrer_info)}'
+            referrer_line = f'По приглашению {re.sub(r" \(ID: \d+\)$", "", referrer_info)}'
+        comment_line = None
+        description = (getattr(transaction, 'description', None) or '').strip()
+        if getattr(transaction, 'payment_method', None) == 'manual' and description:
+            # У ручного начисления описание — это комментарий админа, единственное «за что»
+            comment_line = f'Комментарий: {html.escape(description[:120])}'
         return self._owner_card(
             self._owner_title(
-                '💰 Первое пополнение' if is_first else '💰 Пополнение',
-                transaction.amount_kopeks,
-                self._owner_pay_label(transaction),
+                '💰 Первое пополнение' if is_first else '💰 Пополнение', amount, self._owner_pay_label(transaction)
             ),
             self._owner_who(user, self._owner_subscription_label(subscription, tariff)),
-            f'Баланс: {settings.format_price(old_balance)} → {settings.format_price(user.balance_kopeks)}',
+            what,
+            comment_line,
             referrer_line,
         )
 
@@ -931,14 +994,15 @@ class AdminNotificationService:
             tariff = await self._get_tariff(db, subscription)
             amount = abs(transaction.amount_kopeks)
             what = (
-                f'+{format_days_declension(extended_days)}, до {format_local_datetime(current_end_date, "%d.%m.%Y")}'
+                f'+{format_days_declension(extended_days)}, до {self._owner_until(current_end_date)}'
                 f' · {format_devices_declension(subscription.device_limit or 0)}'
             )
+            breakdown = self._owner_price_breakdown(tariff, extended_days, subscription.device_limit, amount)
             message = self._owner_card(
                 self._owner_title('⏰ Продление', amount, self._owner_pay_label(transaction)),
                 self._owner_who(user, html.escape(tariff.name) if tariff else None),
                 what,
-                self._owner_price_breakdown(tariff, extended_days, subscription.device_limit, amount),
+                breakdown or self._owner_discount_line(transaction),
                 self._owner_balance_line(current_balance),
             )
             return await self._send_message(message, category=NotificationCategory.RENEWALS)
@@ -1664,11 +1728,6 @@ class AdminNotificationService:
 
         return method_names.get(payment_method, f'💳 {html.escape(payment_method)}')
 
-    def _format_traffic(self, traffic_gb: int) -> str:
-        if traffic_gb == 0:
-            return '∞ Безлимит'
-        return f'{traffic_gb} ГБ'
-
     async def send_maintenance_status_notification(
         self, event_type: str, status: str, details: dict[str, Any] = None
     ) -> bool:
@@ -1913,6 +1972,9 @@ class AdminNotificationService:
                 'servers': '🌐 Смена серверов',
             }
             title = titles.get(update_type, '⚙️ Изменение подписки')
+            if update_type == 'devices' and str(new_value).isdigit() and str(old_value).isdigit():
+                if int(new_value) < int(old_value):
+                    title = '📱 Устройств стало меньше'
             tariff = await self._get_tariff(db, subscription)
 
             if update_type == 'servers':
@@ -1926,8 +1988,14 @@ class AdminNotificationService:
                 new_formatted = self._format_update_value(new_value, update_type)
                 what = f'{old_formatted} → {new_formatted}'
 
+            if price_paid > 0:
+                headline = self._owner_title(title, price_paid)
+            elif title == '📱 Устройств стало меньше':
+                headline = title
+            else:
+                headline = f'{title} — бесплатно'
             message = self._owner_card(
-                self._owner_title(title, price_paid) if price_paid > 0 else f'{title} — бесплатно',
+                headline,
                 self._owner_who(user, html.escape(tariff.name) if tariff else None),
                 what,
                 self._owner_balance_line(user.balance_kopeks),
