@@ -171,6 +171,7 @@ async def test_renewal_card_explains_price_and_never_says_from_balance() -> None
     assert lines[2] == '+30 дней, до 16.10.2026 · 3 устройства'
     assert lines[3] == 'Цена: 149 ₽ тариф + 2 × 70 ₽ устройства'
     assert 'Пришёл по ссылке' not in text
+    assert 'На балансе' not in text  # balance_after=0 — про пустой баланс молчим
 
 
 @pytest.mark.asyncio
