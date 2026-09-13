@@ -39,6 +39,7 @@ FORBIDDEN = (
     'Пригласил',
     SQUAD_UUID,
     '<blockquote',
+    '&amp;amp;',  # двойное экранирование
 )
 NOW = datetime(2026, 9, 13, 15, 55, tzinfo=UTC)
 END_DATE = datetime(2026, 9, 16, 12, 26, tzinfo=UTC)
@@ -686,3 +687,37 @@ async def test_first_purchase_with_everything_is_seven_lines_at_most() -> None:
         'На балансе осталось 51 ₽',
         'По приглашению @kozyr20',
     ]
+
+
+@pytest.mark.asyncio
+async def test_unknown_provider_label_is_escaped_exactly_once() -> None:
+    service = _service()
+    await service.send_balance_topup_notification(
+        _user(balance_kopeks=10000),
+        _transaction(amount_kopeks=10000, payment_method='ko&ko', description='Пополнение через ko&ko'),
+        0,
+        topup_status='🔄 Пополнение',
+        referrer_info='Нет',
+        subscription=None,
+        promo_group=None,
+    )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[0] == '<b>💰 Пополнение — 100 ₽ через ko&amp;ko</b>'
+
+
+@pytest.mark.asyncio
+async def test_year_in_date_follows_the_local_calendar_not_utc(monkeypatch) -> None:
+    # 31.12 23:00 МСК «сейчас», подписка до 01.01 01:00 МСК: по UTC оба момента ещё в 2026,
+    # по местному календарю год уже другой — и он должен быть напечатан.
+    from app.utils import timezone as tz_module
+
+    monkeypatch.setattr(tz_module.settings, 'TIMEZONE', 'Europe/Moscow')
+    tz_module.get_local_timezone.cache_clear()  # зона закэширована lru_cache — иначе подмена не видна
+    try:
+        new_year_eve = datetime(2026, 12, 31, 20, 0, tzinfo=UTC)
+        with patch.object(_FrozenDatetime, 'now', classmethod(lambda cls, tz=None: new_year_eve)):
+            assert AdminNotificationService._owner_until(datetime(2026, 12, 31, 22, 0, tzinfo=UTC)) == '01.01.2027'
+            assert AdminNotificationService._owner_until(datetime(2026, 12, 31, 19, 0, tzinfo=UTC)) == '31.12'
+    finally:
+        tz_module.get_local_timezone.cache_clear()
