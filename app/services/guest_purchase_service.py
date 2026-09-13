@@ -29,6 +29,7 @@ from app.database.models import (
     GuestPurchaseStatus,
     LandingPage,
     PaymentMethod,
+    Subscription,
     Tariff,
     Transaction,
     TransactionType,
@@ -1202,6 +1203,24 @@ async def notify_gift_claim_available(
             logger.warning('Failed to send gift link to buyer', purchase_id=purchase.id, exc_info=True)
 
 
+def _gift_extend_device_limit(tariff: Tariff, existing: Subscription) -> int:
+    """Лимит устройств при продлении СУЩЕСТВУЮЩЕЙ подписки подарком (этап ДУ-1).
+
+    🔴 Раньше сюда уходила голая база тарифа подарка, а `extend_subscription` присваивает
+    лимит без разговоров — платная подписка на 3 устройствах после подарка «Базового»
+    (база 1) получала лимит 1, и панель тут же отключала два оплаченных устройства.
+    Правило — зеркало кассы (`device_first_checkout_service._complete_direct_sale_locked`):
+    у ПЛАТНОЙ никогда не ниже текущего, у ПРОБНОЙ — строго база подарка (пробные устройства
+    не становятся полом, ОУ-1.3). `is_trial` = NULL считается платной, как в кассе.
+    ⚠️ Подаренный срок идёт на текущем числе устройств получателя, а оплачен по базе —
+    принято владельцем 14.09.2026 (решение 3А), не «забыто».
+    """
+    base = int(tariff.device_limit or 0)
+    if existing.is_trial:
+        return base
+    return max(base, int(existing.device_limit or 0))
+
+
 async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notification: bool = False) -> GuestPurchase:
     """Activate a PENDING_ACTIVATION purchase by replacing or creating a subscription.
 
@@ -1282,7 +1301,7 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                     existing_for_tariff,
                     purchase.period_days,
                     traffic_limit_gb=tariff.traffic_limit_gb,
-                    device_limit=tariff.device_limit,
+                    device_limit=_gift_extend_device_limit(tariff, existing_for_tariff),
                     connected_squads=squads,
                     commit=False,
                 )
@@ -1320,6 +1339,24 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                 and existing_subscription.end_date is not None
                 and _aware(existing_subscription.end_date) > datetime.now(UTC)
             )
+            if (
+                existing_subscription is not None
+                and _sub_has_time
+                and not existing_subscription.is_trial
+                and existing_subscription.tariff_id is not None
+                and existing_subscription.tariff_id != tariff.id
+            ):
+                # 🔴 ДУ-1б. Подарок на ДРУГОЙ тариф поверх действующей платной подписки —
+                # это смена тарифа внутри `extend_subscription`: `tariff_id`, сквады, трафик
+                # переписываются тарифом подарка, а остаток срока с бесплатного тарифа
+                # сгорает (`TARIFF_SWITCH_RESET_FREE_DAYS`). Друг на Team «до 2031» после
+                # подарка «Базового» остался бы с 30 днями. Пробную подписку не запираем:
+                # её конверсия подарком — штатный путь.
+                raise GuestPurchaseError(
+                    'Подарок нельзя применить к действующей подписке другого тарифа. '
+                    'Дождитесь её окончания или напишите в поддержку.',
+                    status_code=409,
+                )
             if existing_subscription is not None and _sub_has_time:
                 # Extend existing active subscription (preserve remaining days)
                 subscription = await extend_subscription(
@@ -1328,7 +1365,7 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                     purchase.period_days,
                     tariff_id=tariff.id,
                     traffic_limit_gb=tariff.traffic_limit_gb,
-                    device_limit=tariff.device_limit,
+                    device_limit=_gift_extend_device_limit(tariff, existing_subscription),
                     connected_squads=squads,
                     commit=False,
                 )

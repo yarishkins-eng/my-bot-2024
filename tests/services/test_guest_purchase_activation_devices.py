@@ -1,0 +1,192 @@
+"""Этап ДУ-1: подарок поверх существующей подписки не понижает число устройств.
+
+Дефект 2 внешнего ревью 13.09.2026 (мина LF, половина): ветка «продлить существующую с
+остатком срока» в `activate_purchase` отдавала `device_limit=tariff.device_limit` (база
+подарка = 1), `extend_subscription` присваивал его без `max()`, и панель тут же получала
+урезанный лимит — оплаченные устройства отключались. Здесь закреплено правило кассы:
+платная — никогда не ниже текущего, пробная — строго база подарка. Плюс забор ДУ-1б:
+подарок нельзя применить к действующей подписке другого тарифа (иначе `extend_subscription`
+делает смену тарифа и сжигает остаток срока бесплатного тарифа — Team «до 2031»).
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.services import guest_purchase_service as svc
+
+
+@pytest.mark.parametrize(
+    ('is_trial', 'current', 'base', 'expected'),
+    [
+        (False, 3, 1, 3),  # платная с 3 устройствами: подарок «Базового» не режет
+        (False, 1, 1, 1),
+        (False, 2, 4, 4),  # база подарка выше текущего — растём до базы
+        (False, None, 1, 1),  # лимит не записан — база
+        (None, 3, 1, 3),  # is_trial = NULL считается платной, как в кассе
+        (True, 3, 1, 1),  # пробная: строго база подарка, старые устройства не пол
+        (True, 1, 1, 1),
+    ],
+)
+def test_gift_extend_device_limit_never_lowers_a_paid_subscription(is_trial, current, base, expected):
+    tariff = SimpleNamespace(device_limit=base)
+    existing = SimpleNamespace(is_trial=is_trial, device_limit=current)
+    assert svc._gift_extend_device_limit(tariff, existing) == expected
+
+
+# --- через настоящую activate_purchase, с подставной базой ---------------------------
+
+
+def _purchase(**overrides):
+    base = dict(
+        id=11,
+        token='T' * 64,
+        status=svc.GuestPurchaseStatus.PENDING_ACTIVATION.value,
+        recipient_warning=None,
+        tariff_id=3,
+        user_id=206,
+        period_days=30,
+        is_gift=True,
+        cabinet_password=None,
+        auto_login_token=None,
+        subscription_url=None,
+        subscription_crypto_link=None,
+        delivered_at=None,
+        gift_message=None,
+        payment_method='platega',
+        payment_id='p-1',
+        amount_kopeks=14_900,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _user():
+    return SimpleNamespace(
+        id=206,
+        auth_type='telegram',
+        password_hash='x',
+        email_verified=True,
+        language='ru',
+        account_erasure_requested_at=None,
+    )
+
+
+def _existing(*, tariff_id, is_trial, device_limit, days_left):
+    return SimpleNamespace(
+        id=142,
+        tariff_id=tariff_id,
+        is_trial=is_trial,
+        device_limit=device_limit,
+        end_date=datetime.now(UTC) + timedelta(days=days_left),
+        subscription_url='https://sub/old',
+        subscription_crypto_link=None,
+    )
+
+
+def _db(purchase, user):
+    db = MagicMock()
+    results = [
+        SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: purchase)),
+        SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: user)),
+    ]
+    db.execute = AsyncMock(side_effect=results)
+    db.commit = AsyncMock()
+    db.rollback = AsyncMock()
+    db.refresh = AsyncMock()
+    return db
+
+
+def _wire(monkeypatch, *, existing, tariff):
+    """Подставляем всё вокруг ветки продления; сама ветка и её условия — настоящие."""
+    # Метод pydantic-настроек подменяется на классе (поле — на экземпляре), урок 19.08.
+    monkeypatch.setattr(type(svc.settings), 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(svc, 'get_tariff_by_id', AsyncMock(return_value=tariff))
+    monkeypatch.setattr(svc, '_purchase_touches_financially_closing_account', AsyncMock(return_value=False))
+    monkeypatch.setattr(svc, 'get_subscription_by_user_id', AsyncMock(return_value=existing))
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
+        AsyncMock(return_value=SimpleNamespace(squad_uuids=('sq-de',))),
+    )
+    extended = SimpleNamespace(subscription_url='https://sub/new', subscription_crypto_link=None)
+    extend = AsyncMock(return_value=extended)
+    replace = AsyncMock(return_value=extended)
+    monkeypatch.setattr(svc, 'extend_subscription', extend)
+    monkeypatch.setattr(svc, 'replace_subscription', replace)
+    monkeypatch.setattr(svc, 'create_paid_subscription', AsyncMock(return_value=extended))
+    panel = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(svc, 'SubscriptionService', lambda: SimpleNamespace(create_remnawave_user=panel))
+    monkeypatch.setattr(svc, '_send_admin_notification', AsyncMock())
+    return extend, replace
+
+
+@pytest.mark.asyncio
+async def test_gift_over_a_paid_subscription_keeps_its_three_devices(monkeypatch):
+    tariff = SimpleNamespace(id=3, name='Базовый', device_limit=1, traffic_limit_gb=0)
+    existing = _existing(tariff_id=3, is_trial=False, device_limit=3, days_left=40)
+    extend, replace = _wire(monkeypatch, existing=existing, tariff=tariff)
+    purchase, user = _purchase(), _user()
+
+    result = await svc.activate_purchase(_db(purchase, user), purchase.token, skip_notification=True)
+
+    extend.assert_awaited_once()
+    kwargs = extend.await_args.kwargs
+    assert kwargs['device_limit'] == 3, 'оплаченные устройства нельзя отнимать подарком'
+    assert kwargs['tariff_id'] == 3
+    assert extend.await_args.args[2] == 30, 'подарок продлевает ровно на купленные дни'
+    replace.assert_not_awaited()
+    assert result.status == svc.GuestPurchaseStatus.DELIVERED.value
+
+
+@pytest.mark.asyncio
+async def test_gift_over_a_trial_takes_exactly_the_gift_base(monkeypatch):
+    tariff = SimpleNamespace(id=3, name='Базовый', device_limit=1, traffic_limit_gb=0)
+    # Пробная на своём тарифе (5) и с большим лимитом: конверсия подарком разрешена,
+    # но пробные устройства полом не становятся.
+    existing = _existing(tariff_id=5, is_trial=True, device_limit=3, days_left=2)
+    extend, _ = _wire(monkeypatch, existing=existing, tariff=tariff)
+    purchase, user = _purchase(), _user()
+
+    await svc.activate_purchase(_db(purchase, user), purchase.token, skip_notification=True)
+
+    extend.assert_awaited_once()
+    assert extend.await_args.kwargs['device_limit'] == 1
+
+
+@pytest.mark.asyncio
+async def test_gift_of_another_tariff_over_an_active_paid_subscription_is_refused(monkeypatch):
+    """ДУ-1б: другу на Team (бесплатный, до 2031) подарок «Базового» стёр бы срок до 30 дней."""
+    tariff = SimpleNamespace(id=3, name='Базовый', device_limit=1, traffic_limit_gb=0)
+    existing = _existing(tariff_id=4, is_trial=False, device_limit=3, days_left=1500)
+    extend, replace = _wire(monkeypatch, existing=existing, tariff=tariff)
+    purchase, user = _purchase(), _user()
+    db = _db(purchase, user)
+
+    with pytest.raises(svc.GuestPurchaseError) as error:
+        await svc.activate_purchase(db, purchase.token, skip_notification=True)
+
+    assert error.value.status_code == 409
+    assert 'другого тарифа' in error.value.message
+    extend.assert_not_awaited()
+    replace.assert_not_awaited()
+    db.rollback.assert_awaited()
+    assert purchase.status == svc.GuestPurchaseStatus.PENDING_ACTIVATION.value, 'деньги дарителя остаются в покупке'
+
+
+@pytest.mark.asyncio
+async def test_gift_over_an_expired_subscription_starts_fresh_on_the_gift_base(monkeypatch):
+    """Решение владельца 1А (14.09.2026): истёкшая подписка получает свежий месяц на базе подарка."""
+    tariff = SimpleNamespace(id=3, name='Базовый', device_limit=1, traffic_limit_gb=0)
+    existing = _existing(tariff_id=3, is_trial=False, device_limit=3, days_left=-5)
+    extend, replace = _wire(monkeypatch, existing=existing, tariff=tariff)
+    purchase, user = _purchase(), _user()
+
+    await svc.activate_purchase(_db(purchase, user), purchase.token, skip_notification=True)
+
+    extend.assert_not_awaited()
+    replace.assert_awaited_once()
+    assert replace.await_args.kwargs['device_limit'] == 1
