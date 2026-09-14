@@ -21,7 +21,7 @@ from app.database.crud.subscription import (
     get_subscription_by_user_id,
     replace_subscription,
 )
-from app.database.crud.tariff import get_tariff_by_id
+from app.database.crud.tariff import get_tariff_by_id, get_trial_tariff
 from app.database.crud.transaction import create_transaction
 from app.database.crud.user import _get_or_create_default_promo_group, create_unique_referral_code
 from app.database.models import (
@@ -29,6 +29,7 @@ from app.database.models import (
     GuestPurchaseStatus,
     LandingPage,
     PaymentMethod,
+    Subscription,
     Tariff,
     Transaction,
     TransactionType,
@@ -1202,6 +1203,37 @@ async def notify_gift_claim_available(
             logger.warning('Failed to send gift link to buyer', purchase_id=purchase.id, exc_info=True)
 
 
+def _is_real_trial(existing: Subscription, trial_tariff_id: int | None) -> bool:
+    """Настоящая пробная — пробная НА ПРОБНОМ ТАРИФЕ, а не просто с флагом `is_trial`.
+
+    🔴 Флагу верить нельзя: 21 из 31 подписки Team (друзья владельца, срок до 2031) несёт
+    `is_trial=True` и по флагу неотличима от трёхдневного теста (состояние работ, ТИМ-1).
+    Судить по каноническому пробному тарифу (`get_trial_tariff`) — рецепт ТИМ-1/ПД-1.
+    Если пробного тарифа нет вовсе — никого пробным не считаем (безопасная сторона:
+    устройства не режем, чужой тариф не переписываем).
+    """
+    return bool(existing.is_trial) and trial_tariff_id is not None and existing.tariff_id == trial_tariff_id
+
+
+def _gift_extend_device_limit(tariff: Tariff, existing: Subscription, *, trial_tariff_id: int | None) -> int:
+    """Лимит устройств при продлении СУЩЕСТВУЮЩЕЙ подписки подарком (этап ДУ-1).
+
+    🔴 Раньше сюда уходила голая база тарифа подарка, а `extend_subscription` присваивает
+    лимит без разговоров — платная подписка на 3 устройствах после подарка «Базового»
+    (база 1) получала лимит 1, и панель тут же отключала два оплаченных устройства.
+    Правило — зеркало кассы (`device_first_checkout_service._complete_direct_sale_locked`):
+    у ПЛАТНОЙ никогда не ниже текущего, у НАСТОЯЩЕЙ ПРОБНОЙ (см. `_is_real_trial`) — строго
+    база подарка (пробные устройства не становятся полом, ОУ-1.3). `is_trial` = NULL и
+    «пробная» на непробном тарифе (Team) считаются платными.
+    ⚠️ Подаренный срок идёт на текущем числе устройств получателя, а оплачен по базе —
+    принято владельцем 14.09.2026 (решение 3А), не «забыто».
+    """
+    base = int(tariff.device_limit or 0)
+    if _is_real_trial(existing, trial_tariff_id):
+        return base
+    return max(base, int(existing.device_limit or 0))
+
+
 async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notification: bool = False) -> GuestPurchase:
     """Activate a PENDING_ACTIVATION purchase by replacing or creating a subscription.
 
@@ -1264,6 +1296,8 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
 
         entitlement = await resolve_tariff_entitlement(db, tariff)
         squads = list(entitlement.squad_uuids)
+        trial_tariff = await get_trial_tariff(db)
+        trial_tariff_id = trial_tariff.id if trial_tariff is not None else None
 
         # In multi-tariff mode, always create a new subscription (new Remnawave user)
         if settings.is_multi_tariff_enabled():
@@ -1282,7 +1316,9 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                     existing_for_tariff,
                     purchase.period_days,
                     traffic_limit_gb=tariff.traffic_limit_gb,
-                    device_limit=tariff.device_limit,
+                    device_limit=_gift_extend_device_limit(
+                        tariff, existing_for_tariff, trial_tariff_id=trial_tariff_id
+                    ),
                     connected_squads=squads,
                     commit=False,
                 )
@@ -1320,6 +1356,38 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                 and existing_subscription.end_date is not None
                 and _aware(existing_subscription.end_date) > datetime.now(UTC)
             )
+            if (
+                existing_subscription is not None
+                and _sub_has_time
+                # Пропускаем только НАСТОЯЩУЮ пробную (на пробном тарифе): её конверсия
+                # подарком — штатный путь. «Пробная» по флагу на Team — это друг «до 2031».
+                and not _is_real_trial(existing_subscription, trial_tariff_id)
+                # Классическую подписку без тарифа (tariff_id IS NULL) забор пропускает:
+                # для неё подарок — переход на тариф с переносом остатка, как и до этапа.
+                and existing_subscription.tariff_id is not None
+                and existing_subscription.tariff_id != tariff.id
+            ):
+                # 🔴 ДУ-1б. Подарок на ДРУГОЙ тариф поверх действующей платной подписки —
+                # это смена тарифа внутри `extend_subscription`: `tariff_id`, сквады, трафик
+                # переписываются тарифом подарка, а остаток срока с бесплатного тарифа
+                # сгорает (`TARIFF_SWITCH_RESET_FREE_DAYS`). Друг на Team «до 2031» после
+                # подарка «Базового» остался бы с 30 днями. Пробную подписку не запираем:
+                # её конверсия подарком — штатный путь.
+                # Отказ виден владельцу только здесь: деньги дарителя остаются в покупке
+                # (PAID), автовозврата в проекте нет — разбирать руками по этой строке.
+                # Уровень error, а не warning: в Telegram-тему «ошибки» уходят только
+                # error-события (`app/logging_handler.py`, TelegramNotifierProcessor).
+                logger.error(
+                    'gift_refused_other_tariff',
+                    purchase_id=purchase.id,
+                    user_id=user.id,
+                    existing_tariff_id=existing_subscription.tariff_id,
+                    gift_tariff_id=tariff.id,
+                )
+                raise GuestPurchaseError(
+                    'Подарок нельзя применить к действующей подписке другого тарифа. Напишите в поддержку.',
+                    status_code=409,
+                )
             if existing_subscription is not None and _sub_has_time:
                 # Extend existing active subscription (preserve remaining days)
                 subscription = await extend_subscription(
@@ -1328,7 +1396,9 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                     purchase.period_days,
                     tariff_id=tariff.id,
                     traffic_limit_gb=tariff.traffic_limit_gb,
-                    device_limit=tariff.device_limit,
+                    device_limit=_gift_extend_device_limit(
+                        tariff, existing_subscription, trial_tariff_id=trial_tariff_id
+                    ),
                     connected_squads=squads,
                     commit=False,
                 )

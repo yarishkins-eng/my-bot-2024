@@ -174,6 +174,7 @@ async def _activate_pending_gift_after_registration(
 
         from app.services.guest_purchase_service import (
             GIFT_TOKEN_MIN_PREFIX_LENGTH,
+            GuestPurchaseError,
             activate_purchase as svc_activate,
         )
 
@@ -244,6 +245,27 @@ async def _activate_pending_gift_after_registration(
             f'Ваша подписка обновлена.',
             parse_mode=ParseMode.HTML,
         )
+    except GuestPurchaseError as exc:
+        # ДУ-1б: отказ с причиной (409 «подписка другого тарифа») человек должен прочитать
+        # здесь же — диплинк единственный живой вход подарка в бот. Зеркало кнопки
+        # `handlers/gift_activation.py`; сбой сервера (5xx) остаётся общим текстом ниже.
+        logger.warning(
+            'Gift activation via deep link refused',
+            token_prefix=(gift_token or '')[:5],
+            error=exc.message,
+        )
+        # `raise` отсюда не попал бы в соседний `except Exception` — поэтому общий текст
+        # для 5xx повторяется здесь, а не пробрасывается.
+        text = (
+            '❌ Произошла ошибка при активации подарка. Попробуйте активировать через личный кабинет.'
+            if exc.status_code >= 500
+            # Без экранирования: при `parse_mode=None` Telegram показал бы сущности буквально.
+            else f'Не удалось активировать подарок: {exc.message}'
+        )
+        try:
+            await answer_func(text, parse_mode=None)
+        except Exception:
+            pass
     except Exception:
         logger.exception(
             'Failed to auto-activate gift after registration',
