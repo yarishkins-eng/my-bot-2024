@@ -43,9 +43,14 @@ def test_gift_extend_device_limit_never_lowers_a_paid_subscription(is_trial, tar
     assert svc._gift_extend_device_limit(tariff, existing, trial_tariff_id=TRIAL_TARIFF_ID) == expected
 
 
-def test_without_a_trial_tariff_nobody_counts_as_a_trial():
-    """Нет пробного тарифа — никого не считаем пробным (безопасная сторона: устройства не режем)."""
-    existing = SimpleNamespace(is_trial=True, tariff_id=5, device_limit=3)
+@pytest.mark.parametrize('tariff_id', [5, None])
+def test_without_a_trial_tariff_nobody_counts_as_a_trial(tariff_id):
+    """Нет пробного тарифа — никого не считаем пробным (безопасная сторона: устройства не режем).
+
+    `tariff_id=None` вместе с `trial_tariff_id=None` — мутация MD5: сравнение `None == None` не должно
+    делать классическую подписку «пробной».
+    """
+    existing = SimpleNamespace(is_trial=True, tariff_id=tariff_id, device_limit=3)
     assert svc._gift_extend_device_limit(SimpleNamespace(device_limit=1), existing, trial_tariff_id=None) == 3
 
 

@@ -259,7 +259,8 @@ async def _activate_pending_gift_after_registration(
         text = (
             '❌ Произошла ошибка при активации подарка. Попробуйте активировать через личный кабинет.'
             if exc.status_code >= 500
-            else f'Не удалось активировать подарок: {html.escape(exc.message)}'
+            # Без экранирования: при `parse_mode=None` Telegram показал бы сущности буквально.
+            else f'Не удалось активировать подарок: {exc.message}'
         )
         try:
             await answer_func(text, parse_mode=None)
