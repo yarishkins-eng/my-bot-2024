@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.services import device_first_checkout_service as service_module
+from app.services.admin_notification_service import NotificationCategory
 from app.services.device_first_checkout_service import (
     READY_NOTIFICATION_TYPE,
     RETRYABLE_NOTIFICATION_TYPES,
@@ -349,3 +350,72 @@ async def test_direct_sale_queues_the_row_before_flipping_the_paid_flag(monkeypa
 
     assert seen_flag == [False], 'строка ставится ДО переворота флага, иначе первая продажа станет «Продление»'
     assert user.has_had_paid_subscription is True
+
+
+# --- сторожа на пережившие мутации (волна 2, мутационный скептик) ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('kind', 'categories', 'expected_status'),
+    [
+        ('first', {NotificationCategory.PURCHASES: False}, 'obsolete'),
+        ('repeat', {NotificationCategory.RENEWALS: False}, 'obsolete'),
+        ('first', {NotificationCategory.RENEWALS: False}, 'sent'),  # чужая категория продажу не гасит
+        ('repeat', {NotificationCategory.PURCHASES: False}, 'sent'),
+    ],
+)
+async def test_sale_card_respects_exactly_its_own_category_switch(kind, categories, expected_status):
+    row = _outbox_row(1, f'{SALE_NOTIFICATION_PREFIX}{kind}')
+    admin = _admin(categories=categories)
+    await _run(
+        [row],
+        checkout=_checkout(funding_mode='wallet'),
+        admin=admin,
+        attempt=None,
+        loads_entities=expected_status == 'sent',
+    )
+
+    assert row.status == expected_status
+
+
+@pytest.mark.asyncio
+async def test_payment_attempt_is_picked_by_credited_amount_then_newest():
+    """У заказа бывает несколько попыток (сорвавшаяся + оплаченная): берём оплаченную, а при
+    равенстве — последнюю. Моки кладут одну строку, поэтому порядок проверяем по самому запросу."""
+    checkout = _checkout()
+    statements = []
+
+    async def execute(stmt):
+        statements.append(str(stmt))
+        for model, value in (
+            ('users', _user()),
+            ('subscriptions', SimpleNamespace(id=104)),
+            ('transactions', SimpleNamespace(id=594)),
+            ('checkout_payment_attempts', SimpleNamespace(provider_method_code=2)),
+        ):
+            if f'FROM {model}' in str(stmt):
+                return _Result([value])
+        raise AssertionError(str(stmt))
+
+    db = SimpleNamespace(execute=execute)
+    admin = _admin()
+    with patch('app.services.admin_notification_service.AdminNotificationService', return_value=admin):
+        assert await service_module._send_owner_sale_card(db, bot=MagicMock(), checkout=checkout, first=True)
+
+    attempt_query = next(s for s in statements if 'FROM checkout_payment_attempts' in s)
+    order_by = attempt_query.split('ORDER BY', 1)[1]
+    assert 'credited_amount_kopeks DESC' in order_by and 'id DESC' in order_by
+    assert 'LIMIT' in attempt_query
+    assert admin.send_subscription_purchase_notification.await_args.kwargs['payment_label'] == 'по СБП'
+
+
+def test_unknown_platega_method_still_names_the_provider():
+    """Новый код метода у Platega не должен превращаться в пустую метку — карточка молча
+    потеряла бы способ оплаты."""
+    from app.services.admin_notification_service import platega_method_label
+
+    assert platega_method_label(2) == 'по СБП'
+    assert platega_method_label('11') == 'картой'
+    assert platega_method_label(99) == 'через Platega'
+    assert platega_method_label(None) == 'через Platega'

@@ -904,3 +904,41 @@ async def test_second_topup_of_someone_who_still_has_not_bought_is_not_first() -
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>💰 Пополнение — 100 ₽ через Platega</b>'
     assert 'По приглашению' not in text
+
+
+# --- сторожа на пережившие мутации (волна 2, мутационный скептик) ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('balance_after', 'total_price', 'expected_tail'),
+    [
+        (24900, 24900, 'Дальше — продление подписки на 30 дней (Базовый), карточка придёт следом'),  # ровно хватает
+        (24900, 0, 'В корзине — продление подписки на 30 дней (Базовый), бот сам не спишет'),  # битая корзина
+    ],
+)
+async def test_cart_hint_boundaries_match_the_auto_purchase(balance_after, total_price, expected_tail) -> None:
+    service = _service()
+    cart = dict(_CART, total_price=total_price)
+    with (
+        patch('app.services.user_cart_service.user_cart_service.get_user_cart', AsyncMock(return_value=cart)),
+        patch('app.services.user_cart_service.user_cart_service.has_topup_intent', AsyncMock(return_value=True)),
+        patch.object(type(settings), 'is_auto_purchase_after_topup_enabled', return_value=True),
+    ):
+        await service.send_balance_topup_notification(
+            _user(balance_kopeks=balance_after),
+            _transaction(amount_kopeks=balance_after - 100, payment_method='platega', description='Пополнение'),
+            100,
+            topup_status='🔄 Пополнение',
+            referrer_info='Нет',
+            subscription=_subscription(tariff=_tariff()),
+            promo_group=None,
+        )
+    text, _ = _sent(service)
+    assert _assert_card_shape(text)[2].endswith(expected_tail)
+
+
+def test_subscription_state_survives_a_tariff_named_with_until() -> None:
+    subscription = _subscription(tariff=_tariff(name='Тариф до 3 устройств'), device_limit=3)
+    state = AdminNotificationService._owner_subscription_state(subscription, subscription.tariff)
+    assert state == 'Тариф до 3 устройств, 3 устройства, до 16.09'

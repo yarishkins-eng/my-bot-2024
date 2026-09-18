@@ -245,3 +245,18 @@ async def test_customer_receipt_failure_remains_retryable(monkeypatch: pytest.Mo
             intent=SimpleNamespace(public_id='intent-3', subscription_id=None),
             payment=SimpleNamespace(metadata_json={'device_addon_attempt_id': 48}),
         )
+
+
+def test_addon_topup_receipt_carries_the_platega_method_name() -> None:
+    """К-2: по «(имени метода)» в описании карточка владельцу пишет «по СБП», а не «через Platega».
+    Путь `_settle_locked` целиком в тестах не поднимается — сторожим само место, как
+    `tests/database/test_money_in_pays_referral.py`."""
+    import inspect
+
+    from app.services import device_addon_payment_service as module
+
+    source = inspect.getsource(module._settle_locked)
+    assert (
+        "f'Пополнение через Platega ({settings.get_platega_method_display_name(int(attempt.provider_method_code))})'"
+        in source
+    )
