@@ -32,7 +32,6 @@ LOGO_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.svg']
 BRANDING_NAME_KEY = 'CABINET_BRANDING_NAME'
 BRANDING_LOGO_KEY = 'CABINET_BRANDING_LOGO'  # Stores "custom" or "default"
 THEME_COLORS_KEY = 'CABINET_THEME_COLORS'  # Stores JSON with theme colors
-ENABLED_THEMES_KEY = 'CABINET_ENABLED_THEMES'  # Stores JSON with enabled themes {"dark": true, "light": false}
 ANIMATION_ENABLED_KEY = 'CABINET_ANIMATION_ENABLED'  # Stores "true" or "false"
 FULLSCREEN_ENABLED_KEY = 'CABINET_FULLSCREEN_ENABLED'  # Stores "true" or "false"
 EMAIL_AUTH_ENABLED_KEY = 'CABINET_EMAIL_AUTH_ENABLED'  # Stores "true" or "false"
@@ -83,17 +82,13 @@ class BrandingNameUpdate(BaseModel):
 
 
 class ThemeColorsResponse(BaseModel):
-    """Theme colors settings."""
+    """Theme colors settings. The cabinet is dark-only (17.09.2026): no light fields, no theme toggle."""
 
     accent: str = '#3b82f6'
     darkBackground: str = '#0a0f1a'
     darkSurface: str = '#0f172a'
     darkText: str = '#f1f5f9'
     darkTextSecondary: str = '#94a3b8'
-    lightBackground: str = '#F7E7CE'
-    lightSurface: str = '#FEF9F0'
-    lightText: str = '#1F1A12'
-    lightTextSecondary: str = '#7D6B48'
     success: str = '#22c55e'
     warning: str = '#f59e0b'
     error: str = '#ef4444'
@@ -107,27 +102,9 @@ class ThemeColorsUpdate(BaseModel):
     darkSurface: str | None = None
     darkText: str | None = None
     darkTextSecondary: str | None = None
-    lightBackground: str | None = None
-    lightSurface: str | None = None
-    lightText: str | None = None
-    lightTextSecondary: str | None = None
     success: str | None = None
     warning: str | None = None
     error: str | None = None
-
-
-class EnabledThemesResponse(BaseModel):
-    """Enabled themes settings."""
-
-    dark: bool = True
-    light: bool = True
-
-
-class EnabledThemesUpdate(BaseModel):
-    """Request to update enabled themes."""
-
-    dark: bool | None = None
-    light: bool | None = None
 
 
 class AnimationEnabledResponse(BaseModel):
@@ -338,10 +315,6 @@ DEFAULT_THEME_COLORS = {
     'darkSurface': '#0f172a',
     'darkText': '#f1f5f9',
     'darkTextSecondary': '#94a3b8',
-    'lightBackground': '#F7E7CE',
-    'lightSurface': '#FEF9F0',
-    'lightText': '#1F1A12',
-    'lightTextSecondary': '#7D6B48',
     'success': '#22c55e',
     'warning': '#f59e0b',
     'error': '#ef4444',
@@ -667,64 +640,6 @@ async def reset_theme_colors(
     logger.info('Admin reset theme colors to defaults', telegram_id=admin.telegram_id)
 
     return ThemeColorsResponse(**DEFAULT_THEME_COLORS)
-
-
-# ============ Enabled Themes Routes ============
-
-DEFAULT_ENABLED_THEMES = {'dark': True, 'light': True}
-
-
-@router.get('/themes', response_model=EnabledThemesResponse)
-async def get_enabled_themes(
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """
-    Get which themes are enabled.
-    This is a public endpoint - no authentication required.
-    """
-    themes_json = await get_setting_value(db, ENABLED_THEMES_KEY)
-
-    if themes_json:
-        try:
-            themes = json.loads(themes_json)
-            return EnabledThemesResponse(**themes)
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    return EnabledThemesResponse(**DEFAULT_ENABLED_THEMES)
-
-
-@router.patch('/themes', response_model=EnabledThemesResponse)
-async def update_enabled_themes(
-    payload: EnabledThemesUpdate,
-    admin: User = Depends(require_permission('settings:edit')),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Update which themes are enabled. Admin only. At least one theme must be enabled."""
-    # Get current settings
-    themes_json = await get_setting_value(db, ENABLED_THEMES_KEY)
-    current_themes = DEFAULT_ENABLED_THEMES.copy()
-
-    if themes_json:
-        try:
-            current_themes.update(json.loads(themes_json))
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    # Update with new values
-    update_data = payload.model_dump(exclude_none=True)
-    current_themes.update(update_data)
-
-    # Ensure at least one theme is enabled
-    if not current_themes.get('dark') and not current_themes.get('light'):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='At least one theme must be enabled')
-
-    # Save to database
-    await set_setting_value(db, ENABLED_THEMES_KEY, json.dumps(current_themes))
-
-    logger.info('Admin updated enabled themes', telegram_id=admin.telegram_id, current_themes=current_themes)
-
-    return EnabledThemesResponse(**current_themes)
 
 
 # ============ Animation Routes ============
