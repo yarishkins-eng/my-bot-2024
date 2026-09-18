@@ -58,6 +58,12 @@ def _frozen_now():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_cart():
+    with patch('app.services.user_cart_service.user_cart_service.get_user_cart', AsyncMock(return_value=None)):
+        yield
+
+
 def _service() -> AdminNotificationService:
     service = AdminNotificationService(MagicMock())
     service._send_message = AsyncMock(return_value=True)
@@ -157,7 +163,7 @@ async def test_addon_card_explains_prorated_price() -> None:
     lines = _assert_card_shape(text)
     assert category is NotificationCategory.ADDONS
     assert lines[0] == '<b>📱 Докупка устройств — 7 ₽</b>'
-    assert lines[1] == 'nikitaa @lilgaandelf · Базовый'
+    assert lines[1] == 'Докупил(а) nikitaa @lilgaandelf · Базовый'
     assert lines[2] == '+1 устройство, стало 3 · 7 ₽ — это 70 ₽/мес за 3 дня до конца подписки (16.09)'
     assert '2 → 3' not in text
 
@@ -228,7 +234,7 @@ async def test_card_falls_back_to_username_or_id_when_name_is_missing() -> None:
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>📊 Докупка трафика — бесплатно</b>'
-    assert lines[1] == '@&lt;evil&gt;'
+    assert lines[1] == 'Получил(а) @&lt;evil&gt;'
     assert lines[2] == '50 ГБ → 100 ГБ'
 
 
@@ -253,7 +259,7 @@ async def test_renewal_card_explains_price_and_never_says_from_balance() -> None
     lines = _assert_card_shape(text)
     assert category is NotificationCategory.RENEWALS
     assert lines[0] == '<b>⏰ Продление — 289 ₽</b>'
-    assert lines[1] == 'nikitaa @lilgaandelf · Базовый'
+    assert lines[1] == 'Продлил(а) nikitaa @lilgaandelf · Базовый'
     assert lines[2] == '+30 дней, до 16.10 · 3 устройства'
     assert lines[3] == 'Цена: тариф 149 ₽ + устройства 2 × 70 ₽'
     assert 'По приглашению' not in text
@@ -302,8 +308,9 @@ async def test_topup_card_names_the_method_in_owner_words() -> None:
     lines = _assert_card_shape(text)
     assert category is NotificationCategory.BALANCE
     assert lines[0] == '<b>💰 Пополнение — 249 ₽ по СБП</b>'
-    assert lines[1] == 'nikitaa @lilgaandelf · Базовый до 16.09'
-    assert lines[2] == 'Баланс: 1 ₽ → 250 ₽'
+    assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
+    assert lines[2] == 'На балансе было 1 ₽, стало 250 ₽. Покупки не было — деньги лежат'
+    assert lines[3] == 'Подписка сейчас: Базовый, 3 устройства, до 16.09'
     assert 'бонус' not in text
     assert 'По приглашению' not in text
 
@@ -313,7 +320,7 @@ async def test_first_topup_card_shows_referrer_without_internal_id() -> None:
     service = _service()
     transaction = _transaction(amount_kopeks=19900, payment_method='platega', description='Пополнение через Platega')
     await service.send_balance_topup_notification(
-        _user(balance_kopeks=29900),
+        _user(balance_kopeks=29900, has_had_paid_subscription=False),
         transaction,
         0,
         topup_status='🆕 Первое пополнение',
@@ -324,8 +331,9 @@ async def test_first_topup_card_shows_referrer_without_internal_id() -> None:
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>💰 Первое пополнение — 199 ₽ через Platega</b>'
-    assert lines[1] == 'nikitaa @lilgaandelf · без подписки'
-    assert lines[2] == 'Баланс: 0 ₽ → 299 ₽ (в т.ч. бонус 100 ₽)'
+    assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
+    assert lines[2] == 'На балансе было 0 ₽, стало 299 ₽ (в т.ч. бонус 100 ₽). Покупки не было — деньги лежат'
+    assert lines[3] == 'Подписка сейчас: нет'
     assert 'По приглашению @kozyr20' in lines
     assert '(ID: 123)' not in text
 
@@ -333,16 +341,19 @@ async def test_first_topup_card_shows_referrer_without_internal_id() -> None:
 @pytest.mark.parametrize(
     ('subscription', 'expected'),
     [
-        (_subscription(tariff=_tariff(), status='limited', is_active=False), 'Базовый до 16.09, трафик исчерпан'),
+        (
+            _subscription(tariff=_tariff(), status='limited', is_active=False),
+            'Базовый, 3 устройства, до 16.09, трафик исчерпан',
+        ),
         (_subscription(tariff=_tariff(), status='disabled', is_active=False), 'Базовый, выключена'),
         (_subscription(status='expired', is_active=False, end_date=NOW - timedelta(days=1)), 'подписка истекла 12.09'),
         (
             _subscription(tariff=_tariff(), status='expired', is_active=False, end_date=NOW - timedelta(days=1)),
             'Базовый, истекла 12.09',
         ),
-        (_subscription(is_trial=True), 'пробный до 16.09'),
+        (_subscription(is_trial=True, device_limit=1), 'пробный, 1 устройство, до 16.09'),
         (_subscription(is_trial=True, end_date=NOW - timedelta(hours=20)), 'пробный истёк 12.09'),
-        (_subscription(status='active', is_active=True), 'подписка до 16.09'),
+        (_subscription(status='active', is_active=True, device_limit=5), 'подписка, 5 устройств, до 16.09'),
     ],
 )
 @pytest.mark.asyncio
@@ -360,7 +371,8 @@ async def test_topup_card_names_subscription_state_honestly(subscription, expect
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>💰 Пополнение — 100 ₽ вручную</b>'
-    assert lines[1] == f'nikitaa @lilgaandelf · {expected}'
+    assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
+    assert f'Подписка сейчас: {expected}' in lines
     assert 'Комментарий: Пополнение администратором' in lines
 
 
@@ -385,7 +397,7 @@ async def test_trial_card_is_short_and_names_the_referrer() -> None:
     lines = _assert_card_shape(text)
     assert category is NotificationCategory.TRIALS
     assert lines[0] == '<b>🎁 Пробный период</b>'
-    assert lines[1] == 'nikitaa @lilgaandelf'  # тариф самого пробного заголовок не дублирует
+    assert lines[1] == 'Взял(а) пробный nikitaa @lilgaandelf'  # тариф пробного заголовок не дублирует
     assert lines[2] == '7 дней, 1 устройство, 5 ГБ, до 20.09'
     assert lines[3] == 'По приглашению @kozyr20'
     assert 'Раньше уже платил' not in text
@@ -402,7 +414,7 @@ async def test_trial_card_flags_a_person_who_already_paid_before() -> None:
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>🎁 Пробный период — 50 ₽</b>'
-    assert lines[1] == 'nikitaa @lilgaandelf'
+    assert lines[1] == 'Взял(а) пробный nikitaa @lilgaandelf'
     assert lines[2] == '60 дней, 2 устройства, до 16.09'
     assert lines[3] == '⚠️ Раньше уже платил(а) — пробный выдан повторно'
 
@@ -498,7 +510,7 @@ async def test_client_without_username_gets_id_so_he_can_be_found() -> None:
         )
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
-    assert lines[1] == 'Алексей · ID 1629864309 · Базовый'
+    assert lines[1] == 'Продлил(а) Алексей · ID 1629864309 · Базовый'
 
 
 @pytest.mark.asyncio
@@ -538,7 +550,8 @@ async def test_html_in_name_tariff_and_admin_comment_is_escaped_everywhere() -> 
     )
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
-    assert lines[1] == 'Анна &amp; &lt;Co&gt; @lilgaandelf · Базовый &lt;VIP&gt; &amp; Co до 16.09'
+    assert lines[1] == 'Пополнил(а) Анна &amp; &lt;Co&gt; @lilgaandelf'
+    assert 'Подписка сейчас: Базовый &lt;VIP&gt; &amp; Co, 3 устройства, до 16.09' in lines
     assert 'Комментарий: см. &lt;тикет&gt; &amp; чек' in lines  # и без пробелов по краям
     assert '<Co>' not in text and '<VIP>' not in text and '<тикет>' not in text
 
@@ -593,7 +606,8 @@ async def test_trial_that_ends_this_very_second_is_already_expired() -> None:
     )
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
-    assert lines[1] == 'nikitaa @lilgaandelf · пробный истёк 13.09'
+    assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
+    assert 'Подписка сейчас: пробный истёк 13.09' in lines
 
 
 @pytest.mark.asyncio
@@ -634,7 +648,8 @@ async def test_disabled_trial_with_future_end_is_not_called_running(subscription
     )
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
-    assert lines[1] == f'nikitaa @lilgaandelf · {expected}'
+    assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
+    assert f'Подписка сейчас: {expected}' in lines
 
 
 @pytest.mark.asyncio
