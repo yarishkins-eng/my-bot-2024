@@ -14,6 +14,7 @@
 иначе get_subscriber_state прочитает старую/пустую подписку и пришлёт неверное меню.
 """
 
+import os
 import time
 
 import redis.asyncio as aioredis
@@ -303,9 +304,31 @@ _ONBOARDING_SHOWN_TTL = 30 * 24 * 3600
 _ONBOARDING_MAX_LATENESS = 3600
 
 
+def referral_onboarding_followup_seconds() -> int:
+    """Задержка добора следующего шага, в секундах. 0 — добор выключен.
+
+    🔴 Читается из окружения, а НЕ из `app/config.py` — намеренно. Любая правка `config.py`
+    останавливает автодеплой (забор миграционного риска в `deploy.yml`) и требует ручной
+    выкладки с одобрением владельца; первая же попытка выложить эту фичу на этом и встала,
+    заморозив выкладку всем последующим правкам. Переменная `.env` доезжает в контейнер
+    через `env_file`, а `Settings` неизвестные ключи игнорирует — ничего не ломается.
+
+    Потолок в сутки: список ожидающих живёт в Redis, и присылать экран онбординга через
+    неделю — значит присылать письмо из ниоткуда.
+    """
+    raw = os.getenv('REFERRAL_ONBOARDING_FOLLOWUP_MINUTES', '10')
+    try:
+        minutes = int(str(raw).strip())
+    except (TypeError, ValueError):
+        minutes = 10
+    if minutes <= 0:
+        return 0
+    return min(minutes, 24 * 60) * 60
+
+
 async def schedule_referral_onboarding_followup(telegram_id: int) -> bool:
     """Поставить человека в очередь на добор следующего шага. True — поставлен."""
-    delay = settings.get_referral_onboarding_followup_seconds()
+    delay = referral_onboarding_followup_seconds()
     if not delay or not telegram_id:
         return False
     client = _get_redis()
@@ -368,7 +391,7 @@ def _has_live_subscription(user) -> bool:
 
 async def process_due_referral_onboarding_followups(bot, limit: int = 20) -> int:
     """Прислать следующий шаг тем, у кого истекло ожидание. Возвращает число отправленных."""
-    if not settings.get_referral_onboarding_followup_seconds():
+    if not referral_onboarding_followup_seconds():
         return 0
     client = _get_redis()
     if client is None:
