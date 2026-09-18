@@ -3,6 +3,7 @@
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
+import structlog
 from sqlalchemy import select, text
 
 from app.database.models import (
@@ -15,6 +16,9 @@ from app.database.models import (
     SubscriptionEntitlementTerm,
     User,
 )
+
+
+logger = structlog.get_logger(__name__)
 
 
 RESET_BUSY = frozenset({'resetting', 'failed'})
@@ -236,6 +240,14 @@ async def _run_reset_under_account_activity(db, *, user_id: int, admin_id: int, 
         await reset_bypass(db)
         result = await _reset_test_account_unlocked(db, current, admin_id, confirm=True)
         if result.done:
+            # Стенд обязан быть повторяемым: отметка «онбординг показан» живёт в Redis 30 дней
+            # по telegram_id и сброс базы её не касается. Лучшее из возможного, сброс не ломает.
+            try:
+                from app.utils.funnel_notify import forget_referral_onboarding
+
+                await forget_referral_onboarding(getattr(current, 'telegram_id', None))
+            except Exception as exc:
+                logger.warning('Не удалось забыть онбординг при сбросе стенда', error=str(exc))
             return result
     except Exception:
         await db.rollback()

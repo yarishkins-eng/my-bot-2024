@@ -366,3 +366,36 @@ async def test_followup_cannot_hold_the_money_worker_hostage(monkeypatch) -> Non
 
     assert time.monotonic() - started < 1, 'проход обязан оборваться по потолку, а не ждать добор'
     assert result == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_by_the_worker_timeout_returns_the_right_to_show(redis, monkeypatch):
+    """🔴 Обрыв по потолку времени — не Exception. Без отдельной ветки право показа оставалось
+
+    занятым на 30 дней, и человек не получал экран ни по таймеру, ни по кнопке. Вход
+    реалистичный: база занята дольше потолка ровно в минуту добора. Ревизия 18.09.2026.
+    """
+    import asyncio
+
+    _delay(monkeypatch, 10)
+    await funnel_notify.schedule_referral_onboarding_followup(1010)
+    redis.zset['1010'] = time.time() - 1
+
+    with _run(AsyncMock(side_effect=asyncio.CancelledError())):
+        with pytest.raises(asyncio.CancelledError):
+            await funnel_notify.process_due_referral_onboarding_followups(bot=AsyncMock())
+
+    assert await funnel_notify.claim_referral_onboarding(1010) is True, 'кнопка обязана сработать после обрыва'
+
+
+@pytest.mark.asyncio
+async def test_forget_clears_both_the_queue_and_the_shown_mark(redis, monkeypatch):
+    """Сброс тестового аккаунта обязан делать стенд повторяемым."""
+    _delay(monkeypatch, 10)
+    await funnel_notify.schedule_referral_onboarding_followup(1010)
+    assert await funnel_notify.claim_referral_onboarding(1010) is True
+
+    await funnel_notify.forget_referral_onboarding(1010)
+
+    assert redis.zset == {}
+    assert await funnel_notify.claim_referral_onboarding(1010) is True, 'после сброса всё как в первый раз'
