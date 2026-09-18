@@ -172,7 +172,7 @@ async def test_next_button_appears_when_the_next_step_is_deferred_and_the_letter
     markup = _welcome(send_notification).kwargs['reply_markup']
     assert isinstance(markup, InlineKeyboardMarkup)
     assert [b.callback_data for row in markup.inline_keyboard for b in row] == [REFERRAL_WELCOME_NEXT_CALLBACK]
-    assert markup.inline_keyboard[0][0].text == 'Дальше →'
+    assert markup.inline_keyboard[0][0].text == 'Подключить VPN →'
 
 
 @pytest.mark.asyncio
