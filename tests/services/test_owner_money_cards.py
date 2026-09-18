@@ -354,7 +354,7 @@ async def test_first_topup_card_shows_referrer_without_internal_id() -> None:
         ),
         (_subscription(is_trial=True, device_limit=1), 'пробный, 1 устройство, до 16.09'),
         (_subscription(is_trial=True, end_date=NOW - timedelta(hours=20)), 'пробный истёк 12.09'),
-        (_subscription(status='active', is_active=True, device_limit=5), 'подписка, 5 устройств, до 16.09'),
+        (_subscription(status='active', is_active=True, device_limit=5), 'активна, 5 устройств, до 16.09'),
     ],
 )
 @pytest.mark.asyncio
@@ -942,3 +942,45 @@ def test_subscription_state_survives_a_tariff_named_with_until() -> None:
     subscription = _subscription(tariff=_tariff(name='Тариф до 3 устройств'), device_limit=3)
     state = AdminNotificationService._owner_subscription_state(subscription, subscription.tariff)
     assert state == 'Тариф до 3 устройств, 3 устройства, до 16.09'
+
+
+# --- критик полноты К-2: карточка автопокупки после пополнения ---
+
+
+def test_auto_purchase_after_topup_decides_first_or_renewal_before_the_balance_is_charged() -> None:
+    """🔴 Три автопокупки после пополнения слали `purchase_type='renewal'` всегда: первая покупка
+    новичка приходила владельцу как «⏰ Продление». Флаг переворачивает само списание, поэтому
+    признак снимается ДО него. Путь целиком в тестах не поднимается — сторожим место."""
+    import inspect
+    import re
+
+    from app.services import subscription_auto_purchase_service as auto
+
+    for function in (auto._auto_purchase_tariff, auto._auto_purchase_daily_tariff, auto._process_legacy_generic_cart):
+        source = inspect.getsource(function)
+        assert "purchase_type='first_purchase' if was_first_purchase else 'renewal'" in source, function.__name__
+        decided = source.index("was_first_purchase = not bool(getattr(user, 'has_had_paid_subscription', False))")
+        charged = re.search(r'await (subtract_user_balance|purchase_service\.submit_purchase)\(', source).start()
+        assert decided < charged, f'{function.__name__}: признак снят после списания'
+
+
+@pytest.mark.asyncio
+async def test_explicit_first_purchase_wins_over_an_already_flipped_flag() -> None:
+    """Так зовёт автопокупка: к моменту карточки флаг уже True, но тип передан явно."""
+    service = _service()
+    transaction = _transaction(amount_kopeks=-24900, payment_method='balance', description='Покупка тарифа Базовый')
+    with _patched_tariff(_tariff()):
+        assert await service.send_subscription_purchase_notification(
+            AsyncMock(),
+            _user(has_had_paid_subscription=True),
+            _subscription(end_date=NEW_END_DATE),
+            transaction,
+            30,
+            False,
+            purchase_type='first_purchase',
+        )
+    text, category = _sent(service)
+    lines = _assert_card_shape(text)
+    assert category is NotificationCategory.PURCHASES
+    assert lines[0] == '<b>💎 Первая покупка — 249 ₽</b>'
+    assert lines[1] == 'Купил(а) nikitaa @lilgaandelf · Базовый'

@@ -989,6 +989,10 @@ async def _auto_purchase_tariff(
     saved_promo_expires = getattr(user, 'promo_offer_discount_expires_at', None) if consume_promo else None
 
     # Списываем баланс
+    # 🔴 «Первая покупка» или «Продление» для карточки владельцу решается ЗДЕСЬ, до списания:
+    # `subtract_user_balance(mark_as_paid_subscription=True)` переворачивает флаг, и после него
+    # первая покупка новичка подписывалась «⏰ Продление» (критик полноты К-2, 18.09.2026).
+    was_first_purchase = not bool(getattr(user, 'has_had_paid_subscription', False))
     try:
         description = f'Покупка тарифа {tariff.name} на {format_days_declension(period_days)}'
         success = await subtract_user_balance(
@@ -1147,7 +1151,7 @@ async def _auto_purchase_tariff(
                 transaction,
                 period_days,
                 was_trial_conversion,
-                purchase_type='renewal',
+                purchase_type='first_purchase' if was_first_purchase else 'renewal',
             )
         )
     except Exception as error:
@@ -1340,6 +1344,7 @@ async def _auto_purchase_daily_tariff(
         return False
 
     # Списываем баланс за первый день
+    was_first_purchase = not bool(getattr(user, 'has_had_paid_subscription', False))  # до переворота флага, см. выше
     try:
         description = f'Активация суточного тарифа {tariff.name}'
         success = await subtract_user_balance(
@@ -1521,7 +1526,7 @@ async def _auto_purchase_daily_tariff(
                 transaction,
                 1,
                 was_trial_conversion,
-                purchase_type='renewal',
+                purchase_type='first_purchase' if was_first_purchase else 'renewal',
             )
         )
     except Exception as error:
@@ -3122,6 +3127,7 @@ async def _process_legacy_generic_cart(
         return False
 
     purchase_service = prepared.service
+    was_first_purchase = not bool(getattr(user, 'has_had_paid_subscription', False))  # до переворота флага
 
     try:
         purchase_result = await purchase_service.submit_purchase(
@@ -3168,7 +3174,7 @@ async def _process_legacy_generic_cart(
                 transaction,
                 selection.period.days,
                 was_trial_conversion,
-                purchase_type='renewal',
+                purchase_type='first_purchase' if was_first_purchase else 'renewal',
             )
         except Exception as error:  # pragma: no cover - defensive logging
             logger.error(

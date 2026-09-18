@@ -557,10 +557,12 @@ class AdminNotificationService:
             return f'{name}, выключена' if name else 'подписка выключена'
         if subscription.is_trial:
             return f'пробный истёк {until}' if expired else f'пробный до {until}'
+        # Без подгруженного тарифа (пополнение под докупку грузит подписку голой) — «активна», а не
+        # «подписка»: строка «Подписка сейчас: подписка, 3 устройства» читалась как обрубок
         if subscription.is_active:
-            return f'{name or "подписка"} до {until}'
+            return f'{name or "активна"} до {until}'
         if status == 'limited' and not expired:
-            return f'{name or "подписка"} до {until}, трафик исчерпан'
+            return f'{name or "активна"} до {until}, трафик исчерпан'
         tail = 'ждёт оплаты' if status == 'pending' else f'истекла {until}'
         return f'{name}, {tail}' if name else f'подписка {tail}'
 
@@ -801,7 +803,7 @@ class AdminNotificationService:
         referrer_info: str,
         subscription: Subscription | None,
         promo_group: PromoGroup | None,
-        cart_hint: str | None = None,
+        cart_hint: OwnerCartHint | None = None,
     ) -> str:
         # Тариф берём только уже загруженным: ленивая подгрузка здесь падала (УВ-1), и
         # ради названия тарифа ходить в базу из этого сборщика нельзя.
@@ -809,7 +811,9 @@ class AdminNotificationService:
         # «Первое» — только у того, кто раньше не платил вообще (владелец 18.09): клиент,
         # заплативший картой напрямую, для бота «пополняет впервые», а для владельца — нет.
         # И только у ПЕРВОГО пополнения: второе пополнение так и не купившего — уже не первое.
-        is_first = not bool(getattr(user, 'has_had_paid_subscription', False)) and 'перво' in topup_status.lower()
+        is_first = (
+            not bool(getattr(user, 'has_had_paid_subscription', False)) and 'перво' in (topup_status or '').lower()
+        )
         amount = int(transaction.amount_kopeks or 0)
         what = (
             f'На балансе было {settings.format_price(old_balance)}, стало {settings.format_price(user.balance_kopeks)}'
