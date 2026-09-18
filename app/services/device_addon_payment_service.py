@@ -768,7 +768,11 @@ async def _settle_locked(
             user_id=user.id,
             type=TransactionType.DEPOSIT.value,
             amount_kopeks=attempt.requested_amount_kopeks,
-            description=f'Пополнение Platega для докупки устройств {intent.public_id}',
+            # Имя метода в скобках — по нему карточка владельцу пишет «по СБП», а не «через Platega»
+            description=(
+                f'Пополнение через Platega ({settings.get_platega_method_display_name(int(attempt.provider_method_code))})'
+                f' для докупки устройств {intent.public_id}'
+            ),
             payment_method=PaymentMethod.PLATEGA.value,
             external_id=external_id,
             device_first_ledger_key=ledger_key,

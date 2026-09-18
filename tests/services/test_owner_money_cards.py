@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.config import settings
 from app.services import admin_notification_service as module
 from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
 
@@ -309,7 +310,7 @@ async def test_topup_card_names_the_method_in_owner_words() -> None:
     assert category is NotificationCategory.BALANCE
     assert lines[0] == '<b>💰 Пополнение — 249 ₽ по СБП</b>'
     assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
-    assert lines[2] == 'На балансе было 1 ₽, стало 250 ₽. Покупки не было — деньги лежат'
+    assert lines[2] == 'На балансе было 1 ₽, стало 250 ₽. Корзины нет — деньги остались на балансе'
     assert lines[3] == 'Подписка сейчас: Базовый, 3 устройства, до 16.09'
     assert 'бонус' not in text
     assert 'По приглашению' not in text
@@ -332,8 +333,8 @@ async def test_first_topup_card_shows_referrer_without_internal_id() -> None:
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>💰 Первое пополнение — 199 ₽ через Platega</b>'
     assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
-    assert lines[2] == 'На балансе было 0 ₽, стало 299 ₽ (в т.ч. бонус 100 ₽). Покупки не было — деньги лежат'
-    assert lines[3] == 'Подписка сейчас: нет'
+    assert lines[2] == 'На балансе было 0 ₽, стало 299 ₽ (в т.ч. бонус 100 ₽). Корзины нет — деньги остались на балансе'
+    assert lines[3] == 'Подписки сейчас нет'
     assert 'По приглашению @kozyr20' in lines
     assert '(ID: 123)' not in text
 
@@ -447,6 +448,35 @@ async def test_purchase_card_first_purchase_via_provider() -> None:
     assert lines[2] == '30 дней, до 16.10 · 3 устройства'
     assert 'Цена: тариф 149 ₽ + устройства 2 × 70 ₽' in lines
     assert 'По приглашению @kozyr20' in lines
+
+
+@pytest.mark.asyncio
+async def test_purchase_card_from_the_cabinet_checkout_renders_method_verb_and_discount() -> None:
+    """Так карточку зовёт воркер кассы (К-2): способ оплаты и скидка приходят явно, не из описания."""
+    service = _service()
+    transaction = _transaction(
+        amount_kopeks=-27400, payment_method='platega', description='Оплата подписки картой: 1 месяц'
+    )
+    with _patched_tariff(_tariff()):
+        assert await service.send_subscription_purchase_notification(
+            AsyncMock(),
+            _user(has_had_paid_subscription=False),
+            _subscription(end_date=NEW_END_DATE),
+            transaction,
+            30,
+            purchase_type='first_purchase',
+            was_trial_conversion=True,
+            payment_label='по СБП',
+            discount_kopeks=1500,
+        )
+    text, category = _sent(service)
+    lines = _assert_card_shape(text)
+    assert category is NotificationCategory.PURCHASES
+    assert lines[0] == '<b>💎 Покупка после пробного — 274 ₽ по СБП</b>'
+    assert lines[1] == 'Купил(а) nikitaa @lilgaandelf · Базовый'
+    assert lines[2] == '30 дней, до 16.10 · 3 устройства'
+    assert 'Со скидкой 15 ₽' in lines
+    assert 'через Platega' not in text
 
 
 @pytest.mark.asyncio
@@ -662,6 +692,7 @@ async def test_unchanged_device_count_is_neither_purchase_nor_free() -> None:
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>📱 Устройства не изменились</b>'
+    assert lines[1] == 'nikitaa @lilgaandelf · Базовый'  # без «Изменил(а)»: под таким заголовком он противоречил бы ему
     assert lines[2] == 'Устройств: 3 → 3'
 
 
@@ -757,15 +788,27 @@ async def test_topup_is_first_only_for_someone_who_never_paid_whatever_the_statu
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>💰 Пополнение — 260 ₽ по СБП</b>'
     assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
-    assert lines[2] == 'На балансе было 10 ₽, стало 270 ₽. Покупки не было — деньги лежат'
+    assert lines[2] == 'На балансе было 10 ₽, стало 270 ₽. Корзины нет — деньги остались на балансе'
     assert lines[3] == 'Подписка сейчас: Базовый, 5 устройств, до 25.09'
+
+
+_CART = {'description': 'Продление подписки на 30 дней (Базовый)', 'total_price': 24900}
+
+
+def _with_cart(*, intent: bool, enabled: bool = True):
+    """Корзина есть; спишет ли бот сам — по тем же трём условиям, что у автопокупки."""
+    return (
+        patch('app.services.user_cart_service.user_cart_service.get_user_cart', AsyncMock(return_value=_CART)),
+        patch('app.services.user_cart_service.user_cart_service.has_topup_intent', AsyncMock(return_value=intent)),
+        patch.object(type(settings), 'is_auto_purchase_after_topup_enabled', return_value=enabled),
+    )
 
 
 @pytest.mark.asyncio
 async def test_topup_with_a_saved_cart_says_the_purchase_card_is_coming() -> None:
     service = _service()
-    cart = {'description': 'Продление подписки на 30 дней (Базовый)', 'total_price': 24900}
-    with patch('app.services.user_cart_service.user_cart_service.get_user_cart', AsyncMock(return_value=cart)):
+    cart_on, intent_on, switch_on = _with_cart(intent=True)
+    with cart_on, intent_on, switch_on:
         await service.send_balance_topup_notification(
             _user(balance_kopeks=25000),
             _transaction(
@@ -782,4 +825,54 @@ async def test_topup_with_a_saved_cart_says_the_purchase_card_is_coming() -> Non
     assert lines[2] == (
         'На балансе было 1 ₽, стало 250 ₽. Дальше — продление подписки на 30 дней (Базовый), карточка придёт следом'
     )
-    assert 'деньги лежат' not in text
+    assert 'остались на балансе' not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('balance_after', 'intent', 'enabled'),
+    [
+        (25000, False, True),  # корзина старше метки намерения (30 мин против 60) — автопокупка пропустит
+        (10000, True, True),  # пополнил меньше цены корзины — денег по-прежнему не хватает
+        (25000, True, False),  # автопокупка выключена в настройках
+    ],
+)
+async def test_topup_with_a_cart_the_bot_will_not_charge_does_not_promise_a_card(balance_after, intent, enabled):
+    """🔴 Волна 1 (три линзы независимо): обещать карточку, которой не будет, нельзя."""
+    service = _service()
+    cart_on, intent_on, switch_on = _with_cart(intent=intent, enabled=enabled)
+    with cart_on, intent_on, switch_on:
+        await service.send_balance_topup_notification(
+            _user(balance_kopeks=balance_after),
+            _transaction(
+                amount_kopeks=balance_after - 100, payment_method='platega', description='Пополнение через Platega'
+            ),
+            100,
+            topup_status='🔄 Пополнение',
+            referrer_info='Нет',
+            subscription=_subscription(tariff=_tariff()),
+            promo_group=None,
+        )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[2].endswith('. В корзине — продление подписки на 30 дней (Базовый), бот сам не спишет')
+    assert 'придёт следом' not in text
+
+
+@pytest.mark.asyncio
+async def test_second_topup_of_someone_who_still_has_not_bought_is_not_first() -> None:
+    """Решение владельца — «Первое» ТОЛЬКО у никогда не платившего, а не у каждого его пополнения."""
+    service = _service()
+    await service.send_balance_topup_notification(
+        _user(balance_kopeks=24900, has_had_paid_subscription=False),
+        _transaction(amount_kopeks=10000, payment_method='platega', description='Пополнение через Platega'),
+        14900,
+        topup_status='🔄 Пополнение',
+        referrer_info='@kozyr20 (ID: 123)',
+        subscription=None,
+        promo_group=None,
+    )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[0] == '<b>💰 Пополнение — 100 ₽ через Platega</b>'
+    assert 'По приглашению' not in text

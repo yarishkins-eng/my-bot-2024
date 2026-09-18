@@ -158,9 +158,10 @@ def _outbox_row(row_id, notification_type):
     )
 
 
-def _checkout(*, funding_mode='external'):
+def _checkout(*, funding_mode='external', target_was_trial=False):
     return SimpleNamespace(
         id=101,
+        target_snapshot={'is_trial': target_was_trial},
         public_id='ck-101',
         user_id=291,
         created_subscription_id=104,
@@ -238,7 +239,33 @@ async def test_first_sale_row_becomes_a_first_purchase_card_with_explicit_argume
     call = admin.send_subscription_purchase_notification.await_args
     assert call.args[1] is user and call.args[2] is subscription and call.args[3] is transaction
     assert call.args[4] == 90  # из снимка, не из колонки
-    assert call.kwargs == {'purchase_type': 'first_purchase', 'payment_label': 'картой', 'discount_kopeks': 1500}
+    assert call.kwargs == {
+        'purchase_type': 'first_purchase',
+        'was_trial_conversion': False,
+        'payment_label': 'картой',
+        'discount_kopeks': 1500,
+    }
+
+
+@pytest.mark.asyncio
+async def test_first_sale_over_a_trial_is_reported_as_a_trial_conversion():
+    """Снимок цели снят при заведении заказа — выдача к моменту воркера уже сняла «пробный»."""
+    row = _outbox_row(1, f'{SALE_NOTIFICATION_PREFIX}first')
+    admin = _admin()
+    sent, *_ = await _run([row], checkout=_checkout(target_was_trial=True), admin=admin)
+
+    assert sent == 1
+    assert admin.send_subscription_purchase_notification.await_args.kwargs['was_trial_conversion'] is True
+
+
+@pytest.mark.asyncio
+async def test_repeat_sale_over_a_trial_flag_is_still_a_renewal():
+    row = _outbox_row(1, f'{SALE_NOTIFICATION_PREFIX}repeat')
+    admin = _admin()
+    await _run([row], checkout=_checkout(funding_mode='wallet', target_was_trial=True), admin=admin, attempt=None)
+
+    kwargs = admin.send_subscription_purchase_notification.await_args.kwargs
+    assert kwargs['purchase_type'] == 'renewal' and kwargs['was_trial_conversion'] is False
 
 
 @pytest.mark.asyncio

@@ -3690,6 +3690,8 @@ async def _send_owner_sale_card(db: AsyncSession, *, bot, checkout: Subscription
         transaction,
         period_days,
         purchase_type='first_purchase' if first else 'renewal',
+        # Снимок цели снят при заведении заказа — до того, как выдача сняла с подписки «пробный»
+        was_trial_conversion=first and bool((checkout.target_snapshot or {}).get('is_trial')),
         payment_label=payment_label,
         discount_kopeks=discount,
     )

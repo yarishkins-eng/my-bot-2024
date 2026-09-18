@@ -4,7 +4,7 @@ import math
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 from aiogram import Bot, types
@@ -83,6 +83,11 @@ logger = structlog.get_logger(__name__)
 # Как называть способ оплаты Platega в карточке владельцу — по коду метода из
 # settings.get_platega_method_definitions(); код без записи здесь зовётся именем провайдера.
 _PLATEGA_METHOD_LABELS = {2: 'по СБП', 11: 'картой', 12: 'зарубежной картой', 13: 'криптой'}
+
+
+class OwnerCartHint(NamedTuple):
+    text: str  # «продление подписки на 30 дней (Базовый)»
+    auto: bool  # спишет ли бот сам следом (тогда придёт карточка покупки)
 
 
 def platega_method_label(method_code: int | None) -> str:
@@ -803,7 +808,8 @@ class AdminNotificationService:
         tariff = subscription.__dict__.get('tariff') if subscription is not None else None
         # «Первое» — только у того, кто раньше не платил вообще (владелец 18.09): клиент,
         # заплативший картой напрямую, для бота «пополняет впервые», а для владельца — нет.
-        is_first = not bool(getattr(user, 'has_had_paid_subscription', False))
+        # И только у ПЕРВОГО пополнения: второе пополнение так и не купившего — уже не первое.
+        is_first = not bool(getattr(user, 'has_had_paid_subscription', False)) and 'перво' in topup_status.lower()
         amount = int(transaction.amount_kopeks or 0)
         what = (
             f'На балансе было {settings.format_price(old_balance)}, стало {settings.format_price(user.balance_kopeks)}'
@@ -812,12 +818,15 @@ class AdminNotificationService:
         if bonus > 0:
             # Баланс вырос больше, чем пришло денег: бонус новичку за первое пополнение
             what += f' (в т.ч. бонус {settings.format_price(bonus)})'
-        # Что будет с деньгами, бот в этот момент знает по корзине: есть — автопокупка пройдёт
-        # следом и придёт своей карточкой; нет — деньги останутся лежать. Обе ветки честные.
-        if cart_hint:
-            what += f'. Дальше — {cart_hint}, карточка придёт следом'
+        # Что будет с деньгами, бот знает по корзине И по тем же трём условиям, по которым
+        # автопокупка решит списывать (`_owner_cart_hint`): обещать карточку, которой не будет,
+        # нельзя — владелец её ждал бы. Корзины нет — деньги просто остались на балансе.
+        if cart_hint and cart_hint.auto:
+            what += f'. Дальше — {cart_hint.text}, карточка придёт следом'
+        elif cart_hint:
+            what += f'. В корзине — {cart_hint.text}, бот сам не спишет'
         else:
-            what += '. Покупки не было — деньги лежат'
+            what += '. Корзины нет — деньги остались на балансе'
         referrer_line = None
         if is_first and referrer_info and referrer_info != 'Нет':
             referrer_line = f'По приглашению {re.sub(r" \(ID: \d+\)$", "", referrer_info)}'
@@ -832,7 +841,11 @@ class AdminNotificationService:
             ),
             self._owner_who(user, verb='Пополнил(а)'),
             what,
-            f'Подписка сейчас: {self._owner_subscription_state(subscription, tariff)}',
+            (
+                f'Подписка сейчас: {self._owner_subscription_state(subscription, tariff)}'
+                if subscription is not None
+                else 'Подписки сейчас нет'
+            ),
             comment_line,
             referrer_line,
         )
@@ -847,25 +860,33 @@ class AdminNotificationService:
         devices = getattr(subscription, 'device_limit', None)
         if not devices or ' до ' not in label:
             return label
-        head, _, until = label.partition(' до ')
+        # с конца: имя тарифа само может содержать « до » («Тариф до 3 устройств»)
+        head, _, until = label.rpartition(' до ')
         return f'{head}, {format_devices_declension(int(devices))}, до {until}'
 
-    async def _owner_cart_hint(self, user_id: int) -> str | None:
-        """Описание сохранённой корзины («продление подписки на 30 дней (Базовый)») или None.
+    async def _owner_cart_hint(self, user: User) -> OwnerCartHint | None:
+        """Сохранённая корзина («продление подписки на 30 дней (Базовый)») и спишет ли бот сам.
+        `auto` повторяет три условия автопокупки после пополнения (`auto_purchase_saved_cart_after_topup`):
+        выключатель, свежая метка намерения (живёт короче корзины) и что денег теперь хватает.
         Только чтение; любой сбой хранилища — молчание, карточка важнее подсказки."""
+        user_id = int(getattr(user, 'id', 0) or 0)
         try:
             from app.services.user_cart_service import user_cart_service
 
             cart = await user_cart_service.get_user_cart(user_id)
+            if not cart:
+                return None
+            auto = (
+                settings.is_auto_purchase_after_topup_enabled()
+                and await user_cart_service.has_topup_intent(user_id)
+                and int(user.balance_kopeks or 0) >= int(cart.get('total_price') or 0) > 0
+            )
         except Exception as error:
             logger.warning('Не удалось прочитать корзину для карточки пополнения', user_id=user_id, error=error)
             return None
-        if not cart:
-            return None
         description = str(cart.get('description') or '').strip()
-        if not description:
-            return 'покупка из корзины'
-        return html.escape(description[:1].lower() + description[1:])
+        text = html.escape(description[:1].lower() + description[1:]) if description else 'покупка из корзины'
+        return OwnerCartHint(text=text, auto=auto)
 
     async def _reload_topup_notification_entities(
         self,
@@ -939,7 +960,7 @@ class AdminNotificationService:
         if not self._is_enabled():
             return False
 
-        cart_hint = await self._owner_cart_hint(getattr(user, 'id', 0))
+        cart_hint = await self._owner_cart_hint(user)
         try:
             logger.info('Пытаемся создать сообщение уведомления')
             message = self._build_balance_topup_message(
@@ -2059,7 +2080,9 @@ class AdminNotificationService:
                 headline = title
             else:
                 headline = f'{title} — бесплатно'
-            if title.startswith('📱 Устройств') or title.startswith('📱 Устройства'):
+            if title == '📱 Устройства не изменились':
+                verb = None  # «Изменил(а)» под таким заголовком противоречил бы ему
+            elif title.startswith('📱 Устройств'):
                 verb = 'Изменил(а)'
             elif title == '🌐 Смена серверов':
                 verb = 'Сменил(а) серверы'
