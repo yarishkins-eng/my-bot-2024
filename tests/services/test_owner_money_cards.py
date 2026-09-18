@@ -736,3 +736,50 @@ async def test_year_in_date_follows_the_local_calendar_not_utc(monkeypatch) -> N
             assert AdminNotificationService._owner_until(datetime(2026, 12, 31, 19, 0, tzinfo=UTC)) == '31.12'
     finally:
         tz_module.get_local_timezone.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_topup_is_first_only_for_someone_who_never_paid_whatever_the_status_says() -> None:
+    # Клиент 291 платил картой напрямую — для бота это «первое пополнение баланса», для владельца нет
+    service = _service()
+    await service.send_balance_topup_notification(
+        _user(balance_kopeks=27000, has_had_paid_subscription=True),
+        _transaction(amount_kopeks=26000, payment_method='platega', description='Пополнение через Platega (СБП (QR))'),
+        1000,
+        topup_status='🆕 Первое пополнение',
+        referrer_info='Нет',
+        subscription=_subscription(
+            tariff=_tariff(), device_limit=5, end_date=datetime(2026, 9, 25, 12, 39, tzinfo=UTC)
+        ),
+        promo_group=None,
+    )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[0] == '<b>💰 Пополнение — 260 ₽ по СБП</b>'
+    assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
+    assert lines[2] == 'На балансе было 10 ₽, стало 270 ₽. Покупки не было — деньги лежат'
+    assert lines[3] == 'Подписка сейчас: Базовый, 5 устройств, до 25.09'
+
+
+@pytest.mark.asyncio
+async def test_topup_with_a_saved_cart_says_the_purchase_card_is_coming() -> None:
+    service = _service()
+    cart = {'description': 'Продление подписки на 30 дней (Базовый)', 'total_price': 24900}
+    with patch('app.services.user_cart_service.user_cart_service.get_user_cart', AsyncMock(return_value=cart)):
+        await service.send_balance_topup_notification(
+            _user(balance_kopeks=25000),
+            _transaction(
+                amount_kopeks=24900, payment_method='platega', description='Пополнение через Platega (СБП (QR))'
+            ),
+            100,
+            topup_status='🔄 Пополнение',
+            referrer_info='Нет',
+            subscription=_subscription(tariff=_tariff()),
+            promo_group=None,
+        )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[2] == (
+        'На балансе было 1 ₽, стало 250 ₽. Дальше — продление подписки на 30 дней (Базовый), карточка придёт следом'
+    )
+    assert 'деньги лежат' not in text

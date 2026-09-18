@@ -295,3 +295,30 @@ async def test_ready_rows_still_reach_the_client_after_the_sale_branch_was_added
     assert sent == 1
     bot.send_message.assert_awaited_once()
     admin.send_subscription_purchase_notification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_sale_queues_the_row_before_flipping_the_paid_flag(monkeypatch):
+    """Тот же порядок на пути картой/СБП (`_complete_direct_sale_locked`): спай видит флаг False."""
+    from tests.services.test_device_first_durable_reconciliation import _paid_sale, _sale_db, live_trial, live_user
+
+    target = live_trial(id=134, is_trial=False, device_limit=3, status='active')
+    checkout, entitlement = _paid_sale(target, snapshot_device_limit=3)
+    user = live_user(balance_kopeks=100_000)
+    user.has_had_paid_subscription = False
+    db = _sale_db(tariff=SimpleNamespace(id=3, entitlement_mode='native_squads'), user=user)
+    db.flush = AsyncMock()
+    seen_flag: list[bool] = []
+
+    async def spy(db_, *, checkout, user):
+        seen_flag.append(bool(user.has_had_paid_subscription))
+
+    monkeypatch.setattr(service_module, '_require_no_legacy_pending_trial', AsyncMock())
+    monkeypatch.setattr(service_module, 'extend_subscription', AsyncMock(return_value=target))
+    monkeypatch.setattr(service_module, '_resolve_checkout_entitlement', AsyncMock(return_value=entitlement))
+    monkeypatch.setattr(service_module, '_owner_alerts_enabled', lambda: True)
+    monkeypatch.setattr(service_module, '_queue_owner_sale_row', spy)
+    await service_module._complete_direct_sale_locked(db, checkout=checkout, user=user, target=target)
+
+    assert seen_flag == [False], 'строка ставится ДО переворота флага, иначе первая продажа станет «Продление»'
+    assert user.has_had_paid_subscription is True
