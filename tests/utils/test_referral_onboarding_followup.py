@@ -59,8 +59,8 @@ def redis(monkeypatch):
     return fake
 
 
-def _settings(minutes: int):
-    return SimpleNamespace(get_referral_onboarding_followup_seconds=lambda: minutes * 60)
+def _delay(monkeypatch, minutes: int):
+    monkeypatch.setattr(funnel_notify, 'referral_onboarding_followup_seconds', lambda: minutes * 60)
 
 
 def _sub(active=True, status='active'):
@@ -89,7 +89,7 @@ def _run(sent_menu, user=None):
 
 @pytest.mark.asyncio
 async def test_person_who_did_not_press_gets_the_next_step_after_the_delay(redis, monkeypatch):
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
     await funnel_notify.schedule_referral_onboarding_followup(1010)
     assert '1010' in redis.zset
 
@@ -114,7 +114,7 @@ async def test_button_and_timer_cannot_both_send(redis, monkeypatch):
     Пока таймер ждёт ответа Telegram, нажатие успевает пройти мимо обычной проверки
     «уже показано» — поэтому право показа занимается одной командой, а не двумя.
     """
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
     await funnel_notify.schedule_referral_onboarding_followup(1010)
     redis.zset['1010'] = time.time() - 1
 
@@ -137,7 +137,7 @@ async def test_stale_subscription_row_does_not_leave_the_person_without_the_step
     Раньше добор молчал и отмечал показ — и кнопка после этого тоже молчала. Человек не
     получал следующий шаг НИ РАЗУ, хотя приветствие с кнопкой ему ушло.
     """
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
     await funnel_notify.schedule_referral_onboarding_followup(1010)
     redis.zset['1010'] = time.time() - 1
 
@@ -150,7 +150,7 @@ async def test_stale_subscription_row_does_not_leave_the_person_without_the_step
 
 @pytest.mark.asyncio
 async def test_live_subscription_is_left_alone_but_the_button_still_works(redis, monkeypatch):
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
     await funnel_notify.schedule_referral_onboarding_followup(1010)
     redis.zset['1010'] = time.time() - 1
 
@@ -164,7 +164,7 @@ async def test_live_subscription_is_left_alone_but_the_button_still_works(redis,
 
 @pytest.mark.asyncio
 async def test_failed_send_returns_the_right_to_show(redis, monkeypatch):
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
     await funnel_notify.schedule_referral_onboarding_followup(1010)
     redis.zset['1010'] = time.time() - 1
 
@@ -177,7 +177,7 @@ async def test_failed_send_returns_the_right_to_show(redis, monkeypatch):
 @pytest.mark.asyncio
 async def test_long_overdue_entry_is_dropped_instead_of_sent(redis, monkeypatch):
     """Бот лежал полдня — экран онбординга из ниоткуда человеку уже не нужен."""
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
     redis.zset['1010'] = time.time() - funnel_notify._ONBOARDING_MAX_LATENESS - 60
 
     sent_menu = AsyncMock()
@@ -191,7 +191,7 @@ async def test_long_overdue_entry_is_dropped_instead_of_sent(redis, monkeypatch)
 @pytest.mark.asyncio
 async def test_garbage_entry_does_not_jam_the_queue_forever(redis, monkeypatch):
     """🔴 Разбор члена очереди стоял вне страховки: мусор глушил добор ВСЕМ навсегда."""
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
     redis.zset['мусор'] = time.time() - 100
     redis.zset['1010'] = time.time() - 50
 
@@ -205,7 +205,7 @@ async def test_garbage_entry_does_not_jam_the_queue_forever(redis, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_zero_minutes_switches_the_followup_off_completely(redis, monkeypatch):
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(0))
+    _delay(monkeypatch, 0)
 
     assert await funnel_notify.schedule_referral_onboarding_followup(1010) is False
     assert redis.zset == {}
@@ -219,7 +219,7 @@ async def test_zero_minutes_switches_the_followup_off_completely(redis, monkeypa
 
 @pytest.mark.asyncio
 async def test_person_is_removed_from_the_queue_before_sending(redis, monkeypatch):
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
     await funnel_notify.schedule_referral_onboarding_followup(1010)
     redis.zset['1010'] = time.time() - 1
     seen: list[dict] = []
@@ -236,7 +236,7 @@ async def test_person_is_removed_from_the_queue_before_sending(redis, monkeypatc
 @pytest.mark.asyncio
 async def test_batch_limit_is_honoured(redis, monkeypatch):
     """Потолок пачки несущий: он же ограничивает время, отнятое у денежного воркера."""
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
     for i in range(5):
         redis.zset[str(1000 + i)] = time.time() - 10
 
@@ -250,7 +250,7 @@ async def test_batch_limit_is_honoured(redis, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_claim_carries_a_long_ttl_so_the_button_stays_quiet_later(redis, monkeypatch):
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
 
     assert await funnel_notify.claim_referral_onboarding(1010) is True
     assert redis.ttls[f'{funnel_notify._ONBOARDING_SHOWN_PREFIX}1010'] == funnel_notify._ONBOARDING_SHOWN_TTL
@@ -260,7 +260,7 @@ async def test_claim_carries_a_long_ttl_so_the_button_stays_quiet_later(redis, m
 async def test_broken_redis_does_not_raise_and_lets_the_button_work(monkeypatch):
     """Redis недоступен — лучше рискнуть копией, чем оставить человека без экрана."""
     monkeypatch.setattr(funnel_notify, '_get_redis', lambda: None)
-    monkeypatch.setattr(funnel_notify, 'settings', _settings(10))
+    _delay(monkeypatch, 10)
 
     assert await funnel_notify.schedule_referral_onboarding_followup(1010) is False
     assert await funnel_notify.claim_referral_onboarding(1010) is True
@@ -281,12 +281,14 @@ async def test_broken_redis_does_not_raise_and_lets_the_button_work(monkeypatch)
         ('не число', 600),
     ],
 )
-def test_followup_delay_setting_is_read_from_the_real_settings(minutes, expected, monkeypatch):
-    """🔴 Выключатель проверяем настоящим расчётом, а не подделкой."""
-    from app.config import settings
+def test_followup_delay_setting_is_read_from_the_real_environment(minutes, expected, monkeypatch):
+    """🔴 Выключатель проверяем настоящим расчётом, а не подделкой.
 
-    monkeypatch.setattr(settings, 'REFERRAL_ONBOARDING_FOLLOWUP_MINUTES', minutes)
-    assert settings.get_referral_onboarding_followup_seconds() == expected
+    Настройка читается из окружения, а не из `app/config.py`: правка того файла
+    замораживает автодеплой (забор миграционного риска).
+    """
+    monkeypatch.setenv('REFERRAL_ONBOARDING_FOLLOWUP_MINUTES', str(minutes))
+    assert funnel_notify.referral_onboarding_followup_seconds() == expected
 
 
 @pytest.mark.asyncio
