@@ -14,6 +14,7 @@
 иначе get_subscriber_state прочитает старую/пустую подписку и пришлёт неверное меню.
 """
 
+import asyncio
 import os
 import time
 
@@ -378,6 +379,23 @@ async def release_referral_onboarding(telegram_id: int) -> None:
         logger.debug('Не удалось освободить показ онбординга', telegram_id=telegram_id, error=str(exc))
 
 
+async def forget_referral_onboarding(telegram_id: int) -> None:
+    """Забыть человека целиком: и очередь, и отметку «показано».
+
+    Нужно сбросу тестового аккаунта: отметка живёт 30 дней по telegram_id, и без этого
+    второй прогон на стенде выглядит сломанным — кнопка отвечает «уже пришёл ниже», добор
+    молчит. Владелец счёл бы фичу нерабочей.
+    """
+    client = _get_redis()
+    if client is None or not telegram_id:
+        return
+    try:
+        await client.zrem(_ONBOARDING_DUE_KEY, str(telegram_id))
+        await client.delete(f'{_ONBOARDING_SHOWN_PREFIX}{telegram_id}')
+    except Exception as exc:
+        logger.debug('Не удалось забыть онбординг', telegram_id=telegram_id, error=str(exc))
+
+
 def _has_live_subscription(user) -> bool:
     """Есть ли у человека ЖИВАЯ подписка.
 
@@ -448,6 +466,12 @@ async def process_due_referral_onboarding_followups(bot, limit: int = 20) -> int
                 await send_onboarding_menu(bot, telegram_id, db, user)
             sent += 1
             logger.info('Онбординг реферала: следующий шаг дослан по таймеру', telegram_id=telegram_id)
+        except asyncio.CancelledError:
+            # 🔴 Обрыв по потолку времени воркера — это НЕ Exception, и без этой ветки право
+            # показа оставалось занятым на 30 дней: человек не получал экран ни по таймеру,
+            # ни по кнопке. Реалистичный вход — база занята дольше потолка. Ревизия 18.09.2026.
+            await release_referral_onboarding(telegram_id)
+            raise
         except Exception as exc:
             await release_referral_onboarding(telegram_id)
             logger.error('Не удалось дослать следующий шаг онбординга', telegram_id=telegram_id, error=str(exc))
