@@ -64,6 +64,13 @@ READY_NOTIFICATION_TYPE = 'ready'
 # бот и защита «ровно один раз» уникальным ключом (заказ, тип).
 REFERRAL_REWARD_NOTIFICATION_TYPE = 'referral_reward'
 OWNER_ALERT_NOTIFICATION_TYPE = 'order_stuck'
+# К-2 (Г1). Карточка ПРОДАЖИ владельцу: касса кабинета с 02.08.2026 не звала общий сборщик
+# вовсе — 28 продаж без единой карточки. Тип несёт признак «первая/повторная» в себе
+# (`sale:first` / `sale:repeat`), потому что снять его можно только ДО того, как сама продажа
+# перевернёт `user.has_had_paid_subscription`; воркер читает флаг позже и подписал бы каждую
+# первую продажу «Продление». В оживление тип НЕ входит: общий сборщик пишет событие
+# `purchase` в `subscription_events` до отправки, и каждый повтор дал бы второе событие (DD).
+SALE_NOTIFICATION_PREFIX = 'sale:'
 # Пункт 4.1-Б. Права тарифа изменились между расчётом и оплатой. Заказ при этом выдаётся
 # захваченным набором — расхождение только СООБЩАЕТСЯ. Колонка `notification_type` —
 # обычный `String(48)` без CHECK (`models.py:3042`), поэтому новое значение не требует
@@ -768,6 +775,24 @@ async def _queue_owner_checkout_drift_row(
     )
     if already is None:
         db.add(DeviceFirstNotificationOutbox(checkout_id=checkout.id, notification_type=notification_type))
+
+
+async def _queue_owner_sale_row(db: AsyncSession, *, checkout: SubscriptionCheckout, user: User) -> None:
+    """К-2: строка «продажа» владельцу. Замки и дедуп те же, что у строк-тревог
+    (`_queue_owner_checkout_drift_row`); признак «первая» — по флагу ДО его переворота.
+    Карточка не смеет ломать продажу: любой сбой здесь — предупреждение в лог, не исключение
+    (тот же щит, что у `_report_entitlement_drift_without_blocking`)."""
+    kind = 'repeat' if getattr(user, 'has_had_paid_subscription', False) else 'first'
+    try:
+        await _queue_owner_checkout_drift_row(
+            db, checkout=checkout, user=user, notification_type=f'{SALE_NOTIFICATION_PREFIX}{kind}'
+        )
+    except Exception as error:
+        logger.warning(
+            'device_first_owner_sale_row_failed',
+            checkout_id=getattr(checkout, 'public_id', None),
+            error=type(error).__name__,
+        )
 
 
 async def _report_entitlement_drift_without_blocking(
@@ -1614,6 +1639,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
     checkout.fulfillment_state = 'in_progress'
     checkout.quote_state = 'committed'
     user.balance_kopeks -= charge
+    await _queue_owner_sale_row(db, checkout=checkout, user=user)  # до переворота флага ниже
     user.has_had_paid_subscription = True
     # Скидку меряем ПЕРЕСЧИТАННОЙ ценой, а не замороженной разбивкой заказа: выше
     # стоит забор `charge != checkout.quoted_price_kopeks`, но он сверяет ИТОГ, а не
@@ -2396,6 +2422,7 @@ async def _complete_direct_sale_locked(
         )
         db.add(sale)
         await db.flush()
+    await _queue_owner_sale_row(db, checkout=checkout, user=user)  # до переворота флага ниже
     user.has_had_paid_subscription = True
     # Читаем из СНИМКА, а не из колонки заказа. Сегодня они совпадают (колонка пишется один
     # раз при создании), но вся остальная функция построена на снимке именно потому, что
@@ -3607,6 +3634,72 @@ def _referral_reward_recipient(notification_type: str) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
+async def _send_owner_sale_card(db: AsyncSession, *, bot, checkout: SubscriptionCheckout, first: bool) -> bool:
+    """К-2: карточка продажи владельцу через общий сборщик, с ЯВНЫМИ аргументами.
+
+    Явными — потому что авто-определение «первая/продление» в сборщике читает флаг, который
+    сама продажа уже перевернула; способ оплаты берём из кода метода провайдера, а не из
+    описания транзакции («Оплата подписки картой: …» пишется и при СБП); скидку — из
+    замороженной разбивки заказа, иначе разложение цены в карточке молча промолчит.
+    False = слать некуда (уведомления или категория выключены) — строка станет `obsolete`.
+    Отказ доставки — исключение → строка `failed`, без повторов (см. SALE_NOTIFICATION_PREFIX).
+    """
+    from app.services.admin_notification_service import (
+        AdminNotificationService,
+        NotificationCategory,
+        platega_method_label,
+    )
+
+    service = AdminNotificationService(bot)
+    category = NotificationCategory.PURCHASES if first else NotificationCategory.RENEWALS
+    if not service.is_enabled or not service.category_enabled.get(category, True):
+        return False
+    user = (
+        await db.execute(select(User).where(User.id == checkout.user_id).execution_options(populate_existing=True))
+    ).scalar_one_or_none()
+    subscription = (
+        await db.execute(
+            select(Subscription)
+            .where(Subscription.id == checkout.created_subscription_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    transaction = (
+        await db.execute(select(Transaction).where(Transaction.id == checkout.debit_transaction_id))
+    ).scalar_one_or_none()
+    if user is None or subscription is None or transaction is None:
+        raise RuntimeError('sale_card_data_missing')
+    snapshot = checkout.sale_snapshot or {}
+    period_days = int(snapshot.get('period_days') or checkout.period_days or 0)
+    payment_label = ''
+    if checkout.funding_mode != 'wallet':
+        attempt = (
+            await db.execute(
+                select(CheckoutPaymentAttempt)
+                .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
+                .order_by(CheckoutPaymentAttempt.credited_amount_kopeks.desc(), CheckoutPaymentAttempt.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        payment_label = platega_method_label(attempt.provider_method_code) if attempt is not None else ''
+    discount = int((snapshot.get('price_breakdown') or {}).get('promo_offer_discount_kopeks') or 0)
+    delivered = await service.send_subscription_purchase_notification(
+        db,
+        user,
+        subscription,
+        transaction,
+        period_days,
+        purchase_type='first_purchase' if first else 'renewal',
+        # Снимок цели снят при заведении заказа — до того, как выдача сняла с подписки «пробный»
+        was_trial_conversion=first and bool((checkout.target_snapshot or {}).get('is_trial')),
+        payment_label=payment_label,
+        discount_kopeks=discount,
+    )
+    if not delivered:
+        raise RuntimeError('sale_card_not_delivered')
+    return True
+
+
 async def _send_referral_reward_message(
     db: AsyncSession, *, bot, checkout: SubscriptionCheckout, recipient_id: int | None = None
 ) -> None:
@@ -3813,6 +3906,12 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
                 # реферальные письма перестали бы повторяться вовсе.
                 await _send_referral_reward_message(
                     db, bot=bot, checkout=checkout, recipient_id=_referral_reward_recipient(row.notification_type)
+                )
+            elif row.notification_type.startswith(SALE_NOTIFICATION_PREFIX):
+                # 🔴 Ветка обязана стоять ДО `else`: иначе карточка продажи владельцу ушла бы
+                # покупателю текстом «✅ Подписка готова» вторым сообщением про тот же заказ.
+                obsolete = not await _send_owner_sale_card(
+                    db, bot=bot, checkout=checkout, first=row.notification_type == f'{SALE_NOTIFICATION_PREFIX}first'
                 )
             elif row.notification_type == READY_NOTIFICATION_TYPE:
                 await _send_client_ready_message(db, bot=bot, checkout=checkout)

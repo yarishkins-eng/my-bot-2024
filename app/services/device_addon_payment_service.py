@@ -768,7 +768,11 @@ async def _settle_locked(
             user_id=user.id,
             type=TransactionType.DEPOSIT.value,
             amount_kopeks=attempt.requested_amount_kopeks,
-            description=f'Пополнение Platega для докупки устройств {intent.public_id}',
+            # Имя метода в скобках — по нему карточка владельцу пишет «по СБП», а не «через Platega»
+            description=(
+                f'Пополнение через Platega ({settings.get_platega_method_display_name(int(attempt.provider_method_code))})'
+                f' для докупки устройств {intent.public_id}'
+            ),
             payment_method=PaymentMethod.PLATEGA.value,
             external_id=external_id,
             device_first_ledger_key=ledger_key,
@@ -847,6 +851,9 @@ async def _send_paid_effect_notifications(
                 subscription=subscription,
                 promo_group=promo_group,
                 db=db,
+                # Этот путь корзину не читает и автопокупку не зовёт; списание за устройства
+                # ждёт нажатия клиента в кабинете и приходит своей карточкой
+                next_step='докупка устройств',
             )
         except Exception as error:
             logger.error(
