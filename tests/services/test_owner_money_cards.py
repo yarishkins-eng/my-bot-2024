@@ -862,7 +862,8 @@ async def test_topup_with_a_cart_the_bot_will_not_charge_does_not_promise_a_card
 @pytest.mark.asyncio
 async def test_topup_for_a_device_addon_names_the_addon_and_ignores_the_cart() -> None:
     """🔴 Скептик волны 2: путь докупки корзину не смотрит и автопокупку не зовёт — подсказка по
-    корзине там врала бы; списание за устройства идёт следом и приходит своей карточкой."""
+    корзине там врала бы. Списание за устройства ждёт нажатия клиента в кабинете (`purchase_intent`
+    зовётся только из `POST /devices/intents/{id}/purchase`), поэтому «придёт следом» обещать нельзя."""
     service = _service()
     cart_on, intent_on, switch_on = _with_cart(intent=True)
     with cart_on, intent_on, switch_on:
@@ -883,7 +884,10 @@ async def test_topup_for_a_device_addon_names_the_addon_and_ignores_the_cart() -
     text, _ = _sent(service)
     lines = _assert_card_shape(text)
     assert lines[0] == '<b>💰 Пополнение — 249 ₽ по СБП</b>'
-    assert lines[2] == 'На балансе было 1 ₽, стало 250 ₽. Дальше — докупка устройств, карточка придёт следом'
+    assert (
+        lines[2] == 'На балансе было 1 ₽, стало 250 ₽. Дальше — докупка устройств, когда клиент подтвердит в кабинете'
+    )
+    assert 'придёт следом' not in text
     assert 'Базовый)' not in text  # корзина не упомянута
 
 
@@ -948,19 +952,20 @@ def test_subscription_state_survives_a_tariff_named_with_until() -> None:
 
 
 def test_auto_purchase_after_topup_decides_first_or_renewal_before_the_balance_is_charged() -> None:
-    """🔴 Три автопокупки после пополнения слали `purchase_type='renewal'` всегда: первая покупка
-    новичка приходила владельцу как «⏰ Продление». Флаг переворачивает само списание, поэтому
-    признак снимается ДО него. Путь целиком в тестах не поднимается — сторожим место."""
+    """🔴 Обе живые автопокупки после пополнения слали `purchase_type='renewal'` всегда: первая
+    покупка новичка приходила владельцу как «⏰ Продление». Флаг переворачивает само списание,
+    поэтому признак снимается ДО него. Путь целиком в тестах не поднимается — сторожим место.
+    `_process_legacy_generic_cart` не сторожим: она мертва (нигде не зовётся, `return False` в начале)."""
     import inspect
     import re
 
     from app.services import subscription_auto_purchase_service as auto
 
-    for function in (auto._auto_purchase_tariff, auto._auto_purchase_daily_tariff, auto._process_legacy_generic_cart):
+    for function in (auto._auto_purchase_tariff, auto._auto_purchase_daily_tariff):
         source = inspect.getsource(function)
         assert "purchase_type='first_purchase' if was_first_purchase else 'renewal'" in source, function.__name__
         decided = source.index("was_first_purchase = not bool(getattr(user, 'has_had_paid_subscription', False))")
-        charged = re.search(r'await (subtract_user_balance|purchase_service\.submit_purchase)\(', source).start()
+        charged = re.search(r'await subtract_user_balance\(', source).start()
         assert decided < charged, f'{function.__name__}: признак снят после списания'
 
 

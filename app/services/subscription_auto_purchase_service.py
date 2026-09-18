@@ -3127,7 +3127,6 @@ async def _process_legacy_generic_cart(
         return False
 
     purchase_service = prepared.service
-    was_first_purchase = not bool(getattr(user, 'has_had_paid_subscription', False))  # до переворота флага
 
     try:
         purchase_result = await purchase_service.submit_purchase(
@@ -3174,7 +3173,7 @@ async def _process_legacy_generic_cart(
                 transaction,
                 selection.period.days,
                 was_trial_conversion,
-                purchase_type='first_purchase' if was_first_purchase else 'renewal',
+                purchase_type='renewal',
             )
         except Exception as error:  # pragma: no cover - defensive logging
             logger.error(
