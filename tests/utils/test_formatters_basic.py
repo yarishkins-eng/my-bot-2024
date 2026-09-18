@@ -37,6 +37,20 @@ def test_format_days_declension_uses_russian_fallback_for_fa() -> None:
     assert formatters.format_days_declension(3, language='fa') == '3 дня'
 
 
+def test_format_devices_declension_supports_all_count_forms() -> None:
+    counts = [1, 2, 5, 11, 21, 101]
+    expected = {
+        'ru': ['1 устройство', '2 устройства', '5 устройств', '11 устройств', '21 устройство', '101 устройство'],
+        'en': ['1 device', '2 devices', '5 devices', '11 devices', '21 devices', '101 devices'],
+        'ua': ['1 пристрій', '2 пристрої', '5 пристроїв', '11 пристроїв', '21 пристрій', '101 пристрій'],
+    }
+
+    for language, labels in expected.items():
+        assert [formatters.format_devices_declension(count, language) for count in counts] == labels
+    assert formatters.format_devices_declension(1, 'fa') == '1 دستگاه'
+    assert formatters.format_devices_declension(1, 'zh') == '1 台设备'
+
+
 def test_format_duration_switches_units() -> None:
     """В зависимости от длины интервала выбирается подходящая единица измерения."""
     assert formatters.format_duration(45) == '45 сек.'

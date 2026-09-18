@@ -16,6 +16,38 @@ from app.config import settings
 
 logger = structlog.get_logger(__name__)
 
+_TERMINAL_CREATE_REJECTION_STATUSES = frozenset({400, 401, 403, 404, 422})
+_PROVIDER_ERROR_KEYS = frozenset({'code', 'description', 'detail', 'error', 'errors', 'message', 'reason'})
+
+
+def _has_meaningful_provider_error(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_has_meaningful_provider_error(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_meaningful_provider_error(item) for item in value)
+    if isinstance(value, bool):
+        return value
+    return value is not None
+
+
+def _is_trustworthy_create_rejection(status_code: int, data: Any) -> bool:
+    if status_code not in _TERMINAL_CREATE_REJECTION_STATUSES or not isinstance(data, dict) or not data:
+        return False
+    return any(
+        str(key).lower() in _PROVIDER_ERROR_KEYS and _has_meaningful_provider_error(value)
+        for key, value in data.items()
+    )
+
+
+class PlategaCreateRejected(Exception):
+    """A trustworthy provider response proving that no invoice was created."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f'Platega rejected invoice creation with HTTP {status_code}')
+
 
 class PlategaService:
     """Обертка над Platega API с базовой повторной отправкой запросов."""
@@ -67,6 +99,63 @@ class PlategaService:
         failed_url: str | None = None,
         payload: str | None = None,
     ) -> dict[str, Any] | None:
+        body = self._build_payment_body(
+            payment_method=payment_method,
+            amount=amount,
+            currency=currency,
+            description=description,
+            return_url=return_url,
+            failed_url=failed_url,
+            payload=payload,
+        )
+
+        # v1 POST /transaction/process — документированный flow с заданным
+        # paymentMethod (ссылка в поле `redirect`). v2 POST /v2/transaction/process
+        # отвечает полем `url` и нужен мерчантам, у которых карточные каскады
+        # работают только в v2 (#2934: v1 отдаёт 400 «No available card cascades»).
+        endpoint = '/v2/transaction/process' if self.api_version == 'v2' else '/transaction/process'
+        return await self._request('POST', endpoint, json_data=body)
+
+    async def create_device_addon_payment(
+        self,
+        *,
+        payment_method: int,
+        amount: float,
+        currency: str,
+        description: str | None = None,
+        return_url: str | None = None,
+        failed_url: str | None = None,
+        payload: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Create an add-on invoice and preserve a trustworthy 4xx rejection."""
+        body = self._build_payment_body(
+            payment_method=payment_method,
+            amount=amount,
+            currency=currency,
+            description=description,
+            return_url=return_url,
+            failed_url=failed_url,
+            payload=payload,
+        )
+        endpoint = '/v2/transaction/process' if self.api_version == 'v2' else '/transaction/process'
+        return await self._request(
+            'POST',
+            endpoint,
+            json_data=body,
+            raise_terminal_create_rejection=True,
+        )
+
+    def _build_payment_body(
+        self,
+        *,
+        payment_method: int,
+        amount: float,
+        currency: str,
+        description: str | None,
+        return_url: str | None,
+        failed_url: str | None,
+        payload: str | None,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {
             'paymentMethod': payment_method,
             'paymentDetails': {
@@ -84,13 +173,7 @@ class PlategaService:
             body['failedUrl'] = failed_url
         if payload:
             body['payload'] = payload
-
-        # v1 POST /transaction/process — документированный flow с заданным
-        # paymentMethod (ссылка в поле `redirect`). v2 POST /v2/transaction/process
-        # отвечает полем `url` и нужен мерчантам, у которых карточные каскады
-        # работают только в v2 (#2934: v1 отдаёт 400 «No available card cascades»).
-        endpoint = '/v2/transaction/process' if self.api_version == 'v2' else '/transaction/process'
-        return await self._request('POST', endpoint, json_data=body)
+        return body
 
     async def get_transaction(self, transaction_id: str) -> dict[str, Any] | None:
         # Статусный GET не версионируется: в доках Platega путь один — /transaction/{id}.
@@ -104,6 +187,7 @@ class PlategaService:
         *,
         json_data: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        raise_terminal_create_rejection: bool = False,
     ) -> dict[str, Any] | None:
         if not self.is_configured:
             logger.error('Platega service is not configured')
@@ -136,6 +220,16 @@ class PlategaService:
                         logger.error(
                             'Platega API error', response_status=response.status, endpoint=endpoint, raw_text=raw_text
                         )
+                        rejection_data = data
+                        if raise_terminal_create_rejection and rejection_data is None and raw_text:
+                            try:
+                                rejection_data = json.loads(raw_text)
+                            except json.JSONDecodeError:
+                                pass
+                        if raise_terminal_create_rejection and _is_trustworthy_create_rejection(
+                            response.status, rejection_data
+                        ):
+                            raise PlategaCreateRejected(response.status)
                         if response.status in self._retryable_statuses and attempt < self._max_retries:
                             await asyncio.sleep(self._retry_delay * attempt)
                             continue
@@ -164,6 +258,8 @@ class PlategaService:
                     max_retries=self._max_retries,
                     error=error,
                 )
+            except PlategaCreateRejected:
+                raise
             except Exception as error:  # pragma: no cover - safety
                 logger.exception('Unexpected Platega error', error=error)
                 return None
@@ -185,7 +281,7 @@ class PlategaService:
     @staticmethod
     async def _deserialize_response(
         response: aiohttp.ClientResponse,
-    ) -> tuple[dict[str, Any] | None, str]:
+    ) -> tuple[Any | None, str]:
         raw_text = await response.text()
         if not raw_text:
             return None, ''

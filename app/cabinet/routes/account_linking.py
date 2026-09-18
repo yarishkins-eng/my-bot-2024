@@ -945,7 +945,7 @@ async def execute_merge_endpoint(
         logger.error('Merge execution failed (ValueError)', error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Account merge cannot be completed. The accounts may have already been merged or deleted.',
+            detail={'code': 'account_merge_blocked', 'message': str(exc)},
         ) from exc
     except Exception as exc:
         await db.rollback()

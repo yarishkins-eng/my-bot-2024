@@ -286,6 +286,18 @@ def _merge_dicts(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, A
 
 
 @cache
+def has_locale(language: str) -> bool:
+    """Check actual locale content without substituting the default language."""
+    try:
+        defaults = _load_default_locale(language)
+        overrides = _load_user_locale(language)
+    except (AttributeError, TypeError) as error:
+        _logger.warning('Invalid locale content', language=language, error=error)
+        return False
+    return bool(defaults or overrides)
+
+
+@cache
 def load_locale(language: str) -> dict[str, Any]:
     language = language or DEFAULT_LANGUAGE
     defaults = _load_default_locale(language)
@@ -302,3 +314,4 @@ def load_locale(language: str) -> dict[str, Any]:
 
 def clear_locale_cache() -> None:
     load_locale.cache_clear()
+    has_locale.cache_clear()

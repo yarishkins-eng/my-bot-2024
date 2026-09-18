@@ -36,6 +36,7 @@ async def test_reward_ledger_key_prevents_duplicate_balance_credit():
         execute=AsyncMock(return_value=Result(None)),
         add=MagicMock(),
         flush=AsyncMock(),
+        refresh=AsyncMock(),
     )
 
     created = await service._add_reward(
@@ -90,6 +91,8 @@ async def test_first_referral_payment_financial_steps_finish_in_one_commit(monke
             side_effect=[
                 Result(job),
                 Result(source),
+                # Source-keyed reward replay guard: no prior reward rows.
+                Result(values=[]),
                 Result(values=[user, referrer]),
                 Result(),
                 # Постановка сообщения о награде (РФ-1 п.1.3) спрашивает, платили ли по заказу.
@@ -146,6 +149,8 @@ async def test_referral_step_failure_does_not_mark_job_done(monkeypatch):
             side_effect=[
                 Result(job),
                 Result(source),
+                # Source-keyed reward replay guard: no prior reward rows.
+                Result(values=[]),
                 Result(values=[user, referrer]),
                 Result(),
                 # Постановка сообщения о награде (РФ-1 п.1.3) спрашивает, платили ли по заказу.
@@ -187,7 +192,11 @@ async def test_non_referral_first_topup_marker_is_durable_and_idempotent():
             side_effect=[
                 Result(job),
                 Result(source),
+                # Source-keyed reward replay guard: no prior reward rows.
+                Result(values=[]),
                 Result(values=[user]),
+                # No referral reward exists, so no notification is queued.
+                Result(),
             ]
         ),
         get=AsyncMock(return_value=user),
@@ -405,7 +414,15 @@ async def test_the_payout_step_always_queues_the_message_before_closing_itself(m
     user = SimpleNamespace(id=1, referred_by_id=2, has_made_first_topup=False, full_name='Друг')
     referrer = SimpleNamespace(id=2, balance_kopeks=0, full_name='Пригласивший')
     db = SimpleNamespace(
-        execute=AsyncMock(side_effect=[Result(job), Result(source), Result(values=[user, referrer]), Result()]),
+        execute=AsyncMock(
+            side_effect=[
+                Result(job),
+                Result(source),
+                Result(values=[]),
+                Result(values=[user, referrer]),
+                Result(),
+            ]
+        ),
         get=AsyncMock(return_value=user),
         commit=AsyncMock(),
     )

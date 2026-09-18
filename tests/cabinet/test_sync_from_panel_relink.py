@@ -63,15 +63,16 @@ def _service(api):
     svc = MagicMock()
     svc.is_configured = True
     svc.get_api_client = _client
+    svc._accept_test_account_panel_snapshot = AsyncMock(return_value=True)
     return svc
 
 
-async def _call(user, sub_id, api):
+async def _call(user, sub_id, api, *, service=None):
     db = AsyncMock()
     with (
         patch.object(type(au.settings), 'is_multi_tariff_enabled', MagicMock(return_value=True)),
         patch.object(au, 'get_user_by_id', AsyncMock(return_value=user)),
-        patch('app.services.remnawave_service.RemnaWaveService', return_value=_service(api)),
+        patch('app.services.remnawave_service.RemnaWaveService', return_value=service or _service(api)),
     ):
         return await au.sync_user_from_panel(
             user_id=user.id, subscription_id=sub_id, request=SyncFromPanelRequest(), admin=MagicMock(), db=db
@@ -155,3 +156,33 @@ async def test_ambiguous_orphans_refuse_to_relink():
         await _call(user, 84, api)
     assert exc.value.status_code == 409
     assert sub.remnawave_uuid is None  # untouched — never guesses among multiple
+
+
+@pytest.mark.asyncio
+async def test_retired_test_snapshot_is_rejected_before_local_mutation():
+    """An admin panel→bot request begun on P1 cannot write after B/P2 exists."""
+    sub = _wiped_sub(84)
+    sub.remnawave_uuid = 'P1-retired'
+    sub.subscription_url = 'https://panel/P1-retired'
+    user = SimpleNamespace(
+        id=7,
+        telegram_id=123,
+        email=None,
+        remnawave_uuid='P1-retired',
+        subscriptions=[sub],
+        last_remnawave_sync=None,
+        updated_at=None,
+    )
+    api = MagicMock()
+    api.get_user_by_uuid = AsyncMock(return_value=_panel_user('P1-retired'))
+    service = _service(api)
+    service._accept_test_account_panel_snapshot = AsyncMock(return_value=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await _call(user, 84, api, service=service)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail['code'] == 'test_account_reset_stale_panel_snapshot'
+    service._accept_test_account_panel_snapshot.assert_awaited_once()
+    assert user.remnawave_uuid == 'P1-retired'
+    assert sub.subscription_url == 'https://panel/P1-retired'

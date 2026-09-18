@@ -32,6 +32,7 @@ pytestmark = [
 
 
 async def _seed_owner_and_tariff(connection: asyncpg.Connection) -> tuple[int, int]:
+    squad_uuid = str(uuid.uuid4())
     user_id = await connection.fetchval(
         """
         INSERT INTO users (
@@ -73,15 +74,39 @@ async def _seed_owner_and_tariff(connection: asyncpg.Connection) -> tuple[int, i
             custom_traffic_enabled,
             traffic_price_per_gb_kopeks,
             min_traffic_gb,
-            max_traffic_gb
+            max_traffic_gb,
+            allowed_squads
         )
         VALUES (
             $1, 0, true, 0, 2, '{"30": 30000}'::json, 1, false,
-            false, false, 0, false, 0, false, 0, 1, 365, false, 0, 0, 0
+            false, false, 0, false, 0, false, 0, 1, 365, false, 0, 0, 0,
+            $2::json
         )
         RETURNING id
         """,
         f'device-first-test-{uuid.uuid4()}',
+        f'["{squad_uuid}"]',
+    )
+    await connection.execute(
+        """
+        INSERT INTO tariff_legacy_entitlement_manifests (
+            tariff_id,
+            squad_uuids,
+            membership_hashes,
+            presentation_locations,
+            manifest_hash,
+            approved_by_actor,
+            approval_permission,
+            approval_reference,
+            approval_reason,
+            approved_at
+        )
+        VALUES ($1, $2::json, '{}'::json, '[]'::json, $3, 'postgres-test',
+                'tests:integration', 'device-first-constraints', 'isolated PostgreSQL fixture', now())
+        """,
+        tariff_id,
+        f'["{squad_uuid}"]',
+        uuid.uuid4().hex,
     )
     return user_id, tariff_id
 

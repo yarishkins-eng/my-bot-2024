@@ -600,6 +600,10 @@ async def activate_trial_with_checkout_resolution(
 
     locked = await _lock_direct_context_for_trial(db, user_id=user_id)
     user = locked.user
+    from app.services.account_test_reset_service import RESET_MESSAGE, reset_is_busy
+
+    if user is not None and reset_is_busy(user):
+        raise TrialCheckoutResolutionError('test_account_reset', RESET_MESSAGE)
     live_subscriptions = list(
         (
             await db.execute(

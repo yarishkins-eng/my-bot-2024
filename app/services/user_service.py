@@ -38,6 +38,8 @@ from app.database.models import (
     CheckoutPaymentAttempt,
     CloudPaymentsPayment,
     CryptoBotPayment,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
     DonutPayment,
     EtoplatezhiPayment,
     FreekassaPayment,
@@ -75,6 +77,10 @@ from app.database.models import (
     YooKassaPayment,
 )
 from app.localization.texts import get_texts
+from app.services.device_addon_service import (
+    device_addon_attempt_blocks_account_change,
+    device_addon_intent_blocks_account_change,
+)
 from app.services.notification_delivery_service import (
     NotificationType,
     notification_delivery_service,
@@ -127,6 +133,10 @@ class UserService:
                 .where(SubscriptionCheckout.user_id == user_id)
                 .limit(1)
             )
+        )
+
+        has_device_addon = bool(
+            await db.scalar(select(DeviceAddonIntent.id).where(DeviceAddonIntent.user_id == user_id).limit(1))
         )
 
         legacy_models = (
@@ -183,7 +193,12 @@ class UserService:
                     CheckoutPaymentAttempt,
                     CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id,
                 )
-                .where(PlategaPayment.user_id == user_id, CheckoutPaymentAttempt.id.is_(None))
+                .outerjoin(DeviceAddonTopupAttempt, DeviceAddonTopupAttempt.platega_payment_id == PlategaPayment.id)
+                .where(
+                    PlategaPayment.user_id == user_id,
+                    CheckoutPaymentAttempt.id.is_(None),
+                    DeviceAddonTopupAttempt.id.is_(None),
+                )
                 .limit(1)
             )
         )
@@ -193,12 +208,23 @@ class UserService:
         has_legacy_transaction = bool(
             await db.scalar(
                 select(Transaction.id)
-                .where(Transaction.user_id == user_id, Transaction.device_first_checkout_id.is_(None))
+                .where(
+                    Transaction.user_id == user_id,
+                    Transaction.device_first_checkout_id.is_(None),
+                    Transaction.id.not_in(
+                        select(DeviceAddonIntent.transaction_id).where(DeviceAddonIntent.transaction_id.is_not(None))
+                    ),
+                    Transaction.id.not_in(
+                        select(PlategaPayment.transaction_id)
+                        .join(DeviceAddonTopupAttempt, DeviceAddonTopupAttempt.platega_payment_id == PlategaPayment.id)
+                        .where(PlategaPayment.transaction_id.is_not(None))
+                    ),
+                )
                 .limit(1)
             )
         )
         has_legacy_history = has_legacy_provider or has_guest_purchase or has_legacy_platega or has_legacy_transaction
-        return has_device_first or has_legacy_history, has_legacy_history
+        return has_device_first or has_device_addon or has_legacy_history, has_legacy_history
 
     async def send_balance_change_notification(
         self, bot: Bot, user: User, amount_kopeks: int, reason: str | None = None
@@ -983,9 +1009,8 @@ class UserService:
             # callback which has already locked a provider payment.
             await db.execute(
                 select(PlategaPayment)
-                .join(CheckoutPaymentAttempt, CheckoutPaymentAttempt.platega_payment_id == PlategaPayment.id)
-                .join(SubscriptionCheckout, SubscriptionCheckout.id == CheckoutPaymentAttempt.checkout_id)
-                .where(SubscriptionCheckout.user_id == user_id)
+                .where(PlategaPayment.user_id == user_id)
+                .order_by(PlategaPayment.id)
                 .with_for_update(of=PlategaPayment)
             )
             user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one_or_none()
@@ -1900,6 +1925,8 @@ class TestAccountResetPlan:
     done: bool = False
     panel_deleted: bool = False
     deleted_rows: dict[str, int] = dataclass_field(default_factory=dict)
+    preview_token: str | None = None
+    reset_state: str | None = None
 
 
 async def notify_balance_change(
@@ -1992,10 +2019,13 @@ def test_account_telegram_ids() -> frozenset[int]:
 
 
 def is_test_account(user: User) -> bool:
-    """Стенд опознаётся ТОЛЬКО по Телеграму из окружения."""
+    """Owner-managed membership overrides the legacy environment allowlist."""
     telegram_id = getattr(user, 'telegram_id', None)
     if not telegram_id:
         return False
+    override = getattr(user, 'test_account_enabled', None)
+    if isinstance(override, bool):
+        return override
     return int(telegram_id) in test_account_telegram_ids()
 
 
@@ -2036,6 +2066,37 @@ def _test_reset_delete_plan(scopes: dict[str, list[int]]) -> list[tuple[Any, Any
     return plan
 
 
+async def _test_reset_redact_guest_purchase_credentials(db: AsyncSession, user_id: int) -> int:
+    """Revoke historical guest-purchase bearer material for this recipient only.
+
+    ``GuestPurchase`` is a financial record and has ``SET NULL`` user links,
+    so the reset deliberately keeps it.  Its stored subscription URLs and
+    cabinet credentials are access material, though, not financial evidence.
+    ``user_id`` is assigned by guest fulfillment to the actual subscription
+    recipient; ``buyer_user_id`` is deliberately not a predicate here, since a
+    reset tester may have bought a gift which belongs to somebody else.
+    """
+    result = await db.execute(
+        update(GuestPurchase)
+        .where(
+            GuestPurchase.user_id == user_id,
+            or_(
+                GuestPurchase.subscription_url.is_not(None),
+                GuestPurchase.subscription_crypto_link.is_not(None),
+                GuestPurchase.cabinet_password.is_not(None),
+                GuestPurchase.auto_login_token.is_not(None),
+            ),
+        )
+        .values(
+            subscription_url=None,
+            subscription_crypto_link=None,
+            cabinet_password=None,
+            auto_login_token=None,
+        )
+    )
+    return int(result.rowcount or 0)
+
+
 async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None:
     """Первая причина, по которой обнулять нельзя. ``None`` — можно."""
     from app.database.models import AccountErasureRequest, DeviceFirstReconciliationCredit, UserRole
@@ -2053,6 +2114,29 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
 
     if user.telegram_id is not None and SupportSettingsService.is_moderator(int(user.telegram_id)):
         return 'Этот человек — модератор поддержки. Обнулять его нельзя.'
+
+    addon_attempts = list(
+        await db.scalars(
+            select(DeviceAddonTopupAttempt)
+            .where(DeviceAddonTopupAttempt.user_id == user.id)
+            .order_by(DeviceAddonTopupAttempt.id)
+        )
+    )
+    if any(device_addon_attempt_blocks_account_change(attempt) for attempt in addon_attempts):
+        return (
+            'Счёт докупки устройств ещё в работе. Дождитесь его завершения и повторите сброс. '
+            'Если ожидание длится больше суток, напишите в поддержку.'
+        )
+    addon_intents = list(
+        await db.scalars(
+            select(DeviceAddonIntent).where(DeviceAddonIntent.user_id == user.id).order_by(DeviceAddonIntent.id)
+        )
+    )
+    if any(device_addon_intent_blocks_account_change(intent) for intent in addon_intents):
+        return (
+            'Выдача докупленных устройств ещё в работе. Дождитесь её завершения и повторите сброс. '
+            'Если ожидание длится больше суток, напишите в поддержку.'
+        )
 
     # Забор №3: деньги. Каждая проверка спрашивает своё.
     #
@@ -2146,6 +2230,7 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
             select(PlategaPayment.amount_kopeks)
             .where(
                 PlategaPayment.user_id == user.id,
+                ~exists().where(DeviceAddonTopupAttempt.platega_payment_id == PlategaPayment.id),
                 func.upper(PlategaPayment.status).not_in(sorted(_TEST_RESET_SETTLED_PROVIDER_STATUSES)),
             )
             .limit(1)
@@ -2179,7 +2264,7 @@ async def _test_reset_blocked_reason(db: AsyncSession, user: User) -> str | None
     return None
 
 
-async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str]) -> bool:
+async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str], *, db=None) -> bool:
     """Удалить пользователя из панели RemnaWave. ``False`` — не удалось.
 
     Логика взята у штатного закрытия аккаунта (``account_erasure_service``), а
@@ -2204,6 +2289,30 @@ async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str]) 
                 )
             if user.email:
                 found.update(item.uuid for item in await api.get_user_by_email(user.email) if item.uuid)
+            if db is not None:
+                # Search can legitimately find multiple identities in multi-tariff.
+                # Verify ownership before any destructive request, never choose first.
+                for panel_uuid in sorted(found):
+                    panel_user = await api.get_user_by_uuid(panel_uuid)
+                    if panel_user is None:
+                        continue
+                    if str(panel_user.telegram_id) != str(user.telegram_id):
+                        return False
+                    other_owner = await db.scalar(
+                        select(User.id).where(User.remnawave_uuid == panel_uuid, User.id != user.id).limit(1)
+                    )
+                    other_sub = await db.scalar(
+                        select(Subscription.id)
+                        .where(Subscription.remnawave_uuid == panel_uuid, Subscription.user_id != user.id)
+                        .limit(1)
+                    )
+                    if other_owner or other_sub:
+                        return False
+                user.test_reset_panel_uuids = sorted(found)
+                await db.commit()
+                from app.services.account_test_reset_service import reset_bypass
+
+                await reset_bypass(db)
             if not found:
                 return True
 
@@ -2221,6 +2330,8 @@ async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str]) 
                 if not deleted:
                     logger.warning('test_account_reset_panel_delete_returned_false', remnawave_uuid=panel_uuid)
                     return False
+                if db is not None and await api.get_user_by_uuid(panel_uuid) is not None:
+                    return False
     except Exception as error:
         logger.error('test_account_reset_panel_delete_error', error=error)
         return False
@@ -2228,6 +2339,19 @@ async def _test_reset_delete_panel_identity(user: User, panel_uuids: list[str]) 
 
 
 async def reset_test_account(
+    db: AsyncSession,
+    user: User,
+    admin_id: int | None,
+    *,
+    confirm: bool,
+    preview_token: str | None = None,
+) -> TestAccountResetPlan:
+    from app.services.account_test_reset_service import run_reset
+
+    return await run_reset(db, user, admin_id, confirm=confirm, preview_token=preview_token)
+
+
+async def _reset_test_account_unlocked(
     db: AsyncSession,
     user: User,
     admin_id: int | None,
@@ -2308,11 +2432,51 @@ async def reset_test_account(
 
     plan.blocked_reason = await _test_reset_blocked_reason(db, user)
     plan.allowed = plan.blocked_reason is None
+    import hashlib
+    import json
+    from dataclasses import asdict
+
+    plan.reset_state = getattr(user, 'test_reset_state', None)
+    fingerprint = {
+        'plan': asdict(plan),
+        'user_id': user_id,
+        'subscriptions': sorted(
+            [[sub.id, sub.updated_at.isoformat() if sub.updated_at else None] for sub in subscriptions]
+        ),
+        'checkout_ids': sorted(checkout_ids),
+        'attempt_ids': sorted(attempt_ids),
+        'addon_intents': [
+            list(row)
+            for row in (
+                await db.execute(
+                    select(DeviceAddonIntent.id, DeviceAddonIntent.updated_at)
+                    .where(DeviceAddonIntent.user_id == user_id)
+                    .order_by(DeviceAddonIntent.id)
+                )
+            ).all()
+        ],
+        'addon_attempt_ids': list(
+            await db.scalars(
+                select(DeviceAddonTopupAttempt.id)
+                .where(DeviceAddonTopupAttempt.user_id == user_id)
+                .order_by(DeviceAddonTopupAttempt.id)
+            )
+        ),
+    }
+    plan.preview_token = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, default=str).encode()).hexdigest()
     if not plan.allowed or not confirm:
         return plan
 
     panel_uuids = sorted(
-        {value for value in [user.remnawave_uuid, *(sub.remnawave_uuid for sub in subscriptions)] if value}
+        {
+            value
+            for value in [
+                user.remnawave_uuid,
+                *(sub.remnawave_uuid for sub in subscriptions),
+                *(user.test_reset_panel_uuids or []),
+            ]
+            if value
+        }
     )
     scopes = {
         'users.id': [user_id],
@@ -2330,13 +2494,28 @@ async def reset_test_account(
     #
     # Удаление в панели идемпотентно (404 = успех), поэтому повтор безопасен:
     # если база ниже не дастся, владелец нажмёт ещё раз и дойдёт до конца.
-    plan.panel_deleted = await _test_reset_delete_panel_identity(user, panel_uuids)
+    plan.panel_deleted = await _test_reset_delete_panel_identity(user, panel_uuids, db=db)
     if not plan.panel_deleted:
         plan.allowed = False
         plan.blocked_reason = 'Панель RemnaWave не ответила. В базе ничего не тронуто — нажмите ещё раз чуть позже.'
         return plan
 
     try:
+        # Channel membership itself belongs to Telegram and is not reset.
+        # Drop only this fixture's cached observations after the DB commit.
+        from app.database.models import RequiredChannel, UserChannelSubscription
+
+        channel_ids = set((await db.scalars(select(RequiredChannel.channel_id))).all())
+        if user.telegram_id is not None:
+            channel_ids.update(
+                (
+                    await db.scalars(
+                        select(UserChannelSubscription.channel_id).where(
+                            UserChannelSubscription.telegram_id == user.telegram_id
+                        )
+                    )
+                ).all()
+            )
         # Счётчики занятости серверов принадлежат ЧУЖИМ строкам: не уменьшив их
         # до удаления связок, мы испортим общий сервер для всех остальных.
         for subscription in subscriptions:
@@ -2366,6 +2545,13 @@ async def reset_test_account(
             .where(or_(ReferralEarning.user_id == user_id, ReferralEarning.referral_id == user_id))
             .values(referral_transaction_id=None)
         )
+
+        # Financial guest-purchase rows intentionally survive the reset (their
+        # two user links are SET NULL), but a completed delivery may retain a
+        # bearer subscription URL or temporary cabinet credential.  Redact
+        # those only when this test user is the delivery recipient; a resetter
+        # who merely bought a gift must not invalidate another person's access.
+        await _test_reset_redact_guest_purchase_credentials(db, user_id)
 
         for table, whereclause in _test_reset_delete_plan(scopes):
             result = await db.execute(delete(table).where(whereclause))
@@ -2406,11 +2592,18 @@ async def reset_test_account(
 
         user.balance_kopeks = 0
         user.remnawave_uuid = None
+        user.lifetime_used_traffic_bytes = 0
+        user.last_remnawave_sync = None
+        user.trojan_password = None
+        user.vless_uuid = None
+        user.ss_password = None
         user.has_had_paid_subscription = False
         user.referred_by_id = None
         user.used_promocodes = 0
         user.status = UserStatus.DELETED.value
         user.account_erasure_requested_at = None
+        user.test_reset_state = 'ready'
+        user.test_reset_completed_at = datetime.now(UTC)
         user.updated_at = datetime.now(UTC)
         await db.commit()
     except Exception as error:
@@ -2425,6 +2618,14 @@ async def reset_test_account(
         return plan
 
     plan.done = True
+    plan.reset_state = 'ready'
+    if user.telegram_id is not None:
+        from app.utils.cache import ChannelSubCache
+
+        try:
+            await ChannelSubCache.invalidate_user_channels(int(user.telegram_id), sorted(channel_ids))
+        except Exception:
+            logger.warning('test_reset_channel_cache_invalidation_failed', user_id=user_id)
     logger.info(
         'test_account_reset_done',
         user_id=user_id,

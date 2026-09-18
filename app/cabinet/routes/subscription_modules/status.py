@@ -39,6 +39,18 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
+def _test_link_metadata(user: User) -> dict[str, Any]:
+    """All connection surfaces must retain strictness after test-list removal."""
+    from app.services.account_test_reset_service import has_reset_history
+    from app.services.user_service import is_test_account
+
+    completed_at = getattr(user, 'test_reset_completed_at', None)
+    return {
+        'test_link_strict': is_test_account(user) or has_reset_history(user),
+        'test_reset_at': completed_at.isoformat() if has_reset_history(user) else None,
+    }
+
+
 async def _resolve_disabled_reason_hint(user: User, subscription) -> str | None:
     """Best-effort guess at WHY a subscription is disabled.
 
@@ -92,7 +104,11 @@ async def get_subscription(
 
     if not subscription:
         # Return 200 with has_subscription: false instead of 404
-        return SubscriptionStatusResponse(has_subscription=False, subscription=None)
+        return SubscriptionStatusResponse(
+            has_subscription=False,
+            subscription=None,
+            **_test_link_metadata(fresh_user),
+        )
 
     # Load tariff for daily subscription check and tariff name
     tariff_name = None
@@ -168,7 +184,11 @@ async def get_subscription(
         ],
         redact_technical_access=is_access_point_subscription,
     )
-    return SubscriptionStatusResponse(has_subscription=True, subscription=subscription_data)
+    return SubscriptionStatusResponse(
+        has_subscription=True,
+        subscription=subscription_data,
+        **_test_link_metadata(fresh_user),
+    )
 
 
 # ============ Connection Link ============
@@ -233,6 +253,7 @@ async def get_connection_link(
         'happ_crypto_link': subscription.subscription_crypto_link,
         'connect_mode': connect_mode,
         'hide_link': hide_subscription_link,
+        **_test_link_metadata(user),
         'instructions': {
             'steps': [
                 'Copy the subscription link',
@@ -619,4 +640,5 @@ async def get_app_config(
         'subscriptionCryptoLink': subscription_crypto_link,
         'hideLink': hide_link,
         'branding': config.get('brandingSettings', {}),
+        **_test_link_metadata(user),
     }

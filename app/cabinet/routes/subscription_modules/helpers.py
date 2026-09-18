@@ -134,6 +134,8 @@ def compute_device_topup_gate(subscription: Subscription, tariff: Tariff | None)
     device_price, max_device_limit = _resolve_device_addon_price(tariff)
     if not device_price or device_price <= 0:
         return False, 0
+    if not settings.DEVICE_ADDON_PURCHASE_ENABLED:
+        return False, device_price
     current_devices = subscription.device_limit or 1
     if max_device_limit and current_devices >= max_device_limit:
         return False, device_price

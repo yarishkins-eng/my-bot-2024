@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import (
     CheckoutPaymentAttempt,
+    DeviceAddonTopupAttempt,
     DeviceFirstDepositOutbox,
     DeviceFirstOutbox,
     PaymentMethod,
@@ -39,6 +40,13 @@ class PlategaPaymentMixin:
         """Direct-sale callbacks must not retain raw webhook payloads/signatures."""
         metadata = getattr(payment, 'metadata_json', None) or {}
         return metadata.get('settlement_mode') == 'direct_purchase_v2'
+
+    @staticmethod
+    async def _get_durable_device_addon_attempt(db: AsyncSession, payment_id: int) -> DeviceAddonTopupAttempt | None:
+        """Classify an add-on payment by its durable FK, not mutable JSON."""
+        return await db.scalar(
+            select(DeviceAddonTopupAttempt).where(DeviceAddonTopupAttempt.platega_payment_id == payment_id)
+        )
 
     @staticmethod
     async def _get_durable_direct_attempt(db: AsyncSession, payment_id: int) -> CheckoutPaymentAttempt | None:
@@ -312,6 +320,16 @@ class PlategaPaymentMixin:
             logger.error('Platega: не удалось заблокировать платёж', payment_id=payment.id)
             return False
         payment = locked
+        device_addon_attempt = await self._get_durable_device_addon_attempt(db, payment.id)
+        if device_addon_attempt is not None:
+            # Add-on callbacks are authenticated by the existing webhook
+            # endpoint, but canonical GET remains the only settlement proof.
+            # The dedicated handler records an exact correlation and wakes its
+            # reconciler without exposing the payment to generic cart/autopay.
+            from app.services.device_addon_payment_service import handle_device_addon_platega_callback
+
+            return await handle_device_addon_platega_callback(db, payment=payment, payload=payload)
+
         direct_device_first = self._is_direct_device_first_payment(payment)
         durable_attempt = None
         if not direct_device_first:
@@ -473,7 +491,11 @@ class PlategaPaymentMixin:
         # Device-first v2 is settled only by its verified callback or its
         # lease-fenced worker. Generic user-initiated checks are local reads:
         # they may observe state but cannot contact the provider or settle it.
-        if self._is_direct_device_first_payment(payment) or await self._get_durable_direct_attempt(db, payment.id):
+        if (
+            await self._get_durable_device_addon_attempt(db, payment.id)
+            or self._is_direct_device_first_payment(payment)
+            or await self._get_durable_direct_attempt(db, payment.id)
+        ):
             return {
                 'payment': payment,
                 'status': payment.status,
@@ -570,6 +592,17 @@ class PlategaPaymentMixin:
 
         # Read fresh metadata AFTER lock to avoid stale data
         metadata = dict(getattr(payment, 'metadata_json', {}) or {})
+
+        # A durable add-on FK always wins over mutable metadata.  This branch
+        # is defensive (normal webhook/status paths intercept earlier) and
+        # prevents a future generic call site from crediting the same invoice
+        # through cart/daily/autopay side effects.
+        if await self._get_durable_device_addon_attempt(db, payment.id):
+            from app.services.device_addon_payment_service import handle_device_addon_platega_callback
+
+            if isinstance(payload, dict):
+                await handle_device_addon_platega_callback(db, payment=payment, payload=payload)
+            return payment
 
         # Device-first owns its exact provider amount, ledger idempotency and
         # explicit-arm fulfillment. It must not fall through to the generic

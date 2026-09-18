@@ -105,6 +105,10 @@ _PINNED_WIPED_TABLES = frozenset(
         'checkout_payment_attempts',
         'cloudpayments_payments',
         'cryptobot_payments',
+        # Only clean draft intents are removable. The runtime preflight
+        # refuses any attempt (including terminal) or purchased receipt.
+        'device_addon_intents',
+        'device_addon_topup_attempts',
         'device_first_deposit_outbox',
         'device_first_mutations',
         'device_first_notification_outbox',
@@ -205,6 +209,9 @@ def test_plan_ignores_columns_that_only_point_at_a_person() -> None:
         ('subscription_entitlement_term_projection_outbox', 'subscription_entitlement_terms'),
         ('device_first_provider_events', 'checkout_payment_attempts'),
         ('checkout_payment_attempts', 'subscription_checkouts'),
+        ('device_addon_topup_attempts', 'device_addon_intents'),
+        ('device_addon_topup_attempts', 'platega_payments'),
+        ('device_addon_intents', 'subscriptions'),
         ('subscription_servers', 'subscriptions'),
         ('platega_payments', 'transactions'),
         ('referral_earnings', 'transactions'),
@@ -357,6 +364,7 @@ async def test_route_refuses_an_account_outside_the_list(monkeypatch) -> None:
         return SimpleNamespace(id=user_id, telegram_id=555000111)
 
     monkeypatch.setattr(route_module, 'get_user_by_id', _fake_get_user)
+    monkeypatch.setattr(route_module, '_can_manage_test_accounts', lambda admin: True)
 
     with pytest.raises(HTTPException) as exc:
         await route_module.reset_test_account_route(

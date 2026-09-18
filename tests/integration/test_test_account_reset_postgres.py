@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import sys
@@ -31,6 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover
     asyncpg = None
 
 from sqlalchemy import func, select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
@@ -65,9 +67,27 @@ pytestmark = [
 ]
 
 
-async def _panel_ok(user, panel_uuids):
+async def _panel_ok(user, panel_uuids, **kwargs):
     """Панель в этих тестах не участвует: её путь проверяется отдельно."""
     return True
+
+
+async def _confirmed_reset(db, user, admin_id=1, **kwargs):
+    preview = await user_service.reset_test_account(db, user, admin_id, confirm=False)
+    result = await user_service.reset_test_account(
+        db, user, admin_id, confirm=True, preview_token=preview.preview_token
+    )
+    await db.refresh(user)
+    return result
+
+
+def _install_guards(connection):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    migration = importlib.import_module('migrations.alembic.versions.0105_test_account_reset_fence')
+    with Operations.context(MigrationContext.configure(connection)):
+        migration.install_guards()
 
 
 STAND_TELEGRAM_ID = 7749231125
@@ -76,6 +96,9 @@ OUTSIDER_TELEGRAM_ID = 999000111
 
 @pytest_asyncio.fixture
 async def session():
+    url = make_url(DATABASE_URL)
+    if url.host not in {'127.0.0.1', 'localhost'} or url.database != 'teplo_reset_test':
+        raise RuntimeError('Destructive tests require the isolated local teplo_reset_test database')
     engine = create_async_engine(DATABASE_URL, poolclass=None)
     async with engine.begin() as connection:
         # `drop_all` не умеет разложить цикл subscription_checkouts <-> transactions;
@@ -83,6 +106,7 @@ async def session():
         await connection.execute(text('DROP SCHEMA public CASCADE'))
         await connection.execute(text('CREATE SCHEMA public'))
         await connection.run_sync(Base.metadata.create_all)
+        await connection.run_sync(_install_guards)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as db:
         yield db
@@ -208,7 +232,7 @@ async def test_reset_removes_the_stand_and_leaves_everyone_else_alone(session, m
 
     deleted_panel_uuids: list[str] = []
 
-    async def _fake_panel_delete(user, panel_uuids):
+    async def _fake_panel_delete(user, panel_uuids, **kwargs):
         deleted_panel_uuids.extend(panel_uuids)
         return True
 
@@ -231,7 +255,7 @@ async def test_reset_removes_the_stand_and_leaves_everyone_else_alone(session, m
     assert (await _counts(session, stand.id))['subscriptions'] == 1
 
     # Второе: снести.
-    done = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    done = await _confirmed_reset(session, stand)
     assert done.done is True
     assert done.panel_deleted is True
     assert deleted_panel_uuids == [f'panel-{STAND_TELEGRAM_ID}']
@@ -268,7 +292,7 @@ async def test_reset_refuses_while_an_order_is_still_in_flight(session, monkeypa
     monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000, checkout_state='awaiting_funds')
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.allowed is False
     assert plan.done is False
@@ -288,7 +312,7 @@ async def test_reset_refuses_when_the_provider_has_not_answered_yet(session, mon
     )
     await session.commit()
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.allowed is False
     assert 'не досверен' in (plan.blocked_reason or '')
@@ -313,7 +337,7 @@ async def test_reset_refuses_a_staff_account_even_if_it_is_on_the_list(session, 
     )
     await session.commit()
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.allowed is False
     assert 'служебная роль' in (plan.blocked_reason or '')
@@ -324,14 +348,14 @@ async def test_nothing_changes_when_the_panel_refuses_to_delete(session, monkeyp
     monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=22450)
 
-    async def _panel_says_no(user, panel_uuids):
+    async def _panel_says_no(user, panel_uuids, **kwargs):
         return False
 
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_says_no)
     squad_users_before = await session.scalar(select(func.sum(ServerSquad.current_users)))
     stand_id = stand.id
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.done is False
     assert plan.allowed is False
@@ -358,7 +382,7 @@ async def test_a_successful_purchase_does_not_lock_the_button(session, monkeypat
     await session.commit()
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.blocked_reason is None
     assert plan.done is True
@@ -373,7 +397,7 @@ async def test_an_abandoned_invoice_does_not_lock_the_button(session, monkeypatc
     await session.commit()
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.blocked_reason is None
     assert plan.done is True
@@ -388,7 +412,7 @@ async def test_a_finished_closure_does_not_lock_the_button_forever(session, monk
     await session.commit()
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.done is True
 
@@ -398,7 +422,7 @@ async def test_a_finished_closure_does_not_lock_the_button_forever(session, monk
     session.add(AccountErasureRequest(user_id=other.id, state='awaiting_manual_resolution'))
     await session.commit()
 
-    blocked = await user_service.reset_test_account(session, other, admin_id=1, confirm=True)
+    blocked = await _confirmed_reset(session, other)
     assert blocked.done is False
     assert 'закрывается' in (blocked.blocked_reason or '')
 
@@ -427,13 +451,323 @@ async def test_a_paid_gift_of_a_real_buyer_survives(session, monkeypatch) -> Non
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand_id = stand.id
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     # Оплаченный, но ещё не доставленный подарок — деньги в пути: отказ.
     assert plan.done is False
     assert 'подарок' in (plan.blocked_reason or '')
     assert await session.scalar(select(func.count()).select_from(GuestPurchase)) == 1
     assert (await _counts(session, stand_id))['subscriptions'] == 1
+
+
+async def test_confirmation_rechecks_the_preview_without_touching_panel(session, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+    panel = AsyncMock(return_value=True)
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', panel)
+    preview = await user_service.reset_test_account(session, stand, 1, confirm=False)
+    stand.balance_kopeks += 1
+    await session.commit()
+    result = await user_service.reset_test_account(session, stand, 1, confirm=True, preview_token=preview.preview_token)
+    assert not result.done and not result.allowed
+    panel.assert_not_awaited()
+    await session.refresh(stand)
+    assert stand.balance_kopeks == 1001 and stand.test_reset_started_at is None
+
+
+@pytest.mark.parametrize(
+    'statement',
+    [
+        'UPDATE users SET balance_kopeks = 999 WHERE id = :id',
+        "UPDATE subscriptions SET status = 'active' WHERE user_id = :id",
+        'DELETE FROM subscriptions WHERE user_id = :id',
+        "INSERT INTO transactions (user_id, type, amount_kopeks) VALUES (:id, 'deposit', 50)",
+        "UPDATE checkout_payment_attempts SET status = 'pending' WHERE checkout_id IN (SELECT id FROM subscription_checkouts WHERE user_id = :id)",
+        "UPDATE subscription_entitlement_snapshots SET provenance = 'late' WHERE subscription_id IN (SELECT id FROM subscriptions WHERE user_id = :id)",
+    ],
+)
+async def test_failed_reset_fences_stale_writers_and_can_resume(session, monkeypatch, statement):
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy.exc import DBAPIError
+
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+    outsider = await _seed_person(session, OUTSIDER_TELEGRAM_ID, balance_kopeks=5000)
+    stand_id, outsider_id = stand.id, outsider.id
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', AsyncMock(return_value=False))
+    result = await _confirmed_reset(session, stand)
+    assert not result.done and result.reset_state == 'failed'
+    assert stand.balance_kopeks == 1000
+    maker = async_sessionmaker(session.bind, expire_on_commit=False)
+    async with maker() as writer:
+        with pytest.raises(DBAPIError, match='test_account_reset_in_progress'):
+            await writer.execute(text(statement), {'id': stand_id})
+            await writer.commit()
+        await writer.rollback()
+        await writer.execute(
+            text('UPDATE users SET balance_kopeks = balance_kopeks + 1 WHERE id = :id'), {'id': outsider_id}
+        )
+        await writer.commit()
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    result = await _confirmed_reset(session, stand)
+    assert result.done and stand.test_reset_state == 'ready'
+    assert stand.test_reset_panel_uuids == [f'panel-{STAND_TELEGRAM_ID}']
+    await session.refresh(outsider)
+    assert outsider.balance_kopeks == 5001
+
+
+async def test_two_reset_requests_have_one_remote_owner(session, monkeypatch):
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+    stand_id = stand.id
+    preview = await user_service.reset_test_account(session, stand, 1, confirm=False)
+    await session.commit()
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def delayed_panel(user, panel_uuids, **kwargs):
+        calls.append(user.id)
+        entered.set()
+        await asyncio.wait_for(release.wait(), 5)
+        return True
+
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', delayed_panel)
+    maker = async_sessionmaker(session.bind, expire_on_commit=False)
+
+    async def first_request():
+        async with maker() as db:
+            user = await db.get(User, stand_id)
+            return await user_service.reset_test_account(db, user, 1, confirm=True, preview_token=preview.preview_token)
+
+    first = asyncio.create_task(first_request())
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        async with maker() as db:
+            user = await db.get(User, stand_id)
+            second = await asyncio.wait_for(
+                user_service.reset_test_account(db, user, 1, confirm=True, preview_token=preview.preview_token), 2
+            )
+            assert not second.done and 'уже выполняется' in second.blocked_reason
+    finally:
+        release.set()
+    assert (await first).done
+    assert calls == [stand_id]
+
+
+@pytest.mark.parametrize('mode', ['valid_multi', 'missing', 'foreign_owner', 'not_deleted', 'lost_response'])
+async def test_panel_verified_delete_and_retry_contract(session, monkeypatch, mode):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from app.services.remnawave_service import RemnaWaveService
+
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+    expected = f'panel-{STAND_TELEGRAM_ID}'
+    records = (
+        {}
+        if mode == 'missing'
+        else {
+            expected: SimpleNamespace(
+                uuid=expected, telegram_id=OUTSIDER_TELEGRAM_ID if mode == 'foreign_owner' else STAND_TELEGRAM_ID
+            ),
+            'second-test-identity': SimpleNamespace(uuid='second-test-identity', telegram_id=STAND_TELEGRAM_ID),
+        }
+    )
+    deletes = []
+    lost = False
+
+    class Panel:
+        async def get_user_by_telegram_id(self, telegram_id):
+            return [item for item in records.values() if item.telegram_id == telegram_id]
+
+        async def get_user_by_uuid(self, panel_uuid):
+            return records.get(panel_uuid)
+
+        async def delete_user(self, panel_uuid):
+            nonlocal lost
+            deletes.append(panel_uuid)
+            if mode != 'not_deleted':
+                records.pop(panel_uuid, None)
+            if mode == 'lost_response' and not lost:
+                lost = True
+                raise TimeoutError('simulated accepted DELETE with lost response')
+            return True
+
+    @asynccontextmanager
+    async def get_api(_self):
+        yield Panel()
+
+    monkeypatch.setattr(RemnaWaveService, 'get_api_client', get_api)
+    result = await _confirmed_reset(session, stand)
+    if mode == 'foreign_owner':
+        assert not result.done and deletes == []
+        assert (await _counts(session, stand.id))['subscriptions'] == 1
+    elif mode == 'not_deleted':
+        assert not result.done and stand.test_reset_state == 'failed'
+        assert (await _counts(session, stand.id))['subscriptions'] == 1
+    else:
+        if mode == 'lost_response':
+            assert not result.done and stand.test_reset_state == 'failed'
+            assert expected in stand.test_reset_panel_uuids
+            result = await _confirmed_reset(session, stand)
+        assert result.done and not records
+
+
+@pytest.mark.parametrize(
+    'event_name', ['user.disabled', 'user.modified', 'user.revoked', 'user.traffic_reset', 'user.deleted']
+)
+async def test_retired_webhook_cannot_touch_new_trial_even_after_unregister(session, monkeypatch, event_name):
+    from unittest.mock import AsyncMock
+
+    from app.services.remnawave_webhook_service import RemnaWaveWebhookService
+
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    assert (await _confirmed_reset(session, stand)).done
+    stand.test_account_enabled = False
+    stand.remnawave_uuid = 'new-identity'
+    stand.status = 'active'
+    subscription = Subscription(
+        user_id=stand.id, is_trial=True, status='active', end_date=datetime.now(UTC) + timedelta(days=3)
+    )
+    session.add(subscription)
+    await session.commit()
+    service = RemnaWaveWebhookService(bot=AsyncMock())
+    handler = AsyncMock()
+    assert await service._process_user_event(
+        session, event_name, {'telegramId': STAND_TELEGRAM_ID, 'uuid': f'panel-{STAND_TELEGRAM_ID}'}, handler
+    )
+    handler.assert_not_awaited()
+    assert await service._process_user_event(
+        session, event_name, {'telegramId': STAND_TELEGRAM_ID, 'uuid': 'new-identity'}, handler
+    )
+    handler.assert_awaited_once()
+
+
+async def test_old_subscription_cannot_provision_after_new_generation(session, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from app.services.subscription_service import SubscriptionService
+
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+    old_id = await session.scalar(select(Subscription.id).where(Subscription.user_id == stand.id))
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    assert (await _confirmed_reset(session, stand)).done
+    stand.remnawave_uuid = 'new-identity'
+    session.add(Subscription(user_id=stand.id, is_trial=True, end_date=datetime.now(UTC) + timedelta(days=3)))
+    await session.commit()
+    operation = AsyncMock()
+    result = await SubscriptionService().run_guarded_panel_write(
+        session, user_id=stand.id, subscription_id=old_id, api=AsyncMock(), operation=operation
+    )
+    assert result is None
+    operation.assert_not_awaited()
+
+
+async def test_membership_is_explicit_reversible_and_non_destructive(session, monkeypatch):
+    from fastapi import HTTPException
+
+    from app.cabinet.routes import admin_users
+    from app.cabinet.schemas.users import TestAccountMembershipRequest, TestAccountResetRequest
+
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    owner = User(telegram_id=111000222, username='owner')
+    session.add(owner)
+    stand = await _seed_person(session, OUTSIDER_TELEGRAM_ID, balance_kopeks=12345)
+    owner_id, stand_id = owner.id, stand.id
+    before = await _counts(session, stand_id)
+    monkeypatch.setattr(admin_users, '_can_manage_test_accounts', lambda user: False)
+    with pytest.raises(HTTPException) as denied:
+        await admin_users.set_test_membership(
+            stand_id,
+            TestAccountMembershipRequest(enabled=True, telegram_id=OUTSIDER_TELEGRAM_ID),
+            admin=owner,
+            db=session,
+        )
+    assert denied.value.status_code == 403
+    with pytest.raises(HTTPException) as denied_reset:
+        await admin_users.reset_test_account_route(stand_id, TestAccountResetRequest(), admin=owner, db=session)
+    assert denied_reset.value.status_code == 403
+    monkeypatch.setattr(admin_users, '_can_manage_test_accounts', lambda user: user.id == owner_id)
+    with pytest.raises(HTTPException) as mismatch:
+        await admin_users.set_test_membership(
+            stand_id, TestAccountMembershipRequest(enabled=True, telegram_id=STAND_TELEGRAM_ID), admin=owner, db=session
+        )
+    assert mismatch.value.status_code == 409
+    result = await admin_users.set_test_membership(
+        stand_id, TestAccountMembershipRequest(enabled=True, telegram_id=OUTSIDER_TELEGRAM_ID), admin=owner, db=session
+    )
+    assert result['is_test_account'] and user_service.is_test_account(stand)
+    assert stand.test_reset_state == 'idle' and stand.test_reset_started_at is None
+    assert await _counts(session, stand_id) == before and stand.balance_kopeks == 12345
+    # Explicit removal wins even if the legacy environment later contains it.
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(OUTSIDER_TELEGRAM_ID))
+    await admin_users.set_test_membership(
+        stand_id, TestAccountMembershipRequest(enabled=False, telegram_id=OUTSIDER_TELEGRAM_ID), admin=owner, db=session
+    )
+    assert not user_service.is_test_account(stand)
+    assert await _counts(session, stand_id) == before and stand.balance_kopeks == 12345
+
+
+async def test_migration_upgrade_is_bounded_and_downgrade_preserves_history(session):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy.exc import DBAPIError
+
+    migration = importlib.import_module('migrations.alembic.versions.0105_test_account_reset_fence')
+
+    def invoke(connection, action):
+        with Operations.context(MigrationContext.configure(connection)):
+            action()
+
+    connection = await session.connection()
+    await connection.run_sync(invoke, migration.downgrade)
+    await session.commit()
+    async with session.bind.connect() as writer:
+        await writer.execute(text('LOCK TABLE subscriptions IN ROW EXCLUSIVE MODE'))
+        connection = await session.connection()
+        with pytest.raises(DBAPIError, match='lock timeout'):
+            await asyncio.wait_for(connection.run_sync(invoke, migration.upgrade), 5)
+        await session.rollback()
+        await writer.rollback()
+    connection = await session.connection()
+    await connection.run_sync(invoke, migration.upgrade)
+    await session.commit()
+    stand = User(telegram_id=STAND_TELEGRAM_ID, test_account_enabled=False)
+    session.add(stand)
+    await session.commit()
+    connection = await session.connection()
+    with pytest.raises(RuntimeError, match='retain additive schema'):
+        await connection.run_sync(invoke, migration.downgrade)
+    await session.rollback()
+
+
+async def test_three_reset_and_fresh_trial_cycles(session, monkeypatch):
+    from app.database.crud.subscription import create_trial_subscription
+    from app.services.user_revival_service import revive_deleted_user
+
+    monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', str(STAND_TELEGRAM_ID))
+    stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
+    monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
+    seen = set()
+    for cycle in range(3):
+        assert (await _confirmed_reset(session, stand)).done
+        await session.refresh(stand, ['subscriptions'])
+        assert not stand.is_trial_already_used()
+        await revive_deleted_user(session, stand, source='test_reset_test')
+        await session.commit()
+        trial = await create_trial_subscription(session, stand.id, duration_days=3, traffic_limit_gb=5, device_limit=1)
+        assert trial.id not in seen
+        seen.add(trial.id)
+        await session.refresh(stand, ['subscriptions'])
+        assert stand.is_trial_already_used()
+        assert trial.is_trial and trial.device_limit == 1 and trial.traffic_limit_gb == 5
 
 
 async def test_referrers_earning_does_not_deadlock_the_reset(session, monkeypatch) -> None:
@@ -462,7 +796,7 @@ async def test_referrers_earning_does_not_deadlock_the_reset(session, monkeypatc
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     referrer_id = referrer.id
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.done is True, plan.blocked_reason
     # Заработок реферера цел, только указатель на снесённую транзакцию снят.
@@ -484,7 +818,7 @@ async def test_a_sleeping_payment_gateway_row_locks_the_button(session, monkeypa
     await session.commit()
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.done is False
     assert 'Lava' in (plan.blocked_reason or '')
@@ -502,7 +836,7 @@ async def test_an_admin_in_the_list_is_still_refused(session, monkeypatch) -> No
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.done is False
     assert 'админский' in (plan.blocked_reason or '').lower()
@@ -518,7 +852,7 @@ async def test_a_support_moderator_is_still_refused(session, monkeypatch) -> Non
     monkeypatch.setattr(user_service, '_test_reset_delete_panel_identity', _panel_ok)
     stand = await _seed_person(session, STAND_TELEGRAM_ID, balance_kopeks=1000)
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.done is False
     assert 'модератор' in (plan.blocked_reason or '').lower()
@@ -542,7 +876,7 @@ async def test_a_staff_role_is_refused_for_the_right_reason(session, monkeypatch
     )
     await session.commit()
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert 'служебная роль' in (plan.blocked_reason or '')
 
@@ -561,7 +895,7 @@ async def test_a_used_promocode_gets_its_slot_back(session, monkeypatch) -> None
     await session.commit()
     promocode_id = promocode.id
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.done is True, plan.blocked_reason
     assert await session.scalar(select(PromoCode.current_uses).where(PromoCode.id == promocode_id)) == 0
@@ -587,7 +921,7 @@ async def test_prices_look_like_a_newcomers_again(session, monkeypatch) -> None:
     await session.commit()
     default_id, stand_id = default_group.id, stand.id
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.done is True, plan.blocked_reason
     refreshed = await session.get(User, stand_id)
@@ -613,7 +947,7 @@ async def test_a_restricted_stand_comes_back_able_to_buy(session, monkeypatch) -
     await session.commit()
     stand_id = stand.id
 
-    plan = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    plan = await _confirmed_reset(session, stand)
 
     assert plan.done is True, plan.blocked_reason
     refreshed = await session.get(User, stand_id)
@@ -649,7 +983,7 @@ async def test_the_plan_names_the_support_conversation_before_it_disappears(sess
     preview = await user_service.reset_test_account(session, stand, admin_id=1, confirm=False)
     assert preview.tickets == 1, 'обращения обязаны быть видны ДО нажатия'
 
-    done = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    done = await _confirmed_reset(session, stand)
     assert done.done is True, done.blocked_reason
     assert await session.scalar(select(func.count()).select_from(TicketMessage)) == 0
 
@@ -670,7 +1004,7 @@ async def test_an_unfinished_gift_locks_but_a_finished_one_does_not(session, mon
     session.add(gift)
     await session.commit()
 
-    blocked = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    blocked = await _confirmed_reset(session, stand)
     assert blocked.done is False
     assert 'подарок' in (blocked.blocked_reason or '')
 
@@ -678,6 +1012,6 @@ async def test_an_unfinished_gift_locks_but_a_finished_one_does_not(session, mon
     gift.status = 'delivered'
     await session.commit()
 
-    done = await user_service.reset_test_account(session, stand, admin_id=1, confirm=True)
+    done = await _confirmed_reset(session, stand)
     assert done.done is True, done.blocked_reason
     assert await session.scalar(select(func.count()).select_from(GuestPurchase)) == 1

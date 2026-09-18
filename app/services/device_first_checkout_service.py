@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import html
 import json
+import math
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
@@ -63,6 +64,13 @@ READY_NOTIFICATION_TYPE = 'ready'
 # бот и защита «ровно один раз» уникальным ключом (заказ, тип).
 REFERRAL_REWARD_NOTIFICATION_TYPE = 'referral_reward'
 OWNER_ALERT_NOTIFICATION_TYPE = 'order_stuck'
+# К-2 (Г1). Карточка ПРОДАЖИ владельцу: касса кабинета с 02.08.2026 не звала общий сборщик
+# вовсе — 28 продаж без единой карточки. Тип несёт признак «первая/повторная» в себе
+# (`sale:first` / `sale:repeat`), потому что снять его можно только ДО того, как сама продажа
+# перевернёт `user.has_had_paid_subscription`; воркер читает флаг позже и подписал бы каждую
+# первую продажу «Продление». В оживление тип НЕ входит: общий сборщик пишет событие
+# `purchase` в `subscription_events` до отправки, и каждый повтор дал бы второе событие (DD).
+SALE_NOTIFICATION_PREFIX = 'sale:'
 # Пункт 4.1-Б. Права тарифа изменились между расчётом и оплатой. Заказ при этом выдаётся
 # захваченным набором — расхождение только СООБЩАЕТСЯ. Колонка `notification_type` —
 # обычный `String(48)` без CHECK (`models.py:3042`), поэтому новое значение не требует
@@ -532,6 +540,63 @@ async def _require_no_legacy_pending_trial(
     )
 
 
+def _upgrade_prorate_basis(
+    subscription: Subscription | None,
+    tariff: Tariff,
+    *,
+    now: datetime,
+) -> tuple[int | None, int]:
+    """Основание доплаты за рост устройств при продлении (этап ДУ-2): (от какого лимита, дней остатка).
+
+    Только для ПЛАТНОЙ подписки с неистёкшим сроком: добавленные при продлении устройства
+    вступают сразу и действуют на остаток старого срока, а цена ячейки матрицы считала их
+    только на покупаемый период — третье устройство на год доставалось бесплатно
+    (дефект 1 внешнего ревью 13.09.2026). Пробная, истёкшая или отсутствующая подписка —
+    доплаты нет: у пробной устройства не оплачены и не пол, у истёкшей остатка нет.
+    «От какого лимита» — `max(текущий, база тарифа)`: докупка посреди срока считает бесплатными
+    устройства до базы (`device_addon_service`), и обе двери обязаны называть одну сумму.
+    Дни — как у докупки: `max(1, ceil(остаток / сутки))`.
+    """
+    if subscription is None or subscription.is_trial:
+        return None, 0
+    end_date = getattr(subscription, 'end_date', None)
+    if end_date is None:
+        return None, 0
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=UTC)
+    remaining_seconds = (end_date - now).total_seconds()
+    if remaining_seconds <= 0:
+        return None, 0
+    upgrade_from = max(int(subscription.device_limit or 0), int(tariff.device_limit or 0))
+    # Буквально как у докупки: ceil по дробным секундам, а не по целым (иначе на
+    # суточной границе две двери расходились бы на день — 1,67 ₽/устр.).
+    remaining_days = max(1, math.ceil(remaining_seconds / 86400))
+    return upgrade_from, remaining_days
+
+
+def _frozen_upgrade_remaining_days(checkout: SubscriptionCheckout) -> int:
+    """Дни остатка, замороженные в котировке заказа (ДУ-2).
+
+    Перепроверка цены берёт дни из `price_breakdown` ячейки, а не от `now`: иначе каждое
+    продление с ростом устройств ловило бы `reprice_required` на тике суток между котировкой
+    и оплатой. «От какого лимита» при этом берётся ЖИВОЙ: докупил устройство в окне
+    котировки — цена разойдётся, и заказ уйдёт на перекотировку вместо двойной оплаты.
+    У заказов, созданных до этого этапа, ключа нет → 0 → цена та же, что была заморожена.
+    """
+    breakdown = getattr(checkout, 'price_breakdown', None) or {}
+    try:
+        return max(0, int(breakdown.get('upgrade_remaining_days', 0) or 0))
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+def _live_upgrade_from(subscription: Subscription | None, tariff: Tariff, frozen_days: int) -> int | None:
+    """«От какого лимита» для перепроверки — ЖИВОЙ лимит подписки и база тарифа (ДУ-2)."""
+    if not frozen_days or subscription is None or subscription.is_trial:
+        return None
+    return max(int(subscription.device_limit or 0), int(tariff.device_limit or 0))
+
+
 def _subscription_snapshot(subscription: Subscription | None) -> dict[str, Any]:
     if subscription is None:
         return {}
@@ -712,6 +777,24 @@ async def _queue_owner_checkout_drift_row(
         db.add(DeviceFirstNotificationOutbox(checkout_id=checkout.id, notification_type=notification_type))
 
 
+async def _queue_owner_sale_row(db: AsyncSession, *, checkout: SubscriptionCheckout, user: User) -> None:
+    """К-2: строка «продажа» владельцу. Замки и дедуп те же, что у строк-тревог
+    (`_queue_owner_checkout_drift_row`); признак «первая» — по флагу ДО его переворота.
+    Карточка не смеет ломать продажу: любой сбой здесь — предупреждение в лог, не исключение
+    (тот же щит, что у `_report_entitlement_drift_without_blocking`)."""
+    kind = 'repeat' if getattr(user, 'has_had_paid_subscription', False) else 'first'
+    try:
+        await _queue_owner_checkout_drift_row(
+            db, checkout=checkout, user=user, notification_type=f'{SALE_NOTIFICATION_PREFIX}{kind}'
+        )
+    except Exception as error:
+        logger.warning(
+            'device_first_owner_sale_row_failed',
+            checkout_id=getattr(checkout, 'public_id', None),
+            error=type(error).__name__,
+        )
+
+
 async def _report_entitlement_drift_without_blocking(
     db: AsyncSession,
     *,
@@ -792,6 +875,9 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
     if not eligibility.eligible or eligibility.tariff is None:
         return {'eligible': False, 'reason': eligibility.reason}
     tariff = eligibility.tariff
+    # ДУ-2: основание доплаты считается ОДИН раз на запрос — все ячейки матрицы и
+    # заказ, рождённый из неё, видят одни и те же дни остатка.
+    upgrade_from, upgrade_days = _upgrade_prorate_basis(subscription, tariff, now=datetime.now(UTC))
     matrix = []
     for days in eligibility.period_options:
         prices = []
@@ -801,11 +887,14 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
                 days,
                 device_limit=devices,
                 user=user,
+                upgrade_from_device_limit=upgrade_from,
+                upgrade_remaining_days=upgrade_days,
             )
             if price.final_total <= 0:
                 # A full promo/free period must retain the established trial or
                 # gift semantics, never be mistaken for a paid checkout.
                 return {'eligible': False, 'reason': 'non_positive_quote'}
+            price_breakdown = getattr(price, 'breakdown', None) or {}
             prices.append(
                 {
                     'device_limit': devices,
@@ -815,6 +904,9 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
                         'devices_price_kopeks': price.devices_price,
                         'promo_group_discount_kopeks': price.promo_group_discount,
                         'promo_offer_discount_kopeks': price.promo_offer_discount,
+                        'upgrade_from_device_limit': upgrade_from,
+                        'upgrade_remaining_days': upgrade_days,
+                        'upgrade_prorate_kopeks': int(price_breakdown.get('upgrade_prorate_kopeks', 0) or 0),
                     },
                 }
             )
@@ -1547,6 +1639,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
     checkout.fulfillment_state = 'in_progress'
     checkout.quote_state = 'committed'
     user.balance_kopeks -= charge
+    await _queue_owner_sale_row(db, checkout=checkout, user=user)  # до переворота флага ниже
     user.has_had_paid_subscription = True
     # Скидку меряем ПЕРЕСЧИТАННОЙ ценой, а не замороженной разбивкой заказа: выше
     # стоит забор `charge != checkout.quoted_price_kopeks`, но он сверяет ИТОГ, а не
@@ -1731,11 +1824,17 @@ async def _validate_direct_pre_commit(
         checkout.terminal_reason = 'tariff_no_longer_eligible'
         await db.commit()
         return None
+    # ДУ-2: дни остатка — замороженные в котировке, «от какого лимита» — живой (см.
+    # `_frozen_upgrade_remaining_days`). Обе перепроверки ниже обязаны считать одинаково.
+    frozen_upgrade_days = _frozen_upgrade_remaining_days(checkout)
+    live_upgrade_from = _live_upgrade_from(target, tariff, frozen_upgrade_days)
     current_price = await pricing_engine.calculate_tariff_purchase_price(
         tariff,
         checkout.period_days,
         device_limit=checkout.selected_device_limit,
         user=user,
+        upgrade_from_device_limit=live_upgrade_from,
+        upgrade_remaining_days=frozen_upgrade_days,
     )
     if (
         int(tariff.pricing_revision or 1) != checkout.pricing_revision
@@ -1771,11 +1870,16 @@ async def _validate_direct_pre_commit(
         if locked_tariff is None:
             raise EntitlementResolutionError('tariff disappeared during final quote validation')
         tariff = locked_tariff
+        # База тарифа перечитана под замком — основание доплаты считаем от неё же, а не
+        # от строки, загруженной до FOR UPDATE.
+        live_upgrade_from = _live_upgrade_from(target, tariff, frozen_upgrade_days)
         locked_price = await pricing_engine.calculate_tariff_purchase_price(
             tariff,
             checkout.period_days,
             device_limit=checkout.selected_device_limit,
             user=user,
+            upgrade_from_device_limit=live_upgrade_from,
+            upgrade_remaining_days=frozen_upgrade_days,
         )
         if (
             int(tariff.pricing_revision or 1) != checkout.pricing_revision
@@ -2318,6 +2422,7 @@ async def _complete_direct_sale_locked(
         )
         db.add(sale)
         await db.flush()
+    await _queue_owner_sale_row(db, checkout=checkout, user=user)  # до переворота флага ниже
     user.has_had_paid_subscription = True
     # Читаем из СНИМКА, а не из колонки заказа. Сегодня они совпадают (колонка пишется один
     # раз при создании), но вся остальная функция построена на снимке именно потому, что
@@ -3529,6 +3634,72 @@ def _referral_reward_recipient(notification_type: str) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
+async def _send_owner_sale_card(db: AsyncSession, *, bot, checkout: SubscriptionCheckout, first: bool) -> bool:
+    """К-2: карточка продажи владельцу через общий сборщик, с ЯВНЫМИ аргументами.
+
+    Явными — потому что авто-определение «первая/продление» в сборщике читает флаг, который
+    сама продажа уже перевернула; способ оплаты берём из кода метода провайдера, а не из
+    описания транзакции («Оплата подписки картой: …» пишется и при СБП); скидку — из
+    замороженной разбивки заказа, иначе разложение цены в карточке молча промолчит.
+    False = слать некуда (уведомления или категория выключены) — строка станет `obsolete`.
+    Отказ доставки — исключение → строка `failed`, без повторов (см. SALE_NOTIFICATION_PREFIX).
+    """
+    from app.services.admin_notification_service import (
+        AdminNotificationService,
+        NotificationCategory,
+        platega_method_label,
+    )
+
+    service = AdminNotificationService(bot)
+    category = NotificationCategory.PURCHASES if first else NotificationCategory.RENEWALS
+    if not service.is_enabled or not service.category_enabled.get(category, True):
+        return False
+    user = (
+        await db.execute(select(User).where(User.id == checkout.user_id).execution_options(populate_existing=True))
+    ).scalar_one_or_none()
+    subscription = (
+        await db.execute(
+            select(Subscription)
+            .where(Subscription.id == checkout.created_subscription_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    transaction = (
+        await db.execute(select(Transaction).where(Transaction.id == checkout.debit_transaction_id))
+    ).scalar_one_or_none()
+    if user is None or subscription is None or transaction is None:
+        raise RuntimeError('sale_card_data_missing')
+    snapshot = checkout.sale_snapshot or {}
+    period_days = int(snapshot.get('period_days') or checkout.period_days or 0)
+    payment_label = ''
+    if checkout.funding_mode != 'wallet':
+        attempt = (
+            await db.execute(
+                select(CheckoutPaymentAttempt)
+                .where(CheckoutPaymentAttempt.checkout_id == checkout.id)
+                .order_by(CheckoutPaymentAttempt.credited_amount_kopeks.desc(), CheckoutPaymentAttempt.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        payment_label = platega_method_label(attempt.provider_method_code) if attempt is not None else ''
+    discount = int((snapshot.get('price_breakdown') or {}).get('promo_offer_discount_kopeks') or 0)
+    delivered = await service.send_subscription_purchase_notification(
+        db,
+        user,
+        subscription,
+        transaction,
+        period_days,
+        purchase_type='first_purchase' if first else 'renewal',
+        # Снимок цели снят при заведении заказа — до того, как выдача сняла с подписки «пробный»
+        was_trial_conversion=first and bool((checkout.target_snapshot or {}).get('is_trial')),
+        payment_label=payment_label,
+        discount_kopeks=discount,
+    )
+    if not delivered:
+        raise RuntimeError('sale_card_not_delivered')
+    return True
+
+
 async def _send_referral_reward_message(
     db: AsyncSession, *, bot, checkout: SubscriptionCheckout, recipient_id: int | None = None
 ) -> None:
@@ -3735,6 +3906,12 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
                 # реферальные письма перестали бы повторяться вовсе.
                 await _send_referral_reward_message(
                     db, bot=bot, checkout=checkout, recipient_id=_referral_reward_recipient(row.notification_type)
+                )
+            elif row.notification_type.startswith(SALE_NOTIFICATION_PREFIX):
+                # 🔴 Ветка обязана стоять ДО `else`: иначе карточка продажи владельцу ушла бы
+                # покупателю текстом «✅ Подписка готова» вторым сообщением про тот же заказ.
+                obsolete = not await _send_owner_sale_card(
+                    db, bot=bot, checkout=checkout, first=row.notification_type == f'{SALE_NOTIFICATION_PREFIX}first'
                 )
             elif row.notification_type == READY_NOTIFICATION_TYPE:
                 await _send_client_ready_message(db, bot=bot, checkout=checkout)

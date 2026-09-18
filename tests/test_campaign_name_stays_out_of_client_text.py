@@ -253,7 +253,8 @@ async def test_real_client_path_never_emits_the_campaign_name(monkeypatch):
     )
 
     assert message, 'сообщение о бонусе исчезло — человек не узнает, что получил деньги'
+    assert message.bonus_type == 'balance'
     for form in (CAMPAIGN_NAME, html.escape(CAMPAIGN_NAME)):
-        assert form not in message, f'имя кампании доехало до клиента живым путём: {message!r}'
+        assert form not in message.text, f'имя кампании доехало до клиента живым путём: {message.text!r}'
     # Сумму сообщение назвать ОБЯЗАНО: без неё оно теряет весь смысл.
-    assert '50' in message, f'сообщение перестало называть сумму бонуса: {message!r}'
+    assert '50' in message.text, f'сообщение перестало называть сумму бонуса: {message.text!r}'

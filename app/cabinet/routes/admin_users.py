@@ -12,9 +12,10 @@ from app.cabinet.utils.device_ownership import verify_hwid_belongs_to_user
 from app.config import settings
 from app.database.crud.campaign import get_campaign_registration_by_user
 from app.database.crud.subscription import (
+    ALIVE_SUBSCRIPTION_STATUSES,
     extend_subscription,
 )
-from app.database.crud.tariff import get_tariff_by_id
+from app.database.crud.tariff import get_all_tariffs, get_tariff_by_id, get_trial_tariff
 from app.database.crud.user import (
     add_user_balance,
     get_referrals,
@@ -35,6 +36,8 @@ from app.database.crud.user_device_alias import (
 from app.database.crud.user_promo_group import sync_user_primary_promo_group
 from app.database.models import (
     AccountErasureRequest,
+    DeviceAddonIntent,
+    DeviceAddonTopupAttempt,
     GuestPurchase,
     PaymentMethod,
     PromoGroup,
@@ -52,6 +55,7 @@ from app.database.models import (
 from app.services.permission_service import PermissionService
 from app.utils.subscription_utils import coerce_panel_device_limit
 from app.utils.timezone import panel_datetime_to_utc
+from app.utils.user_utils import real_payment_user_ids
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.users import (
@@ -87,6 +91,7 @@ from ..schemas.users import (
     SyncFromPanelResponse,
     SyncToPanelRequest,
     SyncToPanelResponse,
+    TestAccountMembershipRequest,
     TestAccountResetRequest,
     TestAccountResetResponse,
     TrafficPurchaseItem,
@@ -143,6 +148,12 @@ def _is_test_account(user: User) -> bool:
     from app.services.user_service import is_test_account
 
     return is_test_account(user)
+
+
+def _can_manage_test_accounts(admin: User) -> bool:
+    from app.services.rbac_bootstrap_service import is_user_admin_by_env
+
+    return is_user_admin_by_env(admin).is_admin
 
 
 def _build_user_list_item(user: User, spending_stats: dict = None) -> UserListItem:
@@ -436,6 +447,7 @@ async def _sync_subscription_to_panel(
                     updated_panel_user = await SubscriptionService().run_guarded_panel_write(
                         db,
                         user_id=user.id,
+                        subscription_id=subscription.id,
                         api=api,
                         panel_uuid=panel_uuid,
                         operation=lambda: api.update_user(**update_kwargs),
@@ -480,6 +492,7 @@ async def _sync_subscription_to_panel(
                 new_panel_user = await SubscriptionService().run_guarded_panel_write(
                     db,
                     user_id=user.id,
+                    subscription_id=subscription.id,
                     api=api,
                     operation=lambda: api.create_user(**create_kwargs),
                 )
@@ -614,6 +627,71 @@ async def list_users(
     )
 
 
+async def _count_trial_and_paying_users(db: AsyncSession) -> dict[str, int]:
+    """Count people on the canonical trial and people with proven external payments."""
+    from app.services.user_service import test_account_telegram_ids
+
+    now = datetime.now(UTC)
+    test_telegram_ids = tuple(test_account_telegram_ids())
+
+    # Erased accounts belong to the archive, not to operational statistics.
+    operational_user = or_(User.status.is_(None), User.status != UserStatus.DELETED.value)
+    # A DB override wins over the legacy environment list; email-only users are never stands.
+    non_test_user_conditions = [
+        User.telegram_id.is_(None),
+        User.test_account_enabled.is_(False),
+    ]
+    if test_telegram_ids:
+        non_test_user_conditions.append(
+            and_(User.test_account_enabled.is_(None), User.telegram_id.not_in(test_telegram_ids))
+        )
+    else:
+        non_test_user_conditions.append(User.test_account_enabled.is_(None))
+    non_test_user = or_(*non_test_user_conditions)
+
+    # Limited access is still a live purchased entitlement; an expired date is not.
+    live_subscription = and_(
+        Subscription.status.in_(sorted(ALIVE_SUBSCRIPTION_STATUSES)),
+        Subscription.end_date > now,
+    )
+    common_conditions = (operational_user, non_test_user, live_subscription)
+
+    trial_tariff = await get_trial_tariff(db)
+    users_on_trial = 0
+    if trial_tariff is not None:
+        trial_result = await db.execute(
+            select(func.count(func.distinct(Subscription.user_id)))
+            .join(User, Subscription.user_id == User.id)
+            .where(
+                *common_conditions,
+                # The flag alone also marks relabelled/free subscriptions; require the canonical trial tariff.
+                Subscription.is_trial.is_(True),
+                Subscription.tariff_id == trial_tariff.id,
+            )
+        )
+        users_on_trial = int(trial_result.scalar() or 0)
+
+    tariffs = await get_all_tariffs(db, include_inactive=True)
+    excluded_tariff_ids = [tariff.id for tariff in tariffs if tariff.is_free or tariff.is_trial_available]
+    paying_conditions = [
+        *common_conditions,
+        # NULL is a legacy non-trial value in production, so only explicit True is excluded.
+        Subscription.is_trial.is_not(True),
+    ]
+    if excluded_tariff_ids:
+        # Legacy NULL tariffs may be paid; known free and trial tariffs never prove a paid entitlement.
+        paying_conditions.append(
+            or_(Subscription.tariff_id.is_(None), Subscription.tariff_id.not_in(excluded_tariff_ids))
+        )
+
+    paying_result = await db.execute(
+        select(Subscription.user_id).join(User, Subscription.user_id == User.id).where(*paying_conditions).distinct()
+    )
+    candidate_ids = set(paying_result.scalars().all())
+    paid_ids = await real_payment_user_ids(db, candidate_ids) if candidate_ids else set()
+    return {'on_trial': users_on_trial, 'paying': len(paid_ids)}
+
+
 @router.get('/stats', response_model=UsersStatsResponse)
 async def get_users_stats(
     admin: User = Depends(require_permission('users:read')),
@@ -621,6 +699,7 @@ async def get_users_stats(
 ):
     """Get overall users statistics."""
     stats = await get_users_statistics(db)
+    truthful_stats = await _count_trial_and_paying_users(db)
 
     # Get subscription stats
     operational_user = or_(User.status.is_(None), User.status != UserStatus.DELETED.value)
@@ -711,6 +790,8 @@ async def get_users_stats(
         users_with_active_subscription=users_with_active,
         users_with_trial=users_with_trial,
         users_with_expired_subscription=users_with_expired,
+        users_on_trial=truthful_stats['on_trial'],
+        users_paying=truthful_stats['paying'],
         total_balance_kopeks=total_balance,
         total_balance_rubles=total_balance / 100,
         avg_balance_kopeks=avg_balance,
@@ -874,6 +955,8 @@ async def get_user_detail(
             else user.remnawave_uuid
         ),
         is_test_account=_is_test_account(user),
+        can_manage_test_account=_can_manage_test_accounts(admin),
+        test_reset_state=user.test_reset_state,
     )
 
 
@@ -1232,6 +1315,127 @@ async def _reject_manual_access_point_grant(db: AsyncSession, subscription: Subs
 
 
 # === Subscription Management ===
+
+
+@router.get('/{user_id}/device-addons')
+async def get_user_device_addons(
+    user_id: int,
+    admin: User = Depends(require_permission('users:read')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Return the durable add-on purchase and fulfillment history for one owner."""
+    del admin
+    if await db.get(User, user_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
+    intents = (
+        (
+            await db.execute(
+                select(DeviceAddonIntent)
+                .where(DeviceAddonIntent.user_id == user_id)
+                .order_by(DeviceAddonIntent.created_at.desc(), DeviceAddonIntent.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    intent_ids = [int(intent.id) for intent in intents]
+    attempts_by_intent: dict[int, list[dict]] = {}
+    if intent_ids:
+        attempts = (
+            (
+                await db.execute(
+                    select(DeviceAddonTopupAttempt)
+                    .where(DeviceAddonTopupAttempt.intent_id.in_(intent_ids))
+                    .order_by(DeviceAddonTopupAttempt.created_at.desc(), DeviceAddonTopupAttempt.id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for attempt in attempts:
+            attempts_by_intent.setdefault(int(attempt.intent_id), []).append(
+                {
+                    'public_id': attempt.public_id,
+                    'status': attempt.status,
+                    'amount_kopeks': int(attempt.requested_amount_kopeks),
+                    'reason': attempt.reconciliation_reason,
+                    'created_at': attempt.created_at,
+                }
+            )
+    return {
+        'items': [
+            {
+                'public_id': intent.public_id,
+                'devices_to_add': int(intent.devices_to_add),
+                'price_kopeks': int(intent.quoted_price_kopeks),
+                'purchase_state': intent.purchase_state,
+                'fulfillment_state': intent.fulfillment_state,
+                'reason': intent.fulfillment_error_code,
+                'purchased_at': intent.purchased_at,
+                'fulfilled_at': intent.fulfilled_at,
+                'created_at': intent.created_at,
+                'attempts': attempts_by_intent.get(int(intent.id), []),
+            }
+            for intent in intents
+        ]
+    }
+
+
+@router.post('/{user_id}/device-addons/{intent_public_id}/retry-fulfillment')
+async def retry_user_device_addon_fulfillment(
+    user_id: int,
+    intent_public_id: str,
+    admin: User = Depends(require_permission('users:subscription')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Release only a reviewed fulfillment back to the existing worker."""
+    intent = (
+        await db.execute(
+            select(DeviceAddonIntent)
+            .where(
+                DeviceAddonIntent.public_id == intent_public_id,
+                DeviceAddonIntent.user_id == user_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if intent is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Device add-on intent not found')
+    if intent.purchase_state != 'purchased' or intent.fulfillment_state != 'needs_attention':
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                'code': 'device_addon_retry_not_allowed',
+                'message': 'Повтор доступен только для застрявшей выдачи оплаченной докупки.',
+            },
+        )
+    previous_reason = intent.fulfillment_error_code
+    intent.fulfillment_state = 'pending'
+    intent.fulfillment_attempts = 0
+    intent.fulfillment_error_code = None
+    intent.next_attempt_at = datetime.now(UTC)
+    intent.lease_token = None
+    intent.lease_expires_at = None
+    await PermissionService.log_action(
+        db,
+        user_id=admin.id,
+        action='retry_device_addon_fulfillment',
+        resource_type='device_addon_intent',
+        resource_id=intent.public_id,
+        details={'target_user_id': user_id, 'previous_reason': previous_reason},
+    )
+    await db.commit()
+
+    from app.services.device_addon_worker import device_addon_worker
+
+    device_addon_worker.wake()
+    return {
+        'success': True,
+        'message': 'Повтор выдачи поставлен в очередь.',
+        'public_id': intent.public_id,
+        'fulfillment_state': intent.fulfillment_state,
+    }
 
 
 @router.post('/{user_id}/subscription', response_model=UpdateSubscriptionResponse)
@@ -2797,6 +3001,50 @@ async def resolve_financial_account_erasure(
     )
 
 
+@router.put('/{user_id}/test-membership')
+async def set_test_membership(
+    user_id: int,
+    request: TestAccountMembershipRequest,
+    admin: User = Depends(require_permission('users:delete')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    if not _can_manage_test_accounts(admin):
+        raise HTTPException(status_code=403, detail='Только владелец может менять список тестировщиков.')
+    from app.database.models import AdminAuditLog
+    from app.services.account_test_reset_service import reset_is_busy
+    from app.services.user_service import _test_reset_blocked_reason
+
+    user = await db.scalar(
+        select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if user is None:
+        raise HTTPException(status_code=404, detail='User not found')
+    if user.telegram_id != request.telegram_id:
+        raise HTTPException(status_code=409, detail='Выбранный Telegram не совпадает с карточкой. Обновите её.')
+    if reset_is_busy(user):
+        raise HTTPException(status_code=409, detail='Сначала завершите начатый сброс.')
+    if request.enabled:
+        reason = await _test_reset_blocked_reason(db, user)
+        if reason or user.account_erased_at is not None:
+            raise HTTPException(status_code=409, detail=reason or 'Закрытый аккаунт нельзя назначить тестовым.')
+    previous = _is_test_account(user)
+    user.test_account_enabled = request.enabled
+    if user.test_reset_state is None:
+        user.test_reset_state = 'idle'
+    db.add(
+        AdminAuditLog(
+            user_id=admin.id,
+            action='test_account.membership',
+            resource_type='user',
+            resource_id=str(user.id),
+            status='success',
+            details={'before': previous, 'enabled': request.enabled},
+        )
+    )
+    await db.commit()
+    return {'is_test_account': request.enabled}
+
+
 @router.post('/{user_id}/test-reset', response_model=TestAccountResetResponse)
 async def reset_test_account_route(
     user_id: int,
@@ -2810,6 +3058,8 @@ async def reset_test_account_route(
     денег, какая подписка, сколько заказов и можно ли вообще. Всё остальное —
     в ``app/services/user_service.py``, включая три забора.
     """
+    if not _can_manage_test_accounts(admin):
+        raise HTTPException(status_code=403, detail='Только владелец может сбрасывать тестовые аккаунты.')
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
@@ -2833,7 +3083,7 @@ async def reset_test_account_route(
     # вместо человеческого отказа увидел бы Internal Server Error.
     admin_id = admin.id
 
-    plan = await reset_test_account(db, user, admin_id, confirm=request.confirm)
+    plan = await reset_test_account(db, user, admin_id, confirm=request.confirm, preview_token=request.preview_token)
     logger.info(
         'Admin test account reset',
         admin_id=admin_id,
@@ -2856,6 +3106,8 @@ async def reset_test_account_route(
         panel_linked=plan.panel_linked,
         panel_deleted=plan.panel_deleted,
         deleted_rows=plan.deleted_rows,
+        preview_token=plan.preview_token,
+        reset_state=plan.reset_state,
     )
 
 
@@ -3535,6 +3787,19 @@ async def sync_user_from_panel(
                     errors=['No user found in Remnawave panel by UUID, telegram_id, or email'],
                 )
 
+            # A manual sync can outlive its Panel read: a test reset may have
+            # removed P1 and a new trial may already own P2 by the time this
+            # request would write local UUIDs/URLs.  Re-use the canonical
+            # fresh row fence before touching either object.
+            if not await service._accept_test_account_panel_snapshot(db, user, {'uuid': panel_user.uuid}):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        'code': 'test_account_reset_stale_panel_snapshot',
+                        'message': 'Panel snapshot belongs to a retired test-account identity. Retry the sync.',
+                    },
+                )
+
             # Build panel info. active_internal_squads is a list[dict] (see the
             # diagnostic in get_user_sync_status / auth.py); the previous .uuid/str
             # checks matched nothing, so panel squads were never extracted and the
@@ -3884,6 +4149,7 @@ async def sync_user_to_panel(
                     updated_panel_user = await SubscriptionService().run_guarded_panel_write(
                         db,
                         user_id=user.id,
+                        subscription_id=sub.id,
                         api=api,
                         panel_uuid=panel_uuid,
                         operation=lambda: api.update_user(**update_kwargs),
@@ -3929,6 +4195,7 @@ async def sync_user_to_panel(
                 new_panel_user = await SubscriptionService().run_guarded_panel_write(
                     db,
                     user_id=user.id,
+                    subscription_id=sub.id,
                     api=api,
                     operation=lambda: api.create_user(**create_kwargs),
                 )

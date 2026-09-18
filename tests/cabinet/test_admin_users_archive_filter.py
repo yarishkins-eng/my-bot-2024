@@ -92,7 +92,9 @@ async def test_historical_statistics_contract_remains_unchanged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cabinet_stats_exclude_erased_accounts_from_operational_counts() -> None:
+async def test_cabinet_stats_exclude_erased_accounts_from_operational_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def scalar_result(value: int) -> SimpleNamespace:
         return SimpleNamespace(scalar=lambda: value)
 
@@ -100,6 +102,11 @@ async def test_cabinet_stats_exclude_erased_accounts_from_operational_counts() -
         return SimpleNamespace(one_or_none=lambda: value)
 
     db = AsyncMock()
+    monkeypatch.setattr(
+        admin_users,
+        '_count_trial_and_paying_users',
+        AsyncMock(return_value={'on_trial': 1, 'paying': 2}),
+    )
     db.execute.side_effect = [
         scalar_result(10),  # all stored rows
         scalar_result(6),  # active
@@ -122,6 +129,8 @@ async def test_cabinet_stats_exclude_erased_accounts_from_operational_counts() -
     assert response.blocked_users == 2
     assert response.deleted_users == 2
     assert response.users_with_subscription == 4
+    assert response.users_on_trial == 1
+    assert response.users_paying == 2
 
     subscription_sql = str(db.execute.await_args_list[5].args[0])
     assert 'JOIN users' in subscription_sql

@@ -368,6 +368,31 @@ class RemnaWaveWebhookService:
 
         user_id = user.id
         try:
+            # Retired test identities must never resolve to a later generation
+            # by Telegram ID. This survives worker restart and unregistering a
+            # fixture; ordinary users keep the existing webhook contract.
+            if isinstance(getattr(user, 'test_reset_started_at', None), datetime):
+                from sqlalchemy import select
+
+                from app.services.account_test_reset_service import reset_is_busy
+
+                if reset_is_busy(user):
+                    return True
+                current = await db.scalar(
+                    select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
+                )
+                nested = data.get('user') if isinstance(data.get('user'), dict) else {}
+                event_uuid = data.get('uuid') or data.get('userUuid') or nested.get('uuid')
+                if current is None or reset_is_busy(current) or not event_uuid:
+                    return True
+                if event_uuid in (current.test_reset_panel_uuids or []):
+                    return True
+                user, subscription = await self._resolve_user_and_subscription(db, data)
+                if not subscription or event_uuid not in {
+                    subscription.remnawave_uuid,
+                    current.remnawave_uuid,
+                }:
+                    return True
             await handler(db, user, subscription, data)
             return True
         except (StaleDataError, PendingRollbackError):

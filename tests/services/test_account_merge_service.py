@@ -133,6 +133,8 @@ def _make_subscription(
 def _make_db() -> SimpleNamespace:
     return SimpleNamespace(
         execute=AsyncMock(),
+        scalar=AsyncMock(return_value=None),
+        scalars=AsyncMock(return_value=[]),
         delete=AsyncMock(),
         flush=AsyncMock(),
     )

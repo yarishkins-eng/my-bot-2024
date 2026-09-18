@@ -384,7 +384,7 @@ async def test_device_first_platega_is_not_misclassified_as_legacy_history() -> 
     """
     # one D1 attempt, then every legacy provider check, then no legacy
     # Platega-only row and no non-D1 ledger transaction
-    scalar_results = [1] + [None] * 24 + [None, None]
+    scalar_results = [1, None] + [None] * 24 + [None, None]
     db = SimpleNamespace(scalar=AsyncMock(side_effect=scalar_results))
 
     assert await UserService._get_financial_history_kind(db, 7) == (True, False)
@@ -397,10 +397,10 @@ async def test_guest_purchase_is_legacy_financial_history_for_buyer_and_recipien
     # D1 + 23 providers return no row, then a guest order is found; Platega
     # and ledger lookups still happen so the result stays an auditable manual
     # financial path.
-    db = SimpleNamespace(scalar=AsyncMock(side_effect=[None] * 24 + [1, None, None]))
+    db = SimpleNamespace(scalar=AsyncMock(side_effect=[None] * 25 + [1, None, None]))
 
     assert await UserService._get_financial_history_kind(db, 7) == (True, True)
-    guest_query = db.scalar.await_args_list[24].args[0]
+    guest_query = db.scalar.await_args_list[25].args[0]
     compiled = str(guest_query)
     assert 'guest_purchases.buyer_user_id' in compiled
     assert 'guest_purchases.user_id' in compiled

@@ -3923,6 +3923,7 @@ async def toggle_user_server(callback: types.CallbackQuery, db_user: User, db: A
                     updated = await SubscriptionService().run_guarded_panel_write(
                         db,
                         user_id=user_id,
+                        subscription_id=subscription.id if subscription else None,
                         api=api,
                         panel_uuid=_uuid,
                         operation=lambda: api.update_user(
@@ -4435,6 +4436,7 @@ async def _update_user_devices(
                     updated = await SubscriptionService().run_guarded_panel_write(
                         db,
                         user_id=user_id,
+                        subscription_id=subscription.id if subscription else None,
                         api=api,
                         panel_uuid=_uuid,
                         operation=lambda: api.update_user(
@@ -4500,6 +4502,7 @@ async def _update_user_traffic(
                     updated = await SubscriptionService().run_guarded_panel_write(
                         db,
                         user_id=user_id,
+                        subscription_id=subscription.id if subscription else None,
                         api=api,
                         panel_uuid=_uuid,
                         operation=lambda: api.update_user(

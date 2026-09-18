@@ -62,6 +62,15 @@ class AuthMiddleware(BaseMiddleware):
             try:
                 db_user = await get_user_by_telegram_id(db, user.id)
 
+                from app.services.account_test_reset_service import RESET_MESSAGE, reset_is_busy
+
+                if db_user and reset_is_busy(db_user):
+                    if isinstance(event, CallbackQuery):
+                        await event.answer(RESET_MESSAGE, show_alert=True)
+                    else:
+                        await event.answer(RESET_MESSAGE)
+                    return None
+
                 if not db_user:
                     state: FSMContext = data.get('state')
                     current_state = None

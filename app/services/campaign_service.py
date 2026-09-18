@@ -598,6 +598,33 @@ class AdvertisingCampaignService:
         campaign: AdvertisingCampaign,
     ) -> CampaignBonusResult:
         """Выдача тарифа на определённое время."""
+        locked_user_id = await db.scalar(select(User.id).where(User.id == user.id).with_for_update())
+        if locked_user_id is None:
+            logger.error('Пользователь исчез до выдачи тарифа кампании', user_id=user.id, campaign_id=campaign.id)
+            return CampaignBonusResult(success=False)
+
+        existing_registration = await db.scalar(
+            select(AdvertisingCampaignRegistration).where(
+                and_(
+                    AdvertisingCampaignRegistration.campaign_id == campaign.id,
+                    AdvertisingCampaignRegistration.user_id == user.id,
+                )
+            )
+        )
+        if existing_registration is not None:
+            logger.info(
+                'ℹ️ Тариф кампании уже был выдан пользователю, пропускаем',
+                format_user_log=_format_user_log(user),
+                campaign_id=campaign.id,
+            )
+            return CampaignBonusResult(
+                success=True,
+                bonus_type='tariff',
+                tariff_id=existing_registration.tariff_id or campaign.tariff_id,
+                tariff_duration_days=(existing_registration.tariff_duration_days or campaign.tariff_duration_days),
+                is_new_registration=False,
+            )
+
         existing_subscription = None
         if settings.is_multi_tariff_enabled():
             from app.database.crud.subscription import get_active_subscriptions_by_user_id
@@ -648,74 +675,131 @@ class AdvertisingCampaignService:
             logger.error('Не удалось разрешить entitlement тарифа кампании', campaign_id=campaign.id, error=error)
             return CampaignBonusResult(success=False)
 
-        if existing_subscription:
-            # Multi-tariff: extend the existing subscription for this tariff
-            from app.database.crud.subscription import extend_subscription
+        try:
+            if existing_subscription:
+                # Multi-tariff: extend the existing subscription for this tariff
+                from app.database.crud.subscription import extend_subscription
 
-            await extend_subscription(db, existing_subscription, duration_days, tariff_id=tariff.id)
+                await extend_subscription(
+                    db,
+                    existing_subscription,
+                    duration_days,
+                    tariff_id=tariff.id,
+                    commit=False,
+                )
+                subscription = existing_subscription
+                panel_action = 'update'
+            else:
+                # Создаём подписку как платную (не trial) с привязкой к тарифу
+                subscription = await create_paid_subscription(
+                    db=db,
+                    user_id=user.id,
+                    duration_days=duration_days,
+                    traffic_limit_gb=traffic_limit or 0,
+                    device_limit=device_limit,
+                    connected_squads=squads,
+                    update_server_counters=True,
+                    is_trial=False,
+                    tariff_id=tariff.id,
+                    commit=False,
+                )
+                panel_action = 'create'
+
+            registration = AdvertisingCampaignRegistration(
+                campaign_id=campaign.id,
+                user_id=user.id,
+                bonus_type='tariff',
+                balance_bonus_kopeks=0,
+                subscription_duration_days=None,
+                tariff_id=tariff.id,
+                tariff_duration_days=duration_days,
+            )
+            db.add(registration)
+            await db.flush()
+
+            # Panel helpers deliberately swallow provider/DB errors and may roll
+            # back their session before returning None. Capture every value needed
+            # for retry and the durable response while ORM rows are still usable.
+            subscription_id = subscription.id
+            user_id = user.id
+            campaign_id = campaign.id
+            result = CampaignBonusResult(
+                success=True,
+                bonus_type='tariff',
+                tariff_id=tariff.id,
+                tariff_name=tariff.name,
+                tariff_duration_days=duration_days,
+                subscription_traffic_gb=traffic_limit or 0,
+                subscription_device_limit=device_limit,
+                subscription_squads=squads,
+                is_new_registration=True,
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+        try:
+            if panel_action == 'update':
+                panel_result = await self.subscription_service.update_remnawave_user(db, subscription)
+            else:
+                panel_result = await self.subscription_service.create_remnawave_user(db, subscription)
+        except Exception as error:
+            panel_result = None
+            logger.error(
+                '❌ Ошибка синхронизации RemnaWave для тарифа кампании',
+                campaign_id=campaign_id,
+                subscription_id=subscription_id,
+                error=error,
+            )
+
+        if panel_result is None:
             try:
-                await self.subscription_service.update_remnawave_user(db, existing_subscription)
+                await db.rollback()
             except Exception as error:
                 logger.error(
-                    '❌ Ошибка синхронизации RemnaWave при продлении тарифа кампании',
-                    campaign_id=campaign.id,
+                    'Не удалось очистить сессию после ошибки синхронизации тарифа кампании',
+                    campaign_id=campaign_id,
+                    subscription_id=subscription_id,
                     error=error,
                 )
 
-            logger.info(
-                '🎁 Подписка пользователя продлена по тарифу кампании на дней',
-                format_user_log=_format_user_log(user),
-                tariff_name=tariff.name,
-                campaign_id=campaign.id,
-                duration_days=duration_days,
-                subscription_id=existing_subscription.id,
-            )
-        else:
-            # Создаём подписку как платную (не trial) с привязкой к тарифу
-            new_subscription = await create_paid_subscription(
-                db=db,
-                user_id=user.id,
-                duration_days=duration_days,
-                traffic_limit_gb=traffic_limit or 0,
-                device_limit=device_limit,
-                connected_squads=squads,
-                update_server_counters=True,
-                is_trial=False,
-                tariff_id=tariff.id,
-            )
-
             try:
-                await self.subscription_service.create_remnawave_user(db, new_subscription)
+                from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+                remnawave_retry_queue.enqueue(
+                    subscription_id=subscription_id,
+                    user_id=user_id,
+                    action=panel_action,
+                )
             except Exception as error:
+                # The DB grant is already durable. The retry queue is in-memory,
+                # so failure here can only be surfaced for manual reconciliation;
+                # it must not turn a committed grant into an apparent DB failure.
                 logger.error(
-                    '❌ Ошибка синхронизации RemnaWave для тарифа кампании', campaign_id=campaign.id, error=error
+                    'Не удалось поставить синхронизацию тарифа кампании в очередь',
+                    campaign_id=campaign_id,
+                    subscription_id=subscription_id,
+                    error=error,
                 )
 
-            logger.info(
-                '🎁 Пользователю выдан тариф по кампании на дней',
-                format_user_log=_format_user_log(user),
-                tariff_name=tariff.name,
-                campaign_id=campaign.id,
-                duration_days=duration_days,
-            )
+            # rollback expires ORM state in some session configurations. The
+            # bot caller still reads the passed user before its own later refresh,
+            # so restore that row or propagate an operational failure only after
+            # the durable panel retry has been recorded.
+            await db.refresh(user)
 
-        _, created = await record_campaign_registration(
-            db,
-            campaign_id=campaign.id,
-            user_id=user.id,
-            bonus_type='tariff',
-            tariff_id=tariff.id,
-            tariff_duration_days=duration_days,
+        logger.info(
+            (
+                '🎁 Подписка пользователя продлена по тарифу кампании на дней'
+                if panel_action == 'update'
+                else '🎁 Пользователю выдан тариф по кампании на дней'
+            ),
+            user_id=user_id,
+            tariff_name=result.tariff_name,
+            campaign_id=campaign_id,
+            duration_days=result.tariff_duration_days,
+            subscription_id=subscription_id,
         )
 
-        return CampaignBonusResult(
-            success=True,
-            bonus_type='tariff',
-            tariff_id=tariff.id,
-            tariff_name=tariff.name,
-            tariff_duration_days=duration_days,
-            subscription_traffic_gb=traffic_limit or 0,
-            subscription_device_limit=device_limit,
-            subscription_squads=squads,
-            is_new_registration=created,
-        )
+        return result

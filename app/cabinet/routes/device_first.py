@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database.crud.rbac import AuditLogCRUD
 from app.database.models import (
     CheckoutPaymentAttempt,
@@ -278,7 +279,13 @@ async def purchase_options(
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    return await build_purchase_options(db, user)
+    options = await build_purchase_options(db, user)
+    # Ineligibility is not permission to use /subscription/purchase-tariff.
+    # Match that route's public-rollout guard even when no tariff is eligible.
+    return {
+        **options,
+        'legacy_tariff_purchase_allowed': not settings.DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED,
+    }
 
 
 @router.get('/payment-methods')
