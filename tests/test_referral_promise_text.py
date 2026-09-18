@@ -25,6 +25,9 @@ PROMISE_KEYS = (
     # 🔴 Найдено прогоном сценария: это текст, который партнёр ОТПРАВЛЯЕТ другу.
     # Экран уже говорил «при оплате», а уходящее сообщение — «при пополнении баланса».
     'REFERRAL_INVITE_BONUS',
+    'REFERRAL_WELCOME_BONUS',
+    'REFERRAL_WELCOME_INVITE',
+    'REFERRAL_WELCOME_INVITE_VARIABLE',
 )
 
 # Слова, которыми обещание сужается до пополнения кошелька.

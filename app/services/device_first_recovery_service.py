@@ -24,6 +24,10 @@ from app.services.device_first_payment_service import reconcile_device_first_pay
 
 logger = structlog.get_logger(__name__)
 
+# Сколько секунд добор онбординга имеет право отнять у денежного воркера за один проход.
+# Вынесено в константу, чтобы сторож проверял потолок за доли секунды, а не за десять.
+ONBOARDING_FOLLOWUP_TIMEOUT_SECONDS = 10
+
 
 class DeviceFirstRecoveryService:
     """Recover direct receipts, provisioning and notifications without global polling."""
@@ -46,6 +50,23 @@ class DeviceFirstRecoveryService:
             # депозитной очереди есть только в цикле мониторинга с периодом 60 минут.
             await process_device_first_deposit_outbox(db, limit=20)
             notified = await process_device_first_notification_outbox(db, bot=bot, limit=20)
+
+        # 🔴 Добор онбординга живёт ЗДЕСЬ, а не в своём цикле, по одной причине: это
+        # единственный воркер с коротким шагом (10 с), обещать «через 10 минут» в часовом
+        # цикле мониторинга нельзя, а отдельный цикл ради одного письма запрещён планом.
+        # Своя страховка обязательна: это денежный путь, и сбой онбординга не имеет права
+        # останавливать сверку платежей и выдачу.
+        try:
+            from app.utils.funnel_notify import process_due_referral_onboarding_followups
+
+            # 🔴 Потолок обязателен. Один человек в очереди может стоить до 30 с ожидания
+            # соединения с базой плюс до 60 с на отправку в Telegram, а их за проход до
+            # двадцати — без потолка добор задержал бы сверку платежей на десятки минут.
+            async with asyncio.timeout(ONBOARDING_FOLLOWUP_TIMEOUT_SECONDS):
+                await process_due_referral_onboarding_followups(bot=bot, limit=20)
+        except Exception as error:
+            logger.error('referral_onboarding_followup_failed', error=type(error).__name__)
+
         return reconciled, provisioned, notified
 
     async def start(self, *, bot) -> None:

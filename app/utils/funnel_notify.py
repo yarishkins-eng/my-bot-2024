@@ -14,6 +14,8 @@
 иначе get_subscriber_state прочитает старую/пустую подписку и пришлёт неверное меню.
 """
 
+import time
+
 import redis.asyncio as aioredis
 import structlog
 
@@ -279,3 +281,152 @@ async def send_funnel_subscriber_menu(user) -> None:
             await bot.session.close()
     except Exception as exc:  # авто-обновление не критично — логируем и идём дальше
         logger.warning('Не удалось отправить меню подписчика после активации', error=exc)
+
+
+# ---------------------------------------------------------------------------
+# Добор следующего шага онбординга для пришедших по реферальной ссылке
+# ---------------------------------------------------------------------------
+# 🔴 Зачем это есть. Приветствие реферала несёт кнопку «Дальше», и следующий шаг —
+# экран с бесплатным пробным — по нажатию. Кто не нажал, не видел его НИКОГДА:
+# автосообщений для человека без подписки у бота нет ни одного, все фоновые выборки
+# идут от таблицы подписок. Добор через N минут снимает эту цену: кнопка становится
+# «пропустить ожидание», а не единственной дверью.
+#
+# Список ожидающих — в Redis, а не в памяти процесса: деплой бота идёт 7–10 минут и
+# перезапускает процесс, а Redis живёт в отдельном контейнере и переживает это.
+_ONBOARDING_DUE_KEY = 'referral_onboarding_due'
+_ONBOARDING_SHOWN_PREFIX = 'referral_onboarding_shown:'
+_ONBOARDING_SHOWN_TTL = 30 * 24 * 3600
+# Насколько запись может опоздать и всё ещё быть отправленной. Дольше — человек уже забыл,
+# что он вообще куда-то переходил: экран онбординга будет выглядеть письмом из ниоткуда.
+# Деплой бота идёт 7-10 минут и в это окно укладывается с запасом.
+_ONBOARDING_MAX_LATENESS = 3600
+
+
+async def schedule_referral_onboarding_followup(telegram_id: int) -> bool:
+    """Поставить человека в очередь на добор следующего шага. True — поставлен."""
+    delay = settings.get_referral_onboarding_followup_seconds()
+    if not delay or not telegram_id:
+        return False
+    client = _get_redis()
+    if client is None:
+        return False
+    try:
+        await client.zadd(_ONBOARDING_DUE_KEY, {str(telegram_id): time.time() + delay})
+        return True
+    except Exception as exc:
+        logger.warning('Не удалось поставить добор онбординга в очередь', telegram_id=telegram_id, error=str(exc))
+        return False
+
+
+async def claim_referral_onboarding(telegram_id: int) -> bool:
+    """Занять право показать следующий шаг. True — показывать нам.
+
+    🔴 Захват АТОМАРНЫЙ (`SET NX`), и это несущая деталь. Кнопка и таймер живут в одном
+    процессе и в одном событийном цикле: пока таймер ждёт ответа Telegram, нажатие успевает
+    пройти мимо обычной проверки «уже показано» — и человек получает экран дважды. Проверка
+    и установка одной командой этого не допускают.
+
+    Redis недоступен — отвечаем True: лучше рискнуть копией, чем оставить человека без экрана.
+    """
+    if not telegram_id:
+        return False
+    client = _get_redis()
+    if client is None:
+        return True
+    try:
+        won = await client.set(f'{_ONBOARDING_SHOWN_PREFIX}{telegram_id}', '1', ex=_ONBOARDING_SHOWN_TTL, nx=True)
+        if won:
+            await client.zrem(_ONBOARDING_DUE_KEY, str(telegram_id))
+        return bool(won)
+    except Exception as exc:
+        logger.warning('Не удалось занять показ онбординга', telegram_id=telegram_id, error=str(exc))
+        return True
+
+
+async def release_referral_onboarding(telegram_id: int) -> None:
+    """Вернуть право показа: отправка не удалась, пусть попробует следующий."""
+    client = _get_redis()
+    if client is None or not telegram_id:
+        return
+    try:
+        await client.delete(f'{_ONBOARDING_SHOWN_PREFIX}{telegram_id}')
+    except Exception as exc:
+        logger.debug('Не удалось освободить показ онбординга', telegram_id=telegram_id, error=str(exc))
+
+
+def _has_live_subscription(user) -> bool:
+    """Есть ли у человека ЖИВАЯ подписка.
+
+    ⛔ Не «есть ли строка в таблице»: в этом проекте мусорные строки — задокументированный
+    факт (мина FT). По строке-призраку человек не получил бы следующий шаг ни по таймеру,
+    ни по кнопке. Набор состояний взят тот же, что в главном меню.
+    """
+    subs = getattr(user, 'subscriptions', None) or []
+    return any(getattr(s, 'is_active', False) or getattr(s, 'actual_status', None) == 'limited' for s in subs)
+
+
+async def process_due_referral_onboarding_followups(bot, limit: int = 20) -> int:
+    """Прислать следующий шаг тем, у кого истекло ожидание. Возвращает число отправленных."""
+    if not settings.get_referral_onboarding_followup_seconds():
+        return 0
+    client = _get_redis()
+    if client is None:
+        return 0
+
+    now = time.time()
+    try:
+        due = await client.zrangebyscore(_ONBOARDING_DUE_KEY, '-inf', now, start=0, num=limit, withscores=True)
+    except Exception as exc:
+        logger.warning('Не удалось прочитать очередь добора онбординга', error=str(exc))
+        return 0
+    if not due:
+        return 0
+
+    from app.database.crud.user import get_user_by_telegram_id
+    from app.database.database import AsyncSessionLocal
+    from app.handlers.start import send_onboarding_menu
+
+    sent = 0
+    for raw, due_at in due:
+        member = raw.decode() if isinstance(raw, bytes) else raw
+        try:
+            telegram_id = int(member)
+        except (TypeError, ValueError):
+            # Мусор в очереди: без снятия он лежит первым по сроку и глушит добор всем.
+            logger.warning('Мусорная запись в очереди добора онбординга, снимаю', member=str(member))
+            try:
+                await client.zrem(_ONBOARDING_DUE_KEY, member)
+            except Exception as exc:
+                logger.error('Не удалось снять мусорную запись очереди добора', error=str(exc))
+            continue
+
+        if now - float(due_at) > _ONBOARDING_MAX_LATENESS:
+            logger.info('Добор онбординга просрочен, не отправляю', telegram_id=telegram_id)
+            try:
+                await client.zrem(_ONBOARDING_DUE_KEY, member)
+            except Exception as exc:
+                logger.debug('Не удалось снять просроченную запись', error=str(exc))
+            continue
+
+        if not await claim_referral_onboarding(telegram_id):
+            continue
+
+        try:
+            async with AsyncSessionLocal() as db:
+                user = await get_user_by_telegram_id(db, telegram_id)
+                if user is None:
+                    continue
+                if _has_live_subscription(user):
+                    # Своё меню он получил при активации. Право показа возвращаем: если он
+                    # всё-таки нажмёт кнопку под приветствием, экран обязан прийти.
+                    await release_referral_onboarding(telegram_id)
+                    continue
+                await send_onboarding_menu(bot, telegram_id, db, user)
+            sent += 1
+            logger.info('Онбординг реферала: следующий шаг дослан по таймеру', telegram_id=telegram_id)
+        except Exception as exc:
+            await release_referral_onboarding(telegram_id)
+            logger.error('Не удалось дослать следующий шаг онбординга', telegram_id=telegram_id, error=str(exc))
+
+    return sent
