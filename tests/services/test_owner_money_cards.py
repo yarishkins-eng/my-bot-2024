@@ -860,6 +860,34 @@ async def test_topup_with_a_cart_the_bot_will_not_charge_does_not_promise_a_card
 
 
 @pytest.mark.asyncio
+async def test_topup_for_a_device_addon_names_the_addon_and_ignores_the_cart() -> None:
+    """🔴 Скептик волны 2: путь докупки корзину не смотрит и автопокупку не зовёт — подсказка по
+    корзине там врала бы; списание за устройства идёт следом и приходит своей карточкой."""
+    service = _service()
+    cart_on, intent_on, switch_on = _with_cart(intent=True)
+    with cart_on, intent_on, switch_on:
+        await service.send_balance_topup_notification(
+            _user(balance_kopeks=25000),
+            _transaction(
+                amount_kopeks=24900,
+                payment_method='platega',
+                description='Пополнение через Platega (СБП (QR)) для докупки устройств dai-1',
+            ),
+            100,
+            topup_status='🔄 Пополнение',
+            referrer_info='Нет',
+            subscription=_subscription(tariff=_tariff()),
+            promo_group=None,
+            next_step='докупка устройств',
+        )
+    text, _ = _sent(service)
+    lines = _assert_card_shape(text)
+    assert lines[0] == '<b>💰 Пополнение — 249 ₽ по СБП</b>'
+    assert lines[2] == 'На балансе было 1 ₽, стало 250 ₽. Дальше — докупка устройств, карточка придёт следом'
+    assert 'Базовый)' not in text  # корзина не упомянута
+
+
+@pytest.mark.asyncio
 async def test_second_topup_of_someone_who_still_has_not_bought_is_not_first() -> None:
     """Решение владельца — «Первое» ТОЛЬКО у никогда не платившего, а не у каждого его пополнения."""
     service = _service()

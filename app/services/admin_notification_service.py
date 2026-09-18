@@ -927,7 +927,10 @@ class AdminNotificationService:
         subscription: Subscription | None,
         promo_group: PromoGroup | None,
         db: AsyncSession | None = None,
+        next_step: str | None = None,
     ) -> bool:
+        """`next_step` — что бот спишет следом САМ на пути, который корзину не смотрит (пополнение
+        под докупку устройств): подсказка по корзине там была бы ложью в обе стороны."""
         logger.info('Начинаем отправку уведомления о пополнении баланса')
 
         if db:
@@ -960,7 +963,7 @@ class AdminNotificationService:
         if not self._is_enabled():
             return False
 
-        cart_hint = await self._owner_cart_hint(user)
+        cart_hint = OwnerCartHint(next_step, True) if next_step else await self._owner_cart_hint(user)
         try:
             logger.info('Пытаемся создать сообщение уведомления')
             message = self._build_balance_topup_message(

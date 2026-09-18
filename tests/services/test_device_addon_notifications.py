@@ -178,6 +178,7 @@ async def test_paid_effect_notifications_send_admin_and_localized_customer_recei
         subscription=subscription,
         promo_group='promo',
         db=db,
+        next_step='докупка устройств',  # К-2: этот путь корзину не читает — подсказка по ней врала бы
     )
     bot.send_message.assert_awaited_once()
     telegram_id, text = bot.send_message.await_args.args
