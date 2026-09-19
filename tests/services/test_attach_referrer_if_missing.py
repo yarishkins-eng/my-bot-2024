@@ -775,3 +775,24 @@ async def test_self_referral_is_ruled_out_before_db(db: AsyncMock) -> None:
     assert result is None
     db.execute.assert_not_called()
     fire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_after_zero_rowcount_does_not_clear_pending(db: AsyncMock) -> None:
+    """rowcount 0, а refresh упал — причину не различить; pending победителя не трогаем."""
+    user = _user(telegram_id=555)
+    referrer = _referrer(user_id=200)
+    db.execute = AsyncMock(return_value=SimpleNamespace(rowcount=0))
+    db.refresh = AsyncMock(side_effect=RuntimeError('db gone'))
+
+    with (
+        patch('app.database.crud.user.get_user_by_referral_code', AsyncMock(return_value=referrer)),
+        patch('app.services.referral_service.get_pending_referral', AsyncMock(return_value=None)),
+        patch('app.services.referral_service.clear_pending_referral', AsyncMock()) as clear,
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
+    ):
+        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
+
+    assert result is None
+    fire.assert_not_called()
+    clear.assert_not_called()

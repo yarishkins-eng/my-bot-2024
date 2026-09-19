@@ -502,18 +502,22 @@ async def attach_referrer_if_missing(
     if (result.rowcount or 0) == 0:
         # Refresh the in-memory object so the caller sees the winning referrer
         # (and so we can tell the two causes apart).
+        refreshed = True
         try:
             await db.refresh(user)
         except Exception:
-            pass
-        if user.referred_by_id is not None:
+            refreshed = False
+        if not refreshed or user.referred_by_id is not None:
+            # Lost the race (or can't tell without a refresh) — the winner
+            # clears pending itself, so leave it alone.
             logger.info(
-                'attach_referrer_if_missing: lost the attach race, another session won',
+                'attach_referrer_if_missing: lost the attach race, another session won'
+                if refreshed
+                else 'attach_referrer_if_missing: no row updated and refresh failed, cause unknown',
                 user_id=user.id,
                 attempted_referrer_id=referrer.id,
                 source=source,
             )
-            # Winner clears pending itself — leave it alone.
             return None
         logger.info(
             'attach_referrer_if_missing: user already paid, retroactive attach refused',
