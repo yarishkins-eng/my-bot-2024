@@ -72,8 +72,6 @@ def db() -> AsyncMock:
     session.commit = AsyncMock(return_value=None)
     session.refresh = AsyncMock(return_value=None)
     session.rollback = AsyncMock(return_value=None)
-    # Забор «уже платил» спрашивает транзакции через ``db.scalar``; по умолчанию — платежей нет.
-    session.scalar = AsyncMock(return_value=None)
     return session
 
 
@@ -589,6 +587,13 @@ async def test_concurrent_attach_loser_does_not_fire_event(db: AsyncMock) -> Non
 
     db.execute = _execute_zero_rowcount
 
+    async def _refresh_shows_winner(obj, *_a, **_kw):
+        # Проигранная гонка отличается от отказа «уже платил» тем, что после
+        # refresh у строки уже стоит пригласивший, записанный победителем.
+        obj.referred_by_id = 999
+
+    db.refresh = AsyncMock(side_effect=_refresh_shows_winner)
+
     with (
         patch('app.database.crud.user.get_user_by_referral_code', AsyncMock(return_value=referrer)),
         patch('app.services.referral_service.clear_pending_referral', AsyncMock()) as clear,
@@ -597,6 +602,7 @@ async def test_concurrent_attach_loser_does_not_fire_event(db: AsyncMock) -> Non
         result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
 
     assert result is None, 'lost race must report None, not the attempted referrer_id'
+    assert user.referred_by_id == 999, 'caller must see the winning referrer after refresh'
     fire.assert_not_called(), 'event must NOT fire when we lost the race (winner fired it already)'
     clear.assert_not_called(), 'do not clear pending — winner may still need it for their own clear'
 
@@ -626,7 +632,9 @@ async def test_helper_uses_caller_supplied_bot_when_provided(db: AsyncMock) -> N
 
 # ---------------------------------------------------------------------------
 # Забор владельца 19.09.2026: задним числом привязывается только тот, кто ещё
-# не платил ДЕНЬГАМИ. Пробный период и бонусы — не помеха.
+# не платил ДЕНЬГАМИ. Пробный период и бонусы — не помеха. Забор живёт в WHERE
+# условного UPDATE (одна инструкция с compare-and-set), поэтому «платил» для
+# кода выглядит так же, как проигранная гонка: rowcount == 0.
 # ---------------------------------------------------------------------------
 
 
@@ -641,53 +649,21 @@ def _attach_patches(referrer: SimpleNamespace):
         yield
 
 
-@pytest.mark.asyncio
-async def test_refuses_when_user_has_made_first_topup(db: AsyncMock) -> None:
-    """Флаг живой оплаты стоит — ни записи, ни письма, ни события пригласившему."""
-    user = _user(has_made_first_topup=True)
-    referrer = _referrer(user_id=200)
-
-    with (
-        _attach_patches(referrer),
-        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
-    ):
-        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
-
-    assert result is None
-    assert user.referred_by_id is None
-    db.execute.assert_not_called(), 'условный UPDATE не должен даже выполняться'
-    db.commit.assert_not_called()
-    fire.assert_not_called(), 'платящий клиент не должен получить письмо «вы пришли по приглашению»'
-    db.scalar.assert_not_called(), 'при стоящем флаге в базу за транзакциями не ходим'
-
-
-@pytest.mark.asyncio
-async def test_refuses_when_user_paid_by_transaction_without_flag(db: AsyncMock) -> None:
-    """20 из 58 плативших на боевом (19.09.2026) не имеют флага — их ловит запрос к транзакциям."""
-    user = _user(has_made_first_topup=False)
-    referrer = _referrer(user_id=200)
-    db.scalar = AsyncMock(return_value=42)
-
-    with (
-        _attach_patches(referrer),
-        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
-    ):
-        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
-
-    assert result is None
-    assert user.referred_by_id is None
-    db.execute.assert_not_called()
-    db.commit.assert_not_called()
-    fire.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_money_query_asks_only_about_real_payments(db: AsyncMock) -> None:
-    """Форма запроса: завершённые deposit/subscription_payment с методом провайдера;
-    бонус за регистрацию (метод NULL) и ручное начисление (manual) — не деньги."""
+def _compiled_update(db: AsyncMock) -> str:
     from sqlalchemy.dialects import postgresql
 
-    user = _user(user_id=777, has_made_first_topup=False)
+    db.execute.assert_awaited_once()
+    stmt = db.execute.await_args[0][0]
+    return str(stmt.compile(dialect=postgresql.dialect(), compile_kwargs={'literal_binds': True}))
+
+
+@pytest.mark.asyncio
+async def test_update_refuses_paid_users_in_its_where_clause(db: AsyncMock) -> None:
+    """Форма UPDATE: флаг живой оплаты и транзакции провайдера — в том же WHERE, что и
+    compare-and-set; бонус за регистрацию (метод NULL), ручное начисление (manual) и покупка с
+    баланса (balance — баланс мог быть целиком бонусным) деньгами не считаются; возврат по
+    заказу на разборе (deposit с device_first_checkout_id) — считается."""
+    user = _user(user_id=777)
     referrer = _referrer(user_id=200)
 
     with (
@@ -696,24 +672,67 @@ async def test_money_query_asks_only_about_real_payments(db: AsyncMock) -> None:
     ):
         await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
 
-    db.scalar.assert_awaited_once()
-    stmt = db.scalar.await_args[0][0]
-    sql = str(stmt.compile(dialect=postgresql.dialect(), compile_kwargs={'literal_binds': True}))
+    sql = _compiled_update(db)
+    assert sql.startswith('UPDATE users SET referred_by_id=200')
+    assert 'users.id = 777' in sql
+    assert 'users.referred_by_id IS NULL' in sql
+    assert 'users.has_made_first_topup IS false' in sql
+    assert 'NOT (EXISTS (SELECT' in sql
     assert 'FROM transactions' in sql
-    assert 'transactions.user_id = 777' in sql
+    assert 'transactions.user_id = users.id' in sql, 'подзапрос должен быть соотнесён с обновляемой строкой'
     assert 'transactions.is_completed IS true' in sql
-    assert "transactions.type IN ('deposit', 'subscription_payment')" in sql
+    assert "transactions.type IN ('deposit', 'subscription_payment', 'provider_receipt')" in sql
     assert 'transactions.payment_method IS NOT NULL' in sql
-    assert "transactions.payment_method != 'manual'" in sql
-    assert 'LIMIT 1' in sql
+    assert "transactions.payment_method NOT IN ('manual', 'balance')" in sql
+    assert "transactions.type = 'deposit' AND transactions.device_first_checkout_id IS NOT NULL" in sql
+    assert sql.count('FROM users') == 0, 'EXISTS не должен тянуть users второй раз'
     assert 'subscriptions' not in sql, 'пробный период и подписки забор не смотрит'
 
 
 @pytest.mark.asyncio
-async def test_trial_user_without_payments_still_attaches(db: AsyncMock) -> None:
-    """Попользовался пробным, денег не платил — привязка проходит, событие уходит."""
-    user = _user(has_made_first_topup=False)
+async def test_paid_user_is_refused_without_event_or_letter(db: AsyncMock) -> None:
+    """База отказала (rowcount 0, привязки нет) — ни события пригласившему, ни письма,
+    ни подмены объекта; хвост pending чистится."""
+    user = _user(telegram_id=555)
     referrer = _referrer(user_id=200)
+    db.execute = AsyncMock(return_value=SimpleNamespace(rowcount=0))
+
+    with (
+        patch('app.database.crud.user.get_user_by_referral_code', AsyncMock(return_value=referrer)),
+        patch('app.services.referral_service.get_pending_referral', AsyncMock(return_value=None)),
+        patch('app.services.referral_service.clear_pending_referral', AsyncMock()) as clear,
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
+    ):
+        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
+
+    assert result is None
+    assert user.referred_by_id is None
+    fire.assert_not_called(), 'платящий клиент не должен получить письмо «вы пришли по приглашению»'
+    clear.assert_awaited_once_with(555)
+
+
+@pytest.mark.asyncio
+async def test_refusal_returns_none_not_referrer_id(db: AsyncMock) -> None:
+    """Отказ не должен выглядеть для вызывающего как успех."""
+    user = _user()
+    referrer = _referrer(user_id=200)
+    db.execute = AsyncMock(return_value=SimpleNamespace(rowcount=0))
+
+    with (
+        _attach_patches(referrer),
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()),
+    ):
+        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_trial_user_without_payments_still_attaches(db: AsyncMock) -> None:
+    """Попользовался пробным, денег не платил — база записала (rowcount 1), событие уходит."""
+    user = _user()
+    referrer = _referrer(user_id=200)
+    db.execute = AsyncMock(return_value=SimpleNamespace(rowcount=1))
 
     with (
         _attach_patches(referrer),
@@ -727,25 +746,9 @@ async def test_trial_user_without_payments_still_attaches(db: AsyncMock) -> None
 
 
 @pytest.mark.asyncio
-async def test_bonus_balance_purchase_flag_alone_does_not_block(db: AsyncMock) -> None:
-    """``has_had_paid_subscription`` ставится и при покупке с бонусного баланса — это не деньги."""
-    user = _user(has_made_first_topup=False, has_had_paid_subscription=True)
-    referrer = _referrer(user_id=200)
-
-    with (
-        _attach_patches(referrer),
-        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
-    ):
-        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
-
-    assert result == 200
-    fire.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_money_guard_runs_before_self_referral_is_ruled_out_but_after_candidate(db: AsyncMock) -> None:
-    """Без кандидата в базу за деньгами не ходим — забор стоит после разрешения пригласившего."""
-    user = _user(has_made_first_topup=False)
+async def test_no_candidate_means_no_db_call(db: AsyncMock) -> None:
+    """Без кандидата в базу не ходим вовсе."""
+    user = _user()
 
     with (
         patch('app.services.referral_service.get_pending_referral', AsyncMock(return_value=None)),
@@ -754,4 +757,21 @@ async def test_money_guard_runs_before_self_referral_is_ruled_out_but_after_cand
         result = await attach_referrer_if_missing(db, user, source='unit_test')
 
     assert result is None
-    db.scalar.assert_not_called()
+    db.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_self_referral_is_ruled_out_before_db(db: AsyncMock) -> None:
+    """Самореферал отсеивается до UPDATE — в базу не ходим."""
+    user = _user(user_id=100, telegram_id=555)
+    referrer = _referrer(user_id=100, telegram_id=555)
+
+    with (
+        _attach_patches(referrer),
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
+    ):
+        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
+
+    assert result is None
+    db.execute.assert_not_called()
+    fire.assert_not_called()
