@@ -105,6 +105,7 @@ CASES = [
     ('возврат по заказу на разборе', False, [('deposit', 'manual', True, 7)], False),
     ('незавершённый возврат по разбору', False, [('deposit', 'manual', False, 7)], True),
     ('незавершённое пополнение', False, [('deposit', 'platega', False, None)], True),
+    ('пополнение с is_completed NULL (в коде никто не пишет)', False, [('deposit', 'platega', None, None)], True),
     ('флаг оплаты без транзакций', True, [], False),
     ('бонус + позже оплата картой', False, [('deposit', None, True, None), ('deposit', 'platega', True, None)], False),
 ]
