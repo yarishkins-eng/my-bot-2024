@@ -1272,66 +1272,13 @@ class AdminNotificationService:
                     exc_info=True,
                 )
 
-        if not self._is_enabled():
-            return False
-
-        try:
-            full_name = telegram_user.full_name or telegram_user.username or str(telegram_user.id)
-            user_status = '🆕 Новый' if not user else '👥 Существующий'
-
-            message_lines = [
-                '📣 <b>ПЕРЕХОД ПО РК</b>',
-                '',
-                f'🧾 {html.escape(campaign.name)} (<code>{html.escape(campaign.start_parameter)}</code>)',
-                '',
-                f'👤 {html.escape(full_name)} (<code>{telegram_user.id}</code>)',
-            ]
-
-            if telegram_user.username:
-                message_lines.append(f'📱 @{html.escape(telegram_user.username)}')
-
-            message_lines.append(f'📋 {user_status}')
-
-            # Промогруппа — только если есть
-            if user:
-                promo_group = await self._get_user_promo_group(db, user)
-                if promo_group:
-                    message_lines.append(f'🏷️ Промогруппа: {html.escape(promo_group.name)}')
-
-            message_lines.append('')
-
-            # Загружаем название тарифа для tariff-бонуса
-            tariff_name = None
-            if campaign.is_tariff_bonus and campaign.tariff_id:
-                try:
-                    from app.database.crud.tariff import get_tariff_by_id
-
-                    tariff = await get_tariff_by_id(db, campaign.tariff_id)
-                    if tariff:
-                        tariff_name = html.escape(tariff.name)
-                except Exception:
-                    pass
-
-            # Бонус кампании
-            bonus_lines = self._format_campaign_bonus(campaign, tariff_name=tariff_name)
-            message_lines.extend(bonus_lines)
-
-            message_lines.extend(
-                [
-                    '',
-                    f'<i>{format_local_datetime(datetime.now(UTC), "%d.%m.%Y %H:%M:%S")}</i>',
-                ]
-            )
-
-            return await self._send_message(
-                '\n'.join(message_lines),
-                category=NotificationCategory.PROMO,
-                manager_topic=ManagerAlertTopic.MARKETING,
-            )
-
-        except Exception as e:
-            logger.error('Ошибка отправки уведомления о переходе по кампании', error=e)
-            return False
+        # 🔴 УВ-3б п.1 (решение владельца 14.09, подтверждено 19.09.2026): «📣 ПЕРЕХОД ПО РК» в
+        # Telegram больше не уходит — ни владельцу, ни менеджеру. Для нового человека он летел
+        # за секунду до «✅ РЕГИСТРАЦИЯ ПО РК» тем же текстом (чистый дубль), а без регистрации
+        # следом означал «открыл бота и ушёл» — сделать с этим нечего. Запись события выше и
+        # счётчик переходов в карточке кампании остаются: воронка считается как раньше.
+        # Возвращаем False, чтобы вызывающие не ставили пометку «отправлено».
+        return False
 
     async def send_campaign_registration_notification(
         self,

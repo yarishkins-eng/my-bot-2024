@@ -137,22 +137,13 @@ async def _registration_notification(service: AdminNotificationService) -> None:
     )
 
 
-async def _link_visit_notification(service: AdminNotificationService) -> None:
-    await service.send_campaign_link_visit_notification(
-        db=AsyncMock(),
-        telegram_user=SimpleNamespace(id=777, full_name='Тестовый', username=None),
-        campaign=_campaign(),
-        user=None,
-    )
-
-
-# 🔴 Уведомлений про кампанию ДВА, и вскрыла это мутация, а не чтение: первый прогон заменил
-# имя в переходе по ссылке, сторож промолчал — он стерёг только регистрацию. Закрываем оба:
-# владелец различает кампании по обоим, и вычистить имя «за компанию» можно из любого.
+# 🔴 Уведомлений про кампанию БЫЛО два, и вскрыла это мутация, а не чтение: первый прогон заменил
+# имя в переходе по ссылке, сторож промолчал — он стерёг только регистрацию. С 19.09.2026 (УВ-3б п.1)
+# «переход по ссылке» в Telegram не уходит вовсе — остался один сторож, на регистрацию.
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('label', 'call'),
-    [('регистрация по кампании', _registration_notification), ('переход по ссылке', _link_visit_notification)],
+    [('регистрация по кампании', _registration_notification)],
 )
 async def test_admin_notification_still_names_the_campaign(label, call):
     """⛔ Обратная сторона забора: владелец обязан ПРОДОЛЖАТЬ видеть, по какой кампании пришёл человек."""
