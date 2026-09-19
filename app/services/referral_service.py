@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.crud.referral import create_referral_earning, get_commission_payment_count, get_user_campaign_id
 from app.database.crud.user import add_user_balance, get_user_by_id
-from app.database.models import ReferralEarning, TransactionType, User
+from app.database.models import PaymentMethod, ReferralEarning, Transaction, TransactionType, User
 from app.localization.texts import get_texts
 from app.services.notification_delivery_service import (
     notification_delivery_service,
@@ -309,6 +309,37 @@ async def calculate_referral_commission_percent(
     return selected_percent
 
 
+async def user_has_paid_money(db: AsyncSession, user: User) -> bool:
+    """Платил ли человек ДЕНЬГАМИ — в отличие от пробного периода и бонусов.
+
+    Решение владельца 19.09.2026: пригласившего задним числом можно привязать только тому,
+    кто ещё не платил. Пробный период — не помеха («попользовался, потом друг прислал ссылку»),
+    оплата — стоп: иначе по ссылке можно «привести» клиента, на котором сервис уже
+    зарабатывает, и получать бонус и комиссию с его платежей.
+
+    Флаг ``has_had_paid_subscription`` тут НЕ годится: он ставится и при покупке с бонусного
+    баланса (``subtract_user_balance(mark_as_paid_subscription=True)``). Флаг
+    ``has_made_first_topup`` ставят провайдеры при живой оплате, но на боевом 19.09.2026 у 20
+    из 58 плативших его нет — поэтому вторым вопросом идут сами транзакции: завершённое
+    пополнение или прямая оплата подписки с платёжным методом провайдера. Бонус за регистрацию
+    (``payment_method IS NULL``) и ручное начисление админом (``manual``) деньгами не считаются.
+    """
+    if user.has_made_first_topup:
+        return True
+    paid_stmt = (
+        select(Transaction.id)
+        .where(
+            Transaction.user_id == user.id,
+            Transaction.is_completed.is_(True),
+            Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value)),
+            Transaction.payment_method.isnot(None),
+            Transaction.payment_method != PaymentMethod.MANUAL.value,
+        )
+        .limit(1)
+    )
+    return (await db.scalar(paid_stmt)) is not None
+
+
 async def attach_referrer_if_missing(
     db: AsyncSession,
     user: User,
@@ -336,6 +367,9 @@ async def attach_referrer_if_missing(
     Self-referral is blocked at both ID and email level (the email
     check mirrors the pre-existing logic in
     ``_process_referral_code``).
+
+    Кто уже платил деньгами (``user_has_paid_money``), задним числом не
+    привязывается — решение владельца 19.09.2026; пробный период не в счёт.
 
     Side effects when the attachment succeeds:
       * Sets ``user.referred_by_id``, commits, refreshes.
@@ -396,6 +430,21 @@ async def attach_referrer_if_missing(
     if referrer.telegram_id is not None and user.telegram_id is not None and referrer.telegram_id == user.telegram_id:
         return None
     if referrer.email and user.email and referrer.email.lower() == user.email.lower():
+        return None
+
+    # ------------------------------------------------------------------
+    # Забор владельца (19.09.2026): задним числом — только тому, кто ещё
+    # не платил деньгами. Стоит ПЕРЕД записью и ПЕРЕД событием регистрации,
+    # чтобы платящий клиент не получил письмо «вы пришли по приглашению»,
+    # а пригласивший — бонус за него. Пробный период забор не трогает.
+    # ------------------------------------------------------------------
+    if await user_has_paid_money(db, user):
+        logger.info(
+            'attach_referrer_if_missing: user already paid, retroactive attach refused',
+            user_id=user.id,
+            referrer_id=referrer.id,
+            source=source,
+        )
         return None
 
     # ------------------------------------------------------------------

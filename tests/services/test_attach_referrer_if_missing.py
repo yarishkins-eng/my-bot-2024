@@ -25,6 +25,7 @@ initData / widget / OIDC). It must be:
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -39,12 +40,16 @@ def _user(
     telegram_id: int | None = 555,
     referred_by_id: int | None = None,
     email: str | None = None,
+    has_made_first_topup: bool = False,
+    has_had_paid_subscription: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=user_id,
         telegram_id=telegram_id,
         referred_by_id=referred_by_id,
         email=email,
+        has_made_first_topup=has_made_first_topup,
+        has_had_paid_subscription=has_had_paid_subscription,
     )
 
 
@@ -67,6 +72,8 @@ def db() -> AsyncMock:
     session.commit = AsyncMock(return_value=None)
     session.refresh = AsyncMock(return_value=None)
     session.rollback = AsyncMock(return_value=None)
+    # Забор «уже платил» спрашивает транзакции через ``db.scalar``; по умолчанию — платежей нет.
+    session.scalar = AsyncMock(return_value=None)
     return session
 
 
@@ -615,3 +622,136 @@ async def test_helper_uses_caller_supplied_bot_when_provided(db: AsyncMock) -> N
     fire.assert_awaited_once()
     _args, kwargs = fire.call_args
     assert kwargs.get('bot') is caller_bot
+
+
+# ---------------------------------------------------------------------------
+# Забор владельца 19.09.2026: задним числом привязывается только тот, кто ещё
+# не платил ДЕНЬГАМИ. Пробный период и бонусы — не помеха.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _attach_patches(referrer: SimpleNamespace):
+    """Кандидат найден по коду, Redis пуст, очистка — заглушка (звёздочку в ``with`` Python не пускает)."""
+    with (
+        patch('app.database.crud.user.get_user_by_referral_code', AsyncMock(return_value=referrer)),
+        patch('app.services.referral_service.get_pending_referral', AsyncMock(return_value=None)),
+        patch('app.services.referral_service.clear_pending_referral', AsyncMock()),
+    ):
+        yield
+
+
+@pytest.mark.asyncio
+async def test_refuses_when_user_has_made_first_topup(db: AsyncMock) -> None:
+    """Флаг живой оплаты стоит — ни записи, ни письма, ни события пригласившему."""
+    user = _user(has_made_first_topup=True)
+    referrer = _referrer(user_id=200)
+
+    with (
+        _attach_patches(referrer),
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
+    ):
+        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
+
+    assert result is None
+    assert user.referred_by_id is None
+    db.execute.assert_not_called(), 'условный UPDATE не должен даже выполняться'
+    db.commit.assert_not_called()
+    fire.assert_not_called(), 'платящий клиент не должен получить письмо «вы пришли по приглашению»'
+    db.scalar.assert_not_called(), 'при стоящем флаге в базу за транзакциями не ходим'
+
+
+@pytest.mark.asyncio
+async def test_refuses_when_user_paid_by_transaction_without_flag(db: AsyncMock) -> None:
+    """20 из 58 плативших на боевом (19.09.2026) не имеют флага — их ловит запрос к транзакциям."""
+    user = _user(has_made_first_topup=False)
+    referrer = _referrer(user_id=200)
+    db.scalar = AsyncMock(return_value=42)
+
+    with (
+        _attach_patches(referrer),
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
+    ):
+        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
+
+    assert result is None
+    assert user.referred_by_id is None
+    db.execute.assert_not_called()
+    db.commit.assert_not_called()
+    fire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_money_query_asks_only_about_real_payments(db: AsyncMock) -> None:
+    """Форма запроса: завершённые deposit/subscription_payment с методом провайдера;
+    бонус за регистрацию (метод NULL) и ручное начисление (manual) — не деньги."""
+    from sqlalchemy.dialects import postgresql
+
+    user = _user(user_id=777, has_made_first_topup=False)
+    referrer = _referrer(user_id=200)
+
+    with (
+        _attach_patches(referrer),
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()),
+    ):
+        await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
+
+    db.scalar.assert_awaited_once()
+    stmt = db.scalar.await_args[0][0]
+    sql = str(stmt.compile(dialect=postgresql.dialect(), compile_kwargs={'literal_binds': True}))
+    assert 'FROM transactions' in sql
+    assert 'transactions.user_id = 777' in sql
+    assert 'transactions.is_completed IS true' in sql
+    assert "transactions.type IN ('deposit', 'subscription_payment')" in sql
+    assert 'transactions.payment_method IS NOT NULL' in sql
+    assert "transactions.payment_method != 'manual'" in sql
+    assert 'LIMIT 1' in sql
+    assert 'subscriptions' not in sql, 'пробный период и подписки забор не смотрит'
+
+
+@pytest.mark.asyncio
+async def test_trial_user_without_payments_still_attaches(db: AsyncMock) -> None:
+    """Попользовался пробным, денег не платил — привязка проходит, событие уходит."""
+    user = _user(has_made_first_topup=False)
+    referrer = _referrer(user_id=200)
+
+    with (
+        _attach_patches(referrer),
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
+    ):
+        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
+
+    assert result == 200
+    assert user.referred_by_id == 200
+    fire.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bonus_balance_purchase_flag_alone_does_not_block(db: AsyncMock) -> None:
+    """``has_had_paid_subscription`` ставится и при покупке с бонусного баланса — это не деньги."""
+    user = _user(has_made_first_topup=False, has_had_paid_subscription=True)
+    referrer = _referrer(user_id=200)
+
+    with (
+        _attach_patches(referrer),
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()) as fire,
+    ):
+        result = await attach_referrer_if_missing(db, user, referral_code='X', source='unit_test')
+
+    assert result == 200
+    fire.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_money_guard_runs_before_self_referral_is_ruled_out_but_after_candidate(db: AsyncMock) -> None:
+    """Без кандидата в базу за деньгами не ходим — забор стоит после разрешения пригласившего."""
+    user = _user(has_made_first_topup=False)
+
+    with (
+        patch('app.services.referral_service.get_pending_referral', AsyncMock(return_value=None)),
+        patch('app.services.referral_service.process_referral_registration', AsyncMock()),
+    ):
+        result = await attach_referrer_if_missing(db, user, source='unit_test')
+
+    assert result is None
+    db.scalar.assert_not_called()
