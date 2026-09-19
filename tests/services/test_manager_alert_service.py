@@ -131,21 +131,19 @@ def _marketing_service(bot: MagicMock) -> AdminNotificationService:
 
 
 @pytest.mark.asyncio
-async def test_campaign_visit_alert_reaches_manager_marketing_topic() -> None:
+async def test_campaign_visit_alert_is_no_longer_sent_to_anyone() -> None:
+    """УВ-3б п.1: «переход по РК» снят — он дублировал «регистрацию» за секунду до неё.
+    Ни владельцу, ни менеджеру; функция отдаёт False, чтобы пометка «отправлено» не ставилась."""
     bot = MagicMock()
     bot.send_message = AsyncMock()
     service = _marketing_service(bot)
     telegram_user = types.User(id=6533655760, is_bot=False, first_name='SMOKY', username='SmokyPkr')
 
-    assert await service.send_campaign_link_visit_notification(MagicMock(), telegram_user, _campaign_stub(), user=None)
+    assert not await service.send_campaign_link_visit_notification(
+        MagicMock(), telegram_user, _campaign_stub(), user=None
+    )
 
-    assert bot.send_message.await_count == 2
-    admin_call, manager_call = bot.send_message.await_args_list
-    assert manager_call.kwargs['chat_id'] == -100123456
-    assert manager_call.kwargs['message_thread_id'] == 40
-    assert manager_call.kwargs['text'] == admin_call.kwargs['text']
-    assert 'ПЕРЕХОД ПО РК' in manager_call.kwargs['text']
-    assert 'reply_markup' not in manager_call.kwargs
+    bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -258,7 +256,6 @@ def test_narrow_manager_route_has_exactly_the_declared_call_sites() -> None:
     call_sites = _call_sites(lambda node: any(kw.arg == 'manager_topic' for kw in node.keywords))
 
     assert call_sites == {
-        ('app/services/admin_notification_service.py', 'send_campaign_link_visit_notification'),
         ('app/services/admin_notification_service.py', 'send_campaign_registration_notification'),
     }
 
