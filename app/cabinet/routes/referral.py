@@ -94,7 +94,14 @@ async def get_referral_info(
 
     # Build referral links
     referral_link = (settings.get_cabinet_referral_link(user.referral_code) or '') if user.referral_code else ''
-    bot_referral_link = settings.get_bot_referral_link(user.referral_code) if user.referral_code else ''
+    # Мина MU: если ``get_me()`` на старте не сработал, имя бота неизвестно и
+    # ``get_bot_referral_link`` подставляет заглушку ``t.me/bot?start=…``. Кабинет
+    # такую строку не отличает от настоящей (запасной путь срабатывает только на
+    # пустой), а с 19.09.2026 именно эту ссылку показывают, копируют и отправляют
+    # «Поделиться». Без имени бота — пустая строка, и кабинет уйдёт на кабинетную.
+    bot_referral_link = (
+        settings.get_bot_referral_link(user.referral_code) if user.referral_code and settings.get_bot_username() else ''
+    )
 
     return ReferralInfoResponse(
         referral_code=user.referral_code or '',

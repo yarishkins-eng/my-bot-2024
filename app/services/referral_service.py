@@ -5,13 +5,13 @@ import redis.asyncio as aioredis
 import structlog
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.crud.referral import create_referral_earning, get_commission_payment_count, get_user_campaign_id
 from app.database.crud.user import add_user_balance, get_user_by_id
-from app.database.models import ReferralEarning, TransactionType, User
+from app.database.models import PaymentMethod, ReferralEarning, Transaction, TransactionType, User
 from app.localization.texts import get_texts
 from app.services.notification_delivery_service import (
     notification_delivery_service,
@@ -309,6 +309,53 @@ async def calculate_referral_commission_percent(
     return selected_percent
 
 
+def paid_money_exists(user_id_column):
+    """SQL-условие «этот человек платил ДЕНЬГАМИ» — в отличие от пробного периода и бонусов.
+
+    Решение владельца 19.09.2026: пригласившего задним числом можно привязать только тому,
+    кто ещё не платил. Пробный период — не помеха («попользовался, потом друг прислал ссылку»),
+    оплата — стоп: иначе по ссылке можно «привести» клиента, на котором сервис уже
+    зарабатывает, и получать бонус и комиссию с его платежей.
+
+    Деньги — завершённая транзакция пополнения или прямой оплаты подписки с платёжным методом
+    ПРОВАЙДЕРА (platega, telegram_stars, …). Не деньги: бонус за регистрацию (``payment_method
+    IS NULL``), ручное начисление админом (``manual``) и списание с баланса (``balance``) — если
+    на балансе были деньги, они пришли пополнением через провайдера и посчитаны там, а сам
+    баланс мог быть целиком бонусным: на боевом 19.09.2026 из 472 без пригласившего 21 человек
+    «покупал» только с бонуса или нулевой строкой «смена тарифа администратором». Отдельно —
+    возврат по заказу на разборе (``deposit/manual`` с ``device_first_checkout_id``): деньги
+    пришли картой, чек не создался, забор обязан их видеть.
+
+    Флаг ``has_had_paid_subscription`` НЕ используется: он ставится и при покупке с бонусного
+    баланса (``subtract_user_balance(mark_as_paid_subscription=True)``). Флаг
+    ``has_made_first_topup`` проверяется отдельно в том же UPDATE (у 4 из 37 плативших на
+    боевом его нет — поэтому транзакции спрашиваются всегда).
+    """
+    provider_payment = and_(
+        Transaction.type.in_(
+            (
+                TransactionType.DEPOSIT.value,
+                TransactionType.SUBSCRIPTION_PAYMENT.value,
+                # чек провайдера при прямой оплате: сегодня всегда идёт парой с
+                # subscription_payment, но заказ, застрявший на разборе, может
+                # оставить только его — деньги при этом уже списаны с карты
+                TransactionType.PROVIDER_RECEIPT.value,
+            )
+        ),
+        Transaction.payment_method.isnot(None),
+        Transaction.payment_method.notin_((PaymentMethod.MANUAL.value, PaymentMethod.BALANCE.value)),
+    )
+    review_refund = and_(
+        Transaction.type == TransactionType.DEPOSIT.value,
+        Transaction.device_first_checkout_id.isnot(None),
+    )
+    return exists().where(
+        Transaction.user_id == user_id_column,
+        Transaction.is_completed.is_(True),
+        or_(provider_payment, review_refund),
+    )
+
+
 async def attach_referrer_if_missing(
     db: AsyncSession,
     user: User,
@@ -336,6 +383,10 @@ async def attach_referrer_if_missing(
     Self-referral is blocked at both ID and email level (the email
     check mirrors the pre-existing logic in
     ``_process_referral_code``).
+
+    Кто уже платил деньгами (``paid_money_exists`` + ``has_made_first_topup``,
+    оба в WHERE условного UPDATE), задним числом не привязывается — решение
+    владельца 19.09.2026; пробный период не в счёт.
 
     Side effects when the attachment succeeds:
       * Sets ``user.referred_by_id``, commits, refreshes.
@@ -413,8 +464,21 @@ async def attach_referrer_if_missing(
     from sqlalchemy import update as _sa_update
 
     try:
+        # Забор владельца (19.09.2026) стоит В ТОМ ЖЕ UPDATE: задним числом
+        # привязывается только тот, кто ещё не платил деньгами. Одна инструкция —
+        # нет окна между проверкой и записью (вебхук провайдера мог бы проскочить
+        # между ними), а флаг читается из базы, а не из протухшего объекта сессии.
+        # rowcount == 0 значит «уже привязан другой сессией» ИЛИ «уже платил» —
+        # в обоих случаях ни записи, ни письма, ни события пригласившему.
         update_stmt = (
-            _sa_update(User).where(User.id == user.id, User.referred_by_id.is_(None)).values(referred_by_id=referrer.id)
+            _sa_update(User)
+            .where(
+                User.id == user.id,
+                User.referred_by_id.is_(None),
+                User.has_made_first_topup.is_(False),
+                ~paid_money_exists(User.id),
+            )
+            .values(referred_by_id=referrer.id)
         )
         result = await db.execute(update_stmt)
         await db.commit()
@@ -432,21 +496,39 @@ async def attach_referrer_if_missing(
             pass
         return None
 
-    # rowcount == 0 means another session beat us to the attach —
-    # don't fire the registration event (the winning session already
-    # did) and don't pretend we attached.
+    # rowcount == 0 means another session beat us to the attach — or the
+    # user already paid (owner's fence above). Either way: don't fire the
+    # registration event and don't pretend we attached.
     if (result.rowcount or 0) == 0:
-        logger.info(
-            'attach_referrer_if_missing: lost the attach race, another session won',
-            user_id=user.id,
-            attempted_referrer_id=referrer.id,
-            source=source,
-        )
-        # Refresh the in-memory object so the caller sees the winning referrer.
+        # Refresh the in-memory object so the caller sees the winning referrer
+        # (and so we can tell the two causes apart).
+        refreshed = True
         try:
             await db.refresh(user)
         except Exception:
-            pass
+            refreshed = False
+        if not refreshed or user.referred_by_id is not None:
+            # Lost the race (or can't tell without a refresh) — the winner
+            # clears pending itself, so leave it alone.
+            logger.info(
+                'attach_referrer_if_missing: lost the attach race, another session won'
+                if refreshed
+                else 'attach_referrer_if_missing: no row updated and refresh failed, cause unknown',
+                user_id=user.id,
+                attempted_referrer_id=referrer.id,
+                source=source,
+            )
+            return None
+        logger.info(
+            'attach_referrer_if_missing: user already paid, retroactive attach refused',
+            user_id=user.id,
+            referrer_id=referrer.id,
+            source=source,
+        )
+        # Хвост pending_referral иначе жил бы до 7 дней и на каждом входе гонял бы
+        # этот UPDATE заново. Оплаченность назад не отматывается — чистить безопасно.
+        if user.telegram_id is not None:
+            await clear_pending_referral(user.telegram_id)
         return None
 
     # We won. Mirror the write onto the in-memory ORM attribute so the
