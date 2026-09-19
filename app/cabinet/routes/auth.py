@@ -322,8 +322,10 @@ async def _process_referral_code(
 ) -> None:
     """Process referral for a newly created user. Never raises.
 
-    Only applies to new users (is_new_user=True). Existing users cannot be
-    assigned a referrer — same logic as the bot /start handler.
+    Only applies to new users (is_new_user=True). Existing users are NOT
+    attached here: the retroactive path is ``attach_referrer_if_missing`` (bot
+    /start and the cabinet login routes), which refuses anyone who has already
+    paid money (owner's decision, 19.09.2026).
 
     Handles two cases:
     - referred_by_id already set by create_user() → fire registration event
