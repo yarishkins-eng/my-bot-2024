@@ -56,6 +56,8 @@ class CampaignDetailResponse(BaseModel):
     # Balance bonus
     balance_bonus_kopeks: int = 0
     balance_bonus_rubles: float = 0.0
+    ad_spend_kopeks: int | None = None
+    ad_spend_rubles: float | None = None
     # Subscription bonus
     subscription_duration_days: int | None = None
     subscription_traffic_gb: int | None = None
@@ -88,6 +90,7 @@ class CampaignCreateRequest(BaseModel):
     is_active: bool = True
     # Balance bonus
     balance_bonus_kopeks: int = Field(0, ge=0)
+    ad_spend_kopeks: int | None = Field(None, ge=0)
     # Subscription bonus
     subscription_duration_days: int | None = Field(None, ge=1)
     subscription_traffic_gb: int | None = Field(None, ge=0)
@@ -109,6 +112,7 @@ class CampaignUpdateRequest(BaseModel):
     is_active: bool | None = None
     # Balance bonus
     balance_bonus_kopeks: int | None = Field(None, ge=0)
+    ad_spend_kopeks: int | None = Field(None, ge=0)
     # Subscription bonus
     subscription_duration_days: int | None = Field(None, ge=1)
     subscription_traffic_gb: int | None = Field(None, ge=0)
@@ -168,6 +172,64 @@ class CampaignStatisticsResponse(BaseModel):
     # Deep link
     deep_link: str | None = None
     web_link: str | None = None
+
+
+class CampaignDataQuality(BaseModel):
+    status: Literal['complete', 'partial']
+
+
+class CampaignDailyCohort(BaseModel):
+    date: str
+    leads: int = 0
+    trial_users: int = 0
+    paid_subscription_users: int = 0
+    mature_7d: bool = False
+
+
+class CampaignDelayPoint(BaseModel):
+    hours: int
+    eligible_leads: int = 0
+    converted_leads: int = 0
+    conversion_rate: float | None = None
+
+
+class CampaignCumulativeReceiptPoint(BaseModel):
+    date: str
+    confirmed_receipts_kopeks: int = 0
+    ad_spend_kopeks: int | None = None
+
+
+class CampaignAnalyticsV2Response(BaseModel):
+    """First-touch funnel and campaign unit economics."""
+
+    campaign_id: int
+    generated_at: datetime
+    timezone: str
+    leads: int = 0
+    historical_trial_users_count: int = 0
+    active_trials_count: int = 0
+    lead_to_trial_rate: float = 0.0
+    paid_subscription_users_count: int = 0
+    lead_to_paid_subscription_rate: float = 0.0
+    paid_after_trial_count: int = 0
+    paid_without_trial_count: int = 0
+    trial_to_paid_rate: float = 0.0
+    confirmed_receipts_kopeks: int = 0
+    ad_spend_kopeks: int | None = None
+    cost_per_lead_kopeks: int | None = None
+    cost_per_trial_kopeks: int | None = None
+    customer_acquisition_cost_kopeks: int | None = None
+    gross_roas_percent: float | None = None
+    receipts_minus_ad_spend_kopeks: int | None = None
+    maturity_horizon_days: int = 7
+    immature_leads_count: int = 0
+    last_lead_at: datetime | None = None
+    last_trial_at: datetime | None = None
+    last_paid_subscription_at: datetime | None = None
+    data_quality: CampaignDataQuality
+    daily_cohorts: list[CampaignDailyCohort] = Field(default_factory=list)
+    delay_curve: list[CampaignDelayPoint] = Field(default_factory=list)
+    cumulative_receipts: list[CampaignCumulativeReceiptPoint] = Field(default_factory=list)
 
 
 class CampaignRegistrationItem(BaseModel):

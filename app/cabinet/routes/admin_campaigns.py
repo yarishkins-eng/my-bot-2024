@@ -28,13 +28,18 @@ from app.database.models import (
     Tariff,
     User,
 )
-from app.services.campaign_service import delete_campaign_if_unattributed, get_campaign_analytics
+from app.services.campaign_service import (
+    delete_campaign_if_unattributed,
+    get_campaign_analytics,
+    get_campaign_performance,
+)
 from app.services.partner_stats_service import PartnerStatsService
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.campaigns import (
     AdminCampaignChartDataResponse,
     AvailablePartnerItem,
+    CampaignAnalyticsV2Response,
     CampaignCreateRequest,
     CampaignDetailResponse,
     CampaignListItem,
@@ -243,6 +248,8 @@ async def get_campaign(
         is_active=campaign.is_active,
         balance_bonus_kopeks=campaign.balance_bonus_kopeks or 0,
         balance_bonus_rubles=_safe_div(campaign.balance_bonus_kopeks),
+        ad_spend_kopeks=campaign.ad_spend_kopeks,
+        ad_spend_rubles=(campaign.ad_spend_kopeks / 100 if campaign.ad_spend_kopeks is not None else None),
         subscription_duration_days=campaign.subscription_duration_days,
         subscription_traffic_gb=campaign.subscription_traffic_gb,
         subscription_device_limit=campaign.subscription_device_limit,
@@ -284,6 +291,28 @@ async def get_campaign_chart_data(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to load campaign chart data',
+        )
+
+
+@router.get('/{campaign_id}/analytics-v2', response_model=CampaignAnalyticsV2Response)
+async def get_campaign_analytics_v2(
+    campaign_id: int,
+    admin: User = Depends(require_permission('campaigns:stats')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Get the first-touch funnel and unit economics without changing legacy endpoints."""
+    try:
+        data = await get_campaign_performance(db, campaign_id)
+        if data is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Campaign not found')
+        return CampaignAnalyticsV2Response(**data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error('Failed to get campaign analytics v2', error=str(e), campaign_id=campaign_id, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load campaign analytics',
         )
 
 
@@ -479,6 +508,7 @@ async def create_new_campaign(
         bonus_type=request.bonus_type,
         created_by=admin.id,
         balance_bonus_kopeks=request.balance_bonus_kopeks,
+        ad_spend_kopeks=request.ad_spend_kopeks,
         subscription_duration_days=request.subscription_duration_days,
         subscription_traffic_gb=request.subscription_traffic_gb,
         subscription_device_limit=request.subscription_device_limit,
@@ -542,6 +572,8 @@ async def update_existing_campaign(
         updates['is_active'] = request.is_active
     if 'balance_bonus_kopeks' in request.model_fields_set:
         updates['balance_bonus_kopeks'] = request.balance_bonus_kopeks
+    if 'ad_spend_kopeks' in request.model_fields_set:
+        updates['ad_spend_kopeks'] = request.ad_spend_kopeks
     if 'subscription_duration_days' in request.model_fields_set:
         updates['subscription_duration_days'] = request.subscription_duration_days
     if 'subscription_traffic_gb' in request.model_fields_set:

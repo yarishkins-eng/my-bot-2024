@@ -662,6 +662,9 @@ class AdminNotificationService:
                 extra={
                     'period_days': period_days,
                     'was_trial_conversion': was_trial_conversion,
+                    # Machine-readable lifecycle classification for campaign analytics.
+                    # Older rows may be classified from their linked checkout transaction.
+                    'purchase_type': purchase_type,
                     'payment_method': self._get_payment_method_display(transaction.payment_method)
                     if transaction
                     else 'Баланс',
