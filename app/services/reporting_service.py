@@ -473,7 +473,8 @@ class ReportingService:
                 .order_by(func.count(AdvertisingCampaignRegistration.id).desc(), AdvertisingCampaign.name)
             )
         ).all()
-        campaign_registrations = [(str(name), int(count or 0)) for name, count in campaign_rows]
+        # имена кампаний на боевом с хвостовыми пробелами («Кувалда 7000₽  ») — в письме они лишние
+        campaign_registrations = [(str(name).strip(), int(count or 0)) for name, count in campaign_rows]
 
         new_tickets = int(
             (

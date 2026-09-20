@@ -217,7 +217,7 @@ def _seed_owner_day(seed: _Seed) -> None:
     seed.subscription(renewal, tariff_id=4, is_trial=True)  # друг на Team с меткой «пробный»
     # По рекламе: две регистрации на «кувалда 2.0 8000», одна на «teplo11», одна у стенда
     seed.campaign(1, 'кувалда 2.0 8000')
-    seed.campaign(2, 'teplo11')
+    seed.campaign(2, 'teplo11  ')  # хвостовые пробелы, как у живых кампаний на боевом
     seed.registration(1, newcomer_a)
     seed.registration(1, newcomer_b)
     seed.registration(2, after_trial)
