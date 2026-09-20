@@ -1,0 +1,362 @@
+"""Утреннее письмо владельцу (ОТЧ-7, 20.09.2026) — считается НАСТОЯЩИМ движком, а не сверяется по тексту SQL.
+
+Правила владельца, которые письмо обязано держать: пробный — не подписка; подписка — только когда
+заплатили деньгами; Team — не клиенты; стенды и удалённые — не люди. Все запросы идут на SQLite в
+памяти с минимальной схемой тех же таблиц и колонок, что читает `reporting_service.py` (образец —
+`test_attach_referrer_money_fence_sqlite.py`): каждый фильтр в WHERE здесь ВЫЧИСЛЯЕТСЯ, и подмена
+`AND`/`OR`, потеря `NOT`, лишний или пропущенный тип проводки красят снимок письма.
+
+Что не считается здесь, а патчится: «Платят / На пробном» (общая с кабинетом функция
+`count_trial_and_paying_users`, у неё свои сторожа в `tests/cabinet/test_admin_users_stats_cards.py`),
+пробный тариф (`get_trial_tariff`) и список стендов.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
+
+from app.services import reporting_service as module
+from app.services.reporting_service import ReportingService, ReportPeriod
+
+
+STAND_TELEGRAM_ID = 777
+# 18.09.2026 по МСК = [2026-09-17 21:00, 2026-09-18 21:00) UTC — как считает `_get_period_range`
+IN_DAY = '2026-09-18 12:00:00'
+DAY_BEFORE = '2026-09-17 12:00:00'
+
+
+class _AsyncOverSync:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    async def execute(self, stmt):
+        return self._s.execute(stmt)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _schema() -> Session:
+    engine = create_engine('sqlite://')
+    with engine.begin() as c:
+        c.execute(
+            text('CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, status TEXT, created_at TIMESTAMP)')
+        )
+        c.execute(
+            text(
+                'CREATE TABLE transactions (id INTEGER PRIMARY KEY, user_id INTEGER, type TEXT, '
+                'amount_kopeks INTEGER, payment_method TEXT, description TEXT, is_completed BOOLEAN, '
+                'created_at TIMESTAMP)'
+            )
+        )
+        c.execute(
+            text(
+                'CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, user_id INTEGER, tariff_id INTEGER, '
+                'is_trial BOOLEAN, status TEXT, created_at TIMESTAMP)'
+            )
+        )
+        c.execute(
+            text(
+                'CREATE TABLE subscription_events (id INTEGER PRIMARY KEY, user_id INTEGER, event_type TEXT, '
+                'extra JSON, occurred_at TIMESTAMP)'
+            )
+        )
+        c.execute(text('CREATE TABLE advertising_campaigns (id INTEGER PRIMARY KEY, name TEXT)'))
+        c.execute(
+            text(
+                'CREATE TABLE advertising_campaign_registrations (id INTEGER PRIMARY KEY, campaign_id INTEGER, '
+                'user_id INTEGER, created_at TIMESTAMP)'
+            )
+        )
+        c.execute(text('CREATE TABLE tickets (id INTEGER PRIMARY KEY, status TEXT, created_at TIMESTAMP)'))
+    return Session(engine)
+
+
+class _Seed:
+    """Заполнение по одному факту за вызов — чтобы каждый тест читался как сценарий."""
+
+    def __init__(self, session: Session) -> None:
+        self.s = session
+        self._next_user = 100
+
+    def user(self, *, telegram_id: int | None = None, status: str = 'active', created_at: str = DAY_BEFORE) -> int:
+        self._next_user += 1
+        self.s.execute(
+            text('INSERT INTO users (id, telegram_id, status, created_at) VALUES (:id, :tg, :st, :c)'),
+            {'id': self._next_user, 'tg': telegram_id or self._next_user * 10, 'st': status, 'c': created_at},
+        )
+        return self._next_user
+
+    def tx(
+        self,
+        user_id: int,
+        tx_type: str,
+        amount: int,
+        *,
+        method: str | None,
+        description: str = '',
+        completed: bool = True,
+        created_at: str = IN_DAY,
+    ) -> None:
+        self.s.execute(
+            text(
+                'INSERT INTO transactions (user_id, type, amount_kopeks, payment_method, description, is_completed, '
+                'created_at) VALUES (:u, :t, :a, :m, :d, :c, :at)'
+            ),
+            {'u': user_id, 't': tx_type, 'a': amount, 'm': method, 'd': description, 'c': completed, 'at': created_at},
+        )
+
+    def event(self, user_id: int, event_type: str, extra: str | None, *, occurred_at: str = IN_DAY) -> None:
+        self.s.execute(
+            text('INSERT INTO subscription_events (user_id, event_type, extra, occurred_at) VALUES (:u, :e, :x, :at)'),
+            {'u': user_id, 'e': event_type, 'x': extra, 'at': occurred_at},
+        )
+
+    def subscription(
+        self, user_id: int, *, tariff_id: int, is_trial: bool, status: str = 'active', created_at: str = IN_DAY
+    ) -> None:
+        self.s.execute(
+            text(
+                'INSERT INTO subscriptions (user_id, tariff_id, is_trial, status, created_at) '
+                'VALUES (:u, :t, :tr, :st, :at)'
+            ),
+            {'u': user_id, 't': tariff_id, 'tr': is_trial, 'st': status, 'at': created_at},
+        )
+
+    def campaign(self, campaign_id: int, name: str) -> None:
+        self.s.execute(
+            text('INSERT INTO advertising_campaigns (id, name) VALUES (:i, :n)'), {'i': campaign_id, 'n': name}
+        )
+
+    def registration(self, campaign_id: int, user_id: int, *, created_at: str = IN_DAY) -> None:
+        self.s.execute(
+            text(
+                'INSERT INTO advertising_campaign_registrations (campaign_id, user_id, created_at) VALUES (:c, :u, :at)'
+            ),
+            {'c': campaign_id, 'u': user_id, 'at': created_at},
+        )
+
+    def ticket(self, status: str, *, created_at: str = IN_DAY) -> None:
+        self.s.execute(
+            text('INSERT INTO tickets (status, created_at) VALUES (:s, :at)'), {'s': status, 'at': created_at}
+        )
+
+
+def _seed_owner_day(seed: _Seed) -> None:
+    """Живой день по мотивам 18–19.09.2026 на боевом: три продажи тремя дорогами, докупка,
+    пополнение, бонусы, стенд, удалённый, чужой день."""
+    # 1. После пробного, с баланса (К-2 `sale:first`, снимок цели был пробным)
+    after_trial = seed.user()
+    seed.tx(
+        after_trial, 'subscription_payment', -14900, method='balance', description='Оплата подписки с баланса: 1 месяц'
+    )
+    seed.event(after_trial, 'purchase', '{"was_trial_conversion": true, "purchase_type": "first_purchase"}')
+    # 2. Новая покупка картой напрямую с кассы: приход `provider_receipt` + списание тем же днём
+    direct = seed.user()
+    seed.tx(direct, 'provider_receipt', 14900, method='platega', description='Оплата картой')
+    seed.tx(direct, 'subscription_payment', -14900, method='platega', description='Оплата подписки картой: 1 месяц')
+    seed.event(direct, 'purchase', '{"was_trial_conversion": false, "purchase_type": "first_purchase"}')
+    # 3. Продление с кассы (К-2 `sale:repeat` → purchase_type=renewal)
+    renewal = seed.user()
+    seed.tx(renewal, 'subscription_payment', -14900, method='balance', description='Оплата подписки с баланса: 1 месяц')
+    seed.event(renewal, 'purchase', '{"was_trial_conversion": false, "purchase_type": "renewal"}')
+    # Докупка устройства — тот же тип проводки, отличается описанием
+    seed.tx(
+        renewal, 'subscription_payment', -4166, method='balance', description='Покупка доп. устройств: 1 устройство'
+    )
+    # Пополнение по СБП 260 ₽ и то, что деньгами НЕ является: бонус за регистрацию, реферальный, ручной
+    topup = seed.user()
+    seed.tx(topup, 'deposit', 26000, method='platega', description='Пополнение через Platega (СБП (QR))')
+    seed.tx(topup, 'deposit', 5000, method=None, description='Бонус за регистрацию по кампании')
+    # Маркер «реферальн» ловится через `ilike`; у SQLite `lower()` знает только латиницу, поэтому в
+    # фикстуре описание уже строчными — на Postgres регистр не важен
+    seed.tx(topup, 'deposit', 4700, method='platega', description='реферальный бонус за покупку друга')
+    seed.tx(topup, 'deposit', 30000, method='manual', description='Начисление администратором')
+    # Незавершённая проводка — не деньги
+    seed.tx(topup, 'deposit', 99900, method='platega', description='Пополнение через Platega', completed=False)
+    # Стенд и удалённый аккаунт: их продажи и приходы не считаются
+    stand = seed.user(telegram_id=STAND_TELEGRAM_ID, created_at=IN_DAY)
+    seed.tx(stand, 'subscription_payment', -27400, method='balance', description='Оплата подписки с баланса: 1 месяц')
+    seed.event(stand, 'purchase', '{"was_trial_conversion": true}')
+    erased = seed.user(status='deleted')
+    seed.tx(erased, 'provider_receipt', 109000, method='platega', description='Оплата картой')
+    # Чужой день — вчера
+    seed.tx(
+        after_trial,
+        'subscription_payment',
+        -14900,
+        method='balance',
+        description='Оплата подписки',
+        created_at=DAY_BEFORE,
+    )
+    seed.event(after_trial, 'renewal', None, occurred_at=DAY_BEFORE)
+    # За день: два новичка (третий — стенд выше), пробные: настоящий, перекрашенный Team, брошенный
+    newcomer_a = seed.user(created_at=IN_DAY)
+    newcomer_b = seed.user(created_at=IN_DAY)
+    seed.subscription(newcomer_a, tariff_id=5, is_trial=True)
+    seed.subscription(newcomer_b, tariff_id=5, is_trial=True, status='pending')
+    seed.subscription(renewal, tariff_id=4, is_trial=True)  # друг на Team с меткой «пробный»
+    # По рекламе: две регистрации на «кувалда 2.0 8000», одна на «teplo11», одна у стенда
+    seed.campaign(1, 'кувалда 2.0 8000')
+    seed.campaign(2, 'teplo11')
+    seed.registration(1, newcomer_a)
+    seed.registration(1, newcomer_b)
+    seed.registration(2, after_trial)
+    seed.registration(1, stand)
+    # Тикеты: один новый сегодня, открытых всего два (один старый)
+    seed.ticket('open')
+    seed.ticket('answered', created_at=DAY_BEFORE)
+    seed.ticket('closed', created_at=DAY_BEFORE)
+    seed.s.commit()
+
+
+async def _render(session: Session, period: ReportPeriod = ReportPeriod.DAILY, *, people=None) -> str:
+    service = ReportingService()
+    with (
+        patch.object(module, 'AsyncSessionLocal', lambda: _AsyncOverSync(session)),
+        patch.object(
+            module, 'count_trial_and_paying_users', AsyncMock(return_value=people or {'paying': 59, 'on_trial': 46})
+        ),
+        patch.object(module, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=5))),
+        patch.object(module, 'test_account_telegram_ids', lambda: frozenset({STAND_TELEGRAM_ID})),
+    ):
+        return await service._build_report(period, date(2026, 9, 18))
+
+
+@pytest.mark.asyncio
+async def test_owner_report_for_a_live_day_is_eight_honest_lines() -> None:
+    session = _schema()
+    _seed_owner_day(_Seed(session))
+
+    text_ = await _render(session)
+
+    assert text_.split('\n') == [
+        '📊 <b>Отчёт за 18.09.2026</b>',
+        '',
+        '💎 <b>Продажи</b>',
+        '• Купили: <b>3</b> на <b>447 ₽</b> — после пробного 1 · продления 1 · новые 1',
+        '• Докупили устройств и трафика: 1 на 42 ₽',
+        '• Пришло денег: <b>409 ₽</b> (пополнений 1 · прямых оплат картой 1)',
+        '',
+        '🚪 <b>За день</b>',
+        '• Открыли бота: 2 · взяли пробный: 1 · по рекламе: 3 (кувалда 2.0 8000 — 2, teplo11 — 1)',
+        '',
+        '📌 <b>Сейчас</b>',
+        '• Платят: <b>59</b> · на пробном: <b>46</b>',
+        '',
+        '🎟 Поддержка: 1 новых · 2 открытых',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_owner_report_never_prints_the_lines_the_owner_removed() -> None:
+    session = _schema()
+    _seed_owner_day(_Seed(session))
+
+    text_ = await _render(session)
+
+    for forbidden in (
+        'Конверси',
+        'рефералам',
+        'серверов',
+        'Примечание',
+        'Новых платных',
+        'Активные триалы',
+        'за 3 дня',
+    ):
+        assert forbidden not in text_, forbidden
+
+
+@pytest.mark.asyncio
+async def test_direct_card_sale_counts_as_money_in_and_as_one_sale() -> None:
+    """🔴 Прежний отчёт видел только `deposit` и терял треть выручки (за 30 дней 7 485 ₽ из 20 248)."""
+    session = _schema()
+    seed = _Seed(session)
+    buyer = seed.user()
+    seed.tx(buyer, 'provider_receipt', 109000, method='platega', description='Оплата картой')
+    seed.tx(buyer, 'subscription_payment', -109000, method='platega', description='Оплата подписки картой: 365 дней')
+    seed.event(buyer, 'purchase', '{"was_trial_conversion": false, "purchase_type": "first_purchase"}')
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert '• Купили: <b>1</b> на <b>1090 ₽</b> — после пробного 0 · продления 0 · новые 1' in text_
+    assert '• Пришло денег: <b>1090 ₽</b> (пополнений 0 · прямых оплат картой 1)' in text_
+
+
+@pytest.mark.asyncio
+async def test_split_that_does_not_match_the_ledger_says_so() -> None:
+    """События пишутся только при включённых уведомлениях (мина MP) — расхождение называется, не прячется."""
+    session = _schema()
+    seed = _Seed(session)
+    a, b = seed.user(), seed.user()
+    seed.tx(a, 'subscription_payment', -14900, method='balance', description='Оплата подписки с баланса: 1 месяц')
+    seed.tx(b, 'subscription_payment', -14900, method='balance', description='Оплата подписки с баланса: 1 месяц')
+    seed.event(a, 'purchase', '{"was_trial_conversion": true}')
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert (
+        '• Купили: <b>2</b> на <b>298 ₽</b> — после пробного 1 · продления 0 · новые 0'
+        ' (разбивка неполная: 1 без записи)'
+    ) in text_
+
+
+@pytest.mark.asyncio
+async def test_legacy_renewal_event_from_the_bot_path_is_a_renewal() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    buyer = seed.user()
+    seed.tx(buyer, 'subscription_payment', -14900, method='balance', description='Продление подписки')
+    seed.event(buyer, 'renewal', '{"extended_days": 30}')
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert '— после пробного 0 · продления 1 · новые 0' in text_
+
+
+@pytest.mark.asyncio
+async def test_weekly_report_uses_the_same_builder_with_a_period_header() -> None:
+    session = _schema()
+    _seed_owner_day(_Seed(session))
+
+    text_ = await _render(session, ReportPeriod.WEEKLY)
+
+    lines = text_.split('\n')
+    assert lines[0] == '📊 <b>Отчёт за период 11.09.2026 - 17.09.2026</b>'
+    assert '🚪 <b>За период</b>' in lines
+    assert '📌 <b>Сейчас</b>' in lines and '• Платят: <b>59</b> · на пробном: <b>46</b>' in lines
+
+
+@pytest.mark.asyncio
+async def test_campaign_name_is_escaped_for_telegram_html() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    seed.campaign(1, 'A&B <test>')
+    seed.registration(1, seed.user(created_at=IN_DAY))
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert 'по рекламе: 1 (A&amp;B &lt;test&gt; — 1)' in text_
+
+
+@pytest.mark.asyncio
+async def test_now_block_comes_from_the_shared_cabinet_definition() -> None:
+    """Плитки кабинета и письмо считает одна функция — подменили её ответ, подменилось письмо."""
+    session = _schema()
+
+    text_ = await _render(session, people={'paying': 7, 'on_trial': 3})
+
+    assert '• Платят: <b>7</b> · на пробном: <b>3</b>' in text_

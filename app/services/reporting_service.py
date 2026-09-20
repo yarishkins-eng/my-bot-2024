@@ -8,17 +8,18 @@ from zoneinfo import ZoneInfo
 import structlog
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from sqlalchemy import cast, func, literal, not_, or_, select
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.sql import false, true
+from sqlalchemy import and_, func, not_, or_, select
+from sqlalchemy.sql import true
 
 from app.config import settings
-from app.database.crud.subscription import get_subscriptions_statistics
-from app.database.crud.transaction import REAL_PAYMENT_METHODS
+from app.database.crud.tariff import get_trial_tariff
+from app.database.crud.transaction import REAL_PAYMENT_METHODS, addon_description_clause
 from app.database.database import AsyncSessionLocal
 from app.database.models import (
+    AdvertisingCampaign,
+    AdvertisingCampaignRegistration,
     Subscription,
-    SubscriptionConversion,
+    SubscriptionEvent,
     SubscriptionStatus,
     Ticket,
     TicketStatus,
@@ -27,6 +28,8 @@ from app.database.models import (
     User,
     UserStatus,
 )
+from app.services.user_service import test_account_telegram_ids
+from app.utils.user_utils import count_trial_and_paying_users
 
 
 logger = structlog.get_logger(__name__)
@@ -235,91 +238,63 @@ class ReportingService:
         period: ReportPeriod,
         report_date: date | None,
     ) -> str:
+        """Письмо владельцу — 8 строк по его правилам (ОТЧ-7, 20.09.2026).
+
+        Пробный — не подписка; подписка — только когда заплатили деньгами; Team — не клиенты;
+        стенды и удалённые — не люди. Числа «Сейчас» считаются той же функцией, что плитки
+        кабинета «Пользователи» (`count_trial_and_paying_users`) — письмо и экран не расходятся.
+        """
         period_range = self._get_period_range(period, report_date)
         start_utc = period_range.start_msk.astimezone(UTC)
         end_utc = period_range.end_msk.astimezone(UTC)
 
         async with AsyncSessionLocal() as session:
-            totals = await self._collect_current_totals(session)
             stats = await self._collect_period_stats(session, start_utc, end_utc)
-            top_referrers = await self._get_top_referrers(session, start_utc, end_utc, limit=5)
-            usage = await self._get_user_usage_stats(session)
+            totals = await self._collect_current_totals(session)
 
-        conversion_rate = (
-            (stats['trial_to_paid_conversions'] / stats['new_trials'] * 100) if stats['new_trials'] > 0 else 0.0
-        )
-
-        lines: list[str] = []
         header = (
-            f'📊 <b>Отчет за {period_range.label}</b>'
+            f'📊 <b>Отчёт за {period_range.label}</b>'
             if period == ReportPeriod.DAILY
-            else f'📊 <b>Отчет за период {period_range.label}</b>'
+            else f'📊 <b>Отчёт за период {period_range.label}</b>'
         )
-        lines += [header, '']
+        split_total = stats['sales_after_trial'] + stats['sales_renewals'] + stats['sales_new']
+        split = (
+            f'после пробного {stats["sales_after_trial"]} · продления {stats["sales_renewals"]}'
+            f' · новые {stats["sales_new"]}'
+        )
+        if split_total != stats['sales_count']:
+            # Разбивка идёт по событиям, а они пишутся только при включённых уведомлениях (мина MP);
+            # сумма и число — по проводкам. Разошлись — сказать, а не подогнать.
+            split += f' (разбивка неполная: {abs(stats["sales_count"] - split_total)} без записи)'
+        campaigns = ', '.join(
+            f'{escape(name, quote=False)} — {count}' for name, count in stats['campaign_registrations']
+        )
+        campaign_line = f'по рекламе: {stats["campaign_registrations_total"]}'
+        if campaigns:
+            campaign_line += f' ({campaigns})'
 
-        # TL;DR
-        lines += [
-            '🧭 <b>Итог по периоду</b>',
-            f'• Новых пользователей: <b>{stats["new_users"]}</b>',
-            f'• Новых триалов: <b>{stats["new_trials"]}</b>',
-            (
-                f'• Конверсий триал → платная: <b>{stats["trial_to_paid_conversions"]}</b> '
-                f'(<i>{conversion_rate:.1f}%</i>)'
-            ),
-            f'• Новых платных (всего): <b>{stats["new_paid_subscriptions"]}</b>',
-            f'• Поступления всего (только пополнения): <b>{self._format_amount(stats["deposits_amount"])}</b>',
+        lines = [
+            header,
             '',
-        ]
-
-        # Подписки
-        lines += [
-            '💎 <b>Подписки</b>',
-            f'• Активные триалы сейчас: {totals["active_trials"]}',
-            f'• Активные платные сейчас: {totals["active_paid"]}',
-            '',
-        ]
-
-        # Финансы
-        lines += [
-            '💰 <b>Финансы</b>',
+            '💎 <b>Продажи</b>',
             (
-                '• Оплаты подписок: '
-                f'{stats["subscription_payments_count"]} на сумму {self._format_amount(stats["subscription_payments_amount"])}'
+                f'• Купили: <b>{stats["sales_count"]}</b> на <b>{self._format_amount(stats["sales_amount"])}</b>'
+                f' — {split}'
             ),
-            (f'• Пополнения: {stats["deposits_count"]} на сумму {self._format_amount(stats["deposits_amount"])}'),
+            f'• Докупили устройств и трафика: {stats["addons_count"]} на {self._format_amount(stats["addons_amount"])}',
             (
-                '<i>Примечание: «Поступления всего» учитывают только пополнения; покупки подписок и реферальные бонусы '
-                'исключены.</i>'
+                f'• Пришло денег: <b>{self._format_amount(stats["money_in_amount"])}</b>'
+                f' (пополнений {stats["deposits_count"]} · прямых оплат картой {stats["receipts_count"]})'
             ),
             '',
-        ]
-
-        # Поддержка
-        lines += [
-            '🎟️ <b>Поддержка</b>',
-            f'• Новых тикетов: {stats["new_tickets"]}',
-            f'• Активных тикетов сейчас: {totals["open_tickets"]}',
+            '🚪 <b>За день</b>' if period == ReportPeriod.DAILY else '🚪 <b>За период</b>',
+            f'• Открыли бота: {stats["new_users"]} · взяли пробный: {stats["new_trials"]} · {campaign_line}',
             '',
-        ]
-
-        # Активность пользователей
-        lines += [
-            '👤 <b>Активность пользователей</b>',
-            f'• Пользователей с активной платной подпиской: {usage["active_paid_users"]}',
-            f'• Пользователей с подпиской без выданных серверов: '
-            f'{usage["users_without_servers"]} (накопительно за всю историю)',
+            '📌 <b>Сейчас</b>',
+            f'• Платят: <b>{totals["paying"]}</b> · на пробном: <b>{totals["on_trial"]}</b>',
             '',
+            f'🎟 Поддержка: {stats["new_tickets"]} новых · {totals["open_tickets"]} открытых',
         ]
-
-        # Топ по рефералам
-        lines += ['🤝 <b>Топ по рефералам (за период)</b>']
-        if top_referrers:
-            for index, row in enumerate(top_referrers, 1):
-                referrer_label = escape(row['referrer_label'], quote=False)
-                lines.append(f'{index}. {referrer_label}: {row["count"]} приглашений')
-        else:
-            lines.append('— данных нет')
-
         return '\n'.join(lines)
 
     def _get_period_range(
@@ -349,8 +324,18 @@ class ReportingService:
         label = self._format_period_label(start, end)
         return ReportPeriodRange(start, end, label)
 
+    @staticmethod
+    def _operational_person():
+        """Условие «это человек, а не стенд и не удалённый аккаунт» — то же, что у кабинета
+        (`count_trial_and_paying_users`). Применяется ко ВСЕМ числам письма."""
+        not_deleted = or_(User.status.is_(None), User.status != UserStatus.DELETED.value)
+        stands = tuple(test_account_telegram_ids())
+        if not stands:
+            return not_deleted
+        return and_(not_deleted, or_(User.telegram_id.is_(None), User.telegram_id.not_in(stands)))
+
     async def _collect_current_totals(self, session) -> dict:
-        stats = await get_subscriptions_statistics(session)
+        people = await count_trial_and_paying_users(session)
         open_tickets_result = await session.execute(
             select(func.count(Ticket.id)).where(
                 Ticket.status.in_(
@@ -362,11 +347,10 @@ class ReportingService:
                 )
             )
         )
-        open_tickets = int(open_tickets_result.scalar() or 0)
         return {
-            'active_trials': stats.get('trial_subscriptions', 0) or 0,
-            'active_paid': stats.get('paid_subscriptions', 0) or 0,
-            'open_tickets': open_tickets,
+            'paying': int(people.get('paying') or 0),
+            'on_trial': int(people.get('on_trial') or 0),
+            'open_tickets': int(open_tickets_result.scalar() or 0),
         }
 
     async def _collect_period_stats(
@@ -375,69 +359,121 @@ class ReportingService:
         start_utc: datetime,
         end_utc: datetime,
     ) -> dict:
+        person = self._operational_person()
+
+        def money(*conditions):
+            return (
+                select(func.count(Transaction.id), func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0))
+                .join(User, User.id == Transaction.user_id)
+                .where(
+                    Transaction.is_completed == true(),
+                    Transaction.created_at >= start_utc,
+                    Transaction.created_at < end_utc,
+                    person,
+                    *conditions,
+                )
+            )
+
+        # Продажи и докупки лежат одним типом проводки; отличает их только описание
+        # (`ADDON_DESCRIPTION_PATTERNS`), и на этом же стоит кабинет.
+        is_addon = addon_description_clause(Transaction.description)
+        sales_count, sales_amount = (
+            await session.execute(money(Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value, not_(is_addon)))
+        ).one()
+        addons_count, addons_amount = (
+            await session.execute(money(Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value, is_addon))
+        ).one()
+
+        # 🔴 Деньги приходят ДВУМЯ типами: пополнение баланса (`deposit`) и оплата картой напрямую с
+        # кассы (`provider_receipt`). Прежний отчёт видел только первый и терял треть выручки.
+        real_money = (
+            Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
+            self._exclude_referral_deposits_condition(),
+        )
+        deposits_count, deposits_amount = (
+            await session.execute(money(Transaction.type == TransactionType.DEPOSIT.value, *real_money))
+        ).one()
+        receipts_count, receipts_amount = (
+            await session.execute(money(Transaction.type == TransactionType.PROVIDER_RECEIPT.value, *real_money))
+        ).one()
+
+        # Разбивка продаж — по тем же признакам, по которым названы карточки в теме «Продажи»:
+        # `purchase` + `was_trial_conversion` → после пробного; `renewal` или `purchase_type='renewal'`
+        # → продление; остальное — новые. Считаем в Python: `extra` — JSON, и это кроссбазово.
+        events = (
+            await session.execute(
+                select(SubscriptionEvent.event_type, SubscriptionEvent.extra)
+                .join(User, User.id == SubscriptionEvent.user_id)
+                .where(
+                    SubscriptionEvent.event_type.in_(('purchase', 'renewal')),
+                    SubscriptionEvent.occurred_at >= start_utc,
+                    SubscriptionEvent.occurred_at < end_utc,
+                    person,
+                )
+            )
+        ).all()
+        after_trial = renewals = new_sales = 0
+        for event_type, extra in events:
+            extra = extra or {}
+            if event_type == 'purchase' and extra.get('was_trial_conversion'):
+                after_trial += 1
+            elif event_type == 'renewal' or extra.get('purchase_type') == 'renewal':
+                renewals += 1
+            else:
+                new_sales += 1
+
         new_users = int(
             (
                 await session.execute(
                     select(func.count(User.id)).where(
                         User.created_at >= start_utc,
                         User.created_at < end_utc,
+                        person,
                     )
                 )
             ).scalar()
             or 0
         )
 
+        # «Взяли пробный» — только канонический пробный тариф: метка `is_trial` стоит и на
+        # перекрашенных Team (ОТЧ-4); брошенное оформление (`pending`) — не пробный.
+        trial_tariff = await get_trial_tariff(session)
+        trial_conditions = [
+            Subscription.created_at >= start_utc,
+            Subscription.created_at < end_utc,
+            Subscription.is_trial.is_(True),
+            Subscription.status != SubscriptionStatus.PENDING.value,
+            person,
+        ]
+        if trial_tariff is not None:
+            trial_conditions.append(Subscription.tariff_id == trial_tariff.id)
         new_trials = int(
             (
                 await session.execute(
-                    select(func.count(Subscription.id)).where(
-                        Subscription.created_at >= start_utc,
-                        Subscription.created_at < end_utc,
-                        Subscription.is_trial == true(),
-                    )
+                    select(func.count(Subscription.id))
+                    .join(User, User.id == Subscription.user_id)
+                    .where(*trial_conditions)
                 )
             ).scalar()
             or 0
         )
 
-        direct_paid = int(
-            (
-                await session.execute(
-                    select(func.count(Subscription.id)).where(
-                        Subscription.created_at >= start_utc,
-                        Subscription.created_at < end_utc,
-                        Subscription.is_trial == false(),
-                    )
-                )
-            ).scalar()
-            or 0
-        )
-
-        trial_to_paid_conversions = int(
-            (
-                await session.execute(
-                    select(func.count(SubscriptionConversion.id)).where(
-                        SubscriptionConversion.converted_at >= start_utc,
-                        SubscriptionConversion.converted_at < end_utc,
-                    )
-                )
-            ).scalar()
-            or 0
-        )
-
-        subscription_payments_count, subscription_payments_amount = (
+        # По рекламе — регистрации (не переходы: их отправка снята 19.09), по имени кампании.
+        campaign_rows = (
             await session.execute(
-                self._txn_query_base(
-                    TransactionType.SUBSCRIPTION_PAYMENT.value,
-                    start_utc,
-                    end_utc,
+                select(AdvertisingCampaign.name, func.count(AdvertisingCampaignRegistration.id))
+                .join(AdvertisingCampaign, AdvertisingCampaign.id == AdvertisingCampaignRegistration.campaign_id)
+                .join(User, User.id == AdvertisingCampaignRegistration.user_id)
+                .where(
+                    AdvertisingCampaignRegistration.created_at >= start_utc,
+                    AdvertisingCampaignRegistration.created_at < end_utc,
+                    person,
                 )
+                .group_by(AdvertisingCampaign.name)
+                .order_by(func.count(AdvertisingCampaignRegistration.id).desc(), AdvertisingCampaign.name)
             )
-        ).one()
-
-        deposits_count, deposits_amount = (
-            await session.execute(self._deposit_query_excluding_referrals(start_utc, end_utc))
-        ).one()
+        ).all()
+        campaign_registrations = [(str(name), int(count or 0)) for name, count in campaign_rows]
 
         new_tickets = int(
             (
@@ -452,146 +488,22 @@ class ReportingService:
         )
 
         return {
+            'sales_count': int(sales_count or 0),
+            'sales_amount': int(sales_amount or 0),
+            'sales_after_trial': after_trial,
+            'sales_renewals': renewals,
+            'sales_new': new_sales,
+            'addons_count': int(addons_count or 0),
+            'addons_amount': int(addons_amount or 0),
+            'deposits_count': int(deposits_count or 0),
+            'receipts_count': int(receipts_count or 0),
+            'money_in_amount': int(deposits_amount or 0) + int(receipts_amount or 0),
             'new_users': new_users,
             'new_trials': new_trials,
-            'new_paid_subscriptions': direct_paid + trial_to_paid_conversions,
-            'trial_to_paid_conversions': trial_to_paid_conversions,
-            'subscription_payments_count': int(subscription_payments_count or 0),
-            'subscription_payments_amount': int(subscription_payments_amount or 0),
-            'deposits_count': int(deposits_count or 0),
-            'deposits_amount': int(deposits_amount or 0),
+            'campaign_registrations': campaign_registrations,
+            'campaign_registrations_total': sum(count for _, count in campaign_registrations),
             'new_tickets': new_tickets,
         }
-
-    def _txn_query_base(self, txn_type: str, start_utc: datetime, end_utc: datetime):
-        return select(
-            func.count(Transaction.id),
-            func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0),
-        ).where(
-            Transaction.type == txn_type,
-            Transaction.is_completed == true(),
-            Transaction.created_at >= start_utc,
-            Transaction.created_at < end_utc,
-        )
-
-    def _deposit_query_excluding_referrals(self, start_utc: datetime, end_utc: datetime):
-        """Запрос депозитов только по реальным платежам.
-
-        Исключаются: колесо удачи, промокоды, админские пополнения, оплата с баланса.
-        """
-        return select(
-            func.count(Transaction.id),
-            func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0),
-        ).where(
-            Transaction.type == TransactionType.DEPOSIT.value,
-            Transaction.is_completed == true(),
-            Transaction.created_at >= start_utc,
-            Transaction.created_at < end_utc,
-            self._exclude_referral_deposits_condition(),
-            # Только реальные платежи (исключаем колесо, промокоды, админские, баланс)
-            Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
-        )
-
-    async def _get_top_referrers(
-        self,
-        session,
-        start_utc: datetime,
-        end_utc: datetime,
-        limit: int = 5,
-    ) -> list[dict]:
-        rows = await session.execute(
-            select(
-                User.referred_by_id,
-                func.count(User.id).label('cnt'),
-            )
-            .where(
-                User.created_at >= start_utc,
-                User.created_at < end_utc,
-                User.referred_by_id.isnot(None),
-            )
-            .group_by(User.referred_by_id)
-            .order_by(func.count(User.id).desc())
-            .limit(limit)
-        )
-        rows = rows.all()
-        if not rows:
-            return []
-        ref_ids = [row[0] for row in rows if row[0] is not None]
-        users_map: dict[int, str] = {}
-        if ref_ids:
-            urows = await session.execute(select(User).where(User.id.in_(ref_ids)))
-            for user in urows.scalars().all():
-                users_map[user.id] = self._user_label(user)
-        return [
-            {'referrer_label': users_map.get(ref_id, f'User #{ref_id}'), 'count': int(count or 0)}
-            for ref_id, count in rows
-        ]
-
-    async def _get_user_usage_stats(self, session) -> dict[str, int]:
-        now_utc = datetime.now(UTC)
-
-        active_paid_q = await session.execute(
-            select(func.count(func.distinct(Subscription.user_id))).where(
-                Subscription.is_trial == false(),
-                Subscription.status == SubscriptionStatus.ACTIVE.value,
-                Subscription.end_date > now_utc,
-            )
-        )
-        active_paid_users = int(active_paid_q.scalar() or 0)
-
-        # 🔴 Считает людей, у которых ХОТЬ ОДНА подписка осталась без выданных серверов, — это
-        # поломка выдачи, а не поведение человека. Фильтра по статусу и сроку тут нет: берутся
-        # все подписки за всю историю, поэтому в число навсегда попадают истёкшие и обнулённые
-        # кнопкой «🧹 Обнулить подписку» (`crud/subscription.py`, `reset_subscription` ставит
-        # `connected_squads = []`). Число монотонно и после починки выдачи не падает — мерить
-        # им «стало лучше» почти нельзя: единственное, что возвращает человека обратно, —
-        # восстановление сквадов у СУТОЧНОЙ подписки (`daily_subscription_service.py`,
-        # `purchase.py` резюм, `subscription_auto_purchase_service.py`), а суточных тарифов
-        # на боевом ноль (проверено 06.09.2026). Мина BY.
-        # Прежнее название строки («ни разу не подключившихся») обещало другое множество — то
-        # самое, которое ищет письмо `trial_not_connected` по данным панели. Не возвращать
-        # прежнее имя, не добавив сюда проверку подключений.
-        without_servers_q = await session.execute(
-            select(func.count(func.distinct(Subscription.user_id)))
-            # 🔴 Удалённые аккаунты вычитаем: их подписки остаются в базе навсегда
-            # (`account_erasure_service`, «Обнулить тестовый аккаунт» — строку не удаляют,
-            # только чистят). Без этого вычитания починка сравнения выше превращает молчание
-            # в ежеутреннюю ЛОЖНУЮ тревогу: замер 06.09.2026 — все три попавших сюда человека
-            # удалены, а живых подписок без серверов ноль. Кабинет вычитает их так же
-            # (`cabinet/routes/admin_users.py`, `operational_user`).
-            .join(User, User.id == Subscription.user_id)
-            .where(
-                or_(User.status.is_(None), User.status != UserStatus.DELETED.value),
-                or_(
-                    Subscription.connected_squads.is_(None),
-                    # 🔴 Сравнивать надо с ПУСТЫМ СПИСКОМ, а не со строкой '[]'. Прежнее
-                    # `cast('[]', JSONB)` уезжало в базу как jsonb-строка "[]"
-                    # (`jsonb_typeof` = string), поэтому не совпадало ни с одной подпиской,
-                    # и вся строка отчёта печатала ноль всегда. Замер 06.09.2026: было 0,
-                    # правильный ответ 3. Мина KJ2.
-                    cast(Subscription.connected_squads, JSONB) == literal([], JSONB),
-                    func.jsonb_typeof(cast(Subscription.connected_squads, JSONB)) != 'array',
-                ),
-            )
-        )
-        users_without_servers = int(without_servers_q.scalar() or 0)
-
-        return {
-            'active_paid_users': active_paid_users,
-            'users_without_servers': users_without_servers,
-        }
-
-    def _user_label(self, user: User) -> str:
-        if getattr(user, 'username', None):
-            return f'@{user.username}'
-        parts = []
-        if getattr(user, 'first_name', None):
-            parts.append(user.first_name)
-        if getattr(user, 'last_name', None):
-            parts.append(user.last_name)
-        if parts:
-            return ' '.join(parts)
-        return f'User #{getattr(user, "id", "?")}'
 
     def _format_period_label(self, start: datetime, end: datetime) -> str:
         start_date = start.astimezone(self._moscow_tz).date()
@@ -604,8 +516,8 @@ class ReportingService:
         return f'{start_date.strftime("%d.%m.%Y")} - {end_date.strftime("%d.%m.%Y")}'
 
     def _format_amount(self, amount_kopeks: int) -> str:
-        rubles = (amount_kopeks or 0) / 100
-        return f'{rubles:,.2f} ₽'.replace(',', ' ')
+        # Как в карточках владельца: целые рубли — целыми, копейки — только если они есть.
+        return settings.format_price(int(amount_kopeks or 0))
 
 
 reporting_service = ReportingService()
