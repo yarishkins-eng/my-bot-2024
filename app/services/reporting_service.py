@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import structlog
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from sqlalchemy import and_, func, not_, or_, select
+from sqlalchemy import func, not_, or_, select
 from sqlalchemy.sql import true
 
 from app.config import settings
@@ -26,10 +26,8 @@ from app.database.models import (
     Transaction,
     TransactionType,
     User,
-    UserStatus,
 )
-from app.services.user_service import test_account_telegram_ids
-from app.utils.user_utils import count_trial_and_paying_users
+from app.utils.user_utils import count_trial_and_paying_users, operational_person_clause
 
 
 logger = structlog.get_logger(__name__)
@@ -262,10 +260,14 @@ class ReportingService:
             f'после пробного {stats["sales_after_trial"]} · продления {stats["sales_renewals"]}'
             f' · новые {stats["sales_new"]}'
         )
-        if split_total != stats['sales_count']:
-            # Разбивка идёт по событиям, а они пишутся только при включённых уведомлениях (мина MP);
-            # сумма и число — по проводкам. Разошлись — сказать, а не подогнать.
-            split += f' (разбивка неполная: {abs(stats["sales_count"] - split_total)} без записи)'
+        unmarked = stats['sales_count'] - split_total
+        if unmarked > 0:
+            # Разбивка идёт по событиям: их нет у продаж до К-2 (18.09.2026), при выключенных
+            # уведомлениях (мина MP) и у событий без пометки типа (до РК-3). Число и рубли — по
+            # проводкам. Четвёртый член ряда, чтобы сумма сходилась, а не подгонка.
+            split += f' · без пометки {unmarked}'
+        elif unmarked < 0:
+            split += f' (пометок больше, чем продаж: {-unmarked})'
         campaigns = ', '.join(
             f'{escape(name, quote=False)} — {count}' for name, count in stats['campaign_registrations']
         )
@@ -324,16 +326,6 @@ class ReportingService:
         label = self._format_period_label(start, end)
         return ReportPeriodRange(start, end, label)
 
-    @staticmethod
-    def _operational_person():
-        """Условие «это человек, а не стенд и не удалённый аккаунт» — то же, что у кабинета
-        (`count_trial_and_paying_users`). Применяется ко ВСЕМ числам письма."""
-        not_deleted = or_(User.status.is_(None), User.status != UserStatus.DELETED.value)
-        stands = tuple(test_account_telegram_ids())
-        if not stands:
-            return not_deleted
-        return and_(not_deleted, or_(User.telegram_id.is_(None), User.telegram_id.not_in(stands)))
-
     async def _collect_current_totals(self, session) -> dict:
         people = await count_trial_and_paying_users(session)
         open_tickets_result = await session.execute(
@@ -359,7 +351,8 @@ class ReportingService:
         start_utc: datetime,
         end_utc: datetime,
     ) -> dict:
-        person = self._operational_person()
+        # «Человек, а не стенд и не удалённый» — тот же предикат, что у плиток кабинета (галка в базе + `.env`)
+        person = operational_person_clause()
 
         def money(*conditions):
             return (
@@ -367,6 +360,8 @@ class ReportingService:
                 .join(User, User.id == Transaction.user_id)
                 .where(
                     Transaction.is_completed == true(),
+                    # Нулевая проводка — не деньги: «Смена тарифа администратором» пишется тем же типом на 0 ₽
+                    Transaction.amount_kopeks != 0,
                     Transaction.created_at >= start_utc,
                     Transaction.created_at < end_utc,
                     person,
@@ -419,8 +414,11 @@ class ReportingService:
                 after_trial += 1
             elif event_type == 'renewal' or extra.get('purchase_type') == 'renewal':
                 renewals += 1
-            else:
+            elif extra.get('purchase_type'):
+                # явная пометка «первая покупка» — только она делает продажу «новой»
                 new_sales += 1
+            # событие без `purchase_type` (записано до РК-3 20.09.2026) — не «новое», а «без пометки»:
+            # у карточки такого события «Продление» решалось по флагу, письму это неизвестно
 
         new_users = int(
             (
@@ -447,7 +445,7 @@ class ReportingService:
         ]
         if trial_tariff is not None:
             trial_conditions.append(Subscription.tariff_id == trial_tariff.id)
-        new_trials = int(
+        still_trial = int(
             (
                 await session.execute(
                     select(func.count(Subscription.id))
@@ -457,6 +455,28 @@ class ReportingService:
             ).scalar()
             or 0
         )
+        # 🔴 Покупка после пробного ПЕРЕПИСЫВАЕТ ту же строку (`is_trial` → False, тариф → платный), и
+        # взявший пробный выпадал из «взяли пробный» в тот же день, когда письмо считало его «после
+        # пробного» (замер 19.09: 44 вместо 47). Добираем по событию покупки с признаком конверсии у
+        # подписки, заведённой в окне. Признак читаем в Python: `extra` — JSON.
+        converted_rows = (
+            await session.execute(
+                select(SubscriptionEvent.subscription_id, SubscriptionEvent.extra)
+                .join(Subscription, Subscription.id == SubscriptionEvent.subscription_id)
+                .join(User, User.id == Subscription.user_id)
+                .where(
+                    SubscriptionEvent.event_type == 'purchase',
+                    Subscription.created_at >= start_utc,
+                    Subscription.created_at < end_utc,
+                    Subscription.is_trial.is_not(True),
+                    person,
+                )
+            )
+        ).all()
+        converted_in_window = {
+            subscription_id for subscription_id, extra in converted_rows if (extra or {}).get('was_trial_conversion')
+        }
+        new_trials = still_trial + len(converted_in_window)
 
         # По рекламе — регистрации (не переходы: их отправка снята 19.09), по имени кампании.
         campaign_rows = (
@@ -479,9 +499,12 @@ class ReportingService:
         new_tickets = int(
             (
                 await session.execute(
-                    select(func.count(Ticket.id)).where(
+                    select(func.count(Ticket.id))
+                    .join(User, User.id == Ticket.user_id)
+                    .where(
                         Ticket.created_at >= start_utc,
                         Ticket.created_at < end_utc,
+                        person,
                     )
                 )
             ).scalar()

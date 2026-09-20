@@ -469,6 +469,28 @@ async def get_referral_analytics(db: AsyncSession, user_id: int) -> dict:
         return {'earnings_by_period': {'today': 0, 'week': 0, 'month': 0, 'quarter': 0}, 'top_referrals': []}
 
 
+def operational_person_clause():
+    """«Это человек»: не удалённый и не тестовый стенд — ровно те же условия, что внутри
+    `count_trial_and_paying_users` (ОТЧ-7: утреннее письмо обязано считать стенды так же, как плитки
+    кабинета). Стенд — по галке в базе (`test_account_enabled`), а при её отсутствии — по списку в `.env`;
+    email-пользователи стендом не бывают."""
+    from app.services.user_service import test_account_telegram_ids
+
+    test_telegram_ids = tuple(test_account_telegram_ids())
+    not_deleted = or_(User.status.is_(None), User.status != UserStatus.DELETED.value)
+    non_test_user_conditions = [
+        User.telegram_id.is_(None),
+        User.test_account_enabled.is_(False),
+    ]
+    if test_telegram_ids:
+        non_test_user_conditions.append(
+            and_(User.test_account_enabled.is_(None), User.telegram_id.not_in(test_telegram_ids))
+        )
+    else:
+        non_test_user_conditions.append(User.test_account_enabled.is_(None))
+    return and_(not_deleted, or_(*non_test_user_conditions))
+
+
 async def count_trial_and_paying_users(db: AsyncSession) -> dict[str, int]:
     """Count people on the canonical trial and people with proven external payments.
 
