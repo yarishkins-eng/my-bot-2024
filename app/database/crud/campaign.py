@@ -30,6 +30,7 @@ async def create_campaign(
     bonus_type: str,
     created_by: int | None = None,
     balance_bonus_kopeks: int = 0,
+    ad_spend_kopeks: int | None = None,
     subscription_duration_days: int | None = None,
     subscription_traffic_gb: int | None = None,
     subscription_device_limit: int | None = None,
@@ -45,6 +46,7 @@ async def create_campaign(
         start_parameter=start_parameter,
         bonus_type=bonus_type,
         balance_bonus_kopeks=balance_bonus_kopeks or 0,
+        ad_spend_kopeks=ad_spend_kopeks,
         subscription_duration_days=subscription_duration_days,
         subscription_traffic_gb=subscription_traffic_gb,
         subscription_device_limit=subscription_device_limit,
@@ -140,6 +142,7 @@ async def update_campaign(
         'start_parameter',
         'bonus_type',
         'balance_bonus_kopeks',
+        'ad_spend_kopeks',
         'subscription_duration_days',
         'subscription_traffic_gb',
         'subscription_device_limit',
@@ -157,6 +160,7 @@ async def update_campaign(
         'subscription_traffic_gb',
         'subscription_device_limit',
         'tariff_duration_days',
+        'ad_spend_kopeks',
     }
 
     update_data = {}

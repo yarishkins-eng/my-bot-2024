@@ -4400,6 +4400,12 @@ class PinnedMessage(Base):
 
 class AdvertisingCampaign(Base):
     __tablename__ = 'advertising_campaigns'
+    __table_args__ = (
+        CheckConstraint(
+            'ad_spend_kopeks IS NULL OR ad_spend_kopeks >= 0',
+            name='ck_advertising_campaigns_ad_spend_nonnegative',
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=False)
@@ -4407,6 +4413,8 @@ class AdvertisingCampaign(Base):
     bonus_type = Column(String(20), nullable=False)
 
     balance_bonus_kopeks = Column(Integer, default=0)
+    # Фактический расход на рекламу. NULL означает «неизвестен», 0 — осознанно без расхода.
+    ad_spend_kopeks = Column(BigInteger, nullable=True)
 
     subscription_duration_days = Column(Integer, nullable=True)
     subscription_traffic_gb = Column(Integer, nullable=True)
