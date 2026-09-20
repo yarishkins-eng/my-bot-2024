@@ -104,6 +104,7 @@ class _Seed:
         status: str = 'active',
         created_at: str = DAY_BEFORE,
         test_account_enabled: bool | None = None,
+        email_only: bool = False,
     ) -> int:
         self._next_user += 1
         self.s.execute(
@@ -113,7 +114,7 @@ class _Seed:
             ),
             {
                 'id': self._next_user,
-                'tg': telegram_id or self._next_user * 10,
+                'tg': None if email_only else (telegram_id or self._next_user * 10),
                 'st': status,
                 'te': test_account_enabled,
                 'c': created_at,
@@ -509,3 +510,52 @@ async def test_zero_amount_ledger_rows_are_not_sales() -> None:
     text_ = await _render(session)
 
     assert '• Купили: <b>0</b> на <b>0 ₽</b>' in text_
+
+
+@pytest.mark.asyncio
+async def test_email_only_client_is_a_person_in_every_number() -> None:
+    """🔴 Мутационный скептик: без `telegram_id IS NULL` в предикате email-клиент (кабинетный вход) выпадал бы
+    из всех чисел молча — `NULL NOT IN (...)` в SQL ни истина, ни ложь."""
+    session = _schema()
+    seed = _Seed(session)
+    client = seed.user(email_only=True, created_at=IN_DAY)
+    seed.tx(client, 'provider_receipt', 14900, method='platega', description='Оплата картой')
+    seed.tx(client, 'subscription_payment', -14900, method='platega', description='Оплата подписки картой: 1 месяц')
+    seed.event(client, 'purchase', '{"was_trial_conversion": false, "purchase_type": "first_purchase"}')
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert '• Купили: <b>1</b> на <b>149 ₽</b> — после пробного 0 · продления 0 · сразу без пробного 1' in text_
+    assert '• Открыли бота: 1 · по рекламе: 0 · взяли пробный: 0' in text_
+
+
+@pytest.mark.asyncio
+async def test_two_conversion_events_on_one_subscription_count_the_trial_once() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    buyer = seed.user()
+    rewritten = seed.subscription(buyer, tariff_id=3, is_trial=False)
+    seed.tx(buyer, 'subscription_payment', -14900, method='balance', description='Оплата подписки с баланса: 1 месяц')
+    seed.event(buyer, 'purchase', '{"was_trial_conversion": true}', subscription_id=rewritten)
+    seed.event(buyer, 'purchase', '{"was_trial_conversion": true}', subscription_id=rewritten)  # повтор записи
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 1' in text_
+
+
+@pytest.mark.asyncio
+async def test_more_marks_than_sales_is_named_with_a_positive_number() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    buyer = seed.user()
+    seed.tx(buyer, 'subscription_payment', -14900, method='balance', description='Оплата подписки с баланса: 1 месяц')
+    seed.event(buyer, 'purchase', '{"was_trial_conversion": true}')
+    seed.event(buyer, 'renewal', None)  # событие без проводки — лишняя пометка
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert '— после пробного 1 · продления 1 · сразу без пробного 0 (пометок больше, чем продаж: 1)' in text_
