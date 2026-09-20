@@ -320,15 +320,15 @@ async def test_owner_report_for_a_live_day_is_eight_honest_lines() -> None:
         '📊 <b>Отчёт за 18.09.2026</b>',
         '',
         '💎 <b>Продажи</b>',
-        '• Купили: <b>4</b> на <b>596 ₽</b> — после пробного 1 · продления 1 · новые 2',
+        '• Купили: <b>4</b> на <b>596 ₽</b> — после пробного 1 · продления 1 · сразу без пробного 2',
         '• Докупили устройств и трафика: 1 на 42 ₽',
-        '• Пришло денег: <b>558 ₽</b> (пополнений 1 · прямых оплат картой 2)',
-        '',
-        '🚪 <b>За день</b>',
-        '• Открыли бота: 3 · взяли пробный: 2 · по рекламе: 3 (кувалда 2.0 8000 — 2, teplo11 — 1)',
+        '• Пришло живых денег: <b>558 ₽</b> (пополнений баланса 1 · оплат сразу за подписку 2)',
         '',
         '📌 <b>Сейчас</b>',
         '• Платят: <b>59</b> · на пробном: <b>46</b>',
+        '',
+        '🚪 <b>За день</b>',
+        '• Открыли бота: 3 · по рекламе: 3 (кувалда 2.0 8000 — 2, teplo11 — 1) · взяли пробный: 2',
         '',
         '🎟 Поддержка: 1 новых · 4 открытых',
     ]
@@ -342,6 +342,8 @@ async def test_owner_report_never_prints_the_lines_the_owner_removed() -> None:
     text_ = await _render(session)
 
     for forbidden in (
+        ' новые ',  # решение 20.09: «сразу без пробного»
+        'прямых оплат',  # решение 20.09: «оплат сразу за подписку»
         'Конверси',
         'рефералам',
         'серверов',
@@ -366,8 +368,8 @@ async def test_direct_card_sale_counts_as_money_in_and_as_one_sale() -> None:
 
     text_ = await _render(session)
 
-    assert '• Купили: <b>1</b> на <b>1090 ₽</b> — после пробного 0 · продления 0 · новые 1' in text_
-    assert '• Пришло денег: <b>1090 ₽</b> (пополнений 0 · прямых оплат картой 1)' in text_
+    assert '• Купили: <b>1</b> на <b>1090 ₽</b> — после пробного 0 · продления 0 · сразу без пробного 1' in text_
+    assert '• Пришло живых денег: <b>1090 ₽</b> (пополнений баланса 0 · оплат сразу за подписку 1)' in text_
 
 
 @pytest.mark.asyncio
@@ -383,7 +385,9 @@ async def test_split_that_does_not_match_the_ledger_says_so() -> None:
 
     text_ = await _render(session)
 
-    assert '• Купили: <b>2</b> на <b>298 ₽</b> — после пробного 1 · продления 0 · новые 0 · без пометки 1' in text_
+    assert (
+        '• Купили: <b>2</b> на <b>298 ₽</b> — после пробного 1 · продления 0 · сразу без пробного 0 · без пометки 1'
+    ) in text_
 
 
 @pytest.mark.asyncio
@@ -399,7 +403,7 @@ async def test_purchase_event_without_a_type_mark_is_unmarked_not_new() -> None:
 
     text_ = await _render(session)
 
-    assert '— после пробного 0 · продления 0 · новые 0 · без пометки 1' in text_
+    assert '— после пробного 0 · продления 0 · сразу без пробного 0 · без пометки 1' in text_
 
 
 @pytest.mark.asyncio
@@ -413,7 +417,7 @@ async def test_legacy_renewal_event_from_the_bot_path_is_a_renewal() -> None:
 
     text_ = await _render(session)
 
-    assert '— после пробного 0 · продления 1 · новые 0' in text_
+    assert '— после пробного 0 · продления 1 · сразу без пробного 0' in text_
 
 
 @pytest.mark.asyncio
@@ -439,7 +443,7 @@ async def test_campaign_name_is_escaped_for_telegram_html() -> None:
 
     text_ = await _render(session)
 
-    assert 'по рекламе: 1 (A&amp;B &lt;test&gt; — 1)' in text_
+    assert 'по рекламе: 1 (A&amp;B &lt;test&gt;)' in text_  # одна кампания — число не повторяется
 
 
 @pytest.mark.asyncio
@@ -470,7 +474,7 @@ async def test_trial_taken_and_bought_the_same_day_still_counts_as_taken() -> No
 
     text_ = await _render(session)
 
-    assert '• Открыли бота: 0 · взяли пробный: 1 · по рекламе: 0' in text_
+    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 1' in text_
 
 
 @pytest.mark.asyncio
@@ -490,8 +494,8 @@ async def test_stand_flagged_in_the_database_is_invisible_like_in_the_cabinet() 
     text_ = await _render(session)
 
     assert '• Купили: <b>0</b> на <b>0 ₽</b>' in text_
-    assert '• Пришло денег: <b>100 ₽</b> (пополнений 1 · прямых оплат картой 0)' in text_
-    assert '• Открыли бота: 1 · взяли пробный: 0 · по рекламе: 0' in text_
+    assert '• Пришло живых денег: <b>100 ₽</b> (пополнений баланса 1 · оплат сразу за подписку 0)' in text_
+    assert '• Открыли бота: 1 · по рекламе: 0 · взяли пробный: 0' in text_
 
 
 @pytest.mark.asyncio

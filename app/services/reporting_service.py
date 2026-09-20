@@ -256,9 +256,11 @@ class ReportingService:
             else f'📊 <b>Отчёт за период {period_range.label}</b>'
         )
         split_total = stats['sales_after_trial'] + stats['sales_renewals'] + stats['sales_new']
+        # Формулировки — решения владельца 20.09.2026 (записка ОТЧ-7, вопросы после волны 1):
+        # «сразу без пробного» вместо «новые», «без пометки N» четвёртым членом, «живых денег».
         split = (
             f'после пробного {stats["sales_after_trial"]} · продления {stats["sales_renewals"]}'
-            f' · новые {stats["sales_new"]}'
+            f' · сразу без пробного {stats["sales_new"]}'
         )
         unmarked = stats['sales_count'] - split_total
         if unmarked > 0:
@@ -268,12 +270,14 @@ class ReportingService:
             split += f' · без пометки {unmarked}'
         elif unmarked < 0:
             split += f' (пометок больше, чем продаж: {-unmarked})'
-        campaigns = ', '.join(
-            f'{escape(name, quote=False)} — {count}' for name, count in stats['campaign_registrations']
-        )
+        registrations = stats['campaign_registrations']
         campaign_line = f'по рекламе: {stats["campaign_registrations_total"]}'
-        if campaigns:
-            campaign_line += f' ({campaigns})'
+        if len(registrations) == 1:
+            campaign_line += f' ({escape(registrations[0][0], quote=False)})'  # одна кампания — число не повторяем
+        elif registrations:
+            campaign_line += (
+                ' (' + ', '.join(f'{escape(name, quote=False)} — {count}' for name, count in registrations) + ')'
+            )
 
         lines = [
             header,
@@ -285,15 +289,15 @@ class ReportingService:
             ),
             f'• Докупили устройств и трафика: {stats["addons_count"]} на {self._format_amount(stats["addons_amount"])}',
             (
-                f'• Пришло денег: <b>{self._format_amount(stats["money_in_amount"])}</b>'
-                f' (пополнений {stats["deposits_count"]} · прямых оплат картой {stats["receipts_count"]})'
+                f'• Пришло живых денег: <b>{self._format_amount(stats["money_in_amount"])}</b>'
+                f' (пополнений баланса {stats["deposits_count"]} · оплат сразу за подписку {stats["receipts_count"]})'
             ),
-            '',
-            '🚪 <b>За день</b>' if period == ReportPeriod.DAILY else '🚪 <b>За период</b>',
-            f'• Открыли бота: {stats["new_users"]} · взяли пробный: {stats["new_trials"]} · {campaign_line}',
             '',
             '📌 <b>Сейчас</b>',
             f'• Платят: <b>{totals["paying"]}</b> · на пробном: <b>{totals["on_trial"]}</b>',
+            '',
+            '🚪 <b>За день</b>' if period == ReportPeriod.DAILY else '🚪 <b>За период</b>',
+            f'• Открыли бота: {stats["new_users"]} · {campaign_line} · взяли пробный: {stats["new_trials"]}',
             '',
             f'🎟 Поддержка: {stats["new_tickets"]} новых · {totals["open_tickets"]} открытых',
         ]
