@@ -234,6 +234,8 @@ def _seed_owner_day(seed: _Seed) -> None:
     stand = seed.user(telegram_id=STAND_TELEGRAM_ID, created_at=IN_DAY)
     seed.tx(stand, 'subscription_payment', -27400, method='balance', description='Оплата подписки с баланса: 1 месяц')
     seed.event(stand, 'purchase', '{"was_trial_conversion": true}')
+    # …но настоящие деньги стенда — в выписке Platega, и в «пришло живых денег» они есть (решение 20.09)
+    seed.tx(stand, 'provider_receipt', 14900, method='platega', description='Оплата картой')
     flagged_stand = seed.user(test_account_enabled=True, created_at=IN_DAY)
     seed.tx(flagged_stand, 'deposit', 26000, method='platega', description='Пополнение через Platega')
     seed.subscription(flagged_stand, tariff_id=5, is_trial=True)
@@ -336,7 +338,8 @@ async def test_owner_report_for_a_live_day_is_eight_honest_lines() -> None:
         '💎 <b>Продажи</b>',
         '• Купили: <b>5</b> на <b>745 ₽</b> — после пробного 2 · продления 1 · сразу без пробного 2',
         '• Докупили устройств и трафика: 1 на 42 ₽',
-        '• Пришло живых денег: <b>658 ₽</b> (пополнений баланса 2 · оплат сразу за подписку 2)',
+        # как в выписке: + стенд по галке (260), + стенд из .env (149), + удалённый (1090)
+        '• Пришло живых денег: <b>2157 ₽</b> (пополнений баланса 3 · оплат сразу за подписку 4)',
         '',
         '📌 <b>Сейчас</b>',
         '• Платят: <b>59</b> · на пробном: <b>46</b>',
@@ -508,7 +511,8 @@ async def test_stand_flagged_in_the_database_is_invisible_like_in_the_cabinet() 
     text_ = await _render(session)
 
     assert '• Купили: <b>0</b> на <b>0 ₽</b>' in text_
-    assert '• Пришло живых денег: <b>100 ₽</b> (пополнений баланса 1 · оплат сразу за подписку 0)' in text_
+    # деньги стенда — настоящие, как в выписке (решение владельца 20.09): 149 + 100
+    assert '• Пришло живых денег: <b>249 ₽</b> (пополнений баланса 1 · оплат сразу за подписку 1)' in text_
     assert '• Открыли бота: 1 · по рекламе: 0 · взяли пробный: 0' in text_
 
 
@@ -572,3 +576,39 @@ async def test_more_marks_than_sales_is_named_with_a_positive_number() -> None:
     text_ = await _render(session)
 
     assert '— после пробного 1 · продления 1 · сразу без пробного 0 (пометок больше, чем продаж: 1)' in text_
+
+
+@pytest.mark.asyncio
+async def test_tariff_switch_mark_is_not_a_sale_without_a_trial() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    buyer = seed.user()
+    seed.tx(buyer, 'subscription_payment', -14900, method='balance', description='Смена тарифа')
+    seed.event(buyer, 'purchase', '{"was_trial_conversion": false, "purchase_type": "tariff_switch"}')
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert '— после пробного 0 · продления 0 · сразу без пробного 0 · без пометки 1' in text_
+
+
+def test_next_run_after_an_early_wakeup_is_tomorrow_not_the_same_minute() -> None:
+    """Проснулись на миллисекунду раньше 06:00 и уже отправили письмо за 20.09 — следующий запуск
+    обязан быть завтра, иначе то же письмо уйдёт дважды (критик полноты ОТЧ-7)."""
+    from datetime import UTC, time as datetime_time
+    from zoneinfo import ZoneInfo
+
+    msk = ZoneInfo('Europe/Moscow')
+
+    class _EarlyClock(module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            moment = module.datetime(2026, 9, 21, 5, 59, 59, 999000, tzinfo=msk)
+            return moment.astimezone(tz) if tz else moment.replace(tzinfo=None)
+
+    sent_run = module.datetime(2026, 9, 21, 6, 0, tzinfo=msk).astimezone(UTC)
+    with patch.object(module, 'datetime', _EarlyClock):
+        next_run, report_date = ReportingService()._next_run_after(sent_run, datetime_time(6, 0))
+
+    assert report_date == date(2026, 9, 21)
+    assert next_run == module.datetime(2026, 9, 22, 6, 0, tzinfo=msk).astimezone(UTC)

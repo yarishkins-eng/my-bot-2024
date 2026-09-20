@@ -134,13 +134,22 @@ class ReportingService:
                 except Exception as exc:
                     logger.error('Ошибка автоматической отправки отчета', exc=exc)
 
-                next_run_utc, report_date = self._calculate_next_run(send_time)
+                next_run_utc, report_date = self._next_run_after(next_run_utc, send_time)
 
         except asyncio.CancelledError:
             logger.info('Сервис отчетов остановлен')
             raise
         except Exception as exc:
             logger.error('Критическая ошибка в сервисе отчетов', exc=exc)
+
+    def _next_run_after(self, sent_run_utc: datetime, send_time: datetime_time) -> tuple[datetime, date]:
+        # Проснулись на миллисекунду раньше срока — `_calculate_next_run` вернул бы ту же минуту,
+        # и то же письмо ушло бы дважды
+        next_run_utc, report_date = self._calculate_next_run(send_time)
+        if next_run_utc <= sent_run_utc:
+            next_run_utc += timedelta(days=1)
+            report_date += timedelta(days=1)
+        return next_run_utc, report_date
 
     def _calculate_next_run(
         self,
@@ -361,7 +370,9 @@ class ReportingService:
         # «Человек, а не стенд и не удалённый» — тот же предикат, что у плиток кабинета (галка в базе + `.env`)
         person = operational_person_clause()
 
-        def money(*conditions):
+        def money(*conditions, everyone: bool = False):
+            # `everyone=True` — деньги считаем как в выписке платёжной системы, включая стенды и удалённых:
+            # решение владельца 20.09.2026 («Пришло живых денег» = Platega). Люди и продажи — без стендов.
             return (
                 select(func.count(Transaction.id), func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0))
                 .join(User, User.id == Transaction.user_id)
@@ -371,7 +382,7 @@ class ReportingService:
                     Transaction.amount_kopeks != 0,
                     Transaction.created_at >= start_utc,
                     Transaction.created_at < end_utc,
-                    person,
+                    true() if everyone else person,
                     *conditions,
                 )
             )
@@ -393,10 +404,12 @@ class ReportingService:
             self._exclude_referral_deposits_condition(),
         )
         deposits_count, deposits_amount = (
-            await session.execute(money(Transaction.type == TransactionType.DEPOSIT.value, *real_money))
+            await session.execute(money(Transaction.type == TransactionType.DEPOSIT.value, *real_money, everyone=True))
         ).one()
         receipts_count, receipts_amount = (
-            await session.execute(money(Transaction.type == TransactionType.PROVIDER_RECEIPT.value, *real_money))
+            await session.execute(
+                money(Transaction.type == TransactionType.PROVIDER_RECEIPT.value, *real_money, everyone=True)
+            )
         ).one()
 
         # Разбивка продаж — по тем же признакам, по которым названы карточки в теме «Продажи»:
@@ -421,8 +434,9 @@ class ReportingService:
                 after_trial += 1
             elif event_type == 'renewal' or extra.get('purchase_type') == 'renewal':
                 renewals += 1
-            elif extra.get('purchase_type'):
-                # явная пометка «первая покупка» — только она делает продажу «новой»
+            elif extra.get('purchase_type') == 'first_purchase':
+                # только явная пометка «первая покупка» делает продажу «сразу без пробного»; смена тарифа
+                # (`tariff_switch`, путь заперт — мина BX) и любая другая пометка идут в «без пометки»
                 new_sales += 1
             # событие без `purchase_type` (записано до РК-3 20.09.2026) — не «новое», а «без пометки»:
             # у карточки такого события «Продление» решалось по флагу, письму это неизвестно
@@ -547,7 +561,8 @@ class ReportingService:
         return f'{start_date.strftime("%d.%m.%Y")} - {end_date.strftime("%d.%m.%Y")}'
 
     def _format_amount(self, amount_kopeks: int) -> str:
-        # Как в карточках владельца: целые рубли — целыми, копейки — только если они есть.
+        # Как в карточках владельца: `format_price` с настройкой округления (на боевом копейки округляются
+        # до рубля: 41.66 → «42 ₽»), чтобы письмо и карточки называли одну сумму одинаково.
         return settings.format_price(int(amount_kopeks or 0))
 
 
