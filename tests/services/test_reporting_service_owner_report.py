@@ -29,6 +29,7 @@ STAND_TELEGRAM_ID = 777
 # 18.09.2026 по МСК = [2026-09-17 21:00, 2026-09-18 21:00) UTC — как считает `_get_period_range`
 IN_DAY = '2026-09-18 12:00:00'
 DAY_BEFORE = '2026-09-17 12:00:00'
+DAY_AFTER = '2026-09-19 12:00:00'
 
 
 class _AsyncOverSync:
@@ -199,6 +200,15 @@ def _seed_owner_day(seed: _Seed) -> None:
         created_at=DAY_BEFORE,
     )
     seed.event(after_trial, 'renewal', None, occurred_at=DAY_BEFORE)
+    # …и завтра: верхняя граница периода строгая, следующий день в письмо не попадает
+    tomorrow = seed.user(created_at=DAY_AFTER)
+    seed.tx(tomorrow, 'provider_receipt', 14900, method='platega', description='Оплата картой', created_at=DAY_AFTER)
+    seed.tx(
+        tomorrow, 'subscription_payment', -14900, method='platega', description='Оплата подписки', created_at=DAY_AFTER
+    )
+    seed.event(tomorrow, 'purchase', '{"was_trial_conversion": false}', occurred_at=DAY_AFTER)
+    seed.subscription(tomorrow, tariff_id=5, is_trial=True, created_at=DAY_AFTER)
+    seed.ticket('open', created_at=DAY_AFTER)
     # За день: два новичка (третий — стенд выше), пробные: настоящий, перекрашенный Team, брошенный
     newcomer_a = seed.user(created_at=IN_DAY)
     newcomer_b = seed.user(created_at=IN_DAY)
@@ -253,7 +263,7 @@ async def test_owner_report_for_a_live_day_is_eight_honest_lines() -> None:
         '📌 <b>Сейчас</b>',
         '• Платят: <b>59</b> · на пробном: <b>46</b>',
         '',
-        '🎟 Поддержка: 1 новых · 2 открытых',
+        '🎟 Поддержка: 1 новых · 3 открытых',
     ]
 
 
