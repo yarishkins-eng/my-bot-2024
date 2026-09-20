@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.cabinet.routes import admin_users
+from app.utils import user_utils  # ОТЧ-7: определение переехало сюда, патчить надо там, где его читают
 
 
 def _scalar_result(value: int) -> SimpleNamespace:
@@ -29,14 +30,14 @@ async def test_truthful_cards_use_canonical_trial_and_real_payment_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', '7454290913,7749231125')
-    monkeypatch.setattr(admin_users, 'get_trial_tariff', AsyncMock(return_value=_tariff(5, trial=True)))
+    monkeypatch.setattr(user_utils, 'get_trial_tariff', AsyncMock(return_value=_tariff(5, trial=True)))
     monkeypatch.setattr(
-        admin_users,
+        user_utils,
         'get_all_tariffs',
         AsyncMock(return_value=[_tariff(3), _tariff(4, free=True), _tariff(5, trial=True)]),
     )
     real_payment_ids = AsyncMock(return_value={11, 12})
-    monkeypatch.setattr(admin_users, 'real_payment_user_ids', real_payment_ids)
+    monkeypatch.setattr(user_utils, 'real_payment_user_ids', real_payment_ids)
     db = AsyncMock()
     db.execute.side_effect = [_scalar_result(21), _scalars_result([11, 12, 13])]
 
@@ -65,10 +66,10 @@ async def test_truthful_cards_use_canonical_trial_and_real_payment_candidates(
 @pytest.mark.asyncio
 async def test_missing_trial_tariff_skips_only_the_trial_query(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', '')
-    monkeypatch.setattr(admin_users, 'get_trial_tariff', AsyncMock(return_value=None))
-    monkeypatch.setattr(admin_users, 'get_all_tariffs', AsyncMock(return_value=[]))
+    monkeypatch.setattr(user_utils, 'get_trial_tariff', AsyncMock(return_value=None))
+    monkeypatch.setattr(user_utils, 'get_all_tariffs', AsyncMock(return_value=[]))
     real_payment_ids = AsyncMock(return_value={7})
-    monkeypatch.setattr(admin_users, 'real_payment_user_ids', real_payment_ids)
+    monkeypatch.setattr(user_utils, 'real_payment_user_ids', real_payment_ids)
     db = AsyncMock()
     db.execute.return_value = _scalars_result([7])
 
@@ -82,10 +83,10 @@ async def test_missing_trial_tariff_skips_only_the_trial_query(monkeypatch: pyte
 @pytest.mark.asyncio
 async def test_no_paying_candidates_skips_payment_ledger_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv('TEST_ACCOUNT_TELEGRAM_IDS', '')
-    monkeypatch.setattr(admin_users, 'get_trial_tariff', AsyncMock(return_value=_tariff(5, trial=True)))
-    monkeypatch.setattr(admin_users, 'get_all_tariffs', AsyncMock(return_value=[]))
+    monkeypatch.setattr(user_utils, 'get_trial_tariff', AsyncMock(return_value=_tariff(5, trial=True)))
+    monkeypatch.setattr(user_utils, 'get_all_tariffs', AsyncMock(return_value=[]))
     real_payment_ids = AsyncMock()
-    monkeypatch.setattr(admin_users, 'real_payment_user_ids', real_payment_ids)
+    monkeypatch.setattr(user_utils, 'real_payment_user_ids', real_payment_ids)
     db = AsyncMock()
     db.execute.side_effect = [_scalar_result(0), _scalars_result([])]
 
