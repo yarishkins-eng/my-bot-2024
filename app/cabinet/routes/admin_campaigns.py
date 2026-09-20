@@ -33,11 +33,9 @@ from app.services.campaign_service import (
     get_campaign_analytics,
     get_campaign_performance,
 )
-from app.services.partner_stats_service import PartnerStatsService
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.campaigns import (
-    AdminCampaignChartDataResponse,
     AvailablePartnerItem,
     CampaignAnalyticsV2Response,
     CampaignCreateRequest,
@@ -265,33 +263,6 @@ async def get_campaign(
         deep_link=get_campaign_deep_link(campaign.start_parameter),
         web_link=get_campaign_web_link(campaign.start_parameter),
     )
-
-
-@router.get('/{campaign_id}/chart-data', response_model=AdminCampaignChartDataResponse)
-async def get_campaign_chart_data(
-    campaign_id: int,
-    admin: User = Depends(require_permission('campaigns:stats')),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Get chart data for admin campaign analytics."""
-    try:
-        campaign = await get_campaign_by_id(db, campaign_id)
-        if not campaign:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail='Campaign not found',
-            )
-
-        data = await PartnerStatsService.get_admin_campaign_chart_data(db, campaign_id)
-        return AdminCampaignChartDataResponse(**data)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error('Failed to get campaign chart data', error=str(e), campaign_id=campaign_id, exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Failed to load campaign chart data',
-        )
 
 
 @router.get('/{campaign_id}/analytics-v2', response_model=CampaignAnalyticsV2Response)
