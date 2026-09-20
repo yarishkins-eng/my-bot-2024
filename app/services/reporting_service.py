@@ -333,14 +333,17 @@ class ReportingService:
     async def _collect_current_totals(self, session) -> dict:
         people = await count_trial_and_paying_users(session)
         open_tickets_result = await session.execute(
-            select(func.count(Ticket.id)).where(
+            select(func.count(Ticket.id))
+            .join(User, User.id == Ticket.user_id)
+            .where(
+                operational_person_clause(),  # тикет стенда — не открытый тикет клиента
                 Ticket.status.in_(
                     [
                         TicketStatus.OPEN.value,
                         TicketStatus.ANSWERED.value,
                         TicketStatus.PENDING.value,
                     ]
-                )
+                ),
             )
         )
         return {

@@ -101,7 +101,7 @@ class _Seed:
         self,
         *,
         telegram_id: int | None = None,
-        status: str = 'active',
+        status: str | None = 'active',
         created_at: str = DAY_BEFORE,
         test_account_enabled: bool | None = None,
         email_only: bool = False,
@@ -251,6 +251,19 @@ def _seed_owner_day(seed: _Seed) -> None:
         created_at=DAY_BEFORE,
     )
     seed.event(after_trial, 'renewal', None, occurred_at=DAY_BEFORE)
+    # Человек без статуса (легаси-строки) — человек; пробный, взятый ВЧЕРА и купленный сегодня, — не «взяли сегодня»
+    legacy = seed.user(status=None, created_at=IN_DAY)
+    seed.tx(legacy, 'deposit', 10000, method='platega', description='Пополнение через Platega')
+    yesterday_trial = seed.user()
+    old_row = seed.subscription(yesterday_trial, tariff_id=3, is_trial=False, created_at=DAY_BEFORE)
+    seed.tx(
+        yesterday_trial,
+        'subscription_payment',
+        -14900,
+        method='balance',
+        description='Оплата подписки с баланса: 1 месяц',
+    )
+    seed.event(yesterday_trial, 'purchase', '{"was_trial_conversion": true}', subscription_id=old_row)
     # Границы суток считаются по МСК, а не по UTC: час ночи 18.09 МСК — внутри, полпервого 19.09 — снаружи
     edge_in = seed.user(created_at=EDGE_INSIDE)
     seed.tx(edge_in, 'provider_receipt', 14900, method='platega', description='Оплата картой', created_at=EDGE_INSIDE)
@@ -293,7 +306,7 @@ def _seed_owner_day(seed: _Seed) -> None:
     seed.ticket('open', user_id=topup)
     seed.ticket('answered', user_id=direct, created_at=DAY_BEFORE)
     seed.ticket('closed', user_id=direct, created_at=DAY_BEFORE)
-    seed.ticket('open', user_id=stand)  # тикет стенда — не «новый», но открытых «сейчас» считает как есть
+    seed.ticket('open', user_id=stand)  # тикет стенда — ни «новый», ни «открытый»
     seed.s.commit()
 
 
@@ -321,17 +334,17 @@ async def test_owner_report_for_a_live_day_is_eight_honest_lines() -> None:
         '📊 <b>Отчёт за 18.09.2026</b>',
         '',
         '💎 <b>Продажи</b>',
-        '• Купили: <b>4</b> на <b>596 ₽</b> — после пробного 1 · продления 1 · сразу без пробного 2',
+        '• Купили: <b>5</b> на <b>745 ₽</b> — после пробного 2 · продления 1 · сразу без пробного 2',
         '• Докупили устройств и трафика: 1 на 42 ₽',
-        '• Пришло живых денег: <b>558 ₽</b> (пополнений баланса 1 · оплат сразу за подписку 2)',
+        '• Пришло живых денег: <b>658 ₽</b> (пополнений баланса 2 · оплат сразу за подписку 2)',
         '',
         '📌 <b>Сейчас</b>',
         '• Платят: <b>59</b> · на пробном: <b>46</b>',
         '',
         '🚪 <b>За день</b>',
-        '• Открыли бота: 3 · по рекламе: 3 (кувалда 2.0 8000 — 2, teplo11 — 1) · взяли пробный: 2',
+        '• Открыли бота: 4 · по рекламе: 3 (кувалда 2.0 8000 — 2, teplo11 — 1) · взяли пробный: 2',
         '',
-        '🎟 Поддержка: 1 новых · 4 открытых',
+        '🎟 Поддержка: 1 новых · 3 открытых',
     ]
 
 
