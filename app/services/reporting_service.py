@@ -12,7 +12,7 @@ from sqlalchemy import func, not_, or_, select
 from sqlalchemy.sql import true
 
 from app.config import settings
-from app.database.crud.tariff import get_trial_tariff
+from app.database.crud.tariff import get_all_tariffs, get_trial_tariff
 from app.database.crud.transaction import REAL_PAYMENT_METHODS, addon_description_clause
 from app.database.database import AsyncSessionLocal
 from app.database.models import (
@@ -258,6 +258,7 @@ class ReportingService:
         async with AsyncSessionLocal() as session:
             stats = await self._collect_period_stats(session, start_utc, end_utc)
             totals = await self._collect_current_totals(session)
+            losses = await self._collect_loss_stats(session, start_utc, end_utc)
 
         header = (
             f'📊 <b>Отчёт за {period_range.label}</b>'
@@ -288,6 +289,9 @@ class ReportingService:
                 ' (' + ', '.join(f'{escape(name, quote=False)} — {count}' for name, count in registrations) + ')'
             )
 
+        def panel(value: int | None) -> str:
+            return 'панель не ответила' if value is None else str(value)
+
         lines = [
             header,
             '',
@@ -307,6 +311,14 @@ class ReportingService:
             '',
             '🚪 <b>За день</b>' if period == ReportPeriod.DAILY else '🚪 <b>За период</b>',
             f'• Открыли бота: {stats["new_users"]} · {campaign_line} · взяли пробный: {stats["new_trials"]}',
+            '',
+            # Четыре строки потерь — решение владельца 24.09.2026 (ВК-0, ОТЧ-8); «панель не ответила» вместо
+            # числа, когда RemnaWave не отдала первые подключения: ноль здесь был бы ложью
+            '📉 <b>Потери за вчера</b>' if period == ReportPeriod.DAILY else '📉 <b>Потери за период</b>',
+            f'• Взяли пробный: {losses["trials"]}, подключились к VPN: {panel(losses["connected"])}',
+            f'• Не подключились за сутки после пробного: {panel(losses["not_connected_after_day"])}',
+            f'• Платная подписка закончилась и не продлена: {losses["paid_expired"]}',
+            f'• Пополнили баланс и ничего не купили: {losses["topped_up_idle"]}',
             '',
             f'🎟 Поддержка: {stats["new_tickets"]} новых · {totals["open_tickets"]} открытых',
         ]
@@ -454,50 +466,9 @@ class ReportingService:
             or 0
         )
 
-        # «Взяли пробный» — только канонический пробный тариф: метка `is_trial` стоит и на
-        # перекрашенных Team (ОТЧ-4); брошенное оформление (`pending`) — не пробный.
+        # «Взяли пробный» — одно определение с блоком «Потери» (`_trial_taker_rows`)
         trial_tariff = await get_trial_tariff(session)
-        trial_conditions = [
-            Subscription.created_at >= start_utc,
-            Subscription.created_at < end_utc,
-            Subscription.is_trial.is_(True),
-            Subscription.status != SubscriptionStatus.PENDING.value,
-            person,
-        ]
-        if trial_tariff is not None:
-            trial_conditions.append(Subscription.tariff_id == trial_tariff.id)
-        still_trial = int(
-            (
-                await session.execute(
-                    select(func.count(Subscription.id))
-                    .join(User, User.id == Subscription.user_id)
-                    .where(*trial_conditions)
-                )
-            ).scalar()
-            or 0
-        )
-        # 🔴 Покупка после пробного ПЕРЕПИСЫВАЕТ ту же строку (`is_trial` → False, тариф → платный), и
-        # взявший пробный выпадал из «взяли пробный» в тот же день, когда письмо считало его «после
-        # пробного» (замер 19.09: 44 вместо 47). Добираем по событию покупки с признаком конверсии у
-        # подписки, заведённой в окне. Признак читаем в Python: `extra` — JSON.
-        converted_rows = (
-            await session.execute(
-                select(SubscriptionEvent.subscription_id, SubscriptionEvent.extra)
-                .join(Subscription, Subscription.id == SubscriptionEvent.subscription_id)
-                .join(User, User.id == Subscription.user_id)
-                .where(
-                    SubscriptionEvent.event_type == 'purchase',
-                    Subscription.created_at >= start_utc,
-                    Subscription.created_at < end_utc,
-                    Subscription.is_trial.is_not(True),
-                    person,
-                )
-            )
-        ).all()
-        converted_in_window = {
-            subscription_id for subscription_id, extra in converted_rows if (extra or {}).get('was_trial_conversion')
-        }
-        new_trials = still_trial + len(converted_in_window)
+        new_trials = len(await self._trial_taker_rows(session, start_utc, end_utc, trial_tariff))
 
         # По рекламе — регистрации (не переходы: их отправка снята 19.09), по имени кампании.
         campaign_rows = (
@@ -548,6 +519,145 @@ class ReportingService:
             'campaign_registrations': campaign_registrations,
             'campaign_registrations_total': sum(count for _, count in campaign_registrations),
             'new_tickets': new_tickets,
+        }
+
+    async def _trial_taker_rows(
+        self, session, start_utc: datetime, end_utc: datetime, trial_tariff
+    ) -> list[tuple[int, int]]:
+        """(id подписки, id человека) взявших пробный в окне — одно определение для «За день» и «Потерь».
+
+        Только канонический пробный тариф: метка `is_trial` стоит и на перекрашенных Team (ОТЧ-4);
+        брошенное оформление (`pending`) — не пробный. 🔴 Покупка после пробного ПЕРЕПИСЫВАЕТ ту же
+        строку (`is_trial` → False, тариф → платный), и взявший пробный выпадал в тот же день, когда письмо
+        считало его «после пробного» (замер 19.09: 44 вместо 47). Добираем по событию покупки с признаком
+        конверсии у подписки, заведённой в окне. Признак читаем в Python: `extra` — JSON.
+        """
+        person = operational_person_clause()
+        in_window = (Subscription.created_at >= start_utc, Subscription.created_at < end_utc, person)
+        still_trial = [Subscription.is_trial.is_(True), Subscription.status != SubscriptionStatus.PENDING.value]
+        if trial_tariff is not None:
+            still_trial.append(Subscription.tariff_id == trial_tariff.id)
+        rows = (
+            await session.execute(
+                select(Subscription.id, Subscription.user_id)
+                .join(User, User.id == Subscription.user_id)
+                .where(*in_window, *still_trial)
+            )
+        ).all()
+        takers = {(int(sub_id), int(user_id)) for sub_id, user_id in rows}
+        converted = (
+            await session.execute(
+                select(Subscription.id, Subscription.user_id, SubscriptionEvent.extra)
+                .select_from(SubscriptionEvent)
+                .join(Subscription, Subscription.id == SubscriptionEvent.subscription_id)
+                .join(User, User.id == Subscription.user_id)
+                .where(SubscriptionEvent.event_type == 'purchase', *in_window, Subscription.is_trial.is_not(True))
+            )
+        ).all()
+        takers |= {
+            (int(sub_id), int(user_id))
+            for sub_id, user_id, extra in converted
+            if (extra or {}).get('was_trial_conversion')
+        }
+        return sorted(takers)
+
+    async def _connected_panel_uuids(self) -> set[str] | None:
+        """UUID клиентов панели с первым подключением — тот же читатель, что у монитора «не подключился»
+        (`None` — панель не ответила, и это не ноль)."""
+        from app.services.monitoring_service import monitoring_service
+
+        return await monitoring_service._fetch_connected_panel_uuids()
+
+    async def _collect_loss_stats(self, session, start_utc: datetime, end_utc: datetime) -> dict:
+        """Блок «Потери» — четыре строки по решению владельца 24.09.2026 (ВК-0, ОТЧ-8).
+
+        Люди — как во всём письме (`operational_person_clause`); пробный — как «взяли пробный»; платный
+        тариф — как у плиток кабинета (не бесплатный и не пробный); «подключился» — по панели RemnaWave
+        (`first_connected_at`) через `users.remnawave_uuid`. Продлённая подписка сюда не попадает: её
+        `end_date` уже в будущем. «Не купил» — после ПЕРВОГО пополнения за день ни одной покупки до письма.
+        """
+        person = operational_person_clause()
+        trial_tariff = await get_trial_tariff(session)
+        takers = {user_id for _, user_id in await self._trial_taker_rows(session, start_utc, end_utc, trial_tariff)}
+        span = end_utc - start_utc  # «за сутки» — окно раньше: к письму у всех прошло больше суток с активации
+        earlier = {
+            user_id
+            for _, user_id in await self._trial_taker_rows(session, start_utc - span, end_utc - span, trial_tariff)
+        }
+        connected = await self._connected_panel_uuids() if takers or earlier else set()
+
+        async def connected_count(user_ids: set[int]) -> int | None:
+            if connected is None:
+                return None
+            if not user_ids:
+                return 0
+            uuids = (await session.execute(select(User.remnawave_uuid).where(User.id.in_(user_ids)))).scalars().all()
+            return sum(1 for uuid in uuids if uuid in connected)
+
+        took_and_connected = await connected_count(takers)
+        earlier_connected = await connected_count(earlier)
+
+        tariffs = await get_all_tariffs(session, include_inactive=True)
+        excluded_tariff_ids = [tariff.id for tariff in tariffs if tariff.is_free or tariff.is_trial_available]
+        paid_ended = [
+            Subscription.is_trial.is_not(True),
+            Subscription.end_date >= start_utc,
+            Subscription.end_date < end_utc,
+            person,
+        ]
+        if excluded_tariff_ids:
+            paid_ended.append(or_(Subscription.tariff_id.is_(None), Subscription.tariff_id.not_in(excluded_tariff_ids)))
+        paid_expired = (
+            await session.execute(
+                select(func.count(Subscription.id)).join(User, User.id == Subscription.user_id).where(*paid_ended)
+            )
+        ).scalar()
+
+        first_topups = (
+            await session.execute(
+                select(Transaction.user_id, func.min(Transaction.created_at))
+                .join(User, User.id == Transaction.user_id)
+                .where(
+                    Transaction.type == TransactionType.DEPOSIT.value,
+                    Transaction.is_completed == true(),
+                    Transaction.amount_kopeks > 0,
+                    Transaction.created_at >= start_utc,
+                    Transaction.created_at < end_utc,
+                    Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
+                    self._exclude_referral_deposits_condition(),
+                    person,
+                )
+                .group_by(Transaction.user_id)
+            )
+        ).all()
+        last_sales: dict = {}
+        if first_topups:
+            last_sales = dict(
+                (
+                    await session.execute(
+                        select(Transaction.user_id, func.max(Transaction.created_at))
+                        .where(
+                            Transaction.user_id.in_([user_id for user_id, _ in first_topups]),
+                            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+                            Transaction.is_completed == true(),
+                            Transaction.amount_kopeks != 0,
+                            Transaction.created_at >= start_utc,
+                        )
+                        .group_by(Transaction.user_id)
+                    )
+                ).all()
+            )
+        topped_up_idle = sum(
+            1
+            for user_id, first_topup in first_topups
+            if last_sales.get(user_id) is None or last_sales[user_id] < first_topup
+        )
+        return {
+            'trials': len(takers),
+            'connected': took_and_connected,
+            'not_connected_after_day': None if earlier_connected is None else len(earlier) - earlier_connected,
+            'paid_expired': int(paid_expired or 0),
+            'topped_up_idle': topped_up_idle,
         }
 
     def _format_period_label(self, start: datetime, end: datetime) -> str:

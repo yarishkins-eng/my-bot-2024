@@ -55,7 +55,7 @@ def _schema() -> Session:
         c.execute(
             text(
                 'CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, status TEXT, '
-                'test_account_enabled BOOLEAN, created_at TIMESTAMP)'
+                'test_account_enabled BOOLEAN, remnawave_uuid TEXT, created_at TIMESTAMP)'
             )
         )
         c.execute(
@@ -68,7 +68,7 @@ def _schema() -> Session:
         c.execute(
             text(
                 'CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, user_id INTEGER, tariff_id INTEGER, '
-                'is_trial BOOLEAN, status TEXT, created_at TIMESTAMP)'
+                'is_trial BOOLEAN, status TEXT, end_date TIMESTAMP, created_at TIMESTAMP)'
             )
         )
         c.execute(
@@ -105,18 +105,20 @@ class _Seed:
         created_at: str = DAY_BEFORE,
         test_account_enabled: bool | None = None,
         email_only: bool = False,
+        remnawave_uuid: str | None = None,
     ) -> int:
         self._next_user += 1
         self.s.execute(
             text(
-                'INSERT INTO users (id, telegram_id, status, test_account_enabled, created_at) '
-                'VALUES (:id, :tg, :st, :te, :c)'
+                'INSERT INTO users (id, telegram_id, status, test_account_enabled, remnawave_uuid, created_at) '
+                'VALUES (:id, :tg, :st, :te, :uuid, :c)'
             ),
             {
                 'id': self._next_user,
                 'tg': None if email_only else (telegram_id or self._next_user * 10),
                 'st': status,
                 'te': test_account_enabled,
+                'uuid': remnawave_uuid,
                 'c': created_at,
             },
         )
@@ -159,14 +161,21 @@ class _Seed:
         )
 
     def subscription(
-        self, user_id: int, *, tariff_id: int, is_trial: bool, status: str = 'active', created_at: str = IN_DAY
+        self,
+        user_id: int,
+        *,
+        tariff_id: int | None,
+        is_trial: bool | None,
+        status: str = 'active',
+        created_at: str = IN_DAY,
+        end_date: str | None = None,
     ) -> int:
         row = self.s.execute(
             text(
-                'INSERT INTO subscriptions (user_id, tariff_id, is_trial, status, created_at) '
-                'VALUES (:u, :t, :tr, :st, :at) RETURNING id'
+                'INSERT INTO subscriptions (user_id, tariff_id, is_trial, status, end_date, created_at) '
+                'VALUES (:u, :t, :tr, :st, :end, :at) RETURNING id'
             ),
-            {'u': user_id, 't': tariff_id, 'tr': is_trial, 'st': status, 'at': created_at},
+            {'u': user_id, 't': tariff_id, 'tr': is_trial, 'st': status, 'end': end_date, 'at': created_at},
         ).scalar_one()
         self.s.commit()
         return int(row)
@@ -292,7 +301,7 @@ def _seed_owner_day(seed: _Seed) -> None:
     seed.subscription(tomorrow, tariff_id=5, is_trial=True, created_at=DAY_AFTER)
     seed.ticket('open', user_id=tomorrow, created_at=DAY_AFTER)
     # За день: два новичка (третий — стенд выше), пробные: настоящий, перекрашенный Team, брошенный
-    newcomer_a = seed.user(created_at=IN_DAY)
+    newcomer_a = seed.user(created_at=IN_DAY, remnawave_uuid='panel-a')  # подключился к панели (см. `_render`)
     newcomer_b = seed.user(created_at=IN_DAY)
     seed.subscription(newcomer_a, tariff_id=5, is_trial=True)
     seed.subscription(newcomer_b, tariff_id=5, is_trial=True, status='pending')
@@ -304,6 +313,16 @@ def _seed_owner_day(seed: _Seed) -> None:
     seed.registration(1, newcomer_b)
     seed.registration(2, after_trial)
     seed.registration(1, stand)
+    # Потери (ВК-0): платная у lapsed кончилась сегодня и не продлена; renewed продлена (срок в будущем);
+    # Team — бесплатный тариф, не клиент; у стенда — не человек. Вчерашний пробный (yesterday_trial)
+    # так и не подключился: uuid панели ему не выдан
+    lapsed = seed.user()
+    seed.subscription(lapsed, tariff_id=3, is_trial=False, status='expired', end_date=IN_DAY)
+    renewed = seed.user()
+    seed.subscription(renewed, tariff_id=3, is_trial=False, end_date=DAY_AFTER)
+    friend = seed.user()
+    seed.subscription(friend, tariff_id=4, is_trial=False, status='expired', end_date=IN_DAY)
+    seed.subscription(stand, tariff_id=3, is_trial=False, status='expired', end_date=IN_DAY)
     # Тикеты: один новый сегодня, открытых всего два (один старый)
     seed.ticket('open', user_id=topup)
     seed.ticket('answered', user_id=direct, created_at=DAY_BEFORE)
@@ -312,7 +331,21 @@ def _seed_owner_day(seed: _Seed) -> None:
     seed.s.commit()
 
 
-async def _render(session: Session, period: ReportPeriod = ReportPeriod.DAILY, *, people=None) -> str:
+TARIFFS = [
+    SimpleNamespace(id=3, is_free=False, is_trial_available=False),  # Базовый — платный
+    SimpleNamespace(id=4, is_free=True, is_trial_available=False),  # Team — бесплатный
+    SimpleNamespace(id=5, is_free=False, is_trial_available=True),  # пробный
+]
+
+
+async def _render(
+    session: Session,
+    period: ReportPeriod = ReportPeriod.DAILY,
+    *,
+    people=None,
+    connected: set[str] | None = frozenset({'panel-a'}),
+) -> str:
+    """`connected` — что ответила панель про первые подключения (`None` — не ответила)."""
     service = ReportingService()
     with (
         patch.object(module, 'AsyncSessionLocal', lambda: _AsyncOverSync(session)),
@@ -320,6 +353,8 @@ async def _render(session: Session, period: ReportPeriod = ReportPeriod.DAILY, *
             module, 'count_trial_and_paying_users', AsyncMock(return_value=people or {'paying': 59, 'on_trial': 46})
         ),
         patch.object(module, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=5))),
+        patch.object(module, 'get_all_tariffs', AsyncMock(return_value=TARIFFS)),
+        patch.object(ReportingService, '_connected_panel_uuids', AsyncMock(return_value=connected)),
         patch('app.services.user_service.test_account_telegram_ids', lambda: frozenset({STAND_TELEGRAM_ID})),
     ):
         return await service._build_report(period, date(2026, 9, 18))
@@ -346,6 +381,12 @@ async def test_owner_report_for_a_live_day_is_eight_honest_lines() -> None:
         '',
         '🚪 <b>За день</b>',
         '• Открыли бота: 4 · по рекламе: 3 (кувалда 2.0 8000 — 2, teplo11 — 1) · взяли пробный: 2',
+        '',
+        '📉 <b>Потери за вчера</b>',
+        '• Взяли пробный: 2, подключились к VPN: 1',
+        '• Не подключились за сутки после пробного: 1',
+        '• Платная подписка закончилась и не продлена: 1',
+        '• Пополнили баланс и ничего не купили: 2',
         '',
         '🎟 Поддержка: 1 новых · 3 открытых',
     ]
@@ -590,6 +631,137 @@ async def test_tariff_switch_mark_is_not_a_sale_without_a_trial() -> None:
     text_ = await _render(session)
 
     assert '— после пробного 0 · продления 0 · сразу без пробного 0 · без пометки 1' in text_
+
+
+@pytest.mark.asyncio
+async def test_losses_connected_is_counted_by_panel_uuid_and_unknown_panel_is_named() -> None:
+    """ВК-0: «подключились» — по первому подключению в панели через `users.remnawave_uuid`; когда панель
+    не ответила, письмо говорит это словами, а не нулём (ноль был бы ложью)."""
+    session = _schema()
+    seed = _Seed(session)
+    seed.subscription(seed.user(created_at=IN_DAY, remnawave_uuid='panel-1'), tariff_id=5, is_trial=True)
+    seed.subscription(seed.user(created_at=IN_DAY, remnawave_uuid='panel-2'), tariff_id=5, is_trial=True)
+    seed.subscription(seed.user(created_at=IN_DAY), tariff_id=5, is_trial=True)  # uuid не выдан: панель не знает
+    session.commit()
+
+    text_ = await _render(session, connected={'panel-1', 'panel-9'})
+    assert '• Взяли пробный: 3, подключились к VPN: 1' in text_
+    assert '• Не подключились за сутки после пробного: 0' in text_
+
+    text_ = await _render(session, connected=None)
+    assert '• Взяли пробный: 3, подключились к VPN: панель не ответила' in text_
+    assert '• Не подключились за сутки после пробного: панель не ответила' in text_
+
+
+@pytest.mark.asyncio
+async def test_not_connected_after_a_day_looks_at_the_previous_window_only() -> None:
+    """«За сутки» — взявшие пробный ОКНОМ РАНЬШЕ (позавчера для утреннего письма): у них к 06:00 прошло
+    больше суток; вчерашние ещё могут подключиться, позавчерашние-минус-день уже отчитаны."""
+    session = _schema()
+    seed = _Seed(session)
+    seed.subscription(seed.user(remnawave_uuid='y-1'), tariff_id=5, is_trial=True, created_at=DAY_BEFORE)
+    seed.subscription(seed.user(remnawave_uuid='y-2'), tariff_id=5, is_trial=True, created_at=DAY_BEFORE)
+    seed.subscription(seed.user(created_at=IN_DAY, remnawave_uuid='t-1'), tariff_id=5, is_trial=True)
+    seed.subscription(seed.user(remnawave_uuid='o-1'), tariff_id=5, is_trial=True, created_at='2026-09-16 12:00:00')
+    # вчерашний, купивший сегодня: строка переписана, но пробный он брал вчера — и так и не подключился
+    yesterday_buyer = seed.user(remnawave_uuid='y-3')
+    row = seed.subscription(yesterday_buyer, tariff_id=3, is_trial=False, created_at=DAY_BEFORE)
+    seed.event(yesterday_buyer, 'purchase', '{"was_trial_conversion": true}', subscription_id=row)
+    session.commit()
+
+    text_ = await _render(session, connected={'y-2'})
+
+    assert '• Взяли пробный: 1, подключились к VPN: 0' in text_
+    assert '• Не подключились за сутки после пробного: 2' in text_
+
+
+@pytest.mark.asyncio
+async def test_paid_expired_counts_only_lapsed_paid_tariffs_of_people() -> None:
+    """Истекла и не продлена — платный тариф (не бесплатный, не пробный, легаси без тарифа — платный), срок
+    кончился в окне по МСК и остался в прошлом: продлённая ушла в будущее, Team бесплатен, пробный не
+    подписка, перекрашенный с меткой пробного — не платный, стенд и удалённый — не люди."""
+    session = _schema()
+    seed = _Seed(session)
+    seed.subscription(seed.user(), tariff_id=3, is_trial=False, status='expired', end_date=IN_DAY)
+    seed.subscription(seed.user(), tariff_id=None, is_trial=None, status='expired', end_date=EDGE_INSIDE)
+    seed.subscription(seed.user(), tariff_id=3, is_trial=False, end_date=DAY_AFTER)  # продлена
+    seed.subscription(seed.user(), tariff_id=3, is_trial=False, status='expired', end_date=EDGE_OUTSIDE)
+    seed.subscription(seed.user(), tariff_id=4, is_trial=False, status='expired', end_date=IN_DAY)  # Team
+    seed.subscription(seed.user(), tariff_id=5, is_trial=True, status='expired', end_date=IN_DAY)  # пробный
+    seed.subscription(seed.user(), tariff_id=3, is_trial=True, status='expired', end_date=IN_DAY)  # с меткой
+    stand = seed.user(telegram_id=STAND_TELEGRAM_ID)
+    seed.subscription(stand, tariff_id=3, is_trial=False, status='expired', end_date=IN_DAY)
+    erased = seed.user(status='deleted')
+    seed.subscription(erased, tariff_id=3, is_trial=False, status='expired', end_date=IN_DAY)
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert '• Платная подписка закончилась и не продлена: 2' in text_
+
+
+@pytest.mark.asyncio
+async def test_topped_up_and_idle_means_no_purchase_after_the_first_topup_of_the_day() -> None:
+    """«Пополнил и не купил» — живые деньги за день (не бонус, не ручное, не стенд) и ни одной покупки после
+    ПЕРВОГО пополнения до сборки письма: ночная покупка после окна считается, утренняя до пополнения — нет."""
+    session = _schema()
+    seed = _Seed(session)
+    bought = seed.user()
+    seed.tx(bought, 'deposit', 14900, method='platega', description='Пополнение', created_at='2026-09-18 10:00:00')
+    seed.tx(
+        bought, 'subscription_payment', -14900, method='balance', description='Оплата', created_at='2026-09-18 10:01:00'
+    )
+    night_buyer = seed.user()  # автопокупка не прошла, купил руками в 01:30 МСК — уже после окна, но до письма
+    seed.tx(night_buyer, 'deposit', 14900, method='platega', description='Пополнение', created_at='2026-09-18 12:00:00')
+    seed.tx(
+        night_buyer, 'subscription_payment', -14900, method='balance', description='Оплата', created_at=EDGE_OUTSIDE
+    )
+    reserve = seed.user()  # купил утром, вечером положил «про запас» — после пополнения покупки нет
+    seed.tx(
+        reserve,
+        'subscription_payment',
+        -14900,
+        method='balance',
+        description='Оплата',
+        created_at='2026-09-18 08:00:00',
+    )
+    seed.tx(reserve, 'deposit', 14900, method='platega', description='Пополнение', created_at='2026-09-18 12:00:00')
+    idle = seed.user()
+    seed.tx(idle, 'deposit', 14900, method='platega', description='Пополнение через Platega')
+    bonus_only = seed.user()
+    seed.tx(bonus_only, 'deposit', 5000, method=None, description='Бонус за регистрацию по кампании')
+    yesterday = seed.user()
+    seed.tx(yesterday, 'deposit', 14900, method='platega', description='Пополнение', created_at=DAY_BEFORE)
+    stand = seed.user(telegram_id=STAND_TELEGRAM_ID)
+    seed.tx(stand, 'deposit', 14900, method='platega', description='Пополнение через Platega')
+    session.commit()
+
+    text_ = await _render(session)
+
+    assert '• Пополнили баланс и ничего не купили: 2' in text_
+
+
+@pytest.mark.asyncio
+async def test_trial_taken_in_the_day_line_and_in_losses_is_one_number() -> None:
+    """Сторож против двух копий определения «взяли пробный»: «За день» и «Потери» называют одно число."""
+    session = _schema()
+    _seed_owner_day(_Seed(session))
+
+    lines = (await _render(session)).split('\n')
+
+    day_line = next(line for line in lines if line.startswith('• Открыли бота'))
+    losses_line = next(line for line in lines if line.startswith('• Взяли пробный'))
+    assert day_line.endswith('взяли пробный: 2') and losses_line.startswith('• Взяли пробный: 2,')
+
+
+@pytest.mark.asyncio
+async def test_weekly_losses_block_has_a_period_header() -> None:
+    session = _schema()
+    _seed_owner_day(_Seed(session))
+
+    text_ = await _render(session, ReportPeriod.WEEKLY)
+
+    assert '📉 <b>Потери за период</b>' in text_ and 'Потери за вчера' not in text_
 
 
 def test_next_run_after_an_early_wakeup_is_tomorrow_not_the_same_minute() -> None:
