@@ -279,6 +279,22 @@ async def test_panel_read_uses_the_callers_own_client_when_given() -> None:
 
 
 @pytest.mark.asyncio
+async def test_panel_read_never_touches_the_client_when_not_configured() -> None:
+    """Панель не настроена — клиент не создаётся вовсе (а не «сходили и получили пусто»)."""
+    calls = []
+
+    def get_api_client():
+        calls.append(1)
+        return _FakeClient(_FakeApi(users=[]))
+
+    service = MonitoringService.__new__(MonitoringService)
+    service.subscription_service = SimpleNamespace(is_configured=False, get_api_client=get_api_client)
+
+    assert await service._fetch_connected_panel_uuids() is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_panel_read_returns_only_those_who_actually_connected() -> None:
     api = _FakeApi(
         users=[

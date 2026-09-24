@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -256,7 +256,9 @@ def _seed_owner_day(seed: _Seed) -> None:
     seed.tx(topup, 'deposit', 26000, method='platega', description='Пополнение через Platega (СБП (QR))')
     seed.tx(topup, 'deposit', 5000, method=None, description='Бонус за регистрацию по кампании')
     # Маркер «реферальн» ловится через `ilike`; у SQLite `lower()` знает только латиницу, поэтому в
-    # фикстуре описание уже строчными — на Postgres регистр не важен
+    # фикстуре описание уже строчными. ⚠️ На боевом Postgres (`lc_ctype = C`, замер критика ВК-0 24.09.2026)
+    # `ilike` тоже НЕ складывает регистр кириллицы: «Реферальный бонус» маркер не поймает. Сегодня это не
+    # бьёт — реферальные начисления пишутся типом `referral_reward`, не пополнением (68 из 68)
     seed.tx(topup, 'deposit', 4700, method='platega', description='реферальный бонус за покупку друга')
     seed.tx(topup, 'deposit', 30000, method='manual', description='Начисление администратором')
     # Незавершённая проводка — не деньги
@@ -1042,6 +1044,55 @@ async def test_conversion_event_counts_only_for_the_subscription_it_belongs_to()
     text_ = await _render(session)
 
     assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 0' in text_.split('\n')
+
+
+@pytest.mark.asyncio
+async def test_topped_up_idle_checks_the_subscription_as_of_building_the_letter() -> None:
+    """«Действующая подписка» — на момент сборки письма, а не на конец окна: у кого подписка кончилась между
+    полуночью и сборкой, тот уже без VPN (мутатор волны 2 ВК-0)."""
+    session = _schema()
+    seed = _Seed(session)
+    user = seed.user()
+    seed.tx(user, 'deposit', 14900, method='platega', description='Пополнение через Platega')
+    seed.subscription(user, tariff_id=3, is_trial=False, end_date='2026-09-19 12:00:00')
+    session.commit()
+
+    class _BuiltOnTheTwentieth(module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            moment = module.datetime(2026, 9, 20, 12, 0, tzinfo=module.UTC)
+            return moment.astimezone(tz) if tz else moment.replace(tzinfo=None)
+
+    with patch.object(module, 'datetime', _BuiltOnTheTwentieth):
+        text_ = await _render(session)
+
+    assert '• Пополнили баланс и ничего не купили: 1' in text_.split('\n')
+
+
+@pytest.mark.asyncio
+async def test_panel_read_lets_a_real_cancellation_through() -> None:
+    """Остановка бота посреди сборки письма — отмена, а не «нет данных»: её нельзя проглатывать."""
+    session = _schema()
+    seed = _Seed(session)
+    seed.subscription(seed.user(created_at=IN_DAY, remnawave_uuid='t'), tariff_id=5, is_trial=True)
+    session.commit()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _render(session, reader=AsyncMock(side_effect=asyncio.CancelledError()))
+
+
+@pytest.mark.asyncio
+async def test_panel_read_failure_is_logged_for_the_engineer() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    seed.subscription(seed.user(created_at=IN_DAY, remnawave_uuid='t'), tariff_id=5, is_trial=True)
+    session.commit()
+    fake_logger = SimpleNamespace(info=Mock(), warning=Mock(), error=Mock(), debug=Mock())
+
+    with patch.object(module, 'logger', fake_logger):
+        await _render(session, reader=AsyncMock(side_effect=RuntimeError('панель упала')))
+
+    fake_logger.warning.assert_called_once()
 
 
 def test_next_run_after_an_early_wakeup_is_tomorrow_not_the_same_minute() -> None:
