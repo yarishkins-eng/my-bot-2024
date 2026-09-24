@@ -267,6 +267,34 @@ async def test_panel_read_returns_none_when_panel_is_not_configured() -> None:
 
 
 @pytest.mark.asyncio
+async def test_panel_read_uses_the_callers_own_client_when_given() -> None:
+    """ВК-0: утреннее письмо передаёт СВОЙ клиент панели — клиент монитора общий, и два одновременных входа в
+    него закрывают друг другу сессию. Без своего клиента читатель по-прежнему ходит клиентом монитора."""
+    own_api = _FakeApi(users=[SimpleNamespace(uuid='from-own-client', first_connected_at=datetime.now(UTC))])
+    service = _service_with_panel(_FakeApi(error=RuntimeError('клиент монитора')))
+    own = SimpleNamespace(is_configured=True, get_api_client=lambda: _FakeClient(own_api))
+
+    assert await service._fetch_connected_panel_uuids(own) == {'from-own-client'}
+    assert await service._fetch_connected_panel_uuids() is None
+
+
+@pytest.mark.asyncio
+async def test_panel_read_never_touches_the_client_when_not_configured() -> None:
+    """Панель не настроена — клиент не создаётся вовсе (а не «сходили и получили пусто»)."""
+    calls = []
+
+    def get_api_client():
+        calls.append(1)
+        return _FakeClient(_FakeApi(users=[]))
+
+    service = MonitoringService.__new__(MonitoringService)
+    service.subscription_service = SimpleNamespace(is_configured=False, get_api_client=get_api_client)
+
+    assert await service._fetch_connected_panel_uuids() is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_panel_read_returns_only_those_who_actually_connected() -> None:
     api = _FakeApi(
         users=[
