@@ -566,7 +566,7 @@ async def test_trial_taken_and_bought_the_same_day_still_counts_as_taken() -> No
 
     text_ = await _render(session)
 
-    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 1' in text_
+    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 1' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -588,7 +588,7 @@ async def test_stand_flagged_in_the_database_is_invisible_like_in_the_cabinet() 
     assert '• Купили: <b>0</b> на <b>0 ₽</b>' in text_
     # деньги стенда — настоящие, как в выписке (решение владельца 20.09): 149 + 100
     assert '• Пришло живых денег: <b>249 ₽</b> (пополнений баланса 1 · оплат сразу за подписку 1)' in text_
-    assert '• Открыли бота: 1 · по рекламе: 0 · взяли пробный: 0' in text_
+    assert '• Открыли бота: 1 · по рекламе: 0 · взяли пробный: 0' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -619,7 +619,7 @@ async def test_email_only_client_is_a_person_in_every_number() -> None:
     text_ = await _render(session)
 
     assert '• Купили: <b>1</b> на <b>149 ₽</b> — после пробного 0 · продления 0 · сразу без пробного 1' in text_
-    assert '• Открыли бота: 1 · по рекламе: 0 · взяли пробный: 0' in text_
+    assert '• Открыли бота: 1 · по рекламе: 0 · взяли пробный: 0' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -635,7 +635,7 @@ async def test_two_conversion_events_on_one_subscription_count_the_trial_once() 
 
     text_ = await _render(session)
 
-    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 1' in text_
+    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 1' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -679,11 +679,11 @@ async def test_losses_connected_is_counted_by_panel_uuid_and_unknown_panel_is_na
     session.commit()
 
     text_ = await _render(session, connected={'panel-1', 'panel-9'})
-    assert '• Взяли пробный: 3, подключились к VPN: 1' in text_
+    assert '• Взяли пробный: 3, подключились к VPN: 1' in text_.split('\n')
     assert '• Не подключились за сутки после пробного: 0' in text_  # позавчера никого — честный ноль, без «из 0»
 
     text_ = await _render(session, connected=None)
-    assert '• Взяли пробный: 3, подключились к VPN: нет данных из панели' in text_
+    assert '• Взяли пробный: 3, подключились к VPN: нет данных из панели' in text_.split('\n')
     assert '• Не подключились за сутки после пробного: 0' in text_  # позавчера никого — панель для этого не нужна
 
 
@@ -709,8 +709,8 @@ async def test_not_connected_after_a_day_looks_at_the_previous_window_only() -> 
 
     text_ = await _render(session, connected={'y-2'})
 
-    assert '• Взяли пробный: 2, подключились к VPN: 0' in text_
-    assert '• Не подключились за сутки после пробного: 3 из 4 (взяли 17.09)' in text_
+    assert '• Взяли пробный: 2, подключились к VPN: 0' in text_.split('\n')
+    assert '• Не подключились за сутки после пробного: 3 из 4 (взяли 17.09)' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -746,7 +746,7 @@ async def test_paid_expired_counts_only_lapsed_paid_tariffs_of_people() -> None:
 
     text_ = await _render(session)
 
-    assert '• Платная подписка закончилась и не продлена: 4' in text_
+    assert '• Платная подписка закончилась и не продлена: 4' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -857,6 +857,17 @@ async def test_topped_up_and_idle_means_no_purchase_after_the_first_topup_of_the
     )
     zero_deposit = seed.user()  # проводка пополнения на 0 ₽ — не пополнение
     seed.tx(zero_deposit, 'deposit', 0, method='platega', description='Техническая проводка')
+    unfinished_sale = seed.user()  # покупка после пополнения не завершилась — ничего не купил
+    seed.tx(unfinished_sale, 'deposit', 14900, method='platega', description='Пополнение')
+    seed.tx(
+        unfinished_sale,
+        'subscription_payment',
+        -14900,
+        method='balance',
+        description='Оплата',
+        completed=False,
+        created_at='2026-09-18 13:00:00',
+    )
     switched_off = seed.user()  # подписка выключена, хотя срок впереди — VPN нет: потеря
     seed.subscription(switched_off, tariff_id=3, is_trial=False, status='disabled', end_date=FAR_FUTURE)
     seed.tx(switched_off, 'deposit', 14900, method='platega', description='Пополнение')
@@ -864,8 +875,8 @@ async def test_topped_up_and_idle_means_no_purchase_after_the_first_topup_of_the
 
     text_ = await _render(session)
 
-    # idle, midnight, zero_sale, bought_before, on_trial, lapsed_payer, stale_active, switched_off
-    assert '• Пополнили баланс и ничего не купили: 8' in text_
+    # idle, midnight, zero_sale, bought_before, on_trial, lapsed_payer, stale_active, switched_off, unfinished_sale
+    assert '• Пополнили баланс и ничего не купили: 9' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -903,8 +914,8 @@ async def test_panel_is_not_asked_when_nobody_took_a_trial_yesterday_or_the_day_
     text_ = await _render(session, reader=reader)
 
     reader.assert_not_awaited()
-    assert '• Взяли пробный: 0, подключились к VPN: 0' in text_
-    assert '• Не подключились за сутки после пробного: 0' in text_
+    assert '• Взяли пробный: 0, подключились к VPN: 0' in text_.split('\n')
+    assert '• Не подключились за сутки после пробного: 0' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -920,12 +931,12 @@ async def test_panel_is_asked_when_only_the_day_before_has_trials() -> None:
     text_ = await _render(session, reader=reader)
 
     reader.assert_awaited_once()
-    assert '• Взяли пробный: 0, подключились к VPN: 0' in text_
-    assert '• Не подключились за сутки после пробного: 1 из 2 (взяли 17.09)' in text_
+    assert '• Взяли пробный: 0, подключились к VPN: 0' in text_.split('\n')
+    assert '• Не подключились за сутки после пробного: 1 из 2 (взяли 17.09)' in text_.split('\n')
 
     text_ = await _render(session, connected=None)  # панель молчит: вчера никого — всё равно честный ноль
-    assert '• Взяли пробный: 0, подключились к VPN: 0' in text_
-    assert '• Не подключились за сутки после пробного: нет данных из панели' in text_
+    assert '• Взяли пробный: 0, подключились к VPN: 0' in text_.split('\n')
+    assert '• Не подключились за сутки после пробного: нет данных из панели' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -938,8 +949,8 @@ async def test_unknown_panel_is_named_in_words_on_both_lines() -> None:
 
     text_ = await _render(session, connected=None)
 
-    assert '• Взяли пробный: 1, подключились к VPN: нет данных из панели' in text_
-    assert '• Не подключились за сутки после пробного: нет данных из панели' in text_
+    assert '• Взяли пробный: 1, подключились к VPN: нет данных из панели' in text_.split('\n')
+    assert '• Не подключились за сутки после пробного: нет данных из панели' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -957,7 +968,7 @@ async def test_letter_reads_the_panel_with_its_own_client_not_the_monitors() -> 
     (client,) = reader.await_args.args
     assert isinstance(client, SubscriptionService)
     assert client is not monitoring_module.monitoring_service.subscription_service
-    assert '• Взяли пробный: 1, подключились к VPN: 1' in text_
+    assert '• Взяли пробный: 1, подключились к VPN: 1' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -969,7 +980,7 @@ async def test_panel_failure_or_slowness_keeps_the_letter_and_says_no_data() -> 
     session.commit()
 
     text_ = await _render(session, reader=AsyncMock(side_effect=RuntimeError('панель упала')))
-    assert '• Взяли пробный: 1, подключились к VPN: нет данных из панели' in text_
+    assert '• Взяли пробный: 1, подключились к VPN: нет данных из панели' in text_.split('\n')
     assert text_.endswith('🎟 Поддержка: 0 новых · 0 открытых')
 
     async def slow(*_args):
@@ -978,7 +989,7 @@ async def test_panel_failure_or_slowness_keeps_the_letter_and_says_no_data() -> 
 
     with patch.object(module, 'PANEL_READ_TIMEOUT_SECONDS', 0.01):
         text_ = await _render(session, reader=AsyncMock(side_effect=slow))
-    assert '• Взяли пробный: 1, подключились к VPN: нет данных из панели' in text_
+    assert '• Взяли пробный: 1, подключились к VPN: нет данных из панели' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -995,8 +1006,8 @@ async def test_weekly_losses_count_trials_whose_day_to_connect_ended_inside_the_
 
     text_ = await _render(session, ReportPeriod.WEEKLY, connected={'w10'})
 
-    assert '• Взяли пробный: 1, подключились к VPN: 0' in text_
-    assert '• Не подключились за сутки после пробного: 1 из 2 (взяли 10.09–16.09)' in text_
+    assert '• Взяли пробный: 1, подключились к VPN: 0' in text_.split('\n')
+    assert '• Не подключились за сутки после пробного: 1 из 2 (взяли 10.09–16.09)' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -1011,7 +1022,7 @@ async def test_legacy_subscription_without_trial_flag_still_counts_after_convers
 
     text_ = await _render(session)
 
-    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 1' in text_
+    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 1' in text_.split('\n')
 
 
 @pytest.mark.asyncio
@@ -1030,7 +1041,7 @@ async def test_conversion_event_counts_only_for_the_subscription_it_belongs_to()
 
     text_ = await _render(session)
 
-    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 0' in text_
+    assert '• Открыли бота: 0 · по рекламе: 0 · взяли пробный: 0' in text_.split('\n')
 
 
 def test_next_run_after_an_early_wakeup_is_tomorrow_not_the_same_minute() -> None:
