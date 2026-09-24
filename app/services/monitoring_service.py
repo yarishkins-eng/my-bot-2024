@@ -1299,17 +1299,21 @@ class MonitoringService:
         except Exception as e:
             logger.error('Ошибка проверки истекающих тестовых подписок', error=e)
 
-    async def _fetch_connected_panel_uuids(self) -> set[str] | None:
+    async def _fetch_connected_panel_uuids(self, service: SubscriptionService | None = None) -> set[str] | None:
         """UUID клиентов панели, у которых БЫЛО первое подключение.
 
         Возвращает None, когда панель не ответила. Это отличие принципиально:
         пустое множество значит «никто не подключался», None значит «мы не знаем»,
         и во втором случае письмо не отправляется вовсе.
+
+        `service` — свой клиент панели для чужого вызывающего (утреннее письмо, ВК-0): клиент монитора
+        общий, и два одновременных входа в него закрывают друг другу сессию.
         """
-        if not self.subscription_service.is_configured:
+        service = service or self.subscription_service
+        if not service.is_configured:
             return None
         try:
-            async with self.subscription_service.get_api_client() as api:
+            async with service.get_api_client() as api:
                 panel_users = await api.get_all_users_stream(size=500)
         except Exception as e:
             logger.error('Не удалось прочитать первые подключения из панели', error=e)
