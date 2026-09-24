@@ -857,12 +857,15 @@ async def test_topped_up_and_idle_means_no_purchase_after_the_first_topup_of_the
     )
     zero_deposit = seed.user()  # проводка пополнения на 0 ₽ — не пополнение
     seed.tx(zero_deposit, 'deposit', 0, method='platega', description='Техническая проводка')
+    switched_off = seed.user()  # подписка выключена, хотя срок впереди — VPN нет: потеря
+    seed.subscription(switched_off, tariff_id=3, is_trial=False, status='disabled', end_date=FAR_FUTURE)
+    seed.tx(switched_off, 'deposit', 14900, method='platega', description='Пополнение')
     session.commit()
 
     text_ = await _render(session)
 
-    # idle, midnight, zero_sale, bought_before, on_trial, lapsed_payer, stale_active
-    assert '• Пополнили баланс и ничего не купили: 7' in text_
+    # idle, midnight, zero_sale, bought_before, on_trial, lapsed_payer, stale_active, switched_off
+    assert '• Пополнили баланс и ничего не купили: 8' in text_
 
 
 @pytest.mark.asyncio
@@ -919,6 +922,10 @@ async def test_panel_is_asked_when_only_the_day_before_has_trials() -> None:
     reader.assert_awaited_once()
     assert '• Взяли пробный: 0, подключились к VPN: 0' in text_
     assert '• Не подключились за сутки после пробного: 1 из 2 (взяли 17.09)' in text_
+
+    text_ = await _render(session, connected=None)  # панель молчит: вчера никого — всё равно честный ноль
+    assert '• Взяли пробный: 0, подключились к VPN: 0' in text_
+    assert '• Не подключились за сутки после пробного: нет данных из панели' in text_
 
 
 @pytest.mark.asyncio
