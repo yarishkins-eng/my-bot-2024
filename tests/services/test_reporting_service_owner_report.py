@@ -33,6 +33,12 @@ DAY_AFTER = '2026-09-19 12:00:00'
 # границы суток по МСК в UTC: 17.09 22:00 UTC = 01:00 МСК 18.09 (внутри), 18.09 21:30 UTC = 00:30 МСК 19.09 (снаружи)
 EDGE_INSIDE = '2026-09-17 22:00:00'
 EDGE_OUTSIDE = '2026-09-18 21:30:00'
+# Ровно полночь по МСК — граница окна. SQLite сравнивает метки как ТЕКСТ, а SQLAlchemy привязывает datetime в
+# виде «…:00.000000»; метка без микросекунд короче и оказалась бы «меньше» границы — поэтому у граничных
+# фикстур микросекунды выписаны явно (на Postgres это те же timestamptz)
+MIDNIGHT_17 = '2026-09-16 21:00:00.000000'  # 00:00 МСК 17.09
+MIDNIGHT_18 = '2026-09-17 21:00:00.000000'  # 00:00 МСК 18.09 — первая секунда окна
+MIDNIGHT_19 = '2026-09-18 21:00:00.000000'  # 00:00 МСК 19.09 — уже снаружи
 
 
 class _AsyncOverSync:
@@ -663,6 +669,9 @@ async def test_not_connected_after_a_day_looks_at_the_previous_window_only() -> 
     seed.subscription(seed.user(remnawave_uuid='y-2'), tariff_id=5, is_trial=True, created_at=DAY_BEFORE)
     seed.subscription(seed.user(created_at=IN_DAY, remnawave_uuid='t-1'), tariff_id=5, is_trial=True)
     seed.subscription(seed.user(remnawave_uuid='o-1'), tariff_id=5, is_trial=True, created_at='2026-09-16 12:00:00')
+    # границы окон ровно по МСК-полуночи: 00:00 17.09 (21:00 UTC 16.09) — уже «позавчера», 00:00 18.09 — «вчера»
+    seed.subscription(seed.user(remnawave_uuid='e-1'), tariff_id=5, is_trial=True, created_at=MIDNIGHT_17)
+    seed.subscription(seed.user(remnawave_uuid='e-2'), tariff_id=5, is_trial=True, created_at=MIDNIGHT_18)
     # вчерашний, купивший сегодня: строка переписана, но пробный он брал вчера — и так и не подключился
     yesterday_buyer = seed.user(remnawave_uuid='y-3')
     row = seed.subscription(yesterday_buyer, tariff_id=3, is_trial=False, created_at=DAY_BEFORE)
@@ -671,8 +680,8 @@ async def test_not_connected_after_a_day_looks_at_the_previous_window_only() -> 
 
     text_ = await _render(session, connected={'y-2'})
 
-    assert '• Взяли пробный: 1, подключились к VPN: 0' in text_
-    assert '• Не подключились за сутки после пробного: 2' in text_
+    assert '• Взяли пробный: 2, подключились к VPN: 0' in text_
+    assert '• Не подключились за сутки после пробного: 3' in text_
 
 
 @pytest.mark.asyncio
@@ -693,11 +702,15 @@ async def test_paid_expired_counts_only_lapsed_paid_tariffs_of_people() -> None:
     seed.subscription(stand, tariff_id=3, is_trial=False, status='expired', end_date=IN_DAY)
     erased = seed.user(status='deleted')
     seed.subscription(erased, tariff_id=3, is_trial=False, status='expired', end_date=IN_DAY)
+    # границы окна ровно по МСК-полуночи: 00:00 18.09 (21:00 UTC 17.09) — внутри, 00:00 19.09 — уже снаружи
+    seed.subscription(seed.user(), tariff_id=3, is_trial=False, status='expired', end_date=MIDNIGHT_18)
+    seed.subscription(seed.user(), tariff_id=3, is_trial=False, status='expired', end_date=MIDNIGHT_19)
+    seed.subscription(seed.user(), tariff_id=3, is_trial=False, status='expired', end_date=DAY_BEFORE)  # вчера
     session.commit()
 
     text_ = await _render(session)
 
-    assert '• Платная подписка закончилась и не продлена: 2' in text_
+    assert '• Платная подписка закончилась и не продлена: 3' in text_
 
 
 @pytest.mark.asyncio
@@ -734,11 +747,51 @@ async def test_topped_up_and_idle_means_no_purchase_after_the_first_topup_of_the
     seed.tx(yesterday, 'deposit', 14900, method='platega', description='Пополнение', created_at=DAY_BEFORE)
     stand = seed.user(telegram_id=STAND_TELEGRAM_ID)
     seed.tx(stand, 'deposit', 14900, method='platega', description='Пополнение через Platega')
+    referral_only = seed.user()  # реферальный бонус записан пополнением платёжного шлюза — не живые деньги
+    seed.tx(referral_only, 'deposit', 4700, method='platega', description='реферальный бонус за покупку друга')
+    same_second = seed.user()  # автопокупка в ту же секунду, что пополнение — купил
+    seed.tx(same_second, 'deposit', 14900, method='platega', description='Пополнение')
+    seed.tx(same_second, 'subscription_payment', -14900, method='balance', description='Оплата')
+    around = seed.user()  # покупка утром, пополнение днём, покупка вечером — после пополнения купил
+    seed.tx(
+        around, 'subscription_payment', -14900, method='balance', description='Оплата', created_at='2026-09-18 08:00:00'
+    )
+    seed.tx(around, 'deposit', 14900, method='platega', description='Пополнение', created_at='2026-09-18 12:00:00')
+    seed.tx(
+        around, 'subscription_payment', -14900, method='balance', description='Оплата', created_at='2026-09-18 13:00:00'
+    )
+    re_topper = seed.user()  # первое пополнение → покупка → второе пополнение без покупки: после ПЕРВОГО купил
+    seed.tx(re_topper, 'deposit', 14900, method='platega', description='Пополнение', created_at='2026-09-18 10:00:00')
+    seed.tx(
+        re_topper,
+        'subscription_payment',
+        -14900,
+        method='balance',
+        description='Оплата',
+        created_at='2026-09-18 11:00:00',
+    )
+    seed.tx(re_topper, 'deposit', 14900, method='platega', description='Пополнение', created_at='2026-09-18 12:00:00')
+    tomorrow = seed.user()  # пополнение уже 19.09 по МСК — не в окне; и ровно в полночь 18.09 — в окне
+    seed.tx(tomorrow, 'deposit', 14900, method='platega', description='Пополнение', created_at=MIDNIGHT_19)
+    midnight = seed.user()
+    seed.tx(midnight, 'deposit', 14900, method='platega', description='Пополнение', created_at=MIDNIGHT_18)
+    unfinished = seed.user()  # счёт выставлен, но не оплачен — не пополнение
+    seed.tx(unfinished, 'deposit', 14900, method='platega', description='Пополнение', completed=False)
+    zero_sale = seed.user()  # после пополнения только нулевая проводка «смена тарифа» — это не покупка
+    seed.tx(zero_sale, 'deposit', 14900, method='platega', description='Пополнение')
+    seed.tx(
+        zero_sale,
+        'subscription_payment',
+        0,
+        method='balance',
+        description='Смена тарифа администратором',
+        created_at='2026-09-18 13:00:00',
+    )
     session.commit()
 
     text_ = await _render(session)
 
-    assert '• Пополнили баланс и ничего не купили: 2' in text_
+    assert '• Пополнили баланс и ничего не купили: 4' in text_
 
 
 @pytest.mark.asyncio
