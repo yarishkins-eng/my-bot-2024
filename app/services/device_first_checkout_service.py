@@ -24,6 +24,7 @@ from app.database.crud.subscription import (
     create_paid_subscription,
     extend_subscription,
     get_subscription_by_user_id,
+    should_carry_trial_remaining_days,
 )
 from app.database.crud.tariff import get_tariffs_for_user
 from app.database.models import (
@@ -256,6 +257,20 @@ def serialize_checkout(
     except (TypeError, ValueError):
         parsed_end = None
     base_end = parsed_end if parsed_end and parsed_end > checkout.created_at else checkout.created_at
+    # ВК-1. При смене тарифа с пробного выдача остаток пробного сжигает (`extend_subscription`, ветка смены
+    # тарифа): срок идёт от оплаты. Прибавлять его к концу пробного — обещать дни, которых не будет (весь остаток
+    # пробного: у обычного до 3 дней, у выданного руками — недели, у Team с флагом «пробная» — годы).
+    # Повторяем правило выдачи для пробного: флаг `is_trial` снимка, другой тариф и запрет переноса. Второе её
+    # правило (непробная на 0₽-тарифе) здесь не нужно, пока касса не пускает смену тарифа с непробной подписки
+    # (`device_first_eligibility.py`, `subscription_tariff_mismatch`); снимут этот запрет — повторить и его.
+    # База — день заказа, не «сейчас»: заказ опрашивается, и дата не должна ползти. Пробный на том же тарифе
+    # продлевается с остатком.
+    if (
+        target_snapshot.get('is_trial') is True
+        and target_snapshot.get('tariff_id') != checkout.tariff_id
+        and not should_carry_trial_remaining_days()
+    ):
+        base_end = checkout.created_at
     return {
         'id': checkout.public_id,
         'tariff_id': checkout.tariff_id,
