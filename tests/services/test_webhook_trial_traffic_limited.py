@@ -33,7 +33,7 @@ TRIAL_DAILY_RU = (
     'В пробном периоде — 5 ГБ в сутки, трафик обновляется каждую ночь.\n'
     'Не хотите ждать — оформите подписку: в ней трафик без ограничений.'
 )
-TRIAL_GENERIC_RU = '⚠️ <b>Трафик пробного периода закончился</b>\n\nОформите подписку — в ней трафик без ограничений.'
+TRIAL_GENERIC_RU = '⚠️ <b>Трафик пробного периода закончился</b>\n\nОформите подписку: в ней трафик без ограничений.'
 PAID_RU = (
     '⚠️ <b>Достигнут лимит трафика</b>\n\n'
     'Вы исчерпали весь доступный трафик по подписке. Докупите трафик или дождитесь сброса.'
@@ -41,6 +41,10 @@ PAID_RU = (
 SUBSCRIBE_ROWS = [
     [('💎 Оформить подписку', f'{CABINET}/subscription/purchase')],
     [('✖️ Закрыть', 'webhook:close')],
+]
+EN_SUBSCRIBE_ROWS = [
+    [('💎 Get a subscription', f'{CABINET}/subscription/purchase')],
+    [('✖️ Close', 'webhook:close')],
 ]
 
 
@@ -118,7 +122,7 @@ async def test_trial_daily_letter_tells_the_truth_and_leads_to_checkout(delivery
     assert kwargs['telegram_silent'] is False
 
 
-@pytest.mark.parametrize('limit_gb', [10, 2])
+@pytest.mark.parametrize('limit_gb', [10, 2, 20])
 async def test_number_follows_the_persons_real_limit(delivery, limit_gb):
     await _fire('user.limited', _sub(), _limited_event(limit_bytes=limit_gb * GB))
 
@@ -154,10 +158,29 @@ async def test_english_trial_letter(delivery):
     message, rows, _ = _letter(delivery)
     assert message == (
         "⚠️ <b>Today's traffic is used up</b>\n\n"
-        'The trial includes 10 GB per day, and traffic renews every night.\n'
-        "Don't want to wait? Get a subscription: its traffic is unlimited."
+        'The trial includes 10 GB per day, and traffic resets every night.\n'
+        "Don't want to wait? Get a subscription with unlimited traffic."
     )
-    assert rows == [[('💎 Get a subscription', f'{CABINET}/subscription/purchase')], [('✖️ Close', 'webhook:close')]]
+    assert rows == EN_SUBSCRIBE_ROWS
+
+
+async def test_english_trial_letter_without_daily_reset(delivery):
+    await _fire('user.limited', _sub(), _limited_event(strategy='NO_RESET'), user=_user('en'))
+
+    message, rows, _ = _letter(delivery)
+    assert message == '⚠️ <b>Trial traffic is used up</b>\n\nGet a subscription with unlimited traffic.'
+    assert rows == EN_SUBSCRIBE_ROWS
+
+
+async def test_fresh_trial_status_goes_limited_and_gets_the_letter(delivery):
+    subscription = _sub(status='trial')
+
+    await _fire('user.limited', subscription, _limited_event())
+
+    message, rows, _ = _letter(delivery)
+    assert message == TRIAL_DAILY_RU
+    assert rows == SUBSCRIBE_ROWS
+    assert subscription.status == 'limited'
 
 
 async def test_paid_subscription_keeps_the_old_letter(delivery):
@@ -182,6 +205,16 @@ async def test_limited_toggle_silences_the_trial_letter_too(delivery, monkeypatc
 
     delivery.assert_not_awaited()
     assert info.call_args.kwargs['sent'] is False
+
+
+async def test_master_switch_silences_every_webhook_letter(delivery, monkeypatch):
+    monkeypatch.setattr(webhook.settings, 'WEBHOOK_NOTIFY_USER_ENABLED', False)
+
+    with patch.object(webhook.logger, 'info') as info:
+        await _fire('user.limited', _sub(), _limited_event())
+
+    delivery.assert_not_awaited()
+    assert info.call_args.kwargs == {'subscription_id': 377, 'variant': 'trial_daily', 'sent': False}
 
 
 @pytest.mark.parametrize(
