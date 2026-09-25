@@ -1798,6 +1798,8 @@
   "WEBHOOK_SUB_DISABLED": "🚫 <b>Subscription{tariff_label} disabled</b>\n\nYour subscription has been disabled by the administrator.",
   "WEBHOOK_SUB_ENABLED": "✅ <b>Subscription{tariff_label} activated</b>\n\nYour subscription is active again. Enjoy!",
   "WEBHOOK_SUB_LIMITED": "⚠️ <b>Traffic limit reached</b>\n\nYou have used all available traffic for your subscription{tariff_label}. Purchase additional traffic or wait for a reset.",
+  "WEBHOOK_TRIAL_TRAFFIC_LIMITED_DAILY": "⚠️ <b>Today's traffic is used up</b>\n\nThe trial includes {limit_gb} GB per day, and traffic renews every night.\nDon't want to wait? Get a subscription: its traffic is unlimited.",
+  "WEBHOOK_TRIAL_TRAFFIC_LIMITED": "⚠️ <b>Trial traffic is used up</b>\n\nGet a subscription — its traffic is unlimited.",
   "WEBHOOK_SUB_TRAFFIC_RESET": "🔄 <b>Traffic reset</b>\n\nTraffic for your subscription{tariff_label} has been reset. Full limit is available again.",
   "WEBHOOK_SUB_DELETED": "🗑️ <b>Subscription{tariff_label} deleted</b>\n\nYour subscription was deleted from the panel.",
   "WEBHOOK_SUB_REVOKED": "🔑 <b>Subscription{tariff_label} key updated</b>\n\nYour connection credentials have been updated. Use the new link to connect.",

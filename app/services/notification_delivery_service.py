@@ -142,6 +142,7 @@ class NotificationDeliveryService:
         bot: Bot | None = None,
         telegram_message: str | None = None,
         telegram_markup: Any | None = None,
+        telegram_silent: bool = False,
     ) -> bool:
         """
         Send notification to user through appropriate channel.
@@ -153,6 +154,7 @@ class NotificationDeliveryService:
             bot: Telegram bot instance (required for Telegram users)
             telegram_message: Pre-formatted Telegram message (optional)
             telegram_markup: Telegram keyboard markup (optional)
+            telegram_silent: deliver the Telegram message without sound (optional)
 
         Returns:
             True if notification was sent successfully through at least one channel
@@ -170,6 +172,7 @@ class NotificationDeliveryService:
                 bot=bot,
                 message=telegram_message,
                 markup=telegram_markup,
+                silent=telegram_silent,
             )
         if user.email and user.email_verified:
             # Email-only user - send via email and WebSocket
@@ -208,6 +211,7 @@ class NotificationDeliveryService:
         bot: Bot | None,
         message: str | None,
         markup: Any | None,
+        silent: bool = False,
     ) -> bool:
         """Send notification via Telegram bot."""
         if not bot:
@@ -245,6 +249,8 @@ class NotificationDeliveryService:
                         text=message,
                         reply_markup=markup,
                         parse_mode='HTML',
+                        # Параметр — только для тихой отправки: остальные вызовы уходят в Telegram как раньше.
+                        **({'disable_notification': True} if silent else {}),
                     ),
                     timeout=15.0,
                 )

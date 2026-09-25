@@ -1684,6 +1684,8 @@
   "WEBHOOK_SUB_DISABLED": "🚫 <b>订阅{tariff_label}已被禁用</b>\n\n您的订阅已被管理员禁用。",
   "WEBHOOK_SUB_ENABLED": "✅ <b>订阅{tariff_label}已激活</b>\n\n您的订阅已重新激活。祝使用愉快！",
   "WEBHOOK_SUB_LIMITED": "⚠️ <b>已达到流量限制</b>\n\n您已用完订阅{tariff_label}的所有可用流量。请购买额外流量或等待重置。",
+  "WEBHOOK_TRIAL_TRAFFIC_LIMITED_DAILY": "⚠️ <b>今日流量已用完</b>\n\n试用期每天 {limit_gb} GB，流量每晚更新。\n不想等待？开通订阅：流量不限。",
+  "WEBHOOK_TRIAL_TRAFFIC_LIMITED": "⚠️ <b>试用期流量已用完</b>\n\n开通订阅，流量不限。",
   "WEBHOOK_SUB_TRAFFIC_RESET": "🔄 <b>流量已重置</b>\n\n订阅{tariff_label}的流量已重置。完整限额再次可用。",
   "WEBHOOK_SUB_DELETED": "🗑️ <b>订阅{tariff_label}已删除</b>\n\n您的订阅已从面板中删除。",
   "WEBHOOK_SUB_REVOKED": "🔑 <b>订阅{tariff_label}密钥已更新</b>\n\n您的连接凭证已更新。请使用新链接进行连接。",
