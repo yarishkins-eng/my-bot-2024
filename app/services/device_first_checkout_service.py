@@ -59,6 +59,7 @@ LEGACY_SETTLEMENT_MODE = 'legacy_deposit'
 DIRECT_SETTLEMENT_MODE = 'direct_purchase_v2'
 KOPEKS_PER_RUBLE = 100
 READY_NOTIFICATION_TYPE = 'ready'
+CLIENT_MENU_TIMEOUT_SECONDS = 15  # ВК-2: меню после «готова» не держит очередь дольше
 # РФ-1 п.1.3: device-first платил реферальную комиссию МОЛЧА — `_add_reward` кладёт деньги на
 # баланс, и обращения к боту в том файле нет вовсе. Партнёру при регистрации обещают процент,
 # и он его получал, не зная об этом. Тип идёт через ту же очередь сообщений: у неё уже есть
@@ -3643,6 +3644,34 @@ async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: Subscri
     await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
 
 
+async def _send_client_subscriber_menu(*, user_id: int, checkout_id: int) -> None:
+    """ВК-2: меню подписчика в чате сразу после «подписка готова», а не при следующем /start.
+
+    Касса кабинета — главный путь покупки, а последним меню в чате у купившего оставалось меню пробного
+    («Оформить подписку») или новичка: регресс записи 22.06 «хуки во всех точках активации платной».
+    Зовётся ПОСЛЕ коммита строки `ready` как `sent`: «готова» уже ушла, и сбой, обрыв при деплое или зависание
+    меню не оставят её в `sending` — клиентскую строку не повторяют никогда. Своя короткая сессия: в ней нет
+    объектов, прочитанных до покупки (пробная в общей сессии дала бы «не подписчик» и тишину), и её сбой не
+    прерывает транзакцию очереди. Потолок по времени: очередь крутится и в 10-секундном денежном воркере.
+    """
+    if not (settings.FUNNEL_MENU_ENABLED and settings.is_funnel_subscriber_menu_enabled()):
+        return  # меню выключено — не открываем сессию и не ходим в Telegram
+    from app.database.database import AsyncSessionLocal
+    from app.utils.funnel_notify import notify_subscriber_menu
+
+    try:
+        async with asyncio.timeout(CLIENT_MENU_TIMEOUT_SECONDS):
+            async with AsyncSessionLocal() as menu_db:
+                user = await menu_db.get(User, user_id)
+                sent = user is not None and await notify_subscriber_menu(menu_db, user)
+        logger.info('Меню подписчика после покупки в кабинете', checkout_id=checkout_id, sent=sent)
+    except TimeoutError:
+        # Потолок мог сработать и после того, как Telegram принял меню, — это не «не отправлено».
+        logger.warning('Меню подписчика после покупки в кабинете: исход неизвестен (потолок)', checkout_id=checkout_id)
+    except Exception as error:
+        logger.warning('Меню подписчика после покупки в кабинете не отправлено', checkout_id=checkout_id, error=error)
+
+
 def _referral_reward_recipient(notification_type: str) -> int | None:
     """Получатель из типа строки. `None` — строка старого формата, до РФ-3."""
     _, _, tail = notification_type.partition(':')
@@ -3961,6 +3990,8 @@ async def process_device_first_notification_outbox(db: AsyncSession, *, bot, lim
             current.status = 'failed'
             current.last_error = error
         await db.commit()
+        if error is None and not obsolete and row.notification_type == READY_NOTIFICATION_TYPE:
+            await _send_client_subscriber_menu(user_id=checkout.user_id, checkout_id=checkout.id)
     return sent
 
 

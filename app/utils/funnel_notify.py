@@ -216,21 +216,22 @@ async def send_funnel_trial_menu(user) -> None:
         logger.warning('Не удалось отправить funnel-меню после активации триала', error=exc)
 
 
-async def notify_subscriber_menu(db, user) -> None:
+async def notify_subscriber_menu(db, user) -> bool:
     """Безопасная обёртка для точек активации платной подписки: освежает подписку и
     шлёт меню подписчика. Полностью best-effort — НЕ бросает в платёжный/активационный поток.
 
     Использовать ПОСЛЕ коммита подписки: ``await notify_subscriber_menu(db, user)``.
+    Возвращает True, если меню ушло (ВК-2: касса пишет исход в лог — иначе тишину не отличить от успеха).
     """
     try:
         # Свежая подписка обязательна — иначе get_subscriber_state прочитает старую.
         await db.refresh(user, ['subscriptions'])
     except Exception as exc:
         logger.debug('notify_subscriber_menu refresh failed', error=exc)
-    await send_funnel_subscriber_menu(user)  # сам best-effort
+    return await send_funnel_subscriber_menu(user)  # сам best-effort
 
 
-async def send_funnel_subscriber_menu(user) -> None:
+async def send_funnel_subscriber_menu(user) -> bool:
     """Шлёт меню платного подписчика после активации платной подписки (без /start).
 
     Состояние и клавиатуру берёт из get_subscriber_state(user) по СВЕЖЕЙ user.subscription:
@@ -241,9 +242,10 @@ async def send_funnel_subscriber_menu(user) -> None:
 
     🔴 Вызывающий ОБЯЗАН передать user со свежей подпиской (после коммита —
     ``await db.refresh(user, ['subscriptions'])``). Best-effort: ошибки не пробрасываются.
+    Возвращает True, только если меню отправлено.
     """
     if not (_funnel_enabled() and getattr(user, 'telegram_id', None)):
-        return
+        return False
 
     try:
         from app.bot_factory import create_bot
@@ -254,7 +256,7 @@ async def send_funnel_subscriber_menu(user) -> None:
 
         state, _sub = get_subscriber_state(user)
         if state is None:
-            return  # не платный подписчик (триал/флаги выкл/мультитариф) — меню не шлём
+            return False  # не платный подписчик (триал/флаги выкл/мультитариф) — меню не шлём
 
         language = getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE
         texts = get_texts(language)
@@ -265,7 +267,7 @@ async def send_funnel_subscriber_menu(user) -> None:
             show_connection_link=has_available_subscription_link(_sub),
         )
         if keyboard is None:
-            return
+            return False
 
         text = texts.t('FUNNEL_SUBSCRIPTION_ACTIVE', '✅ Подписка активна! Вот твоё меню:')
         bot = create_bot()
@@ -281,8 +283,10 @@ async def send_funnel_subscriber_menu(user) -> None:
                 await _remember_menu_message_id(user.telegram_id, sent.message_id)
         finally:
             await bot.session.close()
+        return True
     except Exception as exc:  # авто-обновление не критично — логируем и идём дальше
         logger.warning('Не удалось отправить меню подписчика после активации', error=exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
