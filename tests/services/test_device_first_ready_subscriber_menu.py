@@ -199,7 +199,8 @@ async def test_menu_failure_or_hang_never_touches_the_ready_row(menu_on, monkeyp
     row = _row(1, READY_NOTIFICATION_TYPE)
     db = _queue_db([row], user=_user(_subscription()), trail=trail)
     menu_db, factory = _menu_session(
-        _user(_subscription()), get_error=RuntimeError('connection refused') if failure == 'session' else None
+        _user(_subscription()),
+        get_error=ConnectionRefusedError('database is restarting') if failure == 'session' else None,
     )
 
     async def _hang(session, user):
