@@ -3665,6 +3665,9 @@ async def _send_client_subscriber_menu(*, user_id: int, checkout_id: int) -> Non
                 user = await menu_db.get(User, user_id)
                 sent = user is not None and await notify_subscriber_menu(menu_db, user)
         logger.info('Меню подписчика после покупки в кабинете', checkout_id=checkout_id, sent=sent)
+    except TimeoutError:
+        # Потолок мог сработать и после того, как Telegram принял меню, — это не «не отправлено».
+        logger.warning('Меню подписчика после покупки в кабинете: исход неизвестен (потолок)', checkout_id=checkout_id)
     except Exception as error:
         logger.warning('Меню подписчика после покупки в кабинете не отправлено', checkout_id=checkout_id, error=error)
 

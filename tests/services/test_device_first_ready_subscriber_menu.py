@@ -218,7 +218,12 @@ async def test_menu_failure_or_hang_never_touches_the_ready_row(menu_on, monkeyp
 
     assert sent == 1 and row.status == 'sent' and row.last_error is None
     warning.assert_called_once()
-    assert warning.call_args.args[0] == 'Меню подписчика после покупки в кабинете не отправлено'
+    # Зависание — «исход неизвестен»: потолок мог сработать уже после того, как Telegram принял меню.
+    expected = {
+        'session': 'Меню подписчика после покупки в кабинете не отправлено',
+        'hang': 'Меню подписчика после покупки в кабинете: исход неизвестен (потолок)',
+    }[failure]
+    assert warning.call_args.args[0] == expected
     assert warning.call_args.kwargs['checkout_id'] == 4_917
 
 
@@ -379,3 +384,51 @@ async def test_menu_that_telegram_refused_keeps_the_old_menu_and_says_so(menu_on
     delete_old.assert_not_awaited()  # новое не ушло — старое не трогаем
     remember.assert_not_awaited()
     info.assert_any_call('Меню подписчика после покупки в кабинете', checkout_id=4_917, sent=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('menu_outcome', ['sent', 'hang', 'error'])
+async def test_menu_does_not_break_the_rest_of_a_real_batch(menu_on, monkeypatch, menu_outcome):
+    """Боевой проход заказа 99 (22.09): карточка продажи → «готова» → две реферальные строки. Меню между ними —
+    при любом исходе все четыре строки уходят и сохраняются, порядок прежний."""
+    trail = []
+    rows = [
+        _row(1, f'{SALE_NOTIFICATION_PREFIX}first'),
+        _row(2, READY_NOTIFICATION_TYPE),
+        _row(3, 'referral_reward:311'),
+        _row(4, 'referral_reward:312'),
+    ]
+    db = _queue_db(rows, user=_user(_subscription()), trail=trail)
+    _menu_db, factory = _menu_session(_user(_subscription()))
+
+    async def _menu(session, user):
+        trail.append(('menu',))
+        if menu_outcome == 'hang':
+            await asyncio.sleep(5)
+        if menu_outcome == 'error':
+            raise RuntimeError('redis is down')
+        return True
+
+    async def _card(db_arg, *, bot, checkout, first):
+        trail.append(('card',))
+        return True
+
+    async def _reward(db_arg, *, bot, checkout, recipient_id):
+        trail.append(('reward', recipient_id))
+
+    monkeypatch.setattr(service, 'CLIENT_MENU_TIMEOUT_SECONDS', 0.05)
+    queue, revive = _quiet_queue()
+    with (
+        queue,
+        revive,
+        patch.object(service, '_send_owner_sale_card', AsyncMock(side_effect=_card)),
+        patch.object(service, '_send_referral_reward_message', AsyncMock(side_effect=_reward)),
+        patch('app.database.database.AsyncSessionLocal', factory),
+        patch('app.utils.funnel_notify.notify_subscriber_menu', AsyncMock(side_effect=_menu)),
+    ):
+        sent = await process_device_first_notification_outbox(db, bot=_bot(trail), limit=10)
+
+    assert sent == 4
+    assert [row.status for row in rows] == ['sent', 'sent', 'sent', 'sent']
+    steps = [step[0] for step in trail if step[0] != 'commit']
+    assert steps == ['card', 'send', 'menu', 'reward', 'reward']
