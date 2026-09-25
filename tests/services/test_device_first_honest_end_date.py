@@ -42,7 +42,7 @@ def _checkout(target_snapshot, *, tariff_id=PAID_TARIFF_ID, period_days=PERIOD_D
         funding_mode='platega',
         quote_expires_at=CREATED_AT + timedelta(minutes=30),
         expires_at=CREATED_AT + timedelta(hours=24),
-        lifecycle_state='armed',
+        lifecycle_state='awaiting_funds',  # окно оплаты на боевом: 63 из 63 сохранённых ответов
         quote_state='valid',
         funding_state='invoice_pending',
         fulfillment_state='not_started',
@@ -188,3 +188,68 @@ async def test_cabinet_payment_window_gets_the_honest_date(live_flags):
     assert payload['ui_state'] == 'awaiting_payment'
     assert payload['estimated_end_at'] == (CREATED_AT + timedelta(days=PERIOD_DAYS)).isoformat()
     assert payload['provider_invoice_expires_at'] == invoice_deadline.isoformat()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('trial_add', 'reset'), [(True, True), (True, False), (False, True), (False, False)])
+@pytest.mark.parametrize('same_tariff', [True, False])
+@pytest.mark.parametrize('is_trial', [True, False])
+async def test_issued_term_is_never_shorter_than_the_promise(monkeypatch, is_trial, same_tariff, trial_add, reset):
+    """Договор обещания и выдачи: `extend_subscription` не выдаёт меньше, чем обещал `serialize_checkout`.
+
+    Правило живёт в двух копиях, а `crud/subscription.py` стоит за забором деплоя: красный тест здесь — единственный
+    сигнал, что правка выдачи снова открыла завышение. Источник на 0₽-тарифе в матрице нет: касса не пускает смену
+    тарифа с непробной подписки (`device_first_eligibility.py`, `subscription_tariff_mismatch`).
+    """
+    from app.database.crud.subscription import extend_subscription
+    from app.services.public_location_entitlement_service import ResolvedEntitlement
+
+    monkeypatch.setattr(service.settings, 'TRIAL_ADD_REMAINING_DAYS_TO_PAID', trial_add)
+    monkeypatch.setattr(service.settings, 'TARIFF_SWITCH_RESET_FREE_DAYS', reset)
+    entitlement = ResolvedEntitlement((), ('squad-vk1',), 1, 'test')
+    for name in ('resolve_tariff_entitlement', 'get_effective_subscription_resolved_entitlement'):
+        monkeypatch.setattr(
+            f'app.services.public_location_entitlement_service.{name}', AsyncMock(return_value=entitlement)
+        )
+    monkeypatch.setattr(
+        'app.services.public_location_entitlement_service.persist_subscription_entitlement_snapshot', AsyncMock()
+    )
+    for name in ('_lock_subscription_row', '_housekeep_expired_purchases', 'clear_notifications'):
+        monkeypatch.setattr(f'app.database.crud.subscription.{name}', AsyncMock())
+    monkeypatch.setattr(
+        'app.database.crud.subscription.deactivate_user_trial_subscriptions', AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        'app.database.crud.tariff.get_tariff_by_id',
+        AsyncMock(return_value=SimpleNamespace(is_daily=False, is_free=False)),
+    )
+
+    now = datetime.now(UTC)
+    ordered_at = now - timedelta(minutes=7, seconds=13)
+    source_tariff = PAID_TARIFF_ID if same_tariff else TRIAL_TARIFF_ID
+    subscription = SimpleNamespace(
+        id=7_301,
+        user_id=4_917,
+        status='active',
+        is_trial=is_trial,
+        start_date=now - timedelta(days=1),
+        end_date=now + timedelta(days=2, hours=5, minutes=41),
+        tariff_id=source_tariff,
+        traffic_limit_gb=5,
+        traffic_used_gb=0.0,
+        device_limit=1,
+        connected_squads=[],
+        purchased_traffic_gb=0,
+        updated_at=now,
+    )
+    checkout = _checkout(service._subscription_snapshot(subscription))
+    checkout.created_at = ordered_at
+    promised = datetime.fromisoformat(service.serialize_checkout(checkout)['estimated_end_at'])
+
+    issued = await extend_subscription(
+        AsyncMock(), subscription, PERIOD_DAYS, tariff_id=PAID_TARIFF_ID, convert_trial=True, commit=False
+    )
+
+    assert issued.end_date >= promised - timedelta(minutes=1)
+    # Обещание честное и в другую сторону: не на часы раньше факта, а на время от заказа до оплаты.
+    assert issued.end_date - promised <= now - ordered_at + timedelta(minutes=1)
