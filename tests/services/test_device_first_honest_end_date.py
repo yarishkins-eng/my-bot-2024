@@ -1,9 +1,10 @@
 """ВК-1: дата «до», которую заказ обещает клиенту, не больше той, что выдаст оплата.
 
 Выдача (`crud/subscription.py::extend_subscription`) при смене тарифа с пробного сжигает остаток пробного, пока
-перенос запрещён: срок = момент оплаты + период. Экран заказа (бот «Проверьте заказ», окно оплаты кабинета) читает
-`estimated_end_at` и прибавлял период к концу пробного — клиент видел дату на 1–3 дня позже, чем получал
-(«до» ВК-1: 8 из 11 за 30 дней). Числа в фикстурах нарочно не круглые и не совпадают с умолчаниями кода.
+перенос запрещён: срок = момент оплаты + период. Окно оплаты кабинета читает `estimated_end_at` и прибавляло период
+к концу пробного — клиент видел дату на 1–3 дня позже, чем получал («до» ВК-1: 8 из 11 за 30 дней). Бот эту дату
+новым заказам не показывает: с 02.08 заказ `direct_purchase_v2` идёт мимо экрана «Проверьте заказ». Числа в фикстурах
+нарочно не круглые и не совпадают с умолчаниями кода.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.handlers.subscription.device_first import _render_confirmation
+from app.cabinet.routes import device_first as cabinet_routes
 from app.services import device_first_checkout_service as service
 
 
@@ -25,6 +26,7 @@ PERIOD_DAYS = 90
 
 def _checkout(target_snapshot, *, tariff_id=PAID_TARIFF_ID, period_days=PERIOD_DAYS, fulfilled_end_at=None):
     return SimpleNamespace(
+        id=4_917,
         public_id='vk1-checkout',
         tariff_id=tariff_id,
         target_subscription_id=target_snapshot.get('id'),
@@ -128,6 +130,29 @@ def test_snapshot_without_trial_flag_is_not_guessed(live_flags):
     assert _promised(_checkout(snapshot)) == TRIAL_END + timedelta(days=PERIOD_DAYS)
 
 
+def test_trial_flag_must_be_a_real_boolean(live_flags):
+    """Снимок пишет `bool(is_trial)`; строка «true» — порча, а не пробный. Как и `current_subscription_is_trial`."""
+    snapshot = _snapshot(is_trial='true')
+
+    assert _promised(_checkout(snapshot)) == TRIAL_END + timedelta(days=PERIOD_DAYS)
+
+
+def test_paid_term_ending_minutes_after_the_order_is_still_the_base(live_flags):
+    """Прежняя формула на границе: платный срок, кончающийся через 10 минут после заказа, — база продления."""
+    end = CREATED_AT + timedelta(minutes=10, seconds=7)
+    snapshot = _snapshot(is_trial=False, tariff_id=PAID_TARIFF_ID, end=end)
+
+    assert _promised(_checkout(snapshot)) == end + timedelta(days=PERIOD_DAYS)
+
+
+@pytest.mark.parametrize('is_trial', [True, False])
+def test_broken_end_date_in_snapshot_does_not_break_the_order(live_flags, is_trial):
+    snapshot = _snapshot(is_trial=is_trial, tariff_id=TRIAL_TARIFF_ID if is_trial else PAID_TARIFF_ID)
+    snapshot['end_date'] = 'not-a-date'
+
+    assert _promised(_checkout(snapshot)) == CREATED_AT + timedelta(days=PERIOD_DAYS)
+
+
 def test_expired_trial_counts_from_order_day(live_flags):
     snapshot = _snapshot(end=CREATED_AT - timedelta(hours=5))
 
@@ -153,14 +178,13 @@ def test_promise_does_not_move_while_the_order_is_polled(live_flags):
 
 
 @pytest.mark.asyncio
-async def test_bot_order_screen_shows_the_honest_date(live_flags):
-    """Настоящая точка входа: экран «Проверьте заказ» в боте строит строку «🏁 До:» из того же поля."""
-    user = SimpleNamespace(language='ru', balance_kopeks=12_345)
-    checkout = _checkout(_snapshot())
+async def test_cabinet_payment_window_gets_the_honest_date(live_flags):
+    """Настоящая точка входа: ответ кабинета для окна оплаты — единственный живой экран с этой датой."""
+    invoice_deadline = CREATED_AT + timedelta(minutes=29, seconds=31)
+    db = SimpleNamespace(scalar=AsyncMock(return_value=invoice_deadline))
 
-    with patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as render:
-        await _render_confirmation(SimpleNamespace(), user, checkout, tariff_name='Базовый')
+    payload = await cabinet_routes._serialize_cabinet_checkout(db, _checkout(_snapshot()), balance_kopeks=0)
 
-    caption = render.await_args.kwargs['caption']
-    assert '🏁 До: 23.12.2026' in caption.split('\n')
-    assert '26.12.2026' not in caption
+    assert payload['ui_state'] == 'awaiting_payment'
+    assert payload['estimated_end_at'] == (CREATED_AT + timedelta(days=PERIOD_DAYS)).isoformat()
+    assert payload['provider_invoice_expires_at'] == invoice_deadline.isoformat()
