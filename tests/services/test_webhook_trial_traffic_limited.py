@@ -70,8 +70,10 @@ def _user(language: str = 'ru'):
     return SimpleNamespace(id=688, telegram_id=7_000_688, language=language)
 
 
-def _sub(*, is_trial: bool = True, status: str = 'active'):
-    return SimpleNamespace(id=377, user_id=688, is_trial=is_trial, status=status, updated_at=None)
+def _sub(*, is_trial: bool = True, status: str = 'active', traffic_used_gb: float = 5.07):
+    return SimpleNamespace(
+        id=377, user_id=688, is_trial=is_trial, status=status, updated_at=None, traffic_used_gb=traffic_used_gb
+    )
 
 
 def _receiver_data(user_dto: dict) -> dict:
@@ -256,14 +258,19 @@ def _reactivate_like_crud():
 
 
 @pytest.mark.parametrize(
-    ('status', 'silent'),
-    [('limited', True), ('disabled', False), ('active', False)],
+    ('status', 'silent', 'used_after'),
+    [('limited', True, 0.0), ('disabled', False, 5.07), ('active', False, 5.07)],
     ids=['night-traffic-reset', 'admin-re-enabled', 'already-active'],
 )
-async def test_only_the_night_traffic_return_comes_silently(delivery, monkeypatch, status, silent):
+async def test_only_the_night_traffic_return_comes_silently(delivery, monkeypatch, status, silent, used_after):
     monkeypatch.setattr(webhook, 'reactivate_subscription', _reactivate_like_crud())
+    subscription = _sub(status=status)
 
-    await _fire('user.enabled', _sub(status=status), _receiver_data({'uuid': 'd7849464', 'status': 'ACTIVE'}))
+    await _fire('user.enabled', subscription, _receiver_data({'uuid': 'd7849464', 'status': 'ACTIVE'}))
+
+    # Панель ночью обнулила счётчик — бот тоже: иначе часовой обход трафика увидит вчерашние 5 ГБ из 5 и громко
+    # напишет «лимит почти исчерпан» (так было 5 ночей из 6 предупреждений в логе, волна 2 ВК-3).
+    assert subscription.traffic_used_gb == used_after
 
     message, rows, kwargs = _letter(delivery)
     assert message.startswith('✅ <b>Подписка активирована</b>')

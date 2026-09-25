@@ -1155,8 +1155,12 @@ class RemnaWaveWebhookService:
             return
 
         self._stamp_webhook_update(subscription)
-        # Из limited подписку возвращает ночной сброс трафика панелью (03:05 МСК) — сообщаем без звука (ВК-3).
+        # Из limited подписку возвращает ночной сброс трафика панелью (03:05 МСК): панель обнулила счётчик — обнуляем и
+        # у себя, иначе часовой обход трафика увидит вчерашние гигабайты и громко напишет «лимит почти исчерпан»;
+        # сообщение о возврате — без звука (ВК-3).
         traffic_came_back = subscription.status == SubscriptionStatus.LIMITED.value
+        if traffic_came_back:
+            await update_subscription_usage(db, subscription, 0.0)
         if subscription.status in (SubscriptionStatus.DISABLED.value, SubscriptionStatus.LIMITED.value):
             await reactivate_subscription(db, subscription)
             logger.info('Webhook: subscription re-enabled for user', subscription_id=subscription.id, user_id=user.id)
