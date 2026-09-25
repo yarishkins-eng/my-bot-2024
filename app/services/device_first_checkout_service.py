@@ -3641,6 +3641,29 @@ async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: Subscri
         else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
     )
     await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
+    await _send_client_subscriber_menu(db, user=user, checkout=checkout)
+
+
+async def _send_client_subscriber_menu(db: AsyncSession, *, user: User, checkout: SubscriptionCheckout) -> None:
+    """ВК-2: меню подписчика в чате сразу после «подписка готова», а не при следующем /start.
+
+    Касса кабинета — главный путь покупки, а последним меню в чате у купившего оставалось меню пробного
+    («Оформить подписку») или новичка: регресс записи 22.06 «хуки во всех точках активации платной».
+    Строка `ready` — одна на заказ, значит и меню одно. Купленную подписку перечитываем принудительно:
+    сессия общая с циклом мониторинга (`expire_on_commit=False`), в ней может лежать пробная, прочитанная
+    до покупки, — классификатор решил бы «пробный», и меню не пришло бы. Сбой меню не роняет строку:
+    «готова» уже ушла, а клиентскую строку не повторяют никогда.
+    """
+    from app.utils.funnel_notify import notify_subscriber_menu
+
+    try:
+        if checkout.created_subscription_id is not None:
+            subscription = await db.get(Subscription, checkout.created_subscription_id)
+            if subscription is not None:
+                await db.refresh(subscription)
+        await notify_subscriber_menu(db, user)
+    except Exception as error:
+        logger.warning('Меню подписчика после покупки в кабинете не отправлено', checkout_id=checkout.id, error=error)
 
 
 def _referral_reward_recipient(notification_type: str) -> int | None:
