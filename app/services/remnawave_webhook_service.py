@@ -1045,6 +1045,21 @@ class RemnaWaveWebhookService:
             logger.exception('Notification delivery failed for user , text_key', user_id=user.id, text_key=text_key)
             return False
 
+    @staticmethod
+    def _event_used_traffic_gb(data: dict) -> float:
+        """Израсходованный трафик из события панели, ГБ: вложенный ``userTraffic`` (как в user.modified), иначе плоское
+        поле; нет поля — ноль (почти всегда это ночной сброс, после которого счётчик и так нулевой)."""
+        user_traffic = data.get('userTraffic')
+        used_bytes = (
+            user_traffic.get('usedTrafficBytes')
+            if isinstance(user_traffic, dict) and user_traffic.get('usedTrafficBytes') is not None
+            else data.get('usedTrafficBytes')
+        )
+        try:
+            return round(int(used_bytes or 0) / (1024**3), 2)
+        except (TypeError, ValueError):
+            return 0.0
+
     # ------------------------------------------------------------------
     # Webhook timestamp helper
     # ------------------------------------------------------------------
@@ -1155,12 +1170,12 @@ class RemnaWaveWebhookService:
             return
 
         self._stamp_webhook_update(subscription)
-        # Из limited подписку возвращает ночной сброс трафика панелью (03:05 МСК): панель обнулила счётчик — обнуляем и
-        # у себя, иначе часовой обход трафика увидит вчерашние гигабайты и громко напишет «лимит почти исчерпан»;
-        # сообщение о возврате — без звука (ВК-3).
+        # Из limited подписку возвращает ночной сброс трафика панелью (03:05 МСК). Счётчик берём из события: после
+        # ночного сброса панель шлёт уже обнулённый, после ручного «Enable» — настоящий. Без этого часовой обход трафика
+        # видит вчерашние гигабайты и громко пишет «лимит почти исчерпан». Сообщение о возврате — без звука (ВК-3).
         traffic_came_back = subscription.status == SubscriptionStatus.LIMITED.value
         if traffic_came_back:
-            await update_subscription_usage(db, subscription, 0.0)
+            await update_subscription_usage(db, subscription, self._event_used_traffic_gb(data))
         if subscription.status in (SubscriptionStatus.DISABLED.value, SubscriptionStatus.LIMITED.value):
             await reactivate_subscription(db, subscription)
             logger.info('Webhook: subscription re-enabled for user', subscription_id=subscription.id, user_id=user.id)

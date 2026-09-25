@@ -257,25 +257,52 @@ def _reactivate_like_crud():
     return AsyncMock(side_effect=reactivate)
 
 
+def _enabled_event(*, used_bytes=0, where='nested'):
+    """Событие ``user.enabled`` в форме контракта панели: после ночного сброса панель перечитывает пользователя по
+    tId и шлёт уже обнулённый ``userTraffic.usedTrafficBytes``; после ручного «Enable» — настоящий."""
+    dto = {'uuid': 'd7849464', 'status': 'ACTIVE'}
+    if where == 'nested':
+        dto['userTraffic'] = {'usedTrafficBytes': used_bytes, 'lifetimeUsedTrafficBytes': 6 * GB}
+    elif where == 'flat':
+        dto['usedTrafficBytes'] = used_bytes
+    return _receiver_data(dto)
+
+
 @pytest.mark.parametrize(
-    ('status', 'silent', 'used_after'),
-    [('limited', True, 0.0), ('disabled', False, 5.07), ('active', False, 5.07)],
-    ids=['night-traffic-reset', 'admin-re-enabled', 'already-active'],
+    ('status', 'event', 'silent', 'used_after'),
+    [
+        ('limited', _enabled_event(used_bytes=0), True, 0.0),
+        ('limited', _enabled_event(used_bytes=int(5.3 * GB)), True, 5.3),
+        ('limited', _enabled_event(used_bytes=int(0.25 * GB), where='flat'), True, 0.25),
+        ('limited', _enabled_event(where='absent'), True, 0.0),
+        ('limited', _enabled_event(used_bytes='не число'), True, 0.0),
+        ('disabled', _enabled_event(used_bytes=0), False, 5.07),
+        ('active', _enabled_event(used_bytes=0), False, 5.07),
+    ],
+    ids=[
+        'night-traffic-reset',
+        'manual-enable-without-reset',
+        'flat-counter',
+        'no-counter-in-event',
+        'garbage-counter',
+        'admin-re-enabled',
+        'already-active',
+    ],
 )
-async def test_only_the_night_traffic_return_comes_silently(delivery, monkeypatch, status, silent, used_after):
+async def test_only_the_night_traffic_return_comes_silently(delivery, monkeypatch, status, event, silent, used_after):
     monkeypatch.setattr(webhook, 'reactivate_subscription', _reactivate_like_crud())
     subscription = _sub(status=status)
 
-    await _fire('user.enabled', subscription, _receiver_data({'uuid': 'd7849464', 'status': 'ACTIVE'}))
-
-    # Панель ночью обнулила счётчик — бот тоже: иначе часовой обход трафика увидит вчерашние 5 ГБ из 5 и громко
-    # напишет «лимит почти исчерпан» (так было 5 ночей из 6 предупреждений в логе, волна 2 ВК-3).
-    assert subscription.traffic_used_gb == used_after
+    await _fire('user.enabled', subscription, event)
 
     message, rows, kwargs = _letter(delivery)
     assert message.startswith('✅ <b>Подписка активирована</b>')
     assert rows[0] == [('🔗 Подключиться', f'{CABINET}/subscription')]
     assert kwargs['telegram_silent'] is silent
+    # Счётчик после возврата из limited — из события панели: иначе часовой обход трафика увидит вчерашние 5 ГБ из 5 и
+    # громко напишет «лимит почти исчерпан» (5 ночных из 6 предупреждений в логе, волна 2 ВК-3). Прочее включение
+    # счётчик не трогает.
+    assert subscription.traffic_used_gb == used_after
 
 
 async def test_silent_reaches_telegram_as_disable_notification():
