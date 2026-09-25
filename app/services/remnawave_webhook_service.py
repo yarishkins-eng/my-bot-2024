@@ -49,6 +49,8 @@ _TEXT_KEY_TO_NOTIFICATION_TYPE: dict[str, NotificationType] = {
     'WEBHOOK_SUB_DISABLED': NotificationType.WEBHOOK_SUB_DISABLED,
     'WEBHOOK_SUB_ENABLED': NotificationType.WEBHOOK_SUB_ENABLED,
     'WEBHOOK_SUB_LIMITED': NotificationType.WEBHOOK_SUB_LIMITED,
+    'WEBHOOK_TRIAL_TRAFFIC_LIMITED_DAILY': NotificationType.WEBHOOK_SUB_LIMITED,
+    'WEBHOOK_TRIAL_TRAFFIC_LIMITED': NotificationType.WEBHOOK_SUB_LIMITED,
     'WEBHOOK_SUB_TRAFFIC_RESET': NotificationType.WEBHOOK_SUB_TRAFFIC_RESET,
     'WEBHOOK_SUB_DELETED': NotificationType.WEBHOOK_SUB_DELETED,
     'WEBHOOK_SUB_REVOKED': NotificationType.WEBHOOK_SUB_REVOKED,
@@ -70,6 +72,8 @@ _TEXT_KEY_TO_SETTING: dict[str, str] = {
     'WEBHOOK_SUB_DISABLED': 'WEBHOOK_NOTIFY_SUB_STATUS',
     'WEBHOOK_SUB_ENABLED': 'WEBHOOK_NOTIFY_SUB_STATUS',
     'WEBHOOK_SUB_LIMITED': 'WEBHOOK_NOTIFY_SUB_LIMITED',
+    'WEBHOOK_TRIAL_TRAFFIC_LIMITED_DAILY': 'WEBHOOK_NOTIFY_SUB_LIMITED',
+    'WEBHOOK_TRIAL_TRAFFIC_LIMITED': 'WEBHOOK_NOTIFY_SUB_LIMITED',
     'WEBHOOK_SUB_TRAFFIC_RESET': 'WEBHOOK_NOTIFY_TRAFFIC_RESET',
     'WEBHOOK_SUB_DELETED': 'WEBHOOK_NOTIFY_SUB_DELETED',
     'WEBHOOK_SUB_REVOKED': 'WEBHOOK_NOTIFY_SUB_REVOKED',
@@ -946,6 +950,16 @@ class RemnaWaveWebhookService:
             ]
         )
 
+    def _get_trial_limited_keyboard(self, user: User) -> InlineKeyboardMarkup:
+        # Докупки трафика у пробного нет — одна кнопка сразу на экран оформления (ВК-3).
+        texts = get_texts(user.language)
+        subscribe_text = texts.get('FUNNEL_SUBSCRIBE_CTA', 'Get a subscription')
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [build_miniapp_or_callback_button(text=subscribe_text, callback_data='subscription_upgrade')],
+            ]
+        )
+
     async def _notify_user(
         self,
         user: User,
@@ -954,8 +968,9 @@ class RemnaWaveWebhookService:
         reply_markup: InlineKeyboardMarkup | None = None,
         format_kwargs: dict[str, Any] | None = None,
         subscription: Subscription | None = None,
-    ) -> None:
-        """Send a notification to user via appropriate channel.
+        silent: bool = False,
+    ) -> bool:
+        """Send a notification to user via appropriate channel; return whether it went out.
 
         Telegram users receive a bot message; email-only users receive
         an email and/or WebSocket notification through the unified
@@ -966,18 +981,18 @@ class RemnaWaveWebhookService:
         """
         if not settings.WEBHOOK_NOTIFY_USER_ENABLED:
             logger.debug('Webhook user notifications disabled globally, skipping', text_key=text_key)
-            return
+            return False
 
         setting_key = _TEXT_KEY_TO_SETTING.get(text_key)
         if setting_key and not getattr(settings, setting_key, True):
             logger.debug('Webhook notification disabled via', text_key=text_key, setting_key=setting_key)
-            return
+            return False
 
         texts = get_texts(user.language)
         message = texts.get(text_key)
         if not message:
             logger.warning('Missing locale key for language', text_key=text_key, language=user.language)
-            return
+            return False
 
         # Inject tariff_label for multi-tariff subscription identification
         if format_kwargs is None:
@@ -997,7 +1012,7 @@ class RemnaWaveWebhookService:
                 message = message.format(**format_kwargs)
             except (KeyError, IndexError):
                 logger.warning('Failed to format message with kwargs', text_key=text_key, format_kwargs=format_kwargs)
-                return
+                return False
 
         # Append "Close" button to every webhook notification keyboard
         close_text = texts.get('WEBHOOK_CLOSE_BUTTON', '✖️ Закрыть')
@@ -1012,21 +1027,38 @@ class RemnaWaveWebhookService:
         notification_type = _TEXT_KEY_TO_NOTIFICATION_TYPE.get(text_key)
         if not notification_type:
             logger.warning('No NotificationType mapping for text_key', text_key=text_key)
-            return
+            return False
 
         context = {'text_key': text_key, **(format_kwargs or {})}
 
         try:
-            await notification_delivery_service.send_notification(
+            return await notification_delivery_service.send_notification(
                 user=user,
                 notification_type=notification_type,
                 context=context,
                 bot=self.bot,
                 telegram_message=message,
                 telegram_markup=reply_markup,
+                telegram_silent=silent,
             )
         except Exception:
             logger.exception('Notification delivery failed for user , text_key', user_id=user.id, text_key=text_key)
+            return False
+
+    @staticmethod
+    def _event_used_traffic_gb(data: dict) -> float:
+        """Израсходованный трафик из события панели, ГБ: вложенный ``userTraffic`` (как в user.modified), иначе плоское
+        поле; нет поля — ноль (почти всегда это ночной сброс, после которого счётчик и так нулевой)."""
+        user_traffic = data.get('userTraffic')
+        used_bytes = (
+            user_traffic.get('usedTrafficBytes')
+            if isinstance(user_traffic, dict) and user_traffic.get('usedTrafficBytes') is not None
+            else data.get('usedTrafficBytes')
+        )
+        try:
+            return round(int(used_bytes or 0) / (1024**3), 2)
+        except (TypeError, ValueError):
+            return 0.0
 
     # ------------------------------------------------------------------
     # Webhook timestamp helper
@@ -1138,6 +1170,12 @@ class RemnaWaveWebhookService:
             return
 
         self._stamp_webhook_update(subscription)
+        # Из limited подписку возвращает ночной сброс трафика панелью (03:05 МСК). Счётчик берём из события: после
+        # ночного сброса панель шлёт уже обнулённый, после ручного «Enable» — настоящий. Без этого часовой обход трафика
+        # видит вчерашние гигабайты и громко пишет «лимит почти исчерпан». Сообщение о возврате — без звука (ВК-3).
+        traffic_came_back = subscription.status == SubscriptionStatus.LIMITED.value
+        if traffic_came_back:
+            await update_subscription_usage(db, subscription, self._event_used_traffic_gb(data))
         if subscription.status in (SubscriptionStatus.DISABLED.value, SubscriptionStatus.LIMITED.value):
             await reactivate_subscription(db, subscription)
             logger.info('Webhook: subscription re-enabled for user', subscription_id=subscription.id, user_id=user.id)
@@ -1145,7 +1183,11 @@ class RemnaWaveWebhookService:
             await db.commit()
 
         await self._notify_user(
-            user, 'WEBHOOK_SUB_ENABLED', reply_markup=self._get_connect_keyboard(user), subscription=subscription
+            user,
+            'WEBHOOK_SUB_ENABLED',
+            reply_markup=self._get_connect_keyboard(user),
+            subscription=subscription,
+            silent=traffic_came_back,
         )
 
     async def _handle_user_limited(
@@ -1167,9 +1209,28 @@ class RemnaWaveWebhookService:
         else:
             await db.commit()
 
-        await self._notify_user(
-            user, 'WEBHOOK_SUB_LIMITED', reply_markup=self._get_traffic_keyboard(user), subscription=subscription
-        )
+        if subscription.is_trial:
+            # Лимит пробного суточный, докупки нет — письмо ведёт на оформление. Число и режим сброса берём из
+            # самого события: это настоящий лимит этого человека, а не значение из настроек (ВК-3).
+            try:
+                limit_gb = int(data.get('trafficLimitBytes') or 0) // (1024**3)
+            except (TypeError, ValueError):
+                limit_gb = 0
+            daily = data.get('trafficLimitStrategy') == 'DAY' and limit_gb > 0
+            variant = 'trial_daily' if daily else 'trial'
+            sent = await self._notify_user(
+                user,
+                'WEBHOOK_TRIAL_TRAFFIC_LIMITED_DAILY' if daily else 'WEBHOOK_TRIAL_TRAFFIC_LIMITED',
+                reply_markup=self._get_trial_limited_keyboard(user),
+                format_kwargs={'limit_gb': limit_gb} if daily else None,
+                subscription=subscription,
+            )
+        else:
+            variant = 'paid'
+            sent = await self._notify_user(
+                user, 'WEBHOOK_SUB_LIMITED', reply_markup=self._get_traffic_keyboard(user), subscription=subscription
+            )
+        logger.info('Письмо о лимите трафика', subscription_id=subscription.id, variant=variant, sent=sent)
 
     async def _handle_user_traffic_reset(
         self, db: AsyncSession, user: User, subscription: Subscription | None, data: dict
