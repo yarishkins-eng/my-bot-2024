@@ -29,7 +29,7 @@ from app.services.remnawave_service import RemnaWaveService
 from app.services.version_service import version_service
 
 from ..dependencies import get_cabinet_db, require_permission
-from .admin_sales_stats import owner_people_tiles
+from .admin_sales_stats import dashboard_money, owner_people_tiles
 
 
 logger = structlog.get_logger(__name__)
@@ -365,6 +365,42 @@ async def get_dashboard_stats(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to load dashboard statistics',
+        )
+
+
+class MoneyDay(BaseModel):
+    date: str
+    kopeks: int
+
+
+class MoneyMonth(BaseModel):
+    month: str
+    kopeks: int
+
+
+class DashboardMoneyResponse(BaseModel):
+    """«Пришло денег» для экрана «Статистика»: правило экрана продаж и утреннего письма, сутки и месяцы по Москве."""
+
+    today_kopeks: int
+    month_kopeks: int
+    total_kopeks: int
+    days: list[MoneyDay]
+    months: list[MoneyMonth]
+
+
+@router.get('/money', response_model=DashboardMoneyResponse)
+async def get_dashboard_money(
+    admin: User = Depends(require_permission('stats:read')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> DashboardMoneyResponse:
+    """Деньги на экран «Статистика» (СП-1б): вернули снятые СП-1 суммы и добавили месяцы — решение владельца 27.09."""
+    try:
+        return DashboardMoneyResponse(**await dashboard_money(db, datetime.now(UTC)))
+    except Exception as error:
+        logger.error('Failed to get dashboard money', error=error, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load money',
         )
 
 

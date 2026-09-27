@@ -324,6 +324,41 @@ async def _money_in(db: AsyncSession, start: datetime, end: datetime) -> dict[st
     return {'deposits': deposits[0], 'receipts': receipts[0], 'kopeks': deposits[1] + receipts[1]}
 
 
+async def dashboard_money(db: AsyncSession, now: datetime) -> dict:
+    """Деньги для экрана «Статистика» (СП-1б): те же проводки, что «Пришло живых денег» (как выписка Platega), по
+    суткам и месяцам Москвы — сегодня, этот месяц, всё время, 30 дней, все месяцы. Проводок с деньгами единицы в
+    день, поэтому раскладываем в Python, а не часовыми поясами базы: одно и то же и на боевом, и в SQLite тестов."""
+    rows = (
+        await db.execute(
+            select(Transaction.created_at, func.abs(Transaction.amount_kopeks))
+            .join(User, User.id == Transaction.user_id)
+            .where(_money_in_filter(), Transaction.created_at < now)
+        )
+    ).all()
+    today = now.astimezone(_MSK).date()
+    by_day = {today - timedelta(days=offset): 0 for offset in range(29, -1, -1)}
+    by_month: dict[date, int] = {}
+    for created_at, kopeks in rows:
+        at = created_at if created_at.tzinfo else created_at.replace(tzinfo=UTC)
+        day = at.astimezone(_MSK).date()
+        by_month[day.replace(day=1)] = by_month.get(day.replace(day=1), 0) + int(kopeks)
+        if day in by_day:
+            by_day[day] += int(kopeks)
+    months = []
+    month = min(by_month, default=today.replace(day=1))
+    while month <= today:
+        # месяц без денег — строка с нулём, а не дыра в ряду
+        months.append({'month': month.strftime('%Y-%m'), 'kopeks': by_month.get(month, 0)})
+        month = (month + timedelta(days=32)).replace(day=1)
+    return {
+        'today_kopeks': by_day[today],
+        'month_kopeks': by_month.get(today.replace(day=1), 0),
+        'total_kopeks': sum(by_month.values()),
+        'days': [{'date': day.isoformat(), 'kopeks': kopeks} for day, kopeks in by_day.items()],
+        'months': months,
+    }
+
+
 async def _subscription_people(db: AsyncSession, rules: _OwnerRules, *conditions) -> list:
     """Живые люди, плательщики, с подпиской на платном тарифе (не пробной) под условием — по строке на человека,
     с ближайшим по времени концом. Одно определение для числа на плитке и для списка под ней."""

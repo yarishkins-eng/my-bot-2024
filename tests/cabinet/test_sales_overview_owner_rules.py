@@ -889,3 +889,59 @@ async def test_ending_soon_list_does_not_depend_on_the_period_even_without_custo
 
     assert response.kind == 'ending_soon'
     assert error.value.status_code == 400  # «Не продлили» за период — без дат периода нет
+
+
+# ---------- СП-1б: деньги для экрана «Статистика» ----------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_money_is_the_statement_by_moscow_days_and_months() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    client = seed.user()
+    # 23:30 МСК 26.09 — ещё 26-е, 00:30 МСК 27.09 — уже 27-е (по Гринвичу оба — 26-е)
+    seed.tx(client, 'deposit', 10000, method='platega', at='2026-09-26 20:30:00.000000')
+    seed.tx(client, 'deposit', 20000, method='platega', at='2026-09-26 21:30:00.000000')
+    seed.paid_card(client, at=SEP_05)  # оплата сразу: приход кассы — деньги, списание — нет
+    seed.tx(client, 'deposit', 111, method='platega', at=SEP_FIRST_MIDNIGHT)
+    seed.tx(client, 'deposit', 222, method='platega', at=AUG_LAST_MINUTE)
+    seed.tx(client, 'deposit', 30000, method='platega', at='2026-06-20 12:00:00.000000')  # июль без денег
+    stand = seed.user(telegram_id=ENV_STAND_TELEGRAM_ID)
+    seed.paid_card(stand, at=SEP_05)  # стенд — в выписке есть, значит и здесь
+    # не деньги: бонус, реферальная пометка, незавершённое, ещё не наступившее
+    seed.tx(client, 'deposit', 5000, method=None, description='Бонус за регистрацию', at=SEP_05)
+    seed.tx(client, 'deposit', 4700, method='platega', description='реферальный бонус', at=SEP_05)
+    seed.tx(client, 'deposit', 99900, method='platega', at=SEP_05, completed=False)
+    seed.tx(client, 'deposit', 7777, method='platega', at='2026-09-27 09:00:00.000000')
+    session.commit()
+
+    with _patches()[2]:
+        db = _AsyncOverSync(session)
+        money = await module.dashboard_money(db, NOW)
+        september = await module._money_in(db, _msk(2026, 9, 1), NOW)
+
+    days = {item['date']: item['kopeks'] for item in money['days']}
+    assert (len(days), min(days), max(days)) == (30, '2026-08-29', '2026-09-27')
+    assert (days['2026-09-26'], days['2026-09-27'], days['2026-09-01'], days['2026-08-31']) == (10000, 20000, 111, 222)
+    assert days['2026-09-05'] == 14900 * 2
+    assert money['today_kopeks'] == 20000
+    # тот же месяц, что «Пришло живых денег» на экране продаж, — до копейки
+    assert money['month_kopeks'] == september['kopeks'] == 10000 + 20000 + 14900 * 2 + 111
+    assert money['months'] == [
+        {'month': '2026-06', 'kopeks': 30000},
+        {'month': '2026-07', 'kopeks': 0},
+        {'month': '2026-08', 'kopeks': 222},
+        {'month': '2026-09', 'kopeks': money['month_kopeks']},
+    ]
+    assert money['total_kopeks'] == 30000 + 222 + money['month_kopeks']
+
+
+@pytest.mark.asyncio
+async def test_dashboard_money_without_any_money_is_zeros_not_a_failure() -> None:
+    session = _schema()
+    with _patches()[2]:
+        money = await module.dashboard_money(_AsyncOverSync(session), NOW)
+
+    assert (money['today_kopeks'], money['month_kopeks'], money['total_kopeks']) == (0, 0, 0)
+    assert money['months'] == [{'month': '2026-09', 'kopeks': 0}]
+    assert len(money['days']) == 30 and all(item['kopeks'] == 0 for item in money['days'])

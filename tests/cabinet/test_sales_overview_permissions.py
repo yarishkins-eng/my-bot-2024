@@ -9,11 +9,11 @@ import pytest
 from fastapi import FastAPI
 
 from app.cabinet.dependencies import get_cabinet_db, get_current_cabinet_user
-from app.cabinet.routes import admin_sales_stats
+from app.cabinet.routes import admin_sales_stats, admin_stats
 from app.services.permission_service import PermissionService
 
 
-async def _request(monkeypatch: pytest.MonkeyPatch, path: str, granted: set[str]):
+async def _request(monkeypatch: pytest.MonkeyPatch, path: str, granted: set[str], router=admin_sales_stats.router):
     async def check(db, user, permission, **_kwargs):
         return permission in granted, 'test denial'
 
@@ -21,7 +21,7 @@ async def _request(monkeypatch: pytest.MonkeyPatch, path: str, granted: set[str]
     monkeypatch.setattr(PermissionService, 'check_permission', checker)
     monkeypatch.setattr(PermissionService, 'log_action', AsyncMock())
     app = FastAPI()
-    app.include_router(admin_sales_stats.router, prefix='/cabinet')
+    app.include_router(router, prefix='/cabinet')
     db = SimpleNamespace(commit=AsyncMock())
 
     async def database():
@@ -53,3 +53,12 @@ async def test_ads_need_campaign_stats_too(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert response.status_code == 403
     assert asked == ['sales_stats:read', 'campaigns:stats']
+
+
+@pytest.mark.asyncio
+async def test_statistics_money_needs_the_same_right_as_the_statistics_screen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Деньги на «Статистике» (СП-1б) видит тот же, кто видел их там до СП-1: право `stats:read`, как у `/dashboard`."""
+    response, asked = await _request(monkeypatch, '/cabinet/admin/stats/money', set(), router=admin_stats.router)
+
+    assert response.status_code == 403
+    assert asked == ['stats:read']
