@@ -71,6 +71,21 @@ async def test_dashboard_carries_owner_tiles_next_to_the_old_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_rollback_does_not_take_the_dashboard_down() -> None:
+    db = SimpleNamespace(rollback=AsyncMock(side_effect=RuntimeError('connection lost')))
+    patches = _dashboard_patches(AsyncMock(side_effect=RuntimeError('database went away')))
+    for item in patches:
+        item.start()
+    try:
+        stats = await admin_stats.get_dashboard_stats(admin=None, db=db)
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert stats.subscriptions.people_paying is None and stats.subscriptions.trial == 58
+
+
+@pytest.mark.asyncio
 async def test_owner_tiles_failure_leaves_the_dashboard_alive_with_dashes() -> None:
     stats, db = await _dashboard(AsyncMock(side_effect=RuntimeError('database went away')))
 
@@ -142,6 +157,48 @@ def test_response_contracts_with_the_cabinet() -> None:
         'end_date',
         'autopay_enabled',
         'balance_kopeks',
+    }
+    assert set(admin_sales_stats.SalesWindowInfo.model_fields) == {'start', 'end', 'previous_start', 'previous_end'}
+    assert set(admin_sales_stats.SalesPeopleResponse.model_fields) == {'kind', 'total', 'items'}
+    assert set(admin_sales_stats.SalesAdsResponse.model_fields) == {
+        'campaigns_total',
+        'campaigns_with_spend',
+        'mature_spend_kopeks',
+        'mature_buyers',
+        'mature_cost_per_buyer_kopeks',
+        'mature_receipts_kopeks',
+        'fresh_spend_kopeks',
+        'fresh_buyers',
+        'campaigns',
+    }
+    # кабинет рисует «—» ровно там, где бот может прислать null — остальные поля обязаны быть всегда
+    nullable = {
+        (model.__name__, name)
+        for model in (
+            admin_sales_stats.SalesWindowInfo,
+            admin_sales_stats.SalesMoneyStats,
+            admin_sales_stats.SalesPurchaseStats,
+            admin_sales_stats.SalesPersonItem,
+            admin_sales_stats.SalesAdCampaign,
+            admin_sales_stats.SalesAdsResponse,
+        )
+        for name, field in model.model_fields.items()
+        if not field.is_required()
+    }
+    assert nullable == {
+        ('SalesWindowInfo', 'previous_start'),
+        ('SalesWindowInfo', 'previous_end'),
+        ('SalesMoneyStats', 'previous_received_kopeks'),
+        ('SalesMoneyStats', 'previous_comparable'),
+        ('SalesPurchaseStats', 'previous_first_count'),
+        ('SalesPersonItem', 'name'),
+        ('SalesPersonItem', 'username'),
+        ('SalesPersonItem', 'telegram_id'),
+        ('SalesPersonItem', 'tariff_name'),
+        ('SalesPersonItem', 'autopay_enabled'),
+        ('SalesPersonItem', 'balance_kopeks'),
+        ('SalesAdCampaign', 'cost_per_buyer_kopeks'),
+        ('SalesAdsResponse', 'mature_cost_per_buyer_kopeks'),
     }
     assert set(admin_sales_stats.SalesAdCampaign.model_fields) == {
         'campaign_id',

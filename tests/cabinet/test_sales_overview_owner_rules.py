@@ -246,6 +246,34 @@ def test_last_month_is_the_whole_previous_moscow_month() -> None:
     assert (window.previous_start, window.previous_end) == (_msk(2026, 7, 1), _msk(2026, 8, 1))
 
 
+@pytest.mark.parametrize(
+    ('now', 'start', 'end', 'previous_start'),
+    [
+        # 1 октября: сентябрь (30 дней) сравнивается с ЦЕЛЫМ августом (31 день), а не с «1–30 августа»
+        (_msk(2026, 10, 1, 10), _msk(2026, 9, 1), _msk(2026, 10, 1), _msk(2026, 8, 1)),
+        # 2 марта: февраль сравнивается с целым январём
+        (_msk(2027, 3, 2, 10), _msk(2027, 2, 1), _msk(2027, 3, 1), _msk(2027, 1, 1)),
+    ],
+)
+def test_last_month_compares_with_the_whole_month_before(now, start, end, previous_start) -> None:
+    window = module._sales_window('last_month', None, None, now)
+    assert (window.start, window.end) == (start, end)
+    assert (window.previous_start, window.previous_end) == (previous_start, start)
+
+
+def test_custom_window_that_reaches_now_compares_with_the_same_hour_a_day_earlier() -> None:
+    window = module._sales_window('custom', '2026-09-27', '2026-09-27', NOW)
+    assert (window.start, window.end) == (_msk(2026, 9, 27), NOW)
+    assert (window.previous_start, window.previous_end) == (_msk(2026, 9, 26), NOW - timedelta(days=1))
+
+
+@pytest.mark.parametrize(('start', 'end'), [('0001-01-01', '0001-01-02'), ('9999-12-30', '9999-12-31')])
+def test_custom_dates_at_the_edge_of_the_calendar_are_a_400_not_a_500(start, end) -> None:
+    with pytest.raises(HTTPException) as error:
+        module._sales_window('custom', start, end, NOW)
+    assert error.value.status_code == 400
+
+
 def test_seven_days_is_today_and_six_before_compared_with_the_same_window_a_week_earlier() -> None:
     window = module._sales_window('7d', None, None, NOW)
     assert (window.start, window.end) == (_msk(2026, 9, 21), NOW)
@@ -592,6 +620,43 @@ async def test_percent_is_not_comparable_when_the_previous_window_starts_before_
 
 
 @pytest.mark.asyncio
+async def test_extended_trial_is_not_finished_even_after_three_days() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    # взял пробный 10.09, ему продлили до 2099 — пробный идёт, «закончился» про него неправда (ревью C3-1)
+    extended = seed.user(created_at='2026-09-10 12:00:00.000000')
+    seed.activation(extended, at='2026-09-10 12:00:00.000000')
+    seed.sub(
+        extended, tariff_id=5, is_trial=True, end='2099-01-01 00:00:00.000000', created_at='2026-09-10 12:00:00.000000'
+    )
+    ended = seed.user(created_at='2026-09-11 12:00:00.000000')
+    seed.activation(ended, at='2026-09-11 12:00:00.000000')
+    seed.sub(
+        ended,
+        tariff_id=5,
+        is_trial=True,
+        end='2026-09-14 12:00:00.000000',
+        status='expired',
+        created_at='2026-09-11 12:00:00.000000',
+    )
+    # срок вышел, а сторож ещё не перевёл строку в «истекла» — пробный всё равно закончился
+    not_flipped = seed.user(created_at='2026-09-12 12:00:00.000000')
+    seed.activation(not_flipped, at='2026-09-12 12:00:00.000000')
+    seed.sub(
+        not_flipped,
+        tariff_id=5,
+        is_trial=True,
+        end='2026-09-15 12:00:00.000000',
+        created_at='2026-09-12 12:00:00.000000',
+    )
+    session.commit()
+
+    overview = await _overview(session, module._sales_window('this_month', None, None, NOW))
+
+    assert overview.trial.model_dump() == {'came': 3, 'took_trial': 3, 'trial_finished': 2, 'bought_after_trial': 0}
+
+
+@pytest.mark.asyncio
 async def test_yesterday_has_no_finished_trials_yet() -> None:
     session = _schema()
     seed = _Seed(session)
@@ -701,7 +766,8 @@ async def test_ads_split_mature_and_fresh_campaigns_and_skip_the_ones_without_sp
             "(3, 'Канал Б 4500', NULL, '2026-08-14 12:00:00.000000'),"
             "(14, 'Канал В 12к', 1200000, '2026-09-22 12:00:00.000000'),"
             "(15, 'канал-г', 100, '2026-09-23 12:00:00.000000'),"
-            "(20, 'старая без лидов', 5000, '2026-08-01 12:00:00.000000')"
+            "(20, 'старая без лидов', 5000, '2026-08-01 12:00:00.000000'),"
+            "(21, 'свой канал', 0, '2026-08-01 12:00:00.000000')"
         )
     )
     session.commit()
@@ -711,13 +777,14 @@ async def test_ads_split_mature_and_fresh_campaigns_and_skip_the_ones_without_sp
         14: _performance(37, 37, 1, 14900, 1200000),  # все лиды моложе 7 суток — рано судить
         15: _performance(0, 0, 0, 0, 100),  # лидов нет, заведена 4 дня назад — рано
         20: _performance(0, 0, 0, 0, 5000),  # лидов нет, заведена давно — зрелая, пустая трата
+        21: _performance(40, 0, 6, 89400, 0),  # расход 0 ₽ — не покупная реклама, в расчёт не идёт
     }
     reader = AsyncMock(side_effect=lambda db, campaign_id, now: performances[campaign_id])
 
     with patch.object(module, 'get_campaign_performance', reader):
         ads = await module._ads(_AsyncOverSync(session), NOW)
 
-    assert (ads.campaigns_total, ads.campaigns_with_spend) == (5, 4)
+    assert (ads.campaigns_total, ads.campaigns_with_spend) == (6, 4)
     assert (ads.mature_spend_kopeks, ads.mature_buyers, ads.mature_cost_per_buyer_kopeks) == (705000, 5, 141000)
     assert ads.mature_receipts_kopeks == 322309
     assert (ads.fresh_spend_kopeks, ads.fresh_buyers) == (1200100, 1)
@@ -728,6 +795,7 @@ async def test_ads_split_mature_and_fresh_campaigns_and_skip_the_ones_without_sp
         ('канал-г', True, None),
     ]
     assert all(call.kwargs['now'] == NOW for call in reader.await_args_list)
+    assert 21 not in [call.args[1] for call in reader.await_args_list]
 
 
 # ---------- СП-1.5: верх панели администратора ----------
@@ -764,3 +832,28 @@ async def test_new_buyers_today_are_first_purchases_since_moscow_midnight_by_peo
         tiles = await module.owner_people_tiles(_AsyncOverSync(session), NOW)
 
     assert tiles == {'on_trial': 35, 'paying': 68, 'new_buyers_today': 1}
+
+
+@pytest.mark.asyncio
+async def test_ending_soon_list_does_not_depend_on_the_period_even_without_custom_dates() -> None:
+    session = _schema()
+    _seed_september(_Seed(session))
+    session.commit()
+
+    first, second, third = _patches()
+    with first, second, third:
+        response = await module.get_sales_people(
+            kind='ending_soon', period='custom', start_date=None, end_date=None, admin=None, db=_AsyncOverSync(session)
+        )
+        with pytest.raises(HTTPException) as error:
+            await module.get_sales_people(
+                kind='not_renewed',
+                period='custom',
+                start_date=None,
+                end_date=None,
+                admin=None,
+                db=_AsyncOverSync(session),
+            )
+
+    assert response.kind == 'ending_soon'
+    assert error.value.status_code == 400  # «Не продлили» за период — без дат периода нет

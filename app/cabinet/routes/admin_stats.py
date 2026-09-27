@@ -263,7 +263,10 @@ async def _owner_people_tiles_or_none(db: AsyncSession) -> dict[str, int] | None
         return await owner_people_tiles(db, datetime.now(UTC))
     except Exception as error:
         logger.warning('Dashboard owner tiles failed', error=error)
-        await db.rollback()
+        try:
+            await db.rollback()
+        except Exception as rollback_error:  # сбой отката не должен ронять весь /dashboard (ревью C1-9)
+            logger.warning('Dashboard owner tiles rollback failed', error=rollback_error)
         return None
 
 

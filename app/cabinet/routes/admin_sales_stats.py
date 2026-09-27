@@ -139,6 +139,9 @@ def _sales_window(period: str, start_date: str | None, end_date: str | None, now
             month_start = (month_start - timedelta(days=1)).replace(day=1)
         start = _msk_midnight(month_start)
         previous_start = _msk_midnight((month_start - timedelta(days=1)).replace(day=1))
+        if period == 'last_month':
+            # закрытый месяц сравнивается с ЦЕЛЫМ месяцем перед ним, а не с «теми же числами» (ревью C1-6, C2-1)
+            return _SalesWindow(start, end, previous_start, start)
         return _SalesWindow(start, end, previous_start, min(previous_start + (end - start), start))
     if period in _PERIOD_DAYS:
         days = _PERIOD_DAYS[period]
@@ -153,9 +156,16 @@ def _sales_window(period: str, start_date: str | None, end_date: str | None, now
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid custom period')
         if first > last or (last - first).days > MAX_PERIOD_DAYS:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid custom period')
-        start = _msk_midnight(first)
-        end = max(start, min(_msk_midnight(last + timedelta(days=1)), now))
-        return _SalesWindow(start, end, start - (end - start), start)
+        days = timedelta(days=(last - first).days + 1)
+        try:
+            start = _msk_midnight(first)
+            end = max(start, min(_msk_midnight(last + timedelta(days=1)), now))
+            # сравнение — то же окно на целые сутки раньше, как у 7/30/90: окно, кончающееся «сейчас», сравнивается с
+            # тем же часом N суток назад, а не с отрезком, начатым посреди суток (ревью C1-2)
+            return _SalesWindow(start, end, start - days, end - days)
+        except (OverflowError, ValueError):
+            # год 0001 или 9999 из подделанной ссылки — отказ, а не голая 500 (ревью C5-2)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid custom period')
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unknown period')
 
 
@@ -265,6 +275,21 @@ async def _trial_starts(db: AsyncSession) -> dict[int, datetime]:
             if started_at is not None and (user_id not in starts or started_at < starts[user_id]):
                 starts[user_id] = started_at
     return starts
+
+
+async def _live_trial_user_ids(db: AsyncSession, now: datetime) -> set[int]:
+    trial_tariff = await get_trial_tariff(db)
+    if trial_tariff is None:
+        return set()
+    rows = await db.execute(
+        select(Subscription.user_id).where(
+            Subscription.tariff_id == trial_tariff.id,
+            Subscription.is_trial.is_(True),
+            Subscription.status.in_(sorted(ALIVE_SUBSCRIPTION_STATUSES)),
+            Subscription.end_date > now,
+        )
+    )
+    return set(rows.scalars().all())
 
 
 def _money_in_filter():
@@ -1713,7 +1738,11 @@ async def _build_overview(db: AsyncSession, window: _SalesWindow, now: datetime)
     )
     took = {user_id for user_id in came if user_id in trial_starts}
     trial_length = timedelta(days=int(settings.TRIAL_DURATION_DAYS))
-    finished = {user_id for user_id in took if trial_starts[user_id] + trial_length <= now}
+    live_trial = await _live_trial_user_ids(db, now)
+    # продлённый пробный ещё идёт — человек не «закончил», хотя три дня прошли (ревью C3-1, id 378 до 10.10)
+    finished = {
+        user_id for user_id in took if trial_starts[user_id] + trial_length <= now and user_id not in live_trial
+    }
     bought = {user_id for user_id in finished if user_id in first and first[user_id].at >= trial_starts[user_id]}
 
     return SalesOverviewResponse(
@@ -1828,7 +1857,12 @@ async def get_sales_people(
 ) -> SalesPeopleResponse:
     """Кто за плитками «Не продлили» (за выбранный период) и «Кончится в ближайшие 7 дней» (сейчас)."""
     now = datetime.now(UTC)
-    window = _sales_window(period, start_date, end_date, now)
+    # «Кончится» считается от «сейчас» и от периода не зависит: «Свой» без дат не должен ронять этот список (C6-4)
+    window = (
+        _sales_window(period, start_date, end_date, now)
+        if kind == 'not_renewed'
+        else _SalesWindow(now, now, None, None)
+    )
     try:
         items = await _people_items(db, kind, window, now)
         return SalesPeopleResponse(kind=kind, total=len(items), items=items)
@@ -1879,7 +1913,9 @@ async def _ads(db: AsyncSession, now: datetime) -> SalesAdsResponse:
     ).all()
     campaigns: list[SalesAdCampaign] = []
     for campaign_id, name, spend, created_at in rows:
-        if spend is None:
+        # расход не указан или 0 ₽ («осознанно без расхода») — это не покупная реклама: такие покупатели
+        # занизили бы «покупатель ≈» у платных кампаний (ревью C1-4)
+        if not spend:
             continue
         performance = await get_campaign_performance(db, campaign_id, now=now)
         if performance is None:
