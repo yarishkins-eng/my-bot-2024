@@ -432,6 +432,16 @@ async def test_not_renewed_and_ending_soon_are_payers_on_paid_tariffs_one_row_ea
     disabled = seed.user()
     seed.paid_card(disabled, at=AUG_10)
     seed.sub(disabled, tariff_id=3, is_trial=False, end='2026-10-01 10:00:00.000000', status='disabled')
+    # платил, но сидит на ПРОБНОМ тарифе без пометки «пробная» (на боевом так было у пользователя 196) —
+    # пробный тариф не платный, ни «не продлил», ни «кончится» про него не говорят
+    trial_tariff_payer = seed.user()
+    seed.paid_card(trial_tariff_payer, at=AUG_10)
+    seed.sub(trial_tariff_payer, tariff_id=5, is_trial=False, end=SEP_20, status='expired')
+    seed.sub(trial_tariff_payer, tariff_id=5, is_trial=False, end='2026-10-01 11:00:00.000000')
+    # легаси-подписка без тарифа у плательщика — платная (как «Пользователи»)
+    legacy_tariff = seed.user()
+    seed.paid_card(legacy_tariff, at=AUG_10)
+    seed.sub(legacy_tariff, tariff_id=None, is_trial=False, end='2026-10-02 11:00:00.000000')
     session.commit()
 
     window = module._sales_window('this_month', None, None, NOW)
@@ -445,5 +455,5 @@ async def test_not_renewed_and_ending_soon_are_payers_on_paid_tariffs_one_row_ea
         True,
         'Базовый',
     )
-    assert [row[0] for row in ending_soon] == [ending, limited]
+    assert [row[0] for row in ending_soon] == [ending, legacy_tariff, limited]
     assert ending_soon[0][6].replace(tzinfo=None) == datetime(2026, 10, 1, 10)  # ближайший срок человека
