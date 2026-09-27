@@ -347,6 +347,19 @@ async def _ending_soon(db: AsyncSession, rules: _OwnerRules, now: datetime) -> l
     )
 
 
+async def owner_people_tiles(db: AsyncSession, now: datetime) -> dict[str, int]:
+    """Плитки верха панели администратора: «Платят / На пробном» — функцией экрана «Пользователи», «+N сегодня» —
+    новые покупатели с 00:00 МСК тем же определением первой покупки, что экран продаж (ревью L4-7)."""
+    people_now = await count_trial_and_paying_users(db)
+    _, first = await _payer_purchases(db, await _owner_rules(db))
+    today_start = _msk_midnight(now.astimezone(_MSK).date())
+    return {
+        'on_trial': int(people_now.get('on_trial') or 0),
+        'paying': int(people_now.get('paying') or 0),
+        'new_buyers_today': sum(1 for purchase in first.values() if today_start <= purchase.at <= now),
+    }
+
+
 # ============ Summary Schemas ============
 
 
@@ -1542,6 +1555,8 @@ async def get_payment_health(
     days: int | None = Query(default=30),
     start_date: str | None = Query(default=None),
     end_date: str | None = Query(default=None),
+    # СП-1: новый экран шлёт имя кнопки — окно в сутках МСК; без него — как раньше (старый кабинет)
+    period: SalesPeriod | None = Query(default=None),
     admin: User = Depends(require_permission('sales_stats:read')),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> PaymentHealthResponse:
@@ -1552,9 +1567,12 @@ async def get_payment_health(
     (REFUND with no payment_method) — a signal of how often purchases error out,
     NOT money returned to customers.
     """
-    try:
+    if period is not None:
+        window = _sales_window(period, start_date, end_date, datetime.now(UTC))
+        period_start, period_end = window.start, window.end
+    else:
         period_start, period_end = _parse_period(days, start_date, end_date)
-
+    try:
         gateways = await get_gateway_success_rates(db, period_start, period_end)
         total_attempts = sum(g['total'] for g in gateways)
         total_paid = sum(g['paid'] for g in gateways)

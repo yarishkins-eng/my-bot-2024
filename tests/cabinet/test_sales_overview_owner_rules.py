@@ -728,3 +728,39 @@ async def test_ads_split_mature_and_fresh_campaigns_and_skip_the_ones_without_sp
         ('канал-г', True, None),
     ]
     assert all(call.kwargs['now'] == NOW for call in reader.await_args_list)
+
+
+# ---------- СП-1.5: верх панели администратора ----------
+
+
+@pytest.mark.asyncio
+async def test_new_buyers_today_are_first_purchases_since_moscow_midnight_by_people() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    today_new = seed.user()
+    seed.paid_card(today_new, at='2026-09-26 21:00:00.000000')  # 00:00 МСК 27.09 — первая секунда суток
+    renewal_today = seed.user()
+    seed.paid_card(renewal_today, at=AUG_10)
+    seed.tx(
+        renewal_today,
+        'subscription_payment',
+        -14900,
+        method='balance',
+        description='Продление',
+        at='2026-09-27 05:00:00.000000',
+    )
+    yesterday_late = seed.user()
+    seed.paid_card(yesterday_late, at='2026-09-26 20:59:00.000000')  # 23:59 МСК 26.09 — вчера
+    friend = seed.user()
+    seed.sub(friend, tariff_id=4, is_trial=True, end='2031-12-21 00:00:00.000000')
+    seed.paid_card(friend, at='2026-09-27 06:00:00.000000')
+    stand = seed.user(telegram_id=ENV_STAND_TELEGRAM_ID)
+    seed.paid_card(stand, at='2026-09-27 06:00:00.000000')
+    session.commit()
+
+    first, second, third = _patches()
+    counts = AsyncMock(return_value={'paying': 68, 'on_trial': 35})
+    with first, second, third, patch.object(module, 'count_trial_and_paying_users', counts):
+        tiles = await module.owner_people_tiles(_AsyncOverSync(session), NOW)
+
+    assert tiles == {'on_trial': 35, 'paying': 68, 'new_buyers_today': 1}
