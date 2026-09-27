@@ -1,14 +1,20 @@
 """Admin routes for sales statistics in cabinet."""
 
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, timedelta
+from typing import Literal
+from zoneinfo import ZoneInfo
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import Integer as SAInteger, and_, case, cast, func, select
+from sqlalchemy import Integer as SAInteger, and_, case, cast, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.database.crud.payment_gateway_stats import get_gateway_success_rates
+from app.database.crud.subscription import ALIVE_SUBSCRIPTION_STATUSES
+from app.database.crud.tariff import get_all_tariffs, get_trial_tariff
 from app.database.crud.transaction import (
     REAL_PAYMENT_METHODS,
     addon_description_clause,
@@ -20,6 +26,7 @@ from app.database.models import (
     PaymentMethod,
     Subscription,
     SubscriptionConversion,
+    SubscriptionEvent,
     SubscriptionStatus,
     Tariff,
     TrafficPurchase,
@@ -27,6 +34,8 @@ from app.database.models import (
     TransactionType,
     User,
 )
+from app.services.reporting_service import reporting_service
+from app.utils.user_utils import operational_person_clause, real_payment_user_ids
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -86,6 +95,253 @@ def _parse_period(
         return start, now
     # Default: all time (from epoch)
     return datetime(2020, 1, 1, tzinfo=UTC), now
+
+
+# ============ СП-1: окно в сутках МСК и определения владельца ============
+#
+# Правила владельца (27.09.2026): Team не попадает никуда; пробный — только тариф «Пробный»; платит — только
+# кто платил деньгами; стенды и удалённые — не люди; деньги — как выписка Platega (со стендами, как утреннее
+# письмо). `_parse_period` выше НЕ трогается: его зовут прежние маршруты и старый кабинет (ревью замысла, W2-1).
+
+_MSK = ZoneInfo('Europe/Moscow')
+_PERIOD_DAYS = {'7d': 7, '30d': 30, '90d': 90}
+SalesPeriod = Literal['yesterday', 'this_month', 'last_month', '7d', '30d', '90d', 'all', 'custom']
+
+
+@dataclass(frozen=True)
+class _SalesWindow:
+    start: datetime
+    end: datetime
+    previous_start: datetime | None
+    previous_end: datetime | None
+
+
+def _msk_midnight(day: date) -> datetime:
+    return datetime.combine(day, time.min, tzinfo=_MSK).astimezone(UTC)
+
+
+def _sales_window(period: str, start_date: str | None, end_date: str | None, now: datetime) -> _SalesWindow:
+    """Окно по кнопке периода: сутки МСК, `[начало, конец)`, конец не позже «сейчас». Кабинет шлёт имя кнопки,
+    а не даты по часам телефона. Сравнение — окно той же прошедшей длины перед ним; у месяца — те же числа
+    прошлого месяца до того же часа, но не дальше его конца (31-е число, февраль)."""
+    today = now.astimezone(_MSK).date()
+    if period == 'yesterday':
+        start, end = _msk_midnight(today - timedelta(days=1)), _msk_midnight(today)
+        return _SalesWindow(start, end, start - timedelta(days=1), start)
+    if period in ('this_month', 'last_month'):
+        month_start = today.replace(day=1)
+        end = now
+        if period == 'last_month':
+            end = _msk_midnight(month_start)
+            month_start = (month_start - timedelta(days=1)).replace(day=1)
+        start = _msk_midnight(month_start)
+        previous_start = _msk_midnight((month_start - timedelta(days=1)).replace(day=1))
+        return _SalesWindow(start, end, previous_start, min(previous_start + (end - start), start))
+    if period in _PERIOD_DAYS:
+        days = _PERIOD_DAYS[period]
+        start = _msk_midnight(today - timedelta(days=days - 1))
+        return _SalesWindow(start, now, start - timedelta(days=days), now - timedelta(days=days))
+    if period == 'all':
+        return _SalesWindow(datetime(2020, 1, 1, tzinfo=UTC), now, None, None)
+    if period == 'custom':
+        try:
+            first, last = date.fromisoformat(start_date or ''), date.fromisoformat(end_date or '')
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid custom period')
+        if first > last or (last - first).days > MAX_PERIOD_DAYS:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid custom period')
+        start = _msk_midnight(first)
+        end = max(start, min(_msk_midnight(last + timedelta(days=1)), now))
+        return _SalesWindow(start, end, start - (end - start), start)
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unknown period')
+
+
+@dataclass(frozen=True)
+class _OwnerRules:
+    """Тарифы по правилам владельца. Team — бесплатный тариф, который НЕ пробный: голый `is_free` нельзя, у
+    «Пробного» цены тоже нулевые (`{"5": 0}` на боевом). Платный — ни бесплатный, ни пробный (как «Пользователи»)."""
+
+    team_tariff_ids: tuple[int, ...]
+    not_paid_tariff_ids: tuple[int, ...]
+
+    @property
+    def people(self):
+        """«Человек» для чисел людей: не удалён и не стенд (как письмо и «Пользователи») и не друг из Team — ни
+        одной подписки на Team, ни живой, ни прошлой."""
+        if not self.team_tariff_ids:
+            return operational_person_clause()
+        # своя копия таблицы подписок: внешний запрос сам может идти по подпискам, и без неё подзапрос
+        # сросся бы с ним вместо того, чтобы искать ЛЮБУЮ подписку человека на Team
+        team_subscription = aliased(Subscription)
+        in_team = select(team_subscription.id).where(
+            team_subscription.user_id == User.id, team_subscription.tariff_id.in_(self.team_tariff_ids)
+        )
+        return and_(operational_person_clause(), ~in_team.exists())
+
+    @property
+    def paid_tariff(self):
+        if not self.not_paid_tariff_ids:
+            return true()
+        return or_(Subscription.tariff_id.is_(None), Subscription.tariff_id.not_in(self.not_paid_tariff_ids))
+
+
+async def _owner_rules(db: AsyncSession) -> _OwnerRules:
+    tariffs = await get_all_tariffs(db, include_inactive=True)
+    return _OwnerRules(
+        team_tariff_ids=tuple(t.id for t in tariffs if t.is_free and not t.is_trial_available),
+        not_paid_tariff_ids=tuple(t.id for t in tariffs if t.is_free or t.is_trial_available),
+    )
+
+
+@dataclass(frozen=True)
+class _Purchase:
+    id: int
+    user_id: int
+    at: datetime
+    amount_kopeks: int
+    is_addon: bool
+
+
+async def _payer_purchases(db: AsyncSession, rules: _OwnerRules) -> tuple[list[_Purchase], dict[int, _Purchase]]:
+    """Покупки подписок и докупки людей, плативших деньгами, — за всю историю, и первая покупка подписки каждого
+    (по времени, затем по номеру). Проводки те же, что «Купили» утреннего письма: `subscription_payment` ≠ 0,
+    докупка — по описанию. Покупка на бонусы у того, кто деньгами не платил, — не продажа."""
+    rows = (
+        await db.execute(
+            select(
+                Transaction.id,
+                Transaction.user_id,
+                Transaction.created_at,
+                func.abs(Transaction.amount_kopeks),
+                addon_description_clause(Transaction.description),
+            )
+            .join(User, User.id == Transaction.user_id)
+            .where(
+                Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+                Transaction.is_completed == true(),
+                Transaction.amount_kopeks != 0,
+                rules.people,
+            )
+        )
+    ).all()
+    payers = await real_payment_user_ids(db, {row[1] for row in rows})
+    purchases = sorted(
+        (
+            _Purchase(int(row[0]), int(row[1]), row[2], int(row[3] or 0), bool(row[4]))
+            for row in rows
+            if row[1] in payers
+        ),
+        key=lambda purchase: (purchase.at, purchase.id),
+    )
+    first: dict[int, _Purchase] = {}
+    for purchase in purchases:
+        if not purchase.is_addon:
+            first.setdefault(purchase.user_id, purchase)
+    return purchases, first
+
+
+async def _trial_starts(db: AsyncSession) -> dict[int, datetime]:
+    """Начало пробного по человеку. Покупка переписывает строку подписки (флаг и тариф — урок ОТЧ-7), поэтому
+    главный признак — событие активации, оно переживает покупку; строка пробного тарифа страхует тех, у кого
+    события нет. Пробный из чат-админки события не пишет — после покупки он «сразу без пробного» (предел, L1-5)."""
+    queries = [
+        select(SubscriptionEvent.user_id, func.min(SubscriptionEvent.occurred_at))
+        .where(SubscriptionEvent.event_type == 'activation', SubscriptionEvent.message == 'Trial activation')
+        .group_by(SubscriptionEvent.user_id)
+    ]
+    trial_tariff = await get_trial_tariff(db)
+    if trial_tariff is not None:
+        queries.append(
+            select(Subscription.user_id, func.min(Subscription.created_at))
+            .where(Subscription.tariff_id == trial_tariff.id, Subscription.status != SubscriptionStatus.PENDING.value)
+            .group_by(Subscription.user_id)
+        )
+    starts: dict[int, datetime] = {}
+    for query in queries:
+        for user_id, started_at in (await db.execute(query)).all():
+            if started_at is not None and (user_id not in starts or started_at < starts[user_id]):
+                starts[user_id] = started_at
+    return starts
+
+
+def _money_in_filter():
+    """«Пришло живых денег» — ровно как в утреннем письме (`reporting_service._collect_period_stats`): пополнения
+    и оплаты сразу за подписку платёжной системой, без реферальных пометок, ВСЕ аккаунты — как выписка Platega
+    (решение владельца 20.09.2026: со стендами и друзьями)."""
+    return and_(
+        Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.PROVIDER_RECEIPT.value)),
+        Transaction.is_completed == true(),
+        Transaction.amount_kopeks != 0,
+        Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
+        reporting_service._exclude_referral_deposits_condition(),
+    )
+
+
+async def _money_in(db: AsyncSession, start: datetime, end: datetime) -> dict[str, int]:
+    rows = (
+        await db.execute(
+            select(
+                Transaction.type,
+                func.count(Transaction.id),
+                func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0),
+            )
+            .join(User, User.id == Transaction.user_id)
+            .where(_money_in_filter(), Transaction.created_at >= start, Transaction.created_at < end)
+            .group_by(Transaction.type)
+        )
+    ).all()
+    counts = {row[0]: (int(row[1] or 0), int(row[2] or 0)) for row in rows}
+    deposits = counts.get(TransactionType.DEPOSIT.value, (0, 0))
+    receipts = counts.get(TransactionType.PROVIDER_RECEIPT.value, (0, 0))
+    return {'deposits': deposits[0], 'receipts': receipts[0], 'kopeks': deposits[1] + receipts[1]}
+
+
+async def _subscription_people(db: AsyncSession, rules: _OwnerRules, *conditions) -> list:
+    """Живые люди, плательщики, с подпиской на платном тарифе (не пробной) под условием — по строке на человека,
+    с ближайшим по времени концом. Одно определение для числа на плитке и для списка под ней."""
+    rows = (
+        await db.execute(
+            select(
+                User.id,
+                User.first_name,
+                User.last_name,
+                User.username,
+                User.telegram_id,
+                User.balance_kopeks,
+                Subscription.end_date,
+                Subscription.autopay_enabled,
+                Tariff.name,
+            )
+            .join(User, User.id == Subscription.user_id)
+            .join(Tariff, Tariff.id == Subscription.tariff_id, isouter=True)
+            .where(Subscription.is_trial.is_not(True), rules.people, rules.paid_tariff, *conditions)
+            .order_by(Subscription.end_date)
+        )
+    ).all()
+    payers = await real_payment_user_ids(db, {row[0] for row in rows})
+    people: dict[int, object] = {}
+    for row in rows:
+        if row[0] in payers:
+            people.setdefault(row[0], row)
+    return list(people.values())
+
+
+async def _not_renewed(db: AsyncSession, rules: _OwnerRules, start: datetime, end: datetime) -> list:
+    """«Не продлили» — как «Платная подписка закончилась и не продлена» письма: срок кончился в окне. Продление
+    уводит срок вперёд, и такой человек сюда не попадает. Свежие — сверху."""
+    rows = await _subscription_people(db, rules, Subscription.end_date >= start, Subscription.end_date < end)
+    return sorted(rows, key=lambda row: row[6], reverse=True)
+
+
+async def _ending_soon(db: AsyncSession, rules: _OwnerRules, now: datetime) -> list:
+    """«Кончится в ближайшие 7 дней» — живая платная подписка, срок в `(сейчас, сейчас + 7 суток]`."""
+    return await _subscription_people(
+        db,
+        rules,
+        Subscription.status.in_(sorted(ALIVE_SUBSCRIPTION_STATUSES)),
+        Subscription.end_date > now,
+        Subscription.end_date <= now + timedelta(days=7),
+    )
 
 
 # ============ Summary Schemas ============
