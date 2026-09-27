@@ -634,3 +634,39 @@ async def test_purchase_before_the_trial_row_is_direct_and_not_a_trial_conversio
 
     assert (overview.purchases.first_after_trial, overview.purchases.first_direct) == (0, 1)
     assert overview.trial.model_dump() == {'came': 1, 'took_trial': 1, 'trial_finished': 1, 'bought_after_trial': 0}
+
+
+# ---------- СП-1.3: списки под плитками ----------
+
+
+@pytest.mark.asyncio
+async def test_people_lists_are_the_same_people_as_the_tiles_with_what_the_owner_needs_to_call() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    ids = _seed_september(seed)
+    # второй «не продливший» — раньше, без имени и без ника: список показывает его после свежего
+    earlier = seed.user(balance=25000)
+    seed.paid_card(earlier, at=LONG_AGO)
+    seed.sub(earlier, tariff_id=3, is_trial=False, end=SEP_05, status='expired', autopay=True)
+    session.execute(
+        text("UPDATE users SET first_name = 'Анна', last_name = 'К', username = 'anna' WHERE id = :u"),
+        {'u': ids['lapsed']},
+    )
+    session.commit()
+
+    window = module._sales_window('this_month', None, None, NOW)
+    first, second, third = _patches()
+    with first, second, third:
+        db = _AsyncOverSync(session)
+        lapsed = await module._people_items(db, 'not_renewed', window, NOW)
+        ending = await module._people_items(db, 'ending_soon', window, NOW)
+    overview = await _overview(session, window)
+
+    assert [(p.user_id, p.name, p.username, p.autopay_enabled, p.balance_kopeks, p.tariff_name) for p in lapsed] == [
+        (ids['lapsed'], 'Анна К', 'anna', False, 0, 'Базовый'),
+        (earlier, None, None, True, 25000, 'Базовый'),
+    ]
+    assert lapsed[1].telegram_id == earlier * 10  # без имени и ника — по нему владелец найдёт человека в кабинете
+    assert [p.user_id for p in ending] == [ids['ending']]
+    assert ending[0].end_date.replace(tzinfo=None) == datetime(2026, 10, 1, 10)
+    assert (overview.purchases.not_renewed, overview.now.ending_soon) == (len(lapsed), len(ending))

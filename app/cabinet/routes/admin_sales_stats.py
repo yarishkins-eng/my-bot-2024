@@ -1755,3 +1755,66 @@ async def get_sales_overview(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to load sales overview',
         )
+
+
+class SalesPersonItem(BaseModel):
+    user_id: int
+    name: str | None = None
+    username: str | None = None
+    telegram_id: int | None = None
+    tariff_name: str | None = None
+    end_date: datetime
+    autopay_enabled: bool = False
+    balance_kopeks: int = 0
+
+
+class SalesPeopleResponse(BaseModel):
+    kind: str
+    total: int
+    items: list[SalesPersonItem]
+
+
+async def _people_items(db: AsyncSession, kind: str, window: _SalesWindow, now: datetime) -> list[SalesPersonItem]:
+    """Список под плиткой — тем же помощником, что число на ней: длина списка = число (ревью L2-7)."""
+    rules = await _owner_rules(db)
+    if kind == 'not_renewed':
+        rows = await _not_renewed(db, rules, window.start, min(window.end, now))
+    else:
+        rows = await _ending_soon(db, rules, now)
+    return [
+        SalesPersonItem(
+            user_id=row[0],
+            name=' '.join(part for part in (row[1], row[2]) if part) or None,
+            username=row[3],
+            telegram_id=row[4],
+            balance_kopeks=int(row[5] or 0),
+            end_date=row[6],
+            autopay_enabled=bool(row[7]),
+            tariff_name=row[8],
+        )
+        for row in rows
+    ]
+
+
+@router.get('/people', response_model=SalesPeopleResponse)
+async def get_sales_people(
+    kind: Literal['not_renewed', 'ending_soon'],
+    period: SalesPeriod = Query(default='this_month'),
+    start_date: str | None = Query(default=None),
+    end_date: str | None = Query(default=None),
+    # имена, ники и балансы клиентов — только тем, кому и так видна карточка пользователя
+    admin: User = Depends(require_permission('sales_stats:read', 'users:read')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> SalesPeopleResponse:
+    """Кто за плитками «Не продлили» (за выбранный период) и «Кончится в ближайшие 7 дней» (сейчас)."""
+    now = datetime.now(UTC)
+    window = _sales_window(period, start_date, end_date, now)
+    try:
+        items = await _people_items(db, kind, window, now)
+        return SalesPeopleResponse(kind=kind, total=len(items), items=items)
+    except Exception as e:
+        logger.error('Failed to get sales people', kind=kind, error=e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load people list',
+        )
