@@ -316,6 +316,38 @@ async def test_team_is_the_free_tariff_that_is_not_the_trial_one() -> None:
 
 
 @pytest.mark.asyncio
+async def test_team_friend_with_a_live_paid_row_is_paying_but_not_a_person_known_divergence() -> None:
+    """Ред. 3 п.14 (критик W2-14), мина NU: «Платят» отсекает Team по ПОДПИСКЕ, правило экрана — по ЧЕЛОВЕКУ.
+
+    Человек с любой строкой Team и живой платной строкой в «Платят» есть, а в покупках, списках и когорте — нет.
+    На боевом 27.09 таких 0. Сторож держит расхождение на виду: поменяется одна сторона — тест покраснеет, и
+    решать придётся осознанно, а не узнать из спора «почему Платят 68, а покупателей меньше».
+    """
+    session = _schema()
+    seed = _Seed(session)
+    both = seed.user()
+    seed.sub(both, tariff_id=4, is_trial=False, end='2031-12-21 00:00:00.000000')
+    seed.sub(both, tariff_id=3, is_trial=False, end='2099-01-01 00:00:00.000000')
+    seed.paid_card(both, at=SEP_05)
+    session.commit()
+
+    first, second, third = _patches()
+    with (
+        first,
+        second,
+        third,
+        patch('app.utils.user_utils.get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=5))),
+        patch('app.utils.user_utils.get_all_tariffs', _tariffs),
+    ):
+        db = _AsyncOverSync(session)
+        counts = await module.count_trial_and_paying_users(db)
+        purchases, first_buys = await module._payer_purchases(db, await module._owner_rules(db))
+
+    assert counts == {'on_trial': 0, 'paying': 1}
+    assert (purchases, first_buys) == ([], {})
+
+
+@pytest.mark.asyncio
 async def test_purchases_count_payers_only_and_skip_team_stands_deleted_and_bonus_buyers() -> None:
     session = _schema()
     seed = _Seed(session)
