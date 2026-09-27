@@ -29,6 +29,7 @@ from app.services.remnawave_service import RemnaWaveService
 from app.services.version_service import version_service
 
 from ..dependencies import get_cabinet_db, require_permission
+from .admin_sales_stats import owner_people_tiles
 
 
 logger = structlog.get_logger(__name__)
@@ -90,6 +91,10 @@ class SubscriptionStats(BaseModel):
     purchased_week: int
     purchased_month: int
     trial_to_paid_conversion: float
+    # СП-1: верх панели администратора по правилам владельца. None — не посчиталось (кабинет покажет прочерк)
+    people_on_trial: int | None = None
+    people_paying: int | None = None
+    new_buyers_today: int | None = None
 
 
 class FinancialStats(BaseModel):
@@ -251,6 +256,20 @@ class RecentPaymentsResponse(BaseModel):
 # ============ Routes ============
 
 
+async def _owner_people_tiles_or_none(db: AsyncSession) -> dict[str, int] | None:
+    """Плитки владельца на панели. Общий сеанс: ошибка базы оставила бы транзакцию прерванной — откатываем
+    (ревью СП-1, W2-10) и отдаём None, кабинет покажет прочерк вместо нуля."""
+    try:
+        return await owner_people_tiles(db, datetime.now(UTC))
+    except Exception as error:
+        logger.warning('Dashboard owner tiles failed', error=error)
+        try:
+            await db.rollback()
+        except Exception as rollback_error:  # сбой отката не должен ронять весь /dashboard (ревью C1-9)
+            logger.warning('Dashboard owner tiles rollback failed', error=rollback_error)
+        return None
+
+
 @router.get('/dashboard', response_model=DashboardStats)
 async def get_dashboard_stats(
     admin: User = Depends(require_permission('stats:read')),
@@ -290,6 +309,9 @@ async def get_dashboard_stats(
         # Use chart-derived value if available, otherwise fall back to trans_stats
         income_today_kopeks = income_today_from_chart or trans_stats.get('today', {}).get('income_kopeks', 0)
 
+        # Последними и отдельно: сбой новых плиток не должен ронять /dashboard — он кормит и экран нод (СП-1)
+        people_tiles = await _owner_people_tiles_or_none(db)
+
         # Build response
         return DashboardStats(
             nodes=nodes_data,
@@ -303,6 +325,9 @@ async def get_dashboard_stats(
                 purchased_week=sub_stats.get('purchased_week', 0),
                 purchased_month=sub_stats.get('purchased_month', 0),
                 trial_to_paid_conversion=sub_stats.get('trial_to_paid_conversion', 0.0),
+                people_on_trial=people_tiles['on_trial'] if people_tiles else None,
+                people_paying=people_tiles['paying'] if people_tiles else None,
+                new_buyers_today=people_tiles['new_buyers_today'] if people_tiles else None,
             ),
             financial=FinancialStats(
                 income_today_kopeks=income_today_kopeks,
