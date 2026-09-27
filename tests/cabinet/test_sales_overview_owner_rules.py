@@ -596,3 +596,41 @@ async def test_yesterday_has_no_finished_trials_yet() -> None:
     overview = await _overview(session, module._sales_window('yesterday', None, None, NOW))
 
     assert overview.trial.model_dump() == {'came': 1, 'took_trial': 1, 'trial_finished': 0, 'bought_after_trial': 0}
+
+
+@pytest.mark.asyncio
+async def test_percent_is_not_comparable_when_money_started_inside_the_previous_window() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    user = seed.user()
+    seed.tx(user, 'deposit', 14900, method='platega', at='2026-09-16 12:00:00.000000')  # первые деньги — 16.09
+    seed.tx(user, 'deposit', 14900, method='platega', at='2026-09-22 12:00:00.000000')
+    session.commit()
+
+    # «7 дней» = 21–27.09, сравнение 14–20.09: деньги там есть (16.09), но окно началось раньше первых денег
+    week = await _overview(session, module._sales_window('7d', None, None, NOW))
+
+    assert (week.money.previous_received_kopeks, week.money.previous_comparable) == (14900, False)
+
+
+@pytest.mark.asyncio
+async def test_purchase_before_the_trial_row_is_direct_and_not_a_trial_conversion() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    # пришёл и купил сразу 08.09, а строка пробного появилась позже (выдали руками / сброс) — это не «после пробного»
+    buyer = seed.user(created_at='2026-09-08 12:00:00.000000')
+    seed.paid_card(buyer, at='2026-09-08 12:00:00.000000')
+    seed.sub(
+        buyer,
+        tariff_id=5,
+        is_trial=True,
+        end='2026-09-15 12:00:00.000000',
+        status='expired',
+        created_at='2026-09-12 12:00:00.000000',
+    )
+    session.commit()
+
+    overview = await _overview(session, module._sales_window('this_month', None, None, NOW))
+
+    assert (overview.purchases.first_after_trial, overview.purchases.first_direct) == (0, 1)
+    assert overview.trial.model_dump() == {'came': 1, 'took_trial': 1, 'trial_finished': 1, 'bought_after_trial': 0}
