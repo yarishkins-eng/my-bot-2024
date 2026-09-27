@@ -457,3 +457,142 @@ async def test_not_renewed_and_ending_soon_are_payers_on_paid_tariffs_one_row_ea
     )
     assert [row[0] for row in ending_soon] == [ending, legacy_tariff, limited]
     assert ending_soon[0][6].replace(tzinfo=None) == datetime(2026, 10, 1, 10)  # ближайший срок человека
+
+
+# ---------- СП-1.2: обзор ----------
+
+
+async def _overview(session: Session, window, now=NOW, people=None):
+    first, second, third = _patches()
+    counts = AsyncMock(return_value=people or {'paying': 68, 'on_trial': 35})
+    with first, second, third, patch.object(module, 'count_trial_and_paying_users', counts):
+        return await module._build_overview(_AsyncOverSync(session), window, now)
+
+
+def _seed_september(seed: _Seed) -> dict[str, int]:
+    """Сентябрь по мотивам боевого: у каждого — одна причина попасть или не попасть в число."""
+    ids = {}
+    # пришёл 05.09, взял пробный, купил 09.09 картой — «впервые после пробного»
+    ids['after_trial'] = seed.user(created_at=SEP_05)
+    seed.activation(ids['after_trial'], at=SEP_05)
+    seed.paid_card(ids['after_trial'], at='2026-09-09 12:00:00.000000')
+    # пришёл 20.09 и сразу купил — «впервые сразу без пробного»
+    ids['direct'] = seed.user(created_at=SEP_20)
+    seed.paid_card(ids['direct'], at=SEP_20)
+    # пришёл 25.09, пробный ещё идёт (3 дня не прошли к 27.09 11:30)
+    ids['trial_running'] = seed.user(created_at='2026-09-25 12:00:00.000000')
+    seed.activation(ids['trial_running'], at='2026-09-25 12:00:00.000000')
+    # пришёл 10.09, пробный кончился, не купил
+    ids['trial_lost'] = seed.user(created_at='2026-09-10 12:00:00.000000')
+    seed.sub(
+        ids['trial_lost'],
+        tariff_id=5,
+        is_trial=True,
+        end='2026-09-13 12:00:00.000000',
+        status='expired',
+        created_at='2026-09-10 12:00:00.000000',
+    )
+    # давний клиент: первая покупка в августе, продление и докупка в сентябре, живой
+    ids['old'] = seed.user()
+    seed.tx(ids['old'], 'deposit', 30000, method='platega', at=AUG_10)
+    seed.tx(
+        ids['old'], 'subscription_payment', -14900, method='balance', description='Оплата подписки с баланса', at=AUG_10
+    )
+    seed.tx(ids['old'], 'subscription_payment', -14900, method='balance', description='Продление подписки', at=SEP_20)
+    seed.tx(
+        ids['old'], 'subscription_payment', -4166, method='balance', description='Покупка доп. устройств: 1', at=SEP_20
+    )
+    # друг из Team: пришёл в сентябре, заплатил 100 ₽ — деньги в выписке, а в людях и покупках его нет
+    ids['friend'] = seed.user(created_at='2026-09-06 12:00:00.000000')
+    seed.sub(ids['friend'], tariff_id=4, is_trial=True, end='2031-12-21 00:00:00.000000')
+    seed.tx(ids['friend'], 'deposit', 10000, method='platega', at='2026-09-06 12:00:00.000000')
+    seed.tx(
+        ids['friend'],
+        'subscription_payment',
+        -10000,
+        method='balance',
+        description='Оплата подписки',
+        at='2026-09-06 12:00:00.000000',
+    )
+    # стенд: тестовая оплата картой — в выписке есть, в людях нет
+    ids['stand'] = seed.user(created_at='2026-09-07 12:00:00.000000', telegram_id=ENV_STAND_TELEGRAM_ID)
+    seed.paid_card(ids['stand'], at='2026-09-07 12:00:00.000000')
+    # платил в июне, подписка кончилась 20.09 — не продлил
+    ids['lapsed'] = seed.user()
+    seed.paid_card(ids['lapsed'], at=LONG_AGO)
+    seed.sub(ids['lapsed'], tariff_id=3, is_trial=False, end=SEP_20, status='expired')
+    # платит, срок кончится 01.10 — «кончится за 7 дней»
+    ids['ending'] = seed.user()
+    seed.paid_card(ids['ending'], at=LONG_AGO)
+    seed.sub(ids['ending'], tariff_id=3, is_trial=False, end='2026-10-01 10:00:00.000000')
+    # не деньги: бонус за регистрацию у новичка
+    seed.tx(ids['direct'], 'deposit', 5000, method=None, description='Бонус за регистрацию', at=SEP_20)
+    return ids
+
+
+@pytest.mark.asyncio
+async def test_september_overview_counts_by_the_owners_rules() -> None:
+    session = _schema()
+    _seed_september(_Seed(session))
+    session.commit()
+
+    overview = await _overview(session, module._sales_window('this_month', None, None, NOW))
+
+    assert overview.now.model_dump() == {'paying': 68, 'on_trial': 35, 'ending_soon': 1}
+    # деньги как выписка: две покупки картой + деньги друга + тест стенда; бонус — не деньги
+    assert overview.money.model_dump() == {
+        'received_kopeks': 14900 + 14900 + 10000 + 14900,
+        'deposits_count': 1,
+        'receipts_count': 3,
+        'previous_received_kopeks': 30000,  # 10.08 давний клиент пополнил — те же числа августа
+        'previous_comparable': True,  # первые деньги — в июне, раньше начала августа
+    }
+    assert overview.purchases.model_dump() == {
+        'count': 3,
+        'amount_kopeks': 14900 * 3,
+        'first_count': 2,
+        'first_amount_kopeks': 14900 * 2,
+        'first_after_trial': 1,
+        'first_direct': 1,
+        'renewal_count': 1,
+        'renewal_amount_kopeks': 14900,
+        'addon_count': 1,
+        'addon_amount_kopeks': 4166,
+        'previous_first_count': 1,  # первая покупка давнего клиента 10.08
+        'not_renewed': 1,
+    }
+    # когорта: пришли 4 (друг Team и стенд — не люди), пробный у трёх, кончился у двух, купил после пробного один
+    assert overview.trial.model_dump() == {'came': 4, 'took_trial': 3, 'trial_finished': 2, 'bought_after_trial': 1}
+    assert overview.window.start == _msk(2026, 9, 1) and overview.window.end == NOW
+
+
+@pytest.mark.asyncio
+async def test_percent_is_not_comparable_when_the_previous_window_starts_before_the_first_money() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    user = seed.user()
+    seed.tx(user, 'deposit', 14900, method='platega', at=SEP_05)  # первые деньги — 05.09
+    seed.tx(user, 'deposit', 14900, method='platega', at=SEP_20)
+    session.commit()
+
+    week = await _overview(session, module._sales_window('7d', None, None, NOW))
+    ninety = await _overview(session, module._sales_window('90d', None, None, NOW))
+    everything = await _overview(session, module._sales_window('all', None, None, NOW))
+
+    assert (week.money.previous_received_kopeks, week.money.previous_comparable) == (0, False)  # было 0 — процента нет
+    assert (ninety.money.previous_received_kopeks, ninety.money.previous_comparable) == (0, False)
+    assert (everything.money.previous_received_kopeks, everything.money.previous_comparable) == (None, False)
+    assert everything.purchases.previous_first_count is None
+
+
+@pytest.mark.asyncio
+async def test_yesterday_has_no_finished_trials_yet() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    fresh = seed.user(created_at='2026-09-26 09:00:00.000000')
+    seed.activation(fresh, at='2026-09-26 09:00:00.000000')
+    session.commit()
+
+    overview = await _overview(session, module._sales_window('yesterday', None, None, NOW))
+
+    assert overview.trial.model_dump() == {'came': 1, 'took_trial': 1, 'trial_finished': 0, 'bought_after_trial': 0}

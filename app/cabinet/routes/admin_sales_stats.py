@@ -12,6 +12,7 @@ from sqlalchemy import Integer as SAInteger, and_, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from app.config import settings
 from app.database.crud.payment_gateway_stats import get_gateway_success_rates
 from app.database.crud.subscription import ALIVE_SUBSCRIPTION_STATUSES
 from app.database.crud.tariff import get_all_tariffs, get_trial_tariff
@@ -35,7 +36,7 @@ from app.database.models import (
     User,
 )
 from app.services.reporting_service import reporting_service
-from app.utils.user_utils import operational_person_clause, real_payment_user_ids
+from app.utils.user_utils import count_trial_and_paying_users, operational_person_clause, real_payment_user_ids
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -1585,4 +1586,172 @@ async def get_payment_health(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to load payment health',
+        )
+
+
+# ============ СП-1: обзор продаж по правилам владельца ============
+
+
+class SalesWindowInfo(BaseModel):
+    start: datetime
+    end: datetime
+    previous_start: datetime | None = None
+    previous_end: datetime | None = None
+
+
+class SalesNowStats(BaseModel):
+    """Сейчас — от выбранного периода не зависит."""
+
+    paying: int
+    on_trial: int
+    ending_soon: int
+
+
+class SalesMoneyStats(BaseModel):
+    received_kopeks: int
+    deposits_count: int
+    receipts_count: int
+    previous_received_kopeks: int | None = None
+    # процент к прошлому окну честен, только если там были деньги и оно не начинается раньше первых живых денег
+    previous_comparable: bool = False
+
+
+class SalesPurchaseStats(BaseModel):
+    count: int
+    amount_kopeks: int
+    first_count: int
+    first_amount_kopeks: int
+    first_after_trial: int
+    first_direct: int
+    renewal_count: int
+    renewal_amount_kopeks: int
+    addon_count: int
+    addon_amount_kopeks: int
+    previous_first_count: int | None = None
+    not_renewed: int
+
+
+class SalesTrialStats(BaseModel):
+    """Когорта: люди, впервые открывшие бота в окне."""
+
+    came: int
+    took_trial: int
+    trial_finished: int
+    bought_after_trial: int
+
+
+class SalesOverviewResponse(BaseModel):
+    generated_at: datetime
+    window: SalesWindowInfo
+    now: SalesNowStats
+    money: SalesMoneyStats
+    purchases: SalesPurchaseStats
+    trial: SalesTrialStats
+
+
+async def _build_overview(db: AsyncSession, window: _SalesWindow, now: datetime) -> SalesOverviewResponse:
+    rules = await _owner_rules(db)
+    people_now = await count_trial_and_paying_users(db)
+    ending_soon = await _ending_soon(db, rules, now)
+    money = await _money_in(db, window.start, window.end)
+    previous_kopeks, comparable = None, False
+    if window.previous_start is not None and window.previous_end is not None:
+        previous_kopeks = (await _money_in(db, window.previous_start, window.previous_end))['kopeks']
+        first_money_at = (
+            await db.execute(
+                select(func.min(Transaction.created_at))
+                .join(User, User.id == Transaction.user_id)
+                .where(_money_in_filter())
+            )
+        ).scalar()
+        comparable = previous_kopeks > 0 and first_money_at is not None and first_money_at <= window.previous_start
+
+    purchases, first = await _payer_purchases(db, rules)
+    trial_starts = await _trial_starts(db)
+
+    def is_first(purchase: _Purchase) -> bool:
+        return not purchase.is_addon and first[purchase.user_id].id == purchase.id
+
+    in_window = [p for p in purchases if window.start <= p.at < window.end]
+    firsts = [p for p in in_window if is_first(p)]
+    renewals = [p for p in in_window if not p.is_addon and not is_first(p)]
+    addons = [p for p in in_window if p.is_addon]
+    after_trial = sum(1 for p in firsts if p.user_id in trial_starts and trial_starts[p.user_id] < p.at)
+    previous_first = None
+    if window.previous_start is not None and window.previous_end is not None:
+        previous_first = sum(1 for p in first.values() if window.previous_start <= p.at < window.previous_end)
+    not_renewed = await _not_renewed(db, rules, window.start, min(window.end, now))
+
+    came = set(
+        (
+            await db.execute(
+                select(User.id).where(User.created_at >= window.start, User.created_at < window.end, rules.people)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    took = {user_id for user_id in came if user_id in trial_starts}
+    trial_length = timedelta(days=int(settings.TRIAL_DURATION_DAYS))
+    finished = {user_id for user_id in took if trial_starts[user_id] + trial_length <= now}
+    bought = {user_id for user_id in finished if user_id in first and first[user_id].at >= trial_starts[user_id]}
+
+    return SalesOverviewResponse(
+        generated_at=now,
+        window=SalesWindowInfo(
+            start=window.start,
+            end=window.end,
+            previous_start=window.previous_start,
+            previous_end=window.previous_end,
+        ),
+        now=SalesNowStats(
+            paying=int(people_now.get('paying') or 0),
+            on_trial=int(people_now.get('on_trial') or 0),
+            ending_soon=len(ending_soon),
+        ),
+        money=SalesMoneyStats(
+            received_kopeks=money['kopeks'],
+            deposits_count=money['deposits'],
+            receipts_count=money['receipts'],
+            previous_received_kopeks=previous_kopeks,
+            previous_comparable=comparable,
+        ),
+        purchases=SalesPurchaseStats(
+            count=len(firsts) + len(renewals),
+            amount_kopeks=sum(p.amount_kopeks for p in firsts + renewals),
+            first_count=len(firsts),
+            first_amount_kopeks=sum(p.amount_kopeks for p in firsts),
+            first_after_trial=after_trial,
+            first_direct=len(firsts) - after_trial,
+            renewal_count=len(renewals),
+            renewal_amount_kopeks=sum(p.amount_kopeks for p in renewals),
+            addon_count=len(addons),
+            addon_amount_kopeks=sum(p.amount_kopeks for p in addons),
+            previous_first_count=previous_first,
+            not_renewed=len(not_renewed),
+        ),
+        trial=SalesTrialStats(
+            came=len(came), took_trial=len(took), trial_finished=len(finished), bought_after_trial=len(bought)
+        ),
+    )
+
+
+@router.get('/overview', response_model=SalesOverviewResponse)
+async def get_sales_overview(
+    period: SalesPeriod = Query(default='this_month'),
+    start_date: str | None = Query(default=None, description='Для period=custom: первый день, YYYY-MM-DD (МСК)'),
+    end_date: str | None = Query(default=None, description='Для period=custom: последний день, YYYY-MM-DD (МСК)'),
+    admin: User = Depends(require_permission('sales_stats:read')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> SalesOverviewResponse:
+    """Экран «Статистика продаж» по правилам владельца (СП-1): сейчас, деньги, покупки, пробный."""
+    now = datetime.now(UTC)
+    window = _sales_window(period, start_date, end_date, now)
+    try:
+        return await _build_overview(db, window, now)
+    except Exception as e:
+        logger.error('Failed to get sales overview', error=e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load sales overview',
         )
