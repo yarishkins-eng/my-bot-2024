@@ -159,6 +159,16 @@ def test_response_contracts_with_the_cabinet() -> None:
         'balance_kopeks',
     }
     assert set(admin_sales_stats.SalesWindowInfo.model_fields) == {'start', 'end', 'previous_start', 'previous_end'}
+    # деньги «Статистики» (СП-1б): кабинет читает ровно эти поля, все обязательные
+    assert {name: field.is_required() for name, field in admin_stats.DashboardMoneyResponse.model_fields.items()} == {
+        'today_kopeks': True,
+        'month_kopeks': True,
+        'total_kopeks': True,
+        'days': True,
+        'months': True,
+    }
+    assert set(admin_stats.MoneyDay.model_fields) == {'date', 'kopeks'}
+    assert set(admin_stats.MoneyMonth.model_fields) == {'month', 'kopeks'}
     assert set(admin_sales_stats.SalesPeopleResponse.model_fields) == {'kind', 'total', 'items'}
     assert set(admin_sales_stats.SalesAdsResponse.model_fields) == {
         'campaigns_total',
