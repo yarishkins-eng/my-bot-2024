@@ -45,3 +45,11 @@ async def test_people_list_needs_users_read_too(monkeypatch: pytest.MonkeyPatch)
 
     assert response.status_code == 403
     assert asked == ['sales_stats:read', 'users:read']
+
+
+@pytest.mark.asyncio
+async def test_ads_need_campaign_stats_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    response, asked = await _request(monkeypatch, '/cabinet/admin/stats/sales/ads', {'sales_stats:read'})
+
+    assert response.status_code == 403
+    assert asked == ['sales_stats:read', 'campaigns:stats']

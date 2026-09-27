@@ -84,6 +84,12 @@ def _schema() -> Session:
         c.execute(text('CREATE TABLE tariffs (id INTEGER PRIMARY KEY, name TEXT)'))
         c.execute(
             text(
+                'CREATE TABLE advertising_campaigns (id INTEGER PRIMARY KEY, name TEXT, ad_spend_kopeks INTEGER, '
+                'created_at TIMESTAMP)'
+            )
+        )
+        c.execute(
+            text(
                 'CREATE TABLE guest_purchases (id INTEGER PRIMARY KEY, buyer_user_id INTEGER, user_id INTEGER, '
                 'is_gift BOOLEAN, payment_method TEXT, amount_kopeks INTEGER, paid_at TIMESTAMP)'
             )
@@ -670,3 +676,55 @@ async def test_people_lists_are_the_same_people_as_the_tiles_with_what_the_owner
     assert [p.user_id for p in ending] == [ids['ending']]
     assert ending[0].end_date.replace(tzinfo=None) == datetime(2026, 10, 1, 10)
     assert (overview.purchases.not_renewed, overview.now.ending_soon) == (len(lapsed), len(ending))
+
+
+# ---------- СП-1.4: реклама ----------
+
+
+def _performance(leads: int, immature: int, buyers: int, receipts: int, spend: int | None) -> dict:
+    return {
+        'leads': leads,
+        'immature_leads_count': immature,
+        'paid_subscription_users_count': buyers,
+        'customer_acquisition_cost_kopeks': round(spend / buyers) if spend is not None and buyers else None,
+        'confirmed_receipts_kopeks': receipts,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ads_split_mature_and_fresh_campaigns_and_skip_the_ones_without_spend() -> None:
+    session = _schema()
+    session.execute(
+        text(
+            'INSERT INTO advertising_campaigns (id, name, ad_spend_kopeks, created_at) VALUES '
+            "(4, 'Канал А 7000₽  ', 700000, '2026-08-18 12:00:00.000000'),"
+            "(3, 'Канал Б 4500', NULL, '2026-08-14 12:00:00.000000'),"
+            "(14, 'Канал В 12к', 1200000, '2026-09-22 12:00:00.000000'),"
+            "(15, 'канал-г', 100, '2026-09-23 12:00:00.000000'),"
+            "(20, 'старая без лидов', 5000, '2026-08-01 12:00:00.000000')"
+        )
+    )
+    session.commit()
+    performances = {
+        4: _performance(107, 0, 5, 322309, 700000),  # все лиды старше 7 суток
+        3: _performance(7, 0, 1, 39800, None),
+        14: _performance(37, 37, 1, 14900, 1200000),  # все лиды моложе 7 суток — рано судить
+        15: _performance(0, 0, 0, 0, 100),  # лидов нет, заведена 4 дня назад — рано
+        20: _performance(0, 0, 0, 0, 5000),  # лидов нет, заведена давно — зрелая, пустая трата
+    }
+    reader = AsyncMock(side_effect=lambda db, campaign_id, now: performances[campaign_id])
+
+    with patch.object(module, 'get_campaign_performance', reader):
+        ads = await module._ads(_AsyncOverSync(session), NOW)
+
+    assert (ads.campaigns_total, ads.campaigns_with_spend) == (5, 4)
+    assert (ads.mature_spend_kopeks, ads.mature_buyers, ads.mature_cost_per_buyer_kopeks) == (705000, 5, 141000)
+    assert ads.mature_receipts_kopeks == 322309
+    assert (ads.fresh_spend_kopeks, ads.fresh_buyers) == (1200100, 1)
+    assert [(c.name, c.fresh, c.cost_per_buyer_kopeks) for c in ads.campaigns] == [
+        ('Канал А 7000₽', False, 140000),
+        ('старая без лидов', False, None),
+        ('Канал В 12к', True, 1200000),
+        ('канал-г', True, None),
+    ]
+    assert all(call.kwargs['now'] == NOW for call in reader.await_args_list)

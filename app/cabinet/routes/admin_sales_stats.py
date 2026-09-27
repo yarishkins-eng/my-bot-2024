@@ -23,6 +23,7 @@ from app.database.crud.transaction import (
     traffic_addon_clause,
 )
 from app.database.models import (
+    AdvertisingCampaign,
     GuestPurchase,
     PaymentMethod,
     Subscription,
@@ -35,6 +36,7 @@ from app.database.models import (
     TransactionType,
     User,
 )
+from app.services.campaign_service import get_campaign_performance
 from app.services.reporting_service import reporting_service
 from app.utils.user_utils import count_trial_and_paying_users, operational_person_clause, real_payment_user_ids
 
@@ -1817,4 +1819,99 @@ async def get_sales_people(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to load people list',
+        )
+
+
+class SalesAdCampaign(BaseModel):
+    campaign_id: int
+    name: str
+    ad_spend_kopeks: int
+    buyers: int
+    cost_per_buyer_kopeks: int | None = None
+    receipts_kopeks: int
+    # все лиды моложе 7 суток (или лидов нет и кампания заведена меньше 7 суток назад) — судить рано
+    fresh: bool
+
+
+class SalesAdsResponse(BaseModel):
+    campaigns_total: int
+    campaigns_with_spend: int
+    mature_spend_kopeks: int
+    mature_buyers: int
+    mature_cost_per_buyer_kopeks: int | None = None
+    mature_receipts_kopeks: int
+    fresh_spend_kopeks: int
+    fresh_buyers: int
+    campaigns: list[SalesAdCampaign]
+
+
+async def _ads(db: AsyncSession, now: datetime) -> SalesAdsResponse:
+    """Реклама за всё время — определения экрана кампаний (`get_campaign_performance`, РК-3: покупатель — первая
+    оплата после первого касания, двойного счёта между кампаниями нет). Только кампании с указанным расходом.
+    Свежие кампании отдельно: без этого «покупатель ≈» сам вырастет вдвое, пока они дозревают (ревью, W2-4)."""
+    rows = (
+        await db.execute(
+            select(
+                AdvertisingCampaign.id,
+                AdvertisingCampaign.name,
+                AdvertisingCampaign.ad_spend_kopeks,
+                AdvertisingCampaign.created_at,
+            ).order_by(AdvertisingCampaign.id)
+        )
+    ).all()
+    campaigns: list[SalesAdCampaign] = []
+    for campaign_id, name, spend, created_at in rows:
+        if spend is None:
+            continue
+        performance = await get_campaign_performance(db, campaign_id, now=now)
+        if performance is None:
+            continue
+        leads = int(performance['leads'] or 0)
+        fresh = (
+            int(performance['immature_leads_count'] or 0) == leads
+            if leads
+            else created_at is not None and created_at > now - timedelta(days=7)
+        )
+        campaigns.append(
+            SalesAdCampaign(
+                campaign_id=campaign_id,
+                name=str(name).strip(),
+                ad_spend_kopeks=int(spend),
+                buyers=int(performance['paid_subscription_users_count'] or 0),
+                cost_per_buyer_kopeks=performance['customer_acquisition_cost_kopeks'],
+                receipts_kopeks=int(performance['confirmed_receipts_kopeks'] or 0),
+                fresh=fresh,
+            )
+        )
+    mature = [campaign for campaign in campaigns if not campaign.fresh]
+    fresh_ones = [campaign for campaign in campaigns if campaign.fresh]
+    mature_spend = sum(campaign.ad_spend_kopeks for campaign in mature)
+    mature_buyers = sum(campaign.buyers for campaign in mature)
+    return SalesAdsResponse(
+        campaigns_total=len(rows),
+        campaigns_with_spend=len(campaigns),
+        mature_spend_kopeks=mature_spend,
+        mature_buyers=mature_buyers,
+        mature_cost_per_buyer_kopeks=round(mature_spend / mature_buyers) if mature_buyers else None,
+        mature_receipts_kopeks=sum(campaign.receipts_kopeks for campaign in mature),
+        fresh_spend_kopeks=sum(campaign.ad_spend_kopeks for campaign in fresh_ones),
+        fresh_buyers=sum(campaign.buyers for campaign in fresh_ones),
+        campaigns=sorted(campaigns, key=lambda campaign: (campaign.fresh, -campaign.ad_spend_kopeks)),
+    )
+
+
+@router.get('/ads', response_model=SalesAdsResponse)
+async def get_sales_ads(
+    # расход на рекламу виден тем же, кому видна статистика кампаний
+    admin: User = Depends(require_permission('sales_stats:read', 'campaigns:stats')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> SalesAdsResponse:
+    """Реклама за всё время: расход, покупатели и «во сколько обошёлся покупатель» по кампаниям."""
+    try:
+        return await _ads(db, datetime.now(UTC))
+    except Exception as e:
+        logger.error('Failed to get sales ads', error=e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load ads economics',
         )
