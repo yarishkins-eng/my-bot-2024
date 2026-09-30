@@ -293,6 +293,11 @@ class ReportingService:
             or 0
         )
 
+    async def referral_first_arrival(self, session) -> datetime | None:
+        """Когда пришёл первый приглашённый, которого считаем, — начало ряда месяцев на «Статистике» кабинета."""
+        invited = await self._invited_person_clause(session)
+        return (await session.execute(select(func.min(User.created_at)).where(invited))).scalar()
+
     async def referral_numbers(self, session, start_utc: datetime, end_utc: datetime) -> dict:
         """Рефералка за окно `[start, end)` — ЕДИНСТВЕННОЕ место, где она считается: письмо зовёт его за сутки, кабинет —
         за каждый месяц. Две копии определений разошлись бы молча (мина NW). Только чтение.

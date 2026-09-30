@@ -29,7 +29,7 @@ from app.services.remnawave_service import RemnaWaveService
 from app.services.version_service import version_service
 
 from ..dependencies import get_cabinet_db, require_permission
-from .admin_sales_stats import dashboard_money, owner_people_tiles
+from .admin_sales_stats import dashboard_money, dashboard_referrals, owner_people_tiles
 
 
 logger = structlog.get_logger(__name__)
@@ -401,6 +401,43 @@ async def get_dashboard_money(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to load money',
+        )
+
+
+class ReferralMonthRow(BaseModel):
+    """Месяц блока «Приглашения»: каждое событие — в своём месяце Москвы."""
+
+    month: str  # 'YYYY-MM'
+    came: int
+    trial: int
+    paid_first: int
+    money_kopeks: int
+    rewards_kopeks: int
+
+
+class DashboardReferralsResponse(BaseModel):
+    """Блок «Приглашения» на «Статистике» (РЕФ-2): месяцы тем же счётчиком, что утреннее письмо."""
+
+    months: list[ReferralMonthRow]
+    new_people_month: int
+    money_month_kopeks: int
+    came_pct: int | None = None  # нечего делить — `None`, на экране «—»
+    money_pct: int | None = None
+
+
+@router.get('/referrals/overview', response_model=DashboardReferralsResponse)
+async def get_dashboard_referrals(
+    admin: User = Depends(require_permission('stats:read')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> DashboardReferralsResponse:
+    """Рефералка на экран «Статистика» (РЕФ-2, решения владельца 29.09): по месяцам, как «Деньги» выше."""
+    try:
+        return DashboardReferralsResponse(**await dashboard_referrals(db, datetime.now(UTC)))
+    except Exception as error:
+        logger.error('Failed to get dashboard referrals', error=error, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load referrals',
         )
 
 
