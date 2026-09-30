@@ -65,7 +65,7 @@ def _schema() -> Session:
         'CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, user_id INTEGER, tariff_id INTEGER, is_trial BOOLEAN, '
         'status TEXT, end_date TIMESTAMP, created_at TIMESTAMP)',
         'CREATE TABLE subscription_events (id INTEGER PRIMARY KEY, user_id INTEGER, subscription_id INTEGER, '
-        'event_type TEXT, extra JSON, occurred_at TIMESTAMP)',
+        'event_type TEXT, extra JSON, occurred_at TIMESTAMP, message TEXT)',
         'CREATE TABLE referral_earnings (id INTEGER PRIMARY KEY, user_id INTEGER, referral_id INTEGER, '
         'amount_kopeks INTEGER, reason TEXT, created_at TIMESTAMP)',
     ]

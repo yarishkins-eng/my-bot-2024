@@ -84,7 +84,7 @@ def _schema() -> Session:
         c.execute(
             text(
                 'CREATE TABLE subscription_events (id INTEGER PRIMARY KEY, user_id INTEGER, subscription_id INTEGER, '
-                'event_type TEXT, extra JSON, occurred_at TIMESTAMP)'
+                'event_type TEXT, extra JSON, occurred_at TIMESTAMP, message TEXT)'
             )
         )
         c.execute(text('CREATE TABLE advertising_campaigns (id INTEGER PRIMARY KEY, name TEXT)'))
@@ -181,13 +181,14 @@ class _Seed:
         *,
         occurred_at: str = IN_DAY,
         subscription_id: int | None = None,
+        message: str | None = None,
     ) -> None:
         self.s.execute(
             text(
-                'INSERT INTO subscription_events (user_id, subscription_id, event_type, extra, occurred_at) '
-                'VALUES (:u, :sid, :e, :x, :at)'
+                'INSERT INTO subscription_events (user_id, subscription_id, event_type, extra, occurred_at, message) '
+                'VALUES (:u, :sid, :e, :x, :at, :msg)'
             ),
-            {'u': user_id, 'sid': subscription_id, 'e': event_type, 'x': extra, 'at': occurred_at},
+            {'u': user_id, 'sid': subscription_id, 'e': event_type, 'x': extra, 'at': occurred_at, 'msg': message},
         )
 
     def subscription(
@@ -1237,6 +1238,32 @@ async def test_referral_block_failure_keeps_the_rest_of_the_letter() -> None:
     assert '📉 <b>Потери за вчера</b>' in lines
     assert '🎟 Поддержка: 1 новых · 3 открытых' in lines
     assert not any(line.startswith('• Пришли по ссылке друга') for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_referral_trial_counts_a_trial_whose_row_a_purchase_rewrote() -> None:
+    """О-1 (30.09.2026): покупка переписывает строку пробного, а у старых покупок нет признака конверсии — правило
+    письма таких не видит (боевые июнь / июль / август: 4 / 0 / 5 вместо 8 / 3 / 8). Событие активации покупку
+    переживает."""
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.payer()
+    # Оля взяла пробный сегодня, и покупка переписала строку: флаг снят, тариф платный, признака конверсии нет
+    olya = seed.user(referred_by_id=masha)
+    seed.subscription(olya, tariff_id=3, is_trial=False)
+    seed.event(olya, 'activation', None, message='Trial activation')
+    # Коля: строку перекрасила покупка с признаком конверсии, и событие активации тоже есть — один человек, не два
+    kolya = seed.user(referred_by_id=masha)
+    rewritten = seed.subscription(kolya, tariff_id=3, is_trial=False)
+    seed.event(kolya, 'purchase', '{"was_trial_conversion": true}', subscription_id=rewritten)
+    seed.event(kolya, 'activation', None, message='Trial activation', subscription_id=rewritten)
+    # пробный вчера и завтра — не в этот день; пробный без приглашения — не рефералка
+    seed.event(seed.user(referred_by_id=masha), 'activation', None, message='Trial activation', occurred_at=DAY_BEFORE)
+    seed.event(seed.user(referred_by_id=masha), 'activation', None, message='Trial activation', occurred_at=DAY_AFTER)
+    seed.event(seed.user(), 'activation', None, message='Trial activation')
+    session.commit()
+
+    assert (await _referral_numbers(session))['trial'] == 2
 
 
 @pytest.mark.asyncio

@@ -319,8 +319,9 @@ class ReportingService:
         """Рефералка за окно `[start, end)` — ЕДИНСТВЕННОЕ место, где она считается: письмо зовёт его за сутки, кабинет —
         за каждый месяц. Две копии определений разошлись бы молча (мина NW). Только чтение.
 
-        `came` — новые люди по ссылке друга; `trial` — приглашённые (любой даты прихода), взявшие пробный в окне, тем же
-        определением, что «взяли пробный» письма; `paid` / `money_kopeks` — приглашённые с живой оплатой в окне и сумма;
+        `came` — новые люди по ссылке друга; `trial` — приглашённые (любой даты прихода), взявшие пробный в окне: правило
+        «взяли пробный» письма плюс событие активации пробного (О-1); `paid` / `money_kopeks` — приглашённые с живой
+        оплатой в окне и сумма;
         `paid_first` — из них те, у кого живой оплаты раньше окна не было (по книге оплат, не по флагу — мина MQ);
         `rewards_kopeks` — начисления пригласившим.
         """
@@ -334,13 +335,18 @@ class ReportingService:
             ).scalar()
             or 0
         )
+        # 🔴 О-1 (30.09.2026): покупка переписывает строку пробного, а у старых покупок нет признака конверсии —
+        # правило письма таких не видит (боевые июнь / июль / август: 4 / 0 / 5 вместо 8 / 3 / 8). Событие активации
+        # покупку переживает — добираем по нему, как экран продаж (`_trial_starts`) и кампании
+        activated = select(SubscriptionEvent.user_id).where(
+            SubscriptionEvent.event_type == 'activation',
+            SubscriptionEvent.message == 'Trial activation',
+            SubscriptionEvent.occurred_at >= start_utc,
+            SubscriptionEvent.occurred_at < end_utc,
+        )
         takers = await self._trial_takers(session, start_utc, end_utc, await get_trial_tariff(session))
-        trial = 0
-        if takers:
-            trial = int(
-                (await session.execute(select(func.count(User.id)).where(User.id.in_(list(takers)), invited))).scalar()
-                or 0
-            )
+        took_trial = or_(User.id.in_(activated), User.id.in_(list(takers))) if takers else User.id.in_(activated)
+        trial = int((await session.execute(select(func.count(User.id)).where(invited, took_trial))).scalar() or 0)
         paid_rows = (
             await session.execute(
                 select(Transaction.user_id, func.sum(func.abs(Transaction.amount_kopeks)))
