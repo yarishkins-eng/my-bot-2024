@@ -1077,7 +1077,9 @@ async def get_recent_payments(
                 .order_by(AdvertisingCampaignRegistration.id)
             )
             for campaign_user_id, campaign_name in campaign_rows:
-                campaign_names.setdefault(campaign_user_id, campaign_name)
+                campaign_names.setdefault(
+                    campaign_user_id, (campaign_name or '').strip() or None
+                )  # в базе имена с хвостовым пробелом
             # «За что»: у пополнения ссылки на покупку нет — берём первую покупку с баланса в течение часа после него
             # (замер 30.09: у 57 из 68 пополнений за 60 дней такая покупка есть); у чека кассы — проводку его заказа
             oldest = min(t.created_at for t in transactions)
