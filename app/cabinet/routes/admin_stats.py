@@ -1023,7 +1023,7 @@ async def _hidden_payments_last_30d(db: AsyncSession, since: datetime) -> Hidden
 
 @router.get('/payments/recent', response_model=RecentPaymentsResponse)
 async def get_recent_payments(
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=100),
     admin: User = Depends(require_permission('stats:read')),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
@@ -1083,6 +1083,8 @@ async def get_recent_payments(
             # «За что». У чека кассы — проводка его заказа. У пополнения ссылки на покупку нет: берём первую ещё не
             # занятую покупку с баланса в течение часа ПОСЛЕ него (замер 30.09: у 57 из 68 пополнений за 60 дней она
             # есть); одна покупка — одному пополнению. Это догадка по времени: покупку могли оплатить и старым остатком
+            # время ОПЛАТЫ: у пополнения Platega `created_at` — время создания счёта (на боевом до 10 минут раньше)
+            paid_at = {t.id: t.completed_at or t.created_at for t in transactions}
             oldest = min(t.created_at for t in transactions)
             purchase_rows = await db.execute(
                 select(Transaction)
@@ -1110,7 +1112,7 @@ async def get_recent_payments(
                         paired = (
                             purchase.payment_method == 'balance'
                             and purchase.id not in taken
-                            and trans.created_at <= purchase.created_at <= trans.created_at + timedelta(hours=1)
+                            and paid_at[trans.id] <= purchase.created_at <= paid_at[trans.id] + timedelta(hours=1)
                         )
                     if paired:
                         taken.add(purchase.id)

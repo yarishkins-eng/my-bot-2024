@@ -146,6 +146,10 @@ def _edge_seed(s: Session) -> None:
     # удалённый — не в списке и не в скрытом
     _tx(s, 30, 3, 'deposit', 14900, 'platega', '2026-09-30 12:00:00.000000', 'Пополнение')
     _tx(s, 31, 3, 'deposit', 5000, None, '2026-09-30 12:00:00.000000', 'Бонус за регистрацию')
+    # счёт создан в 13:00, оплачен в 13:50 — покупка в 14:20 идёт в «за что» по времени ОПЛАТЫ
+    _tx(s, 40, 2, 'deposit', 9900, 'platega', '2026-09-30 13:00:00.000000', 'Пополнение через Platega')
+    s.execute(text("UPDATE transactions SET completed_at = '2026-09-30 13:50:00.000000' WHERE id = 40"))
+    _tx(s, 41, 2, 'subscription_payment', -9900, 'balance', '2026-09-30 14:20:00.000000', 'Продление: 1 месяц')
     s.commit()
 
 
@@ -157,12 +161,13 @@ async def test_purpose_takes_each_purchase_once_and_only_after_the_top_up():
         response = await module.get_recent_payments(limit=20, admin=None, db=_AsyncOverSync(s))
 
     assert [(p.id, p.is_first, p.purpose, p.campaign_name) for p in response.payments] == [
+        (40, False, 'Продление: 1 месяц', None),
         (20, True, 'Платёж картой получен', None),
         (12, False, None, 'Канал'),
         (11, True, 'Оплата: 2 месяца', 'Канал'),
     ]
     hidden = response.hidden_last_30d
-    assert (hidden.registration_bonuses, hidden.balance_purchases, hidden.manual_credits) == (0, 2, 0)
+    assert (hidden.registration_bonuses, hidden.balance_purchases, hidden.manual_credits) == (0, 3, 0)
 
 
 @pytest.mark.asyncio
