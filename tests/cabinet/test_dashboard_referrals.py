@@ -99,13 +99,15 @@ class _Seed:
         )
         return self._next
 
-    def pay(self, user_id: int, amount: int, *, created_at: str, tx_type: str = 'provider_receipt') -> None:
+    def pay(
+        self, user_id: int, amount: int, *, created_at: str, tx_type: str = 'provider_receipt', method: str = 'platega'
+    ) -> None:
         self.s.execute(
             text(
                 'INSERT INTO transactions (user_id, type, amount_kopeks, payment_method, description, is_completed, '
-                "created_at) VALUES (:u, :t, :a, 'platega', 'Платёж картой получен', 1, :at)"
+                "created_at) VALUES (:u, :t, :a, :m, 'Платёж картой получен', 1, :at)"
             ),
-            {'u': user_id, 't': tx_type, 'a': amount, 'at': created_at},
+            {'u': user_id, 't': tx_type, 'a': amount, 'm': method, 'at': created_at},
         )
 
     def trial(self, user_id: int, *, created_at: str) -> None:
@@ -157,8 +159,9 @@ def _seed_two_months(seed: _Seed) -> None:
     seed.earning(masha, petya, 4975, 'referral_first_topup', created_at=SEP_05)
     seed.earning(masha, petya, 500, 'referral_commission_topup', created_at=AUG_LAST_MINUTE)
     seed.earning(masha, petya, 1000, 'referral_commission_topup', created_at=SEP_FIRST_MIDNIGHT)
-    # последняя минута августа по Москве — ещё август
-    seed.user(created_at=AUG_LAST_MINUTE, referred_by_id=masha)
+    # последняя минута августа по Москве — ещё август; начисление админа — не оплата деньгами
+    edge_friend = seed.user(created_at=AUG_LAST_MINUTE, referred_by_id=masha)
+    seed.pay(edge_friend, 30000, created_at=SEP_05, tx_type='deposit', method='manual')
     # Иван пришёл в сентябре и заплатил в сентябре
     ivan = seed.user(created_at=SEP_05, referred_by_id=masha)
     seed.pay(ivan, 25000, created_at=SEP_20, tx_type='deposit')
