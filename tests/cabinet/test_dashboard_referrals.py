@@ -227,3 +227,18 @@ async def test_the_screen_and_the_letter_use_one_counter_over_moscow_months() ->
         'money_kopeks': 300,
         'rewards_kopeks': 200,
     }
+
+
+@pytest.mark.asyncio
+async def test_series_starts_in_the_moscow_month_of_the_first_arrival() -> None:
+    """00:30 МСК 01.08 — это ещё 31.07 по UTC: ряд обязан начаться с августа, без пустого «июля»."""
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.user(created_at=JUNE)
+    seed.user(created_at='2026-07-31 21:30:00.000000', referred_by_id=masha)
+    session.commit()
+
+    overview = await _overview(session)
+
+    assert [row['month'] for row in overview['months']] == ['2026-08', '2026-09']
+    assert overview['months'][0]['came'] == 1
