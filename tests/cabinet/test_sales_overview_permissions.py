@@ -62,3 +62,13 @@ async def test_statistics_money_needs_the_same_right_as_the_statistics_screen(mo
 
     assert response.status_code == 403
     assert asked == ['stats:read']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path', ['/cabinet/admin/stats/referrals/overview', '/cabinet/admin/stats/referrals/top'])
+async def test_referral_numbers_need_the_statistics_right(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    """РЕФ-2: приглашения по месяцам, деньги от них и «Топ» с оплатами видит тот же, кто видит «Статистику»."""
+    response, asked = await _request(monkeypatch, path, set(), router=admin_stats.router)
+
+    assert response.status_code == 403
+    assert asked == ['stats:read']

@@ -1267,6 +1267,31 @@ async def test_referral_trial_counts_a_trial_whose_row_a_purchase_rewrote() -> N
 
 
 @pytest.mark.asyncio
+async def test_referral_first_payment_counts_only_live_money_and_team_inviter_keeps_the_pair() -> None:
+    """Ревью C1-2: «впервые» — по книге ЖИВЫХ оплат (ручное начисление раньше — не оплата); нулевая проводка — не
+    «заплатил»; Team исключает приглашённого, а не пару с пригласившим на Team."""
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.payer()
+    # Оле раньше начисляли руками, сегодня она впервые заплатила сама
+    olya = seed.user(referred_by_id=masha)
+    seed.tx(olya, 'deposit', 30000, method='manual', description='Начисление администратором', created_at=LONG_AGO)
+    seed.tx(olya, 'provider_receipt', 19900, method='platega', description='Платёж картой получен')
+    # у Коли сегодня только нулевая проводка — не оплата
+    kolya = seed.user(referred_by_id=masha)
+    seed.tx(kolya, 'deposit', 0, method='platega', description='Пополнение через Platega')
+    # друг на Team позвал Лену: Лена — новая и считается
+    friend_on_team = seed.user()
+    seed.subscription(friend_on_team, tariff_id=7, is_trial=False, created_at=LONG_AGO)
+    seed.user(created_at=IN_DAY, referred_by_id=friend_on_team)
+    session.commit()
+
+    numbers = await _referral_numbers(session)
+
+    assert (numbers['came'], numbers['paid'], numbers['paid_first'], numbers['money_kopeks']) == (1, 1, 1, 19900)
+
+
+@pytest.mark.asyncio
 async def test_referral_counter_day_edges_are_moscow_midnights() -> None:
     session = _schema()
     seed = _Seed(session)
