@@ -357,3 +357,52 @@ async def test_period_totals_are_today_seven_moscow_days_and_the_calendar_month(
         totals = await module.referral_period_totals(_AsyncOverSync(session), NOW)
 
     assert totals == {'today_kopeks': 1000, 'week_kopeks': 4100, 'month_kopeks': 15325}
+
+
+# ---------- W2-M1: сторожа к выжившим мутациям экрана ----------
+
+
+@pytest.mark.asyncio
+async def test_overview_route_fails_loudly_instead_of_showing_zeros() -> None:
+    """Сбой счётчика — это 500 (экран покажет ошибку), а не пустой ответ, который на экране выглядит как «0 приглашённых»."""
+    from fastapi import HTTPException
+
+    from app.cabinet.routes import admin_stats
+
+    with patch.object(admin_stats, 'dashboard_referrals', AsyncMock(side_effect=RuntimeError('db is down'))):
+        with pytest.raises(HTTPException) as caught:
+            await admin_stats.get_dashboard_referrals(admin=SimpleNamespace(), db=SimpleNamespace())
+
+    assert caught.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_top_totals_count_todays_reward_up_to_now() -> None:
+    """«Сегодня» под «Топом» — до «сейчас», а не до начала суток UTC: награда в 08:00 МСК сегодня обязана попасть."""
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.user(created_at=JUNE)
+    petya = seed.user(created_at=AUG_10, referred_by_id=masha)
+    seed.earning(masha, petya, 700, 'referral_commission_topup', created_at='2026-09-27 05:00:00.000000')
+    session.commit()
+
+    response, _ = await _top(session)
+
+    assert response.period_totals.today_kopeks == 700
+
+
+@pytest.mark.asyncio
+async def test_overview_route_returns_every_field_the_screen_reads() -> None:
+    """Маршрут отдаёт ровно то, что насчитал `dashboard_referrals`: поле, пропавшее из модели ответа, pydantic отбросит молча."""
+    from app.cabinet.routes import admin_stats
+
+    session = _schema()
+    _seed_two_months(_Seed(session))
+    overview = await _overview(session)
+
+    counter = AsyncMock(return_value=overview)
+    with patch.object(admin_stats, 'dashboard_referrals', counter):
+        response = await admin_stats.get_dashboard_referrals(admin=SimpleNamespace(), db=SimpleNamespace())
+
+    assert response.model_dump() == overview
+    assert counter.await_args.args[1].tzinfo is not None  # «сейчас» с часовым поясом, а не наивное местное время
