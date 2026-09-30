@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -65,7 +65,7 @@ def _schema() -> Session:
         c.execute(
             text(
                 'CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, status TEXT, '
-                'test_account_enabled BOOLEAN, remnawave_uuid TEXT, created_at TIMESTAMP)'
+                'test_account_enabled BOOLEAN, remnawave_uuid TEXT, referred_by_id INTEGER, created_at TIMESTAMP)'
             )
         )
         c.execute(
@@ -84,7 +84,7 @@ def _schema() -> Session:
         c.execute(
             text(
                 'CREATE TABLE subscription_events (id INTEGER PRIMARY KEY, user_id INTEGER, subscription_id INTEGER, '
-                'event_type TEXT, extra JSON, occurred_at TIMESTAMP)'
+                'event_type TEXT, extra JSON, occurred_at TIMESTAMP, message TEXT)'
             )
         )
         c.execute(text('CREATE TABLE advertising_campaigns (id INTEGER PRIMARY KEY, name TEXT)'))
@@ -96,6 +96,12 @@ def _schema() -> Session:
         )
         c.execute(
             text('CREATE TABLE tickets (id INTEGER PRIMARY KEY, user_id INTEGER, status TEXT, created_at TIMESTAMP)')
+        )
+        c.execute(
+            text(
+                'CREATE TABLE referral_earnings (id INTEGER PRIMARY KEY, user_id INTEGER, referral_id INTEGER, '
+                'amount_kopeks INTEGER, reason TEXT, created_at TIMESTAMP)'
+            )
         )
         c.execute(
             text(
@@ -122,12 +128,13 @@ class _Seed:
         test_account_enabled: bool | None = None,
         email_only: bool = False,
         remnawave_uuid: str | None = None,
+        referred_by_id: int | None = None,
     ) -> int:
         self._next_user += 1
         self.s.execute(
             text(
-                'INSERT INTO users (id, telegram_id, status, test_account_enabled, remnawave_uuid, created_at) '
-                'VALUES (:id, :tg, :st, :te, :uuid, :c)'
+                'INSERT INTO users (id, telegram_id, status, test_account_enabled, remnawave_uuid, referred_by_id, '
+                'created_at) VALUES (:id, :tg, :st, :te, :uuid, :ref, :c)'
             ),
             {
                 'id': self._next_user,
@@ -135,6 +142,7 @@ class _Seed:
                 'st': status,
                 'te': test_account_enabled,
                 'uuid': remnawave_uuid,
+                'ref': referred_by_id,
                 'c': created_at,
             },
         )
@@ -173,13 +181,14 @@ class _Seed:
         *,
         occurred_at: str = IN_DAY,
         subscription_id: int | None = None,
+        message: str | None = None,
     ) -> None:
         self.s.execute(
             text(
-                'INSERT INTO subscription_events (user_id, subscription_id, event_type, extra, occurred_at) '
-                'VALUES (:u, :sid, :e, :x, :at)'
+                'INSERT INTO subscription_events (user_id, subscription_id, event_type, extra, occurred_at, message) '
+                'VALUES (:u, :sid, :e, :x, :at, :msg)'
             ),
-            {'u': user_id, 'sid': subscription_id, 'e': event_type, 'x': extra, 'at': occurred_at},
+            {'u': user_id, 'sid': subscription_id, 'e': event_type, 'x': extra, 'at': occurred_at, 'msg': message},
         )
 
     def subscription(
@@ -213,6 +222,15 @@ class _Seed:
                 'INSERT INTO advertising_campaign_registrations (campaign_id, user_id, created_at) VALUES (:c, :u, :at)'
             ),
             {'c': campaign_id, 'u': user_id, 'at': created_at},
+        )
+
+    def earning(self, referrer: int, referral: int, amount: int, reason: str, *, created_at: str = IN_DAY) -> None:
+        self.s.execute(
+            text(
+                'INSERT INTO referral_earnings (user_id, referral_id, amount_kopeks, reason, created_at) '
+                'VALUES (:u, :r, :a, :why, :at)'
+            ),
+            {'u': referrer, 'r': referral, 'a': amount, 'why': reason, 'at': created_at},
         )
 
     def ticket(self, status: str, *, user_id: int, created_at: str = IN_DAY) -> None:
@@ -359,8 +377,11 @@ def _seed_owner_day(seed: _Seed) -> None:
 TARIFFS = [
     SimpleNamespace(id=3, is_free=False, is_trial_available=False, is_active=True),  # Базовый — платный
     SimpleNamespace(id=4, is_free=True, is_trial_available=False, is_active=True),  # Team — бесплатный
-    # пробный: на боевом ВЫКЛЮЧЕН из продажи — и потому виден только с `include_inactive=True`
-    SimpleNamespace(id=5, is_free=False, is_trial_available=True, is_active=False),
+    # пробный: на боевом ВЫКЛЮЧЕН из продажи — и потому виден только с `include_inactive=True`; цены у него нулевые, то есть
+    # `is_free=True`, как на боевом (РЕФ-2, ревью L5-5): «Team = бесплатный» без оговорки «и не пробный» здесь покраснеет
+    SimpleNamespace(id=5, is_free=True, is_trial_available=True, is_active=False),
+    # Team, снятый с продажи: его друзья — всё равно не клиенты (виден только с `include_inactive=True`)
+    SimpleNamespace(id=7, is_free=True, is_trial_available=False, is_active=False),
 ]
 
 
@@ -418,6 +439,11 @@ async def test_owner_report_for_a_live_day_is_the_owners_letter() -> None:
         '',
         '🚪 <b>За день</b>',
         '• Открыли бота: 4 · по рекламе: 3 (кувалда 2.0 8000 — 2, teplo11 — 1) · взяли пробный: 2',
+        '',
+        # РЕФ-2: в этом дне приглашённых нет — блок всё равно печатается, с нулями (решение владельца 29.09)
+        '🤝 <b>Приглашения</b>',
+        '• Пришли по ссылке друга: 0 · взяли пробный: 0',
+        '• Заплатили приглашённые: 0 на 0 ₽ (впервые 0) · пригласившим начислено 0 ₽',
         '',
         '📉 <b>Потери за вчера</b>',
         '• Взяли пробный: 2, подключились к VPN: 1',
@@ -1116,3 +1142,269 @@ def test_next_run_after_an_early_wakeup_is_tomorrow_not_the_same_minute() -> Non
 
     assert report_date == date(2026, 9, 21)
     assert next_run == module.datetime(2026, 9, 22, 6, 0, tzinfo=msk).astimezone(UTC)
+
+
+# ---------- РЕФ-2 (30.09.2026): блок «Приглашения» и общий счётчик рефералки ----------
+
+WINDOW_18 = (datetime(2026, 9, 17, 21, 0, tzinfo=UTC), datetime(2026, 9, 18, 21, 0, tzinfo=UTC))
+
+
+async def _referral_numbers(session: Session) -> dict:
+    service = ReportingService()
+    with (
+        patch.object(module, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=5))),
+        patch.object(module, 'get_all_tariffs', _tariffs),
+        patch('app.services.user_service.test_account_telegram_ids', lambda: frozenset({STAND_TELEGRAM_ID})),
+    ):
+        return await service.referral_numbers(_AsyncOverSync(session), *WINDOW_18)
+
+
+def _seed_referral_day(seed: _Seed) -> None:
+    """День 18.09 с каждой ловушкой, которую назвало ревью замысла РЕФ-2."""
+    masha = seed.payer()
+    stand = seed.user(telegram_id=STAND_TELEGRAM_ID)
+    # Петя пришёл сегодня по ссылке Маши, взял пробный и заплатил картой в кассе (приход + вторая проводка кассы)
+    petya = seed.user(created_at=IN_DAY, referred_by_id=masha)
+    seed.subscription(petya, tariff_id=5, is_trial=True)
+    seed.tx(petya, 'provider_receipt', 19900, method='platega', description='Платёж картой получен')
+    seed.tx(petya, 'subscription_payment', -19900, method='platega', description='Оплата подписки картой: 1 месяц')
+    seed.earning(masha, petya, 4975, 'referral_first_topup')
+    seed.earning(masha, petya, 0, 'referral_registration_pending')
+    seed.earning(masha, petya, 99900, 'test_earning')  # не живая причина — не деньги рефералки
+    # Иван пришёл давно (платил ещё раньше), сегодня взял пробный и пополнил баланс — «заплатил», но не «впервые»
+    ivan = seed.user(created_at=LONG_AGO, referred_by_id=masha)
+    seed.tx(ivan, 'deposit', 14900, method='platega', description='Пополнение', created_at=LONG_AGO)
+    seed.subscription(ivan, tariff_id=5, is_trial=True)
+    seed.tx(ivan, 'deposit', 25000, method='platega', description='Пополнение через Platega')
+    seed.tx(ivan, 'deposit', 4700, method='platega', description='реферальный бонус за покупку друга')
+    seed.tx(ivan, 'deposit', 30000, method='manual', description='Начисление администратором')
+    seed.earning(masha, ivan, 6250, 'referral_commission_topup')
+    seed.earning(masha, ivan, 1000, 'referral_commission_topup', created_at=DAY_BEFORE)
+    # тестовая пара: приглашённый — человек, пригласивший — стенд (как в проверке 29.09)
+    stand_friend = seed.user(created_at=IN_DAY, referred_by_id=stand)
+    seed.tx(stand_friend, 'provider_receipt', 24900, method='platega', description='Платёж картой получен')
+    seed.earning(stand, stand_friend, 16225, 'referral_first_topup')
+    # друг на Team, который уже сняли с продажи, и удалённый приглашённый — не клиенты
+    team_friend = seed.user(created_at=IN_DAY, referred_by_id=masha)
+    seed.subscription(team_friend, tariff_id=7, is_trial=False, created_at=LONG_AGO)
+    seed.tx(team_friend, 'deposit', 20000, method='platega', description='Пополнение через Platega')
+    deleted_friend = seed.user(status='deleted', created_at=IN_DAY, referred_by_id=masha)
+    seed.tx(deleted_friend, 'provider_receipt', 19900, method='platega', description='Платёж картой получен')
+    seed.s.commit()
+
+
+@pytest.mark.asyncio
+async def test_referral_counter_follows_the_owner_rules() -> None:
+    session = _schema()
+    _seed_referral_day(_Seed(session))
+
+    assert await _referral_numbers(session) == {
+        'came': 1,  # только Петя: стенд-пара, Team и удалённый — не в счёт, Иван пришёл давно
+        'trial': 2,  # Петя и Иван: пробный считается в свой день, когда бы человек ни пришёл
+        'paid': 2,
+        'paid_first': 1,  # Иван платил и раньше
+        'money_kopeks': 44900,  # 199 + 250 ₽: вторая проводка кассы, бонус и ручное начисление — не деньги
+        'rewards_kopeks': 11225,  # 49,75 + 62,50 ₽: без `pending`, `test_earning`, стенда и вчерашнего
+    }
+
+
+@pytest.mark.asyncio
+async def test_referral_block_in_the_letter_prints_the_counter() -> None:
+    session = _schema()
+    _seed_referral_day(_Seed(session))
+
+    lines = (await _render(session)).split('\n')
+
+    start = lines.index('🤝 <b>Приглашения</b>')
+    assert lines[start - 2].startswith('• Открыли бота: ')
+    assert lines[start : start + 4] == [
+        '🤝 <b>Приглашения</b>',
+        '• Пришли по ссылке друга: 1 · взяли пробный: 2',
+        '• Заплатили приглашённые: 2 на 449 ₽ (впервые 1) · пригласившим начислено 112 ₽',
+        '',
+    ]
+    assert lines[start + 4] == '📉 <b>Потери за вчера</b>'
+
+
+@pytest.mark.asyncio
+async def test_referral_block_failure_keeps_the_rest_of_the_letter() -> None:
+    session = _schema()
+    _seed_owner_day(_Seed(session))
+
+    with patch.object(ReportingService, 'referral_numbers', AsyncMock(side_effect=RuntimeError('db is down'))):
+        lines = (await _render(session)).split('\n')
+
+    assert '🤝 <b>Приглашения</b>: не посчитано (сбой)' in lines
+    assert '📉 <b>Потери за вчера</b>' in lines
+    assert '🎟 Поддержка: 1 новых · 3 открытых' in lines
+    assert not any(line.startswith('• Пришли по ссылке друга') for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_referral_trial_counts_a_trial_whose_row_a_purchase_rewrote() -> None:
+    """О-1 (30.09.2026): покупка переписывает строку пробного, а у старых покупок нет признака конверсии — правило
+    письма таких не видит (прошлые месяцы на боевом недосчитывали пробные вдвое). Событие активации покупку
+    переживает."""
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.payer()
+    # Оля взяла пробный сегодня, и покупка переписала строку: флаг снят, тариф платный, признака конверсии нет
+    olya = seed.user(referred_by_id=masha)
+    seed.subscription(olya, tariff_id=3, is_trial=False)
+    seed.event(olya, 'activation', None, message='Trial activation')
+    # Коля: строку перекрасила покупка с признаком конверсии, и событие активации тоже есть — один человек, не два
+    kolya = seed.user(referred_by_id=masha)
+    rewritten = seed.subscription(kolya, tariff_id=3, is_trial=False)
+    seed.event(kolya, 'purchase', '{"was_trial_conversion": true}', subscription_id=rewritten)
+    seed.event(kolya, 'activation', None, message='Trial activation', subscription_id=rewritten)
+    # пробный вчера и завтра — не в этот день; пробный без приглашения — не рефералка
+    seed.event(seed.user(referred_by_id=masha), 'activation', None, message='Trial activation', occurred_at=DAY_BEFORE)
+    seed.event(seed.user(referred_by_id=masha), 'activation', None, message='Trial activation', occurred_at=DAY_AFTER)
+    seed.event(seed.user(), 'activation', None, message='Trial activation')
+    # другие события приглашённого — не пробный: покупка, неудачная активация, покупка с той же подписью (ревью S1-2)
+    seed.event(seed.user(referred_by_id=masha), 'purchase', '{"purchase_type": "first_purchase"}')
+    seed.event(seed.user(referred_by_id=masha), 'activation', None, message='Trial activation failed')
+    seed.event(seed.user(referred_by_id=masha), 'purchase', None, message='Trial activation')
+    session.commit()
+
+    assert (await _referral_numbers(session))['trial'] == 2
+
+
+@pytest.mark.asyncio
+async def test_referral_first_payment_counts_only_live_money_and_team_inviter_keeps_the_pair() -> None:
+    """Ревью C1-2: «впервые» — по книге ЖИВЫХ оплат (ручное начисление раньше — не оплата); нулевая проводка — не
+    «заплатил»; Team исключает приглашённого, а не пару с пригласившим на Team."""
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.payer()
+    # Оле раньше начисляли руками, сегодня она впервые заплатила сама
+    olya = seed.user(referred_by_id=masha)
+    seed.tx(olya, 'deposit', 30000, method='manual', description='Начисление администратором', created_at=LONG_AGO)
+    seed.tx(olya, 'provider_receipt', 19900, method='platega', description='Платёж картой получен')
+    # у Коли сегодня только нулевая проводка — не оплата
+    kolya = seed.user(referred_by_id=masha)
+    seed.tx(kolya, 'deposit', 0, method='platega', description='Пополнение через Platega')
+    # друг на Team позвал Лену: Лена — новая и считается
+    friend_on_team = seed.user()
+    seed.subscription(friend_on_team, tariff_id=7, is_trial=False, created_at=LONG_AGO)
+    seed.user(created_at=IN_DAY, referred_by_id=friend_on_team)
+    session.commit()
+
+    numbers = await _referral_numbers(session)
+
+    assert (numbers['came'], numbers['paid'], numbers['paid_first'], numbers['money_kopeks']) == (1, 1, 1, 19900)
+
+
+@pytest.mark.asyncio
+async def test_referral_counter_day_edges_are_moscow_midnights() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.payer()
+    first_second = seed.user(created_at=MIDNIGHT_18, referred_by_id=masha)
+    seed.tx(first_second, 'provider_receipt', 19900, method='platega', created_at=MIDNIGHT_18)
+    seed.earning(masha, first_second, 4975, 'referral_first_topup', created_at=MIDNIGHT_18)
+    next_day = seed.user(created_at=MIDNIGHT_19, referred_by_id=masha)
+    seed.tx(next_day, 'provider_receipt', 19900, method='platega', created_at=MIDNIGHT_19)
+    seed.earning(masha, next_day, 4975, 'referral_first_topup', created_at=MIDNIGHT_19)
+    session.commit()
+
+    numbers = await _referral_numbers(session)
+
+    assert (numbers['came'], numbers['paid'], numbers['money_kopeks'], numbers['rewards_kopeks']) == (1, 1, 19900, 4975)
+
+
+# ---------- W2-M1: сторожа к выжившим мутациям «взяли пробный» ----------
+
+
+@pytest.mark.asyncio
+async def test_referral_trial_event_window_is_half_open_at_moscow_midnights() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.payer()
+    seed.event(seed.user(referred_by_id=masha), 'activation', None, occurred_at=MIDNIGHT_18, message='Trial activation')
+    seed.event(seed.user(referred_by_id=masha), 'activation', None, occurred_at=MIDNIGHT_19, message='Trial activation')
+    session.commit()
+
+    assert (await _referral_numbers(session))['trial'] == 1  # первая секунда окна — есть, следующие сутки — нет
+
+
+@pytest.mark.asyncio
+async def test_referral_trial_event_of_a_team_deleted_or_stand_pair_person_is_not_counted() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    masha, stand = seed.payer(), seed.user(telegram_id=STAND_TELEGRAM_ID)
+    team_friend = seed.user(referred_by_id=masha)
+    seed.subscription(team_friend, tariff_id=7, is_trial=False, created_at=LONG_AGO)  # взял пробный, потом стал Team
+    for person in (team_friend, seed.user(status='deleted', referred_by_id=masha), seed.user(referred_by_id=stand)):
+        seed.event(person, 'activation', None, message='Trial activation')
+    session.commit()
+
+    assert (await _referral_numbers(session))['trial'] == 0
+
+
+@pytest.mark.asyncio
+async def test_referral_money_sums_all_live_payments_of_one_person_in_the_window() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    olya = seed.user(referred_by_id=seed.payer())
+    seed.tx(olya, 'provider_receipt', 19900, method='platega', description='Платёж картой получен')
+    seed.tx(olya, 'deposit', 14900, method='platega', description='Пополнение через Platega')
+    session.commit()
+
+    numbers = await _referral_numbers(session)
+
+    assert (numbers['paid'], numbers['money_kopeks']) == (1, 34800)  # один человек, обе оплаты в сумме
+
+
+@pytest.mark.asyncio
+async def test_referral_payment_at_the_first_second_of_the_window_is_still_the_first_one() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    olya = seed.user(referred_by_id=seed.payer())
+    seed.tx(olya, 'provider_receipt', 19900, method='platega', created_at=MIDNIGHT_18)
+    session.commit()
+
+    numbers = await _referral_numbers(session)
+
+    assert (numbers['paid'], numbers['paid_first']) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_referral_unfinished_payment_is_not_a_payment() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    olya = seed.user(referred_by_id=seed.payer())
+    seed.tx(olya, 'provider_receipt', 19900, method='platega', description='Платёж картой получен', completed=False)
+    session.commit()
+
+    numbers = await _referral_numbers(session)
+
+    assert (numbers['paid'], numbers['paid_first'], numbers['money_kopeks']) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_referral_rewards_count_only_the_two_live_reasons() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.payer()
+    olya = seed.user(referred_by_id=masha)
+    seed.earning(masha, olya, 4975, 'referral_first_topup')
+    seed.earning(
+        masha, olya, 77700, 'referral_commission'
+    )  # мёртвая причина: в боевой базе таких строк нет, и не должно стать
+    session.commit()
+
+    assert (await _referral_numbers(session))['rewards_kopeks'] == 4975
+
+
+@pytest.mark.asyncio
+async def test_referral_trial_by_subscription_row_stays_in_the_window_and_on_the_trial_tariff() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.payer()
+    seed.subscription(seed.user(referred_by_id=masha), tariff_id=5, is_trial=True, created_at=DAY_BEFORE)
+    seed.subscription(seed.user(referred_by_id=masha), tariff_id=5, is_trial=True, created_at=DAY_AFTER)
+    seed.subscription(seed.user(referred_by_id=masha), tariff_id=3, is_trial=True)  # метка «пробный» на платном тарифе
+    session.commit()
+
+    assert (await _referral_numbers(session))['trial'] == 0

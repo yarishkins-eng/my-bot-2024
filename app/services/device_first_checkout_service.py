@@ -60,6 +60,7 @@ DIRECT_SETTLEMENT_MODE = 'direct_purchase_v2'
 KOPEKS_PER_RUBLE = 100
 READY_NOTIFICATION_TYPE = 'ready'
 CLIENT_MENU_TIMEOUT_SECONDS = 15  # ВК-2: меню после «готова» не держит очередь дольше
+REFERRAL_AMOUNTS_TIMEOUT_SECONDS = 5  # РЕФ-2.2: чтение сумм рефералки для карточки продажи не держит очередь дольше
 # РФ-1 п.1.3: device-first платил реферальную комиссию МОЛЧА — `_add_reward` кладёт деньги на
 # баланс, и обращения к боту в том файле нет вовсе. Партнёру при регистрации обещают процент,
 # и он его получал, не зная об этом. Тип идёт через ту же очередь сообщений: у неё уже есть
@@ -3727,6 +3728,11 @@ async def _send_owner_sale_card(db: AsyncSession, *, bot, checkout: Subscription
         ).scalar_one_or_none()
         payment_label = platega_method_label(attempt.provider_method_code) if attempt is not None else ''
     discount = int((snapshot.get('price_breakdown') or {}).get('promo_offer_discount_kopeks') or 0)
+    referral_amounts = {}
+    if first and getattr(user, 'referred_by_id', None):
+        referral_amounts = await _first_sale_referral_amounts(
+            checkout.id, user_id=user.id, referrer_id=user.referred_by_id
+        )
     delivered = await service.send_subscription_purchase_notification(
         db,
         user,
@@ -3738,10 +3744,45 @@ async def _send_owner_sale_card(db: AsyncSession, *, bot, checkout: Subscription
         was_trial_conversion=first and bool((checkout.target_snapshot or {}).get('is_trial')),
         payment_label=payment_label,
         discount_kopeks=discount,
+        **referral_amounts,
     )
     if not delivered:
         raise RuntimeError('sale_card_not_delivered')
     return True
+
+
+async def _first_sale_referral_amounts(checkout_id: int, *, user_id: int, referrer_id: int) -> dict:
+    """РЕФ-2.2: сколько по этому заказу начислено пригласившему и какой бонус получил сам покупатель — для карточки.
+
+    Награды пишет отдельный шаг очереди после продажи (`_apply_referral_step` → `_add_reward`, у каждой
+    `device_first_checkout_id` заказа), обычно раньше карточки; если карточка его опередила — суммы не печатаются. Своя
+    короткая сессия с потолком: карточка `sale:*` не повторяется (мина MN), и сбой этого чтения не имеет права
+    уронить ни её, ни транзакцию очереди — при любом сбое карточка уходит как раньше, без сумм.
+    """
+    from app.database.database import AsyncSessionLocal
+
+    try:
+        async with asyncio.timeout(REFERRAL_AMOUNTS_TIMEOUT_SECONDS):
+            async with AsyncSessionLocal() as amounts_db:
+                rows = (
+                    await amounts_db.execute(
+                        select(Transaction.user_id, func.coalesce(func.sum(Transaction.amount_kopeks), 0))
+                        .where(
+                            Transaction.type == TransactionType.REFERRAL_REWARD.value,
+                            Transaction.device_first_checkout_id == checkout_id,
+                            Transaction.user_id.in_((user_id, referrer_id)),
+                        )
+                        .group_by(Transaction.user_id)
+                    )
+                ).all()
+    except Exception as error:  # потолок (`TimeoutError`) — тоже сюда
+        logger.warning('Суммы рефералки для карточки продажи не прочитаны', checkout_id=checkout_id, error=error)
+        return {}
+    amounts = {int(recipient): int(total or 0) for recipient, total in rows}
+    return {
+        'referrer_reward_kopeks': amounts.get(referrer_id) or None,
+        'referred_bonus_kopeks': amounts.get(user_id) or None,
+    }
 
 
 async def _send_referral_reward_message(

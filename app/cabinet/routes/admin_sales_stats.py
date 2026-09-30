@@ -359,6 +359,71 @@ async def dashboard_money(db: AsyncSession, now: datetime) -> dict:
     }
 
 
+def _share_pct(part: int, whole: int) -> int | None:
+    """Доля целым процентом, половина — вверх; нечего делить — `None` (на экране «—»), а не ноль."""
+    return int(100 * part / whole + 0.5) if whole > 0 else None
+
+
+async def referral_period_totals(db: AsyncSession, now: datetime) -> dict:
+    """Итоги под «Топом рефералов» (РЕФ-2.4б): начислено ВСЕМ пригласившим за сегодня, 7 суток и календарный месяц
+    Москвы до «сейчас» — тем же счётчиком, что плитка «Начислено пригласившим»: «Этот месяц» под «Топом» и плитка —
+    одно число (прежде экран складывал десять строк вкладки по скользящим суткам UTC — находка D-3)."""
+    today = now.astimezone(_MSK).date()
+    starts = {
+        'today_kopeks': _msk_midnight(today),
+        'week_kopeks': _msk_midnight(today - timedelta(days=6)),
+        'month_kopeks': _msk_midnight(today.replace(day=1)),
+    }
+    return {key: await reporting_service.referral_rewards_kopeks(db, start, now) for key, start in starts.items()}
+
+
+async def dashboard_referrals(db: AsyncSession, now: datetime) -> dict:
+    """«Приглашения» на «Статистике» (РЕФ-2, 30.09.2026): каждый месяц Москвы считает ТОТ ЖЕ счётчик, что утреннее
+    письмо (`reporting_service.referral_numbers`), — письмо и экран не расходятся (мина NW). Каждое событие — в своём
+    месяце (решение владельца 29.09). Месяц без событий — строка с нулями; текущий месяц — до «сейчас». Плитки экран
+    берёт из последней строки: одно число из одного места. Доли: «пришли» — от всех новых людей месяца (Team и стенды
+    не люди, как на экране продаж), «деньги от приглашённых» — от денег месяца как в выписке Platega (со стендами)."""
+    today = now.astimezone(_MSK).date()
+    this_month = today.replace(day=1)
+    month = this_month
+    first = await reporting_service.referral_first_arrival(db)
+    if first is not None:
+        first = first if first.tzinfo else first.replace(tzinfo=UTC)
+        month = min(month, first.astimezone(_MSK).date().replace(day=1))
+    months = []
+    while month <= this_month:
+        next_month = (month + timedelta(days=32)).replace(day=1)
+        numbers = await reporting_service.referral_numbers(
+            db, _msk_midnight(month), min(_msk_midnight(next_month), now)
+        )
+        months.append(
+            {
+                'month': month.strftime('%Y-%m'),
+                **{key: numbers[key] for key in ('came', 'trial', 'paid_first', 'money_kopeks', 'rewards_kopeks')},
+            }
+        )
+        month = next_month
+    month_start = _msk_midnight(this_month)
+    rules = await _owner_rules(db)
+    new_people = int(
+        (
+            await db.execute(
+                select(func.count(User.id)).where(rules.people, User.created_at >= month_start, User.created_at < now)
+            )
+        ).scalar()
+        or 0
+    )
+    money_month = (await _money_in(db, month_start, now))['kopeks']
+    current = months[-1]
+    return {
+        'months': months,
+        'new_people_month': new_people,
+        'money_month_kopeks': money_month,
+        'came_pct': _share_pct(current['came'], new_people),
+        'money_pct': _share_pct(current['money_kopeks'], money_month),
+    }
+
+
 async def _subscription_people(db: AsyncSession, rules: _OwnerRules, *conditions) -> list:
     """Живые люди, плательщики, с подпиской на платном тарифе (не пробной) под условием — по строке на человека,
     с ближайшим по времени концом. Одно определение для числа на плитке и для списка под ней."""

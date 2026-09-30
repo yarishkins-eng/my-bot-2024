@@ -8,7 +8,8 @@ from zoneinfo import ZoneInfo
 import structlog
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from sqlalchemy import func, not_, or_, select
+from sqlalchemy import and_, func, not_, or_, select
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql import true
 
 from app.config import settings
@@ -19,6 +20,7 @@ from app.database.database import AsyncSessionLocal
 from app.database.models import (
     AdvertisingCampaign,
     AdvertisingCampaignRegistration,
+    ReferralEarning,
     Subscription,
     SubscriptionEvent,
     SubscriptionStatus,
@@ -35,6 +37,9 @@ logger = structlog.get_logger(__name__)
 
 # Потолок чтения первых подключений из панели для письма (ВК-0): дольше — «нет данных из панели»
 PANEL_READ_TIMEOUT_SECONDS = 45
+# Начисления пригласившим на живых путях (касса и пополнение); прочие причины (`test_earning`, мёртвая
+# `referral_commission`, метка «привязан, ещё не платил» `referral_registration_pending`) — не деньги рефералки
+REFERRAL_REWARD_REASONS = ('referral_first_topup', 'referral_commission_topup')
 
 
 class ReportingServiceError(RuntimeError):
@@ -242,6 +247,156 @@ class ReportingService:
             return true()
         return not_(or_(*markers))
 
+    # ---------- рефералка: ОДИН счётчик для письма и «Статистики» кабинета (РЕФ-2, 30.09.2026) ----------
+
+    async def _invited_person_clause(self, session):
+        """Приглашённый, которого считаем: человек (не удалён, не стенд) и не друг из Team (ни одной подписки на
+        бесплатном НЕ пробном тарифе, в том числе выключенном — как «человек» экрана продаж), и его пригласивший тоже
+        человек. Правило пары — как в проверке 29.09: тестовая пара «человек ← стенд» не считалась."""
+        tariffs = await get_all_tariffs(session, include_inactive=True)
+        team_tariff_ids = [tariff.id for tariff in tariffs if tariff.is_free and not tariff.is_trial_available]
+        # без корреляции: «пригласившие-люди» — отдельное множество, а не условие на ту же строку `users`
+        inviters = select(User.id).where(operational_person_clause()).correlate(None)
+        clause = and_(User.referred_by_id.is_not(None), operational_person_clause(), User.referred_by_id.in_(inviters))
+        if team_tariff_ids:
+            team_subscription = aliased(Subscription)
+            in_team = select(team_subscription.id).where(
+                team_subscription.user_id == User.id, team_subscription.tariff_id.in_(team_tariff_ids)
+            )
+            clause = and_(clause, ~in_team.exists())
+        return clause
+
+    def _live_payment_conditions(self) -> tuple:
+        """Живая оплата — ровно как «Пришло живых денег»: приход, а не вторая проводка кассы (`subscription_payment`)."""
+        return (
+            Transaction.type.in_((TransactionType.DEPOSIT.value, TransactionType.PROVIDER_RECEIPT.value)),
+            Transaction.is_completed == true(),
+            Transaction.amount_kopeks != 0,
+            Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
+            self._exclude_referral_deposits_condition(),
+        )
+
+    async def _referral_rewards(self, session, start_utc: datetime, end_utc: datetime, invited) -> int:
+        return int(
+            (
+                await session.execute(
+                    select(func.coalesce(func.sum(ReferralEarning.amount_kopeks), 0))
+                    .join(User, User.id == ReferralEarning.referral_id)
+                    .where(
+                        ReferralEarning.reason.in_(REFERRAL_REWARD_REASONS),
+                        ReferralEarning.created_at >= start_utc,
+                        ReferralEarning.created_at < end_utc,
+                        invited,
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
+    async def referral_rewards_kopeks(self, session, start_utc: datetime, end_utc: datetime) -> int:
+        """Начислено пригласившим за окно — то же число, что `rewards_kopeks` у `referral_numbers` (итоги «Топа»)."""
+        return await self._referral_rewards(session, start_utc, end_utc, await self._invited_person_clause(session))
+
+    async def referral_paid_counts(self, session) -> dict[int, int]:
+        """Сколько приглашённых у каждого пригласившего хоть раз платили деньгами — теми же правилами, что счётчик."""
+        invited = await self._invited_person_clause(session)
+        paid = select(Transaction.id).where(Transaction.user_id == User.id, *self._live_payment_conditions())
+        rows = (
+            await session.execute(
+                select(User.referred_by_id, func.count(User.id))
+                .where(invited, paid.exists())
+                .group_by(User.referred_by_id)
+            )
+        ).all()
+        return {int(inviter): int(count) for inviter, count in rows}
+
+    async def referral_first_arrival(self, session) -> datetime | None:
+        """Когда пришёл первый приглашённый, которого считаем, — начало ряда месяцев на «Статистике» кабинета."""
+        invited = await self._invited_person_clause(session)
+        return (await session.execute(select(func.min(User.created_at)).where(invited))).scalar()
+
+    async def referral_numbers(self, session, start_utc: datetime, end_utc: datetime) -> dict:
+        """Рефералка за окно `[start, end)` — ЕДИНСТВЕННОЕ место, где она считается: письмо зовёт его за сутки, кабинет —
+        за каждый месяц. Две копии определений разошлись бы молча (мина NW). Только чтение.
+
+        `came` — новые люди по ссылке друга; `trial` — приглашённые (любой даты прихода), взявшие пробный в окне: правило
+        «взяли пробный» письма плюс событие активации пробного (О-1); `paid` / `money_kopeks` — приглашённые с живой
+        оплатой в окне и сумма;
+        `paid_first` — из них те, у кого живой оплаты раньше окна не было (по книге оплат, не по флагу — мина MQ);
+        `rewards_kopeks` — начисления пригласившим.
+        """
+        invited = await self._invited_person_clause(session)
+        live = self._live_payment_conditions()
+        came = int(
+            (
+                await session.execute(
+                    select(func.count(User.id)).where(invited, User.created_at >= start_utc, User.created_at < end_utc)
+                )
+            ).scalar()
+            or 0
+        )
+        # 🔴 О-1 (30.09.2026): покупка переписывает строку пробного, а у старых покупок нет признака конверсии —
+        # правило письма таких не видит (прошлые месяцы на боевом недосчитывали пробные вдвое). Событие активации
+        # покупку переживает — добираем по нему, как экран продаж (`_trial_starts`) и кампании
+        activated = select(SubscriptionEvent.user_id).where(
+            SubscriptionEvent.event_type == 'activation',
+            SubscriptionEvent.message == 'Trial activation',
+            SubscriptionEvent.occurred_at >= start_utc,
+            SubscriptionEvent.occurred_at < end_utc,
+        )
+        takers = await self._trial_takers(session, start_utc, end_utc, await get_trial_tariff(session))
+        took_trial = or_(User.id.in_(activated), User.id.in_(list(takers))) if takers else User.id.in_(activated)
+        trial = int((await session.execute(select(func.count(User.id)).where(invited, took_trial))).scalar() or 0)
+        paid_rows = (
+            await session.execute(
+                select(Transaction.user_id, func.sum(func.abs(Transaction.amount_kopeks)))
+                .join(User, User.id == Transaction.user_id)
+                .where(*live, invited, Transaction.created_at >= start_utc, Transaction.created_at < end_utc)
+                .group_by(Transaction.user_id)
+            )
+        ).all()
+        paid_ids = {int(user_id) for user_id, _ in paid_rows}
+        paid_before = set()
+        if paid_ids:
+            paid_before = {
+                int(user_id)
+                for user_id in (
+                    await session.execute(
+                        select(Transaction.user_id)
+                        .where(Transaction.user_id.in_(list(paid_ids)), *live, Transaction.created_at < start_utc)
+                        .distinct()
+                    )
+                )
+                .scalars()
+                .all()
+            }
+        return {
+            'came': came,
+            'trial': trial,
+            'paid': len(paid_ids),
+            'paid_first': len(paid_ids - paid_before),
+            'money_kopeks': sum(int(amount or 0) for _, amount in paid_rows),
+            'rewards_kopeks': await self._referral_rewards(session, start_utc, end_utc, invited),
+        }
+
+    async def _referral_block(self, start_utc: datetime, end_utc: datetime) -> list[str]:
+        """Блок «Приглашения» (РЕФ-2): в СВОЕЙ сессии и своём `try` — сбой счётчика не роняет письмо (мина NB)."""
+        try:
+            async with AsyncSessionLocal() as session:
+                numbers = await self.referral_numbers(session, start_utc, end_utc)
+        except Exception as error:
+            logger.error('referral_block_failed', error=error, exc_info=True)
+            return ['🤝 <b>Приглашения</b>: не посчитано (сбой)']
+        return [
+            '🤝 <b>Приглашения</b>',
+            f'• Пришли по ссылке друга: {numbers["came"]} · взяли пробный: {numbers["trial"]}',
+            (
+                f'• Заплатили приглашённые: {numbers["paid"]} на {self._format_amount(numbers["money_kopeks"])}'
+                f' (впервые {numbers["paid_first"]})'
+                f' · пригласившим начислено {self._format_amount(numbers["rewards_kopeks"])}'
+            ),
+        ]
+
     # --------------------------------------
 
     async def _build_report(
@@ -263,6 +418,7 @@ class ReportingService:
             stats = await self._collect_period_stats(session, start_utc, end_utc)
             totals = await self._collect_current_totals(session)
             losses = await self._collect_loss_stats(session, start_utc, end_utc, stats['trial_takers'])
+        referral_lines = await self._referral_block(start_utc, end_utc)
         # Панель — после базы: её ожидание (до 45 секунд) не держит транзакцию открытой
         connected = await self._connected_panel_uuids() if losses['takers'] or losses['earlier'] else set()
 
@@ -330,6 +486,9 @@ class ReportingService:
             '',
             '🚪 <b>За день</b>' if period == ReportPeriod.DAILY else '🚪 <b>За период</b>',
             f'• Открыли бота: {stats["new_users"]} · {campaign_line} · взяли пробный: {stats["new_trials"]}',
+            '',
+            # РЕФ-2: рефералка — отдельным блоком, всегда, даже с нулями (решение владельца 29.09)
+            *referral_lines,
             '',
             # Четыре строки потерь — решения владельца 24.09.2026 (ВК-0, ОТЧ-8), хвост «N из M (взяли дата)» — тоже
             # его; «нет данных из панели» вместо числа, когда первые подключения не прочитаны: ноль был бы ложью
