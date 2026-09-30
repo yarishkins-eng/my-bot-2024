@@ -70,7 +70,7 @@ def _service() -> AdminNotificationService:
     service._send_message = AsyncMock(return_value=True)
     service._record_subscription_event = AsyncMock()
     service._is_enabled = MagicMock(return_value=True)
-    service._get_referrer_info = AsyncMock(return_value='@kozyr20 (ID: 123)')
+    service._get_referrer_info = AsyncMock(return_value='@masha_test (ID: 9001)')
     return service
 
 
@@ -82,7 +82,7 @@ def _user(**overrides) -> SimpleNamespace:
         username='lilgaandelf',
         email=None,
         balance_kopeks=0,
-        referred_by_id=123,
+        referred_by_id=9001,
         has_had_paid_subscription=True,
         promo_group_id=None,
     )
@@ -301,7 +301,7 @@ async def test_topup_card_names_the_method_in_owner_words() -> None:
         transaction,
         100,
         topup_status='🔄 Пополнение',
-        referrer_info='@kozyr20 (ID: 123)',
+        referrer_info='@masha_test (ID: 9001)',
         subscription=_subscription(tariff=_tariff()),
         promo_group=SimpleNamespace(name='Пользователь', apply_discounts_to_addons=True),
     )
@@ -325,7 +325,7 @@ async def test_first_topup_card_shows_referrer_without_internal_id() -> None:
         transaction,
         0,
         topup_status='🆕 Первое пополнение',
-        referrer_info='@kozyr20 (ID: 123)',
+        referrer_info='@masha_test (ID: 9001)',
         subscription=None,
         promo_group=None,
     )
@@ -335,8 +335,8 @@ async def test_first_topup_card_shows_referrer_without_internal_id() -> None:
     assert lines[1] == 'Пополнил(а) nikitaa @lilgaandelf'
     assert lines[2] == 'На балансе было 0 ₽, стало 299 ₽ (в т.ч. бонус 100 ₽). Корзины нет — деньги остались на балансе'
     assert lines[3] == 'Подписки сейчас нет'
-    assert 'По приглашению @kozyr20' in lines
-    assert '(ID: 123)' not in text
+    assert 'По приглашению @masha_test' in lines
+    assert '(ID: 9001)' not in text
 
 
 @pytest.mark.parametrize(
@@ -400,7 +400,7 @@ async def test_trial_card_is_short_and_names_the_referrer() -> None:
     assert lines[0] == '<b>🎁 Пробный период</b>'
     assert lines[1] == 'Взял(а) пробный nikitaa @lilgaandelf'  # тариф пробного заголовок не дублирует
     assert lines[2] == '7 дней, 1 устройство, 5 ГБ, до 20.09'
-    assert lines[3] == 'По приглашению @kozyr20'
+    assert lines[3] == 'По приглашению @masha_test'
     assert 'Раньше уже платил' not in text
 
 
@@ -447,7 +447,7 @@ async def test_purchase_card_first_purchase_via_provider() -> None:
     assert lines[0] == '<b>💎 Первая покупка — 289 ₽ через Platega</b>'
     assert lines[2] == '30 дней, до 16.10 · 3 устройства'
     assert 'Цена: тариф 149 ₽ + устройства 2 × 70 ₽' in lines
-    assert 'По приглашению @kozyr20' in lines
+    assert 'По приглашению @masha_test' in lines
 
 
 @pytest.mark.asyncio
@@ -511,7 +511,7 @@ async def test_purchase_card_after_trial_keeps_referrer_even_when_caller_says_re
     lines = _assert_card_shape(text)
     assert category is NotificationCategory.RENEWALS  # маршрутизация — как была у вызывающих
     assert lines[0] == '<b>💎 Покупка после пробного — 289 ₽</b>'
-    assert 'По приглашению @kozyr20' in lines
+    assert 'По приглашению @masha_test' in lines
 
 
 @pytest.mark.asyncio
@@ -731,7 +731,7 @@ async def test_first_purchase_with_everything_is_seven_lines_at_most() -> None:
     assert lines[3:6] == [
         'Цена: тариф 149 ₽ + устройства 2 × 70 ₽',
         'На балансе осталось 51 ₽',
-        'По приглашению @kozyr20',
+        'По приглашению @masha_test',
     ]
 
 
@@ -900,7 +900,7 @@ async def test_second_topup_of_someone_who_still_has_not_bought_is_not_first() -
         _transaction(amount_kopeks=10000, payment_method='platega', description='Пополнение через Platega'),
         14900,
         topup_status='🔄 Пополнение',
-        referrer_info='@kozyr20 (ID: 123)',
+        referrer_info='@masha_test (ID: 9001)',
         subscription=None,
         promo_group=None,
     )
@@ -1017,7 +1017,7 @@ async def _first_purchase_card(*, balance: int, reward: int | None, bonus: int |
 async def test_first_purchase_card_names_the_reward_and_the_bonus_without_extra_lines() -> None:
     lines = _assert_card_shape(await _first_purchase_card(balance=10000, reward=4975, bonus=10000))
 
-    assert 'По приглашению @kozyr20 · пригласившему начислено 50 ₽' in lines
+    assert 'По приглашению @masha_test · пригласившему начислено 50 ₽' in lines
     assert 'На балансе осталось 100 ₽ (бонус за приглашение)' in lines
 
 
@@ -1039,7 +1039,7 @@ async def test_bonus_is_not_claimed_when_the_balance_holds_less() -> None:
 async def test_card_without_known_reward_keeps_the_old_referrer_line() -> None:
     lines = _assert_card_shape(await _first_purchase_card(balance=0, reward=None, bonus=None))
 
-    assert 'По приглашению @kozyr20' in lines
+    assert 'По приглашению @masha_test' in lines
     assert not any('пригласившему' in line for line in lines)
 
 

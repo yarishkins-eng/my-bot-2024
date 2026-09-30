@@ -42,9 +42,10 @@ def _session() -> Session:
             )
         )
         rows = [
-            (123, 'referral_reward', 4975, 101),  # пригласившему по этому заказу
+            (9001, 'referral_reward', 4975, 101),  # пригласившему по этому заказу
+            (9001, 'referral_reward', 2500, 101),  # доплата на тот же заказ — в ту же сумму
             (291, 'referral_reward', 10000, 101),  # бонус самому покупателю
-            (123, 'referral_reward', 6250, 102),  # чужой заказ
+            (9001, 'referral_reward', 6250, 102),  # чужой заказ
             (777, 'referral_reward', 500, 101),  # третий получатель на том же заказе
             (291, 'provider_receipt', 19900, 101),  # приход денег — не награда
         ]
@@ -63,16 +64,16 @@ def _session() -> Session:
 async def test_amounts_are_read_for_this_order_and_these_two_people_only():
     session = _session()
     with patch('app.database.database.AsyncSessionLocal', lambda: _AsyncOverSync(session)):
-        amounts = await service_module._first_sale_referral_amounts(101, user_id=291, referrer_id=123)
+        amounts = await service_module._first_sale_referral_amounts(101, user_id=291, referrer_id=9001)
 
-    assert amounts == {'referrer_reward_kopeks': 4975, 'referred_bonus_kopeks': 10000}
+    assert amounts == {'referrer_reward_kopeks': 7475, 'referred_bonus_kopeks': 10000}
 
 
 @pytest.mark.asyncio
 async def test_nothing_credited_yet_gives_no_amounts():
     session = _session()
     with patch('app.database.database.AsyncSessionLocal', lambda: _AsyncOverSync(session)):
-        amounts = await service_module._first_sale_referral_amounts(103, user_id=291, referrer_id=123)
+        amounts = await service_module._first_sale_referral_amounts(103, user_id=291, referrer_id=9001)
 
     assert amounts == {'referrer_reward_kopeks': None, 'referred_bonus_kopeks': None}
 
@@ -83,7 +84,7 @@ async def test_a_failing_read_never_breaks_the_card():
         raise RuntimeError('database is down')
 
     with patch('app.database.database.AsyncSessionLocal', _broken):
-        assert await service_module._first_sale_referral_amounts(101, user_id=291, referrer_id=123) == {}
+        assert await service_module._first_sale_referral_amounts(101, user_id=291, referrer_id=9001) == {}
 
 
 @pytest.mark.asyncio
@@ -97,6 +98,6 @@ async def test_a_hanging_read_stops_at_the_ceiling():
         patch('app.database.database.AsyncSessionLocal', lambda: _Slow(None)),
     ):
         started = time.monotonic()
-        assert await service_module._first_sale_referral_amounts(101, user_id=291, referrer_id=123) == {}
+        assert await service_module._first_sale_referral_amounts(101, user_id=291, referrer_id=9001) == {}
     # без потолка чтение тоже кончилось бы пустым ответом — но через 5 с, держа очередь; меряем именно потолок
     assert time.monotonic() - started < 1

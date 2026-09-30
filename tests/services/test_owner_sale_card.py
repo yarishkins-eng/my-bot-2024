@@ -432,10 +432,10 @@ async def test_first_sale_of_an_invited_buyer_passes_the_referral_amounts_to_the
     admin = _admin()
     amounts = AsyncMock(return_value={'referrer_reward_kopeks': 4975, 'referred_bonus_kopeks': 10000})
     with patch.object(service_module, '_first_sale_referral_amounts', amounts):
-        sent, *_ = await _run([row], checkout=_checkout(), admin=admin, user=_user(referred_by_id=123))
+        sent, *_ = await _run([row], checkout=_checkout(), admin=admin, user=_user(referred_by_id=9001))
 
     assert sent == 1 and row.status == 'sent'
-    amounts.assert_awaited_once_with(101, user_id=291, referrer_id=123)
+    amounts.assert_awaited_once_with(101, user_id=291, referrer_id=9001)
     kwargs = admin.send_subscription_purchase_notification.await_args.kwargs
     assert kwargs['referrer_reward_kopeks'] == 4975
     assert kwargs['referred_bonus_kopeks'] == 10000
@@ -447,7 +447,7 @@ async def test_repeat_sale_of_an_invited_buyer_does_not_read_referral_amounts():
     admin = _admin()
     amounts = AsyncMock(return_value={'referrer_reward_kopeks': 4975})
     with patch.object(service_module, '_first_sale_referral_amounts', amounts):
-        await _run([row], checkout=_checkout(), admin=admin, user=_user(referred_by_id=123))
+        await _run([row], checkout=_checkout(), admin=admin, user=_user(referred_by_id=9001))
 
     amounts.assert_not_awaited()
     assert 'referrer_reward_kopeks' not in admin.send_subscription_purchase_notification.await_args.kwargs
