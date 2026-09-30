@@ -123,3 +123,51 @@ async def test_first_payment_is_counted_over_all_time_not_the_page():
         response = await module.get_recent_payments(limit=1, admin=None, db=_AsyncOverSync(s))
 
     assert [(p.id, p.is_first) for p in response.payments] == [(22, False)]
+
+
+def _edge_seed(s: Session) -> None:
+    _user(s, 1, 'Два пополнения')
+    _user(s, 2, 'Почта')
+    s.execute(text("UPDATE users SET telegram_id = NULL, email = 'mail@example.test' WHERE id = 2"))
+    _user(s, 3, 'Удалён')
+    s.execute(text("UPDATE users SET status = 'deleted' WHERE id = 3"))
+    s.execute(text("INSERT INTO advertising_campaigns (id, name) VALUES (8, '   '), (9, 'Канал ')"))
+    s.execute(
+        text('INSERT INTO advertising_campaign_registrations (id, campaign_id, user_id) VALUES (1, 8, 1), (2, 9, 1)')
+    )
+    # покупка ДО пополнения (оплачена старым остатком) — не «за что» этого пополнения
+    _tx(s, 10, 1, 'subscription_payment', -9900, 'balance', '2026-09-30 09:59:30.000000', 'Старым остатком')
+    # два пополнения, одна покупка следом — покупка достаётся одному, раннему
+    _tx(s, 11, 1, 'deposit', 9900, 'platega', '2026-09-30 10:00:00.000000', 'Пополнение 1')
+    _tx(s, 12, 1, 'deposit', 9900, 'platega', '2026-09-30 10:10:00.000000', 'Пополнение 2')
+    _tx(s, 13, 1, 'subscription_payment', -19800, 'balance', '2026-09-30 10:20:00.000000', 'Оплата: 2 месяца')
+    # чек кассы без заказа — своё описание; email-пользователь без telegram — человек
+    _tx(s, 20, 2, 'provider_receipt', 13400, 'platega', '2026-09-30 11:00:00.000000', 'Платёж картой получен')
+    # удалённый — не в списке и не в скрытом
+    _tx(s, 30, 3, 'deposit', 14900, 'platega', '2026-09-30 12:00:00.000000', 'Пополнение')
+    _tx(s, 31, 3, 'deposit', 5000, None, '2026-09-30 12:00:00.000000', 'Бонус за регистрацию')
+    s.commit()
+
+
+@pytest.mark.asyncio
+async def test_purpose_takes_each_purchase_once_and_only_after_the_top_up():
+    s = _session()
+    _edge_seed(s)
+    with patch('app.services.user_service.test_account_telegram_ids', lambda: frozenset({STAND_TELEGRAM_ID})):
+        response = await module.get_recent_payments(limit=20, admin=None, db=_AsyncOverSync(s))
+
+    assert [(p.id, p.is_first, p.purpose, p.campaign_name) for p in response.payments] == [
+        (20, True, 'Платёж картой получен', None),
+        (12, False, None, 'Канал'),
+        (11, True, 'Оплата: 2 месяца', 'Канал'),
+    ]
+    hidden = response.hidden_last_30d
+    assert (hidden.registration_bonuses, hidden.balance_purchases, hidden.manual_credits) == (0, 2, 0)
+
+
+@pytest.mark.asyncio
+async def test_empty_base_gives_empty_list():
+    s = _session()
+    response = await module.get_recent_payments(limit=20, admin=None, db=_AsyncOverSync(s))
+    assert response.payments == []
+    assert response.hidden_last_30d.registration_bonuses == 0

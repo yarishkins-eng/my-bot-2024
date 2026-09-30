@@ -995,9 +995,13 @@ async def _hidden_payments_last_30d(db: AsyncSession, since: datetime) -> Hidden
         return int(
             (
                 await db.execute(
-                    select(func.count(Transaction.id)).where(
-                        Transaction.is_completed == True, Transaction.created_at >= since, *conditions
+                    select(func.count(Transaction.id))
+                    .join(User, User.id == Transaction.user_id)
+                    # те же люди, что в списке: без стендов и удалённых
+                    .where(
+                        Transaction.is_completed == True, Transaction.created_at >= since, operational_person_clause()
                     )
+                    .where(Transaction.amount_kopeks != 0, *conditions)
                 )
             ).scalar()
             or 0
@@ -1010,7 +1014,6 @@ async def _hidden_payments_last_30d(db: AsyncSession, since: datetime) -> Hidden
         balance_purchases=await count(
             Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
             Transaction.payment_method == 'balance',
-            Transaction.amount_kopeks != 0,
         ),
         manual_credits=await count(
             Transaction.type == TransactionType.DEPOSIT.value, Transaction.payment_method == 'manual'
@@ -1056,20 +1059,17 @@ async def get_recent_payments(
         else:
             users_info = {}
 
-        first_payment_ids: set[int] = set()
+        first_payment_at: dict[int, datetime] = {}
         campaign_names: dict[int, str] = {}
-        purchases: dict[int, list] = {}
+        purposes: dict[int, str | None] = {}
         if user_ids:
-            # «Первая оплата» — самая ранняя живая оплата человека за всё время
-            first_payment_ids = set(
-                (
-                    await db.execute(
-                        select(func.min(Transaction.id))
-                        .where(*live, Transaction.user_id.in_(user_ids))
-                        .group_by(Transaction.user_id)
-                    )
-                ).scalars()
+            # «Первая оплата» — самая ранняя по времени живая оплата человека за всё время, а не на этой странице
+            first_rows = await db.execute(
+                select(Transaction.user_id, func.min(Transaction.created_at))
+                .where(*live, Transaction.user_id.in_(user_ids))
+                .group_by(Transaction.user_id)
             )
+            first_payment_at = dict(first_rows.all())
             campaign_rows = await db.execute(
                 select(AdvertisingCampaignRegistration.user_id, AdvertisingCampaign.name)
                 .join(AdvertisingCampaign, AdvertisingCampaign.id == AdvertisingCampaignRegistration.campaign_id)
@@ -1077,11 +1077,12 @@ async def get_recent_payments(
                 .order_by(AdvertisingCampaignRegistration.id)
             )
             for campaign_user_id, campaign_name in campaign_rows:
-                campaign_names.setdefault(
-                    campaign_user_id, (campaign_name or '').strip() or None
-                )  # в базе имена с хвостовым пробелом
-            # «За что»: у пополнения ссылки на покупку нет — берём первую покупку с баланса в течение часа после него
-            # (замер 30.09: у 57 из 68 пополнений за 60 дней такая покупка есть); у чека кассы — проводку его заказа
+                campaign_name = (campaign_name or '').strip()  # в базе имена с хвостовым пробелом
+                if campaign_name:
+                    campaign_names.setdefault(campaign_user_id, campaign_name)
+            # «За что». У чека кассы — проводка его заказа. У пополнения ссылки на покупку нет: берём первую ещё не
+            # занятую покупку с баланса в течение часа ПОСЛЕ него (замер 30.09: у 57 из 68 пополнений за 60 дней она
+            # есть); одна покупка — одному пополнению. Это догадка по времени: покупку могли оплатить и старым остатком
             oldest = min(t.created_at for t in transactions)
             purchase_rows = await db.execute(
                 select(Transaction)
@@ -1090,28 +1091,34 @@ async def get_recent_payments(
                     Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
                     Transaction.is_completed == True,
                     Transaction.amount_kopeks != 0,
-                    Transaction.created_at >= oldest - timedelta(minutes=1),
+                    Transaction.created_at >= oldest,
                 )
                 .order_by(Transaction.created_at, Transaction.id)
             )
+            purchases: dict[int, list] = {}
             for purchase in purchase_rows.scalars():
                 purchases.setdefault(purchase.user_id, []).append(purchase)
-
-        def purpose_of(trans: Transaction) -> str | None:
-            for purchase in purchases.get(trans.user_id, []):
-                if trans.type == TransactionType.PROVIDER_RECEIPT.value:
-                    if (
-                        trans.device_first_checkout_id
-                        and purchase.device_first_checkout_id == trans.device_first_checkout_id
-                    ):
-                        return purchase.description or ''
-                elif purchase.payment_method == 'balance' and trans.created_at - timedelta(
-                    minutes=1
-                ) <= purchase.created_at <= trans.created_at + timedelta(hours=1):
-                    return purchase.description or ''
-            if trans.type == TransactionType.PROVIDER_RECEIPT.value:
-                return trans.description or ''
-            return None  # пополнение пока не потрачено — кабинет пишет это своими словами
+            taken: set[int] = set()
+            for trans in sorted(transactions, key=lambda t: (t.created_at, t.id)):
+                purpose = None
+                for purchase in purchases.get(trans.user_id, []):
+                    if trans.type == TransactionType.PROVIDER_RECEIPT.value:
+                        paired = trans.device_first_checkout_id is not None and (
+                            purchase.device_first_checkout_id == trans.device_first_checkout_id
+                        )
+                    else:
+                        paired = (
+                            purchase.payment_method == 'balance'
+                            and purchase.id not in taken
+                            and trans.created_at <= purchase.created_at <= trans.created_at + timedelta(hours=1)
+                        )
+                    if paired:
+                        taken.add(purchase.id)
+                        purpose = purchase.description or None
+                        break
+                if purpose is None and trans.type == TransactionType.PROVIDER_RECEIPT.value:
+                    purpose = trans.description or None
+                purposes[trans.id] = purpose  # None — пополнение без покупки следом, кабинет пишет это своими словами
 
         # Type display names
         type_display = {
@@ -1160,13 +1167,14 @@ async def get_recent_payments(
                     description=trans.description,
                     created_at=trans.created_at.isoformat() if trans.created_at else '',
                     is_completed=trans.is_completed,
-                    is_first=trans.id in first_payment_ids,
-                    purpose=purpose_of(trans),
+                    is_first=trans.created_at == first_payment_at.get(trans.user_id),
+                    purpose=purposes.get(trans.id),
                     campaign_name=campaign_names.get(trans.user_id),
                 )
             )
 
-        # Calculate totals
+        # Calculate totals — прежнее правило (все пополнения и покупки); кабинет эти поля не показывает с СП-1б,
+        # со списком выше они НЕ согласованы (ПЛ-1)
         total_count_result = await db.execute(
             select(func.count(Transaction.id)).where(
                 Transaction.type.in_(
