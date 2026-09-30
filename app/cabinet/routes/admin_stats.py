@@ -16,6 +16,7 @@ from app.database.crud.subscription import get_subscriptions_statistics
 from app.database.crud.transaction import REAL_PAYMENT_METHODS, get_revenue_by_period, get_transactions_statistics
 from app.database.models import (
     AdvertisingCampaign,
+    AdvertisingCampaignRegistration,
     ReferralEarning,
     Subscription,
     SubscriptionStatus,
@@ -28,6 +29,7 @@ from app.services.campaign_service import get_campaign_analytics
 from app.services.remnawave_service import RemnaWaveService
 from app.services.reporting_service import reporting_service
 from app.services.version_service import version_service
+from app.utils.user_utils import operational_person_clause
 
 from ..dependencies import get_cabinet_db, require_permission
 from .admin_sales_stats import dashboard_money, dashboard_referrals, owner_people_tiles, referral_period_totals
@@ -255,6 +257,17 @@ class RecentPaymentItem(BaseModel):
     description: str | None = None
     created_at: str
     is_completed: bool
+    is_first: bool | None = None  # первая живая оплата человека за всё время (ПЛ-1)
+    purpose: str | None = None  # за что заплачено
+    campaign_name: str | None = None  # рекламная кампания, по которой человек пришёл
+
+
+class HiddenPayments(BaseModel):
+    """Что за 30 дней НЕ попало в «Последние оплаты» (ПЛ-1): это не живые деньги."""
+
+    registration_bonuses: int
+    balance_purchases: int
+    manual_credits: int
 
 
 class RecentPaymentsResponse(BaseModel):
@@ -264,6 +277,7 @@ class RecentPaymentsResponse(BaseModel):
     total_count: int
     total_today_kopeks: int
     total_week_kopeks: int
+    hidden_last_30d: HiddenPayments | None = None
 
 
 # ============ Routes ============
@@ -976,6 +990,34 @@ async def get_top_campaigns(
         )
 
 
+async def _hidden_payments_last_30d(db: AsyncSession, since: datetime) -> HiddenPayments:
+    async def count(*conditions) -> int:
+        return int(
+            (
+                await db.execute(
+                    select(func.count(Transaction.id)).where(
+                        Transaction.is_completed == True, Transaction.created_at >= since, *conditions
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
+    return HiddenPayments(
+        registration_bonuses=await count(
+            Transaction.type == TransactionType.DEPOSIT.value, Transaction.payment_method.is_(None)
+        ),
+        balance_purchases=await count(
+            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+            Transaction.payment_method == 'balance',
+            Transaction.amount_kopeks != 0,
+        ),
+        manual_credits=await count(
+            Transaction.type == TransactionType.DEPOSIT.value, Transaction.payment_method == 'manual'
+        ),
+    )
+
+
 @router.get('/payments/recent', response_model=RecentPaymentsResponse)
 async def get_recent_payments(
     limit: int = 50,
@@ -988,18 +1030,16 @@ async def get_recent_payments(
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_ago = now - timedelta(days=7)
 
-        # Get recent transactions (deposits and subscription payments)
+        # ПЛ-1 (30.09.2026): только живые оплаты — тем же правилом, что «Пришло живых денег» в утреннем письме
+        # (пополнение или чек кассы, способ — касса, не 0 ₽). Бонусы за регистрацию, покупки с баланса и ручные
+        # начисления сюда не идут: на боевом они вытесняли настоящие оплаты (498 бонусов на 64 оплаты за 30 дней),
+        # а пара «пополнение + покупка с баланса» показывала одни деньги дважды.
+        live = reporting_service._live_payment_conditions()
         transactions_query = await db.execute(
             select(Transaction)
-            .where(
-                Transaction.type.in_(
-                    [
-                        TransactionType.DEPOSIT.value,
-                        TransactionType.SUBSCRIPTION_PAYMENT.value,
-                    ]
-                )
-            )
-            .order_by(Transaction.created_at.desc())
+            .join(User, User.id == Transaction.user_id)
+            .where(*live, operational_person_clause())
+            .order_by(Transaction.created_at.desc(), Transaction.id.desc())
             .limit(limit)
         )
         transactions = transactions_query.scalars().all()
@@ -1016,9 +1056,65 @@ async def get_recent_payments(
         else:
             users_info = {}
 
+        first_payment_ids: set[int] = set()
+        campaign_names: dict[int, str] = {}
+        purchases: dict[int, list] = {}
+        if user_ids:
+            # «Первая оплата» — самая ранняя живая оплата человека за всё время
+            first_payment_ids = set(
+                (
+                    await db.execute(
+                        select(func.min(Transaction.id))
+                        .where(*live, Transaction.user_id.in_(user_ids))
+                        .group_by(Transaction.user_id)
+                    )
+                ).scalars()
+            )
+            campaign_rows = await db.execute(
+                select(AdvertisingCampaignRegistration.user_id, AdvertisingCampaign.name)
+                .join(AdvertisingCampaign, AdvertisingCampaign.id == AdvertisingCampaignRegistration.campaign_id)
+                .where(AdvertisingCampaignRegistration.user_id.in_(user_ids))
+                .order_by(AdvertisingCampaignRegistration.id)
+            )
+            for campaign_user_id, campaign_name in campaign_rows:
+                campaign_names.setdefault(campaign_user_id, campaign_name)
+            # «За что»: у пополнения ссылки на покупку нет — берём первую покупку с баланса в течение часа после него
+            # (замер 30.09: у 57 из 68 пополнений за 60 дней такая покупка есть); у чека кассы — проводку его заказа
+            oldest = min(t.created_at for t in transactions)
+            purchase_rows = await db.execute(
+                select(Transaction)
+                .where(
+                    Transaction.user_id.in_(user_ids),
+                    Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+                    Transaction.is_completed == True,
+                    Transaction.amount_kopeks != 0,
+                    Transaction.created_at >= oldest - timedelta(minutes=1),
+                )
+                .order_by(Transaction.created_at, Transaction.id)
+            )
+            for purchase in purchase_rows.scalars():
+                purchases.setdefault(purchase.user_id, []).append(purchase)
+
+        def purpose_of(trans: Transaction) -> str:
+            for purchase in purchases.get(trans.user_id, []):
+                if trans.type == TransactionType.PROVIDER_RECEIPT.value:
+                    if (
+                        trans.device_first_checkout_id
+                        and purchase.device_first_checkout_id == trans.device_first_checkout_id
+                    ):
+                        return purchase.description or ''
+                elif purchase.payment_method == 'balance' and trans.created_at - timedelta(
+                    minutes=1
+                ) <= purchase.created_at <= trans.created_at + timedelta(hours=1):
+                    return purchase.description or ''
+            if trans.type == TransactionType.PROVIDER_RECEIPT.value:
+                return trans.description or ''
+            return 'на баланс, пока не потрачено'
+
         # Type display names
         type_display = {
             TransactionType.DEPOSIT.value: 'Пополнение',
+            TransactionType.PROVIDER_RECEIPT.value: 'Оплата картой',
             TransactionType.SUBSCRIPTION_PAYMENT.value: 'Оплата подписки',
             TransactionType.WITHDRAWAL.value: 'Вывод',
             TransactionType.REFUND.value: 'Возврат',
@@ -1062,6 +1158,9 @@ async def get_recent_payments(
                     description=trans.description,
                     created_at=trans.created_at.isoformat() if trans.created_at else '',
                     is_completed=trans.is_completed,
+                    is_first=trans.id in first_payment_ids,
+                    purpose=purpose_of(trans),
+                    campaign_name=campaign_names.get(trans.user_id),
                 )
             )
 
@@ -1107,6 +1206,7 @@ async def get_recent_payments(
             total_count=total_count,
             total_today_kopeks=total_today,
             total_week_kopeks=total_week,
+            hidden_last_30d=await _hidden_payments_last_30d(db, now - timedelta(days=30)),
         )
 
     except Exception as e:
