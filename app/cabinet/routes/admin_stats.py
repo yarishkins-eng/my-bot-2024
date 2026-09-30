@@ -258,7 +258,7 @@ class RecentPaymentItem(BaseModel):
     created_at: str
     is_completed: bool
     is_first: bool | None = None  # первая живая оплата человека за всё время (ПЛ-1)
-    purpose: str | None = None  # за что заплачено
+    purpose: str | None = None  # за что заплачено; None — пополнение, после которого покупки не было
     campaign_name: str | None = None  # рекламная кампания, по которой человек пришёл
 
 
@@ -1095,7 +1095,7 @@ async def get_recent_payments(
             for purchase in purchase_rows.scalars():
                 purchases.setdefault(purchase.user_id, []).append(purchase)
 
-        def purpose_of(trans: Transaction) -> str:
+        def purpose_of(trans: Transaction) -> str | None:
             for purchase in purchases.get(trans.user_id, []):
                 if trans.type == TransactionType.PROVIDER_RECEIPT.value:
                     if (
@@ -1109,7 +1109,7 @@ async def get_recent_payments(
                     return purchase.description or ''
             if trans.type == TransactionType.PROVIDER_RECEIPT.value:
                 return trans.description or ''
-            return 'на баланс, пока не потрачено'
+            return None  # пополнение пока не потрачено — кабинет пишет это своими словами
 
         # Type display names
         type_display = {

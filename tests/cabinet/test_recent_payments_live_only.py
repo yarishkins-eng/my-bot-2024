@@ -103,9 +103,9 @@ async def test_recent_payments_show_only_live_money_with_context():
 
     rows = [(p.id, p.is_first, p.purpose, p.campaign_name, p.amount_kopeks) for p in response.payments]
     assert rows == [
-        (22, False, 'на баланс, пока не потрачено', None, 9900),
+        (22, False, None, None, 9900),
         (20, True, 'Картой: 1 месяц', None, 13400),
-        (13, False, 'на баланс, пока не потрачено', 'Не тв', 64900),
+        (13, False, None, 'Не тв', 64900),
         (11, True, 'Оплата с баланса: 1 месяц', 'Не тв', 19900),
     ]
     assert response.payments[1].type_display == 'Оплата картой'
