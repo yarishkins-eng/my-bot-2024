@@ -176,3 +176,59 @@ async def test_empty_base_gives_empty_list():
     response = await module.get_recent_payments(limit=20, admin=None, db=_AsyncOverSync(s))
     assert response.payments == []
     assert response.hidden_last_30d.registration_bonuses == 0
+
+
+def _selection_seed(s: Session) -> None:
+    """Выбор из нескольких кандидатов и отсев — входы, на которых мутации переживали прежние сторожа."""
+    _user(s, 1, 'Выбор')
+    s.execute(text("INSERT INTO advertising_campaigns (id, name) VALUES (7, 'А'), (8, 'Б')"))
+    # регистрация id 2 вставлена раньше id 1: берётся первая по id, а не по порядку вставки
+    s.execute(text('INSERT INTO advertising_campaign_registrations (id, campaign_id, user_id) VALUES (2, 8, 1)'))
+    s.execute(text('INSERT INTO advertising_campaign_registrations (id, campaign_id, user_id) VALUES (1, 7, 1)'))
+    # чек без заказа и покупка без заказа — не пара
+    _tx(s, 10, 1, 'provider_receipt', 13400, 'platega', '2026-09-30 10:00:00.000000', 'Чек')
+    _tx(s, 11, 1, 'subscription_payment', -9900, 'balance', '2026-09-30 10:15:00.000000', 'P1 до пополнения')
+    # пополнение 10:30: покупка в ту же секунду — его; из двух подряд — ранняя по времени (у поздней id меньше)
+    _tx(s, 14, 1, 'deposit', 9900, 'platega', '2026-09-30 10:30:00.000000', 'Пополнение B')
+    _tx(s, 16, 1, 'subscription_payment', -9900, 'balance', '2026-09-30 10:30:00.000000', 'P3 в ту же секунду')
+    _tx(s, 15, 1, 'subscription_payment', -9900, 'balance', '2026-09-30 10:40:00.000000', 'P4 позже')
+    # за пополнением следом: оплата кассой, незавершённая покупка, нулевая покупка — ни одна не «за что»
+    _tx(s, 20, 1, 'deposit', 9900, 'platega', '2026-09-30 12:00:00.000000', 'Пополнение C')
+    _tx(s, 21, 1, 'subscription_payment', -9900, 'platega', '2026-09-30 12:05:00.000000', 'Касса без заказа')
+    _tx(s, 22, 1, 'deposit', 9900, 'platega', '2026-09-30 13:00:00.000000', 'Пополнение D')
+    _tx(s, 23, 1, 'subscription_payment', -9900, 'balance', '2026-09-30 13:05:00.000000', 'Не завершена')
+    s.execute(text('UPDATE transactions SET is_completed = 0 WHERE id = 23'))
+    _tx(s, 24, 1, 'deposit', 9900, 'platega', '2026-09-30 14:00:00.000000', 'Пополнение E')
+    _tx(s, 25, 1, 'subscription_payment', 0, 'balance', '2026-09-30 14:05:00.000000', 'Нулевая')
+    # скрытое: засчитывается один бонус; не засчитываются не тот тип, незавершённый, старый и нулевой
+    _tx(s, 30, 1, 'deposit', 5000, None, '2026-09-20 10:00:00.000000', 'Бонус за регистрацию')
+    _tx(s, 31, 1, 'subscription_payment', -5000, None, '2026-09-20 10:00:00.000000', 'Без метода')
+    _tx(s, 32, 1, 'deposit', 5000, 'balance', '2026-09-20 10:00:00.000000', 'Депозит с методом balance')
+    _tx(s, 33, 1, 'deposit', 5000, None, '2026-09-20 10:00:00.000000', 'Незавершённый бонус')
+    s.execute(text('UPDATE transactions SET is_completed = 0 WHERE id = 33'))
+    _tx(s, 34, 1, 'deposit', 5000, None, '2026-08-29 10:00:00.000000', 'Старый бонус')
+    _tx(s, 35, 1, 'deposit', 0, None, '2026-09-20 10:00:00.000000', 'Нулевой бонус')
+    s.commit()
+
+
+@pytest.mark.asyncio
+async def test_purpose_picks_the_right_candidate_and_hidden_filters_noise():
+    s = _session()
+    _selection_seed(s)
+    with (
+        patch.object(module, 'datetime', wraps=datetime) as fake_datetime,
+        patch('app.services.user_service.test_account_telegram_ids', lambda: frozenset({STAND_TELEGRAM_ID})),
+    ):
+        fake_datetime.now.return_value = NOW
+        response = await module.get_recent_payments(limit=20, admin=None, db=_AsyncOverSync(s))
+
+    assert [(p.id, p.is_first, p.purpose, p.campaign_name) for p in response.payments] == [
+        (24, False, None, 'А'),
+        (22, False, None, 'А'),
+        (20, False, None, 'А'),
+        (14, False, 'P3 в ту же секунду', 'А'),
+        (10, True, 'Чек', 'А'),
+    ]
+    hidden = response.hidden_last_30d
+    # покупки с баланса: P1, P3, P4 (незавершённая и нулевая — нет)
+    assert (hidden.registration_bonuses, hidden.balance_purchases, hidden.manual_credits) == (1, 3, 0)
