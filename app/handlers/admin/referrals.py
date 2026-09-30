@@ -152,6 +152,12 @@ async def show_referral_statistics(callback: types.CallbackQuery, db_user: User,
         await callback.answer('Произошла ошибка при загрузке статистики')
 
 
+# РЕФ-2.3 (30.09.2026): кнопки «Начислить все бонусы» и «Применить исправления» платили по своей формуле, без
+# защиты от двойного нажатия, а «восстановление» платило за ту же оплату второй раз (проверка 29.09, находки C-7,
+# C-S1, C-S2). Кнопки сняты с экранов; обработчики оставлены, чтобы старое сообщение с кнопкой получило ответ.
+PAYOUT_BUTTON_DISABLED_TEXT = 'Кнопка отключена. Бот ничего не изменил и не начислил. Она могла заплатить бонус дважды.'
+
+
 def _get_top_keyboard(period: str, sort_by: str) -> types.InlineKeyboardMarkup:
     """Создаёт клавиатуру для выбора периода и сортировки."""
     period_week = '✅ Неделя' if period == 'week' else 'Неделя'
@@ -872,8 +878,8 @@ async def preview_referral_fixes(callback: types.CallbackQuery, db_user: User, d
         text = f"""
 📋 <b>Предпросмотр исправлений — {period_display}</b>
 
-<b>📊 Что будет сделано:</b>
-• Исправлено рефералов: {fix_report.users_fixed}
+<b>📊 Что нашла проверка:</b>
+• Найдено для исправления: {fix_report.users_fixed}
 • Бонусов рефералам: {settings.format_price(fix_report.bonuses_to_referrals)}
 • Бонусов рефереам: {settings.format_price(fix_report.bonuses_to_referrers)}
 • Ошибок: {fix_report.errors}
@@ -909,7 +915,7 @@ async def preview_referral_fixes(callback: types.CallbackQuery, db_user: User, d
         if len(fix_report.details) > 10:
             text += f'\n<i>... и ещё {len(fix_report.details) - 10}</i>\n'
 
-        text += '\n⚠️ <b>Внимание!</b> Это только предпросмотр. Нажмите "Применить", чтобы выполнить исправления.'
+        text += '\n⚠️ <b>Только просмотр.</b> Применять эти исправления из бота больше нельзя: кнопка отключена.'
 
         # Кнопка назад зависит от источника
         back_button_text = '⬅️ К диагностике'
@@ -917,7 +923,6 @@ async def preview_referral_fixes(callback: types.CallbackQuery, db_user: User, d
 
         keyboard = types.InlineKeyboardMarkup(
             inline_keyboard=[
-                [types.InlineKeyboardButton(text='✅ Применить исправления', callback_data='admin_ref_fix_apply')],
                 [types.InlineKeyboardButton(text=back_button_text, callback_data=back_button_callback)],
             ]
         )
@@ -932,115 +937,8 @@ async def preview_referral_fixes(callback: types.CallbackQuery, db_user: User, d
 @admin_required
 @error_handler
 async def apply_referral_fixes(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
-    """Применяет исправления потерянных рефералов."""
-    try:
-        await callback.answer('Применяю исправления...')
-
-        # Получаем период из state
-        state_data = await state.get_data()
-        period = state_data.get('diagnostics_period', 'today')
-
-        from app.services.referral_diagnostics_service import DiagnosticReport, referral_diagnostics_service
-
-        # Проверяем, работаем ли с загруженным файлом
-        if period == 'uploaded_file':
-            # Используем сохранённый отчёт из загруженного файла (десериализуем)
-            report_data = state_data.get('uploaded_file_report')
-            if not report_data:
-                await callback.answer('Отчёт загруженного файла не найден', show_alert=True)
-                return
-            report = DiagnosticReport.from_dict(report_data)
-            period_display = 'загруженный файл'
-        else:
-            # Получаем даты периода
-            start_date, end_date = _get_period_dates(period)
-
-            # Анализируем логи
-            report = await referral_diagnostics_service.analyze_period(db, start_date, end_date)
-            period_display = _get_period_display_name(period)
-
-        if not report.lost_referrals:
-            await callback.answer('Нет потерянных рефералов для исправления', show_alert=True)
-            return
-
-        # Применяем исправления
-        fix_report = await referral_diagnostics_service.fix_lost_referrals(db, report.lost_referrals, apply=True)
-
-        # Формируем отчёт
-        text = f"""
-✅ <b>Исправления применены — {period_display}</b>
-
-<b>📊 Результаты:</b>
-• Исправлено рефералов: {fix_report.users_fixed}
-• Бонусов рефералам: {settings.format_price(fix_report.bonuses_to_referrals)}
-• Бонусов рефереам: {settings.format_price(fix_report.bonuses_to_referrers)}
-• Ошибок: {fix_report.errors}
-
-<b>🔍 Детали:</b>
-"""
-
-        # Показываем первые 10 успешных деталей
-        success_count = 0
-        for detail in fix_report.details:
-            if not detail.error and success_count < 10:
-                success_count += 1
-                if detail.username:
-                    user_name = f'@{html.escape(detail.username)}'
-                elif detail.full_name:
-                    user_name = html.escape(detail.full_name)
-                else:
-                    user_name = f'ID{detail.telegram_id}'
-
-                text += f'{success_count}. {user_name}\n'
-                if detail.referred_by_set:
-                    referrer_display = (
-                        html.escape(detail.referrer_name) if detail.referrer_name else f'ID{detail.referrer_id}'
-                    )
-                    text += f'   • Реферер: {referrer_display}\n'
-                if detail.bonus_to_referral_kopeks > 0:
-                    text += f'   • Бонус рефералу: {settings.format_price(detail.bonus_to_referral_kopeks)}\n'
-                if detail.bonus_to_referrer_kopeks > 0:
-                    text += f'   • Бонус рефереру: {settings.format_price(detail.bonus_to_referrer_kopeks)}\n'
-
-        if fix_report.users_fixed > 10:
-            text += f'\n<i>... и ещё {fix_report.users_fixed - 10} исправлений</i>\n'
-
-        # Показываем ошибки
-        if fix_report.errors > 0:
-            text += '\n<b>❌ Ошибки:</b>\n'
-            error_count = 0
-            for detail in fix_report.details:
-                if detail.error and error_count < 5:
-                    error_count += 1
-                    if detail.username:
-                        user_name = f'@{html.escape(detail.username)}'
-                    elif detail.full_name:
-                        user_name = html.escape(detail.full_name)
-                    else:
-                        user_name = f'ID{detail.telegram_id}'
-                    text += f'• {user_name}: {html.escape(str(detail.error))}\n'
-            if fix_report.errors > 5:
-                text += f'<i>... и ещё {fix_report.errors - 5} ошибок</i>\n'
-
-        # Кнопки зависят от источника
-        keyboard_rows = []
-        if period != 'uploaded_file':
-            keyboard_rows.append(
-                [types.InlineKeyboardButton(text='🔄 Обновить диагностику', callback_data=f'admin_ref_diag:{period}')]
-            )
-        keyboard_rows.append([types.InlineKeyboardButton(text='⬅️ К статистике', callback_data='admin_referrals')])
-
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-
-        await callback.message.edit_text(text, reply_markup=keyboard)
-
-        # Очищаем сохранённый отчёт из state
-        if period == 'uploaded_file':
-            await state.update_data(uploaded_file_report=None)
-
-    except Exception as e:
-        logger.error('Ошибка в apply_referral_fixes', error=e, exc_info=True)
-        await callback.answer('Ошибка при применении исправлений', show_alert=True)
+    """Снято 30.09.2026 (РЕФ-2.3): отвечает отказом, ничего не пишет и не начисляет."""
+    await callback.answer(PAYOUT_BUTTON_DISABLED_TEXT, show_alert=True)
 
 
 # =============================================================================
@@ -1061,9 +959,6 @@ async def check_missing_bonuses(callback: types.CallbackQuery, db_user: User, db
     try:
         report = await referral_diagnostics_service.check_missing_bonuses(db)
 
-        # Сохраняем отчёт в state для последующего применения
-        await state.update_data(missing_bonuses_report=report.to_dict())
-
         text = f"""
 🔍 <b>Проверка бонусов по БД</b>
 
@@ -1075,7 +970,7 @@ async def check_missing_bonuses(callback: types.CallbackQuery, db_user: User, db
 
         if report.missing_bonuses:
             text += f"""
-💰 <b>Требуется начислить:</b>
+💰 <b>Проверка считает не начисленным (только просмотр):</b>
 • Рефералам: {report.total_missing_to_referrals / 100:.0f}₽
 • Рефереерам: {report.total_missing_to_referrers / 100:.0f}₽
 • <b>Итого: {(report.total_missing_to_referrals + report.total_missing_to_referrers) / 100:.0f}₽</b>
@@ -1099,7 +994,6 @@ async def check_missing_bonuses(callback: types.CallbackQuery, db_user: User, db
 
             keyboard = types.InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [types.InlineKeyboardButton(text='✅ Начислить все бонусы', callback_data='admin_ref_bonus_apply')],
                     [types.InlineKeyboardButton(text='🔄 Обновить', callback_data='admin_ref_check_bonuses')],
                     [types.InlineKeyboardButton(text='⬅️ К диагностике', callback_data='admin_referral_diagnostics')],
                 ]
@@ -1123,60 +1017,8 @@ async def check_missing_bonuses(callback: types.CallbackQuery, db_user: User, db
 @admin_required
 @error_handler
 async def apply_missing_bonuses(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
-    """Применяет начисление пропущенных бонусов."""
-    from app.services.referral_diagnostics_service import (
-        MissingBonusReport,
-        referral_diagnostics_service,
-    )
-
-    await callback.answer('💰 Начисляю бонусы...')
-
-    try:
-        # Получаем сохранённый отчёт
-        data = await state.get_data()
-        report_dict = data.get('missing_bonuses_report')
-
-        if not report_dict:
-            await callback.answer('❌ Отчёт не найден. Обновите проверку.', show_alert=True)
-            return
-
-        report = MissingBonusReport.from_dict(report_dict)
-
-        if not report.missing_bonuses:
-            await callback.answer('✅ Нет бонусов для начисления', show_alert=True)
-            return
-
-        # Применяем исправления
-        fix_report = await referral_diagnostics_service.fix_missing_bonuses(db, report.missing_bonuses, apply=True)
-
-        text = f"""
-✅ <b>Бонусы начислены!</b>
-
-📊 <b>Результат:</b>
-• Обработано: {fix_report.users_fixed} пользователей
-• Начислено рефералам: {fix_report.bonuses_to_referrals / 100:.0f}₽
-• Начислено рефереерам: {fix_report.bonuses_to_referrers / 100:.0f}₽
-• <b>Итого: {(fix_report.bonuses_to_referrals + fix_report.bonuses_to_referrers) / 100:.0f}₽</b>
-"""
-
-        if fix_report.errors > 0:
-            text += f'\n⚠️ Ошибок: {fix_report.errors}'
-
-        # Очищаем отчёт из state
-        await state.update_data(missing_bonuses_report=None)
-
-        keyboard = types.InlineKeyboardMarkup(
-            inline_keyboard=[
-                [types.InlineKeyboardButton(text='🔍 Проверить снова', callback_data='admin_ref_check_bonuses')],
-                [types.InlineKeyboardButton(text='⬅️ К диагностике', callback_data='admin_referral_diagnostics')],
-            ]
-        )
-
-        await callback.message.edit_text(text, reply_markup=keyboard)
-
-    except Exception as e:
-        logger.error('Ошибка в apply_missing_bonuses', error=e, exc_info=True)
-        await callback.answer('Ошибка при начислении бонусов', show_alert=True)
+    """Снято 30.09.2026 (РЕФ-2.3): отвечает отказом, ничего не пишет и не начисляет."""
+    await callback.answer(PAYOUT_BUTTON_DISABLED_TEXT, show_alert=True)
 
 
 @admin_required
