@@ -49,12 +49,17 @@ class _AsyncOverSync:
     async def execute(self, stmt):
         return self._s.execute(stmt)
 
+    async def rollback(self):
+        self.rolled_back = True
+        self._s.rollback()
+
 
 def _schema() -> Session:
     engine = create_engine('sqlite://')
     statements = [
         'CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, status TEXT, test_account_enabled BOOLEAN, '
-        'remnawave_uuid TEXT, referred_by_id INTEGER, created_at TIMESTAMP)',
+        'remnawave_uuid TEXT, referred_by_id INTEGER, created_at TIMESTAMP, username TEXT, first_name TEXT, '
+        'last_name TEXT, email TEXT)',
         'CREATE TABLE transactions (id INTEGER PRIMARY KEY, user_id INTEGER, type TEXT, amount_kopeks INTEGER, '
         'payment_method TEXT, description TEXT, is_completed BOOLEAN, created_at TIMESTAMP)',
         'CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, user_id INTEGER, tariff_id INTEGER, is_trial BOOLEAN, '
@@ -75,14 +80,22 @@ class _Seed:
         self.s = session
         self._next = 100
 
-    def user(self, *, created_at: str, referred_by_id: int | None = None, telegram_id: int | None = None) -> int:
+    def user(
+        self, *, created_at: str, referred_by_id: int | None = None, telegram_id: int | None = None, name: str = ''
+    ) -> int:
         self._next += 1
         self.s.execute(
             text(
-                'INSERT INTO users (id, telegram_id, status, referred_by_id, created_at) '
-                "VALUES (:id, :tg, 'active', :ref, :c)"
+                'INSERT INTO users (id, telegram_id, status, referred_by_id, created_at, first_name) '
+                "VALUES (:id, :tg, 'active', :ref, :c, :name)"
             ),
-            {'id': self._next, 'tg': telegram_id or self._next * 10, 'ref': referred_by_id, 'c': created_at},
+            {
+                'id': self._next,
+                'tg': telegram_id or self._next * 10,
+                'ref': referred_by_id,
+                'c': created_at,
+                'name': name or None,
+            },
         )
         return self._next
 
@@ -134,8 +147,8 @@ async def _overview(session: Session) -> dict:
 
 
 def _seed_two_months(seed: _Seed) -> None:
-    masha = seed.user(created_at=JUNE)
-    stand = seed.user(created_at=JUNE, telegram_id=STAND_TELEGRAM_ID)
+    masha = seed.user(created_at=JUNE, name='Маша')
+    stand = seed.user(created_at=JUNE, telegram_id=STAND_TELEGRAM_ID, name='Стенд')
     # Петя пришёл в августе и взял пробный, а заплатил в сентябре — каждое событие в своём месяце
     petya = seed.user(created_at=AUG_10, referred_by_id=masha)
     seed.trial(petya, created_at=AUG_10)
@@ -242,3 +255,102 @@ async def test_series_starts_in_the_moscow_month_of_the_first_arrival() -> None:
 
     assert [row['month'] for row in overview['months']] == ['2026-08', '2026-09']
     assert overview['months'][0]['came'] == 1
+
+
+# ---------- РЕФ-2.4б: «Топ рефералов» — «заплатили N» и итоги по всем пригласившим ----------
+
+MASHA, STAND = 101, 102  # порядок `_seed_two_months`
+
+
+async def _top(session: Session, *, broken_additions: bool = False):
+    from app.cabinet.routes import admin_stats
+
+    db = _AsyncOverSync(session)
+    with (
+        patch.object(reporting_module, 'get_all_tariffs', _tariffs),
+        patch.object(reporting_module, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=5))),
+        patch.object(module, 'get_all_tariffs', _tariffs),
+        patch('app.services.user_service.test_account_telegram_ids', lambda: frozenset({STAND_TELEGRAM_ID})),
+        patch.object(admin_stats, 'datetime', SimpleNamespace(now=lambda tz=None: NOW)),
+        patch.object(
+            reporting_module.reporting_service,
+            'referral_paid_counts',
+            AsyncMock(side_effect=RuntimeError('db is down'))
+            if broken_additions
+            else reporting_module.reporting_service.referral_paid_counts,
+        ),
+    ):
+        response = await admin_stats.get_top_referrers(limit=20, admin=SimpleNamespace(), db=db)
+    return response, db
+
+
+@pytest.mark.asyncio
+async def test_top_adds_paid_count_and_totals_and_keeps_the_old_numbers() -> None:
+    session = _schema()
+    _seed_two_months(_Seed(session))
+
+    response, _ = await _top(session)
+
+    rows = {item.user_id: item for item in response.by_invited}
+    assert rows[MASHA].paid_count == 2  # Петя и Иван платили, «последняя минута августа» — нет
+    assert rows[STAND].paid_count == 0  # пара со стендом не рефералка
+    # прежние числа «Топа» не тронуты (правило владельца «только добавлять»): стенд по-прежнему в списке
+    assert (rows[MASHA].invited_count, rows[STAND].invited_count) == (3, 1)
+    assert response.total_referrals == 4
+    # 27.09: сегодня ничего; 7 суток — с 21.09 МСК (20.09 21:00 UTC), оплата Ивана 20.09 в 15:00 МСК — раньше;
+    # месяц — все сентябрьские начисления людей: 49,75 + 10 + 62,50 ₽; стенду 162,25 ₽ не в счёт
+    assert response.period_totals.model_dump() == {'today_kopeks': 0, 'week_kopeks': 0, 'month_kopeks': 12225}
+
+
+@pytest.mark.asyncio
+async def test_this_month_under_the_top_is_the_same_number_as_the_tile() -> None:
+    session = _schema()
+    _seed_two_months(_Seed(session))
+
+    response, _ = await _top(session)
+    overview = await _overview(session)
+
+    assert response.period_totals.month_kopeks == overview['months'][-1]['rewards_kopeks']
+
+
+@pytest.mark.asyncio
+async def test_top_survives_a_failure_of_the_new_fields() -> None:
+    session = _schema()
+    _seed_two_months(_Seed(session))
+
+    response, db = await _top(session, broken_additions=True)
+
+    assert response.period_totals is None
+    assert all(item.paid_count is None for item in response.by_invited)
+    assert {item.user_id for item in response.by_invited} == {MASHA, STAND}  # «Топ» на экране
+    assert db.rolled_back is True
+
+
+@pytest.mark.asyncio
+async def test_period_totals_are_today_seven_moscow_days_and_the_calendar_month() -> None:
+    session = _schema()
+    seed = _Seed(session)
+    masha = seed.user(created_at=JUNE)
+    petya = seed.user(created_at=AUG_10, referred_by_id=masha)
+    seed.earning(
+        masha, petya, 700, 'referral_commission_topup', created_at='2026-09-27 05:00:00.000000'
+    )  # 08:00 сегодня
+    seed.earning(
+        masha, petya, 300, 'referral_commission_topup', created_at='2026-09-26 21:00:00.000000'
+    )  # 00:00 сегодня
+    seed.earning(masha, petya, 3000, 'referral_commission_topup', created_at='2026-09-26 12:00:00.000000')  # вчера
+    seed.earning(masha, petya, 100, 'referral_commission_topup', created_at='2026-09-20 21:00:00.000000')  # 00:00 21.09
+    seed.earning(
+        masha, petya, 6250, 'referral_commission_topup', created_at='2026-09-20 20:59:00.000000'
+    )  # 23:59 20.09
+    seed.earning(masha, petya, 4975, 'referral_first_topup', created_at=SEP_FIRST_MIDNIGHT)
+    seed.earning(masha, petya, 500, 'referral_commission_topup', created_at=AUG_LAST_MINUTE)
+    session.commit()
+
+    with (
+        patch.object(reporting_module, 'get_all_tariffs', _tariffs),
+        patch('app.services.user_service.test_account_telegram_ids', lambda: frozenset({STAND_TELEGRAM_ID})),
+    ):
+        totals = await module.referral_period_totals(_AsyncOverSync(session), NOW)
+
+    assert totals == {'today_kopeks': 1000, 'week_kopeks': 4100, 'month_kopeks': 15325}

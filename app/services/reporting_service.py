@@ -293,6 +293,23 @@ class ReportingService:
             or 0
         )
 
+    async def referral_rewards_kopeks(self, session, start_utc: datetime, end_utc: datetime) -> int:
+        """Начислено пригласившим за окно — то же число, что `rewards_kopeks` у `referral_numbers` (итоги «Топа»)."""
+        return await self._referral_rewards(session, start_utc, end_utc, await self._invited_person_clause(session))
+
+    async def referral_paid_counts(self, session) -> dict[int, int]:
+        """Сколько приглашённых у каждого пригласившего хоть раз платили деньгами — теми же правилами, что счётчик."""
+        invited = await self._invited_person_clause(session)
+        paid = select(Transaction.id).where(Transaction.user_id == User.id, *self._live_payment_conditions())
+        rows = (
+            await session.execute(
+                select(User.referred_by_id, func.count(User.id))
+                .where(invited, paid.exists())
+                .group_by(User.referred_by_id)
+            )
+        ).all()
+        return {int(inviter): int(count) for inviter, count in rows}
+
     async def referral_first_arrival(self, session) -> datetime | None:
         """Когда пришёл первый приглашённый, которого считаем, — начало ряда месяцев на «Статистике» кабинета."""
         invited = await self._invited_person_clause(session)

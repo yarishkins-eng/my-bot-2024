@@ -26,10 +26,11 @@ from app.database.models import (
 )
 from app.services.campaign_service import get_campaign_analytics
 from app.services.remnawave_service import RemnaWaveService
+from app.services.reporting_service import reporting_service
 from app.services.version_service import version_service
 
 from ..dependencies import get_cabinet_db, require_permission
-from .admin_sales_stats import dashboard_money, dashboard_referrals, owner_people_tiles
+from .admin_sales_stats import dashboard_money, dashboard_referrals, owner_people_tiles, referral_period_totals
 
 
 logger = structlog.get_logger(__name__)
@@ -179,6 +180,17 @@ class TopReferrerItem(BaseModel):
     earnings_week_kopeks: int = 0
     earnings_month_kopeks: int = 0
     earnings_total_kopeks: int = 0
+    # РЕФ-2.4б: сколько приглашённых этого человека хоть раз платили деньгами (правила счётчика рефералки);
+    # `None` — посчитать не удалось, экран строку не печатает
+    paid_count: int | None = None
+
+
+class ReferralPeriodTotals(BaseModel):
+    """Начислено ВСЕМ пригласившим: сегодня, 7 суток и календарный месяц Москвы (тот же счётчик, что плитка)."""
+
+    today_kopeks: int
+    week_kopeks: int
+    month_kopeks: int
 
 
 class TopReferrersResponse(BaseModel):
@@ -189,6 +201,7 @@ class TopReferrersResponse(BaseModel):
     total_referrers: int
     total_referrals: int
     total_earnings_kopeks: int
+    period_totals: ReferralPeriodTotals | None = None  # РЕФ-2.4б; `None` — сбой, на экране «—»
 
 
 class TopCampaignItem(BaseModel):
@@ -811,6 +824,18 @@ async def get_top_referrers(
         else:
             users_info = {}
 
+        # РЕФ-2.4б: новые поля — отдельно и не смертельно: их сбой не снимает «Топ» с экрана, а прежние числа
+        # остаются как были (правило владельца «только добавлять»). Строка аудита прав уже записана зависимостью.
+        paid_counts: dict[int, int] | None = None
+        period_totals: ReferralPeriodTotals | None = None
+        try:
+            paid_counts = await reporting_service.referral_paid_counts(db)
+            period_totals = ReferralPeriodTotals(**await referral_period_totals(db, now))
+        except Exception as error:
+            logger.error('Failed to get referral top additions', error=error, exc_info=True)
+            await db.rollback()
+            paid_counts, period_totals = None, None
+
         # Build referrer items
         referrer_items = []
         for referrer_id, data in referrers_data.items():
@@ -847,6 +872,7 @@ async def get_top_referrers(
                     earnings_week_kopeks=data.get('earnings_week', 0),
                     earnings_month_kopeks=data.get('earnings_month', 0),
                     earnings_total_kopeks=data.get('earnings_total', 0),
+                    paid_count=None if paid_counts is None else paid_counts.get(user.id, 0),
                 )
             )
 
@@ -865,6 +891,7 @@ async def get_top_referrers(
             total_referrers=total_referrers,
             total_referrals=total_referrals,
             total_earnings_kopeks=total_earnings,
+            period_totals=period_totals,
         )
 
     except Exception as e:

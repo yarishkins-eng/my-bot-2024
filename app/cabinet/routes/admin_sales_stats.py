@@ -364,6 +364,19 @@ def _share_pct(part: int, whole: int) -> int | None:
     return int(100 * part / whole + 0.5) if whole > 0 else None
 
 
+async def referral_period_totals(db: AsyncSession, now: datetime) -> dict:
+    """Итоги под «Топом рефералов» (РЕФ-2.4б): начислено ВСЕМ пригласившим за сегодня, 7 суток и календарный месяц
+    Москвы до «сейчас» — тем же счётчиком, что плитка «Начислено пригласившим»: «Этот месяц» под «Топом» и плитка —
+    одно число (прежде экран складывал десять строк вкладки по скользящим суткам UTC — находка D-3)."""
+    today = now.astimezone(_MSK).date()
+    starts = {
+        'today_kopeks': _msk_midnight(today),
+        'week_kopeks': _msk_midnight(today - timedelta(days=6)),
+        'month_kopeks': _msk_midnight(today.replace(day=1)),
+    }
+    return {key: await reporting_service.referral_rewards_kopeks(db, start, now) for key, start in starts.items()}
+
+
 async def dashboard_referrals(db: AsyncSession, now: datetime) -> dict:
     """«Приглашения» на «Статистике» (РЕФ-2, 30.09.2026): каждый месяц Москвы считает ТОТ ЖЕ счётчик, что утреннее
     письмо (`reporting_service.referral_numbers`), — письмо и экран не расходятся (мина NW). Каждое событие — в своём
