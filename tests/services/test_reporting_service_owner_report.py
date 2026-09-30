@@ -1180,7 +1180,7 @@ def _seed_referral_day(seed: _Seed) -> None:
     seed.tx(ivan, 'deposit', 30000, method='manual', description='Начисление администратором')
     seed.earning(masha, ivan, 6250, 'referral_commission_topup')
     seed.earning(masha, ivan, 1000, 'referral_commission_topup', created_at=DAY_BEFORE)
-    # тестовая пара: приглашённый — человек, пригласивший — стенд (как 175 → 196)
+    # тестовая пара: приглашённый — человек, пригласивший — стенд (как в проверке 29.09)
     stand_friend = seed.user(created_at=IN_DAY, referred_by_id=stand)
     seed.tx(stand_friend, 'provider_receipt', 24900, method='platega', description='Платёж картой получен')
     seed.earning(stand, stand_friend, 16225, 'referral_first_topup')
@@ -1243,7 +1243,7 @@ async def test_referral_block_failure_keeps_the_rest_of_the_letter() -> None:
 @pytest.mark.asyncio
 async def test_referral_trial_counts_a_trial_whose_row_a_purchase_rewrote() -> None:
     """О-1 (30.09.2026): покупка переписывает строку пробного, а у старых покупок нет признака конверсии — правило
-    письма таких не видит (боевые июнь / июль / август: 4 / 0 / 5 вместо 8 / 3 / 8). Событие активации покупку
+    письма таких не видит (прошлые месяцы на боевом недосчитывали пробные вдвое). Событие активации покупку
     переживает."""
     session = _schema()
     seed = _Seed(session)
@@ -1261,6 +1261,10 @@ async def test_referral_trial_counts_a_trial_whose_row_a_purchase_rewrote() -> N
     seed.event(seed.user(referred_by_id=masha), 'activation', None, message='Trial activation', occurred_at=DAY_BEFORE)
     seed.event(seed.user(referred_by_id=masha), 'activation', None, message='Trial activation', occurred_at=DAY_AFTER)
     seed.event(seed.user(), 'activation', None, message='Trial activation')
+    # другие события приглашённого — не пробный: покупка, неудачная активация, покупка с той же подписью (ревью S1-2)
+    seed.event(seed.user(referred_by_id=masha), 'purchase', '{"purchase_type": "first_purchase"}')
+    seed.event(seed.user(referred_by_id=masha), 'activation', None, message='Trial activation failed')
+    seed.event(seed.user(referred_by_id=masha), 'purchase', None, message='Trial activation')
     session.commit()
 
     assert (await _referral_numbers(session))['trial'] == 2
