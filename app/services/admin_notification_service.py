@@ -524,14 +524,23 @@ class AdminNotificationService:
         return f'через {html.escape(html.unescape(label), quote=False)}'
 
     @staticmethod
-    def _owner_balance_line(balance_kopeks: int | None) -> str | None:
+    def _owner_balance_line(balance_kopeks: int | None, *, bonus_kopeks: int | None = None) -> str | None:
         balance = int(balance_kopeks or 0)
         shown = settings.format_price(balance)
         if balance <= 0 or shown.startswith('0 ₽'):
             return None
+        # РЕФ-2.2, решение владельца 30.09: у приглашённого после первой оплаты на балансе лежит ЕГО бонус за
+        # приглашение, а «осталось 100 ₽» читалось как остаток от платежа
+        bonus = int(bonus_kopeks or 0)
+        if bonus > 0 and balance == bonus:
+            return f'На балансе осталось {shown} (бонус за приглашение)'
+        if bonus > 0 and balance > bonus:
+            return f'На балансе осталось {shown} (в т.ч. бонус за приглашение {settings.format_price(bonus)})'
         return f'На балансе осталось {shown}'
 
-    async def _owner_referrer_line(self, db: AsyncSession, user: User) -> str | None:
+    async def _owner_referrer_line(
+        self, db: AsyncSession, user: User, *, reward_kopeks: int | None = None
+    ) -> str | None:
         if not getattr(user, 'referred_by_id', None):
             return None
         info = await self._get_referrer_info(db, user.referred_by_id)
@@ -539,7 +548,11 @@ class AdminNotificationService:
             return None
         # «По приглашению», а не «пришёл по ссылке»: реферера может назначить и админ рукой,
         # а форма без рода подходит и клиенту, и пригласившему любого пола.
-        return f'По приглашению {re.sub(r" \(ID: \d+\)$", "", info)}'
+        line = f'По приглашению {re.sub(r" \(ID: \d+\)$", "", info)}'
+        if reward_kopeks and reward_kopeks > 0:
+            # РЕФ-2.2: видно, что рефералка сработала; строк не прибавляется (предел карточки — 7)
+            line += f' · пригласившему начислено {settings.format_price(int(reward_kopeks))}'
+        return line
 
     @staticmethod
     def _owner_subscription_label(subscription: Subscription | None, tariff: Tariff | None) -> str:
@@ -644,6 +657,10 @@ class AdminNotificationService:
         purchase_type: str | None = None,  # 'first_purchase', 'renewal', 'tariff_switch', None (auto-detect)
         payment_label: str | None = None,  # К-2: способ оплаты словами от вызывающего («по СБП»), не из описания
         discount_kopeks: int = 0,  # К-2: скидка из замороженной разбивки заказа
+        # РЕФ-2.2: сколько по этому заказу уже начислено пригласившему и какой бонус получил сам покупатель —
+        # передаёт касса для первой покупки приглашённого; `None` — не известно, строки печатаются как раньше
+        referrer_reward_kopeks: int | None = None,
+        referred_bonus_kopeks: int | None = None,
     ) -> bool:
         try:
             total_amount = (
@@ -701,8 +718,10 @@ class AdminNotificationService:
                 self._owner_who(user, html.escape(tariff.name) if tariff else None, verb=verb),
                 what,
                 breakdown or discount_line,
-                self._owner_balance_line(user.balance_kopeks),
-                await self._owner_referrer_line(db, user) if was_trial_conversion or not is_renewal else None,
+                self._owner_balance_line(user.balance_kopeks, bonus_kopeks=referred_bonus_kopeks),
+                await self._owner_referrer_line(db, user, reward_kopeks=referrer_reward_kopeks)
+                if was_trial_conversion or not is_renewal
+                else None,
             )
 
             # Маршрутизация по категориям (зеркалит логику заголовков выше)

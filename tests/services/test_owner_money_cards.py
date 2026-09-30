@@ -989,3 +989,63 @@ async def test_explicit_first_purchase_wins_over_an_already_flipped_flag() -> No
     assert category is NotificationCategory.PURCHASES
     assert lines[0] == '<b>💎 Первая покупка — 249 ₽</b>'
     assert lines[1] == 'Купил(а) nikitaa @lilgaandelf · Базовый'
+
+
+# ── РЕФ-2.2 (30.09.2026): сумма награды пригласившему и бонус приглашённого на карточке первой покупки ──
+
+
+async def _first_purchase_card(*, balance: int, reward: int | None, bonus: int | None, renewal: bool = False) -> str:
+    service = _service()
+    transaction = _transaction(amount_kopeks=-19900, payment_method='platega', description='Оплата подписки картой')
+    with _patched_tariff(_tariff()):
+        assert await service.send_subscription_purchase_notification(
+            AsyncMock(),
+            _user(has_had_paid_subscription=renewal, balance_kopeks=balance),
+            _subscription(end_date=NEW_END_DATE),
+            transaction,
+            30,
+            purchase_type='renewal' if renewal else 'first_purchase',
+            payment_label='по СБП',
+            referrer_reward_kopeks=reward,
+            referred_bonus_kopeks=bonus,
+        )
+    text, _ = _sent(service)
+    return text
+
+
+@pytest.mark.asyncio
+async def test_first_purchase_card_names_the_reward_and_the_bonus_without_extra_lines() -> None:
+    lines = _assert_card_shape(await _first_purchase_card(balance=10000, reward=4975, bonus=10000))
+
+    assert 'По приглашению @kozyr20 · пригласившему начислено 50 ₽' in lines
+    assert 'На балансе осталось 100 ₽ (бонус за приглашение)' in lines
+
+
+@pytest.mark.asyncio
+async def test_bonus_is_named_as_a_part_when_the_balance_holds_more() -> None:
+    lines = _assert_card_shape(await _first_purchase_card(balance=15000, reward=4975, bonus=10000))
+
+    assert 'На балансе осталось 150 ₽ (в т.ч. бонус за приглашение 100 ₽)' in lines
+
+
+@pytest.mark.asyncio
+async def test_bonus_is_not_claimed_when_the_balance_holds_less() -> None:
+    lines = _assert_card_shape(await _first_purchase_card(balance=5000, reward=4975, bonus=10000))
+
+    assert 'На балансе осталось 50 ₽' in lines
+
+
+@pytest.mark.asyncio
+async def test_card_without_known_reward_keeps_the_old_referrer_line() -> None:
+    lines = _assert_card_shape(await _first_purchase_card(balance=0, reward=None, bonus=None))
+
+    assert 'По приглашению @kozyr20' in lines
+    assert not any('пригласившему' in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_renewal_card_stays_without_the_referrer_even_with_a_reward() -> None:
+    text = await _first_purchase_card(balance=0, reward=4975, bonus=None, renewal=True)
+
+    assert 'По приглашению' not in text
+    assert 'пригласившему' not in text

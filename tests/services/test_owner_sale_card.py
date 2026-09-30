@@ -205,8 +205,10 @@ def _admin(*, enabled=True, delivered=True, categories=None):
     return admin
 
 
-async def _run(rows, *, checkout, admin, attempt=SimpleNamespace(provider_method_code=11), loads_entities=True):
-    user = _user()
+async def _run(
+    rows, *, checkout, admin, attempt=SimpleNamespace(provider_method_code=11), loads_entities=True, user=None
+):
+    user = user or _user()
     subscription = SimpleNamespace(id=104, device_limit=3)
     transaction = SimpleNamespace(id=594, amount_kopeks=-28900, payment_method='platega')
     db = _worker_db(
@@ -419,3 +421,33 @@ def test_unknown_platega_method_still_names_the_provider():
     assert platega_method_label('11') == 'картой'
     assert platega_method_label(99) == 'через Platega'
     assert platega_method_label(None) == 'через Platega'
+
+
+# ── РЕФ-2.2 (30.09.2026): суммы рефералки уходят в карточку только первой покупки приглашённого ──
+
+
+@pytest.mark.asyncio
+async def test_first_sale_of_an_invited_buyer_passes_the_referral_amounts_to_the_card():
+    row = _outbox_row(1, f'{SALE_NOTIFICATION_PREFIX}first')
+    admin = _admin()
+    amounts = AsyncMock(return_value={'referrer_reward_kopeks': 4975, 'referred_bonus_kopeks': 10000})
+    with patch.object(service_module, '_first_sale_referral_amounts', amounts):
+        sent, *_ = await _run([row], checkout=_checkout(), admin=admin, user=_user(referred_by_id=123))
+
+    assert sent == 1 and row.status == 'sent'
+    amounts.assert_awaited_once_with(101, user_id=291, referrer_id=123)
+    kwargs = admin.send_subscription_purchase_notification.await_args.kwargs
+    assert kwargs['referrer_reward_kopeks'] == 4975
+    assert kwargs['referred_bonus_kopeks'] == 10000
+
+
+@pytest.mark.asyncio
+async def test_repeat_sale_of_an_invited_buyer_does_not_read_referral_amounts():
+    row = _outbox_row(1, f'{SALE_NOTIFICATION_PREFIX}repeat')
+    admin = _admin()
+    amounts = AsyncMock(return_value={'referrer_reward_kopeks': 4975})
+    with patch.object(service_module, '_first_sale_referral_amounts', amounts):
+        await _run([row], checkout=_checkout(), admin=admin, user=_user(referred_by_id=123))
+
+    amounts.assert_not_awaited()
+    assert 'referrer_reward_kopeks' not in admin.send_subscription_purchase_notification.await_args.kwargs
