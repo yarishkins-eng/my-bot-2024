@@ -3260,10 +3260,18 @@ _POST_PAID_REVERSAL_PREFIX = 'post_paid_provider_terminal'
 #     заказ в `operator_review` с причиной удаления аккаунта (`:1853-1865`). То есть
 #     «деньги есть, а причина прежняя» — состояние, недостижимое по коду;
 #   · и всё равно этот список спрашивается ВТОРЫМ: факт зачисления в базе сильнее.
+# 🔴 ВК-15 дописал ТРЕТЬЮ: Platega не вернула номер счёта, и заказ закрыт сразу. Ссылку на
+# оплату человек получает только к счёту с номером, значит платить ему было нечем. Причина
+# ставится только у попытки без номера, без оплаты и без зачислений, пока заказ ждёт денег
+# (`device_first_payment_service._invoice_never_reached_customer`). Пришедшее позже от
+# Platega её не сохраняет: уведомление по счёту без номера уводит заказ на разбор со своей
+# причиной (`_queue_direct_callback_for_canonical_reconciliation`, проверка привязки).
+INVOICE_NOT_CREATED_TERMINAL_REASON = 'provider_invoice_not_created'
 _NO_MONEY_TERMINAL_REASONS = frozenset(
     {
         'provider_invoice_missing_or_elapsed_expiry',
         'cancelled_by_user_after_invoice',
+        INVOICE_NOT_CREATED_TERMINAL_REASON,
     }
 )
 

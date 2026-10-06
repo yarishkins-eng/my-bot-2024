@@ -1485,7 +1485,24 @@ async def test_direct_invoice_with_confirmed_canonical_status_uses_strict_settle
 
 
 @pytest.mark.asyncio
-async def test_direct_reconciler_escalates_an_old_identityless_invoice_without_another_provider_post(monkeypatch):
+@pytest.mark.parametrize(
+    ('reconciliation_reason', 'release_failure'),
+    [
+        # Процесс оборвался между записью попытки и ответом Platega — причины нет.
+        (None, 'creation_interrupted'),
+        # Попытку оставил прежний код (до ВК-15) с причиной сбоя — её и отпускаем с ней.
+        ('provider_response_missing_identity', 'provider_response_missing_identity'),
+    ],
+)
+async def test_direct_reconciler_releases_or_escalates_an_old_identityless_invoice_without_another_provider_post(
+    monkeypatch, reconciliation_reason, release_failure
+):
+    """ВК-15: без номера счёта сверка отпускает заказ, если ссылка до человека не дошла.
+
+    Решение «отпустить или на разбор» принимает `_hold_direct_invoice_for_review` под
+    блокировками (`release_failure`); сюда важно, что сверка его просит и что повторного
+    запроса к Platega нет. Сам выбор — `tests/services/test_device_first_invoice_not_created.py`.
+    """
     attempt = SimpleNamespace(
         id=41,
         checkout_id=9,
@@ -1494,6 +1511,7 @@ async def test_direct_reconciler_escalates_an_old_identityless_invoice_without_a
         provider_payment_id=None,
         platega_payment_id=51,
         lease_epoch=3,
+        reconciliation_reason=reconciliation_reason,
     )
 
     class AttemptsResult:
@@ -1525,6 +1543,7 @@ async def test_direct_reconciler_escalates_an_old_identityless_invoice_without_a
         reason='provider_invoice_creation_incomplete',
         lease_token=ANY,
         lease_epoch=3,
+        release_failure=release_failure,
     )
 
 

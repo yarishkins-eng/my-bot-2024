@@ -36,6 +36,7 @@ from app.database.models import (
 )
 from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
+    INVOICE_NOT_CREATED_TERMINAL_REASON,
     LEGACY_SETTLEMENT_MODE,
     OPERATOR_CLOSED_TERMINAL_REASON,
     OPERATOR_REFUND_RECONCILIATION_REASON,
@@ -562,12 +563,18 @@ async def _hold_direct_invoice_for_review(
     reason: str,
     lease_token: str | None = None,
     lease_epoch: int | None = None,
+    release_failure: str | None = None,
 ) -> bool:
     """Fence an ambiguous direct invoice without retrying the provider POST.
 
     With a provider payment this follows the direct financial lock contract:
     Payment -> User -> Attempt -> Checkout. A worker that lost its lease must
     not overwrite a newer webhook decision.
+
+    ВК-15: with ``release_failure`` an invoice whose number Platega never
+    returned is released instead of held (``_invoice_never_reached_customer``):
+    the attempt fails and the order closes as ``provider_invoice_not_created``.
+    The caller reads the outcome from ``attempt.status`` (``failed`` = released).
     """
     payment = None
     if payment_id is not None:
@@ -625,6 +632,22 @@ async def _hold_direct_invoice_for_review(
             checkout.terminal_reason = 'direct_payment_binding_mismatch'
         await db.commit()
         return False
+    if release_failure is not None and _invoice_never_reached_customer(owned_attempt, payment, checkout):
+        owned_attempt.status = 'failed'
+        owned_attempt.reconciliation_reason = f'{INVOICE_NOT_CREATED_TERMINAL_REASON}:{release_failure}'
+        payment.status = 'FAILED'
+        checkout.lifecycle_state = 'cancelled'
+        checkout.quote_state = 'expired'
+        checkout.funding_state = 'invoice_not_created'
+        checkout.terminal_reason = INVOICE_NOT_CREATED_TERMINAL_REASON
+        await db.commit()
+        logger.warning(
+            'device_first_direct_invoice_not_created',
+            checkout_id=checkout.public_id,
+            attempt_id=owned_attempt.id,
+            failure=release_failure,
+        )
+        return True
     owned_attempt.status = 'operator_review'
     owned_attempt.reconciliation_reason = reason
     if payment is not None:
@@ -634,6 +657,37 @@ async def _hold_direct_invoice_for_review(
         checkout.terminal_reason = reason
     await db.commit()
     return True
+
+
+def _invoice_never_reached_customer(
+    attempt: CheckoutPaymentAttempt,
+    payment: PlategaPayment | None,
+    checkout: SubscriptionCheckout | None,
+) -> bool:
+    """ВК-15. Счёт без номера Platega до человека не дошёл — и денег по нему нет.
+
+    Ссылку на оплату человек получает только к счёту с номером: номер ставит одна
+    `_bind_direct_provider_identity`, а ссылку отдают только к живой попытке `pending`
+    (`_is_live_direct_provider_invoice` в кабинете, `pending` в боте). Нет номера — платить
+    было нечем; даже заведённый Platega за ошибкой счёт осиротеет и истечёт сам.
+    Отпускаем, только если и база про деньги молчит: платёж не оплачен, на попытке ничего
+    не зачислено, заказ всё ещё ждёт денег. Иначе — прежний разбор оператором.
+    ⚠️ Уведомление Platega по такому счёту сюда не доходит: проверка привязки в
+    `_queue_direct_callback_for_canonical_reconciliation` сама уводит заказ без номера на
+    разбор (мина OD: позднее «отменён» по осиротевшему счёту снова запрёт клиента; таймаутов
+    POST к Platega за всю историю 0, уведомлений по попыткам без номера — 0).
+    """
+    return bool(
+        payment is not None
+        and checkout is not None
+        and not attempt.provider_payment_id
+        and attempt.status in {'creating', 'reconciliation'}
+        and not payment.is_paid
+        and not attempt.credited_amount_kopeks
+        and checkout.lifecycle_state == 'awaiting_funds'
+        and checkout.fulfillment_state == 'not_started'
+        and checkout.debit_transaction_id is None
+    )
 
 
 async def _apply_direct_pending_provider_observation(
@@ -1486,6 +1540,18 @@ async def create_platega_attempt(
     return attempt
 
 
+def _invoice_creation_failed(attempt: CheckoutPaymentAttempt) -> DeviceFirstError:
+    """Ответ человеку, когда Platega не выставила счёт (ВК-15).
+
+    Заказ отпущен (`failed`) — свой код: кабинет и бот говорят «не ответила, деньги не
+    списаны, нажмите ещё раз», а следующее нажатие рождает новый заказ. Иначе заказ ушёл
+    на разбор оператором, и ответ прежний.
+    """
+    if attempt.status == 'failed':
+        return DeviceFirstError('provider_invoice_not_created', 'Payment provider did not create the invoice')
+    return DeviceFirstError('reconciliation_required', 'Provider invoice requires reconciliation')
+
+
 async def _create_direct_platega_attempt(
     db: AsyncSession,
     *,
@@ -1535,8 +1601,9 @@ async def _create_direct_platega_attempt(
         settlement_mode=DIRECT_SETTLEMENT_MODE,
         status='creating',
         # Let the caller complete its one bounded provider POST first. If it
-        # dies, reconciliation will later preserve the attempt for operator
-        # review rather than guessing that a second invoice is safe to create.
+        # dies, reconciliation later releases the order when no payment link
+        # ever reached the customer (ВК-15), otherwise keeps it for operator
+        # review — it never guesses that a second POST in this attempt is safe.
         next_reconcile_at=datetime.now(UTC) + timedelta(minutes=5),
     )
     db.add(attempt)
@@ -1574,6 +1641,9 @@ async def _create_direct_platega_attempt(
     await db.refresh(attempt)
 
     service = PlategaService()
+    # Один POST на попытку: ключа идемпотентности у Platega нет, и повтор мог бы
+    # завести второй счёт. Сбой без номера счёта не повторяется, а отпускает заказ
+    # (ВК-15): новое нажатие человека — новый заказ. ⛔ Не поднимать (мина P, рецепт В6).
     service._max_retries = 1
     try:
         response = await service.create_payment(
@@ -1586,22 +1656,29 @@ async def _create_direct_platega_attempt(
             payload=f'platega:{correlation_id}',
         )
     except Exception as error:
-        attempt.status = 'reconciliation'
-        attempt.reconciliation_reason = f'create_exception:{type(error).__name__}'
-        payment.status = 'RECONCILIATION'
-        await db.commit()
-        raise DeviceFirstError('reconciliation_required', 'Provider result is ambiguous') from error
+        await _hold_direct_invoice_for_review(
+            db,
+            attempt_id=attempt.id,
+            payment_id=payment.id,
+            reason='provider_invoice_creation_incomplete',
+            release_failure=f'create_exception:{type(error).__name__}',
+        )
+        raise _invoice_creation_failed(attempt) from error
     transaction_id = _provider_transaction_id(response)
     redirect_url = _safe_provider_redirect_url(response)
     if not response or not transaction_id:
-        # No provider identity means no future status lookup is possible.  Do
-        # not make another POST: the worker escalates this durable ambiguity
-        # to operator review after its grace period.
-        attempt.status = 'reconciliation'
-        attempt.reconciliation_reason = 'provider_response_missing_identity'
-        payment.status = 'RECONCILIATION'
-        await db.commit()
-        raise DeviceFirstError('reconciliation_required', 'Provider invoice identity requires reconciliation')
+        # No provider identity means no status lookup is possible and no payment
+        # link ever reached the customer (502, timeout, broken connection or an
+        # answer without a number all land here).  No second POST in this attempt:
+        # ВК-15 releases the order at once instead of holding it for an operator.
+        await _hold_direct_invoice_for_review(
+            db,
+            attempt_id=attempt.id,
+            payment_id=payment.id,
+            reason='provider_invoice_creation_incomplete',
+            release_failure='provider_response_missing_identity',
+        )
+        raise _invoice_creation_failed(attempt)
 
     # POST and webhook are independent channels.  A callback may have been
     # recorded while this request was in flight, so bind the provider identity
@@ -2440,8 +2517,9 @@ async def reconcile_device_first_payments(
             ),
             # A crash after the atomic intent commit but before a
             # provider identity is known is never retried: Platega
-            # has no idempotency key. Escalate it after a grace
-            # period instead of risking a second invoice.
+            # has no idempotency key. After a grace period the order
+            # is released when no payment link ever reached the
+            # customer (ВК-15), otherwise escalated to an operator.
             and_(
                 CheckoutPaymentAttempt.settlement_mode == DIRECT_SETTLEMENT_MODE,
                 CheckoutPaymentAttempt.status.in_(['creating', 'reconciliation']),
@@ -2534,6 +2612,7 @@ async def reconcile_device_first_payments(
                     reason='provider_invoice_creation_incomplete',
                     lease_token=lease_token,
                     lease_epoch=lease_epoch,
+                    release_failure=attempt.reconciliation_reason or 'creation_interrupted',
                 )
                 if not held:
                     continue
