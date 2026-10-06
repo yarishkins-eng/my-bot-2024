@@ -1721,10 +1721,14 @@ async def _create_direct_platega_attempt(
         await db.commit()
         raise DeviceFirstError('reconciliation_required', 'Provider invoice is being verified') from error
     if not details:
-        # Platega не ответила на проверку (5xx, таймаут, обрыв — `_request` отдаёт None): это сбой
-        # связи, а не расхождение. Номер уже привязан и сверка назначена на «сейчас» — она
-        # переспросит сама, как воркер на том же ответе (`status_lookup:empty`), и опубликует ссылку.
-        # Разбор с замком — только для ответа, который не сошёлся (ВК-15, мина OE).
+        # Пустой ответ проверки — не расхождение: `_request` отдаёт None на любой код ≥ 400, таймаут, обрыв
+        # и не-JSON, а GET здесь без повторов (тот же `service`, `_max_retries = 1`). Ничего не пишем: если
+        # номер привязан, привязка уже назначила сверку на «сейчас», и воркер переспросит сам, как на том же
+        # ответе (`status_lookup:empty`); если раньше успело уведомление, решать ему. Разбор с замком — только
+        # для ответа, который не сошёлся (ВК-15, мина OE). Пока идёт сверка, новый расчёт и пробный ждут её.
+        logger.warning(
+            'device_first_direct_invoice_check_silent', checkout_id=checkout.public_id, attempt_id=attempt.id
+        )
         raise DeviceFirstError('reconciliation_required', 'Provider invoice is being verified')
     if not _has_exact_direct_invoice_details(attempt, details):
         await _hold_direct_invoice_for_review(

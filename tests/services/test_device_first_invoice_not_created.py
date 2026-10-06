@@ -14,13 +14,16 @@
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
 from structlog.testing import capture_logs
 
+from app.cabinet.routes.device_first import CheckoutCommitRequest, _is_live_direct_provider_invoice, checkout_commit
 from app.database.models import CheckoutPaymentAttempt, PlategaPayment, SubscriptionCheckout, User
+from app.handlers.subscription.device_first import _render_checkout
 from app.services.device_first_checkout_service import DIRECT_SETTLEMENT_MODE, DeviceFirstError, checkout_money_state
 from app.services.device_first_payment_service import (
     _apply_direct_pending_provider_observation,
@@ -29,6 +32,7 @@ from app.services.device_first_payment_service import (
     _hold_direct_invoice_for_review,
     _invoice_never_reached_customer,
     _queue_direct_callback_for_canonical_reconciliation,
+    reconcile_device_first_payments,
 )
 from app.services.platega_service import PlategaService
 
@@ -670,19 +674,20 @@ _EXACT_PENDING = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('lookup', [None, {}])
-async def test_silence_on_the_invoice_check_leaves_it_to_the_poll_and_never_locks(monkeypatch, lookup):
-    """Platega выдала номер, но на проверку промолчала — переспросит сверка, без разбора и замка.
+async def test_silence_on_the_invoice_check_leaves_it_to_the_poll_without_operator_review(monkeypatch, lookup):
+    """Platega выдала номер, но на проверку промолчала — переспросит сверка, без разбора и тревоги.
 
-    Было: молчание (`_request` отдаёт None на 5xx, таймаут, обрыв) принималось за «счёт не
-    сходится» → заказ на разборе → человек заперт до кнопки владельца. Стало: попытка остаётся
-    на сверке с опросом «сейчас», и первое же точное `PENDING` публикует ссылку.
+    Было: молчание (`_request` отдаёт None на любой код ≥ 400, таймаут, обрыв, не-JSON) принималось
+    за «счёт не сходится» → заказ на разборе → человек заперт до кнопки владельца. Стало: попытка
+    остаётся на сверке с опросом «сейчас», и первое же точное `PENDING` публикует ссылку. Пока идёт
+    сверка, новый расчёт и пробный ждут её — как на любом счёте «на проверке».
     """
     checkout = _checkout()
     db = _Session(checkout)
     posts, lookups = [], []
     _patch_create_with_number(monkeypatch, checkout, lookup, posts, lookups)
 
-    with pytest.raises(DeviceFirstError) as raised:
+    with capture_logs() as logs, pytest.raises(DeviceFirstError) as raised:
         await _pay(db, checkout)
 
     attempt, payment = db.one(CheckoutPaymentAttempt), db.one(PlategaPayment)
@@ -696,7 +701,18 @@ async def test_silence_on_the_invoice_check_leaves_it_to_the_poll_and_never_lock
     )
     assert payment.status == 'VERIFYING'
     assert attempt.next_reconcile_at <= datetime.now(UTC), 'сверка переспросит сразу, а не через минуты'
+    assert not attempt.reconcile_attempts, 'первый откат воркера остаётся минимальным'
     assert (checkout.lifecycle_state, checkout.terminal_reason) == ('awaiting_funds', None)
+    # По этой строке принимается живое доказательство: состояние в базе затрёт первый же проход воркера.
+    assert [log for log in logs if log['event'] == 'device_first_direct_invoice_check_silent'] == [
+        {
+            'event': 'device_first_direct_invoice_check_silent',
+            'log_level': 'warning',
+            'checkout_id': 'checkout-91',
+            'attempt_id': 41,
+        }
+    ]
+    assert _is_live_direct_provider_invoice(checkout, attempt, payment) is False, 'до проверки ссылки нет'
 
     published = await _apply_direct_pending_provider_observation(
         db, attempt_id=41, payment_id=51, payload=_EXACT_PENDING, observed_after=datetime.now(UTC)
@@ -705,6 +721,9 @@ async def test_silence_on_the_invoice_check_leaves_it_to_the_poll_and_never_lock
     assert published is True
     assert attempt.status == 'pending'
     assert checkout.lifecycle_state == 'awaiting_funds'
+    # Ссылку записала привязка, публикация её не пишет: без неё человек получил бы «оплачивайте» без ссылки.
+    assert payment.redirect_url == attempt.redirect_url == 'https://pay.example/inv-77'
+    assert _is_live_direct_provider_invoice(checkout, attempt, payment) is True
 
 
 @pytest.mark.asyncio
@@ -714,6 +733,9 @@ async def test_silence_on_the_invoice_check_leaves_it_to_the_poll_and_never_lock
         {**_EXACT_PENDING, 'id': 'inv-other'},
         {**_EXACT_PENDING, 'paymentMethod': 11},
         {**_EXACT_PENDING, 'paymentDetails': {'amount': 1, 'currency': 'RUB'}},
+        # Непустой ответ без номера или без статуса — не тишина: молчанием считается только пустой.
+        {key: value for key, value in _EXACT_PENDING.items() if key != 'id'},
+        {**{key: value for key, value in _EXACT_PENDING.items() if key != 'status'}, 'id': 'inv-other'},
     ],
 )
 async def test_an_answer_that_does_not_match_still_goes_to_the_operator(monkeypatch, lookup):
@@ -736,3 +758,147 @@ async def test_an_answer_that_does_not_match_still_goes_to_the_operator(monkeypa
         'operator_review',
         'provider_invoice_verification_mismatch',
     )
+
+
+# --- Сторожа по мутационному прогону дельты OE (волна 2 на дельту, мутанты M26, M28, M29, R01, R04) ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', [None, {}])
+async def test_the_worker_takes_an_empty_answer_for_silence_too(monkeypatch, payload):
+    """Паритет, на который ссылается комментарий ветки: воркер на пустом ответе пишет `status_lookup:empty`
+    и переспрашивает с откатом, а не ведёт счёт на разбор."""
+    attempt = SimpleNamespace(
+        id=41,
+        checkout_id=9,
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        status='reconciliation',
+        provider_payment_id='inv-77',
+        platega_payment_id=51,
+        lease_epoch=3,
+        reconcile_attempts=0,
+        reconciliation_reason='provider_invoice_verification_pending',
+        next_reconcile_at=None,
+    )
+
+    class AttemptsResult:
+        def scalars(self):
+            return SimpleNamespace(all=lambda: [attempt])
+
+    provider = SimpleNamespace(get_transaction=AsyncMock(return_value=payload))
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[AttemptsResult(), SimpleNamespace(rowcount=1)]),
+        get=AsyncMock(return_value=attempt),
+        commit=AsyncMock(),
+    )
+    hold = AsyncMock()
+    monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', lambda: provider)
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service._lock_owned_direct_attempt_lease', AsyncMock(return_value=attempt)
+    )
+    monkeypatch.setattr('app.services.device_first_payment_service._release_direct_attempt_lease', AsyncMock())
+    monkeypatch.setattr('app.services.device_first_payment_service._hold_direct_invoice_for_review', hold)
+
+    assert await reconcile_device_first_payments(db) == 0
+
+    assert attempt.reconciliation_reason == 'status_lookup:empty'
+    assert attempt.reconcile_attempts == 1
+    assert attempt.next_reconcile_at > datetime.now(UTC)
+    hold.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('graph', 'status'),
+    [
+        ({'status': 'operator_review'}, 'operator_review'),
+        ({'status': 'paid_processing'}, 'paid_processing'),
+        ({'status': 'credited'}, 'credited'),
+        ({'payment_is_paid': True, 'status': 'reconciliation'}, 'reconciliation'),
+    ],
+)
+async def test_the_bind_never_overwrites_a_later_decision(graph, status):
+    """Ответ на POST, пришедший после уведомления или разбора, не перебивает их решение."""
+    checkout = _checkout()
+    attempt, payment = _graph(**graph)
+    db = _Session(checkout, attempt, payment)
+
+    bound = await _bind_direct_provider_identity(
+        db, attempt_id=41, payment_id=51, provider_payment_id='inv-1', redirect_url='https://pay.example/1'
+    )
+
+    assert bound is attempt
+    assert attempt.status == status
+    assert attempt.provider_payment_id is None
+    assert payment.status == 'CREATING'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('attempt_status', ['reconciliation', 'creating', 'operator_review', 'failed'])
+async def test_the_cabinet_never_exposes_a_stored_link_while_the_attempt_is_not_pending(attempt_status):
+    """Ссылку записывает привязка, но человеку она уходит только с попыткой `pending` — отдельно от
+    статуса платежа. После OE состояние «ссылка записана, попытка на сверке» живёт дольше."""
+    user = SimpleNamespace(id=17, balance_kopeks=0)
+    mutation = SimpleNamespace(checkout_id=None)
+    checkout = SimpleNamespace(
+        id=91,
+        settlement_mode=DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='awaiting_funds',
+        funding_state='invoice_pending',
+        fulfillment_state='not_started',
+        quote_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    attempt = SimpleNamespace(platega_payment_id=51, status=attempt_status)
+    payment = SimpleNamespace(
+        redirect_url='https://pay.example/unverified', is_paid=False, status='PENDING', expires_at=None
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=payment))
+
+    with (
+        patch('app.cabinet.routes.device_first._rate_limit', AsyncMock()),
+        patch('app.cabinet.routes.device_first._mutation', AsyncMock(return_value=(mutation, None))),
+        patch('app.cabinet.routes.device_first.get_owned_checkout', AsyncMock(side_effect=[checkout, checkout])),
+        patch('app.cabinet.routes.device_first.create_platega_attempt', AsyncMock(return_value=attempt)),
+        patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()),
+        pytest.raises(HTTPException) as raised,
+    ):
+        await checkout_commit(
+            'owned-checkout',
+            CheckoutCommitRequest(funding_mode='platega', method_key='sbp'),
+            idempotency_key='commit-unverified',
+            user=user,
+            db=db,
+        )
+
+    assert raised.value.detail['code'] == 'reconciliation_required'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('attempt_status', ['reconciliation', 'creating'])
+async def test_the_bot_never_offers_a_stored_link_while_the_attempt_is_not_pending(attempt_status):
+    """Бот показывает «Проверяем счёт» без кнопки-ссылки, пока попытка не `pending`."""
+    callback = SimpleNamespace(data='df:s:owned-checkout', answer=AsyncMock())
+    user = SimpleNamespace(id=17, language='en', balance_kopeks=0)
+    checkout = SimpleNamespace(
+        id=101, public_id='owned-checkout', selected_device_limit=5, period_days=90, quoted_price_kopeks=45_000
+    )
+    attempt = SimpleNamespace(
+        status=attempt_status,
+        method_key='sbp',
+        requested_amount_kopeks=35_000,
+        redirect_url='https://pay.example/unverified',
+    )
+
+    with (
+        patch(
+            'app.handlers.subscription.device_first.serialize_checkout',
+            return_value={'ui_state': 'awaiting_payment', 'shortage_kopeks': 35_000},
+        ),
+        patch('app.handlers.subscription.device_first.get_pending_platega_attempt', AsyncMock(return_value=attempt)),
+        patch('app.handlers.subscription.device_first.edit_or_answer_photo', AsyncMock()) as output,
+    ):
+        await _render_checkout(callback, user, AsyncMock(), checkout)
+
+    keyboard = output.await_args.kwargs['keyboard'].inline_keyboard
+    assert 'Checking the invoice' in output.await_args.kwargs['caption']
+    assert all(button.url is None for row in keyboard for button in row)
