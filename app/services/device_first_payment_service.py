@@ -1720,6 +1720,12 @@ async def _create_direct_platega_attempt(
         attempt.reconciliation_reason = f'provider_status_lookup:{type(error).__name__}'
         await db.commit()
         raise DeviceFirstError('reconciliation_required', 'Provider invoice is being verified') from error
+    if not details:
+        # Platega не ответила на проверку (5xx, таймаут, обрыв — `_request` отдаёт None): это сбой
+        # связи, а не расхождение. Номер уже привязан и сверка назначена на «сейчас» — она
+        # переспросит сама, как воркер на том же ответе (`status_lookup:empty`), и опубликует ссылку.
+        # Разбор с замком — только для ответа, который не сошёлся (ВК-15, мина OE).
+        raise DeviceFirstError('reconciliation_required', 'Provider invoice is being verified')
     if not _has_exact_direct_invoice_details(attempt, details):
         await _hold_direct_invoice_for_review(
             db,

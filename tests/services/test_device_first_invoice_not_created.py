@@ -628,3 +628,111 @@ async def test_a_late_bound_invoice_of_a_released_order_is_never_published():
     assert attempt.status == 'reconciliation'
     assert payment.status != 'PENDING'
     assert checkout.lifecycle_state == 'cancelled'
+
+
+# --- Мина OE (решение владельца 06.10.2026 «доделать сейчас»): номер есть, проверка промолчала ---
+
+
+def _platega_with_number(lookup, posts, lookups):
+    class FakePlatega:
+        parse_redirect_url = staticmethod(PlategaService.parse_redirect_url)
+        parse_expires_at = staticmethod(PlategaService.parse_expires_at)
+        parse_amount_currency = staticmethod(PlategaService.parse_amount_currency)
+
+        def __init__(self):
+            self._max_retries = 3
+
+        async def create_payment(self, **_kwargs):
+            posts.append(self._max_retries)
+            return {'transactionId': 'inv-77', 'url': 'https://pay.example/inv-77', 'status': 'PENDING'}
+
+        async def get_transaction(self, transaction_id):
+            lookups.append(transaction_id)
+            return lookup
+
+    return FakePlatega
+
+
+def _patch_create_with_number(monkeypatch, checkout, lookup, posts, lookups):
+    _patch_create(monkeypatch, checkout, None, posts)
+    monkeypatch.setattr(
+        'app.services.device_first_payment_service.PlategaService', _platega_with_number(lookup, posts, lookups)
+    )
+
+
+_EXACT_PENDING = {
+    'id': 'inv-77',
+    'status': 'PENDING',
+    'paymentMethod': 2,
+    'paymentDetails': {'amount': 199, 'currency': 'RUB'},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lookup', [None, {}])
+async def test_silence_on_the_invoice_check_leaves_it_to_the_poll_and_never_locks(monkeypatch, lookup):
+    """Platega выдала номер, но на проверку промолчала — переспросит сверка, без разбора и замка.
+
+    Было: молчание (`_request` отдаёт None на 5xx, таймаут, обрыв) принималось за «счёт не
+    сходится» → заказ на разборе → человек заперт до кнопки владельца. Стало: попытка остаётся
+    на сверке с опросом «сейчас», и первое же точное `PENDING` публикует ссылку.
+    """
+    checkout = _checkout()
+    db = _Session(checkout)
+    posts, lookups = [], []
+    _patch_create_with_number(monkeypatch, checkout, lookup, posts, lookups)
+
+    with pytest.raises(DeviceFirstError) as raised:
+        await _pay(db, checkout)
+
+    attempt, payment = db.one(CheckoutPaymentAttempt), db.one(PlategaPayment)
+    assert (raised.value.code, raised.value.status_code) == ('reconciliation_required', 409)
+    assert posts == [1], 'второго запроса к Platega нет'
+    assert lookups == ['inv-77']
+    assert (attempt.status, attempt.reconciliation_reason, attempt.provider_payment_id) == (
+        'reconciliation',
+        'provider_invoice_verification_pending',
+        'inv-77',
+    )
+    assert payment.status == 'VERIFYING'
+    assert attempt.next_reconcile_at <= datetime.now(UTC), 'сверка переспросит сразу, а не через минуты'
+    assert (checkout.lifecycle_state, checkout.terminal_reason) == ('awaiting_funds', None)
+
+    published = await _apply_direct_pending_provider_observation(
+        db, attempt_id=41, payment_id=51, payload=_EXACT_PENDING, observed_after=datetime.now(UTC)
+    )
+
+    assert published is True
+    assert attempt.status == 'pending'
+    assert checkout.lifecycle_state == 'awaiting_funds'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'lookup',
+    [
+        {**_EXACT_PENDING, 'id': 'inv-other'},
+        {**_EXACT_PENDING, 'paymentMethod': 11},
+        {**_EXACT_PENDING, 'paymentDetails': {'amount': 1, 'currency': 'RUB'}},
+    ],
+)
+async def test_an_answer_that_does_not_match_still_goes_to_the_operator(monkeypatch, lookup):
+    """Ответ пришёл, но счёт не тот (номер, способ, сумма) — прежний разбор, его не ослабили."""
+    checkout = _checkout()
+    db = _Session(checkout)
+    posts, lookups = [], []
+    _patch_create_with_number(monkeypatch, checkout, lookup, posts, lookups)
+
+    with pytest.raises(DeviceFirstError) as raised:
+        await _pay(db, checkout)
+
+    attempt = db.one(CheckoutPaymentAttempt)
+    assert raised.value.code == 'reconciliation_required'
+    assert (attempt.status, attempt.reconciliation_reason) == (
+        'operator_review',
+        'provider_invoice_verification_mismatch',
+    )
+    assert (checkout.lifecycle_state, checkout.terminal_reason) == (
+        'operator_review',
+        'provider_invoice_verification_mismatch',
+    )
