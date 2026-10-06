@@ -374,6 +374,7 @@ async def test_a_late_post_response_after_release_binds_but_never_reaches_the_cu
         status='failed',
         reconciliation_reason='provider_invoice_not_created:creation_interrupted',
     )
+    payment.status = 'FAILED'
     db = _Session(checkout, attempt, payment)
 
     bound = await _bind_direct_provider_identity(
@@ -388,6 +389,10 @@ async def test_a_late_post_response_after_release_binds_but_never_reaches_the_cu
     assert (attempt.provider_payment_id, payment.platega_transaction_id) == ('inv-late', 'inv-late')
     assert attempt.status == 'reconciliation'
     assert checkout.lifecycle_state == 'cancelled'
+    # Привязанный счёт сразу уходит на проверку у Platega, а не ждёт: иначе «оплачено» по нему
+    # (теоретически) пролежало бы без разбора. Фикстура платежа — как у отпущенного заказа.
+    assert payment.status == 'VERIFYING'
+    assert abs((attempt.next_reconcile_at - datetime.now(UTC)).total_seconds()) < 60
 
 
 # --- Сторожа по итогам мутационного прогона волны 2 (пережившие мутанты B01–B47) ---
@@ -495,7 +500,7 @@ def test_only_creating_or_reconciliation_attempts_are_released(status):
     assert _decide(attempt=attempt) is False
 
 
-@pytest.mark.parametrize('fulfillment', ['in_progress', 'fulfilled', 'failed', 'blocked'])
+@pytest.mark.parametrize('fulfillment', ['in_progress', 'fulfilled', 'needs_attention', 'pending', 'ready'])
 def test_an_order_whose_fulfilment_started_is_never_released(fulfillment):
     checkout = SimpleNamespace(
         lifecycle_state='awaiting_funds', fulfillment_state=fulfillment, debit_transaction_id=None
@@ -545,6 +550,47 @@ async def test_a_hold_that_did_not_take_effect_never_says_not_created(monkeypatc
 
     assert db.one(CheckoutPaymentAttempt).status == 'creating'
     assert raised.value.code == 'reconciliation_required'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('lifecycle', 'funding'),
+    [
+        # Каждый из двух замков наблюдения `PENDING` по отдельности: один закрытый признак
+        # заказа обязан сам удерживать публикацию (скептик на дельту волны 2: пара маскировала).
+        ('cancelled', 'invoice_pending'),
+        ('operator_review', 'invoice_pending'),
+        ('expired', 'invoice_pending'),
+        ('awaiting_funds', 'invoice_not_created'),
+        ('awaiting_funds', 'invoice_abandoned'),
+    ],
+)
+async def test_one_closed_sign_of_the_order_is_enough_to_keep_a_late_invoice_unpublished(lifecycle, funding):
+    checkout = _checkout(lifecycle_state=lifecycle, funding_state=funding)
+    attempt, payment = _graph(
+        status='reconciliation',
+        provider_payment_id='inv-late',
+        provider_method_code=2,
+        requested_amount_kopeks=19_900,
+        currency='RUB',
+        reconciliation_reason='provider_invoice_verification_pending',
+    )
+    payment.platega_transaction_id = 'inv-late'
+    db = _Session(checkout, attempt, payment)
+    payload = {
+        'id': 'inv-late',
+        'status': 'PENDING',
+        'paymentMethod': 2,
+        'paymentDetails': {'amount': 199, 'currency': 'RUB'},
+    }
+
+    published = await _apply_direct_pending_provider_observation(
+        db, attempt_id=41, payment_id=51, payload=payload, observed_after=datetime.now(UTC)
+    )
+
+    assert published is False
+    assert attempt.status == 'reconciliation'
+    assert checkout.lifecycle_state == lifecycle
 
 
 @pytest.mark.asyncio
