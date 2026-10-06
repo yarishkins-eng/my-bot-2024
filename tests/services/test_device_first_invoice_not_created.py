@@ -21,6 +21,7 @@ from structlog.testing import capture_logs
 from app.database.models import CheckoutPaymentAttempt, PlategaPayment, SubscriptionCheckout, User
 from app.services.device_first_checkout_service import DIRECT_SETTLEMENT_MODE, DeviceFirstError, checkout_money_state
 from app.services.device_first_payment_service import (
+    _bind_direct_provider_identity,
     _create_direct_platega_attempt,
     _hold_direct_invoice_for_review,
     _queue_direct_callback_for_canonical_reconciliation,
@@ -344,3 +345,32 @@ async def test_a_late_provider_callback_takes_the_order_off_the_no_money_reason(
     )
     assert attempt.status == 'operator_review'
     assert await checkout_money_state(db, checkout) != 'no_money'
+
+
+@pytest.mark.asyncio
+async def test_a_late_post_response_after_release_binds_but_never_reaches_the_customer():
+    """Гонка «ответ Platega пришёл после того, как сверка отпустила заказ».
+
+    Соблазнительная «починка» — добавить `failed` в ранний выход привязки — заперла бы человека:
+    номер не привязался бы, и проверка счёта ушла бы в разбор. Правильно — привязать номер к уже
+    закрытому заказу: ссылку не отдаст никто (заказ не `awaiting_funds`, попытка не `pending`).
+    """
+    checkout = _checkout(lifecycle_state='cancelled', terminal_reason='provider_invoice_not_created')
+    attempt, payment = _graph(
+        status='failed',
+        reconciliation_reason='provider_invoice_not_created:creation_interrupted',
+    )
+    db = _Session(checkout, attempt, payment)
+
+    bound = await _bind_direct_provider_identity(
+        db,
+        attempt_id=41,
+        payment_id=51,
+        provider_payment_id='inv-late',
+        redirect_url='https://pay.example/late',
+    )
+
+    assert bound is attempt
+    assert (attempt.provider_payment_id, payment.platega_transaction_id) == ('inv-late', 'inv-late')
+    assert attempt.status == 'reconciliation'
+    assert checkout.lifecycle_state == 'cancelled'

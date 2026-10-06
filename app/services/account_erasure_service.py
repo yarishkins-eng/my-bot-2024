@@ -232,7 +232,9 @@ _PROVIDER_TERMINAL_PAYMENT_STATUSES = frozenset({'FAILED', 'CANCELED', 'EXPIRED'
 
 
 def _safe_terminal_attempt(attempt: CheckoutPaymentAttempt, payment=None) -> bool:
-    """Only a canonical, exact provider terminal result releases PII.
+    """A canonical, exact provider terminal result releases PII — and, since ВК-15,
+    an attempt that never got an invoice number from the provider (no payment link
+    ever existed, see the branch below).
 
     A locally cancelled UI or a fixed polling count is intentionally not
     considered final: Platega may still send an exact CONFIRMED callback.

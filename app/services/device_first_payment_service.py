@@ -1062,6 +1062,11 @@ async def _bind_direct_provider_identity(
         checkout.terminal_reason = 'provider_identity_binding_conflict'
         await db.commit()
         return None
+    # ⛔ ВК-15: `failed` в этот набор НЕ добавлять. Попытку без номера могла отпустить сверка,
+    # пока шёл ответ (только если запрос пережил 5 минут при потолке 30 с). С ранним выходом
+    # номер не привязался бы, и проверка счёта ниже ушла бы в `provider_invoice_verification_mismatch`
+    # — заперла бы уже отпущенного человека. Без него номер привязывается к закрытому заказу:
+    # ссылку не отдаст никто (заказ не `awaiting_funds`), а позднее «оплачено» удержится на разборе.
     if payment.is_paid or attempt.status in {'paid_processing', 'credited', 'operator_review'}:
         # Nothing in create may overwrite a callback/worker that reached a
         # later financial transition while the HTTP POST was in flight.
