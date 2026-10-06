@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.database.models import CheckoutPaymentAttempt, PlategaPayment, SubscriptionCheckout, User
 from app.services.device_first_checkout_service import DIRECT_SETTLEMENT_MODE, DeviceFirstError
@@ -140,10 +141,20 @@ async def test_platega_without_an_invoice_number_releases_the_order_at_once(monk
     posts = []
     _patch_create(monkeypatch, checkout, outcome, posts)
 
-    with pytest.raises(DeviceFirstError) as raised:
+    with capture_logs() as logs, pytest.raises(DeviceFirstError) as raised:
         await _pay(db, checkout)
 
     attempt, payment = db.one(CheckoutPaymentAttempt), db.one(PlategaPayment)
+    # По этой строке после выкладки принимается живое доказательство: первый сбой Platega.
+    assert [log for log in logs if log['event'] == 'device_first_direct_invoice_not_created'] == [
+        {
+            'event': 'device_first_direct_invoice_not_created',
+            'log_level': 'warning',
+            'checkout_id': 'checkout-91',
+            'attempt_id': 41,
+            'failure': failure,
+        }
+    ]
     assert raised.value.code == 'provider_invoice_not_created'
     # 4xx, а не 5xx: на 4xx кабинет сам меняет ключ повтора, и следующее нажатие —
     # новый запрос. Ответ 5xx он повторил бы тем же ключом и получил бы тот же отказ.
