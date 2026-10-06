@@ -69,6 +69,15 @@ def test_released_invoice_without_a_number_does_not_hold_erasure_forever() -> No
     context.payments[0].status = 'VERIFYING'
     assert service._target_state(context) == (service.ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved')
 
+    # Окончательна только ОТПУЩЕННАЯ попытка (`failed`) с причиной ровно в формате ВК-15.
+    context.payments[0].status = 'FAILED'
+    for status in ('creating', 'reconciliation', 'pending', 'paid_processing'):
+        context.attempts[0].status = status
+        assert service._target_state(context)[0] != service.ERASURE_READY, status
+    context.attempts[0].status = 'failed'
+    context.attempts[0].reconciliation_reason = 'provider_invoice_not_created'
+    assert service._target_state(context)[0] != service.ERASURE_READY
+
 
 def test_paid_or_reviewed_money_never_allows_automatic_erasure() -> None:
     state, reason = service._target_state(_context(attempt_status='operator_review', reason='anything'))

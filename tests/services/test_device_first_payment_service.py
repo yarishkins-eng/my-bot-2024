@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from app.services import device_first_payment_service as payment_service
 from app.services.device_first_checkout_service import (
@@ -1531,9 +1532,10 @@ async def test_direct_reconciler_releases_or_escalates_an_old_identityless_invoi
         commit=AsyncMock(),
     )
     hold = AsyncMock(return_value=True)
+    release = AsyncMock()
     monkeypatch.setattr('app.services.device_first_payment_service.PlategaService', FakePlategaService)
     monkeypatch.setattr('app.services.device_first_payment_service._hold_direct_invoice_for_review', hold)
-    monkeypatch.setattr('app.services.device_first_payment_service._release_direct_attempt_lease', AsyncMock())
+    monkeypatch.setattr('app.services.device_first_payment_service._release_direct_attempt_lease', release)
 
     assert await reconcile_device_first_payments(db) == 0
     hold.assert_awaited_once_with(
@@ -1545,6 +1547,16 @@ async def test_direct_reconciler_releases_or_escalates_an_old_identityless_invoi
         lease_epoch=3,
         release_failure=release_failure,
     )
+    # `ANY` пропускает и `None`: без настоящего токена отпуск шёл бы мимо забора аренды. Свою аренду
+    # воркер обязан снять тем же токеном (мутационный прогон ВК-15, волна 2).
+    token = hold.await_args.kwargs['lease_token']
+    assert isinstance(token, str) and len(token) == 32
+    release.assert_awaited_once()
+    assert release.await_args.kwargs['lease_token'] == token
+    # Отбор воркера в CI иначе не исполняется ничем: тест на PostgreSQL без адреса базы пропускается.
+    selection = db.execute.await_args_list[0].args[0].compile(dialect=postgresql.dialect())
+    assert ['creating', 'reconciliation'] in list(selection.params.values())
+    assert 'checkout_payment_attempts.provider_payment_id IS NULL' in str(selection)
 
 
 @pytest.mark.asyncio
