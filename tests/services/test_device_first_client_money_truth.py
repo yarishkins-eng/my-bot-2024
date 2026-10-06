@@ -145,7 +145,7 @@ async def test_the_money_question_actually_asks_about_this_checkout():
     assert 'user_id' not in sql
 
 
-def test_the_no_money_set_stays_the_two_proven_reasons():
+def test_the_no_money_set_stays_the_three_proven_reasons():
     """Сторож от тихого расширения набора. Имена прописаны буквами намеренно.
 
     Он общий с вердиктом владельцу, а тест согласия перебирает этот же набор — то есть
@@ -157,10 +157,19 @@ def test_the_no_money_set_stays_the_two_proven_reasons():
     ставится только там, где `payment.is_paid` ложно, а пришедшие позже деньги её не
     сохраняют — переписывают в `late_paid_wallet_credit` (`:1987-1991`) либо уводят заказ
     в разбор по удалению аккаунта (`:1821-1833`).
+
+    🔴 Третью добавил ВК-15 (06.10.2026): Platega не вернула номер счёта, и заказ закрыт
+    сразу (`provider_invoice_not_created`). Опровержение по коду: ставится только у попытки
+    без номера, без оплаты и без зачислений, пока заказ ждёт денег
+    (`_invoice_never_reached_customer`); ссылку на оплату без номера человек не получает
+    нигде (`_is_live_direct_provider_invoice`, бот — только `pending`); а уведомление Platega
+    по такому счёту уводит заказ на разбор со своей причиной — то есть «деньги есть, а
+    причина прежняя» недостижимо.
     """
     assert set(service_module._NO_MONEY_TERMINAL_REASONS) == {
         'provider_invoice_missing_or_elapsed_expiry',
         'cancelled_by_user_after_invoice',
+        'provider_invoice_not_created',
     }
 
 
