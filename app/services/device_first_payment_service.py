@@ -1,8 +1,10 @@
 """Platega adapter for device-first checkout.
 
-The attempt is committed before the network call. An ambiguous timeout is
-fail-closed and requires reconciliation; the same attempt never creates a
-second provider invoice.
+The attempt is committed before the network call, and the same attempt never
+creates a second provider invoice. A direct-sale POST that returns no invoice
+number (an error, a timeout, a broken connection) is released at once: no
+payment link ever reached the customer (ВК-15). Every other ambiguity is
+fail-closed and requires reconciliation.
 """
 
 from __future__ import annotations
@@ -1543,9 +1545,11 @@ async def create_platega_attempt(
 def _invoice_creation_failed(attempt: CheckoutPaymentAttempt) -> DeviceFirstError:
     """Ответ человеку, когда Platega не выставила счёт (ВК-15).
 
-    Заказ отпущен (`failed`) — свой код: кабинет и бот говорят «не ответила, деньги не
-    списаны, нажмите ещё раз», а следующее нажатие рождает новый заказ. Иначе заказ ушёл
-    на разбор оператором, и ответ прежний.
+    Заказ отпущен (`failed`) — свой код `provider_invoice_not_created`: кабинет показывает на
+    нём свой текст (счёт не выдан, деньги не списаны, оплатить ещё раз или другим способом), а
+    следующее нажатие рождает новый заказ. Ботовая касса своего текста для кода не имеет и
+    отвечает общим «Не удалось продолжить заказ»: её кнопки оплаты открывают кабинет, а запасной
+    путь без адреса кабинета на боевом не встречается. Иначе заказ ушёл на разбор, ответ прежний.
     """
     if attempt.status == 'failed':
         return DeviceFirstError('provider_invoice_not_created', 'Payment provider did not create the invoice')

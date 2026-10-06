@@ -253,11 +253,20 @@ def _safe_terminal_attempt(attempt: CheckoutPaymentAttempt, payment=None) -> boo
     производит — значит это забор на будущий рассинхрон, а не на сегодняшний сценарий.
     """
     # Тот же признак, что держит строку в пуле сверки: берём его оттуда, а не своей копией.
+    from app.services.device_first_checkout_service import INVOICE_NOT_CREATED_TERMINAL_REASON
     from app.services.device_first_payment_service import POOL_KEY_TERMINAL_PREFIX
 
     if attempt.status != 'failed':
         return False
-    if not str(attempt.reconciliation_reason or '').startswith(POOL_KEY_TERMINAL_PREFIX):
+    reason = str(attempt.reconciliation_reason or '')
+    # ВК-15: Platega не вернула номер счёта, и заказ отпущен сразу — ссылки на оплату у человека
+    # не было, а сверка такую попытку больше не берёт. Без этой ветки заявка на удаление навсегда
+    # висела бы в «проверяем ранее созданный счёт», и ручного выхода у неё нет. Номер обязан быть
+    # пустым: с номером счёт у Platega существует, и окончательным его делает только её ответ.
+    released_without_invoice = (
+        reason.startswith(f'{INVOICE_NOT_CREATED_TERMINAL_REASON}:') and not attempt.provider_payment_id
+    )
+    if not (reason.startswith(POOL_KEY_TERMINAL_PREFIX) or released_without_invoice):
         return False
     if payment is None:
         return True

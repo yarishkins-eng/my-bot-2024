@@ -49,6 +49,27 @@ def test_only_canonical_provider_terminal_state_is_safe_to_anonymize() -> None:
     assert (state, reason) == (service.ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved')
 
 
+def test_released_invoice_without_a_number_does_not_hold_erasure_forever() -> None:
+    """ВК-15: Platega не вернула номер счёта, заказ отпущен — ссылки на оплату у человека не было.
+
+    Сверка такую попытку больше не берёт, ручного выхода у «неразобранного счёта» нет, поэтому без
+    признания этого состояния окончательным заявка на удаление висела бы вечно.
+    """
+    context = _context(reason='provider_invoice_not_created:provider_response_missing_identity')
+    context.attempts[0].provider_payment_id = None
+    context.payments[0].status = 'FAILED'
+    assert service._target_state(context) == (service.ERASURE_READY, None)
+
+    # С номером счёт у Platega существует: окончательным его делает только её ответ.
+    context.attempts[0].provider_payment_id = 'inv-1'
+    assert service._target_state(context) == (service.ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved')
+
+    # Платёж не в окончательном статусе — тоже не отпускаем.
+    context.attempts[0].provider_payment_id = None
+    context.payments[0].status = 'VERIFYING'
+    assert service._target_state(context) == (service.ERASURE_AWAITING_RECONCILIATION, 'provider_invoice_unresolved')
+
+
 def test_paid_or_reviewed_money_never_allows_automatic_erasure() -> None:
     state, reason = service._target_state(_context(attempt_status='operator_review', reason='anything'))
     assert (state, reason) == (service.ERASURE_AWAITING_MANUAL, 'paid_or_review_payment')

@@ -19,10 +19,11 @@ import pytest
 from structlog.testing import capture_logs
 
 from app.database.models import CheckoutPaymentAttempt, PlategaPayment, SubscriptionCheckout, User
-from app.services.device_first_checkout_service import DIRECT_SETTLEMENT_MODE, DeviceFirstError
+from app.services.device_first_checkout_service import DIRECT_SETTLEMENT_MODE, DeviceFirstError, checkout_money_state
 from app.services.device_first_payment_service import (
     _create_direct_platega_attempt,
     _hold_direct_invoice_for_review,
+    _queue_direct_callback_for_canonical_reconciliation,
 )
 from app.services.platega_service import PlategaService
 
@@ -36,6 +37,8 @@ class _Session:
         self.commit = AsyncMock()
         self.refresh = AsyncMock()
         self.rollback = AsyncMock()
+        # Единственный вопрос к базе в этих сторожах вне выборок по сущности — «сколько зачислено».
+        self.scalar = AsyncMock(return_value=0)
 
     def add(self, model):
         self.added.append(model)
@@ -304,3 +307,40 @@ async def test_a_foreign_payment_is_never_released():
         'operator_review',
         'direct_payment_binding_mismatch',
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('provider_status', ['CANCELED', 'CONFIRMED'])
+async def test_a_late_provider_callback_takes_the_order_off_the_no_money_reason(provider_status):
+    """На этом держится «денег не брали» у причины `provider_invoice_not_created`.
+
+    Уведомление Platega по счёту без номера (если Platega всё-таки завела счёт за сбоем) не
+    проходит проверку привязки и уводит заказ на разбор со своей причиной (мина OD). Если когда-
+    нибудь «починить» это молчаливым пропуском, заказ останется с причиной «счёт не создан», и
+    при пришедшем «оплачено» клиенту и владельцу продолжат говорить «денег не брали».
+    """
+    checkout = _checkout(
+        lifecycle_state='cancelled', funding_mode='platega', terminal_reason='provider_invoice_not_created'
+    )
+    attempt, payment = _graph(
+        status='failed',
+        reconciliation_reason='provider_invoice_not_created:provider_response_missing_identity',
+    )
+    payment.status = 'FAILED'
+    db = _Session(checkout, attempt, payment)
+    assert await checkout_money_state(db, checkout) == 'no_money'
+
+    await _queue_direct_callback_for_canonical_reconciliation(
+        db,
+        payment_id=51,
+        payload={'id': 'orphan-1', 'status': provider_status},
+        reason='provider_callback_before_identity_binding',
+        attempt_id=41,
+    )
+
+    assert (checkout.lifecycle_state, checkout.terminal_reason) == (
+        'operator_review',
+        'direct_payment_binding_mismatch',
+    )
+    assert attempt.status == 'operator_review'
+    assert await checkout_money_state(db, checkout) != 'no_money'
