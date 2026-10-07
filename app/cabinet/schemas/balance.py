@@ -102,7 +102,7 @@ class TopUpResponse(BaseModel):
     обычное пополнение без обещания), `open_order`, `order_on_review` (к заказу не вести — поддержка),
     `already_paying` (тот же неоплаченный счёт того же заказа и способа — его ссылка), `already_paid` (деньги по
     намерению уже пришли, оформляем — ссылки нет), `already_fulfilled`, `balance_covers`, `invoice_not_created`.
-    Срок, устройства и цена — того заказа, о котором исход.
+    Срок и устройства — того заказа, о котором исход; цена — где известна.
     """
 
     payment_id: str | None = None

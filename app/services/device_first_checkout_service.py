@@ -1452,8 +1452,8 @@ _TOPUP_INTENT_LIVE_INVOICE_STATUSES = frozenset({'PENDING', 'INPROGRESS'})
 class TopUpIntentDecision(NamedTuple):
     """Что делать с доплатой под заказ до счёта — полный список исходов (стартер ВК-16, 16а-1).
 
-    Срок, устройства и цена — того заказа, о котором исход: у `already_*` и `open_order` это найденный заказ, а не
-    запрошенный.
+    Срок и устройства — того заказа, о котором исход: у `already_*` и `open_order` это найденный заказ, а не
+    запрошенный. Цена — только где она известна (`already_paid`, `already_paying`, `balance_covers`, `accepted`).
     """
 
     status: str

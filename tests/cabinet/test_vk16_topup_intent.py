@@ -382,6 +382,17 @@ async def test_same_order_same_method_live_invoice_is_reused(db, session, env):
     assert (decision.amount_kopeks, decision.price_kopeks, decision.period_days) == (TOP_UP_30_1, PRICE_30_1, 30)
 
 
+async def test_two_live_invoices_of_the_same_order_reuse_the_latest_decision(db, session, env):
+    # Замена могла проглотить сбой (`_replace_older_topup_intents_quietly`): оба счёта живы. Отдаём тот, что решён
+    # позже, — его человек открыл последним (и когда у него больший номер строки, и когда меньший — гонка выше).
+    _intent_payment(session, payment_id=10, created_ago=timedelta(minutes=4))
+    _intent_payment(session, payment_id=11, created_ago=timedelta(minutes=1))
+
+    decision = await _decide(db, session)
+
+    assert (decision.status, decision.payment.id) == ('already_paying', 11)
+
+
 async def test_invoice_without_provider_deadline_at_minute_35_is_still_reused(db, session, env):
     # Мина V: СБП-счёт без срока Platega закрывает сама за 30–41 минуту и до того принимает деньги.
     live = _intent_payment(session, payment_id=61, created_ago=timedelta(minutes=35))

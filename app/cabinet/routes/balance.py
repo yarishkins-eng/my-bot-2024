@@ -368,8 +368,8 @@ def _check_top_up_amount(amount_kopeks: int, method: PaymentMethodResponse) -> N
 def _topup_intent_response(decision: TopUpIntentDecision) -> TopUpResponse:
     """ВК-16 (16а-1): исход без нового счёта — экран показывает его вместо оплаты (замысел v2, правило 6).
 
-    Срок, устройства и цена — того заказа, о котором исход (найденного, а не запрошенного). У `already_paid` деньги
-    уже пришли: только номер платежа для экрана ожидания, ссылки нет — платить второй раз нечего.
+    Срок и устройства — того заказа, о котором исход (найденного, а не запрошенного); цена — где известна.
+    У `already_paid` деньги уже пришли: только номер платежа для экрана ожидания, ссылки нет — платить второй раз нечего.
     """
     payment = decision.payment
     amount = int(payment.amount_kopeks) if payment is not None else 0
@@ -1492,7 +1492,7 @@ async def _with_purchase_step(record_response: PendingPaymentResponse, user: Use
     """
     # ВК-16 (16а-1): доплату под заказ оформляет сервер — «оформите сами» поверх ожидания или готового заказа было бы
     # ложью; после отказа (`refused`) решает подсказка, как у обычного пополнения.
-    if not record_response.is_paid or record_response.intent_outcome in ('waiting', 'processing', 'fulfilled'):
+    if not record_response.is_paid or record_response.intent_outcome in ('processing', 'fulfilled'):
         return record_response
     from app.services.payment.common import topup_pending_purchase_hint
 
