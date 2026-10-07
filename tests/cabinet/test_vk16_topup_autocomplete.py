@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import html
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -20,7 +19,6 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database.models import PlategaPayment, SubscriptionCheckout, Transaction, User
-from app.localization.texts import get_texts
 from app.services import device_first_checkout_service as dfc, device_first_payment_service
 from app.services.payment.platega import PlategaPaymentMixin
 from tests.cabinet.test_vk16_topup_intent import (  # noqa: F401 -- фикстуры стенда 16а-1
@@ -473,6 +471,9 @@ def webhook(monkeypatch, buy):
     monkeypatch.setattr('app.services.payment.common.send_cart_notification_after_topup', cart)
     monkeypatch.setattr('app.services.admin_notification_service.AdminNotificationService', _Admin)
     erasure = AsyncMock(return_value=False)
+    calls.email = AsyncMock()
+    monkeypatch.setattr('app.services.payment.common.notify_email_user_topup', calls.email)
+    monkeypatch.setattr('app.services.payment.common.topup_pending_purchase_hint', AsyncMock(return_value='ХВОСТ'))
     monkeypatch.setattr('app.services.account_erasure_service.mark_late_legacy_payment_for_manual_review', erasure)
     carts = SimpleNamespace(delete_user_cart=AsyncMock(), clear_topup_intent=AsyncMock())
     monkeypatch.setattr('app.services.user_cart_service.user_cart_service', carts)
@@ -517,7 +518,13 @@ async def test_webhook_credits_then_completes_then_runs_side_effects_and_skips_t
     assert dfc.topup_intent_outcome(stored) == ('fulfilled', 'chk-501', None)
     assert stored.metadata_json['balance_credited'] is True
     assert session.get(User, 1).balance_kopeks == BALANCE + TOP_UP_30_1 - PRICE_30_1
-    webhook.bot.send_message.assert_not_awaited()  # «Пополнение успешно… сама не оплатится» оформленному — ложь
+    # «Пополнение успешно… сама не оплатится» оформленному — ложь; о деньгах — сразу и честно (выдача может задержаться).
+    webhook.bot.send_message.assert_awaited_once()
+    text_ = webhook.bot.send_message.await_args.args[1]
+    assert 'Оплата получена: 99' in text_ and 'Заказ оформлен с баланса' in text_
+    assert 'Пополнение успешно' not in text_ and 'ХВОСТ' not in text_
+    assert webhook.bot.send_message.await_args.kwargs.get('reply_markup') is None
+    webhook.email.assert_awaited_once()
     assert webhook.admin[0]['auto_next_step'] == 'заказ на 30 дн., устройств 1 оформлен сам с баланса'
     webhook.erasure.assert_awaited_once()
     webhook.carts.delete_user_cart.assert_awaited_once_with(1)
@@ -560,13 +567,34 @@ async def test_refused_intent_still_tells_about_the_money_but_not_through_the_ol
     webhook.bot.send_message.assert_awaited_once()
     text_ = webhook.bot.send_message.await_args.args[1]
     assert 'Пополнение успешно' in text_
-    # Хвост «оформите сами» — без заборов старой автопокупки: её здесь не будет (клиент 106).
-    assert html.escape(get_texts('ru').TOPUP_SUBSCRIPTION_NOT_PAID_HINT) in text_
-    assert 'Баланс пополнен автоматически' not in text_
+    # Хвост «оформите сами» на месте (клиент 106): корзина с её меткой погашены ДО него, заборы автоплатежа остаются.
+    assert text_.endswith('ХВОСТ')
     assert webhook.carts_cleared_before_message == [True]
     assert 'cart_chain' not in webhook.order
     assert webhook.admin[0]['auto_next_step'] is None
     webhook.erasure.assert_awaited_once()
+
+
+@pytest.mark.parametrize('lifecycle_state', ['awaiting_funds', 'operator_review'])
+async def test_refusal_over_an_open_order_does_not_push_to_buy_again(db, session, webhook, env, lifecycle_state):
+    env.open_checkout.return_value = SimpleNamespace(lifecycle_state=lifecycle_state, public_id='chk-open')
+    _intent_payment(session, payment_id=97, **TRIAL)
+
+    await _pay(db, webhook)
+
+    text_ = webhook.bot.send_message.await_args.args[1]
+    assert 'ХВОСТ' not in text_ and 'Пополнение успешно' in text_
+
+
+async def test_refusal_after_a_purchase_by_another_path_does_not_push_to_buy_again(db, session, webhook):
+    payment = _intent_payment(session, payment_id=97, **TRIAL)
+    after = datetime.fromisoformat(dfc.topup_intent_of(payment)['created_at']) + timedelta(seconds=1)
+    session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=1, created_at=after))
+    session.commit()
+
+    await _pay(db, webhook)
+
+    assert 'ХВОСТ' not in webhook.bot.send_message.await_args.args[1]
 
 
 async def test_outcome_write_failure_still_keeps_the_old_chain_away(db, session, webhook, monkeypatch):
@@ -589,7 +617,7 @@ async def test_repeated_webhook_completes_the_order_once(db, session, webhook):
     await _pay(db, webhook)
 
     assert webhook.order.count('hook') == 1
-    assert len(webhook.service.bot.send_message.await_args_list) == 0
+    assert len(webhook.service.bot.send_message.await_args_list) == 1
 
 
 async def test_top_up_without_intent_runs_the_old_chain_and_no_hook(db, session, webhook):
