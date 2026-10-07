@@ -392,6 +392,62 @@ async def test_resumed_foreign_order_charged_then_crashed_is_reported_as_fulfill
     assert (stored['status'], stored['checkout_public_id']) == ('fulfilled', 'chk-401')
 
 
+async def test_balance_exactly_equal_to_the_price_is_enough(session, buy):
+    # Самый частый случай: доплатили ровно недостающее.
+    _paid(session)
+    _set_user(session, balance_kopeks=PRICE_30_1)
+
+    _, stored = await _complete(session)
+
+    assert stored['status'] == 'fulfilled'
+
+
+async def test_balance_is_checked_against_the_fresh_price_not_the_quote(session, buy, env):
+    cheaper = PRICE_30_1 - 1_037
+    options = _options()
+    options['price_matrix'][0]['prices'][0]['price_kopeks'] = cheaper
+    env.options.return_value = options
+    _paid(session)
+    _set_user(session, balance_kopeks=cheaper + 1)  # меньше котировки, но хватает на свежую цену
+
+    _, stored = await _complete(session)
+
+    assert stored['status'] == 'fulfilled'
+
+
+async def test_the_remembered_period_and_devices_are_what_gets_ordered(session, buy, env):
+    options = _options()
+    options['price_matrix'].append({'period_days': 90, 'prices': [{'device_limit': 3, 'price_kopeks': 13_377}]})
+    env.options.return_value = options
+    _paid(session, period_days=90, devices=3, quote_kopeks=13_377)
+
+    _, stored = await _complete(session)
+
+    assert stored['status'] == 'fulfilled'
+    request = buy.create[0]
+    assert (request['period_days'], request['selected_device_limit']) == (90, 3)
+    assert request['expected_tariff_total_kopeks'] == 13_377
+
+
+async def test_refusal_already_written_is_returned_as_is(session, buy):
+    _paid(session, status='refused', reason='balance_short')
+
+    final, stored = await _complete(session)
+
+    assert (final['reason'], stored['reason']) == ('balance_short', 'balance_short')
+    assert buy.create == []
+
+
+async def test_even_the_fallback_write_failing_returns_none_not_an_exception(session, buy, monkeypatch):
+    async def broken(*args, **kwargs):
+        raise RuntimeError('db gone')
+
+    monkeypatch.setattr(dfc, '_record_topup_intent_outcome', broken)
+    _paid(session)
+
+    assert await dfc.complete_topup_intent(payment_id=97) is None
+
+
 async def test_crash_inside_the_purchase_is_a_refusal_never_silence(session, buy):
     async def crash(checkout):
         raise RuntimeError('panel exploded')
@@ -597,6 +653,46 @@ async def test_refusal_after_a_purchase_by_another_path_does_not_push_to_buy_aga
     assert 'ХВОСТ' not in webhook.bot.send_message.await_args.args[1]
 
 
+async def test_cart_that_cannot_be_cleared_does_not_stop_the_money_message(db, session, webhook):
+    webhook.carts.delete_user_cart.side_effect = RuntimeError('redis down')
+    _intent_payment(session, payment_id=97, **TRIAL)
+
+    assert await _pay(db, webhook) is True
+
+    assert webhook.order == ['hook', 'side_effects']
+    webhook.bot.send_message.assert_awaited_once()
+
+
+async def test_owner_card_says_the_bot_already_ordered_and_ignores_the_cart(monkeypatch):
+    from app.services import admin_notification_service as module
+
+    service = module.AdminNotificationService(bot=None)
+    captured = {}
+    monkeypatch.setattr(service, '_is_enabled', lambda: True)
+    monkeypatch.setattr(service, '_owner_cart_hint', AsyncMock(side_effect=AssertionError('корзину не спрашиваем')))
+
+    def build(*args, cart_hint=None, **kwargs):
+        captured['hint'] = cart_hint
+        raise ValueError('stop here')  # дальше — отправка, она не предмет этого сторожа
+
+    monkeypatch.setattr(service, '_build_balance_topup_message', build)
+    user = SimpleNamespace(id=1)
+    transaction = SimpleNamespace(amount_kopeks=1, completed_at=None, created_at=None)
+
+    await service.send_balance_topup_notification(
+        user,
+        transaction,
+        0,
+        topup_status='t',
+        referrer_info='',
+        subscription=None,
+        promo_group=None,
+        auto_next_step='заказ X',
+    )
+
+    assert captured['hint'] == module.OwnerCartHint('заказ X', True)
+
+
 async def test_outcome_write_failure_still_keeps_the_old_chain_away(db, session, webhook, monkeypatch):
     async def nothing(**kwargs):
         return None
@@ -705,4 +801,7 @@ async def test_own_session_loads_the_user_with_promo_groups_so_pricing_does_not_
     final = await dfc.complete_topup_intent(payment_id=97)
 
     assert (final['status'], final['reason']) == ('refused', 'price_changed')  # не `technical_error`
+    async with factory() as reader:  # исход закоммичен, а не только записан в сессию
+        stored = await reader.get(PlategaPayment, 97)
+        assert dfc.topup_intent_of(stored)['reason'] == 'price_changed'
     await engine.dispose()
