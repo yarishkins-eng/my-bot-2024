@@ -79,6 +79,19 @@ def test_catalog_covers_every_recorded_notification_type() -> None:
     assert not missing, f'бот отправляет типы, которых нет в каталоге экрана: {sorted(missing)}'
 
 
+def test_every_catalogued_sent_type_is_really_recorded() -> None:
+    """Обратная сторона полноты: счётчик карточки читает отметки своего типа — кто-то обязан их писать.
+
+    Иначе на экране вечный ноль, который выглядит как «никому не ушло». ВК-4: «Пробный истёк» и
+    «Подписка истекла» получили счётчик, и он живой, только пока отправитель пишет эти отметки.
+    """
+    source = (_BOT_ROOT / 'app/services/monitoring_service.py').read_text(encoding='utf-8')
+    recorded = set(re.findall(r"record_notification\(\s*\w+,[^)]*?'([a-z0-9_]+)'", source, re.DOTALL))
+    catalogued = {entry['sent_type'] for entry in AUTO_MESSAGE_CATALOG if entry.get('sent_type')}
+    assert {'trial_expired', 'subscription_expired'} <= catalogued
+    assert not catalogued - recorded, f'счётчик без отправителя: {sorted(catalogued - recorded)}'
+
+
 def test_end_of_subscription_cards_count_their_letters() -> None:
     """ВК-4 (АП-0): у «Пробный истёк» и «Подписка истекла» вместо счётчика был прочерк.
 

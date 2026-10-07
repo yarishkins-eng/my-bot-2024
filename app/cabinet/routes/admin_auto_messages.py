@@ -234,11 +234,13 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'trial-expired',
         'group': 'trial',
         'title': 'Пробный истёк',
-        'when': 'Сразу, как панель сообщила, что срок вышел, — шлёт бот',
+        'when': (
+            'Сразу, как панель сообщила, что срок вышел, — шлёт бот. С ценой из кассы; не назвала касса цену — '
+            'письмо уходит без неё. С 00:00 до 08:00 по Москве — без звука'
+        ),
         'control': 'toggle',
-        'settings_key': 'subscription_expired',
+        'settings_key': 'trial_expired',
         'params': (),
-        'shares_switch_with': 'Подписка истекла',
         'sent_type': 'trial_expired',
         'warning': (
             'Выключите — и человек, у которого кончился пробный, не получит никакого письма о конце: письмо '
@@ -308,7 +310,6 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'control': 'toggle',
         'settings_key': 'subscription_expired',
         'params': (),
-        'shares_switch_with': 'Пробный истёк',
         'sent_type': 'subscription_expired',
         'warning': (
             'Выключите — и клиент не получит никакого письма о конце подписки: письмо панели «Подписка истекла» '
@@ -316,7 +317,6 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         ),
         'buttons': [
             {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
-            {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
         ],
     },
     {
@@ -1014,6 +1014,12 @@ _INSERT_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
         ('AUTOPAY_ACTION_RENEW', 'автоплатёж выключен, и в настройках бота он тоже выключен'),
     ),
     'check_button': (('CHANNEL_CHECK_BUTTON', 'всегда'),),
+    # ВК-4: строки цены в письме о конце пробного. Условия списаны с `_trial_price_lines`; не назвала касса
+    # цену — строк нет вовсе (это сказано в «когда» карточки).
+    'price_lines': (
+        ('TRIAL_EXPIRED_PRICE_LINES', 'на балансе пусто или денег хватает на месяц'),
+        ('TRIAL_EXPIRED_PRICE_LINES_BALANCE', 'на балансе есть деньги, но меньше цены месяца'),
+    ),
 }
 
 # Пара, которую отправитель выбирает НЕ по клиенту, а по настройке бота: показывать
@@ -1126,6 +1132,11 @@ _MARKER_HINTS_BY_MESSAGE: dict[tuple[str, str], tuple[str, str]] = {
     ('autopay-final', 'required'): ('сколько нужно списать целиком, вместе с рублём', '199 ₽'),
     ('low-balance', 'balance'): ('остаток на счету, без копеек', '340'),
     ('low-balance', 'threshold'): ('порог, который клиент выставил себе сам, без копеек', '100'),
+    # ВК-4: метки внутри строк цены письма о конце пробного. Цены — те, что клиент увидит в кассе.
+    ('trial-expired', 'month_price'): ('цена месяца в кассе, вместе с рублём', '149 ₽'),
+    ('trial-expired', 'quarter_price'): ('цена трёх месяцев в кассе, вместе с рублём', '399 ₽'),
+    ('trial-expired', 'balance'): ('сколько денег у клиента на балансе, вместе с рублём', '50 ₽'),
+    ('trial-expired', 'top_up'): ('сколько доплатить за месяц с учётом баланса, вместе с рублём', '99 ₽'),
 }
 
 # Метки, значение которых владелец задаёт ЗДЕСЬ ЖЕ, полем на этой карточке. Для них
@@ -1412,13 +1423,22 @@ def _text_facts(message_id: str, params: dict[str, int] | None = None) -> dict[s
         if body and '{' + name + '}' in body
     ]
 
+    markers = _markers_of(message_id, body, params)
+    # Метки внутри фраз-вставок — только те, что расшифрованы именно для этого письма (строки цены письма о конце
+    # пробного, ВК-4). Общая расшифровка чужой вставки могла бы показать не ту форму значения.
+    shown = {marker.name for marker in markers}
+    for marker in _markers_of(message_id, '\n'.join(v.text for insert in inserts for v in insert.variants), params):
+        if (message_id, marker.name) in _MARKER_HINTS_BY_MESSAGE and marker.name not in shown:
+            markers.append(marker)
+            shown.add(marker.name)
+
     return {
         'text': body,
         'text_suffixes': suffixes,
         'text_inserts': inserts,
         'shares_text_with': _shares_text_with(message_id),
         'text_source': 'custom' if edited else 'code',
-        'text_markers': _markers_of(message_id, body, params),
+        'text_markers': markers,
         'text_has_english': bool(key and load_locale('en').get(key)),
         'text_with_logo': message_id in _WITH_LOGO_IDS,
         'text_limits': {'max': _TEXT_LIMIT, 'caption': _CAPTION_LIMIT},

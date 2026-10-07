@@ -27,6 +27,8 @@ def _user() -> MagicMock:
 def _sub() -> MagicMock:
     s = MagicMock()
     s.id = 42
+    # Платная: «истекла вчера» платным уходит как раньше — ВК-4 снимает его только пробным (по тарифу).
+    s.is_trial = False
     return s
 
 

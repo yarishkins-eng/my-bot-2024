@@ -73,7 +73,10 @@ class NotificationSettingsService:
         # По умолчанию ВЫКЛЮЧЕНО: появление ключа не должно начать рассылку само,
         # включается вручную в кабинете. Тот же порядок, что у 'trial_expired_discount'.
         'trial_not_connected': {'enabled': False, 'not_connected_after_hours': 3},
-        'subscription_expired': {'enabled': True},  # «пробный истёк» И «подписка истекла»
+        # ВК-4: «Пробный истёк» и «Подписка истекла» больше не делят выключатель — письмо выбирает пробный или
+        # платный по тарифу и проверяет свой ключ.
+        'trial_expired': {'enabled': True},
+        'subscription_expired': {'enabled': True},
         'subscription_expiring': {'enabled': True},  # «истекает через 3 дня» И «истекает завтра»
         'traffic_warning': {'enabled': True},
         'low_balance': {'enabled': True},

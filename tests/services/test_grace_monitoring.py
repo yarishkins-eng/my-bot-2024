@@ -70,7 +70,8 @@ async def test_eligible_subscriber_enters_grace_instead_of_expiring(monkeypatch)
     enter_grace_spy = AsyncMock(return_value=True)
     expired_notify_spy = AsyncMock(return_value=True)
     monkeypatch.setattr(monitoring_service, '_enter_subscription_grace', enter_grace_spy)
-    monkeypatch.setattr(monitoring_service, '_send_subscription_expired_notification', expired_notify_spy)
+    # ВК-4: письмо о конце монитор шлёт общей функцией — шов теста здесь.
+    monkeypatch.setattr(monitoring_service, 'notify_subscription_ended', expired_notify_spy)
     monkeypatch.setattr(monitoring_service, '_process_grace_ended', AsyncMock())
     monkeypatch.setattr(monitoring_service, '_log_monitoring_event', AsyncMock())
     monitoring_service.bot = MagicMock()
@@ -83,11 +84,12 @@ async def test_eligible_subscriber_enters_grace_instead_of_expiring(monkeypatch)
     assert enter_grace_spy.await_args.args[1] is eligible
     expired_ids = [call.args[1].id for call in expire_spy.await_args_list]
     assert 1 not in expired_ids, 'eligible subscriber must NOT be expired'
-    notified_ids = [call.args[1].id for call in expired_notify_spy.await_args_list]
+    notified_ids = [call.args[2].id for call in expired_notify_spy.await_args_list]
     assert 1 not in notified_ids, 'eligible subscriber must NOT get the «истекла» push'
 
-    # The trial → normal expiry.
+    # The trial → normal expiry, and the end-of-subscription letter goes through the shared function (ВК-4).
     assert 2 in expired_ids
+    assert 2 in notified_ids
 
 
 @pytest.mark.asyncio
@@ -118,7 +120,7 @@ async def test_grace_disabled_flag_falls_back_to_normal_expiry(monkeypatch):
     monkeypatch.setattr('app.database.crud.subscription.expire_subscription', expire_spy)
     enter_grace_spy = AsyncMock(return_value=True)
     monkeypatch.setattr(monitoring_service, '_enter_subscription_grace', enter_grace_spy)
-    monkeypatch.setattr(monitoring_service, '_send_subscription_expired_notification', AsyncMock())
+    monkeypatch.setattr(monitoring_service, 'notify_subscription_ended', AsyncMock())
     monkeypatch.setattr(monitoring_service, '_process_grace_ended', AsyncMock())
     monkeypatch.setattr(monitoring_service, '_log_monitoring_event', AsyncMock())
     monitoring_service.bot = MagicMock()
