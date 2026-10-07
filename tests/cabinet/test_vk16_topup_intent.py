@@ -655,6 +655,9 @@ async def test_route_slow_first_request_does_not_replace_the_invoice_the_client_
     assert (held.intent_status, lost.intent_status) == ('accepted', 'accepted')
     assert int(lost.payment_id) > int(held.payment_id)
     assert dfc.topup_intent_of(session.get(PlategaPayment, int(held.payment_id)))['status'] == 'pending'
+    # Третье нажатие отдаёт тот счёт, что у клиента (самое позднее решение), а не потерянный с большим номером.
+    again = await balance_route.create_topup(request=_request(), user=_user(session), db=db)
+    assert (again.intent_status, again.payment_id) == ('already_paying', held.payment_id)
 
 
 async def test_route_reopening_the_same_order_returns_the_same_invoice(db, session, provider):
@@ -753,8 +756,19 @@ async def test_route_other_method_with_intent_is_ordinary(db, session, provider,
     ('intent_extra', 'expected'),
     [
         ({'status': 'pending'}, ('waiting', None, None)),
+        # Зачислено, исхода ещё нет: «оплата получена, оформляем» — даже если поздний «отменён» сироты (мина OH)
+        # перевернул `is_paid`: экран не сочтёт счёт мёртвым.
+        ({'status': 'pending', 'is_paid': True, 'transaction_id': 980}, ('processing', None, None)),
+        (
+            {'status': 'pending', 'provider_status': 'CANCELED', 'transaction_id': 980},
+            ('processing', None, None),
+        ),
         ({'status': 'fulfilled', 'checkout_public_id': 'chk-ok-3'}, ('fulfilled', 'chk-ok-3', None)),
         ({'status': 'refused', 'reason': 'price_changed'}, ('refused', None, 'price_changed')),
+        (
+            {'status': 'refused', 'reason': 'open_order', 'checkout_public_id': 'chk-open-4'},
+            ('refused', 'chk-open-4', 'open_order'),
+        ),
         ({'status': 'replaced'}, ('closed', None, 'replaced')),
         ({'status': 'cancelled'}, ('closed', None, 'cancelled')),
     ],
@@ -927,3 +941,88 @@ async def test_purchase_options_tell_the_screens_whom_it_is_enabled_for(session,
     result = await device_first_route.purchase_options(user=_user(session, user_id), db=AsyncMock())
 
     assert result['topup_intent_enabled'] is enabled
+
+
+# --- сторожа скептика волны 2: края замены, порядок проверок, признак экранам ---------------------------------
+
+
+async def test_paid_intent_beats_balance_that_now_covers_the_price(db, session, env):
+    # После зачисления баланс ВСЕГДА покрывает цену (доплата округлена вверх): при обратном порядке «оплата получена»
+    # была бы недостижима, и человек увидел бы «оплатите с баланса» поверх идущего автооформления.
+    _intent_payment(session, payment_id=10, provider_status='CONFIRMED', is_paid=True, transaction_id=910)
+    _set_user(session, balance_kopeks=BALANCE + TOP_UP_30_1)
+
+    assert (await _decide(db, session)).status == 'already_paid'
+
+
+async def test_fulfilled_intent_beats_balance_that_covers_the_price(db, session, env):
+    _intent_payment(
+        session,
+        payment_id=10,
+        status='fulfilled',
+        is_paid=True,
+        transaction_id=910,
+        checkout_public_id='chk-1',
+        decided_at=(datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+    )
+    _set_user(session, balance_kopeks=PRICE_30_1 + 100)
+
+    assert (await _decide(db, session)).status == 'already_fulfilled'
+
+
+def _rewrite_intent(session: Session, payment: PlategaPayment, **changes) -> None:
+    intent = {**payment.metadata_json[dfc.TOPUP_INTENT_KEY], **changes}
+    payment.metadata_json = {
+        **payment.metadata_json,
+        dfc.TOPUP_INTENT_KEY: {key: value for key, value in intent.items() if value is not None},
+    }
+    session.commit()
+
+
+async def test_equal_decision_time_replaces_nobody(db, session, env):
+    stamp = (datetime.now(UTC) - timedelta(minutes=3)).isoformat()
+    for payment_id in (10, 11):
+        _rewrite_intent(session, _intent_payment(session, payment_id=payment_id), created_at=stamp)
+
+    assert await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=11) == 0
+    assert [dfc.topup_intent_of(session.get(PlategaPayment, pid))['status'] for pid in (10, 11)] == ['pending'] * 2
+
+
+async def test_newer_without_decision_time_replaces_nobody(db, session, env):
+    _intent_payment(session, payment_id=10)
+    _rewrite_intent(session, _intent_payment(session, payment_id=11), created_at=None)
+
+    assert await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=11) == 0
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 10))['status'] == 'pending'
+
+
+async def test_older_without_decision_time_is_left_alone(db, session, env):
+    _rewrite_intent(session, _intent_payment(session, payment_id=10), created_at=None)
+    _intent_payment(session, payment_id=11, created_ago=timedelta(minutes=1))
+
+    assert await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=11) == 0
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 10))['status'] == 'pending'
+
+
+async def test_purchase_options_flag_follows_the_shared_rule_not_just_the_stand_list(session, env, monkeypatch):
+    monkeypatch.setattr(device_first_route, 'build_purchase_options', AsyncMock(return_value=_options()))
+    _set_user(session, restriction_subscription=1)
+
+    result = await device_first_route.purchase_options(user=_user(session, 1), db=AsyncMock())
+
+    assert result['topup_intent_enabled'] is False
+
+
+async def test_other_method_with_intent_still_checks_the_client_amount(db, session, provider, monkeypatch):
+    class _YooService:
+        async def create_yookassa_payment(self, **_):
+            return {'confirmation_url': 'https://yoo.test/pay', 'local_payment_id': 5}
+
+    monkeypatch.setattr(balance_route, 'PaymentService', _YooService)
+
+    with pytest.raises(HTTPException) as error:
+        await balance_route.create_topup(
+            request=_request(method='yookassa', option=None, amount_kopeks=1), user=_user(session), db=db
+        )
+
+    assert error.value.status_code == 400

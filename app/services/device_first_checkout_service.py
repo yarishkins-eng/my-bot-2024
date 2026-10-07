@@ -1507,10 +1507,11 @@ def topup_intent_of(payment: Any) -> dict[str, Any] | None:
 
 
 def topup_intent_outcome(payment: Any) -> tuple[str | None, str | None, str | None]:
-    """Исход для экрана: (`waiting` | `fulfilled` | `refused` | `closed`, номер заказа, причина); без намерения — пусто.
+    """Исход для экрана: (`waiting` | `processing` | `fulfilled` | `refused` | `closed`, номер заказа, причина).
 
-    🔴 Читать вместе с платежом: пока платёж не зачислен, `waiting` значит «ждём оплату», и судьбу счёта (оплачен,
-    закрыт провайдером) говорит его статус; после зачисления — «оформляем». `closed` — намерение закрыто ДО оплаты
+    Без намерения — пусто. 🔴 `waiting` — денег ещё нет: судьбу счёта (оплачен, закрыт провайдером) говорит статус
+    платежа; `processing` — деньги зачислены, оформляем (признак — зачисление, а не `is_paid`, см. ниже). `refused`
+    несёт номер заказа, если он был, — кнопке «к этому заказу». `closed` — намерение закрыто ДО оплаты
     (`replaced`, `cancelled`); если такой счёт всё же оплатят, оформление (16а-2) пишет `refused` с той же причиной.
     Исход берётся из намерения, а не из `is_paid`: поздний «отменён» по счёту-сироте повторного POST находит строку по
     `correlation_id` и пишет `is_paid=false` (мина OH), но метаданных не трогает.
@@ -1520,11 +1521,12 @@ def topup_intent_outcome(payment: Any) -> tuple[str | None, str | None, str | No
         return None, None, None
     status = intent.get('status')
     if status == 'pending':
-        return 'waiting', None, None
+        credited = bool(payment.is_paid) or payment.transaction_id is not None
+        return ('processing' if credited else 'waiting'), None, None
     if status == 'fulfilled':
         return 'fulfilled', intent.get('checkout_public_id'), None
     if status == 'refused':
-        return 'refused', None, intent.get('reason')
+        return 'refused', intent.get('checkout_public_id'), intent.get('reason')
     return 'closed', None, str(status)
 
 
@@ -1602,7 +1604,7 @@ async def prepare_topup_intent(
             devices=open_checkout.selected_device_limit,
         )
     now = datetime.now(UTC)
-    same_live_invoice, requested = None, (period_days, devices, method_code)
+    same_order_invoices, requested = [], (period_days, devices, method_code)
     for payment in await _recent_topup_intent_payments(db, user_id=user.id, now=now):
         intent = topup_intent_of(payment)
         decided_at = _intent_time(intent.get('decided_at'))
@@ -1619,12 +1621,16 @@ async def prepare_topup_intent(
                 'already_paid', payment=payment, price_kopeks=intent.get('quote_kopeks'), **found
             )
         same_order = (found['period_days'], found['devices'], intent.get('method')) == requested
-        if state == 'invoice' and same_order and same_live_invoice is None:
-            same_live_invoice = payment
+        if state == 'invoice' and same_order:
+            same_order_invoices.append(payment)
     balance = int(user.balance_kopeks or 0)
     if balance >= price:
         return TopUpIntentDecision('balance_covers', price_kopeks=price, period_days=period_days, devices=devices)
     amount = device_first_top_up_kopeks(price_kopeks=price, balance_kopeks=balance)
+    # Из живых счетов того же заказа — самое позднее решение: его человек открыл последним (гонка зависшего запроса).
+    same_live_invoice = max(
+        same_order_invoices, key=lambda p: _intent_time(topup_intent_of(p)['created_at']), default=None
+    )
     if (
         same_live_invoice is not None
         and same_live_invoice.amount_kopeks == amount

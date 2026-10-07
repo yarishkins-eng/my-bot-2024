@@ -1492,7 +1492,7 @@ async def _with_purchase_step(record_response: PendingPaymentResponse, user: Use
     """
     # ВК-16 (16а-1): доплату под заказ оформляет сервер — «оформите сами» поверх ожидания или готового заказа было бы
     # ложью; после отказа (`refused`) решает подсказка, как у обычного пополнения.
-    if not record_response.is_paid or record_response.intent_outcome in ('waiting', 'fulfilled'):
+    if not record_response.is_paid or record_response.intent_outcome in ('waiting', 'processing', 'fulfilled'):
         return record_response
     from app.services.payment.common import topup_pending_purchase_hint
 
