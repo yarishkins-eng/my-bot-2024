@@ -45,6 +45,7 @@ from app.cabinet.routes.admin_auto_messages import (
     _max_promo_group_percent,
     _params_for,
     _resolve_when,
+    _state_of,
     patch_auto_message,
 )
 from app.services.notification_settings_service import NotificationSettingsService
@@ -101,6 +102,16 @@ def test_end_of_subscription_cards_count_their_letters() -> None:
     """
     assert CATALOG_BY_ID['trial-expired'].get('sent_type') == 'trial_expired'
     assert CATALOG_BY_ID['paid-expired'].get('sent_type') == 'subscription_expired'
+
+
+def test_trial_end_letter_goes_quiet_without_a_marked_trial_tariff(monkeypatch) -> None:
+    """ВК-4: письмо о конце выбирает «пробный» по помеченному пробному тарифу. Без метки пробные получили бы платный
+    текст, а карточка «Пробный истёк» горела бы «работает» — она обязана сказать, почему молчит."""
+    monkeypatch.setattr(NotificationSettingsService, 'is_enabled', classmethod(lambda cls, key: True))
+    reasons = {'trial_tariff_marked': 'ни один тариф не помечен пробным — отбирать не по чему'}
+
+    assert _state_of(CATALOG_BY_ID['trial-expired'], reasons, {})[:2] == ('quiet', reasons['trial_tariff_marked'])
+    assert _state_of(CATALOG_BY_ID['trial-expired'], {}, {})[0] == 'live'
 
 
 def test_catalog_days_match_the_bot_settings() -> None:

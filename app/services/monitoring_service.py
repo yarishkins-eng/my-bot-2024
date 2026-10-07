@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -347,6 +347,8 @@ def ended_without_letter_query(now: datetime):
             .where(
                 SentNotification.subscription_id == Subscription.id,
                 SentNotification.notification_type.in_(END_OF_SUBSCRIPTION_MARKS),
+                # Отметка старше нынешнего срока — про прошлый конец (подписку оживили без продления).
+                SentNotification.created_at >= Subscription.end_date,
             )
             .exists(),
         )
@@ -646,8 +648,10 @@ class MonitoringService:
                             error=recurrent_error,
                             exc_info=True,
                         )
-                await self._check_expired_subscriptions(db)
+                # Обход — ДО прохода монитора: письмо, которое монитор не смог отправить, обход повторит через час,
+                # а не через секунды в том же цикле (Телеграм мог доставить его с опозданием).
                 await self._check_ended_without_letter(db)
+                await self._check_expired_subscriptions(db)
                 await self._check_expiring_subscriptions(db)
                 await self._check_trial_expiring_soon(db)
                 await self._check_trial_not_connected(db)
@@ -871,7 +875,9 @@ class MonitoringService:
                 await expire_subscription(db, subscription)
 
                 if user and not skip_notify:
-                    await self.notify_subscription_ended(db, user, subscription, tariff_name=_tariff_name)
+                    await self.notify_subscription_ended(
+                        db, user, subscription, tariff_name=_tariff_name, source='monitor'
+                    )
 
                 logger.info(
                     "🔴 Подписка пользователя истекла и статус изменен на 'expired'", user_id=subscription.user_id
@@ -1005,7 +1011,9 @@ class MonitoringService:
                 )
 
                 if user:
-                    await self.notify_subscription_ended(db, user, subscription, tariff_name=_tariff_name)
+                    await self.notify_subscription_ended(
+                        db, user, subscription, tariff_name=_tariff_name, source='grace'
+                    )
         except Exception as e:
             logger.error('Ошибка финализации grace-подписок', error=e)
 
@@ -2594,16 +2602,23 @@ class MonitoringService:
         return other_active.scalar_one_or_none() is not None
 
     async def notify_subscription_ended(
-        self, db: AsyncSession, user: User, subscription: Subscription, *, tariff_name: str | None = None
+        self,
+        db: AsyncSession,
+        user: User,
+        subscription: Subscription,
+        *,
+        source: str,
+        tariff_name: str | None = None,
     ) -> bool:
         """ВК-4: единственное письмо в момент конца подписки; возвращает, ушло ли оно сейчас.
 
         Его зовут вебхук `user.expired`, монитор, конец бонусных дней и страховочный обход: кто первый — тот пишет,
         остальные видят отметку и молчат. Пробному — «Пробный период завершён» с ценой из кассы, ночью без звука;
         платному — «Подписка истекла». Отметка ставится, только когда письмо ушло или человек заблокировал бота:
-        таймаут и сбой её не ставят, и обход повторит. Порядок «отправка → отметка» оставляет секундное окно, в
-        котором вебхук и монитор могут написать оба (уникального ключа у таблицы нет); обратный порядок терял бы
-        письмо при каждом сбое Телеграма — цена названа в записке ВК-4.
+        таймаут и сбой её не ставят, и обход повторит (кроме конца бонусных дней: их исходный срок старше окна
+        обхода). Порядок «отправка → отметка» оставляет секундное окно, в котором вебхук и монитор могут написать
+        оба (уникального ключа у таблицы нет); обратный порядок терял бы письмо при каждом сбое Телеграма — цена
+        названа в записке ВК-4. `source` — кто зовёт (webhook, monitor, sweep, grace), только для журнала.
         """
         if subscription.end_date > datetime.now(UTC):
             # «Истекла» про подписку, у которой срок ещё идёт, — неправда человеку, который скорее всего только что
@@ -2626,7 +2641,8 @@ class MonitoringService:
             return False
         if settings.is_multi_tariff_enabled() and await self._has_other_active_subscription(db, user, subscription):
             return False
-        if await notification_sent(db, user.id, subscription.id, 'trial_expired' if trial else 'subscription_expired'):
+        mark = 'trial_expired' if trial else 'subscription_expired'
+        if await self._end_letter_already_sent(db, subscription, mark):
             return False
 
         if trial:
@@ -2637,52 +2653,88 @@ class MonitoringService:
             delivered = await self._send_subscription_expired_notification(user, subscription, tariff_name=tariff_name)
         if not delivered:
             return False
+        # Отметка прошлого конца (подписку оживили без продления) больше не нужна: без её снятия
+        # `record_notification` счёл бы новую повтором и не записал.
+        await clear_notification_by_type(db, subscription.id, mark, commit=False)
         if trial:
             await record_notification(db, user.id, subscription.id, 'trial_expired')
         else:
             await record_notification(db, user.id, subscription.id, 'subscription_expired')
-        logger.info('Письмо о конце подписки отправлено', subscription_id=subscription.id, user_id=user.id, trial=trial)
+        logger.info(
+            'Письмо о конце подписки отправлено',
+            subscription_id=subscription.id,
+            user_id=user.id,
+            trial=trial,
+            source=source,
+        )
         return True
+
+    async def _end_letter_already_sent(self, db: AsyncSession, subscription: Subscription, mark: str) -> bool:
+        """Было ли письмо об ЭТОМ конце срока.
+
+        Отметки стирает продление, но не «оживление» админом («Активировать», дата вперёд, перенос даты из
+        панели): старая отметка остаётся, и без сравнения со сроком следующий конец прошёл бы без письма.
+        """
+        found = await db.scalar(
+            select(SentNotification.id)
+            .where(
+                SentNotification.subscription_id == subscription.id,
+                SentNotification.notification_type == mark,
+                SentNotification.created_at >= subscription.end_date,
+            )
+            .limit(1)
+        )
+        return found is not None
 
     async def _trial_price_lines(self, db: AsyncSession, user: User) -> str:
         """Строки цены в письме о конце пробного (решение владельца 07.10.2026) — из кассы этого человека.
 
         Цены те же, что он увидит, нажав «Оформить подписку»: ячейки 1 и 3 месяца на базовое число устройств из
-        `build_purchase_options`, доплата при деньгах на балансе — расчётом самой кассы. Касса цену не назвала —
-        письмо уходит без цены. 🔴 Запасной `PRICE_30_DAYS` (990 ₽) не подставлять никогда: это не цена тарифа.
+        `build_purchase_options`, доплата при деньгах на балансе — расчётом самой кассы. Касса цену не назвала или
+        строки не собрались — письмо уходит без цены. 🔴 Запасной `PRICE_30_DAYS` (990 ₽) не подставлять никогда.
         """
         from app.services.device_first_checkout_service import build_purchase_options, device_first_top_up_kopeks
 
         try:
-            options = await build_purchase_options(db, user)
-        except Exception as error:
-            logger.warning('Письмо о конце пробного уйдёт без цены: касса не ответила', user_id=user.id, error=error)
+            # Точка сохранения: сбой запроса внутри кассы не должен сломать транзакцию — следом пишется отметка.
+            async with db.begin_nested():
+                options = await build_purchase_options(db, user)
+            base = (options.get('tariff') or {}).get('base_device_limit')
+            prices = {
+                row.get('period_days'): cell.get('price_kopeks')
+                for row in options.get('price_matrix') or []
+                for cell in row.get('prices') or []
+                if cell.get('device_limit') == base
+            }
+            month, quarter = prices.get(30), prices.get(90)
+            texts = get_texts(user.language)
+            if month:
+                balance = int(user.balance_kopeks or 0)
+                top_up = device_first_top_up_kopeks(price_kopeks=month, balance_kopeks=balance)
+                # Остаток — в целых рублях вниз: «с вашими N ₽» плюс доплата «M ₽» дают цену месяца, а M — ровно то,
+                # что попросит касса. Меньше рубля на балансе или доплата не меньше цены — строки баланса нет (касса
+                # такую доплату тоже не предлагает).
+                whole_rubles = balance // 100 * 100
+                if whole_rubles > 0 and 0 < top_up < month:
+                    return texts.t(
+                        'TRIAL_EXPIRED_PRICE_LINES_BALANCE',
+                        '1 месяц — {month_price}\nс вашими {balance} на балансе — {top_up}',
+                    ).format(
+                        month_price=settings.format_price(month),
+                        balance=settings.format_price(whole_rubles),
+                        top_up=settings.format_price(top_up),
+                    )
+                if quarter:
+                    return texts.t(
+                        'TRIAL_EXPIRED_PRICE_LINES', '1 месяц — {month_price}\n3 месяца — {quarter_price}'
+                    ).format(month_price=settings.format_price(month), quarter_price=settings.format_price(quarter))
+            logger.info('Письмо о конце пробного уйдёт без цены', user_id=user.id, reason=options.get('reason'))
             return ''
-        base = (options.get('tariff') or {}).get('base_device_limit')
-        prices = {
-            row.get('period_days'): cell.get('price_kopeks')
-            for row in options.get('price_matrix') or []
-            for cell in row.get('prices') or []
-            if cell.get('device_limit') == base
-        }
-        month, quarter = prices.get(30), prices.get(90)
-        balance = int(user.balance_kopeks or 0)
-        texts = get_texts(user.language)
-        if month and 0 < balance < month:
-            top_up = device_first_top_up_kopeks(price_kopeks=month, balance_kopeks=balance)
-            return texts.t(
-                'TRIAL_EXPIRED_PRICE_LINES_BALANCE', '1 месяц — {month_price}\nс вашими {balance} на балансе — {top_up}'
-            ).format(
-                month_price=settings.format_price(month),
-                balance=settings.format_price(balance),
-                top_up=settings.format_price(top_up),
+        except Exception as error:
+            logger.warning(
+                'Письмо о конце пробного уйдёт без цены: строки цены не собрались', user_id=user.id, error=error
             )
-        if month and quarter:
-            return texts.t('TRIAL_EXPIRED_PRICE_LINES', '1 месяц — {month_price}\n3 месяца — {quarter_price}').format(
-                month_price=settings.format_price(month), quarter_price=settings.format_price(quarter)
-            )
-        logger.info('Письмо о конце пробного уйдёт без цены', user_id=user.id, reason=options.get('reason'))
-        return ''
+            return ''
 
     async def _check_ended_without_letter(self, db: AsyncSession) -> None:
         """ВК-4: страховочный обход. Срок вышел 15 мин – 6 ч назад, а письма о конце не было — пишем.
@@ -2690,28 +2742,53 @@ class MonitoringService:
         Подбирает потерянное: событие панели не пришло (подписку погасил загрузчик, пока человек жал кнопки), письмо
         упало по таймауту, админ отменил подписку, а панель промолчала. Пробный в «лимит исчерпан» с вышедшим сроком
         гасит только вебхук (мина NN) — такую обход переводит в «истекла» сам. 15 минут — запас, чтобы не бежать
-        впереди вебхука. Запрос живёт здесь, а не в `crud/`: забор деплоя.
+        впереди вебхука. Запрос живёт здесь, а не в `crud/`: забор деплоя. Одна подписка с ошибкой не останавливает
+        остальные.
         """
-        from app.database.crud.subscription import expire_subscription
-
         try:
             due = (await db.execute(ended_without_letter_query(datetime.now(UTC)))).scalars().all()
-            for subscription_id in due:
+        except Exception as error:
+            logger.error('Ошибка выборки страховочного обхода писем о конце подписки', error=error)
+            await db.rollback()
+            return
+        for subscription_id in due:
+            try:
+                # Запись условная: продление, закоммиченное после выборки, не превратится в «истекла» со сроком в
+                # будущем (мина NO — оплативший без VPN). У «истекла» запрос ничего не меняет.
+                now = datetime.now(UTC)
+                await db.execute(
+                    update(Subscription)
+                    .where(
+                        Subscription.id == subscription_id,
+                        Subscription.status == SubscriptionStatus.LIMITED.value,
+                        Subscription.end_date <= now,
+                    )
+                    .values(status=SubscriptionStatus.EXPIRED.value, updated_at=now)
+                )
+                await db.commit()
                 subscription = await db.scalar(
                     select(Subscription)
                     .options(selectinload(Subscription.tariff))
                     .where(Subscription.id == subscription_id)
+                    .execution_options(populate_existing=True)
                 )
+                if subscription is None or subscription.status != SubscriptionStatus.EXPIRED.value:
+                    continue
                 user = await get_user_by_id(db, subscription.user_id)
                 if user is None:
                     continue
-                # Имя тарифа — до expire_subscription: её refresh сбрасывает связи.
-                tariff_name = subscription.tariff.name if subscription.tariff else None
-                if subscription.status == SubscriptionStatus.LIMITED.value:
-                    await expire_subscription(db, subscription)
-                await self.notify_subscription_ended(db, user, subscription, tariff_name=tariff_name)
-        except Exception as error:
-            logger.error('Ошибка страховочного обхода писем о конце подписки', error=error)
+                await self.notify_subscription_ended(
+                    db,
+                    user,
+                    subscription,
+                    tariff_name=subscription.tariff.name if subscription.tariff else None,
+                    source='sweep',
+                )
+            except Exception as error:
+                logger.error(
+                    'Ошибка страховочного обхода писем о конце подписки', subscription_id=subscription_id, error=error
+                )
+                await db.rollback()
 
     async def _send_subscription_expired_notification(
         self, user: User, subscription: Subscription, *, tariff_name: str | None = None
@@ -2773,7 +2850,7 @@ class MonitoringService:
         the agreed scenario has no image here.
         """
         if not getattr(user, 'telegram_id', None):
-            return True
+            return False
 
         try:
             texts = get_texts(user.language)

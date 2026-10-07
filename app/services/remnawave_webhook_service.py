@@ -1125,7 +1125,7 @@ class RemnaWaveWebhookService:
         from app.services.monitoring_service import monitoring_service
 
         await monitoring_service.notify_subscription_ended(
-            db, user, subscription, tariff_name=tariff.name if tariff is not None else None
+            db, user, subscription, tariff_name=tariff.name if tariff is not None else None, source='webhook'
         )
 
     async def _handle_user_disabled(
