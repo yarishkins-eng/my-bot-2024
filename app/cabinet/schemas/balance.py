@@ -87,8 +87,9 @@ class TopUpRequest(BaseModel):
     # об этом нельзя — оба запроса выглядят одинаково, знает только сам кабинет.
     # Пусто → прежнее поведение (сайт): старая сборка кабинета поля не шлёт.
     return_surface: str | None = Field(None, description="Where to send the payer back: 'telegram' or 'web'")
-    # 🔴 ВК-16 (16а-1). Доплата под заказ: при намерении сумму к оплате считает сервер, `amount_kopeks` клиента
-    # идёт только в обычное пополнение (исход `ordinary`). Без намерения ответ прежний байт в байт.
+    # 🔴 ВК-16 (16а-1). Доплата под заказ: при намерении сумму к оплате считает сервер, а `amount_kopeks` клиента идёт
+    # только в обычное пополнение (исход `ordinary`) — поэтому экран обязан слать настоящую сумму доплаты, а не заглушку.
+    # Без намерения прежние поля ответа те же, новые — `null`.
     intent: TopUpIntent | None = Field(None, description='Order this top-up pays for (device-first checkout)')
 
 
@@ -97,8 +98,11 @@ class TopUpResponse(BaseModel):
 
     🔴 ВК-16 (16а-1): при намерении `intent_status` говорит исход, и у части исходов счёта нет — поэтому
     `payment_id`/`payment_url` необязательны. Исходы: `accepted` (счёт с намерением — «оформится само»),
-    `ordinary` + `intent_reason` (обычное пополнение без обещания), `open_order`, `order_on_review`,
-    `already_paying` (счёт того же заказа), `already_fulfilled`, `balance_covers`, `invoice_not_created`.
+    `ordinary` + `intent_reason` (`disabled`, `account_erasure`, `restricted`, `unavailable`, `method_not_supported` —
+    обычное пополнение без обещания), `open_order`, `order_on_review` (к заказу не вести — поддержка),
+    `already_paying` (тот же неоплаченный счёт того же заказа и способа — его ссылка), `already_paid` (деньги по
+    намерению уже пришли, оформляем — ссылки нет), `already_fulfilled`, `balance_covers`, `invoice_not_created`.
+    Срок, устройства и цена — того заказа, о котором исход.
     """
 
     payment_id: str | None = None
@@ -158,7 +162,9 @@ class PendingPaymentResponse(BaseModel):
     # деньги потратит автопокупка или автоплатёж, опаснее, чем промолчать.
     purchase_step_pending: bool = False
     # 🔴 ВК-16 (16а-1). Исход заказа, ради которого доплачивали: `waiting` / `fulfilled` (+ номер заказа) /
-    # `refused` (+ причина). Нет намерения — пусто. Экран ждёт ЗАКАЗ, а не деньги (замысел v2, правило 1).
+    # `refused` (+ причина, после оплаты) / `closed` (+ `replaced`|`cancelled`, закрыто до оплаты). Нет намерения —
+    # пусто. Экран ждёт ЗАКАЗ, а не деньги (замысел v2, правило 1); пока платёж не зачислен, судьбу счёта говорит
+    # `status`/`is_paid`, исход `waiting` значит «ждём оплату».
     intent_outcome: str | None = None
     intent_checkout_public_id: str | None = None
     intent_reason: str | None = None
