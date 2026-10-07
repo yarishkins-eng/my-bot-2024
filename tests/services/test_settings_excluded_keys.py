@@ -34,3 +34,16 @@ def test_excluded_keys_have_no_editable_definition() -> None:
     for key in EXCLUDED_AUTH_KEYS:
         with pytest.raises(KeyError):
             BotConfigurationService.get_definition(key)
+
+
+def test_dead_trial_warning_hours_is_not_offered_on_the_settings_screen() -> None:
+    """ВК-4 (АП-0): «Предупреждать за N часов» бот не читает нигде, а в боевой базе уже стоит «3».
+
+    Письмо «пробный скоро истекает» берёт срок из раздела «Автосообщения» (6 ч). Экран «Настройки»
+    обещал рычаг, которого нет. Соседний ключ того же раздела обязан остаться — иначе проверка
+    прошла бы и на пустом списке настроек.
+    """
+    assert 'TRIAL_WARNING_HOURS' in BotConfigurationService.EXCLUDED_KEYS
+    with pytest.raises(KeyError):
+        BotConfigurationService.get_definition('TRIAL_WARNING_HOURS')
+    assert BotConfigurationService.get_definition('TRIAL_DURATION_DAYS').key == 'TRIAL_DURATION_DAYS'

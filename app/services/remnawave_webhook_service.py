@@ -1100,6 +1100,18 @@ class RemnaWaveWebhookService:
             await db.commit()
             return
 
+        # ВК-4: событие пришло, а срок у нас ещё идёт — так бывает сразу после продления, когда панель успела
+        # погасить пользователя по старой дате. Гасить подписку и писать «истекла» тому, кто только что заплатил,
+        # нельзя.
+        if subscription.status != SubscriptionStatus.EXPIRED.value and subscription.end_date > datetime.now(UTC):
+            logger.warning(
+                'Webhook user.expired: срок подписки ещё не вышел — не гасим и не пишем',
+                subscription_id=subscription.id,
+                user_id=user.id,
+                end_date=subscription.end_date,
+            )
+            return
+
         self._stamp_webhook_update(subscription)
         if subscription.status != SubscriptionStatus.EXPIRED.value:
             await expire_subscription(db, subscription)
@@ -1107,11 +1119,13 @@ class RemnaWaveWebhookService:
         else:
             await db.commit()
 
-        await self._notify_user(
-            user,
-            'WEBHOOK_SUB_EXPIRED',
-            reply_markup=self._get_renew_keyboard(user, subscription.id),
-            subscription=subscription,
+        # Письмо о конце — одно, от бота (ВК-4): пробному с ценой, платному «Подписка истекла»; повтор события
+        # видит отметку и молчит. Письмо панели WEBHOOK_SUB_EXPIRED больше не шлём, поэтому его выключатель в
+        # .env письмо о конце не гасит — гасит карточка раздела «Автосообщения».
+        from app.services.monitoring_service import monitoring_service
+
+        await monitoring_service.notify_subscription_ended(
+            db, user, subscription, tariff_name=tariff.name if tariff is not None else None, source='webhook'
         )
 
     async def _handle_user_disabled(
@@ -1734,6 +1748,19 @@ class RemnaWaveWebhookService:
                 hours=hours,
                 text_key=text_key,
             )
+
+        if text_key == 'WEBHOOK_SUB_EXPIRED_24H_AGO':
+            # ВК-4 (решение владельца 07.10.2026): пробному «💤 Подписка истекла вчера… продлите» не шлём — в тот же
+            # час уходит наше письмо со скидкой на первую подписку. Пробный — по тарифу; платным письмо остаётся.
+            from app.services.monitoring_service import is_canonical_trial
+
+            if await is_canonical_trial(db, subscription):
+                logger.info(
+                    'Webhook user.expiration: «истекла вчера» пробному не шлём',
+                    user_id=user.id,
+                    subscription_id=subscription.id,
+                )
+                return
 
         await self._notify_user(
             user,

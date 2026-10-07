@@ -40,7 +40,7 @@ async def test_grace_disable_failure_enqueues_retry(monkeypatch):
     monkeypatch.setattr('app.services.monitoring_service.get_user_by_id', AsyncMock(return_value=user))
     # Панель НЕ приняла disable.
     monkeypatch.setattr(monitoring_service.subscription_service, 'push_panel_state', AsyncMock(return_value=False))
-    monkeypatch.setattr(monitoring_service, '_send_subscription_expired_notification', AsyncMock(return_value=True))
+    monkeypatch.setattr(monitoring_service, 'notify_subscription_ended', AsyncMock(return_value=True))
     enqueue_spy = MagicMock()
     monkeypatch.setattr('app.services.remnawave_retry_queue.remnawave_retry_queue.enqueue', enqueue_spy)
     monitoring_service.bot = MagicMock()
@@ -62,7 +62,7 @@ async def test_grace_disable_success_no_retry(monkeypatch):
     monkeypatch.setattr('app.services.monitoring_service.get_user_by_id', AsyncMock(return_value=user))
     # Панель приняла disable.
     monkeypatch.setattr(monitoring_service.subscription_service, 'push_panel_state', AsyncMock(return_value=True))
-    monkeypatch.setattr(monitoring_service, '_send_subscription_expired_notification', AsyncMock(return_value=True))
+    monkeypatch.setattr(monitoring_service, 'notify_subscription_ended', AsyncMock(return_value=True))
     enqueue_spy = MagicMock()
     monkeypatch.setattr('app.services.remnawave_retry_queue.remnawave_retry_queue.enqueue', enqueue_spy)
     monitoring_service.bot = MagicMock()

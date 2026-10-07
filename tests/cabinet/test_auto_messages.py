@@ -45,6 +45,7 @@ from app.cabinet.routes.admin_auto_messages import (
     _max_promo_group_percent,
     _params_for,
     _resolve_when,
+    _state_of,
     patch_auto_message,
 )
 from app.services.notification_settings_service import NotificationSettingsService
@@ -77,6 +78,40 @@ def test_catalog_covers_every_recorded_notification_type() -> None:
     catalogued = {entry['sent_type'] for entry in AUTO_MESSAGE_CATALOG if entry.get('sent_type')}
     missing = recorded - catalogued
     assert not missing, f'бот отправляет типы, которых нет в каталоге экрана: {sorted(missing)}'
+
+
+def test_every_catalogued_sent_type_is_really_recorded() -> None:
+    """Обратная сторона полноты: счётчик карточки читает отметки своего типа — кто-то обязан их писать.
+
+    Иначе на экране вечный ноль, который выглядит как «никому не ушло». ВК-4: «Пробный истёк» и
+    «Подписка истекла» получили счётчик, и он живой, только пока отправитель пишет эти отметки.
+    """
+    source = (_BOT_ROOT / 'app/services/monitoring_service.py').read_text(encoding='utf-8')
+    recorded = set(re.findall(r"record_notification\(\s*\w+,[^)]*?'([a-z0-9_]+)'", source, re.DOTALL))
+    catalogued = {entry['sent_type'] for entry in AUTO_MESSAGE_CATALOG if entry.get('sent_type')}
+    assert {'trial_expired', 'subscription_expired'} <= catalogued
+    assert not catalogued - recorded, f'счётчик без отправителя: {sorted(catalogued - recorded)}'
+
+
+def test_end_of_subscription_cards_count_their_letters() -> None:
+    """ВК-4 (АП-0): у «Пробный истёк» и «Подписка истекла» вместо счётчика был прочерк.
+
+    Письмо о конце не оставляло отметок, и карточка не могла сказать, ушло ли оно хоть раз — а за
+    30 дней до этапа оно не ушло ни разу. Обратную сторону (каждый тип каталога правда пишет
+    отправитель) держит `test_every_catalogued_sent_type_is_really_recorded`.
+    """
+    assert CATALOG_BY_ID['trial-expired'].get('sent_type') == 'trial_expired'
+    assert CATALOG_BY_ID['paid-expired'].get('sent_type') == 'subscription_expired'
+
+
+def test_trial_end_letter_goes_quiet_without_a_marked_trial_tariff(monkeypatch) -> None:
+    """ВК-4: письмо о конце выбирает «пробный» по помеченному пробному тарифу. Без метки пробные получили бы платный
+    текст, а карточка «Пробный истёк» горела бы «работает» — она обязана сказать, почему молчит."""
+    monkeypatch.setattr(NotificationSettingsService, 'is_enabled', classmethod(lambda cls, key: True))
+    reasons = {'trial_tariff_marked': 'ни один тариф не помечен пробным — отбирать не по чему'}
+
+    assert _state_of(CATALOG_BY_ID['trial-expired'], reasons, {})[:2] == ('quiet', reasons['trial_tariff_marked'])
+    assert _state_of(CATALOG_BY_ID['trial-expired'], {}, {})[0] == 'live'
 
 
 def test_catalog_days_match_the_bot_settings() -> None:
