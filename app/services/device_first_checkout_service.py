@@ -1718,8 +1718,8 @@ async def replace_older_topup_intents(db: AsyncSession, *, user_id: int, newer_p
 
 # --- ВК-16 (16а-2): деньги доплаты пришли — заказ оформляется сам ----------------------------------------------
 TOPUP_INTENT_SOURCE = 'topup_intent'
-# Свой заказ, закрытый отказом автооформления. Денег по нему не брали: оформление идёт целиком с баланса, и закрываем
-# только заказ без списания (`financial_committed_at` пуст) — поэтому причина стоит в `_NO_MONEY_TERMINAL_REASONS`.
+# Свой заказ, закрытый отказом автооформления: закрываем только заказ без списания (`financial_committed_at` пуст).
+# В `_NO_MONEY_TERMINAL_REASONS` НЕ добавлена: набор сторожится поимённо, а экрану такого заказа никто не показывает.
 TOPUP_INTENT_REFUSED_TERMINAL_REASON = 'topup_intent_refused'
 
 
@@ -3784,7 +3784,6 @@ _NO_MONEY_TERMINAL_REASONS = frozenset(
         'provider_invoice_missing_or_elapsed_expiry',
         'cancelled_by_user_after_invoice',
         INVOICE_NOT_CREATED_TERMINAL_REASON,
-        TOPUP_INTENT_REFUSED_TERMINAL_REASON,
     }
 )
 
