@@ -6,7 +6,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot_factory import create_bot
@@ -17,6 +17,13 @@ from app.database.crud.saved_payment_method import (
 )
 from app.database.crud.user import get_user_by_id
 from app.database.models import PaymentMethod, Transaction, User
+from app.services.device_first_checkout_service import (
+    TOPUP_INTENT_KEY,
+    TopUpIntentDecision,
+    prepare_topup_intent,
+    replace_older_topup_intents,
+    topup_intent_outcome,
+)
 from app.services.payment_method_config_service import get_enabled_methods_for_user
 from app.services.payment_service import PaymentService
 from app.services.payment_verification_service import (
@@ -41,6 +48,7 @@ from ..schemas.balance import (
     SavedCardsListResponse,
     StarsInvoiceRequest,
     StarsInvoiceResponse,
+    TopUpIntent,
     TopUpRequest,
     TopUpResponse,
     TransactionListResponse,
@@ -345,6 +353,39 @@ def _telegram_top_up_return_url(method_id: str, *, failed: bool) -> str:
     return build_main_miniapp_startapp_url(f'tup-{method}-{outcome}')
 
 
+def _topup_intent_response(decision: TopUpIntentDecision, intent: TopUpIntent) -> TopUpResponse:
+    """ВК-16 (16а-1): исход без нового счёта — экран показывает его вместо оплаты (замысел v2, правило 6)."""
+    payment = decision.payment
+    amount = int(payment.amount_kopeks) if payment is not None else 0
+    paid = payment is not None and (bool(payment.is_paid) or payment.transaction_id is not None)
+    return TopUpResponse(
+        payment_id=str(payment.id) if payment is not None else None,
+        payment_url=payment.redirect_url if payment is not None else None,
+        amount_kopeks=amount,
+        amount_rubles=amount / 100,
+        status='none' if payment is None else 'paid' if paid else 'pending',
+        expires_at=payment.expires_at if payment is not None else None,
+        intent_status=decision.status,
+        intent_reason=decision.reason,
+        checkout_public_id=decision.checkout_public_id,
+        period_days=intent.period_days,
+        devices=intent.devices,
+        price_kopeks=decision.price_kopeks,
+    )
+
+
+async def _replace_older_topup_intents_quietly(db: AsyncSession, *, user_id: int, payment_id: int) -> None:
+    """Счёт уже выдан — сбой замены не отнимает его у человека. Старое намерение останется «ждём»; оплатят оба —
+    оформит первое, второе отклонит сверка при зачислении (16а-2)."""
+    try:
+        await replace_older_topup_intents(db, user_id=user_id, newer_payment_id=payment_id)
+    except Exception as error:
+        logger.warning(
+            'topup_intent_replace_failed', user_id=user_id, payment_id=payment_id, error=type(error).__name__
+        )
+        await db.rollback()
+
+
 @router.post('/topup', response_model=TopUpResponse)
 async def create_topup(
     request: TopUpRequest,
@@ -381,9 +422,13 @@ async def create_topup(
             detail=f'Maximum amount is {method.max_amount_kopeks / 100:.2f} RUB',
         )
 
-    amount_rubles = request.amount_kopeks / 100
+    amount_kopeks = request.amount_kopeks
     payment_url = None
     payment_id = None
+    # ВК-16 (16а-1): исход намерения. Без намерения поля пустые, и ответ прежний байт в байт.
+    intent_status = intent_reason = intent_price_kopeks = None
+    if request.intent is not None and request.payment_method != 'platega':
+        intent_status, intent_reason = 'ordinary', 'method_not_supported'
     cabinet_return_url = f'{settings.CABINET_URL.rstrip("/")}/balance/top-up/result?method={request.payment_method}'
     cabinet_success_url = f'{cabinet_return_url}&status=success'
     cabinet_failed_url = f'{cabinet_return_url}&status=failed'
@@ -534,18 +579,41 @@ async def create_topup(
                     detail='Selected Platega method is unavailable',
                 )
 
+            # 🔴 ВК-16 (16а-1). Доплата под заказ: сначала решаем, нужен ли счёт вообще и на какую сумму. Сумму
+            # считает сервер той же формулой, что кнопка бота и письмо о конце пробного (`device_first_top_up_kopeks`).
+            extra_metadata = None
+            if request.intent is not None:
+                decision = await prepare_topup_intent(
+                    db,
+                    user=user,
+                    period_days=request.intent.period_days,
+                    devices=request.intent.devices,
+                    method_code=method_code,
+                    min_kopeks=method.min_amount_kopeks,
+                    max_kopeks=method.max_amount_kopeks,
+                )
+                intent_status, intent_reason = decision.status, decision.reason
+                logger.info('topup_intent_decision', user_id=user.id, status=decision.status, reason=decision.reason)
+                if decision.status not in {'accepted', 'ordinary'}:
+                    return _topup_intent_response(decision, request.intent)
+                if decision.status == 'accepted':
+                    amount_kopeks = decision.amount_kopeks
+                    intent_price_kopeks = decision.price_kopeks
+                    extra_metadata = {TOPUP_INTENT_KEY: decision.intent}
+
             payment_service = PaymentService()
             result = await payment_service.create_platega_payment(
                 db=db,
                 user_id=user.id,
-                amount_kopeks=request.amount_kopeks,
+                amount_kopeks=amount_kopeks,
                 description=settings.get_balance_payment_description(
-                    request.amount_kopeks, telegram_user_id=user.telegram_id, user_db_id=user.id
+                    amount_kopeks, telegram_user_id=user.telegram_id, user_db_id=user.id
                 ),
                 language=getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE,
                 payment_method_code=method_code,
                 return_url=cabinet_success_url,
                 failed_url=cabinet_failed_url,
+                extra_metadata=extra_metadata,
             )
 
             if result and result.get('redirect_url'):
@@ -554,6 +622,20 @@ async def create_topup(
                 # Platega's external transaction id is useful for provider API
                 # calls, but cannot address that endpoint reliably.
                 payment_id = str(result.get('local_payment_id') or result.get('transaction_id') or 'pending')
+                if extra_metadata is not None and result.get('local_payment_id'):
+                    await _replace_older_topup_intents_quietly(
+                        db, user_id=user.id, payment_id=int(result['local_payment_id'])
+                    )
+            elif request.intent is not None:
+                # Мина OG: экран заказа покажет текст ВК-15 («счёт не выдан, деньги не списаны»), а не английскую 500.
+                return TopUpResponse(
+                    amount_kopeks=amount_kopeks,
+                    amount_rubles=amount_kopeks / 100,
+                    status='failed',
+                    intent_status='invoice_not_created',
+                    period_days=request.intent.period_days,
+                    devices=request.intent.devices,
+                )
             else:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1103,10 +1185,15 @@ async def create_topup(
     return TopUpResponse(
         payment_id=payment_id or 'pending',
         payment_url=payment_url,
-        amount_kopeks=request.amount_kopeks,
-        amount_rubles=amount_rubles,
+        amount_kopeks=amount_kopeks,
+        amount_rubles=amount_kopeks / 100,
         status='pending',
         expires_at=None,
+        intent_status=intent_status,
+        intent_reason=intent_reason,
+        period_days=request.intent.period_days if intent_status == 'accepted' else None,
+        devices=request.intent.devices if intent_status == 'accepted' else None,
+        price_kopeks=intent_price_kopeks,
     )
 
 
@@ -1337,7 +1424,11 @@ def _get_payment_url(record: PendingPayment) -> str | None:
 def _record_to_response(record: PendingPayment) -> PendingPaymentResponse:
     """Convert PendingPayment to API response."""
     status_emoji, status_text = _get_status_info(record)
+    intent_outcome, intent_checkout_public_id, intent_reason = topup_intent_outcome(record.payment)
     return PendingPaymentResponse(
+        intent_outcome=intent_outcome,
+        intent_checkout_public_id=intent_checkout_public_id,
+        intent_reason=intent_reason,
         id=record.local_id,
         method=record.method.value,
         method_display=method_display_name(record.method),
@@ -1499,6 +1590,15 @@ async def get_latest_payment_by_method(
         .order_by(desc(model.created_at))
         .limit(1)
     )
+    if payment_method == PaymentMethod.PLATEGA:
+        # 🔴 Мина OI (ВК-16, 16а-1): запасной опрос экрана ПОПОЛНЕНИЯ берёт только пополнения. Строка прямой оплаты
+        # заказа (с ВК-15 — и строка FAILED при сбое счёта) и докупки устройств — чужой исход, не этого экрана.
+        from app.database.models import CheckoutPaymentAttempt, DeviceAddonTopupAttempt
+
+        stmt = stmt.where(
+            ~exists().where(CheckoutPaymentAttempt.platega_payment_id == model.id),
+            ~exists().where(DeviceAddonTopupAttempt.platega_payment_id == model.id),
+        )
     result = await db.execute(stmt)
     payment = result.scalars().first()
 

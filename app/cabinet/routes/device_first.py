@@ -42,6 +42,7 @@ from app.services.device_first_checkout_service import (
     request_hash,
     serialize_checkout,
     store_mutation_result,
+    topup_intent_enabled_for,
 )
 from app.services.device_first_payment_service import (
     abandon_direct_checkout_for_new_calculation,
@@ -285,6 +286,9 @@ async def purchase_options(
     return {
         **options,
         'legacy_tariff_purchase_allowed': not settings.DEVICE_FIRST_PUBLIC_ROLLOUT_ENABLED,
+        # ВК-16 (16а-1): доплата под заказ оформится сама — по этому признаку экраны (16в-3, 16б) показывают новое
+        # поведение только тем, кому оно включено, и сами откатываются к старому виду, когда его снимут.
+        'topup_intent_enabled': topup_intent_enabled_for(user),
     }
 
 

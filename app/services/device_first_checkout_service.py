@@ -33,6 +33,7 @@ from app.database.models import (
     DeviceFirstNotificationOutbox,
     DeviceFirstOutbox,
     DeviceFirstReconciliationCredit,
+    PlategaPayment,
     Subscription,
     SubscriptionCheckout,
     SubscriptionEntitlementTerm,
@@ -1432,6 +1433,207 @@ async def create_or_resume_direct_checkout(
         initial_lifecycle_state='confirmed',
     )
     return FusedDirectCheckout(checkout=checkout, proceed_to_payment=True)
+
+
+# --- ВК-16 (16а-1): доплата помнит заказ ---------------------------------------------------------------------
+# 🔴 Решение владельца 05.10.2026 «Оформляется само» разворачивает решение 02.09 «одно нажатие»: доплата под заказ
+# оформит его без нажатия (16а-2, при зачислении). Здесь — память о заказе в счёте и честный ответ ДО счёта.
+TOPUP_INTENT_KEY = 'topup_intent'
+TOPUP_INTENT_TTL = timedelta(hours=1)
+# Счёт Platega живёт ≈30 минут; если провайдер срок не назвал, считаем по этому числу.
+TOPUP_INTENT_INVOICE_TTL = timedelta(minutes=30)
+# 🔴 Только стенды — ответ владельца 07.10.2026 17:10: «если все будет отлично - ты просто сделаешь это постоянным
+# решение в коде а не городить всякие переключатели в админке». Переключателя нет НАМЕРЕННО: на всех — отдельным PR
+# после живого прохода и слова владельца; быстрое выключение — откат этого PR.
+TOPUP_INTENT_STANDS_ONLY = True
+_TOPUP_INTENT_LIVE_INVOICE_STATUSES = frozenset({'PENDING', 'INPROGRESS'})
+
+
+class TopUpIntentDecision(NamedTuple):
+    """Что делать с доплатой под заказ до счёта — полный список исходов (стартер ВК-16, 16а-1)."""
+
+    status: str
+    reason: str | None = None
+    amount_kopeks: int = 0
+    price_kopeks: int | None = None
+    intent: dict[str, Any] | None = None
+    checkout_public_id: str | None = None
+    payment: PlategaPayment | None = None
+
+
+def topup_intent_enabled_for(user: User) -> bool:
+    """Включено ли автооформление доплаты этому человеку — одна функция для счёта, зачисления и экранов."""
+    if not TOPUP_INTENT_STANDS_ONLY:
+        return True
+    from app.services.user_service import is_test_account
+
+    return is_test_account(user)
+
+
+def _intent_time(raw: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def topup_intent_of(payment: Any) -> dict[str, Any] | None:
+    metadata = getattr(payment, 'metadata_json', None)
+    intent = metadata.get(TOPUP_INTENT_KEY) if isinstance(metadata, dict) else None
+    return intent if isinstance(intent, dict) else None
+
+
+def topup_intent_outcome(payment: Any) -> tuple[str | None, str | None, str | None]:
+    """Исход для экрана: (`waiting` | `fulfilled` | `refused`, номер заказа, причина); без намерения — пусто.
+
+    Читается из намерения, а не из `is_paid`: поздний «отменён» по счёту-сироте повторного POST находит строку по
+    `correlation_id` и пишет `is_paid=false` (мина OH), но метаданных не трогает.
+    """
+    intent = topup_intent_of(payment)
+    if intent is None:
+        return None, None, None
+    status = intent.get('status')
+    if status == 'pending':
+        return 'waiting', None, None
+    if status == 'fulfilled':
+        return 'fulfilled', intent.get('checkout_public_id'), None
+    # `refused` несёт свою причину; `replaced` и `cancelled` — сами причина.
+    return 'refused', None, intent.get('reason') if status == 'refused' else str(status)
+
+
+def _topup_intent_awaits_outcome(payment: PlategaPayment, intent: dict[str, Any], *, now: datetime) -> str | None:
+    """`paid` — деньги пришли, исхода ещё нет; `invoice` — живой неоплаченный счёт; иначе ничего."""
+    created_at = _intent_time(intent.get('created_at'))
+    if intent.get('status') != 'pending' or created_at is None or created_at < now - TOPUP_INTENT_TTL:
+        return None
+    if payment.is_paid or payment.transaction_id is not None:
+        return 'paid'
+    expires_at = payment.expires_at or created_at + TOPUP_INTENT_INVOICE_TTL
+    if str(payment.status or '').upper() in _TOPUP_INTENT_LIVE_INVOICE_STATUSES and expires_at > now:
+        return 'invoice'
+    return None
+
+
+async def _recent_topup_intent_payments(db: AsyncSession, *, user_id: int, now: datetime) -> list[PlategaPayment]:
+    rows = (
+        await db.execute(
+            select(PlategaPayment)
+            .where(PlategaPayment.user_id == user_id, PlategaPayment.created_at >= now - 2 * TOPUP_INTENT_TTL)
+            .order_by(PlategaPayment.id.desc())
+        )
+    ).scalars()
+    return [payment for payment in rows if topup_intent_of(payment) is not None]
+
+
+async def prepare_topup_intent(
+    db: AsyncSession,
+    *,
+    user: User,
+    period_days: int,
+    devices: int,
+    method_code: int,
+    min_kopeks: int,
+    max_kopeks: int,
+) -> TopUpIntentDecision:
+    """Решить до счёта, что делать с доплатой под заказ (замысел v2, правила 6 и 9).
+
+    Пишет только то, что пишет сама `get_open_checkout_for_user` (истечение протухшего заказа). Порядок проверок —
+    контракт: выключено → обычное пополнение, как сегодня, без единой проверки ниже.
+    """
+    if not topup_intent_enabled_for(user):
+        return TopUpIntentDecision('ordinary', 'disabled')
+    if user.account_erasure_requested_at is not None or user.account_erased_at is not None:
+        return TopUpIntentDecision('ordinary', 'account_erasure')
+    options = await build_purchase_options(db, user)
+    try:
+        if not options.get('eligible'):
+            raise DeviceFirstError('legacy_only', 'Device-first checkout is unavailable')
+        price = _fused_selection_price(options, period_days=period_days, selected_device_limit=devices)
+    except DeviceFirstError:
+        return TopUpIntentDecision('ordinary', 'unavailable')
+    try:
+        open_checkout = await get_open_checkout_for_user(db, user_id=user.id)
+    except DeviceFirstError:
+        # Испорченный признак расчёта у заказа — это разбор, а не повод выставить счёт поверх.
+        return TopUpIntentDecision('order_on_review')
+    if open_checkout is not None and open_checkout.lifecycle_state not in {'draft', 'confirmed'}:
+        # Живой счёт, выдача или разбор: новый счёт поверх — вторые деньги за один заказ. Заказ «на разборе» к
+        # заказу не ведёт (ревизия ВК-15, п.2): там ждёт поддержка.
+        status = 'order_on_review' if open_checkout.lifecycle_state == 'operator_review' else 'open_order'
+        return TopUpIntentDecision(status, checkout_public_id=open_checkout.public_id)
+    now = datetime.now(UTC)
+    for payment in await _recent_topup_intent_payments(db, user_id=user.id, now=now):
+        intent = topup_intent_of(payment)
+        decided_at = _intent_time(intent.get('decided_at'))
+        if intent.get('status') == 'fulfilled' and decided_at is not None and decided_at >= now - TOPUP_INTENT_TTL:
+            # Вечная кнопка в чате после оформления купила бы второй срок (замысел v2, правило 6).
+            return TopUpIntentDecision('already_fulfilled', checkout_public_id=intent.get('checkout_public_id'))
+        awaiting = _topup_intent_awaits_outcome(payment, intent, now=now)
+        same_invoice = (intent.get('period_days'), intent.get('devices'), intent.get('method')) == (
+            period_days,
+            devices,
+            method_code,
+        )
+        if awaiting == 'paid' or (awaiting == 'invoice' and same_invoice):
+            return TopUpIntentDecision('already_paying', payment=payment)
+    balance = int(user.balance_kopeks or 0)
+    if balance >= price:
+        return TopUpIntentDecision('balance_covers', price_kopeks=price)
+    amount = device_first_top_up_kopeks(price_kopeks=price, balance_kopeks=balance)
+    if not min_kopeks <= amount <= max_kopeks:
+        # Минимум способа сужен в админке выше формулы кассы (мина ON): сумму не подменяем — бот и письмо назвали
+        # бы одну, счёт другую.
+        return TopUpIntentDecision('ordinary', 'unavailable')
+    current = options.get('current_subscription') or {}
+    return TopUpIntentDecision(
+        'accepted',
+        amount_kopeks=amount,
+        price_kopeks=price,
+        intent={
+            'period_days': period_days,
+            'devices': devices,
+            'quote_kopeks': price,
+            'tariff_id': options['tariff']['id'],
+            'method': method_code,
+            'had_subscription': bool(current),
+            'subscription_id': current.get('id'),
+            'subscription_tariff_id': current.get('tariff_id'),
+            'subscription_is_trial': current.get('is_trial'),
+            'created_at': now.isoformat(),
+            'status': 'pending',
+        },
+    )
+
+
+async def replace_older_topup_intents(db: AsyncSession, *, user_id: int, newer_payment_id: int) -> int:
+    """Новое намерение заменяет СВОИ неоплаченные старые (смена способа оплаты — стартер ВК-16, 16а-1).
+
+    🔴 «Новейший побеждает» (`id < newer_payment_id`): два одновременных нажатия не гасят друг друга. Строка берётся под
+    `FOR UPDATE` и перечитывается: вебхук мог оплатить её секунду назад — оплаченное не трогаем.
+    """
+    now = datetime.now(UTC)
+    older = [p.id for p in await _recent_topup_intent_payments(db, user_id=user_id, now=now) if p.id < newer_payment_id]
+    replaced = 0
+    for payment_id in sorted(older):
+        locked = (
+            await db.execute(
+                select(PlategaPayment)
+                .where(PlategaPayment.id == payment_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        intent = topup_intent_of(locked)
+        if intent is None or intent.get('status') != 'pending' or locked.is_paid or locked.transaction_id is not None:
+            continue
+        locked.metadata_json = {
+            **locked.metadata_json,
+            TOPUP_INTENT_KEY: {**intent, 'status': 'replaced', 'replaced_by': newer_payment_id},
+        }
+        replaced += 1
+    await db.commit()
+    return replaced
 
 
 async def confirm_checkout(db: AsyncSession, checkout: SubscriptionCheckout) -> SubscriptionCheckout:

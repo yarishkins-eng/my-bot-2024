@@ -64,6 +64,13 @@ class PaymentMethodResponse(BaseModel):
     open_url_direct: bool = False
 
 
+class TopUpIntent(BaseModel):
+    """ВК-16 (16а-1): заказ, ради которого доплачивают, — срок и устройства. Цену и сумму считает сервер."""
+
+    period_days: int = Field(..., ge=1, le=3650)
+    devices: int = Field(..., ge=1, le=100)
+
+
 class TopUpRequest(BaseModel):
     """Request to create payment for balance top-up."""
 
@@ -80,17 +87,32 @@ class TopUpRequest(BaseModel):
     # об этом нельзя — оба запроса выглядят одинаково, знает только сам кабинет.
     # Пусто → прежнее поведение (сайт): старая сборка кабинета поля не шлёт.
     return_surface: str | None = Field(None, description="Where to send the payer back: 'telegram' or 'web'")
+    # 🔴 ВК-16 (16а-1). Доплата под заказ: при намерении сумму к оплате считает сервер, `amount_kopeks` клиента
+    # идёт только в обычное пополнение (исход `ordinary`). Без намерения ответ прежний байт в байт.
+    intent: TopUpIntent | None = Field(None, description='Order this top-up pays for (device-first checkout)')
 
 
 class TopUpResponse(BaseModel):
-    """Response with payment info."""
+    """Response with payment info.
 
-    payment_id: str
-    payment_url: str
+    🔴 ВК-16 (16а-1): при намерении `intent_status` говорит исход, и у части исходов счёта нет — поэтому
+    `payment_id`/`payment_url` необязательны. Исходы: `accepted` (счёт с намерением — «оформится само»),
+    `ordinary` + `intent_reason` (обычное пополнение без обещания), `open_order`, `order_on_review`,
+    `already_paying` (счёт того же заказа), `already_fulfilled`, `balance_covers`, `invoice_not_created`.
+    """
+
+    payment_id: str | None = None
+    payment_url: str | None = None
     amount_kopeks: int
     amount_rubles: float
     status: str
     expires_at: datetime | None = None
+    intent_status: str | None = None
+    intent_reason: str | None = None
+    checkout_public_id: str | None = None
+    period_days: int | None = None
+    devices: int | None = None
+    price_kopeks: int | None = None
 
 
 class StarsInvoiceRequest(BaseModel):
@@ -135,6 +157,11 @@ class PendingPaymentResponse(BaseModel):
     # боте поля не увидит и обязан показать прежний текст: обещать оставшийся шаг тому, за кого
     # деньги потратит автопокупка или автоплатёж, опаснее, чем промолчать.
     purchase_step_pending: bool = False
+    # 🔴 ВК-16 (16а-1). Исход заказа, ради которого доплачивали: `waiting` / `fulfilled` (+ номер заказа) /
+    # `refused` (+ причина). Нет намерения — пусто. Экран ждёт ЗАКАЗ, а не деньги (замысел v2, правило 1).
+    intent_outcome: str | None = None
+    intent_checkout_public_id: str | None = None
+    intent_reason: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
