@@ -79,6 +79,17 @@ def test_catalog_covers_every_recorded_notification_type() -> None:
     assert not missing, f'бот отправляет типы, которых нет в каталоге экрана: {sorted(missing)}'
 
 
+def test_end_of_subscription_cards_count_their_letters() -> None:
+    """ВК-4 (АП-0): у «Пробный истёк» и «Подписка истекла» вместо счётчика был прочерк.
+
+    Письмо о конце не оставляло отметок, и карточка не могла сказать, ушло ли оно хоть раз — а за
+    30 дней до этапа оно не ушло ни разу. Обратную сторону (каждый тип каталога правда пишет
+    отправитель) держит `test_every_catalogued_sent_type_is_really_recorded`.
+    """
+    assert CATALOG_BY_ID['trial-expired'].get('sent_type') == 'trial_expired'
+    assert CATALOG_BY_ID['paid-expired'].get('sent_type') == 'subscription_expired'
+
+
 def test_catalog_days_match_the_bot_settings() -> None:
     """Дни у «истекает через N» зашиты в каталог, а бот берёт их из настройки.
 

@@ -87,6 +87,11 @@ class BotConfigurationService:
         'WEB_API_DEFAULT_TOKEN',
         'WEB_API_TOKEN_HMAC_SECRET',
         'WEBHOOK_SECRET_TOKEN',
+        # Не секрет, а мёртвый рычаг (ВК-4, АП-0): поле бот не читает нигде, письмо «пробный скоро
+        # истекает» берёт срок из раздела «Автосообщения». На экране «Настройки» оно обещало управление,
+        # которого нет, — в базе уже лежит выставленное кем-то «3». Поле из `Settings` не удаляем: это
+        # `config.py`, забор деплоя.
+        'TRIAL_WARNING_HOURS',
     }
 
     READ_ONLY_KEYS: set[str] = set()
