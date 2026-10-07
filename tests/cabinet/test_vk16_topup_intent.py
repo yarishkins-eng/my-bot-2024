@@ -1037,3 +1037,588 @@ async def test_other_method_with_intent_still_checks_the_client_amount(db, sessi
         )
 
     assert error.value.status_code == 400
+
+
+# =====================================================================================================================
+# Сторожа мутационного прогона ВК-16, 16а-1 (07.10.2026).
+# Дописываются В КОНЕЦ `tests/cabinet/test_vk16_topup_intent.py`: используют его импорты, фикстуры (`db`, `session`, `env`,
+# `provider`) и помощники (`_intent_payment`, `_decide`, `_request`, `_user`, `_set_user`, `_options`, константы).
+# В скобках после имени — поломка, которую сторож ловит (идентификатор мутации из отчёта). Каждый сторож проверен: на
+# исходном коде проходит, на своей мутации падает.
+# =====================================================================================================================
+
+
+def _ago(minutes: int) -> str:
+    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
+
+
+def _bare_payment(session, *, payment_id: int, metadata) -> None:
+    session.add(
+        PlategaPayment(
+            id=payment_id,
+            user_id=1,
+            amount_kopeks=10_000,
+            currency='RUB',
+            status='PENDING',
+            is_paid=False,
+            payment_method_code=2,
+            correlation_id=f'corr-{payment_id}',
+            metadata_json=metadata,
+            created_at=datetime.now(UTC),
+        )
+    )
+    session.commit()
+
+
+# --- кому включено и в каком порядке названа причина -------------------------------------------------------------
+
+
+async def test_erasure_is_named_before_restriction_when_both_apply(session, env):
+    # (S09, мелочь) порядок проверок в `topup_intent_unavailable_reason` — контракт: экран по причине решает, что показать.
+    _set_user(session, account_erasure_requested_at='2026-10-07 10:00:00', restriction_topup=1)
+
+    assert dfc.topup_intent_unavailable_reason(_user(session)) == 'account_erasure'
+
+
+# --- память о заказе в счёте: ключ, время, чужие и испорченные строки --------------------------------------------
+
+
+async def test_the_key_under_which_the_intent_is_remembered_is_a_stable_literal(db, session, provider):
+    # (S21) ключ лежит в базе: переименование осиротит живые счета и разойдётся с оформлением при зачислении (16а-2).
+    assert dfc.TOPUP_INTENT_KEY == 'topup_intent'
+
+    response = await balance_route.create_topup(request=_request(), user=_user(session), db=db)
+
+    stored = session.get(PlategaPayment, int(response.payment_id))
+    assert stored.metadata_json['topup_intent']['status'] == 'pending'
+
+
+async def test_naive_intent_time_is_read_as_utc_not_a_crash(db, session, env):
+    # (S11) время без пояса не должно ронять сравнение с «сейчас» — иначе пополнение человека падает на 2 часа.
+    naive = (datetime.now(UTC) - timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+    live = _intent_payment(session, payment_id=60, created_at=naive)
+
+    decision = await _decide(db, session)
+
+    assert (decision.status, decision.payment.id) == ('already_paying', live.id)
+
+
+@pytest.mark.parametrize('garbage', ['not-a-time', None, ''])
+async def test_garbage_intent_time_is_neither_live_nor_a_crash(db, session, env, garbage):
+    # (S12, S28) мусор вместо времени: счёт не считается «живым» (время рождения неизвестно), решение не падает.
+    _intent_payment(session, payment_id=60, created_at=garbage)
+
+    assert (await _decide(db, session)).status == 'accepted'
+
+
+@pytest.mark.parametrize('metadata', [None, {'topup_intent': 'garbage'}, {'topup_intent': ['x']}])
+async def test_other_payments_with_empty_or_broken_metadata_do_not_break_the_decision(db, session, env, metadata):
+    # (S13, S14) выборка читает ВСЕ платежи человека за 2 часа: пустые метаданные (NULL) и чужой мусор не должны её ронять.
+    _bare_payment(session, payment_id=95, metadata=metadata)
+
+    assert (await _decide(db, session)).status == 'accepted'
+
+
+# --- что считается живым счётом ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('provider_status', ['INPROGRESS', 'inprogress', 'pending'])
+async def test_invoice_in_progress_or_with_a_lowercase_status_is_still_live(db, session, env, provider_status):
+    # (S24, S31) те же статусы «ждёт оплаты», что у `_is_live_direct_provider_invoice`, и без учёта регистра.
+    live = _intent_payment(session, payment_id=61, provider_status=provider_status)
+
+    decision = await _decide(db, session)
+
+    assert (decision.status, decision.payment.id) == ('already_paying', live.id)
+
+
+async def test_invoice_with_a_provider_deadline_in_the_future_is_reused(db, session, env):
+    # (S32) срок провайдера, если назван и не вышел, не делает счёт мёртвым.
+    live = _intent_payment(session, payment_id=61, expires_in=timedelta(minutes=10))
+
+    decision = await _decide(db, session)
+
+    assert (decision.status, decision.payment.id) == ('already_paying', live.id)
+
+
+async def test_newest_live_invoice_of_the_same_order_is_the_one_reused(db, session, env):
+    # (S38, P29) два живых счёта одного заказа и способа (гонка двух запросов): отдаём самый новый.
+    _intent_payment(session, payment_id=60, created_ago=timedelta(minutes=10))
+    newest = _intent_payment(session, payment_id=61, created_ago=timedelta(minutes=5))
+
+    decision = await _decide(db, session)
+
+    assert (decision.status, decision.payment.id) == ('already_paying', newest.id)
+
+
+async def test_intent_row_older_than_two_hours_is_not_looked_at(db, session, env):
+    # (S37, необязательный: граничный случай) окно выборки — ровно вдвое шире срока намерения; всё, что старше, в решение
+    # не входит. Закрепляет документированное окно: расширять его без причины незачем.
+    _intent_payment(
+        session,
+        payment_id=53,
+        status='fulfilled',
+        is_paid=True,
+        transaction_id=903,
+        created_ago=timedelta(hours=3),
+        checkout_public_id='chk-ancient',
+        decided_at=_ago(10),
+    )
+
+    assert (await _decide(db, session)).status == 'accepted'
+
+
+async def test_paid_flag_alone_counts_as_money_that_has_come(db, session, env):
+    # (S29) вебхук успел поставить `is_paid`, а `transaction_id` ещё нет (или не поставит: ветка «пользователь не найден»).
+    found = _intent_payment(session, payment_id=67, provider_status='CONFIRMED', is_paid=True)
+
+    decision = await _decide(db, session, period_days=90, method=11)
+
+    assert (decision.status, decision.payment.id) == ('already_paid', found.id)
+
+
+# --- цена, баланс, сумма, порядок проверок ---------------------------------------------------------------------------
+
+
+async def test_price_and_amount_follow_the_requested_device_count(db, session, env):
+    # (P04) цену берём по ЗАПРОШЕННОМУ числу устройств; во всех прежних тестах устройство одно.
+    decision = await _decide(db, session, devices=2)
+
+    assert (decision.status, decision.price_kopeks, decision.amount_kopeks, decision.devices) == (
+        'accepted',
+        19_900,
+        14_900,
+        2,
+    )
+    assert (decision.intent['devices'], decision.intent['quote_kopeks']) == (2, 19_900)
+
+
+async def test_options_and_open_order_are_looked_up_for_this_very_user(db, session, env):
+    # (P07, X18) заглушки `build_purchase_options` и `get_open_checkout_for_user` принимают что угодно — закрепляем, ЧЬИ
+    # цены и ЧЕЙ заказ ищутся.
+    await _decide(db, session)
+
+    env.options.assert_awaited_once_with(db, _user(session))
+    env.open_checkout.assert_awaited_once_with(db, user_id=1)
+
+
+async def test_unpriceable_selection_is_answered_before_the_open_order_is_looked_up(db, session, env):
+    # (P15) порядок проверок — контракт (docstring `prepare_topup_intent`): цена → открытый заказ.
+    env.options.return_value = _options(eligible=False)
+    env.open_checkout.return_value = SimpleNamespace(
+        lifecycle_state='awaiting_funds', public_id='chk-live-7', period_days=90, selected_device_limit=2
+    )
+
+    decision = await _decide(db, session)
+
+    assert (decision.status, decision.reason) == ('ordinary', 'unavailable')
+    env.open_checkout.assert_not_awaited()
+
+
+async def test_refused_intent_with_a_fresh_decision_time_does_not_block_a_new_invoice(db, session, env):
+    # (P17) запирает только ОФОРМЛЕННЫЙ заказ: отказ (деньги остались на балансе) не должен держать человека час.
+    _intent_payment(
+        session,
+        payment_id=53,
+        status='refused',
+        reason='price_changed',
+        provider_status='CONFIRMED',
+        is_paid=True,
+        transaction_id=903,
+        decided_at=_ago(10),
+    )
+
+    assert (await _decide(db, session)).status == 'accepted'
+
+
+async def test_fulfilled_intent_without_a_decision_time_does_not_crash(db, session, env):
+    # (P18) защита от строки «оформлено» без времени решения: не падаем и не запираем.
+    _intent_payment(
+        session,
+        payment_id=54,
+        status='fulfilled',
+        provider_status='CONFIRMED',
+        is_paid=True,
+        transaction_id=904,
+        checkout_public_id='chk-x',
+    )
+
+    assert (await _decide(db, session)).status == 'accepted'
+
+
+@pytest.mark.parametrize('overrides', [{'devices': 2}, {'period_days': 90}])
+async def test_live_invoice_of_another_order_is_not_reused_even_with_the_same_amount_and_price(
+    db, session, env, overrides
+):
+    # (P27, P28) заказ различается сроком и устройствами САМ по себе: сумма и цена в счёте их не заменяют (в прежних
+    # тестах они всегда расходились вместе с заказом, и проверка суммы прикрывала дыру в сравнении заказа).
+    _intent_payment(session, payment_id=63, **overrides)
+
+    assert (await _decide(db, session)).status == 'accepted'
+
+
+async def test_one_kopek_short_of_the_price_still_needs_an_invoice(db, session, env):
+    # (P33) баланс покрывает цену только при `>=`; недостача в копейку — это счёт на целый рубль.
+    _set_user(session, balance_kopeks=PRICE_30_1 - 1)
+
+    decision = await _decide(db, session)
+
+    assert (decision.status, decision.amount_kopeks) == ('accepted', 100)
+
+
+@pytest.mark.parametrize(
+    ('intent', 'expected'),
+    [
+        ({'provider_status': 'CONFIRMED', 'is_paid': True, 'transaction_id': 903}, 'already_paid'),
+        (
+            {
+                'status': 'fulfilled',
+                'is_paid': True,
+                'transaction_id': 904,
+                'checkout_public_id': 'chk-done-5',
+                'decided_at': _ago(10),
+            },
+            'already_fulfilled',
+        ),
+    ],
+)
+async def test_credited_money_is_named_before_the_balance_that_now_covers_the_price(db, session, env, intent, expected):
+    # (P35) деньги по намерению уже на балансе, поэтому он «покрывает» цену, — но это исход намерения, а не повод
+    # купить с баланса руками поверх оформления, которое идёт само.
+    _intent_payment(session, payment_id=67, **intent)
+    _set_user(session, balance_kopeks=BALANCE + TOP_UP_30_1)
+
+    assert (await _decide(db, session)).status == expected
+
+
+@pytest.mark.parametrize(
+    ('min_kopeks', 'max_kopeks', 'expected'),
+    [
+        (TOP_UP_30_1, 100_000_000, ('accepted', None)),  # сумма ровно на нижней границе способа
+        (100, TOP_UP_30_1, ('accepted', None)),  # ровно на верхней
+        (100, TOP_UP_30_1 - 100, ('ordinary', 'unavailable')),  # выше верхней границы способа
+    ],
+)
+async def test_amount_on_the_method_bounds_is_accepted_and_above_the_max_is_not(
+    db, session, env, min_kopeks, max_kopeks, expected
+):
+    # (P41, P42, P43) границы включительно. Нижняя — не экзотика: при недостаче меньше минимума кассы сумма счёта
+    # равна именно минимуму, то есть всегда лежит на границе.
+    decision = await _decide(db, session, min_kopeks=min_kopeks, max_kopeks=max_kopeks)
+
+    assert (decision.status, decision.reason) == expected
+
+
+async def test_reused_invoice_names_the_requested_devices_and_price(db, session, env):
+    # (P55) у исхода без нового счёта экран показывает срок, устройства и цену заказа, о котором исход.
+    live = _intent_payment(session, payment_id=60, devices=2, quote_kopeks=19_900, amount_kopeks=14_900)
+
+    decision = await _decide(db, session, devices=2)
+
+    assert (decision.status, decision.payment.id) == ('already_paying', live.id)
+    assert (decision.devices, decision.price_kopeks, decision.period_days) == (2, 19_900, 30)
+
+
+async def test_balance_covers_names_the_requested_devices(db, session, env):
+    # (P53)
+    _set_user(session, balance_kopeks=19_900)
+
+    decision = await _decide(db, session, devices=2)
+
+    assert (decision.status, decision.devices, decision.period_days) == ('balance_covers', 2, 30)
+
+
+# --- замена своих неоплаченных ---------------------------------------------------------------------------------------
+
+
+async def test_replace_leaves_an_already_closed_older_intent_as_it_was(db, session, env):
+    # (R08) уже закрытое («cancelled») намерение не перезаписывается меткой «replaced» и не теряет свою причину.
+    newer = _intent_payment(session, payment_id=74, created_ago=timedelta(minutes=1))
+    _intent_payment(session, payment_id=70, status='cancelled')
+
+    assert await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=newer.id) == 0
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 70))['status'] == 'cancelled'
+
+
+async def test_replace_never_touches_a_row_the_webhook_has_flagged_paid(db, session, env):
+    # (R09) `is_paid` без `transaction_id` — тоже оплачено (вебхук ставит их не одним движением).
+    newer = _intent_payment(session, payment_id=74, created_ago=timedelta(minutes=1))
+    _intent_payment(session, payment_id=70, provider_status='CONFIRMED', is_paid=True)
+
+    assert await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=newer.id) == 0
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 70))['status'] == 'pending'
+
+
+async def test_replace_keeps_the_rest_of_the_intent_and_of_the_payment_metadata(db, session, env):
+    # (R12, R13) замена меняет метку, а не стирает память о заказе и прочие метаданные счёта (язык, способ).
+    newer = _intent_payment(session, payment_id=74, created_ago=timedelta(minutes=1))
+    _intent_payment(session, payment_id=70)
+
+    await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=newer.id)
+
+    stored = session.get(PlategaPayment, 70)
+    intent = dfc.topup_intent_of(stored)
+    assert (intent['status'], intent['replaced_by']) == ('replaced', 74)
+    assert (intent['period_days'], intent['devices'], intent['quote_kopeks'], intent['method']) == (
+        30,
+        1,
+        PRICE_30_1,
+        2,
+    )
+    assert 'created_at' in intent
+    assert (stored.metadata_json['language'], stored.metadata_json['selected_method']) == ('ru', 2)
+
+
+async def test_replace_is_committed(db, session, env):
+    # (R16) route не коммитит сам: без коммита внутри замена пропала бы вместе с сессией запроса.
+    newer = _intent_payment(session, payment_id=74, created_ago=timedelta(minutes=1))
+    _intent_payment(session, payment_id=70)
+
+    await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=newer.id)
+    session.rollback()  # всё, что не закоммичено, пропадает
+
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 70))['status'] == 'replaced'
+
+
+async def test_replace_with_a_newer_payment_that_has_no_intent_touches_nothing(db, session, env):
+    # (R19) страховка: если у «нового» платежа намерения нет (метаданные не легли), старые не трогаем и не падаем.
+    _bare_payment(session, payment_id=74, metadata={'language': 'ru'})
+    _intent_payment(session, payment_id=70)
+
+    assert await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=74) == 0
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 70))['status'] == 'pending'
+
+
+async def test_replace_skips_an_older_intent_whose_time_is_garbage(db, session, env):
+    # (R04) испорченное время у старого намерения: пропускаем, а не роняем выдачу счёта.
+    newer = _intent_payment(session, payment_id=74, created_ago=timedelta(minutes=1))
+    _intent_payment(session, payment_id=70, created_at='not-a-time')
+
+    assert await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=newer.id) == 0
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 70))['status'] == 'pending'
+
+
+async def test_row_that_lost_its_intent_between_read_and_lock_is_left_alone(db, session, env):
+    # (R11) как и «оплачено между чтением и замком»: перечитанная под замком строка без намерения пропускается.
+    newer = _intent_payment(session, payment_id=74, created_ago=timedelta(minutes=1))
+    held = _intent_payment(session, payment_id=70)  # сессия держит строку с намерением (ссылка — чтобы не потерялась)
+    session.execute(text('UPDATE platega_payments SET metadata_json = \'{"language": "ru"}\' WHERE id = 70'))
+    session.commit()
+
+    assert await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=newer.id) == 0
+    assert dfc.topup_intent_of(held) is None
+
+
+async def test_replace_locks_the_older_rows_one_by_one_in_ascending_order(db, session, env, monkeypatch):
+    # (R05, R06) FOR UPDATE и порядок захвата по возрастанию номера: два замещающих запроса не должны брать строки
+    # навстречу друг другу. SQLite замок не исполняет, поэтому смотрим на сами запросы, как их увидит Postgres.
+    from sqlalchemy.dialects import postgresql
+
+    newer = _intent_payment(session, payment_id=74, created_ago=timedelta(minutes=1))
+    _intent_payment(session, payment_id=70, created_ago=timedelta(minutes=9))
+    _intent_payment(session, payment_id=71, created_ago=timedelta(minutes=8))
+    locked, original = [], db.execute
+
+    async def spy(statement, *args, **kwargs):
+        compiled = statement.compile(dialect=postgresql.dialect())
+        if 'FOR UPDATE' in str(compiled):
+            locked.append(next(iter(compiled.params.values())))
+        return await original(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, 'execute', spy)
+
+    await dfc.replace_older_topup_intents(db, user_id=1, newer_payment_id=newer.id)
+
+    assert locked == [70, 71]
+
+
+# --- маршрут /topup ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('amount', 'detail'),
+    [(99, 'Minimum amount is 1.00 RUB'), (100, None), (1_000, None), (1_001, 'Maximum amount is 10.00 RUB')],
+)
+def test_top_up_amount_bounds_are_inclusive_and_name_the_right_limit(amount, detail):
+    # (B02, B03, B04, B05) сторожа предела суммы: максимум в прежних тестах не проверялся вовсе.
+    method = PaymentMethodResponse(id='platega', name='Platega', min_amount_kopeks=100, max_amount_kopeks=1_000)
+
+    if detail is None:
+        balance_route._check_top_up_amount(amount, method)
+        return
+    with pytest.raises(HTTPException) as error:
+        balance_route._check_top_up_amount(amount, method)
+    assert (error.value.status_code, error.value.detail) == (400, detail)
+
+
+async def test_route_other_method_with_intent_still_checks_the_client_amount(db, session, provider):
+    # (B09) отказ от проверки суммы при намерении действует только для Platega; у остальных способов она обязательна.
+    with pytest.raises(HTTPException) as error:
+        await balance_route.create_topup(
+            request=_request(method='yookassa', option=None, amount_kopeks=1), user=_user(session), db=db
+        )
+
+    assert (error.value.status_code, error.value.detail) == (400, 'Minimum amount is 1.00 RUB')
+
+
+@pytest.mark.parametrize('outcome', ['balance_covers', 'already_fulfilled', 'order_on_review'])
+async def test_route_every_outcome_without_an_invoice_has_no_payment_and_never_calls_the_provider(
+    db, session, provider, env, outcome
+):
+    # (B12, B13, B14, B39) прежние тесты проверяли это для open_order, already_paid и already_paying — не для этих.
+    if outcome == 'balance_covers':
+        _set_user(session, balance_kopeks=PRICE_30_1)
+    elif outcome == 'already_fulfilled':
+        _intent_payment(
+            session,
+            payment_id=50,
+            status='fulfilled',
+            is_paid=True,
+            transaction_id=900,
+            checkout_public_id='chk-done-5',
+            decided_at=_ago(10),
+        )
+    else:
+        env.open_checkout.return_value = SimpleNamespace(
+            lifecycle_state='operator_review', public_id='chk-rev-1', period_days=30, selected_device_limit=1
+        )
+
+    response = await balance_route.create_topup(request=_request(), user=_user(session), db=db)
+
+    assert response.intent_status == outcome
+    assert (response.payment_id, response.payment_url, response.amount_kopeks, response.status) == (
+        None,
+        None,
+        0,
+        'none',
+    )
+    assert provider.calls == []
+
+
+async def test_route_open_order_names_its_own_term_and_devices(db, session, provider, env):
+    # (B45) срок и устройства в ответе — найденного заказа, а не запрошенного.
+    env.open_checkout.return_value = SimpleNamespace(
+        lifecycle_state='awaiting_funds', public_id='chk-live-9', period_days=90, selected_device_limit=2
+    )
+
+    response = await balance_route.create_topup(request=_request(), user=_user(session), db=db)
+
+    assert (response.intent_status, response.checkout_public_id, response.period_days, response.devices) == (
+        'open_order',
+        'chk-live-9',
+        90,
+        2,
+    )
+
+
+async def test_route_invoice_description_and_rubles_carry_the_server_amount(db, session, provider):
+    # (B20, B31) человек видит в платёжной форме и в ответе ту сумму, которую реально платит, а не заглушку экрана.
+    response = await balance_route.create_topup(request=_request(), user=_user(session), db=db)
+
+    assert response.amount_rubles == TOP_UP_30_1 / 100
+    description = provider.calls[0]['description']
+    assert settings.format_price(TOP_UP_30_1) in description
+    assert settings.format_price(CLIENT_AMOUNT) not in description
+
+
+async def test_route_invoice_refused_with_intent_says_what_it_would_have_billed(db, session, provider):
+    # (B27, B29, B30) «счёт не выдан»: статус, сумма сервера, срок и устройства — для экрана заказа (текст ВК-15).
+    provider.fail = True
+
+    response = await balance_route.create_topup(request=_request(), user=_user(session), db=db)
+
+    assert (response.status, response.intent_status, response.payment_id, response.payment_url) == (
+        'failed',
+        'invoice_not_created',
+        None,
+        None,
+    )
+    assert (response.amount_kopeks, response.amount_rubles, response.period_days, response.devices) == (
+        TOP_UP_30_1,
+        TOP_UP_30_1 / 100,
+        30,
+        1,
+    )
+
+
+async def test_route_reopened_invoice_carries_the_provider_deadline(db, session, provider):
+    # (B41) срок счёта, если провайдер его назвал, нужен экрану для обратного отсчёта.
+    live = _intent_payment(session, payment_id=60, expires_in=timedelta(minutes=10))
+
+    again = await balance_route.create_topup(request=_request(), user=_user(session), db=db)
+
+    assert (again.intent_status, again.expires_at) == ('already_paying', live.expires_at)
+
+
+async def test_route_failed_replace_does_not_take_the_invoice_away(db, session, provider, monkeypatch):
+    # (B25, B26) счёт уже выдан: сбой замены старых намерений глотается, а сессия откатывается.
+    async def boom(*_, **__):
+        raise RuntimeError('db hiccup')
+
+    monkeypatch.setattr(balance_route, 'replace_older_topup_intents', boom)
+    rollback = AsyncMock()
+    monkeypatch.setattr(db, 'rollback', rollback)
+
+    response = await balance_route.create_topup(request=_request(), user=_user(session), db=db)
+
+    assert (response.intent_status, response.payment_url) == ('accepted', 'https://pay.test/new-1')
+    rollback.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ('min_kopeks', 'max_kopeks', 'client_amount'),
+    [(10_000, 100_000_000, CLIENT_AMOUNT), (100, 9_000, 5_000)],
+)
+async def test_route_hands_the_narrowed_method_range_to_the_decision(
+    db, session, provider, monkeypatch, min_kopeks, max_kopeks, client_amount
+):
+    # (B07, B08) диапазон способа сужен в админке: сервер не подменяет сумму (мина ON), счёт выставляется на сумму клиента.
+    async def narrowed(*_, **__):
+        return [
+            PaymentMethodResponse(
+                id='platega', name='Platega', min_amount_kopeks=min_kopeks, max_amount_kopeks=max_kopeks
+            )
+        ]
+
+    monkeypatch.setattr(balance_route, 'get_payment_methods', narrowed)
+
+    response = await balance_route.create_topup(
+        request=_request(amount_kopeks=client_amount), user=_user(session), db=db
+    )
+
+    assert (response.intent_status, response.intent_reason, response.amount_kopeks) == (
+        'ordinary',
+        'unavailable',
+        client_amount,
+    )
+
+
+# --- исход для экрана --------------------------------------------------------------------------------------------------
+
+
+async def test_replaced_or_cancelled_intent_that_got_paid_still_gets_the_purchase_hint(db, session, monkeypatch):
+    # (B54) закрытое до оплаты намерение сервер уже не оформит: подсказка «оформите подписку» обязана остаться.
+    hint = AsyncMock(return_value='Оформите подписку')
+    monkeypatch.setattr('app.services.payment.common.topup_pending_purchase_hint', hint)
+    _intent_payment(session, payment_id=82, status='replaced', provider_status='CONFIRMED', is_paid=True)
+
+    response = await balance_route.get_pending_payment_details(
+        method='platega', payment_id=82, user=_user(session), db=db
+    )
+
+    assert (response.intent_outcome, response.purchase_step_pending) == ('closed', True)
+
+
+async def test_unpaid_payment_is_never_asked_for_the_purchase_hint(db, session, monkeypatch):
+    # (B56) маршрут опрашивают раз в три секунды: подсказку спрашиваем только у оплаченного.
+    hint = AsyncMock(return_value='Оформите подписку')
+    monkeypatch.setattr('app.services.payment.common.topup_pending_purchase_hint', hint)
+    _intent_payment(session, payment_id=83, status='pending')  # PENDING у провайдера, не оплачен, намерение «ждём»
+    _bare_payment(session, payment_id=84, metadata={'language': 'ru'})  # обычное пополнение, не оплачено
+
+    for payment_id in (83, 84):
+        response = await balance_route.get_pending_payment_details(
+            method='platega', payment_id=payment_id, user=_user(session), db=db
+        )
+        assert response.purchase_step_pending is False
+    hint.assert_not_awaited()
