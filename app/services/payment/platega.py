@@ -187,6 +187,7 @@ class PlategaPaymentMixin:
         payment_method_code: int,
         return_url: str | None = None,
         failed_url: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         service: PlategaService | None = getattr(self, 'platega_service', None)
         if not service or not service.is_configured:
@@ -247,7 +248,11 @@ class PlategaPaymentMixin:
         status = str(response.get('status') or 'PENDING').upper()
         expires_at = PlategaService.parse_expires_at(response.get('expiresIn'))
 
+        # ВК-16 (16а-1): намерение доплаты кладётся сюда (`topup_intent`). Свои ключи — первыми: перекрыть
+        # базовые им нельзя. ⛔ Ключи device-first (`settlement_mode`, `device_first_attempt_id`) уводят вебхук
+        # в ветку прямой продажи без зачисления — через этот параметр их не передавать.
         metadata = {
+            **(extra_metadata or {}),
             'raw_response': response,
             'language': language,
             'selected_method': payment_method_code,

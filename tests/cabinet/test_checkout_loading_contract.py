@@ -24,7 +24,8 @@ async def test_options_explicitly_report_legacy_permission_independent_of_eligib
 
     result = await device_first.purchase_options(user=user, db=db)
 
-    assert result == {**payload, 'legacy_tariff_purchase_allowed': not public_rollout}
+    # ВК-16 (16а-1): + признак «доплата оформится сама»; у человека без Телеграма (не стенд) — выключен.
+    assert result == {**payload, 'legacy_tariff_purchase_allowed': not public_rollout, 'topup_intent_enabled': False}
     assert 'legacy_tariff_purchase_allowed' not in payload
     build.assert_awaited_once_with(db, user)
     db.commit.assert_not_awaited()
