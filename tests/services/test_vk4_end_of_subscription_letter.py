@@ -20,7 +20,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import (
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.methods import SendMessage
 from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, insert, text
 from sqlalchemy.orm import Session
@@ -497,6 +502,69 @@ async def test_a_blocked_bot_counts_as_delivered(env, db) -> None:
     )
     assert await _notify(db, _user(), _sub()) is True
     assert await _marks(db) == {(USER_ID, 233, 'trial_expired')}
+
+
+class _Log:
+    """Подменяет журнал службы и запоминает строки: (уровень, событие, поля)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def __getattr__(self, level: str):
+        return lambda event, *args, **fields: self.calls.append((level, event, fields))
+
+
+@pytest.mark.asyncio
+async def test_every_attempt_leaves_a_log_line_with_its_outcome(env, db, monkeypatch) -> None:
+    """Приёмка на боевом считает по журналу: у каждого исхода строка с источником, подпиской и сроком."""
+    log = _Log()
+    monkeypatch.setattr(monitoring_module, 'logger', log)
+    subscription = _sub()
+
+    assert await _notify(db, _user(), subscription) is True
+    assert await _notify(db, _user(), subscription) is False
+    env.bot.send_message.side_effect = TimeoutError
+    assert await _notify(db, _user(), _sub(sid=51)) is False
+    assert await _notify(db, _user(telegram_id=None), _sub(sid=52)) is False
+    monkeypatch.setattr(NotificationSettingsService, 'is_enabled', classmethod(lambda cls, key: False))
+    assert await _notify(db, _user(), _sub(sid=53)) is False
+
+    lines = [(event, fields) for level, event, fields in log.calls if event.startswith('Письмо о конце подписки')]
+    assert [(event, fields.get('reason'), fields['subscription_id']) for event, fields in lines] == [
+        ('Письмо о конце подписки отправлено', None, 233),
+        ('Письмо о конце подписки не отправлено', 'already_sent', 233),
+        ('Письмо о конце подписки не отправлено', 'not_delivered', 51),
+        ('Письмо о конце подписки не отправлено', 'no_telegram', 52),
+        ('Письмо о конце подписки не отправлено', 'switched_off', 53),
+    ]
+    assert all(fields['source'] == 'test' and fields['end_date'] is not None for _, fields in lines)
+
+
+_HICCUP_METHOD = SendMessage(chat_id=TELEGRAM_ID, text='x')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'error',
+    [
+        TelegramRetryAfter(method=_HICCUP_METHOD, message='Too Many Requests: retry after 5', retry_after=5),
+        TelegramServerError(method=_HICCUP_METHOD, message='Bad Gateway'),
+        TelegramNetworkError(method=_HICCUP_METHOD, message='Request timeout error'),
+    ],
+    ids=['429', '5xx', 'сеть'],
+)
+async def test_a_telegram_hiccup_is_a_warning_not_an_admin_alert(env, db, monkeypatch, error) -> None:
+    """Сбой связи с Телеграмом не уходит в админ-чат ошибкой: отметки нет, письмо допишет обход."""
+    log = _Log()
+    monkeypatch.setattr(monitoring_module, 'logger', log)
+    env.bot.send_message.side_effect = error
+    env.logo.side_effect = error
+
+    assert await _notify(db, _user(), _sub(sid=61)) is False
+    assert await _notify(db, _user(), _sub(sid=62, is_trial=False, tariff_id=PAID_TARIFF_ID)) is False
+
+    assert await _marks(db) == set()
+    assert [event for level, event, _ in log.calls if level in {'error', 'exception', 'critical'}] == []
 
 
 @pytest.mark.asyncio

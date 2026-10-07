@@ -8,7 +8,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import structlog
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -2630,20 +2636,32 @@ class MonitoringService:
                 end_date=subscription.end_date,
             )
             return False
+
+        def skipped(reason: str) -> bool:
+            # Каждый выход — строкой журнала: приёмка видит, почему на событие не было письма и кто его написал.
+            logger.info(
+                'Письмо о конце подписки не отправлено',
+                reason=reason,
+                subscription_id=subscription.id,
+                end_date=subscription.end_date,
+                source=source,
+            )
+            return False
+
         # Без Телеграма писать некуда: почта не настроена, а окно кабинета сегодня никто не видит.
         if not self.bot or not user.telegram_id or user.status != UserStatus.ACTIVE.value:
-            return False
+            return skipped('no_telegram')
         trial = await is_canonical_trial(db, subscription)
         if trial:
             if not NotificationSettingsService.is_enabled('trial_expired'):
-                return False
+                return skipped('switched_off')
         elif not NotificationSettingsService.is_enabled('subscription_expired'):
-            return False
+            return skipped('switched_off')
         if settings.is_multi_tariff_enabled() and await self._has_other_active_subscription(db, user, subscription):
-            return False
+            return skipped('other_subscription_active')
         mark = 'trial_expired' if trial else 'subscription_expired'
         if await self._end_letter_already_sent(db, subscription, mark):
-            return False
+            return skipped('already_sent')
 
         if trial:
             delivered = await self._send_trial_expired_notification(
@@ -2652,7 +2670,7 @@ class MonitoringService:
         else:
             delivered = await self._send_subscription_expired_notification(user, subscription, tariff_name=tariff_name)
         if not delivered:
-            return False
+            return skipped('not_delivered')
         # Отметка прошлого конца (подписку оживили без продления) больше не нужна: без её снятия
         # `record_notification` счёл бы новую повтором и не записал.
         await clear_notification_by_type(db, subscription.id, mark, commit=False)
@@ -2660,10 +2678,12 @@ class MonitoringService:
             await record_notification(db, user.id, subscription.id, 'trial_expired')
         else:
             await record_notification(db, user.id, subscription.id, 'subscription_expired')
+        # «Отправлено» включает и заблокировавших бота: их отдельно называет строка «Пользователь недоступен».
         logger.info(
             'Письмо о конце подписки отправлено',
             subscription_id=subscription.id,
             user_id=user.id,
+            end_date=subscription.end_date,
             trial=trial,
             source=source,
         )
@@ -2834,6 +2854,12 @@ class MonitoringService:
                 exc=exc,
             )
             return False
+        except (TelegramNetworkError, TelegramRetryAfter, TelegramServerError) as exc:
+            # Сбой связи с Телеграмом — не повод звать владельца: письмо допишет часовой обход.
+            logger.warning(
+                'Сбой Телеграма при отправке уведомления об истечении подписки', telegram_id=user.telegram_id, exc=exc
+            )
+            return False
         except Exception as e:
             logger.error(
                 'Ошибка отправки уведомления об истечении подписки пользователю', telegram_id=user.telegram_id, e=e
@@ -2906,7 +2932,7 @@ class MonitoringService:
                 exc=exc,
             )
             return False
-        except (TelegramNetworkError, TimeoutError) as exc:
+        except (TelegramNetworkError, TelegramRetryAfter, TelegramServerError, TimeoutError) as exc:
             logger.warning(
                 'Таймаут отправки уведомления о завершении пробного периода',
                 telegram_id=user.telegram_id,
