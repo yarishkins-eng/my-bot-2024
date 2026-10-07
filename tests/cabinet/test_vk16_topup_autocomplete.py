@@ -331,6 +331,33 @@ async def test_resumed_foreign_order_is_never_closed_by_the_refusal(session, buy
     assert session.get(SubscriptionCheckout, 400).lifecycle_state == 'conflict'
 
 
+async def test_order_that_won_the_race_is_named_and_not_paid_again(session, buy, monkeypatch):
+    # Между сверкой и оформлением другой путь успел создать оплаченный заказ: его состояние — ответ, второго нет.
+    winner = _add_checkout(session, checkout_id=402, source='cabinet', lifecycle_state='fulfilling')
+
+    async def create(db_, **kwargs):
+        buy.create.append(kwargs)
+        return dfc.FusedDirectCheckout(checkout=winner, proceed_to_payment=False)
+
+    monkeypatch.setattr(dfc, 'create_or_resume_direct_checkout', create)
+    _paid(session)
+
+    _, stored = await _complete(session)
+
+    assert (stored['status'], stored['reason'], stored['checkout_public_id']) == ('refused', 'open_order', 'chk-402')
+    assert buy.commit == []
+
+
+async def test_tariff_that_is_no_longer_sold_is_refused_even_if_a_price_is_left(session, buy, env):
+    env.options.return_value = {**_options(), 'eligible': False}
+    _paid(session)
+
+    _, stored = await _complete(session)
+
+    assert (stored['status'], stored['reason']) == ('refused', 'unavailable')
+    assert buy.create == []
+
+
 async def test_crash_inside_the_purchase_is_a_refusal_never_silence(session, buy):
     async def crash(checkout):
         raise RuntimeError('panel exploded')

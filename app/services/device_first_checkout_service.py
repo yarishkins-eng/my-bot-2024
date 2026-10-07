@@ -1832,7 +1832,7 @@ async def _close_own_topup_checkout(db: AsyncSession, checkout_id: int | None) -
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if checkout is None or checkout.source != TOPUP_INTENT_SOURCE:
+    if checkout is None:  # чужой сюда не попадает: в `own` кладётся только заказ с `source=topup_intent`
         await db.rollback()
         return None
     if checkout.financial_committed_at is not None:
