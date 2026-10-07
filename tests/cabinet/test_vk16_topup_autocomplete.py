@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import html
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database.models import PlategaPayment, SubscriptionCheckout, Transaction, User
+from app.localization.texts import get_texts
 from app.services import device_first_checkout_service as dfc, device_first_payment_service
 from app.services.payment.platega import PlategaPaymentMixin
 from tests.cabinet.test_vk16_topup_intent import (  # noqa: F401 -- фикстуры стенда 16а-1
@@ -35,7 +37,13 @@ from tests.cabinet.test_vk16_topup_intent import (  # noqa: F401 -- фиксту
 )
 
 
-TRIAL = {'had_subscription': True, 'subscription_id': 41, 'subscription_tariff_id': 5, 'subscription_is_trial': True}
+TRIAL = {
+    'tariff_id': 3,
+    'had_subscription': True,
+    'subscription_id': 41,
+    'subscription_tariff_id': 5,
+    'subscription_is_trial': True,
+}
 
 
 @pytest.fixture
@@ -358,6 +366,34 @@ async def test_tariff_that_is_no_longer_sold_is_refused_even_if_a_price_is_left(
     assert buy.create == []
 
 
+async def test_other_tariff_on_sale_now_is_refused_even_at_the_same_price(session, buy):
+    _paid(session, tariff_id=4)
+
+    _, stored = await _complete(session)
+
+    assert (stored['status'], stored['reason']) == ('refused', 'price_changed')
+    assert buy.create == []
+
+
+async def test_resumed_foreign_order_charged_then_crashed_is_reported_as_fulfilled(session, buy):
+    # Чужой заказ той же конфигурации списан, а потом упало: «оформите сами» толкнуло бы ко второй покупке.
+    foreign = _add_checkout(session, checkout_id=401, source='cabinet')
+    buy.resume = foreign
+
+    async def charged_then_crash(checkout):
+        checkout.financial_committed_at = datetime.now(UTC)
+        checkout.lifecycle_state = 'fulfilling'
+        session.commit()
+        raise RuntimeError('refresh failed')
+
+    buy.commit_effect = charged_then_crash
+    _paid(session)
+
+    _, stored = await _complete(session)
+
+    assert (stored['status'], stored['checkout_public_id']) == ('fulfilled', 'chk-401')
+
+
 async def test_crash_inside_the_purchase_is_a_refusal_never_silence(session, buy):
     async def crash(checkout):
         raise RuntimeError('panel exploded')
@@ -446,7 +482,11 @@ def webhook(monkeypatch, buy):
         AsyncMock(side_effect=AssertionError('намерение не прямая продажа')),
     )
 
-    bot = SimpleNamespace(send_message=AsyncMock(), delete_message=AsyncMock())
+    async def send_message(*args, **kwargs):
+        calls.carts_cleared_before_message.append(carts.clear_topup_intent.await_count == 1)
+
+    calls.carts_cleared_before_message = []
+    bot = SimpleNamespace(send_message=AsyncMock(side_effect=send_message), delete_message=AsyncMock())
 
     class _Service(PlategaPaymentMixin):
         def __init__(self):
@@ -478,28 +518,36 @@ async def test_webhook_credits_then_completes_then_runs_side_effects_and_skips_t
     assert stored.metadata_json['balance_credited'] is True
     assert session.get(User, 1).balance_kopeks == BALANCE + TOP_UP_30_1 - PRICE_30_1
     webhook.bot.send_message.assert_not_awaited()  # «Пополнение успешно… сама не оплатится» оформленному — ложь
-    assert webhook.admin[0]['auto_next_step'] == 'заказ chk-501 оформлен сам с баланса'
+    assert webhook.admin[0]['auto_next_step'] == 'заказ на 30 дн., устройств 1 оформлен сам с баланса'
     webhook.erasure.assert_awaited_once()
     webhook.carts.delete_user_cart.assert_awaited_once_with(1)
     webhook.carts.clear_topup_intent.assert_awaited_once_with(1)
 
 
 async def test_deposit_is_committed_before_the_hook_opens_its_own_session(db, session, webhook, monkeypatch):
+    # Ловушка 11: своя сессия оформления открывается, когда депозит уже ЗАКОММИЧЕН сессией вебхука. Смотрим на сами
+    # коммиты: баланс, с которым прошёл последний коммит до открытия своей сессии (`flush` вместо `commit` не прошёл бы).
+    committed_balances: list[int] = []
+    real_commit = db.commit
+
+    async def recording_commit():
+        await real_commit()
+        committed_balances.append(session.get(User, 1).balance_kopeks)
+
     seen = {}
     real = dfc._topup_intent_session
 
     def watching_session():
-        # В момент открытия своей сессии деньги уже должны лежать в базе, а не в памяти сессии вебхука.
-        seen['balance'] = session.execute(text('SELECT balance_kopeks FROM users WHERE id = 1')).scalar_one()
-        seen['committed'] = not session.dirty and not session.new
+        seen['last_commit_balance'] = committed_balances[-1] if committed_balances else None
         return real()
 
+    monkeypatch.setattr(db, 'commit', recording_commit)
     monkeypatch.setattr(dfc, '_topup_intent_session', watching_session)
     _intent_payment(session, payment_id=97, **TRIAL)
 
     await _pay(db, webhook)
 
-    assert seen == {'balance': BALANCE + TOP_UP_30_1, 'committed': True}
+    assert seen == {'last_commit_balance': BALANCE + TOP_UP_30_1}
 
 
 async def test_refused_intent_still_tells_about_the_money_but_not_through_the_old_chain(db, session, webhook):
@@ -510,7 +558,12 @@ async def test_refused_intent_still_tells_about_the_money_but_not_through_the_ol
     session.expire_all()
     assert dfc.topup_intent_outcome(session.get(PlategaPayment, 97)) == ('refused', None, 'subscription_changed')
     webhook.bot.send_message.assert_awaited_once()
-    assert 'Пополнение успешно' in webhook.bot.send_message.await_args.args[1]
+    text_ = webhook.bot.send_message.await_args.args[1]
+    assert 'Пополнение успешно' in text_
+    # Хвост «оформите сами» — без заборов старой автопокупки: её здесь не будет (клиент 106).
+    assert html.escape(get_texts('ru').TOPUP_SUBSCRIPTION_NOT_PAID_HINT) in text_
+    assert 'Баланс пополнен автоматически' not in text_
+    assert webhook.carts_cleared_before_message == [True]
     assert 'cart_chain' not in webhook.order
     assert webhook.admin[0]['auto_next_step'] is None
     webhook.erasure.assert_awaited_once()
@@ -548,3 +601,80 @@ async def test_top_up_without_intent_runs_the_old_chain_and_no_hook(db, session,
 
     assert webhook.order == ['side_effects', 'cart_chain']
     webhook.erasure.assert_not_awaited()
+
+
+# --- настоящая асинхронная сессия: то, чего не видит синхронная обёртка ------------------------------------------
+
+
+async def test_own_session_loads_the_user_with_promo_groups_so_pricing_does_not_crash(tmp_path, monkeypatch, env):
+    # 🔴 P0 волны 1: голый `select(User)` в свежей AsyncSession, и первая же строка цены
+    # (`user.get_primary_promo_group()`) роняла ленивую подгрузку `promo_group` — MissingGreenlet, отказ у каждого.
+    # Синхронная обёртка остальных сторожей этого не видит: здесь настоящий aiosqlite и настоящая загрузка.
+    import importlib
+    import sys
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    # `tests/conftest.py` подкладывает пустой модуль `aiosqlite`, чтобы приложение не требовало драйвер; здесь нужен
+    # настоящий — подставляем его только на время теста.
+    stub = sys.modules.pop('aiosqlite', None)
+    try:
+        real_driver = importlib.import_module('aiosqlite')
+    finally:
+        if stub is not None:
+            sys.modules['aiosqlite'] = stub
+    monkeypatch.setitem(sys.modules, 'aiosqlite', real_driver)
+
+    from app.database.models import (
+        PromoGroup,
+        ServerSquad,
+        Subscription,
+        Tariff,
+        UserPromoGroup,
+        server_squad_promo_groups,
+    )
+
+    engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "own.db"}')
+    async with engine.begin() as connection:
+        models = (User, PlategaPayment, Transaction, Subscription, Tariff, PromoGroup, UserPromoGroup, ServerSquad)
+        for table in [model.__table__ for model in models] + [server_squad_promo_groups]:
+            columns = ', '.join(
+                'id INTEGER PRIMARY KEY' if column.name == 'id' else column.name for column in table.columns
+            )
+            await connection.execute(text(f'CREATE TABLE {table.name} ({columns})'))
+        await connection.execute(text("INSERT INTO promo_groups (id, name, priority) VALUES (7, 'Базовая', 0)"))
+        await connection.execute(
+            text(
+                'INSERT INTO users (id, telegram_id, balance_kopeks, status, language, promo_group_id) '
+                f"VALUES (1, 777001, {BALANCE + TOP_UP_30_1}, 'active', 'ru', 7)"
+            )
+        )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as setup:
+        intent = {**TRIAL, 'period_days': 30, 'devices': 1, 'quote_kopeks': PRICE_30_1, 'method': 2}
+        intent.update(created_at=datetime.now(UTC).isoformat(), status='pending', tariff_id=4)  # → отказ по тарифу
+        setup.add(
+            PlategaPayment(
+                id=97,
+                user_id=1,
+                amount_kopeks=TOP_UP_30_1,
+                currency='RUB',
+                status='CONFIRMED',
+                is_paid=True,
+                correlation_id='corr-97',
+                metadata_json={dfc.TOPUP_INTENT_KEY: intent},
+            )
+        )
+        await setup.commit()
+
+    async def pricing(db_, user):
+        assert user.get_primary_promo_group().id == 7  # ровно то, с чего начинается настоящая цена
+        return _options()
+
+    monkeypatch.setattr(dfc, 'build_purchase_options', pricing)
+    monkeypatch.setattr(dfc, '_topup_intent_session', factory)
+
+    final = await dfc.complete_topup_intent(payment_id=97)
+
+    assert (final['status'], final['reason']) == ('refused', 'price_changed')  # не `technical_error`
+    await engine.dispose()
