@@ -882,6 +882,11 @@ async def test_intent_payment_is_credited_by_the_real_generic_top_up(db, session
         'app.services.payment.common.send_cart_notification_after_topup',
     ):
         monkeypatch.setattr(target, AsyncMock(return_value=None))
+    # 16а-2 переписал: при зачислении намерение оформляется (его сторожа — `test_vk16_topup_autocomplete.py`); здесь
+    # оформление подменено, а проверяется, что деньги пришли ОБЩЕЙ веткой и исход оформления дошёл до записи.
+    completed = {'status': 'fulfilled', 'checkout_public_id': 'chk-97'}
+    complete = AsyncMock(return_value=completed)
+    monkeypatch.setattr(dfc, 'complete_topup_intent', complete)
     _intent_payment(session, payment_id=97)
 
     handled = await PlategaPaymentMixin().process_platega_webhook(
@@ -895,8 +900,8 @@ async def test_intent_payment_is_credited_by_the_real_generic_top_up(db, session
     assert [tuple(row) for row in deposit] == [('deposit', TOP_UP_30_1, 'platega')]
     stored = session.get(PlategaPayment, 97)
     assert (stored.is_paid, stored.transaction_id is not None) == (True, True)
-    # Оформление — 16а-2; 16а-1 намерение при зачислении не трогает.
-    assert dfc.topup_intent_of(stored)['status'] == 'pending'
+    complete.assert_awaited_once_with(payment_id=97)
+    assert dfc.topup_intent_of(stored) == completed
 
 
 async def test_late_orphan_cancel_keeps_the_intent_outcome(db, session):

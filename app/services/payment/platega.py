@@ -740,6 +740,19 @@ class PlategaPaymentMixin:
         await db.commit()
         await db.refresh(user)
 
+        # ВК-16 (16а-2): доплата под заказ оформляет его сама (решение владельца 05.10.2026). Место — строго здесь:
+        # депозит уже закоммичен, а побочные эффекты ниже ещё не взяли `User FOR UPDATE` в этой сессии без коммита
+        # (`maybe_assign_promo_group_by_total_spent`) — иначе своя сессия оформления ждала бы его до таймаута.
+        from app.services import device_first_checkout_service as dfc
+
+        has_topup_intent = dfc.topup_intent_of(payment) is not None
+        topup_intent = await dfc.complete_topup_intent(payment_id=payment.id) if has_topup_intent else None
+        if topup_intent is not None:
+            # Финальная запись ниже присваивает метаданные ЦЕЛИКОМ из этого словаря — без строки исход затёрся бы.
+            metadata[dfc.TOPUP_INTENT_KEY] = topup_intent
+        fulfilled = topup_intent is not None and topup_intent.get('status') == 'fulfilled'
+        fulfilled_checkout = str(topup_intent.get('checkout_public_id') or '') if fulfilled else None
+
         # Emit deferred side-effects after atomic commit
         from app.database.crud.transaction import emit_transaction_side_effects
 
@@ -786,13 +799,18 @@ class PlategaPaymentMixin:
                     subscription=subscription,
                     promo_group=promo_group,
                     db=db,
+                    auto_next_step=(
+                        f'заказ {html.escape(fulfilled_checkout)} оформлен сам с баланса' if fulfilled else None
+                    ),
                 )
             except Exception as error:
                 logger.error('Ошибка отправки админ уведомления Platega', error=error)
 
         method_title = settings.get_platega_method_display_title(payment.payment_method_code)
 
-        if getattr(self, 'bot', None) and user.telegram_id:
+        # Оформленному «Пополнение успешно… подписка сама не оплатится» было бы ложью: «✅ Ваша VPN-подписка готова» и
+        # меню подписчика придут из очереди выдачи, как после оплаты картой.
+        if getattr(self, 'bot', None) and user.telegram_id and not fulfilled:
             try:
                 keyboard = await self.build_topup_success_keyboard(user)
                 # 🔴 Последняя строка сообщения РАЗНАЯ у двух разных людей, и это решение, а не
@@ -826,7 +844,17 @@ class PlategaPaymentMixin:
         try:
             from app.services.payment.common import send_cart_notification_after_topup
 
-            await send_cart_notification_after_topup(user, payment.amount_kopeks, db, getattr(self, 'bot', None))
+            if not has_topup_intent:
+                await send_cart_notification_after_topup(user, payment.amount_kopeks, db, getattr(self, 'bot', None))
+            else:
+                # Деньги доплаты под заказ: старая корзина и автопродление их не трогают (ловушка 8 стартера) — иначе
+                # вторая покупка поверх оформленной. Забор удаления аккаунта — зовём; корзину и её метку — гасим.
+                from app.services.account_erasure_service import mark_late_legacy_payment_for_manual_review
+                from app.services.user_cart_service import user_cart_service
+
+                await user_cart_service.delete_user_cart(user.id)
+                await user_cart_service.clear_topup_intent(user.id)
+                await mark_late_legacy_payment_for_manual_review(db, user)
         except Exception as error:
             logger.error(
                 'Ошибка при работе с сохраненной корзиной для пользователя',

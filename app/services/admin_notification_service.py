@@ -957,10 +957,12 @@ class AdminNotificationService:
         promo_group: PromoGroup | None,
         db: AsyncSession | None = None,
         next_step: str | None = None,
+        auto_next_step: str | None = None,
     ) -> bool:
         """`next_step` — за что деньги на пути, который корзину не смотрит (пополнение под докупку
         устройств): подсказка по корзине там была бы ложью в обе стороны. Само списание там ждёт
-        нажатия клиента в кабинете (`POST /devices/intents/{id}/purchase`), сервер сам не спишет."""
+        нажатия клиента в кабинете (`POST /devices/intents/{id}/purchase`), сервер сам не спишет.
+        `auto_next_step` — бот уже оформил сам (доплата под заказ, ВК-16): «карточка придёт следом»."""
         logger.info('Начинаем отправку уведомления о пополнении баланса')
 
         if db:
@@ -993,7 +995,12 @@ class AdminNotificationService:
         if not self._is_enabled():
             return False
 
-        cart_hint = OwnerCartHint(next_step, False, True) if next_step else await self._owner_cart_hint(user)
+        if next_step:
+            cart_hint = OwnerCartHint(next_step, False, True)
+        elif auto_next_step:
+            cart_hint = OwnerCartHint(auto_next_step, True)
+        else:
+            cart_hint = await self._owner_cart_hint(user)
         try:
             logger.info('Пытаемся создать сообщение уведомления')
             message = self._build_balance_topup_message(
