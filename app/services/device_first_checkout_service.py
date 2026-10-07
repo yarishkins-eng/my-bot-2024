@@ -1602,7 +1602,7 @@ async def prepare_topup_intent(
             devices=open_checkout.selected_device_limit,
         )
     now = datetime.now(UTC)
-    same_live_invoice = None
+    same_live_invoice, requested = None, (period_days, devices, method_code)
     for payment in await _recent_topup_intent_payments(db, user_id=user.id, now=now):
         intent = topup_intent_of(payment)
         decided_at = _intent_time(intent.get('decided_at'))
@@ -1618,11 +1618,7 @@ async def prepare_topup_intent(
             return TopUpIntentDecision(
                 'already_paid', payment=payment, price_kopeks=intent.get('quote_kopeks'), **found
             )
-        same_order = (found['period_days'], found['devices'], intent.get('method')) == (
-            period_days,
-            devices,
-            method_code,
-        )
+        same_order = (found['period_days'], found['devices'], intent.get('method')) == requested
         if state == 'invoice' and same_order and same_live_invoice is None:
             same_live_invoice = payment
     balance = int(user.balance_kopeks or 0)
