@@ -501,8 +501,22 @@ async def test_cancel_while_the_money_arrived_but_the_order_is_not_placed_wins(d
 
 
 async def test_cancel_after_the_order_was_already_charged_says_fulfilled_and_leaves_it(db, session):
+    # Заявка 3а (мина OV): переписано — «уже списано» по СВОЕМУ заказу автооформления, а не по любой проводке.
     payment = _intent_payment(session, payment_id=91, is_paid=True)
     after = datetime.fromisoformat(dfc.topup_intent_of(payment)['created_at']) + timedelta(seconds=1)
+    session.add(
+        SubscriptionCheckout(
+            public_id='chk-auto-91',
+            user_id=1,
+            source=dfc.TOPUP_INTENT_SOURCE,
+            tariff_id=3,
+            period_days=30,
+            selected_device_limit=1,
+            lifecycle_state='fulfilling',
+            financial_committed_at=after,
+            funding_mode='wallet',
+        )
+    )
     session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=PRICE_30_1, created_at=after))
     session.commit()
 
@@ -511,19 +525,22 @@ async def test_cancel_after_the_order_was_already_charged_says_fulfilled_and_lea
     assert _intent(session, 91)['status'] == 'pending'  # исход запишет оформление, метку не ставим
 
 
-async def test_cancel_says_fulfilled_when_the_top_up_already_bought_the_order(db, session):
+async def test_cancel_after_a_top_up_decided_earlier_says_earlier_not_fulfilled(db, session):
+    # Заявка 3а (мина OV): переписано — раньше отмена ЛЮБОГО заказа час после оформленной доплаты отвечала «Отменить
+    # уже нельзя… подробности придут», хотя заказ отменён и сообщения не будет. Решённую раньше доплату эта отмена не
+    # трогает: о ней уже написано отдельно, а «деньги не списаны» не пишем (правило 7 замысла v2).
     decided = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     _intent_payment(session, payment_id=91, status='fulfilled', is_paid=True, decided_at=decided)
     _intent_payment(session, payment_id=92, status='refused', is_paid=True, decided_at=decided)
 
-    assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'earlier'
 
 
-async def test_cancel_says_paid_for_a_refused_top_up_within_the_hour(db, session):
+async def test_cancel_after_a_refused_top_up_within_the_hour_says_earlier(db, session):
     decided = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     _intent_payment(session, payment_id=91, status='refused', is_paid=True, decided_at=decided)
 
-    assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'earlier'
 
 
 async def test_money_older_than_an_hour_does_not_change_the_cancel_words(db, session):
@@ -1082,19 +1099,33 @@ async def test_any_closed_label_under_the_lock_stops_the_debit(session, buy, mon
 async def test_money_known_only_by_the_transaction_link_counts_as_arrived(db, session):
     _intent_payment(session, payment_id=91, transaction_id=5)  # `is_paid` ещё не стоит
     after = datetime.now(UTC) + timedelta(seconds=1)
-    session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=1, created_at=after))
+    session.add(
+        SubscriptionCheckout(
+            public_id='chk-auto-91',
+            user_id=1,
+            source=dfc.TOPUP_INTENT_SOURCE,
+            tariff_id=3,
+            period_days=30,
+            selected_device_limit=1,
+            lifecycle_state='fulfilling',
+            financial_committed_at=after,
+            funding_mode='wallet',
+        )
+    )
     session.commit()
 
     assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
     assert _intent(session, 91)['status'] == 'pending'
 
 
-async def test_fulfilled_survives_a_second_paid_top_up_found_later(db, session):
+async def test_own_paid_top_up_is_named_over_one_decided_earlier(db, session):
+    # Заявка 3а (мина OV): переписано — ответ про доплату, которую эта отмена погасила (92), а не про решённую раньше.
     decided = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     _intent_payment(session, payment_id=91, status='fulfilled', is_paid=True, decided_at=decided)
     _intent_payment(session, payment_id=92, is_paid=True)  # оплачена, исхода нет — придёт в paid_pending
 
-    assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
+    assert _intent(session, 92)['status'] == 'cancelled'
 
 
 async def test_the_hour_counts_from_the_decision_not_from_the_choice(db, session):
@@ -1103,4 +1134,4 @@ async def test_the_hour_counts_from_the_decision_not_from_the_choice(db, session
         session, payment_id=91, status='fulfilled', is_paid=True, decided_at=decided, created_ago=timedelta(minutes=80)
     )
 
-    assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'earlier'

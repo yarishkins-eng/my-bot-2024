@@ -50,7 +50,7 @@ def checkouts(session):
         'id INTEGER PRIMARY KEY' if column.name == 'id' else column.name
         for column in SubscriptionCheckout.__table__.columns
     )
-    session.execute(text(f'CREATE TABLE subscription_checkouts ({columns})'))
+    session.execute(text(f'CREATE TABLE IF NOT EXISTS subscription_checkouts ({columns})'))
     session.commit()
 
 

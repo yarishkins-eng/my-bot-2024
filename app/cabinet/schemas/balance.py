@@ -69,6 +69,12 @@ class TopUpIntent(BaseModel):
 
     period_days: int = Field(..., ge=1, le=3650)
     devices: int = Field(..., ge=1, le=100)
+    # ВК-16 (16а-2, заявка 3а). `confirmed_purchase_at` — ответ «да» на «Уже оформлено до …. Оплатить ещё период?»:
+    # экран возвращает `purchased_at` того вопроса (мина OP); если с тех пор была покупка новее, сервер спросит снова.
+    # `change_method` — человек сам выбрал другой способ при живом счёте того же заказа (иначе сервер вернёт тот же
+    # счёт — `already_paying`, мина OR). Старый экран их не шлёт — прежнее поведение.
+    confirmed_purchase_at: datetime | None = None
+    change_method: bool = False
 
 
 class TopUpRequest(BaseModel):
@@ -103,6 +109,14 @@ class TopUpResponse(BaseModel):
     `already_paying` (тот же неоплаченный счёт того же заказа и способа — его ссылка), `already_paid` (деньги по
     намерению уже пришли, оформляем — ссылки нет), `already_fulfilled`, `balance_covers`, `invoice_not_created`.
     Срок и устройства — того заказа, о котором исход; цена — где известна.
+    С заявки 3а (договор для экрана 16в-1): `already_fulfilled` — за последний час была покупка ЛЮБЫМ путём
+    (проводка покупки); `purchased_at` — её момент, `subscription_end_date` — конец подписки, `price_kopeks` — цена
+    запрошенного срока сейчас. Срок и устройства есть, только если куплен срок в новой кассе; без них (карта, докупка
+    устройств или трафика, суточное) экран не пишет «оформлено <срок>», а «за последний час уже была покупка»; без даты —
+    без «до …». «Да» — повтор запроса с `intent.confirmed_purchase_at = purchased_at`; сумму к оплате брать из ответа
+    `accepted`, а не из прежнего экрана. `already_paying` — живой счёт того же заказа любым способом; `payment_option` —
+    каким (код как `id` варианта Platega в `/payment-methods`; может быть `null` или отсутствовать в списке — тогда
+    «у вас уже есть неоплаченный счёт»); рядом всегда «оплатить другим способом» — запрос с `intent.change_method`.
     """
 
     payment_id: str | None = None
@@ -117,6 +131,9 @@ class TopUpResponse(BaseModel):
     period_days: int | None = None
     devices: int | None = None
     price_kopeks: int | None = None
+    subscription_end_date: datetime | None = None
+    purchased_at: datetime | None = None
+    payment_option: str | None = None
 
 
 class StarsInvoiceRequest(BaseModel):

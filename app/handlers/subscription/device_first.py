@@ -1990,13 +1990,13 @@ async def cancel(
                         '⚠️ <b>Отменить заказ?</b>\n\n'
                         'Платёжная ссылка может оставаться доступной некоторое время. Не оплачивайте её. '
                         'Если оплата всё же подтвердится позже, сумма один раз зачислится на баланс — '
-                        'прежняя подписка не оформится.'
+                        'подписка по этому заказу не оформится.'
                     ),
                     (
                         '⚠️ <b>Cancel this order?</b>\n\n'
                         'The payment link can remain available for a while. Do not pay it. '
                         'If a payment is confirmed later, the amount is credited to your balance once — '
-                        'the previous subscription will not be activated.'
+                        "this order's subscription will not be activated."
                     ),
                 ),
                 keyboard=InlineKeyboardMarkup(
@@ -2073,11 +2073,11 @@ async def abandon(
             db_user,
             (
                 '\n\nЕсли старая ссылка будет оплачена позднее, сумма один раз зачислится на баланс. '
-                'Прежняя подписка не оформится.'
+                'Подписка по этому заказу не оформится.'
             ),
             (
                 '\n\nIf the old link is paid later, the amount is credited to your balance once. '
-                'The previous subscription will not be activated.'
+                "This order's subscription will not be activated."
             ),
         ),
         keyboard=InlineKeyboardMarkup(inline_keyboard=[[_main_menu(db_user)]]),
@@ -2510,7 +2510,7 @@ async def cancel_fused(
         return
     await edit_or_answer_photo(
         callback=callback,
-        caption=_cancelled_text(db_user, paid_note),
+        caption=_cancelled_text(db_user, paid_note, order=False),
         keyboard=InlineKeyboardMarkup(inline_keyboard=[[_main_menu(db_user)]]),
         parse_mode='HTML',
     )
@@ -2539,7 +2539,7 @@ async def _cancel_topup_intents(callback: types.CallbackQuery, db: AsyncSession,
         return 'unknown'
 
 
-def _cancelled_text(user: User, paid_note: str | None) -> str:
+def _cancelled_text(user: User, paid_note: str | None, *, order: bool = True) -> str:
     """«Деньги не списаны» — только если за последний час доплата под заказ не приходила (правило 7 замысла v2)."""
     if paid_note == 'fulfilled':
         return _text(
@@ -2553,6 +2553,26 @@ def _cancelled_text(user: User, paid_note: str | None) -> str:
             user,
             'Заказ отменён. Доплата уже пришла — деньги на балансе.',
             'Order cancelled. Your top-up has already arrived — the money is on your balance.',
+        )
+    if paid_note == 'earlier' and not order:
+        # Витрина `df:x2`: заказа нет, отменять нечего — а оплата, пришедшая раньше, могла уже оформить ЭТОТ же выбор.
+        # «Заказ отменён» оплатившему читалось бы как «подписку отменили» (волна 1 заявки 3а).
+        return _text(
+            user,
+            'Экран закрыт. Оплату, которая пришла раньше, эта кнопка не отменяет: '
+            'что с ней стало, бот написал отдельным сообщением.',
+            'Screen closed. This button does not cancel the payment that arrived earlier: '
+            'the bot told you what happened to it in a separate message.',
+        )
+    if paid_note == 'earlier':
+        # Мина OV: эта отмена своей доплаты с деньгами не застала, а другая за час уже пришла и решена. Без «уже»:
+        # исход пишется до отправки сообщения о нём.
+        return _text(
+            user,
+            'Заказ отменён. Оплату, которая пришла раньше, это не затронуло: '
+            'что с ней стало, бот написал отдельным сообщением.',
+            'Order cancelled. The payment that arrived earlier is not affected: '
+            'the bot told you what happened to it in a separate message.',
         )
     return _text(user, 'Заказ отменён. Деньги не списаны.', 'Order cancelled. No money was charged.')
 
@@ -2648,6 +2668,8 @@ def topup_intent_refusal_message(
             )
     rows.append([_main_menu(user)])
     tail = {
+        # «Уже была оплата» другим путём могла потратить и эти деньги — остаток называет строка ниже (волна 2 заявки 3а).
+        'bought': _text(user, 'Сколько осталось на балансе — ниже.', 'Your balance is shown below.'),
         'order': _text(user, 'Деньги на балансе — откройте заказ.', 'The money is on your balance — open the order.'),
         'support': _text(
             user,

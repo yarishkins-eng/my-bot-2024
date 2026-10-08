@@ -31,6 +31,7 @@ from app.database.models import (
     PlategaPayment,
     PromoGroup,
     Subscription,
+    SubscriptionCheckout,
     Tariff,
     Transaction,
     User,
@@ -89,6 +90,7 @@ def _new_session() -> Session:
             DeviceAddonTopupAttempt.__table__,
             Transaction.__table__,
             Subscription.__table__,
+            SubscriptionCheckout.__table__,
             Tariff.__table__,
             PromoGroup.__table__,
             UserPromoGroup.__table__,
@@ -224,7 +226,54 @@ async def _decide(db, session, *, user_id: int = 1, period_days: int = 30, devic
         method_code=method,
         min_kopeks=kw.get('min_kopeks', 100),
         max_kopeks=kw.get('max_kopeks', 100_000_000),
+        confirmed_purchase_at=kw.get('confirmed_purchase_at'),
+        change_method=kw.get('change_method', False),
     )
+
+
+def _purchase(
+    session: Session,
+    *,
+    minutes_ago: float,
+    checkout_public_id: str | None = None,
+    period_days: int = 30,
+    devices: int = 1,
+    user_id: int = 1,
+    transaction: bool = True,
+    lifecycle_state: str = 'ready',
+    source: str = 'cabinet',
+    funding_mode: str = 'wallet',
+) -> None:
+    """Покупка ЛЮБЫМ путём (заявка 3а, мина OP): проводка покупки подписки и, если назван номер, заказ новой кассы,
+    к которому она привязана (`device_first_checkout_id`, как у `direct-sale:`). `transaction=False` с заказом — счёт
+    картой, выставленный и брошенный: `financial_committed_at` у него есть, а денег не было."""
+    at = datetime.now(UTC) - timedelta(minutes=minutes_ago)
+    checkout = None
+    if checkout_public_id is not None:
+        checkout = SubscriptionCheckout(
+            public_id=checkout_public_id,
+            user_id=user_id,
+            source=source,
+            tariff_id=3,
+            period_days=period_days,
+            selected_device_limit=devices,
+            lifecycle_state=lifecycle_state,
+            financial_committed_at=at,
+            funding_mode=funding_mode,
+        )
+        session.add(checkout)
+        session.flush()
+    if transaction:
+        session.add(
+            Transaction(
+                user_id=user_id,
+                type='subscription_payment',
+                amount_kopeks=PRICE_30_1,
+                created_at=at,
+                device_first_checkout_id=checkout.id if checkout is not None else None,
+            )
+        )
+    session.commit()
 
 
 # --- кому включено ----------------------------------------------------------------------------------------------
@@ -322,7 +371,9 @@ async def test_corrupted_order_is_review_not_a_new_invoice(db, session, env):
     assert (await _decide(db, session)).status == 'order_on_review'
 
 
-async def test_order_fulfilled_within_an_hour_blocks_a_second_term_and_names_it(db, session, env):
+async def test_order_fulfilled_within_an_hour_asks_before_a_second_term_and_names_it(db, session, env):
+    # Заявка 3а (мина OP): переписано — раньше это был ЗАПРЕТ по строке намерения; теперь вопрос «уже оформлено до …»
+    # по самой покупке (заказ со списанием), и срок/устройства — купленного заказа, а не запрошенного.
     decided = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     _intent_payment(
         session,
@@ -333,6 +384,7 @@ async def test_order_fulfilled_within_an_hour_blocks_a_second_term_and_names_it(
         checkout_public_id='chk-done-5',
         decided_at=decided,
     )
+    _purchase(session, minutes_ago=10, checkout_public_id='chk-done-5')
 
     decision = await _decide(db, session, period_days=90)
 
@@ -340,8 +392,8 @@ async def test_order_fulfilled_within_an_hour_blocks_a_second_term_and_names_it(
     assert (decision.period_days, decision.devices) == (30, 1)
 
 
-async def test_intent_made_70_minutes_ago_and_fulfilled_50_minutes_ago_still_blocks(db, session, env):
-    # Окно поиска вдвое шире срока намерения: оформлено в последний час, хотя намерение старше часа.
+async def test_intent_made_70_minutes_ago_and_fulfilled_50_minutes_ago_still_asks(db, session, env):
+    # Час считается от покупки, а не от выбора заказа (заявка 3а: от списания, а не от строки намерения).
     _intent_payment(
         session,
         payment_id=52,
@@ -352,6 +404,7 @@ async def test_intent_made_70_minutes_ago_and_fulfilled_50_minutes_ago_still_blo
         checkout_public_id='chk-late',
         decided_at=(datetime.now(UTC) - timedelta(minutes=50)).isoformat(),
     )
+    _purchase(session, minutes_ago=50, checkout_public_id='chk-late')
 
     decision = await _decide(db, session)
 
@@ -402,10 +455,13 @@ async def test_invoice_without_provider_deadline_at_minute_35_is_still_reused(db
     assert (decision.status, decision.payment.id) == ('already_paying', live.id)
 
 
-async def test_same_order_other_method_is_a_new_invoice(db, session, env):
-    _intent_payment(session, payment_id=62, method=2)
+async def test_same_order_other_method_is_the_same_invoice_unless_the_method_is_changed_explicitly(db, session, env):
+    # Заявка 3а (мина OR): переписано — раньше другой способ давал новый счёт и молча гасил старый, а кнопка бота
+    # способа не несёт. Теперь новый счёт другим способом — только явной сменой способа.
+    live = _intent_payment(session, payment_id=62, method=2)
 
-    assert (await _decide(db, session, method=11)).status == 'accepted'
+    assert ((await _decide(db, session, method=11)).status, live.id) == ('already_paying', 62)
+    assert (await _decide(db, session, method=11, change_method=True)).status == 'accepted'
 
 
 async def test_other_order_same_method_is_a_new_invoice(db, session, env):
@@ -595,12 +651,21 @@ def _request(
     intent: bool = True,
     period_days: int = 30,
     amount_kopeks: int = CLIENT_AMOUNT,
+    confirmed_purchase_at: datetime | None = None,
+    change_method: bool = False,
 ) -> TopUpRequest:
     return TopUpRequest(
         amount_kopeks=amount_kopeks,
         payment_method=method,
         payment_option=option,
-        intent=TopUpIntent(period_days=period_days, devices=1) if intent else None,
+        intent=TopUpIntent(
+            period_days=period_days,
+            devices=1,
+            confirmed_purchase_at=confirmed_purchase_at,
+            change_method=change_method,
+        )
+        if intent
+        else None,
     )
 
 
@@ -634,8 +699,11 @@ async def test_route_ordinary_top_up_still_checks_the_client_amount(db, session,
 
 
 async def test_route_switching_method_replaces_the_old_invoice(db, session, provider):
+    # Заявка 3а (мина OR): замена — только явной сменой способа (`intent.change_method`).
     first = await balance_route.create_topup(request=_request(option='2'), user=_user(session), db=db)
-    second = await balance_route.create_topup(request=_request(option='11'), user=_user(session), db=db)
+    second = await balance_route.create_topup(
+        request=_request(option='11', change_method=True), user=_user(session), db=db
+    )
 
     assert (first.intent_status, second.intent_status) == ('accepted', 'accepted')
     old = dfc.topup_intent_of(session.get(PlategaPayment, int(first.payment_id)))
@@ -990,6 +1058,7 @@ async def test_fulfilled_intent_beats_balance_that_covers_the_price(db, session,
         checkout_public_id='chk-1',
         decided_at=(datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
     )
+    _purchase(session, minutes_ago=5, checkout_public_id='chk-1')
     _set_user(session, balance_kopeks=PRICE_30_1 + 100)
 
     assert (await _decide(db, session)).status == 'already_fulfilled'
@@ -1300,6 +1369,8 @@ async def test_credited_money_is_named_before_the_balance_that_now_covers_the_pr
     # (P35) деньги по намерению уже на балансе, поэтому он «покрывает» цену, — но это исход намерения, а не повод
     # купить с баланса руками поверх оформления, которое идёт само.
     _intent_payment(session, payment_id=67, **intent)
+    if expected == 'already_fulfilled':
+        _purchase(session, minutes_ago=10, checkout_public_id='chk-done-5')  # оформление — это и есть покупка
     _set_user(session, balance_kopeks=BALANCE + TOP_UP_30_1)
 
     assert (await _decide(db, session)).status == expected
@@ -1492,6 +1563,7 @@ async def test_route_every_outcome_without_an_invoice_has_no_payment_and_never_c
             checkout_public_id='chk-done-5',
             decided_at=_ago(10),
         )
+        _purchase(session, minutes_ago=10, checkout_public_id='chk-done-5')
     else:
         env.open_checkout.return_value = SimpleNamespace(
             lifecycle_state='operator_review', public_id='chk-rev-1', period_days=30, selected_device_limit=1

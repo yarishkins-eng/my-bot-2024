@@ -774,8 +774,12 @@ class PlategaPaymentMixin:
             metadata[dfc.TOPUP_INTENT_KEY] = topup_intent
         fulfilled = topup_intent is not None and topup_intent.get('status') == 'fulfilled'
         # Списание шло в своей сессии: `user` здесь помнит баланс ДО него — для слов человеку и владельцу читаем свежий.
+        # Свежий баланс и при отказе: «уже была оплата» другим путём в эти секунды списала его в чужой сессии (волна 2
+        # заявки 3а), а `user` вебхука помнит баланс сразу после зачисления.
         balance_left = (
-            await db.scalar(select(User.balance_kopeks).where(User.id == user.id)) if fulfilled else user.balance_kopeks
+            await db.scalar(select(User.balance_kopeks).where(User.id == user.id))
+            if has_topup_intent
+            else user.balance_kopeks
         )
         if has_topup_intent:
             # Старая корзина и автопродление эти деньги не тратят (ловушка 8 стартера) — гасим корзину и её метку ДО
@@ -900,7 +904,7 @@ class PlategaPaymentMixin:
                 from app.handlers.subscription.device_first import topup_intent_refusal_message
 
                 refusal = topup_intent_refusal_message(
-                    user, topup_intent, amount_kopeks=payment.amount_kopeks, balance_kopeks=user.balance_kopeks
+                    user, topup_intent, amount_kopeks=payment.amount_kopeks, balance_kopeks=balance_left
                 )
             except Exception as error:
                 logger.error('Не собралось сообщение отказа автооформления доплаты', user_id=user.id, error=error)
