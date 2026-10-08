@@ -192,6 +192,8 @@ async def test_we_stay_silent_when_the_cart_is_about_to_spend_the_same_money() -
     (проверено 30.08.2026) — то есть дефолт `False` из кода не действует. Через секунду после
     нашего сообщения автопокупка спишет тот же баланс и пришлёт своё «подписка оформлена».
     Сказать перед ней «нажмите кнопку» — подтолкнуть купить ВТОРОЙ период поверх оплаченного.
+    Решение 05.10.2026 «Оформляется само» (ВК-16): доплату под заказ эта подсказка не обслуживает вовсе — её сторожа
+    в `tests/cabinet/test_vk16_topup_autocomplete.py` и `test_vk16_topup_refusals.py`; здесь — обычное пополнение.
     """
     expiring = [_sub(status='active', is_trial=False, days_left=0.1)]
     assert await _hint(expiring, topup_intent=False) is not None

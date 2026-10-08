@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from importlib import import_module
 from typing import Any
 
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +26,24 @@ from app.database.models import (
 from app.services.platega_service import PlategaService
 from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
+
+
+# Причина отказа автооформления доплаты (ВК-16) — словами для карточки владельцу: он не программист.
+_OWNER_REFUSAL_WHY = {
+    'expired': 'клиент оплатил позже чем через час',
+    'replaced': 'клиент открыл новый счёт на доплату',
+    'cancelled': 'клиент отменил или изменил заказ в боте',
+    'disabled': 'автооформление выключено для этого клиента',
+    'price_changed': 'цена изменилась',
+    'balance_short': 'не хватило баланса',
+    'subscription_changed': 'подписка клиента изменилась, пока шла оплата',
+    'already_purchased': 'после заказа было другое списание за подписку',
+    'open_order': 'у клиента открыт другой заказ',
+    'order_on_review': 'у клиента заказ на разборе — загляните в «Заказы на разборе»',
+    'restricted': 'у клиента запрет на покупку подписки',
+    'account_erasure': 'клиент удаляет аккаунт',
+    'unavailable': 'этот заказ сейчас не продаётся',
+}
 
 
 class PlategaPaymentMixin:
@@ -823,8 +842,9 @@ class PlategaPaymentMixin:
                         else None
                     ),
                     intent_refused=(
-                        f'Заказ по доплате бот сам не оформил ({topup_intent.get("reason")}) — деньги остались на '
-                        'балансе, клиенту ушло сообщение с кнопкой'
+                        'Заказ по доплате бот сам не оформил: '
+                        f'{_OWNER_REFUSAL_WHY.get(topup_intent.get("reason"), "технический отказ, смотреть журнал")}'
+                        ' — деньги остались на балансе, клиенту отправлено объяснение'
                         if topup_intent is not None and not fulfilled
                         else None
                     ),
@@ -842,33 +862,51 @@ class PlategaPaymentMixin:
         if getattr(self, 'bot', None) and user.telegram_id and fulfilled:
             try:
                 english = getattr(user, 'language', None) == 'en'
+                support_url = settings.get_support_contact_url()
                 await self.bot.send_message(
                     user.telegram_id,
                     (
                         f'✅ <b>Payment received: {settings.format_price(payment.amount_kopeks)}</b>\n\n'
-                        'Your order is paid from the balance — we are connecting your subscription, usually within '
-                        'a minute. If the «subscription is ready» message has not arrived in 10 minutes, please '
+                        'Your order is paid from the balance. When the subscription is connected, you will get the '
+                        '"Your VPN subscription is ready" message. If it has not arrived in 10 minutes, please '
                         f'contact support.\n\nBalance left: {settings.format_price(balance_left)}'
                         if english
                         else f'✅ <b>Оплата получена: {settings.format_price(payment.amount_kopeks)}</b>\n\n'
-                        'Заказ оформлен с баланса — подключаем подписку, обычно это минута. Если сообщение '
-                        '«подписка готова» не придёт за 10 минут — напишите в поддержку.\n\n'
+                        'Заказ оформлен с баланса. Когда подписка подключится, придёт сообщение «Ваша VPN-подписка '
+                        'готова». Если его нет через 10 минут — напишите в поддержку.\n\n'
                         f'На балансе осталось: {settings.format_price(balance_left)}'
                     ),
                     parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text='Contact support' if english else 'Написать в поддержку', url=support_url
+                                )
+                            ]
+                        ]
+                    )
+                    if support_url
+                    else None,
                 )
             except Exception as error:
                 logger.error('Ошибка отправки уведомления пользователю Platega', error=error)
+        refusal = None
         if getattr(self, 'bot', None) and user.telegram_id and topup_intent is not None and not fulfilled:
             # Отказ автооформления — ОДНО сообщение с кнопкой по причине вместо «Пополнение успешно» с общим хвостом
-            # (замысел v2, правило 5; план ВК, 16а-2, заявка 2).
+            # (замысел v2, правило 5; план ВК, 16а-2, заявка 2). Не собралось — ниже прежнее «Пополнение успешно»:
+            # никогда не тишина (правило 3).
             try:
                 from app.handlers.subscription.device_first import topup_intent_refusal_message
 
-                text, keyboard = topup_intent_refusal_message(
+                refusal = topup_intent_refusal_message(
                     user, topup_intent, amount_kopeks=payment.amount_kopeks, balance_kopeks=user.balance_kopeks
                 )
-                await self.bot.send_message(user.telegram_id, text, parse_mode='HTML', reply_markup=keyboard)
+            except Exception as error:
+                logger.error('Не собралось сообщение отказа автооформления доплаты', user_id=user.id, error=error)
+        if refusal is not None:
+            try:
+                await self.bot.send_message(user.telegram_id, refusal[0], parse_mode='HTML', reply_markup=refusal[1])
             except Exception as error:
                 logger.error('Ошибка отправки отказа автооформления доплаты', user_id=user.id, error=error)
         elif getattr(self, 'bot', None) and user.telegram_id and not fulfilled:

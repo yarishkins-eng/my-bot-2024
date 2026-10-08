@@ -165,15 +165,18 @@ def _between_create_and_debit(monkeypatch, effect) -> None:
 
     async def create(db_, **kwargs):
         resolved = await inner(db_, **kwargs)
-        effect()
+        done = effect()
+        if done is not None:
+            await done
         return resolved
 
     monkeypatch.setattr(dfc, 'create_or_resume_direct_checkout', create)
 
 
-async def test_cancel_pressed_after_the_check_but_before_the_debit_wins(session, buy, monkeypatch):
-    _paid(session)
-    _between_create_and_debit(monkeypatch, lambda: _write_intent(session, status='cancelled'))
+async def test_cancel_pressed_after_the_check_but_before_the_debit_wins(session, db, buy, monkeypatch):
+    # Настоящая кнопка: деньги уже зачислены (`_paid`), отмена приходит посреди оформления — и побеждает.
+    _paid(session, transaction_id=5, is_paid=True)
+    _between_create_and_debit(monkeypatch, lambda: dfc.cancel_topup_intents(db, user_id=1))
 
     _, stored = await _complete(session)
 
@@ -326,7 +329,8 @@ def _message(reason: str, language: str = 'ru', **intent):
 def test_already_bought_has_no_button_to_buy_again():
     text_, keyboard = _message('already_purchased')
 
-    assert 'Оплата получена: 99 ₽' in text_ and 'дважды мы не списываем' in text_
+    assert 'Оплата получена: 99 ₽' in text_ and 'чтобы случайно не взять деньги дважды' in text_
+    assert 'другое списание за подписку' in text_  # «что-то списано», а не «куплена подписка» (суточные, докупка)
     assert 'На балансе: 149,37 ₽' in text_.split('\n')
     assert _buttons(keyboard) == [('В главное меню', 'back_to_menu', None)]
 
@@ -355,11 +359,16 @@ def test_order_on_review_says_review_and_blocked_says_cannot_order():
 
 
 def test_retry_offers_one_tap_at_the_fresh_price_and_another_period():
-    text_, keyboard = _message('price_changed', offer_kopeks=13_377, offer_tariff_name='Базовый')
+    text_, keyboard = _message('price_changed', offer_kopeks=13_377, offer_tariff_name='Базовый <&>')
 
     assert 'Заказ сам не оформился: цена изменилась. Деньги на балансе.' in text_
+    # Что именно спишет кнопка — в тексте, с устройствами; имя тарифа экранировано (сообщение в HTML).
+    assert (
+        'Можно оформить одной кнопкой — Базовый &lt;&amp;&gt; · 1 месяц · 2 устройства за 133,77 ₽, спишем с баланса.'
+        in text_
+    )
     assert _buttons(keyboard) == [
-        ('Оформить: Базовый · 1 месяц · 133,77 ₽', 'df:a2:30:2:13377', None),
+        ('Оформить за 133,77 ₽', 'df:a2:30:2:13377', None),
         ('‹ Выбрать другой срок', 'df:e2', None),
         ('В главное меню', 'back_to_menu', None),
     ]
@@ -368,18 +377,19 @@ def test_retry_offers_one_tap_at_the_fresh_price_and_another_period():
 def test_retry_without_an_offer_only_lets_choose_a_period():
     text_, keyboard = _message('technical_error')
 
-    assert 'Заказ сам не оформился. Деньги на балансе.' in text_
-    assert [b[:2] for b in _buttons(keyboard)] == [('Выбрать срок', 'df:e2'), ('В главное меню', 'back_to_menu')]
+    assert 'Заказ сам не оформился. Деньги на балансе.' in text_ and 'одной кнопкой' not in text_
+    # Без предложения — новый расчёт: `df:e2` при снятом тарифе ответил бы ошибкой поверх сообщения с суммой.
+    assert [b[:2] for b in _buttons(keyboard)] == [('Выбрать срок', 'df:start'), ('В главное меню', 'back_to_menu')]
 
 
 @pytest.mark.parametrize(
     ('reason', 'why'),
     [
         ('expired', 'с выбора заказа прошло больше часа'),
-        ('replaced', 'вы открыли другой счёт на этот заказ'),
-        ('cancelled', 'вы отменили заказ'),
+        ('replaced', 'потом вы открыли новый счёт на доплату'),
+        ('cancelled', 'вы отменили или изменили заказ в боте'),
         ('subscription_changed', 'ваша подписка изменилась'),
-        ('balance_short', 'на балансе не хватило денег'),
+        ('balance_short', 'денег на балансе не хватило на этот заказ'),
     ],
 )
 def test_retry_names_why(reason, why):
@@ -390,7 +400,8 @@ def test_english_refusal():
     text_, keyboard = _message('price_changed', language='en', offer_kopeks=13_377, offer_tariff_name='Basic')
 
     assert 'Payment received: ₽99' in text_ and 'the price has changed' in text_ and 'Balance: ₽149.37' in text_
-    assert _buttons(keyboard)[0] == ('Order: Basic · 1 month · ₽133.77', 'df:a2:30:2:13377', None)
+    assert 'You can order it with one tap — Basic · 1 month · 2 devices for ₽133.77' in text_
+    assert _buttons(keyboard)[0] == ('Order for ₽133.77', 'df:a2:30:2:13377', None)
 
 
 # --- зачисление: отказ уходит одним сообщением, исход не откатывается ------------------------------------------
@@ -407,17 +418,20 @@ async def test_webhook_refusal_is_one_message_with_the_button_and_the_owner_hear
     buttons = _buttons(webhook.bot.send_message.await_args.kwargs['reply_markup'])
     assert buttons[0][1] == f'df:a2:30:1:{PRICE_30_1}'
     assert webhook.admin[0]['intent_refused'] == (
-        'Заказ по доплате бот сам не оформил (subscription_changed) — деньги остались на балансе, '
-        'клиенту ушло сообщение с кнопкой'
+        'Заказ по доплате бот сам не оформил: подписка клиента изменилась, пока шла оплата — деньги остались на '
+        'балансе, клиенту отправлено объяснение'
     )
 
 
-async def test_refusal_message_failure_is_logged_and_does_not_stop_the_webhook(db, session, webhook, monkeypatch):
+async def test_refusal_message_failure_falls_back_to_the_money_message(db, session, webhook, monkeypatch):
+    # Никогда не тишина (правило 3): не собралось сообщение отказа — уходит прежнее «Пополнение успешно».
     monkeypatch.setattr(handlers, 'topup_intent_refusal_message', lambda *a, **k: 1 / 0)
     _intent_payment(session, payment_id=97, **{**TRIAL, 'subscription_id': 40})
 
     assert await _pay(db, webhook) is True
     assert _intent(session)['status'] == 'refused'
+    webhook.bot.send_message.assert_awaited_once()
+    assert 'Пополнение успешно' in webhook.bot.send_message.await_args.args[1]
 
 
 async def test_final_write_keeps_the_label_written_after_the_webhook_snapshot(db, session, webhook, monkeypatch):
@@ -474,13 +488,26 @@ async def test_cancel_marks_only_unpaid_pending_intents_of_this_person(db, sessi
     assert _intent(session, 93)['status'] == 'replaced'
 
 
-async def test_cancel_never_touches_an_intent_whose_money_arrived(db, session):
+async def test_cancel_while_the_money_arrived_but_the_order_is_not_placed_wins(db, session):
+    # Деньги пришли, оформление идёт (исход ещё `pending`): отмена гасит и такую — иначе «Заказ отменён», а через
+    # секунду списание (волна 1, четыре линзы). Оформление прочитает метку под замком и откажет.
     _intent_payment(session, payment_id=91, is_paid=True)
     _intent_payment(session, payment_id=92, transaction_id=5)
 
     assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
 
-    assert (_intent(session, 91)['status'], _intent(session, 92)['status']) == ('pending', 'pending')
+    assert (_intent(session, 91)['status'], _intent(session, 92)['status']) == ('cancelled', 'cancelled')
+
+
+async def test_cancel_after_the_order_was_already_charged_says_fulfilled_and_leaves_it(db, session):
+    payment = _intent_payment(session, payment_id=91, is_paid=True)
+    after = datetime.fromisoformat(dfc.topup_intent_of(payment)['created_at']) + timedelta(seconds=1)
+    session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=PRICE_30_1, created_at=after))
+    session.commit()
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
+
+    assert _intent(session, 91)['status'] == 'pending'  # исход запишет оформление, метку не ставим
 
 
 async def test_cancel_says_fulfilled_when_the_top_up_already_bought_the_order(db, session):
@@ -519,7 +546,7 @@ async def test_cancelled_then_paid_is_refused_with_the_one_tap_offer(db, session
     await _pay(db, webhook)
 
     assert (_intent(session)['status'], _intent(session)['reason']) == ('refused', 'cancelled')
-    assert 'вы отменили заказ' in webhook.bot.send_message.await_args.args[1]
+    assert 'вы отменили или изменили заказ в боте' in webhook.bot.send_message.await_args.args[1]
     assert session.get(User, 1).balance_kopeks == BALANCE + TOP_UP_30_1  # не списано
 
 
@@ -535,7 +562,7 @@ def _callback(data: str) -> SimpleNamespace:
     [
         (None, 'Заказ отменён. Деньги не списаны.', 'Доплата'),
         ('paid', 'Заказ отменён. Доплата уже пришла — деньги на балансе.', 'Деньги не списаны'),
-        ('fulfilled', 'заказ по ней оформлен с баланса', 'Деньги не списаны'),
+        ('fulfilled', 'Заказ отменён. Отдельно: ваша доплата пришла раньше', 'Деньги не списаны'),
     ],
 )
 async def test_cancel_fused_words_follow_the_money(note, expected, absent):
@@ -564,9 +591,9 @@ async def test_cancel_that_could_not_gas_the_top_up_does_nothing_and_asks_again(
         await handlers.cancel_fused(_callback('df:x2'), user, db, SimpleNamespace(clear=AsyncMock()))
 
     db.rollback.assert_awaited_once()
-    in_flight.assert_not_awaited()
+    in_flight.assert_awaited_once()  # гасим только в ветке «отменено», после проверки живого заказа
     assert 'Заказ отменён' not in render.await_args.kwargs['caption']
-    assert 'нажмите ещё раз' in render.await_args.kwargs['caption']
+    assert 'попробуйте ещё раз через минуту' in render.await_args.kwargs['caption']
 
 
 async def test_cancel_of_an_order_names_the_money_too():
@@ -733,7 +760,7 @@ async def test_email_top_up_names_the_balance_it_is_given(monkeypatch):
     assert second['new_balance_kopeks'] == 14_937
 
 
-async def test_recheck_takes_the_user_lock_before_reading_the_label(db, session, monkeypatch):
+async def test_recheck_takes_the_payment_then_the_user_lock(db, session, monkeypatch):
     _intent_payment(session, payment_id=97)
     seen = []
     real_execute = db.execute
@@ -748,4 +775,116 @@ async def test_recheck_takes_the_user_lock_before_reading_the_label(db, session,
 
     assert await dfc._topup_intent_recheck_locked(db, payment_id=97, user_id=1, intent=intent) is None
 
-    assert seen[:2] == [('users', True), ('platega_payments', True)]
+    # Порядок «платёж → пользователь», как у вебхука и у отмены (договор `create_or_resume_direct_checkout`).
+    assert seen[:2] == [('platega_payments', True), ('users', True)]
+
+
+# --- правки по волне 1 ---------------------------------------------------------------------------------------
+
+
+async def test_recheck_refreshes_the_user_so_a_credit_meanwhile_is_not_overwritten(db, session):
+    # F1: пользователь загружен сверкой задолго до замка; зачисление другой сессией в эти секунды. Без
+    # `populate_existing` списание записало бы баланс поверх него (опыт скептика: 550 → 50).
+    _intent_payment(session, payment_id=97)
+    user = session.get(User, 1)
+    seen_before = user.balance_kopeks
+    session.execute(text('UPDATE users SET balance_kopeks = balance_kopeks + 9900 WHERE id = 1'))
+    session.commit()
+    assert user.balance_kopeks == seen_before  # объект в карте сессии старый
+
+    await dfc._topup_intent_recheck_locked(db, payment_id=97, user_id=1, intent=_intent(session))
+
+    assert user.balance_kopeks == seen_before + 9_900
+
+
+@pytest.mark.parametrize('label', ['cancelled', 'replaced', 'expired_by_time'])
+async def test_label_then_purchase_by_another_path_gets_no_buy_button(session, buy, label):
+    # F3: отменил / заменил / просрочил, потом купил картой — кнопка «Оформить» списала бы второй срок.
+    extra = {'created_ago': timedelta(minutes=70)} if label == 'expired_by_time' else {'status': label}
+    payment = _intent_payment(session, payment_id=97, is_paid=True, transaction_id=5, **{**TRIAL, **extra})
+    _set_user(session, balance_kopeks=BALANCE + TOP_UP_30_1)
+    after = datetime.fromisoformat(dfc.topup_intent_of(payment)['created_at']) + timedelta(seconds=1)
+    session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=PRICE_30_1, created_at=after))
+    session.commit()
+
+    _, stored = await _complete(session)
+
+    assert stored['reason'] == 'already_purchased'
+    assert 'offer_kopeks' not in stored and buy.commit == []
+
+
+async def test_cancel_error_renders_without_touching_the_expired_user():
+    # F4: после `rollback` объект пользователя протухает — чтение `language` в async роняло обработчик.
+    class Expiring:
+        id, expired = 17, False
+
+        @property
+        def language(self):
+            if self.expired:
+                raise AssertionError('MissingGreenlet: протухший объект после rollback')
+            return 'ru'
+
+    user = Expiring()
+    db = AsyncMock()
+    db.rollback.side_effect = lambda: setattr(user, 'expired', True)
+    with (
+        patch.object(handlers, 'cancel_topup_intents', AsyncMock(side_effect=SQLAlchemyError('down'))),
+        patch.object(handlers, 'edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        assert await handlers._cancel_topup_intents(_callback('df:x2'), db, user) == 'unknown'
+
+    assert 'попробуйте ещё раз через минуту' in render.await_args.kwargs['caption']
+
+
+async def test_first_cancel_tap_on_an_invoice_order_does_not_gas_the_top_up():
+    # F5: у заказа со счётом первое нажатие — только вопрос «Отменить заказ?», можно вернуться к оплате.
+    user = SimpleNamespace(id=17, language='ru')
+    with (
+        patch.object(handlers, 'cancel_topup_intents', AsyncMock(return_value=None)) as gas,
+        patch.object(handlers, 'get_owned_checkout', AsyncMock(return_value=SimpleNamespace(public_id='chk-1'))),
+        patch.object(handlers, 'settlement_mode', lambda c: handlers.DIRECT_SETTLEMENT_MODE),
+        patch.object(handlers, 'edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await handlers.cancel(_callback('df:x:chk-1'), user, AsyncMock(), SimpleNamespace(clear=AsyncMock()))
+
+    gas.assert_not_awaited()
+    assert 'Отменить заказ?' in render.await_args.kwargs['caption']
+
+
+async def test_screen_close_with_a_live_order_does_not_gas_the_top_up():
+    # F5: «Заказ не отменён… кнопка закрывает экран» — человек ничего не отменял.
+    user = SimpleNamespace(id=17, language='ru')
+    with (
+        patch.object(handlers, 'cancel_topup_intents', AsyncMock(return_value=None)) as gas,
+        patch.object(handlers, '_has_order_in_flight', AsyncMock(return_value=True)),
+        patch.object(handlers, 'edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await handlers.cancel_fused(_callback('df:x2'), user, AsyncMock(), SimpleNamespace(clear=AsyncMock()))
+
+    gas.assert_not_awaited()
+    assert 'Заказ не отменён' in render.await_args.kwargs['caption']
+
+
+async def test_cancel_commits_first_so_the_payment_lock_comes_before_the_user_lock(db, session, monkeypatch):
+    # F20: сессия обработчика держит строку пользователя с первого запроса (`last_activity`); коммит в начале её
+    # отпускает — порядок «платёж → пользователь», как у вебхука и перепроверки.
+    _intent_payment(session, payment_id=91, is_paid=True)
+    events = []
+    real_commit, real_execute = db.commit, db.execute
+
+    async def commit():
+        events.append('commit')
+        await real_commit()
+
+    async def execute(statement, *args, **kwargs):
+        froms = getattr(statement, 'get_final_froms', list)()
+        if getattr(statement, '_for_update_arg', None) is not None and froms:
+            events.append(str(froms[0]))
+        return await real_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, 'commit', commit)
+    monkeypatch.setattr(db, 'execute', execute)
+
+    await dfc.cancel_topup_intents(db, user_id=1)
+
+    assert events[:3] == ['commit', 'platega_payments', 'users']

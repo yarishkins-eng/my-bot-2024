@@ -7,6 +7,7 @@ from collections.abc import Collection
 from datetime import datetime
 from html import escape
 from itertools import islice
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import structlog
@@ -1975,9 +1976,6 @@ async def cancel(
             _text(db_user, 'Заказ не найден.', 'Order not found.'),
         )
         return
-    paid_note = await _cancel_topup_intents(callback, db, db_user)
-    if paid_note == 'unknown':
-        return
     try:
         checkout = await get_owned_checkout(db, public_id=public_id, user_id=db_user.id)
         if settlement_mode(checkout) == DIRECT_SETTLEMENT_MODE:
@@ -2019,6 +2017,10 @@ async def cancel(
                 ),
                 parse_mode='HTML',
             )
+            return
+        # Доплату гасим, только когда отмена действительно исполняется: на экране подтверждения можно вернуться.
+        paid_note = await _cancel_topup_intents(callback, db, db_user)
+        if paid_note == 'unknown':
             return
         checkout = await cancel_checkout(db, checkout)
     except DeviceFirstError as error:
@@ -2464,9 +2466,6 @@ async def cancel_fused(
     """
     await callback.answer()
     await state.clear()
-    paid_note = await _cancel_topup_intents(callback, db, db_user)
-    if paid_note == 'unknown':
-        return
     try:
         has_order = await _has_order_in_flight(db, user_id=db_user.id, states=(*OPEN_STATES, OPERATOR_REVIEW_STATE))
     except SQLAlchemyError:
@@ -2504,6 +2503,10 @@ async def cancel_fused(
             parse_mode='HTML',
         )
         return
+    # Доплату гасим только здесь: в ветке «Заказ не отменён» выше человек ничего не отменял.
+    paid_note = await _cancel_topup_intents(callback, db, db_user)
+    if paid_note == 'unknown':
+        return
     await edit_or_answer_photo(
         callback=callback,
         caption=_cancelled_text(db_user, paid_note),
@@ -2516,13 +2519,21 @@ async def cancel_fused(
 async def _cancel_topup_intents(callback: types.CallbackQuery, db: AsyncSession, user: User) -> str | None:
     """Погасить неоплаченную доплату под заказ (замысел v2, правило 7). Не вышло — `unknown`: кнопку не исполняем и
     просим повторить, иначе «Заказ отменён» оказался бы неправдой, а доплата оформилась бы сама."""
+    # После `rollback` объект пользователя протухает (async — MissingGreenlet): всё нужное — до вызова.
+    user_id, reader = user.id, SimpleNamespace(language=user.language)
     try:
-        return await cancel_topup_intents(db, user_id=user.id)
+        return await cancel_topup_intents(db, user_id=user_id)
     except SQLAlchemyError:
-        logger.warning('Кнопка отмены не смогла погасить доплату под заказ', user_id=user.id, exc_info=True)
+        logger.warning('Кнопка отмены не смогла погасить доплату под заказ', user_id=user_id, exc_info=True)
         await db.rollback()
         await _render_error(
-            callback, user, _text(user, 'Не получилось — нажмите ещё раз.', 'That did not work — please tap again.')
+            callback,
+            reader,
+            _text(
+                reader,
+                'Не получилось. Откройте главное меню и попробуйте ещё раз через минуту.',
+                'That did not work. Open the main menu and try again in a minute.',
+            ),
         )
         return 'unknown'
 
@@ -2532,8 +2543,8 @@ def _cancelled_text(user: User, paid_note: str | None) -> str:
     if paid_note == 'fulfilled':
         return _text(
             user,
-            'Доплата уже пришла, и заказ по ней оформлен с баланса — подписка в главном меню.',
-            'Your top-up has already arrived and the order was paid from the balance — see the main menu.',
+            'Заказ отменён. Отдельно: ваша доплата пришла раньше, и по ней уже оформлена подписка с баланса.',
+            'Order cancelled. Separately: your top-up arrived earlier, and a subscription was already paid with it.',
         )
     if paid_note == 'paid':
         return _text(
@@ -2547,10 +2558,13 @@ def _cancelled_text(user: User, paid_note: str | None) -> str:
 _TOPUP_REFUSAL_WHY = {
     'price_changed': ('цена изменилась', 'the price has changed'),
     'expired': ('с выбора заказа прошло больше часа', 'more than an hour has passed since you chose it'),
-    'replaced': ('вы открыли другой счёт на этот заказ', 'you opened another invoice for this order'),
-    'cancelled': ('вы отменили заказ', 'you cancelled the order'),
+    'replaced': (
+        'потом вы открыли новый счёт на доплату',
+        'you opened a new top-up invoice after this one',
+    ),
+    'cancelled': ('вы отменили или изменили заказ в боте', 'you cancelled or changed the order in the bot'),
     'subscription_changed': ('ваша подписка изменилась', 'your subscription has changed'),
-    'balance_short': ('на балансе не хватило денег', 'the balance was not enough'),
+    'balance_short': ('денег на балансе не хватило на этот заказ', 'the balance did not cover this order'),
 }
 
 
@@ -2559,19 +2573,23 @@ def topup_intent_refusal_message(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Доплата пришла, а заказ сам не оформился — ОДНО сообщение, кнопка по причине (замысел v2, правило 5).
 
-    `bought` — без кнопки покупки: после заказа уже была покупка, второй раз не списываем. `order` — к открытому
-    заказу. `support` — заказ на проверке, запрет покупок или удаление аккаунта: без кнопки покупки. Остальное —
-    «Оформить» по свежей цене (если баланса хватает) и выбор срока. ⚠️ Вне «Автосообщений» и вне сторожа текстов
-    (исключение мины KE, дом — АП-5).
+    `bought` — без кнопки покупки: после заказа уже было списание за подписку, второй раз не берём. `order` — к
+    открытому заказу. `support` — заказ на проверке, запрет покупок или удаление аккаунта: без кнопки покупки.
+    Остальное — «Оформить за N ₽» по свежей цене (если баланса хватает; что именно — в тексте) и выбор срока; без
+    предложения — новый расчёт (`df:start` сам уйдёт на обычные тарифы, если касса недоступна). ⚠️ Вне
+    «Автосообщений» и вне сторожа текстов (исключение мины KE, дом — АП-5).
     """
     reason = topup_intent_refusal_reason(intent.get('reason'))
     kind = topup_intent_refusal_kind(reason)
     rows: list[list[InlineKeyboardButton]] = []
+    offer_line = ''
     if kind == 'bought':
         why = _text(
             user,
-            'после него на вашем аккаунте уже была покупка, а дважды мы не списываем',
-            'there was already a purchase on your account after it, and we never charge twice',
+            'пока шла оплата, с вашего баланса уже прошло другое списание за подписку — '
+            'чтобы случайно не взять деньги дважды, мы ничего не оформляли',
+            'while the payment was going through, another subscription charge was made from your balance — '
+            'to avoid charging you twice, we did not place the order',
         )
     elif kind == 'order':
         why = _text(user, 'у вас уже есть открытый заказ', 'you already have an open order')
@@ -2592,33 +2610,40 @@ def topup_intent_refusal_message(
         offer = intent.get('offer_kopeks')
         days, devices = intent.get('period_days'), intent.get('devices')
         if offer and days and devices:
-            label = ' · '.join(
+            price = _text(user, f'{_money(user, int(offer))} ₽', f'₽{_money(user, int(offer))}')
+            what = ' · '.join(
                 part
                 for part in (
-                    intent.get('offer_tariff_name'),
+                    escape(str(intent.get('offer_tariff_name') or '')),
                     _period_short_label(user, int(days)),
-                    _text(user, f'{_money(user, int(offer))} ₽', f'₽{_money(user, int(offer))}'),
+                    _device_label(user, int(devices)),
                 )
                 if part
+            )
+            offer_line = _text(
+                user,
+                f'\n\nМожно оформить одной кнопкой — {what} за {price}, спишем с баланса.',
+                f'\n\nYou can order it with one tap — {what} for {price}, paid from your balance.',
             )
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=_text(user, f'Оформить: {label}', f'Order: {label}'),
+                        text=_text(user, f'Оформить за {price}', f'Order for {price}'),
                         callback_data=f'df:a2:{int(days)}:{int(devices)}:{int(offer)}',
                     )
                 ]
             )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=_text(user, '‹ Выбрать другой срок', '‹ Choose another period')
-                    if offer
-                    else _text(user, 'Выбрать срок', 'Choose a period'),
-                    callback_data='df:e2',
-                )
-            ]
-        )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=_text(user, '‹ Выбрать другой срок', '‹ Choose another period'), callback_data='df:e2'
+                    )
+                ]
+            )
+        else:
+            rows.append(
+                [InlineKeyboardButton(text=_text(user, 'Выбрать срок', 'Choose a period'), callback_data='df:start')]
+            )
     rows.append([_main_menu(user)])
     tail = {
         'order': _text(user, 'Деньги на балансе — откройте заказ.', 'The money is on your balance — open the order.'),
@@ -2631,10 +2656,10 @@ def topup_intent_refusal_message(
     text = _text(
         user,
         f'💰 <b>Оплата получена: {_money(user, amount_kopeks)} ₽</b>\n\n'
-        f'Заказ сам не оформился{": " + why if why else ""}. {tail}\n\n'
+        f'Заказ сам не оформился{": " + why if why else ""}. {tail}{offer_line}\n\n'
         f'На балансе: {_money(user, balance_kopeks)} ₽',
         f'💰 <b>Payment received: ₽{_money(user, amount_kopeks)}</b>\n\n'
-        f'The order was not placed automatically{": " + why if why else ""}. {tail}\n\n'
+        f'The order was not placed automatically{": " + why if why else ""}. {tail}{offer_line}\n\n'
         f'Balance: ₽{_money(user, balance_kopeks)}',
     )
     return text, InlineKeyboardMarkup(inline_keyboard=rows)

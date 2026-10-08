@@ -1718,31 +1718,49 @@ async def replace_older_topup_intents(db: AsyncSession, *, user_id: int, newer_p
 
 
 async def cancel_topup_intents(db: AsyncSession, *, user_id: int) -> str | None:
-    """«Отменить заказ» и «Изменить» в боте гасят неоплаченную доплату человека (замысел v2, правило 7; план ВК, 16а-2,
-    заявка 2): если банк потом проведёт оплату, деньги лягут на баланс с сообщением об отказе, заказ сам не оформится.
+    """«Отменить заказ» и «Изменить» в боте гасят доплату человека, исход которой ещё не решён (замысел v2, правило 7;
+    план ВК, 16а-2, заявка 2): оформление прочитает метку под замком прямо перед списанием и откажет — деньги лягут на
+    баланс с сообщением об отказе.
 
-    Метка ставится под замком строки и перечитанной строкой — вебхук мог оплатить её секунду назад; оформление читает
-    её под тем же замком прямо перед списанием (`_topup_intent_recheck_locked`). Возвращает, что сказать про деньги:
-    `fulfilled` — за последний час доплата пришла и заказ по ней оформлен; `paid` — доплата пришла, деньги на балансе;
+    Гасится и доплата, деньги которой уже пришли, а оформление ещё идёт: иначе «Заказ отменён», а через секунду
+    списание. Если списание уже прошло (проводка покупки после намерения) — метку не ставим и говорим `fulfilled`.
+    Возвращает: `fulfilled` — за последний час доплата оформила заказ; `paid` — доплата пришла, деньги на балансе;
     `None` — денег по доплате не приходило.
+    🔴 Порядок замков «платёж → пользователь», как у вебхука: коммит в начале отпускает строку пользователя, которую
+    сессия обработчика держит с первого запроса (`last_activity`), иначе вышел бы встречный порядок.
     """
+    await db.commit()
     now = datetime.now(UTC)
-    paid_note = None
+    paid_note, paid_pending = None, []
     for payment_id in sorted(p.id for p in await _recent_topup_intent_payments(db, user_id=user_id, now=now)):
         locked = await get_platega_payment_by_id_for_update(db, payment_id)
         intent = topup_intent_of(locked)
         if intent is None:
             continue
         status = intent.get('status')
-        if locked.is_paid or locked.transaction_id is not None:
-            moment = _intent_time(intent.get('decided_at') or intent.get('created_at'))
-            if moment is not None and moment >= now - TOPUP_INTENT_TTL:
-                paid_note = 'fulfilled' if status == 'fulfilled' else (paid_note or 'paid')
-        elif status == 'pending':
+        paid = locked.is_paid or locked.transaction_id is not None
+        moment = _intent_time(intent.get('decided_at') or intent.get('created_at'))
+        if paid and status == 'pending':
+            paid_pending.append((locked, intent))
+        elif paid and moment is not None and moment >= now - TOPUP_INTENT_TTL:
+            paid_note = 'fulfilled' if status == 'fulfilled' else (paid_note or 'paid')
+        elif status == 'pending' and not paid:
             locked.metadata_json = {
                 **locked.metadata_json,
                 TOPUP_INTENT_KEY: {**intent, 'status': 'cancelled', 'cancelled_at': now.isoformat()},
             }
+    if paid_pending:
+        # Оформление держит те же два замка до коммита списания: дождались — его проводка уже видна.
+        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+        for locked, intent in paid_pending:
+            if await _bought_since(db, user_id=user_id, since=_intent_time(intent.get('created_at'))):
+                paid_note = 'fulfilled'
+                continue
+            locked.metadata_json = {
+                **locked.metadata_json,
+                TOPUP_INTENT_KEY: {**intent, 'status': 'cancelled', 'cancelled_at': now.isoformat()},
+            }
+            paid_note = paid_note or 'paid'
     await db.commit()
     return paid_note
 
@@ -1801,6 +1819,21 @@ def _topup_intent_session():
     return AsyncSessionLocal()
 
 
+async def _bought_since(db: AsyncSession, *, user_id: int, since: datetime | None) -> bool:
+    if since is None:
+        return False
+    bought = await db.scalar(
+        select(Transaction.id)
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+            Transaction.created_at >= since,
+        )
+        .limit(1)
+    )
+    return bought is not None
+
+
 async def _topup_intent_drift(
     db: AsyncSession, *, user_id: int, intent: dict[str, Any], created_at: datetime, current: dict[str, Any] | None
 ) -> str | None:
@@ -1809,16 +1842,7 @@ async def _topup_intent_drift(
     # пишется проводкой `SUBSCRIPTION_PAYMENT` (`debit_transaction_id`), поэтому одной проверки хватает на все пути.
     # ⚠️ Той же проводкой пишутся докупка трафика и устройств, суточные списания и действия админа — отказ и на них:
     # осторожно в сторону «деньги остаются на балансе», но причину называть «что-то куплено», а не «куплена подписка».
-    bought = await db.scalar(
-        select(Transaction.id)
-        .where(
-            Transaction.user_id == user_id,
-            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
-            Transaction.created_at >= created_at,
-        )
-        .limit(1)
-    )
-    if bought is not None:
+    if await _bought_since(db, user_id=user_id, since=created_at):
         return 'already_purchased'
     # Та же подписка — по номеру, тарифу и признаку пробной; `updated_at`, `status`, `device_limit`, `end_date` не
     # сравниваем: их двигает фон (панель, монитор), и сверка отказывала бы впустую (замысел v2, правило 2).
@@ -1836,11 +1860,17 @@ async def _topup_intent_drift(
 async def _topup_intent_recheck_locked(
     db: AsyncSession, *, payment_id: int, user_id: int, intent: dict[str, Any]
 ) -> str | None:
-    """Последний момент перед списанием (план ВК, 16а-2, заявка 2): замок пользователя — тот же, что возьмёт
-    `commit_direct_wallet_checkout`, — держится до коммита списания, поэтому ни отмена, ни покупка другим путём между
-    этой проверкой и списанием не вклинятся. Метку отмены читаем со строки платежа под её замком, а не из снимка."""
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    """Последний момент перед списанием (план ВК, 16а-2, заявка 2): замки строки платежа и пользователя держатся до
+    коммита списания в `commit_direct_wallet_checkout`, поэтому ни отмена, ни покупка другим путём между этой
+    проверкой и списанием не вклинятся. Метку отмены читаем со строки платежа под её замком, а не из снимка.
+
+    🔴 Порядок «платёж → пользователь» — как у вебхука и у `cancel_topup_intents` (договор
+    `create_or_resume_direct_checkout`: с замком пользователя за платежом не тянуться). 🔴 Пользователь — с
+    `populate_existing`: объект загружен сверкой задолго до замка, а `_lock_direct_context` без этого отдал бы его же,
+    и списание записало бы баланс поверх зачисления, пришедшего в эти секунды (второй платёж, начисление админа).
+    """
     fresh = topup_intent_of(await get_platega_payment_by_id_for_update(db, payment_id)) or {}
+    await db.execute(select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True))
     if fresh.get('status') != 'pending':
         return str(fresh.get('status'))
     return await _topup_intent_drift(
@@ -1904,6 +1934,10 @@ async def _topup_intent_refused(
     db: AsyncSession, *, payment_id: int, user_id: int, intent: dict[str, Any], raw: Any, public_id: str | None
 ) -> dict[str, Any] | None:
     reason = topup_intent_refusal_reason(raw)
+    since = _intent_time(intent.get('created_at'))
+    if topup_intent_refusal_kind(reason) == 'retry' and await _bought_since(db, user_id=user_id, since=since):
+        # Отменил, просрочил или заменил — а потом купил другим путём: кнопка «Оформить» списала бы второй срок.
+        reason = 'already_purchased'
     extra: dict[str, Any] = {} if reason == raw else {'detail': str(raw)}
     if topup_intent_refusal_kind(reason) == 'retry':
         extra.update(await _topup_intent_offer(db, user_id=user_id, intent=intent) or {})

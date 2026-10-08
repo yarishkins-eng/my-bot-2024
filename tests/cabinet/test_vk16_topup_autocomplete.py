@@ -588,8 +588,9 @@ async def test_webhook_credits_then_completes_then_runs_side_effects_and_skips_t
     assert 'Пополнение успешно' not in text_ and 'ХВОСТ' not in text_
     # Мина OT (заявка 2): «готова» не обещается безусловно, остаток назван — ПОСЛЕ списания, а не до.
     left = settings.format_price(BALANCE + TOP_UP_30_1 - PRICE_30_1)
-    assert 'не придёт за 10 минут — напишите в поддержку' in text_ and f'На балансе осталось: {left}' in text_
-    assert webhook.bot.send_message.await_args.kwargs.get('reply_markup') is None
+    assert 'Если его нет через 10 минут — напишите в поддержку' in text_ and f'На балансе осталось: {left}' in text_
+    support = webhook.bot.send_message.await_args.kwargs['reply_markup'].inline_keyboard
+    assert [[b.text for b in row] for row in support] == [['Написать в поддержку']]  # к покупке не зовём
     webhook.email.assert_awaited_once()
     assert webhook.email.await_args.kwargs == {'balance_kopeks': BALANCE + TOP_UP_30_1 - PRICE_30_1}
     assert webhook.admin[0]['auto_next_step'] == (
@@ -643,7 +644,7 @@ async def test_refused_intent_still_tells_about_the_money_but_not_through_the_ol
     assert webhook.carts_cleared_before_message == [True]
     assert 'cart_chain' not in webhook.order
     assert webhook.admin[0]['auto_next_step'] is None
-    assert 'бот сам не оформил (subscription_changed)' in webhook.admin[0]['intent_refused']
+    assert 'бот сам не оформил: подписка клиента изменилась, пока шла оплата' in webhook.admin[0]['intent_refused']
     webhook.erasure.assert_awaited_once()
 
 
@@ -673,6 +674,8 @@ async def test_refusal_after_a_purchase_by_another_path_does_not_push_to_buy_aga
     await _pay(db, webhook)
 
     assert 'ХВОСТ' not in webhook.bot.send_message.await_args.args[1]
+    keyboard = webhook.bot.send_message.await_args.kwargs['reply_markup'].inline_keyboard
+    assert [b.callback_data for row in keyboard for b in row] == ['back_to_menu']  # купившему — ни «Оформить», ни срока
 
 
 async def test_cart_that_cannot_be_cleared_does_not_stop_the_money_message(db, session, webhook):
