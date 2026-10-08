@@ -13,7 +13,7 @@ from typing import Any, NamedTuple
 
 import structlog
 from aiogram.types import InlineKeyboardMarkup
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import and_, case, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1853,17 +1853,30 @@ async def _topup_intent_recheck_locked(
 
 
 async def _subscription_identity(db: AsyncSession, user_id: int) -> dict[str, Any] | None:
-    """Номер, тариф и признак пробной текущей подписки — колонками, мимо карты объектов сессии: объект, загруженный
-    сверкой раньше, помнил бы старые значения."""
-    subscription = await _current_subscription(db, user_id)
-    if subscription is None:
-        return None
-    tariff_id, is_trial = (
+    """Номер, тариф и признак пробной текущей подписки — чистым чтением колонок под замком пользователя.
+
+    🔴 Не `_current_subscription`: она зовёт `check_and_update_subscription_status`, а та может сделать `commit` и
+    отпустить замки перепроверки до списания. Порядок выбора — тот же, что у `get_subscription_by_user_id`
+    (`crud/subscription.py`): активная, пробная, затем по сроку и дате создания. Колонки идут мимо карты объектов
+    сессии — объект, загруженный сверкой раньше, помнил бы старые значения.
+    """
+    row = (
         await db.execute(
-            select(Subscription.tariff_id, Subscription.is_trial).where(Subscription.id == subscription.id)
+            select(Subscription.id, Subscription.tariff_id, Subscription.is_trial)
+            .where(Subscription.user_id == user_id)
+            .order_by(
+                case(
+                    (Subscription.status == SubscriptionStatus.ACTIVE.value, 0),
+                    (Subscription.status == SubscriptionStatus.TRIAL.value, 1),
+                    else_=2,
+                ),
+                Subscription.end_date.desc().nulls_last(),
+                Subscription.created_at.desc(),
+            )
+            .limit(1)
         )
-    ).one()
-    return {'id': subscription.id, 'tariff_id': tariff_id, 'is_trial': bool(is_trial)}
+    ).first()
+    return None if row is None else {'id': row.id, 'tariff_id': row.tariff_id, 'is_trial': bool(row.is_trial)}
 
 
 async def _topup_intent_offer(db: AsyncSession, *, user_id: int, intent: dict[str, Any]) -> dict[str, Any] | None:
