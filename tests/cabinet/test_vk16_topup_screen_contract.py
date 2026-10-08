@@ -742,8 +742,9 @@ async def test_old_invoice_counts_as_paid_by_either_sign(db, session, paid_by):
     assert (await _by_id(db, session, 71)).intent_payment_id == 70
 
 
-async def test_the_old_invoice_whose_money_came_last_wins_regardless_of_its_number(db, session):
-    # Номер строки и порядок прихода денег — разные вещи: побеждает пришедший позже, а не созданный позже.
+@pytest.mark.parametrize(('ago_68', 'ago_69', 'winner'), [(10, 50, 68), (50, 10, 69)])
+async def test_the_old_invoice_whose_money_came_last_wins_regardless_of_its_number(db, session, ago_68, ago_69, winner):
+    # Номер строки и порядок прихода денег — разные вещи: побеждает пришедший позже, в обоих порядках номеров.
     _intent_payment(
         session,
         payment_id=68,
@@ -752,7 +753,7 @@ async def test_the_old_invoice_whose_money_came_last_wins_regardless_of_its_numb
         transaction_id=968,
         status='refused',
         reason='cancelled',
-        decided_at=_iso(timedelta(seconds=10)),
+        decided_at=_iso(timedelta(seconds=ago_68)),
     )
     _intent_payment(
         session,
@@ -762,11 +763,11 @@ async def test_the_old_invoice_whose_money_came_last_wins_regardless_of_its_numb
         transaction_id=969,
         status='refused',
         reason='replaced',
-        decided_at=_iso(timedelta(seconds=50)),
+        decided_at=_iso(timedelta(seconds=ago_69)),
     )
     _intent_payment(session, payment_id=71, created_ago=timedelta(minutes=6))
 
-    assert (await _by_id(db, session, 71)).intent_payment_id == 68
+    assert (await _by_id(db, session, 71)).intent_payment_id == winner
 
 
 async def test_an_older_invoice_is_not_given_the_outcome_of_a_newer_one(db, session):
