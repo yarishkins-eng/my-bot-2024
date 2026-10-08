@@ -425,6 +425,13 @@ async def test_own_charge_before_the_top_up_was_chosen_does_not_count(db, sessio
     assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
 
 
+async def test_paid_top_up_without_an_outcome_is_named_as_money_on_the_balance(db, session):
+    # Волна 2 (N5, мина OU): оформление оборвалось, исхода и сообщения нет — «бот написал» было бы неправдой.
+    _intent_payment(session, payment_id=91, status='cancelled', is_paid=True, created_ago=timedelta(minutes=5))
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
+
+
 async def test_someone_elses_decided_top_up_changes_nothing(db, session):
     decided = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     _intent_payment(session, payment_id=91, user_id=2, status='fulfilled', is_paid=True, decided_at=decided)

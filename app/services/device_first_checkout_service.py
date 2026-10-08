@@ -1797,8 +1797,11 @@ async def cancel_topup_intents(db: AsyncSession, *, user_id: int) -> str | None:
         moment = _intent_time(intent.get('decided_at') or intent.get('created_at'))
         if paid and status == 'pending':
             paid_pending.append((locked, intent))
-        elif paid and moment is not None and moment >= now - TOPUP_INTENT_TTL:
+        elif paid and moment is not None and moment >= now - TOPUP_INTENT_TTL and intent.get('decided_at'):
             earlier = True
+        elif paid and moment is not None and moment >= now - TOPUP_INTENT_TTL:
+            # Деньги пришли, а исхода нет (оформление оборвалось — мина OU): сообщения о ней не было, деньги на балансе.
+            paid_note = paid_note or 'paid'
         elif status == 'pending' and not paid:
             locked.metadata_json = {
                 **locked.metadata_json,
