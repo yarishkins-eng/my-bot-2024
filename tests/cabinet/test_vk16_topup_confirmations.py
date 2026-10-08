@@ -32,6 +32,7 @@ from tests.cabinet.test_vk16_topup_intent import (  # noqa: F401 -- фиксту
     _options,
     _purchase,
     _request,
+    _set_user,
     _user,
     db,
     env,
@@ -576,6 +577,8 @@ async def test_refusal_names_the_balance_read_after_the_attempt_not_the_webhook_
 ):
     # Покупка другим путём в эти секунды списала деньги в чужой сессии: `user` вебхука помнит баланс после зачисления.
     _intent_payment(session, payment_id=97, **TRIAL)
+    # Не первое пополнение: иначе вебхук сам перечитал бы пользователя (`has_made_first_topup`) и сторож был бы слеп.
+    _set_user(session, has_made_first_topup=1)
 
     async def other_path_spent_it(*, payment_id):
         session.execute(text(f'UPDATE users SET balance_kopeks = balance_kopeks - {PRICE_30_1} WHERE id = 1'))
