@@ -684,3 +684,171 @@ def test_refusal_offer_button_carries_the_moment_the_top_up_began(monkeypatch):
 
 def test_moment_fits_telegram_callback_limit_for_the_longest_order():
     assert len(f'df:a2:3650:100:{2_000_000_000}:{handlers._shown_at()}'.encode()) <= 64
+
+
+# --- добор по мутациям волны 2 (заявка 3б) ---------------------------------------------------------------------------
+
+
+async def test_late_cancel_that_cleared_is_paid_still_counts_as_money_came(db, session):
+    # Мина OH: поздний «отменён» гасит `is_paid`, а зачисление (`transaction_id`) осталось — деньги пришли.
+    _intent_payment(session, payment_id=84, status='cancelled', is_paid=False, transaction_id=984)
+
+    response = await _by_id(db, session, 84)
+
+    assert (response.intent_paid, response.intent_refusal_kind) == (True, 'retry')
+
+
+@pytest.mark.parametrize(('status', 'extra'), [('pending', {}), ('fulfilled', {'checkout_public_id': 'chk-ok-3'})])
+async def test_offer_tariff_name_is_only_for_a_refusal(db, session, status, extra):
+    _intent_payment(session, payment_id=83, status=status, offer_tariff_name='Базовый', **extra)
+
+    assert (await _by_id(db, session, 83)).intent_offer_tariff_name is None
+
+
+async def test_payment_without_intent_has_no_intent_fields_at_all(db, session):
+    _intent_payment(session, payment_id=82, is_paid=True, transaction_id=982)
+    payment = session.get(dfc.PlategaPayment, 82)
+    payment.metadata_json = {'language': 'ru'}
+    session.commit()
+
+    response = await _by_id(db, session, 82)
+
+    assert (response.intent_payment_id, response.intent_paid, response.intent_amount_kopeks) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    ('reason', 'kind_after'),
+    [('open_order', 'bought'), ('order_on_review', 'support')],  # «к заказу» гасится покупкой, «в поддержку» — нет
+)
+async def test_purchase_after_the_refusal_withdraws_only_buying_buttons(db, session, reason, kind_after):
+    _intent_payment(
+        session, payment_id=81, created_ago=timedelta(minutes=20), status='refused', reason=reason, is_paid=True
+    )
+    _purchase(session, minutes_ago=1)
+
+    assert (await _by_id(db, session, 81)).intent_refusal_kind == kind_after
+
+
+@pytest.mark.parametrize('paid_by', ['is_paid', 'transaction_id'])
+async def test_old_invoice_counts_as_paid_by_either_sign(db, session, paid_by):
+    _replaced_then_paid(session)
+    payment = session.get(dfc.PlategaPayment, 70)
+    if paid_by == 'is_paid':
+        payment.transaction_id = None  # зачисление ещё не связано, но провайдер подтвердил
+    else:
+        payment.is_paid = False  # мина OH
+    session.commit()
+
+    assert (await _by_id(db, session, 71)).intent_payment_id == 70
+
+
+async def test_the_old_invoice_whose_money_came_last_wins_regardless_of_its_number(db, session):
+    # Номер строки и порядок прихода денег — разные вещи: побеждает пришедший позже, а не созданный позже.
+    _intent_payment(
+        session,
+        payment_id=68,
+        created_ago=timedelta(minutes=12),
+        is_paid=True,
+        transaction_id=968,
+        status='refused',
+        reason='cancelled',
+        decided_at=_iso(timedelta(seconds=10)),
+    )
+    _intent_payment(
+        session,
+        payment_id=69,
+        created_ago=timedelta(minutes=11),
+        is_paid=True,
+        transaction_id=969,
+        status='refused',
+        reason='replaced',
+        decided_at=_iso(timedelta(seconds=50)),
+    )
+    _intent_payment(session, payment_id=71, created_ago=timedelta(minutes=6))
+
+    assert (await _by_id(db, session, 71)).intent_payment_id == 68
+
+
+async def test_an_older_invoice_is_not_given_the_outcome_of_a_newer_one(db, session):
+    # Опрашивают НЕ самый новый счёт: оплаченный более новый — не его предшественник.
+    _intent_payment(session, payment_id=71, created_ago=timedelta(minutes=10))
+    _intent_payment(
+        session,
+        payment_id=72,
+        created_ago=timedelta(minutes=6),
+        is_paid=True,
+        transaction_id=972,
+        status='refused',
+        reason='price_changed',
+        decided_at=_iso(timedelta(seconds=10)),
+    )
+
+    assert (await _by_id(db, session, 71)).intent_payment_id == 71
+
+
+async def test_check_button_answers_with_the_outcome_of_the_paid_old_invoice(db, session, monkeypatch):
+    # «Проверить ещё раз» (16в-2) — тот же договор, что `/{id}` и `/latest`.
+    _replaced_then_paid(session)
+
+    class _Bot:
+        session = SimpleNamespace(close=AsyncMock())
+
+    monkeypatch.setattr(balance_route, 'create_bot', lambda: _Bot())
+    monkeypatch.setattr(balance_route, '_is_checkable', lambda record: True)
+
+    async def manual_check(db_, method, payment_id, service):
+        from app.services.payment_verification_service import get_payment_record
+
+        return await get_payment_record(db_, method, payment_id)
+
+    monkeypatch.setattr(balance_route, 'run_manual_check', manual_check)
+    checked = await balance_route.check_payment_status(method='platega', payment_id=71, user=_user(session), db=db)
+    monkeypatch.setattr(balance_route, '_is_checkable', lambda record: False)
+    unavailable = await balance_route.check_payment_status(method='platega', payment_id=71, user=_user(session), db=db)
+    monkeypatch.setattr(balance_route, '_is_checkable', lambda record: True)
+    monkeypatch.setattr(balance_route, 'run_manual_check', AsyncMock(return_value=None))
+    failed = await balance_route.check_payment_status(method='platega', payment_id=71, user=_user(session), db=db)
+
+    for answer in (checked, unavailable, failed):
+        assert (answer.payment.intent_payment_id, answer.payment.intent_outcome) == (70, 'refused')
+
+
+def test_moment_in_the_wallet_button_is_now(monkeypatch):
+    now = datetime.now(UTC).timestamp()
+
+    assert abs(handlers._shown_at() - now) <= 2
+
+
+def test_moment_of_a_top_up_without_time_zone_is_read_as_utc():
+    assert handlers._intent_moment({'created_at': '2026-10-08T10:00:00'}) == int(
+        datetime(2026, 10, 8, 10, 0, tzinfo=UTC).timestamp()
+    )
+
+
+@pytest.mark.parametrize(('period_days', 'devices'), [(30, 2), (90, 1)])  # тот же срок или те же устройства — не тот же
+async def test_own_tap_needs_both_the_same_period_and_devices(db, session, period_days, devices):
+    _purchase(session, minutes_ago=0.05, checkout_public_id='chk-near-1', period_days=period_days, devices=devices)
+
+    _, _, render = await _press(db, session, _wallet_callback(timedelta(minutes=2)))
+
+    render.shown.assert_not_awaited()
+    assert 'с баланса ничего не списано' in render.await_args.kwargs['caption']
+
+
+async def test_english_guard_names_the_balance(db, session):
+    _set_user(session, language='en')
+    session.expire_all()
+    _purchase(session, minutes_ago=30)
+
+    _, _, render = await _press(db, session, _wallet_callback(timedelta(hours=1)))
+
+    assert 'nothing was taken from your balance — your balance is ₽50.37.' in render.await_args.kwargs['caption']
+
+
+async def test_moment_too_large_for_a_date_does_nothing(db, session):
+    create, _, render = await _press(
+        db, session, SimpleNamespace(data='df:a2:30:1:14900:99999999999999999999', answer=AsyncMock())
+    )
+
+    create.assert_not_awaited()
+    render.assert_not_awaited()
