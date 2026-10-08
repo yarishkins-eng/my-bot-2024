@@ -2073,11 +2073,11 @@ async def abandon(
             db_user,
             (
                 '\n\nЕсли старая ссылка будет оплачена позднее, сумма один раз зачислится на баланс. '
-                'Прежняя подписка не оформится.'
+                'Подписка по этому заказу не оформится.'
             ),
             (
                 '\n\nIf the old link is paid later, the amount is credited to your balance once. '
-                'The previous subscription will not be activated.'
+                "This order's subscription will not be activated."
             ),
         ),
         keyboard=InlineKeyboardMarkup(inline_keyboard=[[_main_menu(db_user)]]),
@@ -2668,6 +2668,8 @@ def topup_intent_refusal_message(
             )
     rows.append([_main_menu(user)])
     tail = {
+        # «Уже была оплата» другим путём могла потратить и эти деньги — остаток называет строка ниже (волна 2 заявки 3а).
+        'bought': _text(user, 'Сколько осталось на балансе — ниже.', 'Your balance is shown below.'),
         'order': _text(user, 'Деньги на балансе — откройте заказ.', 'The money is on your balance — open the order.'),
         'support': _text(
             user,

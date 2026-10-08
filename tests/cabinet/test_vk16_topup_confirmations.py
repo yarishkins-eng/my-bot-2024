@@ -553,3 +553,67 @@ async def test_wallet_debit_lock_on_a_real_async_session_keeps_the_promo_group(t
         assert user.balance_kopeks == BALANCE + 9_900
         assert user.get_primary_promo_group().id == 7
     await engine.dispose()
+
+
+# --- волна 2, прогон глазами клиента: правда в текстах отказа и отмены со старой ссылкой --------------------------
+
+
+def test_already_bought_refusal_does_not_promise_the_money_is_on_the_balance():
+    # «Уже была оплата» другим путём могла потратить и эти деньги — остаток называет строка ниже.
+    text_, _ = handlers.topup_intent_refusal_message(
+        SimpleNamespace(id=1, language='ru'),
+        {'status': 'refused', 'reason': 'already_purchased', 'period_days': 30, 'devices': 1},
+        amount_kopeks=9_900,
+        balance_kopeks=37,
+    )
+
+    assert 'Деньги на балансе' not in text_
+    assert 'Сколько осталось на балансе — ниже.' in text_ and 'На балансе: 0,37 ₽' in text_
+
+
+async def test_refusal_names_the_balance_read_after_the_attempt_not_the_webhook_snapshot(
+    db, session, webhook, monkeypatch
+):
+    # Покупка другим путём в эти секунды списала деньги в чужой сессии: `user` вебхука помнит баланс после зачисления.
+    _intent_payment(session, payment_id=97, **TRIAL)
+
+    async def other_path_spent_it(*, payment_id):
+        session.execute(text(f'UPDATE users SET balance_kopeks = balance_kopeks - {PRICE_30_1} WHERE id = 1'))
+        session.commit()
+        return {
+            **dfc.topup_intent_of(session.get(PlategaPayment, 97)),
+            'status': 'refused',
+            'reason': 'already_purchased',
+        }
+
+    monkeypatch.setattr(dfc, 'complete_topup_intent', other_path_spent_it)
+
+    await _pay(db, webhook)
+
+    sent = webhook.bot.send_message.await_args.args[1]
+    assert (
+        f'На балансе: {handlers._money(SimpleNamespace(language="ru"), BALANCE + TOP_UP_30_1 - PRICE_30_1)} ₽' in sent
+    )
+
+
+async def test_abandon_tail_speaks_about_this_order_not_a_previous_subscription():
+    user = SimpleNamespace(id=17, language='ru')
+    with (
+        patch.object(handlers, 'cancel_topup_intents', AsyncMock(return_value='earlier')),
+        patch.object(
+            handlers,
+            'abandon_direct_checkout_for_new_calculation',
+            AsyncMock(return_value=SimpleNamespace(lifecycle_state='cancelled')),
+        ),
+        patch.object(handlers, 'edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await handlers.abandon(
+            SimpleNamespace(data='df:xa:chk-1', answer=AsyncMock()),
+            user,
+            AsyncMock(),
+            SimpleNamespace(clear=AsyncMock()),
+        )
+
+    caption = render.await_args.kwargs['caption']
+    assert caption.endswith('Подписка по этому заказу не оформится.')
+    assert 'Прежняя подписка' not in caption and 'Оплату, которая пришла раньше, это не затронуло' in caption
