@@ -239,11 +239,13 @@ def _purchase(
     period_days: int = 30,
     devices: int = 1,
     user_id: int = 1,
+    transaction: bool = True,
 ) -> None:
     """Покупка ЛЮБЫМ путём (заявка 3а, мина OP): проводка покупки подписки и, если назван номер, заказ новой кассы
     со списанием — так выглядит и оформление доплатой, и касса, и карта."""
     at = datetime.now(UTC) - timedelta(minutes=minutes_ago)
-    session.add(Transaction(user_id=user_id, type='subscription_payment', amount_kopeks=PRICE_30_1, created_at=at))
+    if transaction:
+        session.add(Transaction(user_id=user_id, type='subscription_payment', amount_kopeks=PRICE_30_1, created_at=at))
     if checkout_public_id is not None:
         session.add(
             SubscriptionCheckout(

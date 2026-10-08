@@ -86,6 +86,33 @@ async def test_newest_purchase_within_the_hour_is_the_one_named(db, session, end
     assert (decision.checkout_public_id, decision.period_days) == ('chk-new-2', 180)
 
 
+async def test_order_with_money_but_without_a_purchase_record_still_asks(db, session, ends):
+    # Заказ новой кассы со списанием — покупка сам по себе, даже если проводки покупки рядом нет.
+    _purchase(session, minutes_ago=8, checkout_public_id='chk-direct-4', transaction=False)
+
+    assert (await _decide(db, session)).checkout_public_id == 'chk-direct-4'
+
+
+async def test_top_up_or_bonus_within_the_hour_is_not_a_purchase(db, session, ends):
+    # Пополнение баланса и бонус — не покупка: иначе любая доплата спрашивала бы «уже оформлено» у того, кто только
+    # что пополнил баланс.
+    at = datetime.now(UTC) - timedelta(minutes=5)
+    session.add(Transaction(user_id=1, type='deposit', amount_kopeks=TOP_UP_30_1, created_at=at))
+    session.add(Transaction(user_id=1, type='referral_reward', amount_kopeks=5_000, created_at=at))
+    session.commit()
+
+    assert (await _decide(db, session)).status == 'accepted'
+
+
+async def test_invoice_issued_between_two_purchases_is_not_reused_for_once_more(db, session, ends):
+    # Считаем от ПОСЛЕДНЕЙ покупки: счёт между ними при зачислении откажет «уже была оплата».
+    _purchase(session, minutes_ago=40, checkout_public_id='chk-first-1', transaction=False)
+    _intent_payment(session, payment_id=73, created_ago=timedelta(minutes=20))
+    _purchase(session, minutes_ago=10)
+
+    assert (await _decide(db, session, repeat=True)).status == 'accepted'
+
+
 async def test_yes_once_more_bills_another_period(db, session, ends):
     _purchase(session, minutes_ago=20, checkout_public_id='chk-card-7')
 
