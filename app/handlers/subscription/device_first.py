@@ -1990,13 +1990,13 @@ async def cancel(
                         '⚠️ <b>Отменить заказ?</b>\n\n'
                         'Платёжная ссылка может оставаться доступной некоторое время. Не оплачивайте её. '
                         'Если оплата всё же подтвердится позже, сумма один раз зачислится на баланс — '
-                        'прежняя подписка не оформится.'
+                        'подписка по этому заказу не оформится.'
                     ),
                     (
                         '⚠️ <b>Cancel this order?</b>\n\n'
                         'The payment link can remain available for a while. Do not pay it. '
                         'If a payment is confirmed later, the amount is credited to your balance once — '
-                        'the previous subscription will not be activated.'
+                        "this order's subscription will not be activated."
                     ),
                 ),
                 keyboard=InlineKeyboardMarkup(

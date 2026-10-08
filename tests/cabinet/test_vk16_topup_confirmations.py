@@ -195,6 +195,15 @@ async def test_money_already_on_its_way_is_named_before_the_question(db, session
     assert decision.status == 'already_paid'
 
 
+async def test_an_old_yes_does_not_cover_a_purchase_seconds_newer(db, session, ends):
+    # Запас «да» — секунда (срезанные микросекунды), не больше: покупка на 3 секунды новее — вопрос снова.
+    _purchase(session, minutes_ago=0.1, checkout_public_id='chk-new-3')
+    newest = await _decide(db, session)
+    older_yes = newest.purchased_at - timedelta(seconds=3)
+
+    assert (await _decide(db, session, confirmed_purchase_at=older_yes)).status == 'already_fulfilled'
+
+
 async def test_yes_without_a_time_zone_is_read_as_utc_not_a_crash(db, session, ends):
     # Волна 2: дата без пояса роняла сравнение (`TypeError`) — маршрут ответил бы 500.
     _purchase(session, minutes_ago=20)
