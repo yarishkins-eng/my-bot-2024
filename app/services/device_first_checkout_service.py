@@ -1870,7 +1870,12 @@ async def _topup_intent_recheck_locked(
     и списание записало бы баланс поверх зачисления, пришедшего в эти секунды (второй платёж, начисление админа).
     """
     fresh = topup_intent_of(await get_platega_payment_by_id_for_update(db, payment_id)) or {}
-    await db.execute(select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True))
+    # Строку обязательно прочитать: без выборки строк объект в карте сессии не освежается — остаётся только замок.
+    (
+        await db.execute(
+            select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
+        )
+    ).scalar_one()
     if fresh.get('status') != 'pending':
         return str(fresh.get('status'))
     return await _topup_intent_drift(
