@@ -1016,3 +1016,91 @@ async def test_change_on_a_foreign_or_missing_order_keeps_the_top_up_alive():
         await handlers.change_selection(_callback('df:e:chk-1'), user, AsyncMock(), SimpleNamespace())
 
     gas.assert_not_awaited()
+
+
+# --- добор по мутатору волны 2 --------------------------------------------------------------------------------
+
+
+async def test_refusal_is_sent_as_html_with_the_balance_after_the_money(db, session, webhook):
+    _intent_payment(session, payment_id=97, **{**TRIAL, 'subscription_id': 40})
+
+    await _pay(db, webhook)
+
+    kwargs = webhook.bot.send_message.await_args.kwargs
+    assert kwargs['parse_mode'] == 'HTML'  # иначе человек увидит сырые <b> и &amp;
+    assert (
+        f'На балансе: {handlers._money(_user(), BALANCE + TOP_UP_30_1)} ₽'
+        in webhook.bot.send_message.await_args.args[1]
+    )
+
+
+def test_owner_hints_are_not_final_unless_said_so():
+    from app.services.admin_notification_service import OwnerCartHint
+
+    assert OwnerCartHint('x', True).final is False
+    assert OwnerCartHint('x', False, True).final is False
+
+
+async def test_email_names_a_zero_balance_left_after_the_order(monkeypatch):
+    from app.services import notification_delivery_service as delivery
+    from app.services.payment.common import notify_email_user_topup
+
+    sent = AsyncMock()
+    monkeypatch.setattr(delivery.notification_delivery_service, 'send_notification', sent)
+    user = SimpleNamespace(id=1, telegram_id=None, email='a@b.c', balance_kopeks=14_937)
+
+    await notify_email_user_topup(user, 9_900, balance_kopeks=0)
+
+    assert sent.await_args.kwargs['context']['new_balance_kopeks'] == 0
+
+
+async def test_ordinary_top_up_writes_no_refusal_error_to_the_log(db, session, webhook, monkeypatch):
+    errors = []
+    monkeypatch.setattr(
+        'app.services.payment.platega.logger.error', lambda message, *a, **k: errors.append(message), raising=False
+    )
+    _intent_payment(session, payment_id=97, **TRIAL)
+    session.execute(text("UPDATE platega_payments SET metadata_json = '{}' WHERE id = 97"))  # обычное пополнение
+    session.commit()
+
+    await _pay(db, webhook)
+
+    assert not [e for e in errors if 'отказа' in str(e)]
+    assert 'Пополнение успешно' in webhook.bot.send_message.await_args.args[1]
+
+
+@pytest.mark.parametrize('label', ['replaced', 'expired', 'refused'])
+async def test_any_closed_label_under_the_lock_stops_the_debit(session, buy, monkeypatch, label):
+    _paid(session)
+    _between_create_and_debit(monkeypatch, lambda: _write_intent(session, status=label))
+
+    _, stored = await _complete(session)
+
+    assert stored['status'] == 'refused' and buy.commit == []
+
+
+async def test_money_known_only_by_the_transaction_link_counts_as_arrived(db, session):
+    _intent_payment(session, payment_id=91, transaction_id=5)  # `is_paid` ещё не стоит
+    after = datetime.now(UTC) + timedelta(seconds=1)
+    session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=1, created_at=after))
+    session.commit()
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
+    assert _intent(session, 91)['status'] == 'pending'
+
+
+async def test_fulfilled_survives_a_second_paid_top_up_found_later(db, session):
+    decided = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    _intent_payment(session, payment_id=91, status='fulfilled', is_paid=True, decided_at=decided)
+    _intent_payment(session, payment_id=92, is_paid=True)  # оплачена, исхода нет — придёт в paid_pending
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
+
+
+async def test_the_hour_counts_from_the_decision_not_from_the_choice(db, session):
+    decided = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    _intent_payment(
+        session, payment_id=91, status='fulfilled', is_paid=True, decided_at=decided, created_ago=timedelta(minutes=80)
+    )
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
