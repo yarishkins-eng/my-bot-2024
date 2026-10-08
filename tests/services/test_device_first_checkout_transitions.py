@@ -541,7 +541,11 @@ async def test_direct_finalizers_fence_a_preexisting_draft_after_another_order_n
     user = SimpleNamespace(id=7)
     new_draft = SimpleNamespace(id=101, settlement_mode='direct_purchase_v2')
     prior_operator_hold = SimpleNamespace(id=91)
-    db = SimpleNamespace(execute=AsyncMock(side_effect=[ScalarResult(user), ScalarResult(prior_operator_hold)]))
+    # Заявка 3а ВК-16 (мина OW): замок прямой продажи перечитывает баланс — подделке нужен `refresh`.
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[ScalarResult(user), ScalarResult(prior_operator_hold)]),
+        refresh=AsyncMock(),
+    )
     get_owned = AsyncMock(return_value=new_draft)
     monkeypatch.setattr(service, 'get_owned_checkout', get_owned)
 
