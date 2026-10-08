@@ -946,7 +946,11 @@ class PlategaPaymentMixin:
                         + (
                             'клиенту отправлено объяснение'
                             if refusal_sent
-                            else 'объяснение в бот клиенту не ушло (нет Telegram или сбой отправки — смотреть журнал)'
+                            else 'у клиента нет Telegram — объяснения в боте нет, при желании напишите ему'
+                            if not user.telegram_id
+                            else 'клиенту ушло обычное «Пополнение успешно» без объяснения'
+                            if refusal is None
+                            else 'сообщение клиенту не дошло — напишите ему сами: деньги на балансе, заказ не оформлен'
                         )
                         if topup_intent is not None and not fulfilled
                         else None

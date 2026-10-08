@@ -23,8 +23,8 @@ from app.services.device_first_checkout_service import (
     TopUpIntentDecision,
     prepare_topup_intent,
     replace_older_topup_intents,
-    topup_intent_paid_predecessor,
     topup_intent_screen_fields,
+    topup_intent_screen_view,
 )
 from app.services.payment_method_config_service import get_enabled_methods_for_user
 from app.services.payment_service import PaymentService
@@ -1439,14 +1439,17 @@ def _get_payment_url(record: PendingPayment) -> str | None:
     return payment_url
 
 
-def _record_to_response(record: PendingPayment, *, intent_payment: Any = None) -> PendingPaymentResponse:
+def _record_to_response(
+    record: PendingPayment, *, intent_fields: dict[str, Any] | None = None
+) -> PendingPaymentResponse:
     """Convert PendingPayment to API response.
 
-    `intent_payment` — чей исход доплаты отдать, если не этого платежа (оплаченный предшественник, заявка 3б (ж)).
+    `intent_fields` — исход доплаты, собранный `topup_intent_screen_view` (предшественник, погашенное предложение,
+    заявка 3б); без него — исход самого платежа как есть (список платежей).
     """
     status_emoji, status_text = _get_status_info(record)
     return PendingPaymentResponse(
-        **topup_intent_screen_fields(intent_payment or record.payment),
+        **(intent_fields if intent_fields is not None else topup_intent_screen_fields(record.payment)),
         id=record.local_id,
         method=record.method.value,
         method_display=method_display_name(record.method),
@@ -1501,9 +1504,9 @@ async def _with_purchase_step(record_response: PendingPaymentResponse, user: Use
     # ложью. После отказа (и закрытого намерения, чьи деньги пришли) решает ВИД кнопки, как в сообщении бота, а не
     # подсказка корзины: она не знает, что бот только что написал «второй раз не списываем» (`bought`) или «напишите в
     # поддержку» (`support`) — шаг за человеком есть только у `retry` и `order` (заявка 3б).
-    kind = record_response.intent_refusal_kind
-    if kind is not None and (record_response.intent_outcome == 'refused' or record_response.is_paid):
-        record_response.purchase_step_pending = kind in {'retry', 'order'}
+    if record_response.intent_refusal_kind is not None:
+        # Вид есть только у отказа и у закрытого намерения с пришедшими деньгами; покупка после отказа уже дала `bought`.
+        record_response.purchase_step_pending = record_response.intent_refusal_kind in {'retry', 'order'}
         return record_response
     if not record_response.is_paid or record_response.intent_outcome in ('processing', 'fulfilled'):
         return record_response
@@ -1515,9 +1518,10 @@ async def _with_purchase_step(record_response: PendingPaymentResponse, user: Use
 
 async def _payment_response(db: AsyncSession, record: PendingPayment, user: User) -> PendingPaymentResponse:
     """Ответ про один платёж: при доплате под заказ, пока он ждёт денег, — исход оплаченного старого счёта (заявка 3б
-    (ж)): иначе экран ждал бы свои деньги, а они уже пришли по прежней ссылке."""
-    predecessor = await topup_intent_paid_predecessor(db, record.payment) if record.payment is not None else None
-    return await _with_purchase_step(_record_to_response(record, intent_payment=predecessor), user)
+    (ж)): иначе экран ждал бы свои деньги, а они уже пришли по прежней ссылке. Предложение, погашенное покупкой, — не
+    отдаём (`topup_intent_screen_view`)."""
+    fields = await topup_intent_screen_view(db, record.payment) if record.payment is not None else None
+    return await _with_purchase_step(_record_to_response(record, intent_fields=fields), user)
 
 
 @router.get('/pending-payments', response_model=PendingPaymentListResponse)

@@ -1548,18 +1548,24 @@ def topup_intent_screen_fields(payment: Any) -> dict[str, Any]:
     Срок, устройства и цена — заказа этого намерения; предложение «Оформить: тариф · срок · цена» — только у отказа и
     только если сервер его сделал (баланса хватает на свежую цену). Причина — из закрытого набора, вид кнопки — как в
     сообщении бота (`bought` / `order` / `support` / `retry`); сырой код ошибки (`detail`) наружу не отдаём.
-    `intent_payment_id` — платёж, о котором исход: у оплаченного предшественника он чужой (`topup_intent_paid_predecessor`).
+    `intent_payment_id` — платёж, о котором исход: у оплаченного предшественника он чужой (`topup_intent_paid_predecessor`);
+    `intent_paid` и `intent_amount_kopeks` — пришли ли деньги и сколько ИМЕННО по нему (`is_paid` и `amount_kopeks` записи —
+    про её собственный счёт). Вид кнопки — у отказа и у закрытого намерения, деньги которого пришли: без денег бот ничего
+    не пишет, и экран не рисует «Оформить» (волна 1 заявки 3б).
     """
     intent = topup_intent_of(payment)
     if intent is None:
         return {}
     outcome, public_id, reason = topup_intent_outcome(payment)
+    paid = bool(payment.is_paid) or payment.transaction_id is not None  # мина OH: поздний «отменён» гасит `is_paid`
     kind = None
     if outcome in {'refused', 'closed'}:
         reason = topup_intent_refusal_reason(reason)
-        kind = topup_intent_refusal_kind(reason)
+        kind = topup_intent_refusal_kind(reason) if outcome == 'refused' or paid else None
     refused = outcome == 'refused'
     return {
+        'intent_paid': paid,
+        'intent_amount_kopeks': payment.amount_kopeks,
         'intent_outcome': outcome,
         'intent_checkout_public_id': public_id,
         'intent_reason': reason,
@@ -1579,8 +1585,9 @@ async def topup_intent_paid_predecessor(db: AsyncSession, payment: Any) -> Plate
     Человек открыл счёт, потом сменил способ (старый — `replaced`) или отменил заказ в боте и открыл новый (старый —
     `cancelled`, без ссылки на новый), а заплатил по СТАРОЙ ссылке. Экран нового счёта ждал бы свои деньги 10 минут; его
     ответ отдаёт исход того старого, чьи деньги пришли ПОСЛЕ открытия нового. Момент прихода — момент исхода
-    (`decided_at`: оформление пишет его в том же вебхуке), без исхода — последняя запись строки. Оплаченный ДО открытия
-    нового сюда не попадает: тогда `/topup` ответил бы `already_paid`, а не выставил новый счёт.
+    (`decided_at`: оформление пишет его в том же вебхуке), без исхода — момент проводки зачисления (не `updated_at`: его
+    сдвигает любая поздняя запись строки, мина OH). Оплаченный ДО открытия нового сюда не попадает: тогда `/topup`
+    ответил бы `already_paid`, а не выставил новый счёт.
     """
     intent = topup_intent_of(payment)
     created_at = _intent_time((intent or {}).get('created_at'))
@@ -1594,10 +1601,33 @@ async def topup_intent_paid_predecessor(db: AsyncSession, payment: Any) -> Plate
             continue
         if not (older.is_paid or older.transaction_id is not None):
             continue
-        arrived = _intent_time(older_intent.get('decided_at')) or _intent_time(older.updated_at)
+        arrived = _intent_time(older_intent.get('decided_at'))
+        if arrived is None and older.transaction_id is not None:
+            deposit_at = await db.scalar(select(Transaction.created_at).where(Transaction.id == older.transaction_id))
+            arrived = _intent_time(deposit_at) if deposit_at is not None else None
         if arrived is not None and arrived >= created_at and (found_at is None or arrived > found_at):
             found, found_at = older, arrived
     return found
+
+
+async def topup_intent_screen_view(db: AsyncSession, payment: Any) -> dict[str, Any]:
+    """Поля исхода для ответа опроса одного платежа: исход оплаченного предшественника, если он есть, и предложение,
+    погашенное покупкой. 🔴 Предложение «Оформить» и «за вами шаг» лежат в метаданных бессрочно, а экран (16в-2)
+    списывает с баланса без банка: купил после отказа ЛЮБЫМ путём — вид `bought`, без предложения (тот же забор, что
+    момент в кнопке бота `df:a2:`; три линзы волны 1 заявки 3б). Покупка, бывшая ДО решения, уже дала бы
+    `already_purchased` при отказе — значит, найденная здесь случилась после."""
+    source = await topup_intent_paid_predecessor(db, payment) or payment
+    fields = topup_intent_screen_fields(source)
+    since = _intent_time((topup_intent_of(source) or {}).get('created_at'))
+    if fields.get('intent_refusal_kind') in {'retry', 'order'} and since is not None:
+        if await recent_purchase(db, user_id=source.user_id, since=since) is not None:
+            fields.update(
+                intent_reason='already_purchased',
+                intent_refusal_kind='bought',
+                intent_offer_kopeks=None,
+                intent_offer_tariff_name=None,
+            )
+    return fields
 
 
 def _topup_intent_state(payment: PlategaPayment, intent: dict[str, Any], *, now: datetime) -> str | None:
@@ -1684,8 +1714,6 @@ async def prepare_topup_intent(
     reason = topup_intent_unavailable_reason(user)
     if reason is not None:
         return TopUpIntentDecision('ordinary', reason)
-    if method_code in _TOPUP_INTENT_SLOW_METHODS:
-        return TopUpIntentDecision('ordinary', 'method_not_supported')
     options = await build_purchase_options(db, user)
     try:
         if not options.get('eligible'):
@@ -1767,6 +1795,10 @@ async def prepare_topup_intent(
         # Минимум способа сужен в админке выше формулы кассы (мина ON): сумму не подменяем — бот и письмо назвали бы
         # одну, счёт другую.
         return TopUpIntentDecision('ordinary', 'unavailable')
+    if method_code in _TOPUP_INTENT_SLOW_METHODS:
+        # Только вместо «принято»: открытый заказ, оплаченный или живой счёт, «уже оформлено» и «баланса хватает»
+        # крипте отвечают так же, как СБП, — иначе обычный счёт поверх них толкал бы ко второй оплате (волна 1, 3б).
+        return TopUpIntentDecision('ordinary', 'method_not_supported')
     current = options.get('current_subscription') or {}
     return TopUpIntentDecision(
         'accepted',

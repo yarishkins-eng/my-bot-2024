@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.cabinet.routes import balance as balance_route
+from app.database.models import Transaction
 from app.handlers.subscription import device_first as handlers
 from app.services import device_first_checkout_service as dfc
 from tests.cabinet.test_vk16_topup_autocomplete import (  # noqa: F401 -- фикстуры стенда заявки 1
@@ -25,6 +26,7 @@ from tests.cabinet.test_vk16_topup_autocomplete import (  # noqa: F401 -- фик
 )
 from tests.cabinet.test_vk16_topup_intent import (  # noqa: F401 -- фикстуры стенда 16а-1
     PRICE_30_1,
+    TOP_UP_30_1,
     _decide,
     _intent_payment,
     _purchase,
@@ -57,12 +59,24 @@ async def test_crypto_is_an_ordinary_top_up_and_promises_nothing(db, session, en
     decision = await _decide(db, session, method=13)
 
     assert (decision.status, decision.reason, decision.intent) == ('ordinary', 'method_not_supported', None)
-    env.options.assert_not_awaited()  # ни одной проверки ниже: счёт обычный, как у не-Platega
 
 
 async def test_sbp_and_card_still_get_the_intent(db, session, env):
     for method in (2, 11):
         assert (await _decide(db, session, method=method)).status == 'accepted'
+
+
+async def test_crypto_still_gets_the_same_invoice_answer_before_an_ordinary_one(db, session, env):
+    # Волна 1 заявки 3б: обычный счёт криптой поверх живого счёта СБП того же заказа толкал бы ко второй оплате.
+    _intent_payment(session, payment_id=60, created_ago=timedelta(minutes=3))
+
+    assert (await _decide(db, session, method=13)).status == 'already_paying'
+
+
+async def test_crypto_with_enough_balance_is_told_the_balance_covers_it(db, session, env):
+    _set_user(session, balance_kopeks=PRICE_30_1)
+
+    assert (await _decide(db, session, method=13)).status == 'balance_covers'
 
 
 # --- (з) ответ опроса: всё, что экрану нужно для честного ответа -------------------------------------------------------
@@ -92,7 +106,7 @@ async def test_refusal_with_offer_tells_the_screen_everything_and_hides_the_raw_
         )
         assert (response.intent_period_days, response.intent_devices, response.intent_quote_kopeks) == (90, 2, 41_377)
         assert (response.intent_offer_kopeks, response.intent_offer_tariff_name) == (43_311, 'Базовый')
-        assert response.intent_payment_id == 90
+        assert (response.intent_payment_id, response.intent_paid, response.intent_amount_kopeks) == (90, True, 9_900)
         assert 'reprice_required' not in response.model_dump_json()  # сырой код — только для разбора
 
 
@@ -117,6 +131,7 @@ async def test_raw_error_code_in_the_reason_is_normalized_for_the_screen(db, ses
     ],
 )
 async def test_kind_is_the_same_as_in_the_bot_message(db, session, status, extra, kind):
+    # Деньги пришли (`transaction_id`): у закрытого без денег вида нет — см. тест ниже.
     _intent_payment(session, payment_id=92, status=status, is_paid=True, transaction_id=992, **extra)
 
     response = await _by_id(db, session, 92)
@@ -140,6 +155,62 @@ async def test_waiting_and_fulfilled_have_no_kind_and_no_offer(db, session, stat
         None,
     )
     assert (response.intent_period_days, response.intent_devices) == (30, 1)
+
+
+@pytest.mark.parametrize('status', ['replaced', 'cancelled'])
+async def test_closed_without_money_has_no_button_kind(db, session, status):
+    # Бот без денег ничего не пишет — экран не рисует «Оформить» по закрытому неоплаченному счёту (волна 1 заявки 3б).
+    _intent_payment(session, payment_id=89, status=status)
+
+    response = await _by_id(db, session, 89)
+
+    assert (response.intent_outcome, response.intent_refusal_kind, response.intent_paid) == ('closed', None, False)
+
+
+async def test_offer_is_withdrawn_once_anything_was_bought_after_the_refusal(db, session, monkeypatch):
+    # 🔴 Три линзы волны 1 заявки 3б: предложение в метаданных вечное, а экран 16в-2 спишет с баланса без банка.
+    monkeypatch.setattr('app.services.payment.common.topup_pending_purchase_hint', AsyncMock(return_value='x'))
+    _intent_payment(
+        session,
+        payment_id=88,
+        created_ago=timedelta(minutes=20),
+        status='refused',
+        reason='price_changed',
+        offer_kopeks=14_911,
+        offer_tariff_name='Базовый',
+        is_paid=True,
+        transaction_id=988,
+    )
+    before = await _by_id(db, session, 88)
+    _purchase(session, minutes_ago=2)  # потом купил картой
+    after = await _by_id(db, session, 88)
+
+    assert (before.intent_refusal_kind, before.intent_offer_kopeks, before.purchase_step_pending) == (
+        'retry',
+        14_911,
+        True,
+    )
+    assert (after.intent_reason, after.intent_refusal_kind) == ('already_purchased', 'bought')
+    assert (after.intent_offer_kopeks, after.intent_offer_tariff_name, after.purchase_step_pending) == (
+        None,
+        None,
+        False,
+    )
+
+
+async def test_purchase_before_the_top_up_does_not_withdraw_the_offer(db, session):
+    _purchase(session, minutes_ago=40)
+    _intent_payment(
+        session,
+        payment_id=87,
+        created_ago=timedelta(minutes=20),
+        status='refused',
+        reason='open_order',
+        checkout_public_id='chk-open-9',
+        is_paid=True,
+    )
+
+    assert (await _by_id(db, session, 87)).intent_refusal_kind == 'order'
 
 
 # --- шаг «осталось оформить» — по виду кнопки, а не по подсказке корзины ----------------------------------------------
@@ -192,8 +263,12 @@ async def test_ordinary_top_up_still_asks_the_hint(db, session, monkeypatch):
 # --- (ж) оплатили СТАРЫЙ счёт, а экран ждёт новый ----------------------------------------------------------------------
 
 
-def _replaced_then_paid(session, *, status='refused', paid_ago=timedelta(seconds=30), **old):
-    """Счёт 70 открыт 10 мин назад, через 4 минуты человек открыл 71 другим способом (70 — «заменён»), а заплатил по 70."""
+def _replaced_then_paid(session, *, status='refused', paid_ago=timedelta(seconds=30), decided=True, **old):
+    """Счёт 70 открыт 10 мин назад, через 4 минуты человек открыл 71 другим способом (70 — «заменён»), а заплатил по 70.
+    Суммы разные (сумма 70 нарочно не та, что у 71): экран обязан взять сумму пришедших денег, а не своего счёта."""
+    session.add(
+        Transaction(id=970, user_id=1, type='deposit', amount_kopeks=12_377, created_at=datetime.now(UTC) - paid_ago)
+    )
     _intent_payment(
         session,
         payment_id=70,
@@ -201,13 +276,14 @@ def _replaced_then_paid(session, *, status='refused', paid_ago=timedelta(seconds
         is_paid=True,
         transaction_id=970,
         provider_status='CONFIRMED',
+        amount_kopeks=12_377,
         **{
             'status': status,
             'replaced_by': 71,
             'reason': 'replaced',
             'offer_kopeks': 14_911,
             'offer_tariff_name': 'Базовый',
-            'decided_at': _iso(paid_ago),
+            **({'decided_at': _iso(paid_ago)} if decided else {}),
             **old,
         },
     )
@@ -225,6 +301,9 @@ async def test_new_invoice_screen_shows_the_outcome_of_the_paid_old_invoice(db, 
             70,
         )
         assert response.intent_offer_kopeks == 14_911
+        assert (response.intent_paid, response.intent_amount_kopeks) == (True, 12_377)
+        assert response.amount_kopeks == TOP_UP_30_1  # своя сумма записи — не то, что пришло
+        assert response.purchase_step_pending is True
 
 
 async def test_cancelled_old_invoice_without_a_link_to_the_new_one_is_found_too(db, session):
@@ -252,13 +331,24 @@ async def test_unpaid_old_invoice_is_not_an_outcome(db, session):
     assert (await _by_id(db, session, 71)).intent_payment_id == 71
 
 
-async def test_old_invoice_paid_and_still_being_processed_shows_processing(db, session):
-    # Деньги пришли секунду назад, исход ещё пишется (`decided_at` нет) — «оформляем», а не «ждём».
-    _replaced_then_paid(session, status='pending', decided_at=None)
+async def test_old_replaced_invoice_paid_before_its_outcome_is_written_says_money_came(db, session):
+    # Живой путь (волна 1 заявки 3б): старый счёт уже `replaced`, деньги зачислены, исход ещё пишется (или не записался —
+    # мина OU). Момент прихода — по проводке зачисления; экран видит «закрыто, но деньги пришли», а не «денег не было».
+    _replaced_then_paid(session, status='replaced', decided=False)
 
     response = await _by_id(db, session, 71)
 
-    assert (response.intent_outcome, response.intent_payment_id) == ('processing', 70)
+    assert (response.intent_outcome, response.intent_payment_id, response.intent_paid) == ('closed', 70, True)
+    assert (response.intent_refusal_kind, response.purchase_step_pending) == ('retry', True)
+
+
+async def test_old_invoice_paid_before_the_new_one_without_outcome_is_not_moved_by_a_late_row_write(db, session):
+    # Без `decided_at` момент прихода — проводка зачисления, а не `updated_at` (его сдвигает поздний статус, мина OH).
+    _replaced_then_paid(session, status='replaced', decided=False, paid_ago=timedelta(minutes=8))
+    session.get(dfc.PlategaPayment, 70).updated_at = datetime.now(UTC)
+    session.commit()
+
+    assert (await _by_id(db, session, 71)).intent_payment_id == 71
 
 
 async def test_newest_of_two_paid_old_invoices_wins(db, session):
@@ -342,8 +432,20 @@ async def test_owner_card_does_not_claim_an_explanation_that_failed_to_send(db, 
 
     assert 'клиенту отправлено объяснение' not in webhook.admin[0]['intent_refused']
     assert webhook.admin[0]['intent_refused'].endswith(
-        'объяснение в бот клиенту не ушло (нет Telegram или сбой отправки — смотреть журнал)'
+        'сообщение клиенту не дошло — напишите ему сами: деньги на балансе, заказ не оформлен'
     )
+
+
+async def test_owner_card_says_the_client_got_the_plain_top_up_message_when_the_refusal_did_not_build(
+    db, session, webhook, monkeypatch
+):
+    monkeypatch.setattr(handlers, 'topup_intent_refusal_message', lambda *a, **k: 1 / 0)
+    _intent_payment(session, payment_id=97, **{**TRIAL, 'subscription_id': 40})
+
+    await _pay(db, webhook)
+
+    assert 'Пополнение успешно' in webhook.bot.send_message.await_args.args[1]
+    assert webhook.admin[0]['intent_refused'].endswith('клиенту ушло обычное «Пополнение успешно» без объяснения')
 
 
 async def test_owner_card_of_a_client_without_telegram_does_not_claim_an_explanation(db, session, webhook):
@@ -353,7 +455,9 @@ async def test_owner_card_of_a_client_without_telegram_does_not_claim_an_explana
     await _pay(db, webhook)
 
     webhook.bot.send_message.assert_not_awaited()
-    assert 'не ушло' in webhook.admin[0]['intent_refused']
+    assert webhook.admin[0]['intent_refused'].endswith(
+        'у клиента нет Telegram — объяснения в боте нет, при желании напишите ему'
+    )
 
 
 # --- вечная кнопка «Оформить за N ₽» / «Оплатить с баланса» ---------------------------------------------------------
@@ -369,17 +473,41 @@ def _wallet_callback(shown_ago: timedelta | None):
 async def _press(db, session, callback):
     checkout = SimpleNamespace(public_id='chk-wallet')
     with (
+        patch.object(handlers, '_render_checkout', AsyncMock()) as shown,
         patch.object(
             handlers,
             'create_or_resume_direct_checkout',
             AsyncMock(return_value=SimpleNamespace(checkout=checkout, proceed_to_payment=True)),
         ) as create,
         patch.object(handlers, 'commit_direct_wallet_checkout', AsyncMock(return_value=checkout)) as commit,
-        patch.object(handlers, '_render_checkout', AsyncMock()),
         patch.object(handlers, 'edit_or_answer_photo', AsyncMock()) as render,
     ):
         await handlers.pay_wallet_fused(callback, _user(session), db, AsyncMock())
+    render.shown = shown
     return create, commit, render
+
+
+async def test_second_tap_of_the_same_button_shows_the_paid_order_not_charged_nothing(db, session):
+    # Двойной тап идёт параллельно: второе нажатие видит проводку первого — это СВОЙ заказ (тот же срок и устройства),
+    # показываем его, а не «ничего не списали» поверх списания (волна 1 заявки 3б).
+    _purchase(session, minutes_ago=0.05, checkout_public_id='chk-own-1', period_days=30, devices=1)
+
+    create, commit, render = await _press(db, session, _wallet_callback(timedelta(minutes=2)))
+
+    create.assert_not_awaited()
+    commit.assert_not_awaited()
+    render.assert_not_awaited()
+    assert render.shown.await_args.args[3].public_id == 'chk-own-1'
+
+
+async def test_purchase_of_another_order_after_the_button_is_not_shown_as_this_one(db, session):
+    _purchase(session, minutes_ago=1, checkout_public_id='chk-90-2', period_days=90, devices=2)
+
+    create, commit, render = await _press(db, session, _wallet_callback(timedelta(minutes=5)))
+
+    create.assert_not_awaited()
+    render.shown.assert_not_awaited()
+    assert 'уже прошла оплата' in render.await_args.kwargs['caption']
 
 
 async def test_button_pressed_after_a_purchase_by_another_path_charges_nothing(db, session):
@@ -390,7 +518,8 @@ async def test_button_pressed_after_a_purchase_by_another_path_charges_nothing(d
     create.assert_not_awaited()
     commit.assert_not_awaited()
     caption = render.await_args.kwargs['caption']
-    assert 'После этого сообщения на вашем аккаунте уже была покупка, поэтому мы ничего не списали.' in caption
+    assert 'С тех пор как бот показал эту кнопку, на вашем аккаунте уже прошла оплата.' in caption
+    assert 'с баланса ничего не списано — на балансе 50,37 ₽.' in caption  # где деньги — называем
     rows = render.await_args.kwargs['keyboard'].inline_keyboard
     assert [(b.text, b.callback_data) for row in rows for b in row] == [
         ('Открыть заказ заново', 'df:start'),
@@ -425,9 +554,11 @@ async def test_broken_button_does_nothing(db, session, data):
     render.assert_not_awaited()
 
 
-def test_refusal_offer_button_carries_the_moment_it_was_shown(monkeypatch):
-    monkeypatch.setattr(handlers, '_shown_at', lambda: 1_791_234_567)
+def test_refusal_offer_button_carries_the_moment_the_top_up_began(monkeypatch):
+    # Не момент сборки сообщения: покупка между решением и сообщением прошла бы мимо обеих проверок (волна 1, 3б).
+    monkeypatch.setattr(handlers, '_shown_at', lambda: 1_999_999_999)
     intent = {
+        'created_at': datetime.fromtimestamp(1_791_234_567, UTC).isoformat(),
         'status': 'refused',
         'reason': 'price_changed',
         'period_days': 30,
