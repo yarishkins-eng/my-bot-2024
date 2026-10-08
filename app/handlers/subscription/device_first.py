@@ -1891,8 +1891,6 @@ async def change_selection(
 ) -> None:
     """Navigate to choices without touching a resumable provider invoice."""
     await callback.answer()
-    if await _cancel_topup_intents(callback, db, db_user) == 'unknown':
-        return
     public_id = _checkout_id(callback)
     if not public_id:
         await _render_error(callback, db_user, _text(db_user, 'Заказ не найден.', 'Order not found.'))
@@ -1901,6 +1899,8 @@ async def change_selection(
         checkout = await get_owned_checkout(db, public_id=public_id, user_id=db_user.id)
     except DeviceFirstError as error:
         await _render_error(callback, db_user, error)
+        return
+    if await _cancel_topup_intents(callback, db, db_user) == 'unknown':
         return
 
     data = await state.get_data()
@@ -2018,13 +2018,14 @@ async def cancel(
                 parse_mode='HTML',
             )
             return
-        # Доплату гасим, только когда отмена действительно исполняется: на экране подтверждения можно вернуться.
-        paid_note = await _cancel_topup_intents(callback, db, db_user)
-        if paid_note == 'unknown':
-            return
         checkout = await cancel_checkout(db, checkout)
     except DeviceFirstError as error:
         await _render_error(callback, db_user, error)
+        return
+    # Доплату гасим, только когда отмена исполнилась: с экрана подтверждения можно вернуться, а заказ в выдаче
+    # `cancel_checkout` не отменяет.
+    paid_note = await _cancel_topup_intents(callback, db, db_user)
+    if paid_note == 'unknown':
         return
     await state.clear()
     await edit_or_answer_photo(
@@ -2047,9 +2048,6 @@ async def abandon(
     if not public_id:
         await _render_error(callback, db_user, _text(db_user, 'Заказ не найден.', 'Order not found.'))
         return
-    paid_note = await _cancel_topup_intents(callback, db, db_user)
-    if paid_note == 'unknown':
-        return
     try:
         checkout = await abandon_direct_checkout_for_new_calculation(
             db,
@@ -2063,6 +2061,9 @@ async def abandon(
         return
     if checkout.lifecycle_state != 'cancelled':
         await _render_checkout(callback, db_user, db, checkout)
+        return
+    paid_note = await _cancel_topup_intents(callback, db, db_user)  # только после исполнившейся отмены
+    if paid_note == 'unknown':
         return
     await state.clear()
     await edit_or_answer_photo(
@@ -2543,8 +2544,9 @@ def _cancelled_text(user: User, paid_note: str | None) -> str:
     if paid_note == 'fulfilled':
         return _text(
             user,
-            'Заказ отменён. Отдельно: ваша доплата пришла раньше, и по ней уже оформлена подписка с баланса.',
-            'Order cancelled. Separately: your top-up arrived earlier, and a subscription was already paid with it.',
+            'Отменить уже нельзя: доплата пришла, и оплата с баланса прошла. Подробности придут отдельным сообщением.',
+            'It can no longer be cancelled: the top-up arrived and the payment from the balance went through. '
+            'Details will follow in a separate message.',
         )
     if paid_note == 'paid':
         return _text(
@@ -2586,9 +2588,9 @@ def topup_intent_refusal_message(
     if kind == 'bought':
         why = _text(
             user,
-            'пока шла оплата, с вашего баланса уже прошло другое списание за подписку — '
+            'пока шла оплата, на вашем аккаунте прошла ещё одна оплата — '
             'чтобы случайно не взять деньги дважды, мы ничего не оформляли',
-            'while the payment was going through, another subscription charge was made from your balance — '
+            'while the payment was going through, another payment went through on your account — '
             'to avoid charging you twice, we did not place the order',
         )
     elif kind == 'order':

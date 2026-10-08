@@ -330,7 +330,8 @@ def test_already_bought_has_no_button_to_buy_again():
     text_, keyboard = _message('already_purchased')
 
     assert 'Оплата получена: 99 ₽' in text_ and 'чтобы случайно не взять деньги дважды' in text_
-    assert 'другое списание за подписку' in text_  # «что-то списано», а не «куплена подписка» (суточные, докупка)
+    # «ещё одна оплата», а не «списание с баланса»: купивший картой баланса не трогал (прогон сценария, D1).
+    assert 'на вашем аккаунте прошла ещё одна оплата' in text_ and 'с вашего баланса' not in text_
     assert 'На балансе: 149,37 ₽' in text_.split('\n')
     assert _buttons(keyboard) == [('В главное меню', 'back_to_menu', None)]
 
@@ -562,7 +563,7 @@ def _callback(data: str) -> SimpleNamespace:
     [
         (None, 'Заказ отменён. Деньги не списаны.', 'Доплата'),
         ('paid', 'Заказ отменён. Доплата уже пришла — деньги на балансе.', 'Деньги не списаны'),
-        ('fulfilled', 'Заказ отменён. Отдельно: ваша доплата пришла раньше', 'Деньги не списаны'),
+        ('fulfilled', 'Отменить уже нельзя: доплата пришла, и оплата с баланса прошла', 'Заказ отменён'),
     ],
 )
 async def test_cancel_fused_words_follow_the_money(note, expected, absent):
@@ -965,3 +966,53 @@ async def test_recheck_on_a_real_async_session_keeps_the_promo_group_loaded_and_
         assert user.balance_kopeks == BALANCE + 9_900
         assert user.get_primary_promo_group().id == 7  # связи живы — цене есть из чего считать
     await engine.dispose()
+
+
+# --- волна 2: доплата гаснет только после исполнившейся отмены (N5) -------------------------------------------
+
+
+async def test_cancel_that_failed_keeps_the_top_up_alive():
+    user = SimpleNamespace(id=17, language='ru')
+    with (
+        patch.object(handlers, 'cancel_topup_intents', AsyncMock(return_value=None)) as gas,
+        patch.object(handlers, 'get_owned_checkout', AsyncMock(return_value=SimpleNamespace(public_id='chk-1'))),
+        patch.object(handlers, 'settlement_mode', lambda c: 'legacy'),
+        patch.object(
+            handlers, 'cancel_checkout', AsyncMock(side_effect=handlers.DeviceFirstError('invalid_state', 'x'))
+        ),
+        patch.object(handlers, 'edit_or_answer_photo', AsyncMock()),
+    ):
+        await handlers.cancel(_callback('df:x:chk-1'), user, AsyncMock(), SimpleNamespace(clear=AsyncMock()))
+
+    gas.assert_not_awaited()
+
+
+async def test_abandon_that_the_provider_won_keeps_the_top_up_alive():
+    user = SimpleNamespace(id=17, language='ru')
+    with (
+        patch.object(handlers, 'cancel_topup_intents', AsyncMock(return_value=None)) as gas,
+        patch.object(
+            handlers,
+            'abandon_direct_checkout_for_new_calculation',
+            AsyncMock(return_value=SimpleNamespace(lifecycle_state='fulfilling')),
+        ),
+        patch.object(handlers, '_render_checkout', AsyncMock()) as rendered,
+    ):
+        await handlers.abandon(_callback('df:xa:chk-1'), user, AsyncMock(), SimpleNamespace(clear=AsyncMock()))
+
+    rendered.assert_awaited_once()
+    gas.assert_not_awaited()
+
+
+async def test_change_on_a_foreign_or_missing_order_keeps_the_top_up_alive():
+    user = SimpleNamespace(id=17, language='ru')
+    with (
+        patch.object(handlers, 'cancel_topup_intents', AsyncMock(return_value=None)) as gas,
+        patch.object(
+            handlers, 'get_owned_checkout', AsyncMock(side_effect=handlers.DeviceFirstError('not_found', 'x'))
+        ),
+        patch.object(handlers, 'edit_or_answer_photo', AsyncMock()),
+    ):
+        await handlers.change_selection(_callback('df:e:chk-1'), user, AsyncMock(), SimpleNamespace())
+
+    gas.assert_not_awaited()
