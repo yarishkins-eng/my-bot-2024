@@ -889,3 +889,79 @@ async def test_cancel_commits_first_so_the_payment_lock_comes_before_the_user_lo
     await dfc.cancel_topup_intents(db, user_id=1)
 
     assert events[:3] == ['commit', 'platega_payments', 'users']
+
+
+async def test_recheck_on_a_real_async_session_keeps_the_promo_group_loaded_and_the_balance_fresh(
+    tmp_path, monkeypatch
+):
+    # 🔴 P0 волны 2: освежение пользователя целиком (`populate_existing`) сбрасывало загруженные связи, и первая же
+    # цена в `_validate_direct_pre_commit` падала ленивой подгрузкой (MissingGreenlet) — отказ у каждого. Синхронная
+    # обёртка остальных сторожей этого не видит: здесь настоящий aiosqlite и пользователь тем же помощником, что в бою.
+    import importlib
+    import sys
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.database.crud.user import get_user_by_id
+    from app.database.models import (
+        PromoGroup,
+        ServerSquad,
+        Subscription,
+        Tariff,
+        UserPromoGroup,
+        server_squad_promo_groups,
+    )
+
+    stub = sys.modules.pop('aiosqlite', None)
+    try:
+        real_driver = importlib.import_module('aiosqlite')
+    finally:
+        if stub is not None:
+            sys.modules['aiosqlite'] = stub
+    monkeypatch.setitem(sys.modules, 'aiosqlite', real_driver)
+
+    engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "recheck.db"}')
+    async with engine.begin() as connection:
+        models = (User, PlategaPayment, Transaction, Subscription, Tariff, PromoGroup, UserPromoGroup, ServerSquad)
+        for table in [model.__table__ for model in models] + [server_squad_promo_groups]:
+            columns = ', '.join(
+                'id INTEGER PRIMARY KEY' if column.name == 'id' else column.name for column in table.columns
+            )
+            await connection.execute(text(f'CREATE TABLE {table.name} ({columns})'))
+        await connection.execute(text("INSERT INTO promo_groups (id, name, priority) VALUES (7, 'Базовая', 0)"))
+        await connection.execute(
+            text(
+                'INSERT INTO users (id, telegram_id, balance_kopeks, status, language, promo_group_id) '
+                f"VALUES (1, 777001, {BALANCE}, 'active', 'ru', 7)"
+            )
+        )
+    factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    intent = {'period_days': 30, 'devices': 1, 'quote_kopeks': PRICE_30_1, 'had_subscription': False}
+    intent.update(created_at=datetime.now(UTC).isoformat(), status='pending')
+    async with factory() as setup:
+        setup.add(
+            PlategaPayment(
+                id=97,
+                user_id=1,
+                amount_kopeks=TOP_UP_30_1,
+                currency='RUB',
+                status='CONFIRMED',
+                is_paid=True,
+                correlation_id='corr-97',
+                metadata_json={dfc.TOPUP_INTENT_KEY: intent},
+            )
+        )
+        await setup.commit()
+
+    async with factory() as db_:
+        user = await get_user_by_id(db_, 1)
+        assert user.get_primary_promo_group().id == 7
+        async with factory() as other:  # зачисление другой сессией, пока оформление идёт
+            await other.execute(text('UPDATE users SET balance_kopeks = balance_kopeks + 9900 WHERE id = 1'))
+            await other.commit()
+
+        assert await dfc._topup_intent_recheck_locked(db_, payment_id=97, user_id=1, intent=intent) is None
+
+        assert user.balance_kopeks == BALANCE + 9_900
+        assert user.get_primary_promo_group().id == 7  # связи живы — цене есть из чего считать
+    await engine.dispose()

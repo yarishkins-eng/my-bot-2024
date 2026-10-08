@@ -1865,17 +1865,16 @@ async def _topup_intent_recheck_locked(
     проверкой и списанием не вклинятся. Метку отмены читаем со строки платежа под её замком, а не из снимка.
 
     🔴 Порядок «платёж → пользователь» — как у вебхука и у `cancel_topup_intents` (договор
-    `create_or_resume_direct_checkout`: с замком пользователя за платежом не тянуться). 🔴 Пользователь — с
-    `populate_existing`: объект загружен сверкой задолго до замка, а `_lock_direct_context` без этого отдал бы его же,
-    и списание записало бы баланс поверх зачисления, пришедшего в эти секунды (второй платёж, начисление админа).
+    `create_or_resume_direct_checkout`: с замком пользователя за платежом не тянуться); вызывающий перед этим
+    коммитит. 🔴 Баланс перечитывается под замком: объект загружен сверкой задолго до него, а `_lock_direct_context`
+    отдал бы его же, и списание записало бы баланс поверх зачисления, пришедшего в эти секунды (второй платёж,
+    начисление админа).
     """
     fresh = topup_intent_of(await get_platega_payment_by_id_for_update(db, payment_id)) or {}
-    # Строку обязательно прочитать: без выборки строк объект в карте сессии не освежается — остаётся только замок.
-    (
-        await db.execute(
-            select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
-        )
-    ).scalar_one()
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    # Освежаем ТОЛЬКО баланс: `populate_existing` по всему объекту сбросил бы загруженные связи (промогруппа), и цена в
+    # `_validate_direct_pre_commit` упала бы ленивой подгрузкой (MissingGreenlet) — отказ у каждого (волна 2, P0).
+    await db.refresh(await db.get(User, user_id), attribute_names=['balance_kopeks'])
     if fresh.get('status') != 'pending':
         return str(fresh.get('status'))
     return await _topup_intent_drift(
@@ -2101,6 +2100,9 @@ async def _complete_topup_intent(
             if not resolved.proceed_to_payment:
                 reason, public_id = 'open_order', resolved.checkout.public_id
             else:
+                # Возобновление заказа держит замок пользователя без коммита: отпускаем, чтобы перепроверка взяла
+                # замки в общем порядке «платёж → пользователь».
+                await db.commit()
                 reason = await _topup_intent_recheck_locked(db, payment_id=payment_id, user_id=user_id, intent=intent)
             if reason is None:
                 state['charged'] = resolved.checkout.id
