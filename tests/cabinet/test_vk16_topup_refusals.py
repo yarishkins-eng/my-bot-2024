@@ -786,13 +786,14 @@ async def test_recheck_refreshes_the_user_so_a_credit_meanwhile_is_not_overwritt
     # F1: пользователь загружен сверкой задолго до замка; зачисление другой сессией в эти секунды. Без
     # `populate_existing` списание записало бы баланс поверх него (опыт скептика: 550 → 50).
     _intent_payment(session, payment_id=97)
+    intent = _intent(session)  # до загрузки пользователя: `_intent` сбрасывает карту сессии
     user = session.get(User, 1)
     seen_before = user.balance_kopeks
     session.execute(text('UPDATE users SET balance_kopeks = balance_kopeks + 9900 WHERE id = 1'))
     session.commit()
     assert user.balance_kopeks == seen_before  # объект в карте сессии старый
 
-    await dfc._topup_intent_recheck_locked(db, payment_id=97, user_id=1, intent=_intent(session))
+    await dfc._topup_intent_recheck_locked(db, payment_id=97, user_id=1, intent=intent)
 
     assert user.balance_kopeks == seen_before + 9_900
 
