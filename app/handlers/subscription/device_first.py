@@ -2554,6 +2554,13 @@ def _cancelled_text(user: User, paid_note: str | None) -> str:
             'Заказ отменён. Доплата уже пришла — деньги на балансе.',
             'Order cancelled. Your top-up has already arrived — the money is on your balance.',
         )
+    if paid_note == 'earlier':
+        # Мина OV: эта отмена своей доплаты с деньгами не застала, а другая за час уже пришла и решена.
+        return _text(
+            user,
+            'Заказ отменён. О доплате, которая пришла раньше, бот уже написал отдельным сообщением.',
+            'Order cancelled. The bot has already sent a separate message about the top-up that arrived earlier.',
+        )
     return _text(user, 'Заказ отменён. Деньги не списаны.', 'Order cancelled. No money was charged.')
 
 

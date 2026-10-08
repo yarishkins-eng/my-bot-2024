@@ -69,6 +69,11 @@ class TopUpIntent(BaseModel):
 
     period_days: int = Field(..., ge=1, le=3650)
     devices: int = Field(..., ge=1, le=100)
+    # ВК-16 (16а-2, заявка 3а). `repeat` — ответ «да» на «Уже оформлено до …. Оплатить ещё период?» (исход
+    # `already_fulfilled`, мина OP); `change_method` — человек сам выбрал другой способ при живом счёте того же заказа
+    # (иначе сервер вернёт тот же счёт — `already_paying`, мина OR). Старый экран их не шлёт — прежнее поведение.
+    repeat: bool = False
+    change_method: bool = False
 
 
 class TopUpRequest(BaseModel):
@@ -103,6 +108,9 @@ class TopUpResponse(BaseModel):
     `already_paying` (тот же неоплаченный счёт того же заказа и способа — его ссылка), `already_paid` (деньги по
     намерению уже пришли, оформляем — ссылки нет), `already_fulfilled`, `balance_covers`, `invoice_not_created`.
     Срок и устройства — того заказа, о котором исход; цена — где известна.
+    С заявки 3а: `already_fulfilled` — за последний час была покупка ЛЮБЫМ путём; `subscription_end_date` — до какого
+    дня оформлено, экран спрашивает «Оплатить ещё период?» и повторяет запрос с `intent.repeat`. `already_paying` —
+    живой счёт того же заказа любым способом; `payment_option` — каким (другой способ — запрос с `intent.change_method`).
     """
 
     payment_id: str | None = None
@@ -117,6 +125,8 @@ class TopUpResponse(BaseModel):
     period_days: int | None = None
     devices: int | None = None
     price_kopeks: int | None = None
+    subscription_end_date: datetime | None = None
+    payment_option: str | None = None
 
 
 class StarsInvoiceRequest(BaseModel):
