@@ -2510,7 +2510,7 @@ async def cancel_fused(
         return
     await edit_or_answer_photo(
         callback=callback,
-        caption=_cancelled_text(db_user, paid_note),
+        caption=_cancelled_text(db_user, paid_note, order=False),
         keyboard=InlineKeyboardMarkup(inline_keyboard=[[_main_menu(db_user)]]),
         parse_mode='HTML',
     )
@@ -2539,7 +2539,7 @@ async def _cancel_topup_intents(callback: types.CallbackQuery, db: AsyncSession,
         return 'unknown'
 
 
-def _cancelled_text(user: User, paid_note: str | None) -> str:
+def _cancelled_text(user: User, paid_note: str | None, *, order: bool = True) -> str:
     """«Деньги не списаны» — только если за последний час доплата под заказ не приходила (правило 7 замысла v2)."""
     if paid_note == 'fulfilled':
         return _text(
@@ -2554,12 +2554,25 @@ def _cancelled_text(user: User, paid_note: str | None) -> str:
             'Заказ отменён. Доплата уже пришла — деньги на балансе.',
             'Order cancelled. Your top-up has already arrived — the money is on your balance.',
         )
-    if paid_note == 'earlier':
-        # Мина OV: эта отмена своей доплаты с деньгами не застала, а другая за час уже пришла и решена.
+    if paid_note == 'earlier' and not order:
+        # Витрина `df:x2`: заказа нет, отменять нечего — а оплата, пришедшая раньше, могла уже оформить ЭТОТ же выбор.
+        # «Заказ отменён» оплатившему читалось бы как «подписку отменили» (волна 1 заявки 3а).
         return _text(
             user,
-            'Заказ отменён. О доплате, которая пришла раньше, бот уже написал отдельным сообщением.',
-            'Order cancelled. The bot has already sent a separate message about the top-up that arrived earlier.',
+            'Экран закрыт. Оплату, которая пришла раньше, эта кнопка не отменяет: '
+            'что с ней стало, бот написал отдельным сообщением.',
+            'Screen closed. This button does not cancel the payment that arrived earlier: '
+            'the bot told you what happened to it in a separate message.',
+        )
+    if paid_note == 'earlier':
+        # Мина OV: эта отмена своей доплаты с деньгами не застала, а другая за час уже пришла и решена. Без «уже»:
+        # исход пишется до отправки сообщения о нём.
+        return _text(
+            user,
+            'Заказ отменён. Оплату, которая пришла раньше, это не затронуло: '
+            'что с ней стало, бот написал отдельным сообщением.',
+            'Order cancelled. The payment that arrived earlier is not affected: '
+            'the bot told you what happened to it in a separate message.',
         )
     return _text(user, 'Заказ отменён. Деньги не списаны.', 'Order cancelled. No money was charged.')
 

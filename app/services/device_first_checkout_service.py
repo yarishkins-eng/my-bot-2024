@@ -1468,6 +1468,7 @@ class TopUpIntentDecision(NamedTuple):
     checkout_public_id: str | None = None
     payment: PlategaPayment | None = None
     subscription_end_date: str | None = None
+    purchased_at: datetime | None = None
 
 
 def _topup_intent_rolled_out(user: User) -> bool:
@@ -1574,25 +1575,27 @@ async def _recent_topup_intent_payments(db: AsyncSession, *, user_id: int, now: 
 async def _recent_purchase(
     db: AsyncSession, *, user_id: int, since: datetime
 ) -> tuple[datetime, SubscriptionCheckout | None] | None:
-    """Последняя покупка после `since` ЛЮБЫМ путём (мина OP): заказ новой кассы со списанием или проводка покупки
-    подписки (карта, касса бота и кабинета, старая автопокупка). Момент и заказ, если он есть, — иначе `None`."""
-    checkout = (
+    """Последняя покупка после `since` ЛЮБЫМ путём (мина OP) — по проводке `SUBSCRIPTION_PAYMENT`, как
+    `_bought_since`: её пишет каждая настоящая продажа (касса бота и кабинета с баланса и картой — `direct-sale:`,
+    старая автопокупка), а заодно докупка устройств и трафика, суточные списания. Момент и заказ новой кассы, к которому
+    привязана ЭТА проводка (иначе `None` — «что-то куплено»).
+    🔴 Не по `financial_committed_at` заказа: его ставит уже ВЫСТАВЛЕНИЕ счёта картой (`prepare_direct_external_checkout`)
+    и не снимает отмена — брошенный неоплаченный счёт выглядел бы покупкой (волна 1 заявки 3а; на боевом 08.10 таких
+    отменённых заказов 29)."""
+    row = (
         await db.execute(
-            select(SubscriptionCheckout)
-            .where(SubscriptionCheckout.user_id == user_id, SubscriptionCheckout.financial_committed_at >= since)
-            .order_by(SubscriptionCheckout.financial_committed_at.desc())
+            select(Transaction.created_at, SubscriptionCheckout)
+            .outerjoin(SubscriptionCheckout, SubscriptionCheckout.id == Transaction.device_first_checkout_id)
+            .where(
+                Transaction.user_id == user_id,
+                Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+                Transaction.created_at >= since,
+            )
+            .order_by(Transaction.created_at.desc(), Transaction.id.desc())
             .limit(1)
         )
-    ).scalar_one_or_none()
-    paid_at = await db.scalar(
-        select(func.max(Transaction.created_at)).where(
-            Transaction.user_id == user_id,
-            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
-            Transaction.created_at >= since,
-        )
-    )
-    moments = [_intent_time(m) for m in (paid_at, checkout and checkout.financial_committed_at) if m is not None]
-    return (max(moments), checkout) if moments else None
+    ).first()
+    return None if row is None else (_intent_time(row[0]), row[1])
 
 
 async def prepare_topup_intent(
@@ -1604,7 +1607,7 @@ async def prepare_topup_intent(
     method_code: int,
     min_kopeks: int,
     max_kopeks: int,
-    repeat: bool = False,
+    confirmed_purchase_at: datetime | None = None,
     change_method: bool = False,
 ) -> TopUpIntentDecision:
     """Решить до счёта, что делать с доплатой под заказ (замысел v2, правила 6 и 9).
@@ -1612,8 +1615,10 @@ async def prepare_topup_intent(
     Своих записей не делает; коммит возможен только внутри `get_open_checkout_for_user` (истечение протухшего заказа)
     и `build_purchase_options` (статус подписки). Порядок проверок — контракт: выключено → обычное пополнение, как
     сегодня, без единой проверки ниже.
-    `repeat` — человек ответил «да» на «Уже оформлено до …. Оплатить ещё период?» (мина OP); `change_method` — сам выбрал
-    другой способ оплаты при живом счёте того же заказа (мина OR). Без отметок — вопрос и тот же счёт соответственно.
+    `confirmed_purchase_at` — человек ответил «да» на «Уже оформлено до …. Оплатить ещё период?» (мина OP) про покупку
+    с ЭТИМ моментом (`purchased_at` вопроса): покупка новее — вопрос снова, иначе повтор старого «да» (вкладка, «назад»)
+    выставил бы счёт третьего срока молча. `change_method` — сам выбрал другой способ оплаты при живом счёте того же
+    заказа (мина OR). Без отметок — вопрос и тот же счёт соответственно.
     """
     reason = topup_intent_unavailable_reason(user)
     if reason is not None:
@@ -1656,16 +1661,18 @@ async def prepare_topup_intent(
         if state == 'invoice' and (found['period_days'], found['devices']) == requested and same_method:
             same_live.append(payment)
     purchase = await _recent_purchase(db, user_id=user.id, since=now - TOPUP_INTENT_TTL)
-    if purchase is not None and not repeat:
+    if purchase is not None and (confirmed_purchase_at is None or purchase[0] > confirmed_purchase_at):
         # 🔴 Мина OP: вечная кнопка в чате после покупки любым путём купила бы второй срок молча (замысел v2, правило
-        # 6) — спрашиваем «Уже оформлено до …. Оплатить ещё период?», а не запрещаем: «да» приходит с `repeat`.
+        # 6) — спрашиваем «Уже оформлено до …. Оплатить ещё период?», а не запрещаем. Цена — за запрошенный срок сейчас.
         bought = purchase[1]
         return TopUpIntentDecision(
             'already_fulfilled',
+            price_kopeks=price,
             checkout_public_id=bought.public_id if bought is not None else None,
             period_days=bought.period_days if bought is not None else None,
             devices=bought.selected_device_limit if bought is not None else None,
             subscription_end_date=(options.get('current_subscription') or {}).get('end_date'),
+            purchased_at=purchase[0],
         )
     if purchase is not None:
         # Счёт, выставленный ДО покупки, при зачислении откажет «уже была оплата» — «ещё период» им не оплатить.
@@ -1798,7 +1805,9 @@ async def cancel_topup_intents(db: AsyncSession, *, user_id: int) -> str | None:
         # Оформление держит те же два замка до коммита списания: дождались — его проводка уже видна.
         await db.execute(select(User.id).where(User.id == user_id).with_for_update())
         for locked, intent in paid_pending:
-            if await _bought_since(db, user_id=user_id, since=_intent_time(intent.get('created_at'))):
+            # Списание ИМЕННО этой доплатой (свой заказ автооформления), а не любая покупка после неё: купленное другим
+            # путём оформление само откажет «уже была оплата», деньги останутся на балансе (мина OV, вторая половина).
+            if await _topup_intent_charged_since(db, user_id=user_id, since=_intent_time(intent.get('created_at'))):
                 paid_note = 'fulfilled'
                 continue
             locked.metadata_json = {
@@ -1864,6 +1873,23 @@ def _topup_intent_session():
     return AsyncSessionLocal()
 
 
+async def _topup_intent_charged_since(db: AsyncSession, *, user_id: int, since: datetime | None) -> bool:
+    """Списал ли заказ автооформления доплаты после `since`: у списания с баланса `financial_committed_at` ставится в
+    момент списания (`commit_direct_wallet_checkout`), а не при выставлении счёта, как у карты."""
+    if since is None:
+        return False
+    charged = await db.scalar(
+        select(SubscriptionCheckout.id)
+        .where(
+            SubscriptionCheckout.user_id == user_id,
+            SubscriptionCheckout.source == TOPUP_INTENT_SOURCE,
+            SubscriptionCheckout.financial_committed_at >= since,
+        )
+        .limit(1)
+    )
+    return charged is not None
+
+
 async def _bought_since(db: AsyncSession, *, user_id: int, since: datetime | None) -> bool:
     if since is None:
         return False
@@ -1911,9 +1937,9 @@ async def _topup_intent_recheck_locked(
 
     🔴 Порядок «платёж → пользователь» — как у вебхука и у `cancel_topup_intents` (договор
     `create_or_resume_direct_checkout`: с замком пользователя за платежом не тянуться); вызывающий перед этим
-    коммитит. 🔴 Баланс перечитывается под замком: объект загружен сверкой задолго до него, а `_lock_direct_context`
-    отдал бы его же, и списание записало бы баланс поверх зачисления, пришедшего в эти секунды (второй платёж,
-    начисление админа).
+    коммитит. 🔴 Баланс перечитывается под замком: объект загружен сверкой задолго до него, и списание записало бы
+    баланс поверх зачисления, пришедшего в эти секунды (второй платёж, начисление админа). С заявки 3а то же делает и
+    `_lock_direct_context` (мина OW) — здесь освежение остаётся, потому что сверка смотрит баланс до списания.
     """
     fresh = topup_intent_of(await get_platega_payment_by_id_for_update(db, payment_id)) or {}
     await db.execute(select(User.id).where(User.id == user_id).with_for_update())
@@ -2094,7 +2120,9 @@ async def _record_topup_intent_outcome(db: AsyncSession, *, payment_id: int, **o
         await db.rollback()
         return None
     if intent.get('status') in {'fulfilled', 'refused'}:
-        # (к): исход уже решён — второй вход не превратит «оформлено» в отказ и не пошлёт второе сообщение.
+        # (к): исход уже решён — второй вход (сегодня его отсекает `transaction_id` в `_finalize_platega_payment`)
+        # не превратит «оформлено» в отказ. Не «только поверх pending/cancelled/replaced»: метка, которой нет в списке,
+        # тоже должна получить исход, а не остаться без него.
         await db.rollback()
         return intent
     final = {**intent, **outcome, 'decided_at': datetime.now(UTC).isoformat()}

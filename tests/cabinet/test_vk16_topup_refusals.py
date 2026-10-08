@@ -501,8 +501,21 @@ async def test_cancel_while_the_money_arrived_but_the_order_is_not_placed_wins(d
 
 
 async def test_cancel_after_the_order_was_already_charged_says_fulfilled_and_leaves_it(db, session):
+    # Заявка 3а (мина OV): переписано — «уже списано» по СВОЕМУ заказу автооформления, а не по любой проводке.
     payment = _intent_payment(session, payment_id=91, is_paid=True)
     after = datetime.fromisoformat(dfc.topup_intent_of(payment)['created_at']) + timedelta(seconds=1)
+    session.add(
+        SubscriptionCheckout(
+            public_id='chk-auto-91',
+            user_id=1,
+            source=dfc.TOPUP_INTENT_SOURCE,
+            tariff_id=3,
+            period_days=30,
+            selected_device_limit=1,
+            lifecycle_state='fulfilling',
+            financial_committed_at=after,
+        )
+    )
     session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=PRICE_30_1, created_at=after))
     session.commit()
 
@@ -1085,7 +1098,18 @@ async def test_any_closed_label_under_the_lock_stops_the_debit(session, buy, mon
 async def test_money_known_only_by_the_transaction_link_counts_as_arrived(db, session):
     _intent_payment(session, payment_id=91, transaction_id=5)  # `is_paid` ещё не стоит
     after = datetime.now(UTC) + timedelta(seconds=1)
-    session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=1, created_at=after))
+    session.add(
+        SubscriptionCheckout(
+            public_id='chk-auto-91',
+            user_id=1,
+            source=dfc.TOPUP_INTENT_SOURCE,
+            tariff_id=3,
+            period_days=30,
+            selected_device_limit=1,
+            lifecycle_state='fulfilling',
+            financial_committed_at=after,
+        )
+    )
     session.commit()
 
     assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'

@@ -226,7 +226,7 @@ async def _decide(db, session, *, user_id: int = 1, period_days: int = 30, devic
         method_code=method,
         min_kopeks=kw.get('min_kopeks', 100),
         max_kopeks=kw.get('max_kopeks', 100_000_000),
-        repeat=kw.get('repeat', False),
+        confirmed_purchase_at=kw.get('confirmed_purchase_at'),
         change_method=kw.get('change_method', False),
     )
 
@@ -240,23 +240,35 @@ def _purchase(
     devices: int = 1,
     user_id: int = 1,
     transaction: bool = True,
+    lifecycle_state: str = 'ready',
+    source: str = 'cabinet',
 ) -> None:
-    """Покупка ЛЮБЫМ путём (заявка 3а, мина OP): проводка покупки подписки и, если назван номер, заказ новой кассы
-    со списанием — так выглядит и оформление доплатой, и касса, и карта."""
+    """Покупка ЛЮБЫМ путём (заявка 3а, мина OP): проводка покупки подписки и, если назван номер, заказ новой кассы,
+    к которому она привязана (`device_first_checkout_id`, как у `direct-sale:`). `transaction=False` с заказом — счёт
+    картой, выставленный и брошенный: `financial_committed_at` у него есть, а денег не было."""
     at = datetime.now(UTC) - timedelta(minutes=minutes_ago)
-    if transaction:
-        session.add(Transaction(user_id=user_id, type='subscription_payment', amount_kopeks=PRICE_30_1, created_at=at))
+    checkout = None
     if checkout_public_id is not None:
+        checkout = SubscriptionCheckout(
+            public_id=checkout_public_id,
+            user_id=user_id,
+            source=source,
+            tariff_id=3,
+            period_days=period_days,
+            selected_device_limit=devices,
+            lifecycle_state=lifecycle_state,
+            financial_committed_at=at,
+        )
+        session.add(checkout)
+        session.flush()
+    if transaction:
         session.add(
-            SubscriptionCheckout(
-                public_id=checkout_public_id,
+            Transaction(
                 user_id=user_id,
-                source='cabinet',
-                tariff_id=3,
-                period_days=period_days,
-                selected_device_limit=devices,
-                lifecycle_state='ready',
-                financial_committed_at=at,
+                type='subscription_payment',
+                amount_kopeks=PRICE_30_1,
+                created_at=at,
+                device_first_checkout_id=checkout.id if checkout is not None else None,
             )
         )
     session.commit()
@@ -637,14 +649,19 @@ def _request(
     intent: bool = True,
     period_days: int = 30,
     amount_kopeks: int = CLIENT_AMOUNT,
-    repeat: bool = False,
+    confirmed_purchase_at: datetime | None = None,
     change_method: bool = False,
 ) -> TopUpRequest:
     return TopUpRequest(
         amount_kopeks=amount_kopeks,
         payment_method=method,
         payment_option=option,
-        intent=TopUpIntent(period_days=period_days, devices=1, repeat=repeat, change_method=change_method)
+        intent=TopUpIntent(
+            period_days=period_days,
+            devices=1,
+            confirmed_purchase_at=confirmed_purchase_at,
+            change_method=change_method,
+        )
         if intent
         else None,
     )

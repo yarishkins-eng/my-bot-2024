@@ -388,6 +388,7 @@ def _topup_intent_response(decision: TopUpIntentDecision) -> TopUpResponse:
         devices=decision.devices,
         price_kopeks=decision.price_kopeks,
         subscription_end_date=decision.subscription_end_date,
+        purchased_at=decision.purchased_at,
         payment_option=str(payment.payment_method_code) if reusable and payment.payment_method_code else None,
     )
 
@@ -602,7 +603,7 @@ async def create_topup(
                     method_code=method_code,
                     min_kopeks=method.min_amount_kopeks,
                     max_kopeks=method.max_amount_kopeks,
-                    repeat=request.intent.repeat,
+                    confirmed_purchase_at=request.intent.confirmed_purchase_at,
                     change_method=request.intent.change_method,
                 )
                 intent_status, intent_reason = decision.status, decision.reason

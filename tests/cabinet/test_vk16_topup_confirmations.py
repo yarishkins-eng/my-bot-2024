@@ -86,11 +86,38 @@ async def test_newest_purchase_within_the_hour_is_the_one_named(db, session, end
     assert (decision.checkout_public_id, decision.period_days) == ('chk-new-2', 180)
 
 
-async def test_order_with_money_but_without_a_purchase_record_still_asks(db, session, ends):
-    # Заказ новой кассы со списанием — покупка сам по себе, даже если проводки покупки рядом нет.
-    _purchase(session, minutes_ago=8, checkout_public_id='chk-direct-4', transaction=False)
+@pytest.mark.parametrize('lifecycle_state', ['cancelled', 'ready'])
+async def test_card_invoice_without_money_is_not_a_purchase(db, session, ends, lifecycle_state):
+    # 🔴 P1 волны 1 (четыре линзы): `financial_committed_at` ставит уже ВЫСТАВЛЕНИЕ счёта картой и не снимает отмена —
+    # брошенный счёт давал «Уже оформлено до <конец пробного>», и человек решил бы, что заплатил. Покупка — проводка.
+    _purchase(
+        session, minutes_ago=8, checkout_public_id='chk-direct-4', transaction=False, lifecycle_state=lifecycle_state
+    )
 
-    assert (await _decide(db, session)).checkout_public_id == 'chk-direct-4'
+    assert (await _decide(db, session)).status == 'accepted'
+
+
+async def test_the_order_named_is_the_one_of_the_last_purchase_not_the_last_order(db, session, ends):
+    # Заказ час назад, потом докупка устройства 5 минут назад: назван не старый заказ, а «что-то куплено».
+    _purchase(session, minutes_ago=50, checkout_public_id='chk-old-5', period_days=90)
+    _purchase(session, minutes_ago=5)
+    _purchase(
+        session, minutes_ago=2, checkout_public_id='chk-abandoned-6', transaction=False, lifecycle_state='cancelled'
+    )
+
+    decision = await _decide(db, session)
+
+    assert (decision.status, decision.checkout_public_id, decision.period_days) == ('already_fulfilled', None, None)
+
+
+async def test_question_names_the_moment_and_the_price_of_another_period(db, session, ends):
+    _purchase(session, minutes_ago=12, checkout_public_id='chk-card-7')
+
+    decision = await _decide(db, session, period_days=90)
+
+    assert decision.price_kopeks == 39_900  # цена ЗАПРОШЕННОГО срока сейчас — экрану для «Оплатить ещё период?»
+    assert decision.purchased_at is not None
+    assert abs((decision.purchased_at - (datetime.now(UTC) - timedelta(minutes=12))).total_seconds()) < 5
 
 
 async def test_top_up_or_bonus_within_the_hour_is_not_a_purchase(db, session, ends):
@@ -106,17 +133,24 @@ async def test_top_up_or_bonus_within_the_hour_is_not_a_purchase(db, session, en
 
 async def test_invoice_issued_between_two_purchases_is_not_reused_for_once_more(db, session, ends):
     # Считаем от ПОСЛЕДНЕЙ покупки: счёт между ними при зачислении откажет «уже была оплата».
-    _purchase(session, minutes_ago=40, checkout_public_id='chk-first-1', transaction=False)
+    _purchase(session, minutes_ago=40, checkout_public_id='chk-first-1')
     _intent_payment(session, payment_id=73, created_ago=timedelta(minutes=20))
     _purchase(session, minutes_ago=10)
 
-    assert (await _decide(db, session, repeat=True)).status == 'accepted'
+    assert (await _yes(db, session)).status == 'accepted'
+
+
+async def _yes(db, session, **kw):
+    """«Да» на вопрос: повтор с моментом той покупки, о которой спросили."""
+    asked = await _decide(db, session, **kw)
+    assert asked.status == 'already_fulfilled'
+    return await _decide(db, session, confirmed_purchase_at=asked.purchased_at, **kw)
 
 
 async def test_yes_once_more_bills_another_period(db, session, ends):
     _purchase(session, minutes_ago=20, checkout_public_id='chk-card-7')
 
-    decision = await _decide(db, session, repeat=True)
+    decision = await _yes(db, session)
 
     assert (decision.status, decision.amount_kopeks, decision.price_kopeks) == ('accepted', TOP_UP_30_1, PRICE_30_1)
 
@@ -139,14 +173,14 @@ async def test_yes_once_more_does_not_reuse_an_invoice_issued_before_the_purchas
     _intent_payment(session, payment_id=70, created_ago=timedelta(minutes=30))
     _purchase(session, minutes_ago=20)
 
-    assert (await _decide(db, session, repeat=True)).status == 'accepted'
+    assert (await _yes(db, session)).status == 'accepted'
 
 
 async def test_yes_once_more_reuses_an_invoice_issued_after_the_purchase(db, session, ends):
     _purchase(session, minutes_ago=20)
     live = _intent_payment(session, payment_id=71, created_ago=timedelta(minutes=5))
 
-    decision = await _decide(db, session, repeat=True)
+    decision = await _yes(db, session)
 
     assert (decision.status, decision.payment.id) == ('already_paying', live.id)
 
@@ -156,14 +190,27 @@ async def test_money_already_on_its_way_is_named_before_the_question(db, session
     _intent_payment(session, payment_id=72, provider_status='CONFIRMED', is_paid=True, transaction_id=990)
     _purchase(session, minutes_ago=3)
 
-    assert (await _decide(db, session, repeat=True)).status == 'already_paid'
+    decision = await _decide(db, session, confirmed_purchase_at=datetime.now(UTC))
+    assert decision.status == 'already_paid'
+
+
+async def test_an_old_yes_does_not_cover_a_newer_purchase(db, session, ends):
+    # 🔴 P2 волны 1: «да» было голым флагом — повтор старого запроса (вкладка, «назад») после того, как «да» уже
+    # оформило второй срок, выставил бы счёт третьего без вопроса. «Да» привязано к моменту покупки из вопроса.
+    _purchase(session, minutes_ago=30, checkout_public_id='chk-first-8')
+    asked = await _decide(db, session)
+    _purchase(session, minutes_ago=1, checkout_public_id='chk-second-9')
+
+    decision = await _decide(db, session, confirmed_purchase_at=asked.purchased_at)
+
+    assert (decision.status, decision.checkout_public_id) == ('already_fulfilled', 'chk-second-9')
 
 
 async def test_route_carries_the_question_and_the_yes(db, session, provider, ends):
     _purchase(session, minutes_ago=15, checkout_public_id='chk-card-7')
 
     asked = await balance_route_topup(db, session)
-    billed = await balance_route_topup(db, session, repeat=True)
+    billed = await balance_route_topup(db, session, confirmed_purchase_at=asked.purchased_at)
 
     assert (asked.intent_status, asked.payment_url, asked.checkout_public_id) == (
         'already_fulfilled',
@@ -171,6 +218,7 @@ async def test_route_carries_the_question_and_the_yes(db, session, provider, end
         'chk-card-7',
     )
     assert asked.subscription_end_date == datetime(2026, 11, 7, 12, 34, 56, tzinfo=UTC)
+    assert asked.price_kopeks == PRICE_30_1 and asked.purchased_at is not None
     assert provider.calls and len(provider.calls) == 1  # счёт выставлен только на «да»
     assert (billed.intent_status, billed.amount_kopeks) == ('accepted', TOP_UP_30_1)
 
@@ -297,15 +345,31 @@ async def test_cancel_with_only_an_unpaid_top_up_says_no_money(db, session):
 
 
 async def test_cancel_charged_just_now_is_still_named_fulfilled(db, session):
-    # Своя доплата, застанная в работе, со списанием после выбора — «отменить уже нельзя» остаётся правдой.
-    payment = _intent_payment(session, payment_id=91, is_paid=True)
-    after = datetime.fromisoformat(dfc.topup_intent_of(payment)['created_at']) + timedelta(seconds=1)
-    session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=PRICE_30_1, created_at=after))
-    session.commit()
+    # Своя доплата, застанная в работе, со своим списанием после выбора — «отменить уже нельзя» остаётся правдой.
+    _intent_payment(session, payment_id=91, is_paid=True, created_ago=timedelta(minutes=2))
+    _purchase(session, minutes_ago=1, checkout_public_id='chk-auto-1', source=dfc.TOPUP_INTENT_SOURCE)
     decided = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     _intent_payment(session, payment_id=92, status='refused', is_paid=True, decided_at=decided)
 
     assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
+
+
+async def test_cancel_after_a_purchase_by_another_path_says_money_is_on_the_balance(db, session):
+    # 🔴 Мина OV, вторая половина: купил другим путём (касса, докупка), пока доплата оформлялась, — оформление откажет
+    # «уже была оплата», деньги останутся на балансе. «Оплата с баланса прошла» было бы неправдой.
+    _intent_payment(session, payment_id=91, is_paid=True, created_ago=timedelta(minutes=2))
+    _purchase(session, minutes_ago=1, checkout_public_id='chk-cashier-2')
+    _purchase(session, minutes_ago=1)
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 91))['status'] == 'cancelled'
+
+
+async def test_own_charge_before_the_top_up_was_chosen_does_not_count(db, session):
+    _purchase(session, minutes_ago=30, checkout_public_id='chk-auto-old', source=dfc.TOPUP_INTENT_SOURCE)
+    _intent_payment(session, payment_id=91, is_paid=True, created_ago=timedelta(minutes=2))
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
 
 
 async def test_someone_elses_decided_top_up_changes_nothing(db, session):
@@ -320,9 +384,29 @@ def test_earlier_words_neither_promise_a_message_nor_deny_the_money():
 
     caption = handlers._cancelled_text(user, 'earlier')
 
-    assert caption == 'Заказ отменён. О доплате, которая пришла раньше, бот уже написал отдельным сообщением.'
+    assert caption == (
+        'Заказ отменён. Оплату, которая пришла раньше, это не затронуло: что с ней стало, бот написал отдельным '
+        'сообщением.'
+    )
     english = handlers._cancelled_text(SimpleNamespace(language='en'), 'earlier')
+    assert english.startswith('Order cancelled. The payment that arrived earlier is not affected')
     assert 'no money' not in english.lower() and 'will follow' not in english
+
+
+def test_screen_close_after_an_earlier_payment_does_not_say_order_cancelled():
+    # 🔴 P1 линзы текстов: витрина `df:x2` — заказа нет; оплативший прочёл бы «Заказ отменён» как «подписку отменили».
+    caption = handlers._cancelled_text(SimpleNamespace(language='ru'), 'earlier', order=False)
+    english = handlers._cancelled_text(SimpleNamespace(language='en'), 'earlier', order=False)
+
+    assert caption == (
+        'Экран закрыт. Оплату, которая пришла раньше, эта кнопка не отменяет: что с ней стало, бот написал '
+        'отдельным сообщением.'
+    )
+    assert english.startswith('Screen closed.') and 'cancelled' not in english.lower()
+    # Остальные ответы витрины прежние.
+    assert handlers._cancelled_text(SimpleNamespace(language='ru'), None, order=False) == (
+        'Заказ отменён. Деньги не списаны.'
+    )
 
 
 async def test_cancel_fused_after_an_earlier_top_up_uses_the_earlier_words():
@@ -337,8 +421,8 @@ async def test_cancel_fused_after_an_earlier_top_up_uses_the_earlier_words():
         )
 
     caption = render.await_args.kwargs['caption']
-    assert 'бот уже написал отдельным сообщением' in caption
-    assert 'Деньги не списаны' not in caption and 'Отменить уже нельзя' not in caption
+    assert caption.startswith('Экран закрыт.') and 'бот написал отдельным сообщением' in caption
+    assert 'Заказ отменён' not in caption and 'Деньги не списаны' not in caption
 
 
 # --- мина OW: списание с баланса читает баланс под замком ---------------------------------------------------------
