@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Collection
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape
 from itertools import islice
 from types import SimpleNamespace
@@ -2392,9 +2392,17 @@ async def pay_wallet_fused(
             purchased_at=purchase[0].isoformat() if purchase[0] else None,
             checkout_id=bought.public_id if bought is not None else None,
         )
-        if bought is not None and (bought.period_days, bought.selected_device_limit) == (days, devices):
-            # Чаще всего это СВОЁ первое нажатие этой же кнопки (двойной тап обрабатывается параллельно): показываем
-            # оплаченный заказ, как прежде, а не «ничего не списали» поверх списания (волна 1 заявки 3б).
+        own_tap = (
+            bought is not None
+            and bought.funding_mode == 'wallet'
+            and (bought.period_days, bought.selected_device_limit) == (days, devices)
+            and purchase[0] is not None
+            and purchase[0] >= datetime.now(UTC) - timedelta(minutes=1)
+        )
+        if own_tap:
+            # СВОЁ первое нажатие этой же кнопки (двойной тап обрабатывается параллельно): только свежее списание с
+            # баланса того же срока — показываем оплаченный заказ, как прежде (волна 1). Давнюю покупку того же размера
+            # (кабинет, вчера) так не показываем: «VPN готов» читался бы как «продлил» (волна 2 заявки 3б).
             await _render_checkout(callback, db_user, db, bought)
             return
         balance = _money(db_user, int(db_user.balance_kopeks or 0))

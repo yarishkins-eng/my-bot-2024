@@ -1585,8 +1585,9 @@ async def topup_intent_paid_predecessor(db: AsyncSession, payment: Any) -> Plate
     Человек открыл счёт, потом сменил способ (старый — `replaced`) или отменил заказ в боте и открыл новый (старый —
     `cancelled`, без ссылки на новый), а заплатил по СТАРОЙ ссылке. Экран нового счёта ждал бы свои деньги 10 минут; его
     ответ отдаёт исход того старого, чьи деньги пришли ПОСЛЕ открытия нового. Момент прихода — момент исхода
-    (`decided_at`: оформление пишет его в том же вебхуке), без исхода — момент проводки зачисления (не `updated_at`: его
-    сдвигает любая поздняя запись строки, мина OH). Оплаченный ДО открытия нового сюда не попадает: тогда `/topup`
+    (`decided_at`: оформление пишет его в том же вебхуке), без исхода — момент проводки зачисления `completed_at` (не
+    `created_at`: Platega пишет туда время ВЫСТАВЛЕНИЯ счёта; и не `updated_at`: его сдвигает любая поздняя запись строки,
+    мина OH — волна 2 заявки 3б). Оплаченный ДО открытия нового сюда не попадает: тогда `/topup`
     ответил бы `already_paid`, а не выставил новый счёт.
     """
     intent = topup_intent_of(payment)
@@ -1603,7 +1604,7 @@ async def topup_intent_paid_predecessor(db: AsyncSession, payment: Any) -> Plate
             continue
         arrived = _intent_time(older_intent.get('decided_at'))
         if arrived is None and older.transaction_id is not None:
-            deposit_at = await db.scalar(select(Transaction.created_at).where(Transaction.id == older.transaction_id))
+            deposit_at = await db.scalar(select(Transaction.completed_at).where(Transaction.id == older.transaction_id))
             arrived = _intent_time(deposit_at) if deposit_at is not None else None
         if arrived is not None and arrived >= created_at and (found_at is None or arrived > found_at):
             found, found_at = older, arrived
@@ -1613,14 +1614,28 @@ async def topup_intent_paid_predecessor(db: AsyncSession, payment: Any) -> Plate
 async def topup_intent_screen_view(db: AsyncSession, payment: Any) -> dict[str, Any]:
     """Поля исхода для ответа опроса одного платежа: исход оплаченного предшественника, если он есть, и предложение,
     погашенное покупкой. 🔴 Предложение «Оформить» и «за вами шаг» лежат в метаданных бессрочно, а экран (16в-2)
-    списывает с баланса без банка: купил после отказа ЛЮБЫМ путём — вид `bought`, без предложения (тот же забор, что
-    момент в кнопке бота `df:a2:`; три линзы волны 1 заявки 3б). Покупка, бывшая ДО решения, уже дала бы
-    `already_purchased` при отказе — значит, найденная здесь случилась после."""
+    списывает с баланса без банка: была покупка после начала доплаты ЛЮБЫМ путём — предложения нет (тот же забор, что
+    момент в кнопке бота `df:a2:`; три линзы волны 1 заявки 3б). Куплен именно этот заказ (тот же срок и устройства —
+    чаще всего кнопкой «Оформить» из сообщения бота) — исход `fulfilled` с его номером: в чате у человека «VPN готов»,
+    и экран не должен сказать «заказ не оформился» (волна 2). Иначе — вид `bought`, как в сообщении бота.
+    ⚠️ Покупку до решения отказ `retry` уже назвал бы `already_purchased`; у `order` — нет (открытый заказ проверяется
+    раньше), и опрос тогда скажет `bought` там, где бот написал «к моему заказу», — редкий край, денег не стоит."""
     source = await topup_intent_paid_predecessor(db, payment) or payment
     fields = topup_intent_screen_fields(source)
-    since = _intent_time((topup_intent_of(source) or {}).get('created_at'))
+    intent = topup_intent_of(source) or {}
+    since = _intent_time(intent.get('created_at'))
+    purchase = None
     if fields.get('intent_refusal_kind') in {'retry', 'order'} and since is not None:
-        if await recent_purchase(db, user_id=source.user_id, since=since) is not None:
+        purchase = await recent_purchase(db, user_id=source.user_id, since=since)
+    if purchase is not None:
+        bought = purchase[1]
+        if bought is not None and (bought.period_days, bought.selected_device_limit) == (
+            intent.get('period_days'),
+            intent.get('devices'),
+        ):
+            fields.update(intent_outcome='fulfilled', intent_checkout_public_id=bought.public_id, intent_reason=None)
+            fields.update(intent_refusal_kind=None, intent_offer_kopeks=None, intent_offer_tariff_name=None)
+        else:
             fields.update(
                 intent_reason='already_purchased',
                 intent_refusal_kind='bought',

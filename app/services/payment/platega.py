@@ -864,7 +864,7 @@ class PlategaPaymentMixin:
                 )
             except Exception as error:
                 logger.error('Ошибка отправки уведомления пользователю Platega', error=error)
-        refusal, refusal_sent = None, False
+        refusal, refusal_sent, plain_sent = None, False, False
         if getattr(self, 'bot', None) and user.telegram_id and topup_intent is not None and not fulfilled:
             # Отказ автооформления — ОДНО сообщение с кнопкой по причине вместо «Пополнение успешно» с общим хвостом
             # (замысел v2, правило 5; план ВК, 16а-2, заявка 2). Не собралось — ниже прежнее «Пополнение успешно»:
@@ -914,6 +914,7 @@ class PlategaPaymentMixin:
                     parse_mode='HTML',
                     reply_markup=keyboard,
                 )
+                plain_sent = True
             except Exception as error:
                 logger.error('Ошибка отправки уведомления пользователю Platega', error=error)
 
@@ -949,7 +950,7 @@ class PlategaPaymentMixin:
                             else 'у клиента нет Telegram — объяснения в боте нет, при желании напишите ему'
                             if not user.telegram_id
                             else 'клиенту ушло обычное «Пополнение успешно» без объяснения'
-                            if refusal is None
+                            if refusal is None and plain_sent
                             else 'сообщение клиенту не дошло — напишите ему сами: деньги на балансе, заказ не оформлен'
                         )
                         if topup_intent is not None and not fulfilled
