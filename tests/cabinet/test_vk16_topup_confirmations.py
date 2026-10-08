@@ -620,3 +620,115 @@ async def test_abandon_tail_speaks_about_this_order_not_a_previous_subscription(
     caption = render.await_args.kwargs['caption']
     assert caption.endswith('Подписка по этому заказу не оформится.')
     assert 'Прежняя подписка' not in caption and 'Оплату, которая пришла раньше, это не затронуло' in caption
+
+
+# --- волна 2, мутатор: дыры сторожей --------------------------------------------------------------------------------
+
+
+async def test_someone_elses_wallet_charge_does_not_make_my_cancel_say_fulfilled(db, session):
+    # №29: без фильтра по человеку «отменить уже нельзя» срабатывало бы от чужого списания.
+    _intent_payment(session, payment_id=91, is_paid=True, created_ago=timedelta(minutes=2))
+    _purchase(session, minutes_ago=1, checkout_public_id='chk-other-7', user_id=2)
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
+
+
+async def test_paid_top_up_without_a_choice_time_is_cancelled_as_money_on_the_balance(db, session):
+    # №31: без момента выбора «своё списание после него» не доказать — гасим, деньги на балансе.
+    from tests.cabinet.test_vk16_topup_intent import _rewrite_intent
+
+    payment = _intent_payment(session, payment_id=91, is_paid=True)
+    _rewrite_intent(session, payment, created_at=None)
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 91))['status'] == 'cancelled'
+
+
+@pytest.mark.parametrize('lifecycle_state', ['draft', 'confirmed'])
+async def test_a_fresh_quote_after_the_purchase_still_gets_the_question(db, session, ends, lifecycle_state):
+    # №58: купил, начал новый расчёт (котировка без счёта — не заказ) и нажал старую кнопку доплаты.
+    ends.open_checkout.return_value = SimpleNamespace(
+        lifecycle_state=lifecycle_state, public_id='chk-quote-1', period_days=90, selected_device_limit=2
+    )
+    _purchase(session, minutes_ago=10, checkout_public_id='chk-card-7')
+
+    decision = await _decide(db, session)
+
+    assert (decision.status, decision.checkout_public_id) == ('already_fulfilled', 'chk-card-7')
+
+
+def test_the_screen_flags_default_to_no_and_no_yes():
+    # №46: старый экран полей не шлёт — без явной смены способа сервер обязан вернуть тот же счёт.
+    from app.cabinet.schemas.balance import TopUpIntent
+
+    intent = TopUpIntent(period_days=30, devices=1)
+
+    assert (intent.change_method, intent.confirmed_purchase_at) == (False, None)
+
+
+async def test_route_without_the_change_flag_returns_the_live_invoice_of_another_method(db, session, provider):
+    first = await balance_route_topup(db, session, option='2')
+    from app.cabinet.routes import balance as balance_route
+    from app.cabinet.schemas.balance import TopUpRequest
+
+    # Как пришлёт старый экран: JSON без новых полей намерения.
+    request = TopUpRequest.model_validate(
+        {
+            'amount_kopeks': 12_345,
+            'payment_method': 'platega',
+            'payment_option': '11',
+            'intent': {'period_days': 30, 'devices': 1},
+        }
+    )
+
+    again = await balance_route.create_topup(request=request, user=_user(session), db=db)
+
+    assert (again.intent_status, again.payment_id) == ('already_paying', first.payment_id)
+
+
+async def test_already_paid_names_no_method(db, session, provider):
+    # №40: «деньги пришли» — ссылки и способа нет, платить второй раз нечем.
+    _intent_payment(session, payment_id=72, provider_status='CONFIRMED', is_paid=True, transaction_id=990)
+
+    response = await balance_route_topup(db, session)
+
+    assert (response.intent_status, response.payment_url, response.payment_option) == ('already_paid', None, None)
+
+
+@pytest.mark.parametrize('language', ['ru', 'en'])
+async def test_real_cancel_and_abandon_after_an_earlier_payment_say_the_order_is_cancelled(language):
+    # №49, №50: «Экран закрыт» — только витрина; настоящая отмена заказа говорит «Заказ отменён».
+    user = SimpleNamespace(id=17, language=language)
+    expected = (
+        'Заказ отменён. Оплату, которая пришла раньше, это не затронуло'
+        if language == 'ru'
+        else 'Order cancelled. The payment that arrived earlier is not affected'
+    )
+    with (
+        patch.object(handlers, 'cancel_topup_intents', AsyncMock(return_value='earlier')),
+        patch.object(handlers, 'get_owned_checkout', AsyncMock(return_value=SimpleNamespace(public_id='chk-1'))),
+        patch.object(handlers, 'settlement_mode', lambda checkout: 'legacy_deposit'),
+        patch.object(handlers, 'cancel_checkout', AsyncMock(return_value=SimpleNamespace(lifecycle_state='cancelled'))),
+        patch.object(
+            handlers,
+            'abandon_direct_checkout_for_new_calculation',
+            AsyncMock(return_value=SimpleNamespace(lifecycle_state='cancelled')),
+        ),
+        patch.object(handlers, 'edit_or_answer_photo', AsyncMock()) as render,
+    ):
+        await handlers.cancel(
+            SimpleNamespace(data='df:x:chk-1', answer=AsyncMock()),
+            user,
+            AsyncMock(),
+            SimpleNamespace(clear=AsyncMock()),
+        )
+        await handlers.abandon(
+            SimpleNamespace(data='df:xa:chk-1', answer=AsyncMock()),
+            user,
+            AsyncMock(),
+            SimpleNamespace(clear=AsyncMock()),
+        )
+
+    captions = [call.kwargs['caption'] for call in render.await_args_list]
+    assert len(captions) == 2
+    assert all(c.startswith(expected) and 'Экран закрыт' not in c and 'Screen closed' not in c for c in captions)
