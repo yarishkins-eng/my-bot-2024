@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Collection
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from html import escape
 from itertools import islice
 from types import SimpleNamespace
@@ -38,6 +38,7 @@ from app.services.device_first_checkout_service import (
     device_first_top_up_surplus_kopeks,
     get_open_checkout_for_user,
     get_owned_checkout,
+    recent_purchase,
     serialize_checkout,
     settlement_mode,
     topup_intent_refusal_kind,
@@ -172,6 +173,22 @@ def _chunks(values: list[int], size: int):
 
 def _back(user: User, callback_data: str = 'back_to_menu') -> InlineKeyboardButton:
     return InlineKeyboardButton(text=_text(user, '‹ Назад', '‹ Back'), callback_data=callback_data)
+
+
+def _shown_at() -> int:
+    """Момент показа кнопки списания с баланса — для проверки «после него уже была покупка» (заявка 3б)."""
+    return int(datetime.now(UTC).timestamp())
+
+
+def _intent_moment(intent: dict) -> int:
+    """Момент для кнопки «Оформить за N ₽» в сообщении отказа — начало доплаты, а не сборка сообщения: покупку до
+    решения отказ уже назвал бы «уже была оплата», а покупка между решением и сообщением иначе прошла бы мимо обеих
+    проверок (волна 1 заявки 3б)."""
+    try:
+        parsed = datetime.fromisoformat(str(intent.get('created_at')))
+    except ValueError:
+        return _shown_at()
+    return int((parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).timestamp())
 
 
 def _main_menu(user: User) -> InlineKeyboardButton:
@@ -1171,7 +1188,7 @@ async def _render_fused_confirmation(
                         f'Оплатить с баланса · {total} ₽',
                         f'Pay from balance · ₽{total}',
                     ),
-                    callback_data=f'df:a2:{days}:{devices}:{price}',
+                    callback_data=f'df:a2:{days}:{devices}:{price}:{_shown_at()}',
                 )
             ]
         ]
@@ -2349,14 +2366,69 @@ async def pay_wallet_fused(
     db: AsyncSession,
     state: FSMContext,
 ) -> None:
-    """Birth/resume the direct checkout and debit the wallet at «Pay from balance»."""
+    """Birth/resume the direct checkout and debit the wallet at «Pay from balance».
+
+    🔴 ВК-16 (заявка 3б): кнопка живёт в чате вечно (экран «Ваш заказ», сообщение об отказе автооформления) и
+    списывает без банка — нажатие через день, когда срок уже куплен другим путём, взяло бы второй молча. В кнопке —
+    момент показа (`df:a2:дни:устройства:цена:момент`); была покупка после него — не списываем, а зовём открыть заказ
+    заново. Кнопки старых сообщений (без момента) — как раньше.
+    """
     await callback.answer()
     parts = (callback.data or '').split(':')
-    if len(parts) != 5:
+    if len(parts) not in {5, 6}:
         return
     try:
         days, devices, kopeks = int(parts[2]), int(parts[3]), int(parts[4])
-    except ValueError:
+        shown_at = datetime.fromtimestamp(int(parts[5]), UTC) if len(parts) == 6 else None
+    except (ValueError, OverflowError, OSError):
+        return
+    purchase = await recent_purchase(db, user_id=db_user.id, since=shown_at) if shown_at is not None else None
+    if purchase is not None:
+        bought = purchase[1]
+        logger.info(
+            'Кнопка списания с баланса: после показа уже была покупка — не списываем',
+            user_id=db_user.id,
+            shown_at=shown_at.isoformat(),
+            purchased_at=purchase[0].isoformat() if purchase[0] else None,
+            checkout_id=bought.public_id if bought is not None else None,
+        )
+        own_tap = (
+            bought is not None
+            and bought.funding_mode == 'wallet'
+            and (bought.period_days, bought.selected_device_limit) == (days, devices)
+            and purchase[0] is not None
+            and purchase[0] >= datetime.now(UTC) - timedelta(minutes=1)
+        )
+        if own_tap:
+            # СВОЁ первое нажатие этой же кнопки (двойной тап обрабатывается параллельно): только свежее списание с
+            # баланса того же срока — показываем оплаченный заказ, как прежде (волна 1). Давнюю покупку того же размера
+            # (кабинет, вчера) так не показываем: «VPN готов» читался бы как «продлил» (волна 2 заявки 3б).
+            await _render_checkout(callback, db_user, db, bought)
+            return
+        balance = _money(db_user, int(db_user.balance_kopeks or 0))
+        await edit_or_answer_photo(
+            callback=callback,
+            caption=_text(
+                db_user,
+                'С тех пор как бот показал эту кнопку, на вашем аккаунте уже прошла оплата. Чтобы не взять деньги '
+                f'дважды, с баланса ничего не списано — на балансе {balance} ₽.\n\n'
+                'Если нужен ещё срок подписки, откройте заказ заново: там будет свежая цена.',
+                'A payment has already gone through on your account since this button was shown. To avoid charging '
+                f'you twice, nothing was taken from your balance — your balance is ₽{balance}.\n\n'
+                'If you need another subscription period, open a new order: it will show the current price.',
+            ),
+            keyboard=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=_text(db_user, 'Открыть заказ заново', 'Open a new order'), callback_data='df:start'
+                        )
+                    ],
+                    [_main_menu(db_user)],
+                ]
+            ),
+            parse_mode='HTML',
+        )
         return
     try:
         resolved = await create_or_resume_direct_checkout(
@@ -2651,7 +2723,7 @@ def topup_intent_refusal_message(
                 [
                     InlineKeyboardButton(
                         text=_text(user, f'Оформить за {price}', f'Order for {price}'),
-                        callback_data=f'df:a2:{int(days)}:{int(devices)}:{int(offer)}',
+                        callback_data=f'df:a2:{int(days)}:{int(devices)}:{int(offer)}:{_intent_moment(intent)}',
                     )
                 ]
             )

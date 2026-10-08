@@ -825,37 +825,6 @@ class PlategaPaymentMixin:
             await db.commit()
             await db.refresh(user)
 
-        if getattr(self, 'bot', None):
-            try:
-                from app.services.admin_notification_service import AdminNotificationService
-
-                notification_service = AdminNotificationService(self.bot)
-                await notification_service.send_balance_topup_notification(
-                    user,
-                    transaction,
-                    old_balance,
-                    topup_status=topup_status,
-                    referrer_info=referrer_info,
-                    subscription=subscription,
-                    promo_group=promo_group,
-                    db=db,
-                    auto_next_step=(
-                        f'заказ на {topup_intent.get("period_days")} дн., устройств {topup_intent.get("devices")} '
-                        f'оформлен сам с баланса, на балансе осталось {settings.format_price(balance_left)}'
-                        if fulfilled
-                        else None
-                    ),
-                    intent_refused=(
-                        'Заказ по доплате бот сам не оформил: '
-                        f'{_OWNER_REFUSAL_WHY.get(topup_intent.get("reason"), "технический отказ, смотреть журнал")}'
-                        ' — деньги остались на балансе, клиенту отправлено объяснение'
-                        if topup_intent is not None and not fulfilled
-                        else None
-                    ),
-                )
-            except Exception as error:
-                logger.error('Ошибка отправки админ уведомления Platega', error=error)
-
         method_title = settings.get_platega_method_display_title(payment.payment_method_code)
 
         # Оформленному «Пополнение успешно… подписка сама не оплатится» было бы ложью; «✅ Ваша VPN-подписка готова» и
@@ -895,7 +864,7 @@ class PlategaPaymentMixin:
                 )
             except Exception as error:
                 logger.error('Ошибка отправки уведомления пользователю Platega', error=error)
-        refusal = None
+        refusal, refusal_sent, plain_sent = None, False, False
         if getattr(self, 'bot', None) and user.telegram_id and topup_intent is not None and not fulfilled:
             # Отказ автооформления — ОДНО сообщение с кнопкой по причине вместо «Пополнение успешно» с общим хвостом
             # (замысел v2, правило 5; план ВК, 16а-2, заявка 2). Не собралось — ниже прежнее «Пополнение успешно»:
@@ -911,6 +880,7 @@ class PlategaPaymentMixin:
         if refusal is not None:
             try:
                 await self.bot.send_message(user.telegram_id, refusal[0], parse_mode='HTML', reply_markup=refusal[1])
+                refusal_sent = True
             except Exception as error:
                 logger.error('Ошибка отправки отказа автооформления доплаты', user_id=user.id, error=error)
         elif getattr(self, 'bot', None) and user.telegram_id and not fulfilled:
@@ -944,8 +914,51 @@ class PlategaPaymentMixin:
                     parse_mode='HTML',
                     reply_markup=keyboard,
                 )
+                plain_sent = True
             except Exception as error:
                 logger.error('Ошибка отправки уведомления пользователю Platega', error=error)
+
+        if getattr(self, 'bot', None):
+            try:
+                from app.services.admin_notification_service import AdminNotificationService
+
+                notification_service = AdminNotificationService(self.bot)
+                await notification_service.send_balance_topup_notification(
+                    user,
+                    transaction,
+                    old_balance,
+                    topup_status=topup_status,
+                    referrer_info=referrer_info,
+                    subscription=subscription,
+                    promo_group=promo_group,
+                    db=db,
+                    auto_next_step=(
+                        f'заказ на {topup_intent.get("period_days")} дн., устройств {topup_intent.get("devices")} '
+                        f'оформлен сам с баланса, на балансе осталось {settings.format_price(balance_left)}'
+                        if fulfilled
+                        else None
+                    ),
+                    # Карточка — после сообщения клиенту и по факту отправки (заявка 3б): раньше она писала
+                    # «отправлено объяснение» до отправки и клиенту без Telegram, которому уходит обычное письмо.
+                    intent_refused=(
+                        'Заказ по доплате бот сам не оформил: '
+                        f'{_OWNER_REFUSAL_WHY.get(topup_intent.get("reason"), "технический отказ, смотреть журнал")}'
+                        ' — деньги остались на балансе, '
+                        + (
+                            'клиенту отправлено объяснение'
+                            if refusal_sent
+                            else 'у клиента нет Telegram — объяснения в боте нет, при желании напишите ему'
+                            if not user.telegram_id
+                            else 'клиенту ушло обычное «Пополнение успешно» без объяснения'
+                            if refusal is None and plain_sent
+                            else 'сообщение клиенту не дошло — напишите ему сами: деньги на балансе, заказ не оформлен'
+                        )
+                        if topup_intent is not None and not fulfilled
+                        else None
+                    ),
+                )
+            except Exception as error:
+                logger.error('Ошибка отправки админ уведомления Platega', error=error)
 
         try:
             from app.services.payment.common import send_cart_notification_after_topup
