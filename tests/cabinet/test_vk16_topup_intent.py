@@ -885,7 +885,16 @@ async def test_intent_payment_is_credited_by_the_real_generic_top_up(db, session
     # 16а-2 переписал: при зачислении намерение оформляется (его сторожа — `test_vk16_topup_autocomplete.py`); здесь
     # оформление подменено, а проверяется, что деньги пришли ОБЩЕЙ веткой и исход оформления дошёл до записи.
     completed = {'status': 'fulfilled', 'checkout_public_id': 'chk-97'}
-    complete = AsyncMock(return_value=completed)
+
+    async def complete_and_record(*, payment_id):
+        # Как настоящее оформление: исход пишется в строку платежа его сессией (финальная запись вебхука с заявки 2
+        # берёт намерение со строки под замком, а не из своего снимка).
+        row = session.get(PlategaPayment, payment_id)
+        row.metadata_json = {**row.metadata_json, dfc.TOPUP_INTENT_KEY: completed}
+        session.commit()
+        return completed
+
+    complete = AsyncMock(side_effect=complete_and_record)
     monkeypatch.setattr(dfc, 'complete_topup_intent', complete)
     _intent_payment(session, payment_id=97)
 

@@ -36,6 +36,13 @@ from app.handlers.subscription.device_first import (
 from app.services.device_first_checkout_service import DeviceFirstError
 
 
+@pytest.fixture(autouse=True)
+def _no_topup_intents(monkeypatch):
+    # ВК-16 (16а-2, заявка 2): кнопки отмены и «Изменить» сначала гасят доплату под заказ. Здесь база — заглушка;
+    # само гашение и тексты после него сторожит `tests/cabinet/test_vk16_topup_refusals.py` на настоящем движке.
+    monkeypatch.setattr('app.handlers.subscription.device_first.cancel_topup_intents', AsyncMock(return_value=None))
+
+
 # Адрес двери доплаты, которую этап БК ставит на экран заказа.
 TOP_UP_PREFIX = '/balance/top-up/'
 TOP_UP_LABEL = 'Доплатить'
