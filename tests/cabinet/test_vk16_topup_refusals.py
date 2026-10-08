@@ -359,7 +359,9 @@ def test_order_on_review_says_review_and_blocked_says_cannot_order():
     assert 'оформить подписку сейчас нельзя' in _message('restricted')[0]
 
 
-def test_retry_offers_one_tap_at_the_fresh_price_and_another_period():
+def test_retry_offers_one_tap_at_the_fresh_price_and_another_period(monkeypatch):
+    # Заявка 3б: в кнопке — момент показа (вечная кнопка не спишет второй срок после покупки другим путём).
+    monkeypatch.setattr(handlers, '_shown_at', lambda: 1_791_000_000)
     text_, keyboard = _message('price_changed', offer_kopeks=13_377, offer_tariff_name='Базовый <&>')
 
     assert 'Заказ сам не оформился: цена изменилась. Деньги на балансе.' in text_
@@ -369,7 +371,7 @@ def test_retry_offers_one_tap_at_the_fresh_price_and_another_period():
         in text_
     )
     assert _buttons(keyboard) == [
-        ('Оформить за 133,77 ₽', 'df:a2:30:2:13377', None),
+        ('Оформить за 133,77 ₽', 'df:a2:30:2:13377:1791000000', None),
         ('‹ Выбрать другой срок', 'df:e2', None),
         ('В главное меню', 'back_to_menu', None),
     ]
@@ -397,12 +399,13 @@ def test_retry_names_why(reason, why):
     assert f'Заказ сам не оформился: {why}.' in _message(reason)[0]
 
 
-def test_english_refusal():
+def test_english_refusal(monkeypatch):
+    monkeypatch.setattr(handlers, '_shown_at', lambda: 1_791_000_000)
     text_, keyboard = _message('price_changed', language='en', offer_kopeks=13_377, offer_tariff_name='Basic')
 
     assert 'Payment received: ₽99' in text_ and 'the price has changed' in text_ and 'Balance: ₽149.37' in text_
     assert 'You can order it with one tap — Basic · 1 month · 2 devices for ₽133.77' in text_
-    assert _buttons(keyboard)[0] == ('Order for ₽133.77', 'df:a2:30:2:13377', None)
+    assert _buttons(keyboard)[0] == ('Order for ₽133.77', 'df:a2:30:2:13377:1791000000', None)
 
 
 # --- зачисление: отказ уходит одним сообщением, исход не откатывается ------------------------------------------
@@ -417,7 +420,7 @@ async def test_webhook_refusal_is_one_message_with_the_button_and_the_owner_hear
     text_ = webhook.bot.send_message.await_args.args[1]
     assert 'Пополнение успешно' not in text_ and 'ваша подписка изменилась' in text_
     buttons = _buttons(webhook.bot.send_message.await_args.kwargs['reply_markup'])
-    assert buttons[0][1] == f'df:a2:30:1:{PRICE_30_1}'
+    assert buttons[0][1].startswith(f'df:a2:30:1:{PRICE_30_1}:')  # + момент показа (заявка 3б)
     assert webhook.admin[0]['intent_refused'] == (
         'Заказ по доплате бот сам не оформил: подписка клиента изменилась, пока шла оплата — деньги остались на '
         'балансе, клиенту отправлено объяснение'

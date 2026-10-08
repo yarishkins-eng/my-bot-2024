@@ -3,6 +3,7 @@
 import math
 import time
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -22,7 +23,8 @@ from app.services.device_first_checkout_service import (
     TopUpIntentDecision,
     prepare_topup_intent,
     replace_older_topup_intents,
-    topup_intent_outcome,
+    topup_intent_paid_predecessor,
+    topup_intent_screen_fields,
 )
 from app.services.payment_method_config_service import get_enabled_methods_for_user
 from app.services.payment_service import PaymentService
@@ -1437,14 +1439,14 @@ def _get_payment_url(record: PendingPayment) -> str | None:
     return payment_url
 
 
-def _record_to_response(record: PendingPayment) -> PendingPaymentResponse:
-    """Convert PendingPayment to API response."""
+def _record_to_response(record: PendingPayment, *, intent_payment: Any = None) -> PendingPaymentResponse:
+    """Convert PendingPayment to API response.
+
+    `intent_payment` — чей исход доплаты отдать, если не этого платежа (оплаченный предшественник, заявка 3б (ж)).
+    """
     status_emoji, status_text = _get_status_info(record)
-    intent_outcome, intent_checkout_public_id, intent_reason = topup_intent_outcome(record.payment)
     return PendingPaymentResponse(
-        intent_outcome=intent_outcome,
-        intent_checkout_public_id=intent_checkout_public_id,
-        intent_reason=intent_reason,
+        **topup_intent_screen_fields(intent_payment or record.payment),
         id=record.local_id,
         method=record.method.value,
         method_display=method_display_name(record.method),
@@ -1496,13 +1498,26 @@ async def _with_purchase_step(record_response: PendingPaymentResponse, user: Use
     Экран результата пополнения его не зовёт (во фронте кабинета у него вообще нет вызовов).
     """
     # ВК-16 (16а-1): доплату под заказ оформляет сервер — «оформите сами» поверх ожидания или готового заказа было бы
-    # ложью; после отказа (`refused`) решает подсказка, как у обычного пополнения.
+    # ложью. После отказа (и закрытого намерения, чьи деньги пришли) решает ВИД кнопки, как в сообщении бота, а не
+    # подсказка корзины: она не знает, что бот только что написал «второй раз не списываем» (`bought`) или «напишите в
+    # поддержку» (`support`) — шаг за человеком есть только у `retry` и `order` (заявка 3б).
+    kind = record_response.intent_refusal_kind
+    if kind is not None and (record_response.intent_outcome == 'refused' or record_response.is_paid):
+        record_response.purchase_step_pending = kind in {'retry', 'order'}
+        return record_response
     if not record_response.is_paid or record_response.intent_outcome in ('processing', 'fulfilled'):
         return record_response
     from app.services.payment.common import topup_pending_purchase_hint
 
     record_response.purchase_step_pending = bool(await topup_pending_purchase_hint(user))
     return record_response
+
+
+async def _payment_response(db: AsyncSession, record: PendingPayment, user: User) -> PendingPaymentResponse:
+    """Ответ про один платёж: при доплате под заказ, пока он ждёт денег, — исход оплаченного старого счёта (заявка 3б
+    (ж)): иначе экран ждал бы свои деньги, а они уже пришли по прежней ссылке."""
+    predecessor = await topup_intent_paid_predecessor(db, record.payment) if record.payment is not None else None
+    return await _with_purchase_step(_record_to_response(record, intent_payment=predecessor), user)
 
 
 @router.get('/pending-payments', response_model=PendingPaymentListResponse)
@@ -1639,7 +1654,7 @@ async def get_latest_payment_by_method(
         payment=payment,
     )
 
-    return await _with_purchase_step(_record_to_response(record), user)
+    return await _payment_response(db, record, user)
 
 
 @router.get('/pending-payments/{method}/{payment_id}', response_model=PendingPaymentResponse)
@@ -1673,7 +1688,7 @@ async def get_pending_payment_details(
             detail='Access denied',
         )
 
-    return await _with_purchase_step(_record_to_response(record), user)
+    return await _payment_response(db, record, user)
 
 
 @router.post('/pending-payments/{method}/{payment_id}/check', response_model=ManualCheckResponse)
@@ -1713,7 +1728,7 @@ async def check_payment_status(
         return ManualCheckResponse(
             success=False,
             message='Ручная проверка недоступна для этого платежа',
-            payment=await _with_purchase_step(_record_to_response(record), user),
+            payment=await _payment_response(db, record, user),
             status_changed=False,
         )
 
@@ -1732,7 +1747,7 @@ async def check_payment_status(
         return ManualCheckResponse(
             success=False,
             message='Не удалось проверить статус платежа',
-            payment=await _with_purchase_step(_record_to_response(record), user),
+            payment=await _payment_response(db, record, user),
             status_changed=False,
         )
 
@@ -1747,7 +1762,7 @@ async def check_payment_status(
     return ManualCheckResponse(
         success=True,
         message=message,
-        payment=await _with_purchase_step(_record_to_response(updated), user),
+        payment=await _payment_response(db, updated, user),
         status_changed=status_changed,
         old_status=old_status,
         new_status=updated.status,

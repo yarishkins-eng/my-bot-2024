@@ -1398,7 +1398,9 @@ async def test_legacy_trial_reconciliation_error_explains_the_hold_and_offers_su
 
 
 @pytest.mark.asyncio
-async def test_fused_confirmation_offers_the_wallet_button_when_balance_covers() -> None:
+async def test_fused_confirmation_offers_the_wallet_button_when_balance_covers(monkeypatch) -> None:
+    # Заявка 3б: в кнопке списания — момент показа экрана.
+    monkeypatch.setattr('app.handlers.subscription.device_first._shown_at', lambda: 1_791_000_000)
     callback = SimpleNamespace(data='df:d:view1234:2', answer=AsyncMock())
     user = SimpleNamespace(id=17, language='ru', balance_kopeks=50_000)
     options = {
@@ -1421,9 +1423,9 @@ async def test_fused_confirmation_offers_the_wallet_button_when_balance_covers()
     caption = render.await_args.kwargs['caption']
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert 'Оплатите с баланса.' in caption
-    assert keyboard[0][0].callback_data == 'df:a2:30:2:36900'
+    assert keyboard[0][0].callback_data == 'df:a2:30:2:36900:1791000000'
     callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
-    assert callbacks == ['df:a2:30:2:36900', 'df:e2', 'df:x2']
+    assert callbacks == ['df:a2:30:2:36900:1791000000', 'df:e2', 'df:x2']
 
 
 @pytest.mark.asyncio

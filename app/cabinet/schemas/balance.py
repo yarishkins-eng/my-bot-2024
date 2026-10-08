@@ -185,6 +185,18 @@ class PendingPaymentResponse(BaseModel):
     intent_outcome: str | None = None
     intent_checkout_public_id: str | None = None
     intent_reason: str | None = None
+    # ВК-16 (16а-2, заявка 3б) — договор с экраном 16в-2: при `refused`/`closed` причина — из закрытого набора, вид кнопки
+    # (`bought` — без кнопки покупки, `order` — к заказу, `support` — в поддержку, `retry` — «Оформить» по предложению,
+    # а без него — выбор срока, как бот). Срок, устройства, цена — заказа намерения; предложение — только у отказа.
+    # `intent_payment_id` — о каком платеже исход: если не этот, деньги пришли по СТАРОМУ счёту того же человека
+    # (сменил способ или отменил заказ, а заплатил по прежней ссылке) — экран показывает его исход, а не ждёт свой.
+    intent_refusal_kind: str | None = None
+    intent_payment_id: int | None = None
+    intent_period_days: int | None = None
+    intent_devices: int | None = None
+    intent_quote_kopeks: int | None = None
+    intent_offer_kopeks: int | None = None
+    intent_offer_tariff_name: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

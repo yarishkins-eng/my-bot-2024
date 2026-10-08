@@ -1448,6 +1448,9 @@ TOPUP_INTENT_TTL = timedelta(hours=1)
 TOPUP_INTENT_ROLLOUT = 'stands'
 # Те же статусы «ждёт оплаты», что у `_is_live_direct_provider_invoice` (`cabinet/routes/device_first.py`).
 _TOPUP_INTENT_LIVE_INVOICE_STATUSES = frozenset({'PENDING', 'INPROGRESS'})
+# Способы Platega, чьё подтверждение может прийти позже часа намерения (13 — криптовалюта): оформление отказало бы
+# «прошло больше часа» — для них обычное пополнение без обещания (план ВК, 16а-2 (л); заявка 3б).
+_TOPUP_INTENT_SLOW_METHODS = frozenset({13})
 
 
 class TopUpIntentDecision(NamedTuple):
@@ -1539,6 +1542,64 @@ def topup_intent_outcome(payment: Any) -> tuple[str | None, str | None, str | No
     return 'closed', None, str(status)
 
 
+def topup_intent_screen_fields(payment: Any) -> dict[str, Any]:
+    """Всё, что экран доплаты (16в-2) показывает по исходу, — договор с экраном (план ВК, 16а-2 (з); заявка 3б).
+
+    Срок, устройства и цена — заказа этого намерения; предложение «Оформить: тариф · срок · цена» — только у отказа и
+    только если сервер его сделал (баланса хватает на свежую цену). Причина — из закрытого набора, вид кнопки — как в
+    сообщении бота (`bought` / `order` / `support` / `retry`); сырой код ошибки (`detail`) наружу не отдаём.
+    `intent_payment_id` — платёж, о котором исход: у оплаченного предшественника он чужой (`topup_intent_paid_predecessor`).
+    """
+    intent = topup_intent_of(payment)
+    if intent is None:
+        return {}
+    outcome, public_id, reason = topup_intent_outcome(payment)
+    kind = None
+    if outcome in {'refused', 'closed'}:
+        reason = topup_intent_refusal_reason(reason)
+        kind = topup_intent_refusal_kind(reason)
+    refused = outcome == 'refused'
+    return {
+        'intent_outcome': outcome,
+        'intent_checkout_public_id': public_id,
+        'intent_reason': reason,
+        'intent_refusal_kind': kind,
+        'intent_payment_id': payment.id,
+        'intent_period_days': intent.get('period_days'),
+        'intent_devices': intent.get('devices'),
+        'intent_quote_kopeks': intent.get('quote_kopeks'),
+        'intent_offer_kopeks': intent.get('offer_kopeks') if refused else None,
+        'intent_offer_tariff_name': intent.get('offer_tariff_name') if refused else None,
+    }
+
+
+async def topup_intent_paid_predecessor(db: AsyncSession, payment: Any) -> PlategaPayment | None:
+    """Оплаченный СТАРЫЙ счёт доплаты, пока новый ждёт денег (план ВК, 16а-2 (ж); заявка 3б).
+
+    Человек открыл счёт, потом сменил способ (старый — `replaced`) или отменил заказ в боте и открыл новый (старый —
+    `cancelled`, без ссылки на новый), а заплатил по СТАРОЙ ссылке. Экран нового счёта ждал бы свои деньги 10 минут; его
+    ответ отдаёт исход того старого, чьи деньги пришли ПОСЛЕ открытия нового. Момент прихода — момент исхода
+    (`decided_at`: оформление пишет его в том же вебхуке), без исхода — последняя запись строки. Оплаченный ДО открытия
+    нового сюда не попадает: тогда `/topup` ответил бы `already_paid`, а не выставил новый счёт.
+    """
+    intent = topup_intent_of(payment)
+    created_at = _intent_time((intent or {}).get('created_at'))
+    if created_at is None or topup_intent_outcome(payment)[0] != 'waiting':
+        return None
+    found, found_at = None, None
+    for older in await _recent_topup_intent_payments(db, user_id=payment.user_id, now=datetime.now(UTC)):
+        older_intent = topup_intent_of(older)
+        older_created = _intent_time(older_intent.get('created_at'))
+        if older.id == payment.id or older_created is None or older_created >= created_at:
+            continue
+        if not (older.is_paid or older.transaction_id is not None):
+            continue
+        arrived = _intent_time(older_intent.get('decided_at')) or _intent_time(older.updated_at)
+        if arrived is not None and arrived >= created_at and (found_at is None or arrived > found_at):
+            found, found_at = older, arrived
+    return found
+
+
 def _topup_intent_state(payment: PlategaPayment, intent: dict[str, Any], *, now: datetime) -> str | None:
     """`paid` — деньги пришли, исхода ещё нет; `invoice` — счёт можно оплатить; иначе ничего.
 
@@ -1572,7 +1633,7 @@ async def _recent_topup_intent_payments(db: AsyncSession, *, user_id: int, now: 
     return [payment for payment in rows if topup_intent_of(payment) is not None]
 
 
-async def _recent_purchase(
+async def recent_purchase(
     db: AsyncSession, *, user_id: int, since: datetime
 ) -> tuple[datetime, SubscriptionCheckout | None] | None:
     """Последняя покупка после `since` ЛЮБЫМ путём (мина OP) — по проводке `SUBSCRIPTION_PAYMENT`, как
@@ -1623,6 +1684,8 @@ async def prepare_topup_intent(
     reason = topup_intent_unavailable_reason(user)
     if reason is not None:
         return TopUpIntentDecision('ordinary', reason)
+    if method_code in _TOPUP_INTENT_SLOW_METHODS:
+        return TopUpIntentDecision('ordinary', 'method_not_supported')
     options = await build_purchase_options(db, user)
     try:
         if not options.get('eligible'):
@@ -1660,7 +1723,7 @@ async def prepare_topup_intent(
         same_method = not change_method or intent.get('method') == method_code
         if state == 'invoice' and (found['period_days'], found['devices']) == requested and same_method:
             same_live.append(payment)
-    purchase = await _recent_purchase(db, user_id=user.id, since=now - TOPUP_INTENT_TTL)
+    purchase = await recent_purchase(db, user_id=user.id, since=now - TOPUP_INTENT_TTL)
     # «Да» сравниваем с запасом в секунду и как UTC: экран может прислать момент без пояса или срезать микросекунды
     # (`toISOString`), и тогда вопрос возвращался бы вечно, а дата без пояса роняла бы сравнение (волна 2 заявки 3а).
     confirmed = _intent_time(confirmed_purchase_at) if confirmed_purchase_at is not None else None

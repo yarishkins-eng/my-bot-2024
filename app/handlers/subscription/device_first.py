@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Collection
-from datetime import datetime
+from datetime import UTC, datetime
 from html import escape
 from itertools import islice
 from types import SimpleNamespace
@@ -38,6 +38,7 @@ from app.services.device_first_checkout_service import (
     device_first_top_up_surplus_kopeks,
     get_open_checkout_for_user,
     get_owned_checkout,
+    recent_purchase,
     serialize_checkout,
     settlement_mode,
     topup_intent_refusal_kind,
@@ -172,6 +173,11 @@ def _chunks(values: list[int], size: int):
 
 def _back(user: User, callback_data: str = 'back_to_menu') -> InlineKeyboardButton:
     return InlineKeyboardButton(text=_text(user, '‹ Назад', '‹ Back'), callback_data=callback_data)
+
+
+def _shown_at() -> int:
+    """Момент показа кнопки списания с баланса — для проверки «после него уже была покупка» (заявка 3б)."""
+    return int(datetime.now(UTC).timestamp())
 
 
 def _main_menu(user: User) -> InlineKeyboardButton:
@@ -1171,7 +1177,7 @@ async def _render_fused_confirmation(
                         f'Оплатить с баланса · {total} ₽',
                         f'Pay from balance · ₽{total}',
                     ),
-                    callback_data=f'df:a2:{days}:{devices}:{price}',
+                    callback_data=f'df:a2:{days}:{devices}:{price}:{_shown_at()}',
                 )
             ]
         ]
@@ -2349,14 +2355,44 @@ async def pay_wallet_fused(
     db: AsyncSession,
     state: FSMContext,
 ) -> None:
-    """Birth/resume the direct checkout and debit the wallet at «Pay from balance»."""
+    """Birth/resume the direct checkout and debit the wallet at «Pay from balance».
+
+    🔴 ВК-16 (заявка 3б): кнопка живёт в чате вечно (экран «Ваш заказ», сообщение об отказе автооформления) и
+    списывает без банка — нажатие через день, когда срок уже куплен другим путём, взяло бы второй молча. В кнопке —
+    момент показа (`df:a2:дни:устройства:цена:момент`); была покупка после него — не списываем, а зовём открыть заказ
+    заново. Кнопки старых сообщений (без момента) — как раньше.
+    """
     await callback.answer()
     parts = (callback.data or '').split(':')
-    if len(parts) != 5:
+    if len(parts) not in {5, 6}:
         return
     try:
         days, devices, kopeks = int(parts[2]), int(parts[3]), int(parts[4])
-    except ValueError:
+        shown_at = datetime.fromtimestamp(int(parts[5]), UTC) if len(parts) == 6 else None
+    except (ValueError, OverflowError, OSError):
+        return
+    if shown_at is not None and await recent_purchase(db, user_id=db_user.id, since=shown_at) is not None:
+        await edit_or_answer_photo(
+            callback=callback,
+            caption=_text(
+                db_user,
+                'После этого сообщения на вашем аккаунте уже была покупка, поэтому мы ничего не списали. '
+                'Если нужен ещё один период — откройте заказ заново, там будет свежая цена.',
+                'There has already been a purchase on your account since this message, so we did not charge '
+                'anything. If you need one more period, open a new order — it will show the current price.',
+            ),
+            keyboard=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=_text(db_user, 'Открыть заказ заново', 'Open a new order'), callback_data='df:start'
+                        )
+                    ],
+                    [_main_menu(db_user)],
+                ]
+            ),
+            parse_mode='HTML',
+        )
         return
     try:
         resolved = await create_or_resume_direct_checkout(
@@ -2651,7 +2687,7 @@ def topup_intent_refusal_message(
                 [
                     InlineKeyboardButton(
                         text=_text(user, f'Оформить за {price}', f'Order for {price}'),
-                        callback_data=f'df:a2:{int(days)}:{int(devices)}:{int(offer)}',
+                        callback_data=f'df:a2:{int(days)}:{int(devices)}:{int(offer)}:{_shown_at()}',
                     )
                 ]
             )
