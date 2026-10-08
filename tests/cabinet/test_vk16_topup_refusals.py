@@ -690,3 +690,62 @@ def test_owner_card_line_with_the_refusal():
 
     assert f'стало {settings.format_price(14_937)}. Заказ по доплате бот сам не оформил (x)' in message
     assert 'Корзины нет' not in message and 'карточка придёт' not in message
+
+
+# --- добор по своим мутациям ----------------------------------------------------------------------------------
+
+
+async def test_balance_after_the_debit_is_read_fresh_not_from_the_webhook_user(db, session, webhook, buy):
+    # Списание идёт в СВОЕЙ сессии: объект пользователя в сессии вебхука помнит баланс до него. Здесь списание пишет
+    # мимо карты объектов (как чужая сессия) — старое значение в объекте остаётся, и только свежее чтение верно.
+    async def debit_elsewhere(checkout):
+        session.execute(text('UPDATE users SET balance_kopeks = balance_kopeks - :p WHERE id = 1'), {'p': PRICE_30_1})
+        session.execute(
+            text("UPDATE subscription_checkouts SET lifecycle_state = 'fulfilling' WHERE id = :id"), {'id': checkout.id}
+        )
+        session.commit()
+        return checkout
+
+    buy.commit_effect = debit_elsewhere
+    _intent_payment(session, payment_id=97, **TRIAL)
+
+    await _pay(db, webhook)
+
+    left = settings.format_price(BALANCE + TOP_UP_30_1 - PRICE_30_1)
+    assert f'На балансе осталось: {left}' in webhook.bot.send_message.await_args.args[1]
+    assert webhook.admin[0]['auto_next_step'].endswith(f'на балансе осталось {left}')
+    assert webhook.email.await_args.kwargs == {'balance_kopeks': BALANCE + TOP_UP_30_1 - PRICE_30_1}
+
+
+async def test_email_top_up_names_the_balance_it_is_given(monkeypatch):
+    from app.services import notification_delivery_service as delivery
+    from app.services.payment.common import notify_email_user_topup
+
+    sent = AsyncMock()
+    monkeypatch.setattr(delivery.notification_delivery_service, 'send_notification', sent)
+    user = SimpleNamespace(id=1, telegram_id=None, email='a@b.c', balance_kopeks=14_937)
+
+    await notify_email_user_topup(user, 9_900, balance_kopeks=37)
+    await notify_email_user_topup(user, 9_900)
+
+    first, second = (call.kwargs['context'] for call in sent.await_args_list)
+    assert (first['new_balance_kopeks'], first['formatted_balance']) == (37, settings.format_price(37))
+    assert second['new_balance_kopeks'] == 14_937
+
+
+async def test_recheck_takes_the_user_lock_before_reading_the_label(db, session, monkeypatch):
+    _intent_payment(session, payment_id=97)
+    seen = []
+    real_execute = db.execute
+
+    async def recording(statement, *args, **kwargs):
+        table = getattr(statement, 'get_final_froms', list)()
+        seen.append((str(table[0]) if table else '', getattr(statement, '_for_update_arg', None) is not None))
+        return await real_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, 'execute', recording)
+    intent = _intent(session)
+
+    assert await dfc._topup_intent_recheck_locked(db, payment_id=97, user_id=1, intent=intent) is None
+
+    assert seen[:2] == [('users', True), ('platega_payments', True)]
