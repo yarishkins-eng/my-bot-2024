@@ -556,7 +556,7 @@ class PlategaPaymentMixin:
                 # клиента и админа, кнопки чат-админки) — метка «заменено»/«отменено» и исход доплаты откатывались бы.
                 platega_crud = import_module('app.database.crud.platega')
                 locked = await platega_crud.get_platega_payment_by_id_for_update(db, payment.id)
-                if locked is not None and not locked.is_paid:
+                if locked is not None:
                     payment = locked
                     payment.status = remote_status
                     if not self._is_direct_device_first_payment(payment):
