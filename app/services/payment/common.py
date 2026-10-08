@@ -436,7 +436,7 @@ class PaymentCommonMixin:
             return False
 
 
-async def notify_email_user_topup(user: Any, amount_kopeks: int) -> None:
+async def notify_email_user_topup(user: Any, amount_kopeks: int, *, balance_kopeks: int | None = None) -> None:
     """«Пополнение успешно» для юзеров без Telegram (#2952).
 
     Провайдерские webhook-обработчики шлют это сообщение только в Telegram
@@ -448,6 +448,8 @@ async def notify_email_user_topup(user: Any, amount_kopeks: int) -> None:
     """
     if user is None or getattr(user, 'telegram_id', None) or not getattr(user, 'email', None):
         return
+    # Баланс после автооформления доплаты (ВК-16) передаёт вызывающий: объект пользователя помнит его ДО списания.
+    balance = (getattr(user, 'balance_kopeks', 0) or 0) if balance_kopeks is None else balance_kopeks
     try:
         from app.services.notification_delivery_service import (
             NotificationType,
@@ -459,9 +461,9 @@ async def notify_email_user_topup(user: Any, amount_kopeks: int) -> None:
             notification_type=NotificationType.BALANCE_TOPUP,
             context={
                 'formatted_amount': settings.format_price(amount_kopeks),
-                'formatted_balance': settings.format_price(getattr(user, 'balance_kopeks', 0) or 0),
+                'formatted_balance': settings.format_price(balance),
                 'amount_kopeks': amount_kopeks,
-                'new_balance_kopeks': getattr(user, 'balance_kopeks', 0) or 0,
+                'new_balance_kopeks': balance,
             },
             bot=None,
         )

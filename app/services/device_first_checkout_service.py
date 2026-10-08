@@ -1717,17 +1717,186 @@ async def replace_older_topup_intents(db: AsyncSession, *, user_id: int, newer_p
     return replaced
 
 
+async def cancel_topup_intents(db: AsyncSession, *, user_id: int) -> str | None:
+    """«Отменить заказ» и «Изменить» в боте гасят неоплаченную доплату человека (замысел v2, правило 7; план ВК, 16а-2,
+    заявка 2): если банк потом проведёт оплату, деньги лягут на баланс с сообщением об отказе, заказ сам не оформится.
+
+    Метка ставится под замком строки и перечитанной строкой — вебхук мог оплатить её секунду назад; оформление читает
+    её под тем же замком прямо перед списанием (`_topup_intent_recheck_locked`). Возвращает, что сказать про деньги:
+    `fulfilled` — за последний час доплата пришла и заказ по ней оформлен; `paid` — доплата пришла, деньги на балансе;
+    `None` — денег по доплате не приходило.
+    """
+    now = datetime.now(UTC)
+    paid_note = None
+    for payment_id in sorted(p.id for p in await _recent_topup_intent_payments(db, user_id=user_id, now=now)):
+        locked = await get_platega_payment_by_id_for_update(db, payment_id)
+        intent = topup_intent_of(locked)
+        if intent is None:
+            continue
+        status = intent.get('status')
+        if locked.is_paid or locked.transaction_id is not None:
+            moment = _intent_time(intent.get('decided_at') or intent.get('created_at'))
+            if moment is not None and moment >= now - TOPUP_INTENT_TTL:
+                paid_note = 'fulfilled' if status == 'fulfilled' else (paid_note or 'paid')
+        elif status == 'pending':
+            locked.metadata_json = {
+                **locked.metadata_json,
+                TOPUP_INTENT_KEY: {**intent, 'status': 'cancelled', 'cancelled_at': now.isoformat()},
+            }
+    await db.commit()
+    return paid_note
+
+
 # --- ВК-16 (16а-2): деньги доплаты пришли — заказ оформляется сам ----------------------------------------------
 TOPUP_INTENT_SOURCE = 'topup_intent'
 # Свой заказ, закрытый отказом автооформления: закрываем только заказ без списания (`financial_committed_at` пуст).
 # В `_NO_MONEY_TERMINAL_REASONS` НЕ добавлена: набор сторожится поимённо, а экрану такого заказа никто не показывает.
 TOPUP_INTENT_REFUSED_TERMINAL_REASON = 'topup_intent_refused'
+# Причина отказа — ЗАКРЫТЫЙ набор (план ВК, 16а-2, заявка 2): её читают сообщение бота и экран кабинета (16в-2), и
+# сырой код оформления (`DeviceFirstError`) туда не уходит — он лежит в `detail` для разбора.
+_TOPUP_INTENT_ERROR_REASONS = {
+    'operator_review_required': 'order_on_review',
+    'legacy_trial_reconciliation_required': 'order_on_review',
+    'open_checkout_exists': 'open_order',
+    'external_invoice_active': 'open_order',
+    'funding_mode_locked': 'open_order',
+    'reprice_required': 'price_changed',
+    'wallet_insufficient': 'balance_short',
+    'subscription_restricted': 'restricted',
+    'account_closing': 'account_erasure',
+    'feature_disabled': 'unavailable',
+    'legacy_only': 'unavailable',
+    'tariff_missing': 'unavailable',
+    'invalid_selection': 'unavailable',
+    'location_policy_not_sellable': 'unavailable',
+    'device_limit_decrease_not_allowed': 'unavailable',
+}
+TOPUP_INTENT_REFUSAL_REASONS = frozenset(
+    {*_TOPUP_INTENT_ERROR_REASONS.values(), 'expired', 'replaced', 'cancelled', 'disabled', 'already_purchased'}
+    | {'subscription_changed', 'technical_error'}
+)
+
+
+def topup_intent_refusal_reason(raw: Any) -> str:
+    return raw if raw in TOPUP_INTENT_REFUSAL_REASONS else _TOPUP_INTENT_ERROR_REASONS.get(raw, 'technical_error')
+
+
+def topup_intent_refusal_kind(reason: Any) -> str:
+    """Какую кнопку дать при отказе (замысел v2, правило 5): `bought` — без кнопки покупки (дважды не списываем);
+    `order` — к открытому заказу; `support` — заказ на проверке, запрет или удаление аккаунта, без кнопки покупки;
+    `retry` — оформить одним нажатием по свежей цене."""
+    reason = topup_intent_refusal_reason(reason)
+    if reason == 'already_purchased':
+        return 'bought'
+    if reason == 'open_order':
+        return 'order'
+    if reason in {'order_on_review', 'restricted', 'account_erasure'}:
+        return 'support'
+    return 'retry'
 
 
 def _topup_intent_session():
     from app.database.database import AsyncSessionLocal
 
     return AsyncSessionLocal()
+
+
+async def _topup_intent_drift(
+    db: AsyncSession, *, user_id: int, intent: dict[str, Any], created_at: datetime, current: dict[str, Any] | None
+) -> str | None:
+    """«Уже купил» раньше «подписка изменилась» (купившему не предлагать купить снова)."""
+    # Любая покупка подписки после намерения — карта, баланс, касса бота или кабинета: у прямой продажи списание тоже
+    # пишется проводкой `SUBSCRIPTION_PAYMENT` (`debit_transaction_id`), поэтому одной проверки хватает на все пути.
+    # ⚠️ Той же проводкой пишутся докупка трафика и устройств, суточные списания и действия админа — отказ и на них:
+    # осторожно в сторону «деньги остаются на балансе», но причину называть «что-то куплено», а не «куплена подписка».
+    bought = await db.scalar(
+        select(Transaction.id)
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+            Transaction.created_at >= created_at,
+        )
+        .limit(1)
+    )
+    if bought is not None:
+        return 'already_purchased'
+    # Та же подписка — по номеру, тарифу и признаку пробной; `updated_at`, `status`, `device_limit`, `end_date` не
+    # сравниваем: их двигает фон (панель, монитор), и сверка отказывала бы впустую (замысел v2, правило 2).
+    remembered = (
+        intent.get('subscription_id'),
+        intent.get('subscription_tariff_id'),
+        intent.get('subscription_is_trial'),
+    )
+    now_held = (current.get('id'), current.get('tariff_id'), current.get('is_trial')) if current else None
+    if (now_held != remembered) if intent.get('had_subscription') else bool(current):
+        return 'subscription_changed'
+    return None
+
+
+async def _topup_intent_recheck_locked(
+    db: AsyncSession, *, payment_id: int, user_id: int, intent: dict[str, Any]
+) -> str | None:
+    """Последний момент перед списанием (план ВК, 16а-2, заявка 2): замок пользователя — тот же, что возьмёт
+    `commit_direct_wallet_checkout`, — держится до коммита списания, поэтому ни отмена, ни покупка другим путём между
+    этой проверкой и списанием не вклинятся. Метку отмены читаем со строки платежа под её замком, а не из снимка."""
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    fresh = topup_intent_of(await get_platega_payment_by_id_for_update(db, payment_id)) or {}
+    if fresh.get('status') != 'pending':
+        return str(fresh.get('status'))
+    return await _topup_intent_drift(
+        db,
+        user_id=user_id,
+        intent=intent,
+        created_at=_intent_time(intent.get('created_at')),
+        current=await _subscription_identity(db, user_id),
+    )
+
+
+async def _subscription_identity(db: AsyncSession, user_id: int) -> dict[str, Any] | None:
+    """Номер, тариф и признак пробной текущей подписки — колонками, мимо карты объектов сессии: объект, загруженный
+    сверкой раньше, помнил бы старые значения."""
+    subscription = await _current_subscription(db, user_id)
+    if subscription is None:
+        return None
+    tariff_id, is_trial = (
+        await db.execute(
+            select(Subscription.tariff_id, Subscription.is_trial).where(Subscription.id == subscription.id)
+        )
+    ).one()
+    return {'id': subscription.id, 'tariff_id': tariff_id, 'is_trial': bool(is_trial)}
+
+
+async def _topup_intent_offer(db: AsyncSession, *, user_id: int, intent: dict[str, Any]) -> dict[str, Any] | None:
+    """Кнопка «Оформить: тариф · срок · цена» по СВЕЖЕЙ цене — только если баланса на неё хватает (иначе кнопка
+    списания отказала бы «не хватает»). Пользователь перечитывается: после `rollback` старый объект протух (ловушка 3)."""
+    from app.database.crud.user import get_user_by_id
+
+    try:
+        user = await get_user_by_id(db, user_id)
+        options = await build_purchase_options(db, user)
+        if not options.get('eligible'):
+            return None
+        price = _fused_selection_price(
+            options, period_days=int(intent['period_days']), selected_device_limit=int(intent['devices'])
+        )
+    except Exception as error:  # кнопка — удобство: без неё человек выберет срок сам
+        logger.warning('topup_intent_offer_failed', user_id=user_id, error=str(error))
+        return None
+    if int(user.balance_kopeks or 0) < price:
+        return None
+    return {'offer_kopeks': price, 'offer_tariff_name': options['tariff'].get('name')}
+
+
+async def _topup_intent_refused(
+    db: AsyncSession, *, payment_id: int, user_id: int, intent: dict[str, Any], raw: Any, public_id: str | None
+) -> dict[str, Any] | None:
+    reason = topup_intent_refusal_reason(raw)
+    extra: dict[str, Any] = {} if reason == raw else {'detail': str(raw)}
+    if topup_intent_refusal_kind(reason) == 'retry':
+        extra.update(await _topup_intent_offer(db, user_id=user_id, intent=intent) or {})
+    return await _record_topup_intent_outcome(
+        db, payment_id=payment_id, status='refused', reason=reason, checkout_public_id=public_id, **extra
+    )
 
 
 async def _topup_intent_refusal(
@@ -1760,33 +1929,12 @@ async def _topup_intent_refusal(
     if open_checkout is not None and open_checkout.lifecycle_state not in {'draft', 'confirmed'}:
         on_review = open_checkout.lifecycle_state == 'operator_review'
         return ('order_on_review' if on_review else 'open_order'), open_checkout.public_id, None
-    # Любая покупка подписки после намерения — карта, баланс, касса бота или кабинета: у прямой продажи списание тоже
-    # пишется проводкой `SUBSCRIPTION_PAYMENT` (`debit_transaction_id`), поэтому одной проверки хватает на все пути.
-    # ⚠️ Той же проводкой пишутся докупка трафика и устройств, суточные списания и действия админа — отказ и на них:
-    # осторожно в сторону «деньги остаются на балансе», но причину называть «что-то куплено», а не «куплена подписка».
-    bought = await db.scalar(
-        select(Transaction.id)
-        .where(
-            Transaction.user_id == user.id,
-            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
-            Transaction.created_at >= created_at,
-        )
-        .limit(1)
-    )
-    if bought is not None:
-        return 'already_purchased', None, None
     options = await build_purchase_options(db, user)
-    current = options.get('current_subscription') or {}
-    # Та же подписка — по номеру, тарифу и признаку пробной; `updated_at`, `status`, `device_limit`, `end_date` не
-    # сравниваем: их двигает фон (панель, монитор), и сверка отказывала бы впустую (замысел v2, правило 2).
-    remembered = (
-        intent.get('subscription_id'),
-        intent.get('subscription_tariff_id'),
-        intent.get('subscription_is_trial'),
+    drift = await _topup_intent_drift(
+        db, user_id=user.id, intent=intent, created_at=created_at, current=options.get('current_subscription')
     )
-    now_held = (current.get('id'), current.get('tariff_id'), current.get('is_trial')) if current else None
-    if (now_held != remembered) if intent.get('had_subscription') else bool(current):
-        return 'subscription_changed', None, None
+    if drift is not None:
+        return drift, None, None
     try:
         if not options.get('eligible'):
             raise DeviceFirstError('legacy_only', 'Device-first checkout is unavailable')
@@ -1875,13 +2023,14 @@ async def _complete_topup_intent(
         await db.rollback()
         return intent  # исход уже есть — второе оформление не начинаем
     # ⚠️ Замок строки платежа отпускает ПЕРВЫЙ же коммит сверки (`get_open_checkout_for_user` истекает протухший заказ,
-    # `build_purchase_options` двигает статус подписки), задолго до списания. Метку отмены (заявка 2) поэтому
-    # перечитывать под замком прямо перед списанием, а не полагаться на этот.
+    # `build_purchase_options` двигает статус подписки), задолго до списания. Метку отмены, «уже купил» и «та же
+    # подписка» поэтому перечитывает `_topup_intent_recheck_locked` под замком прямо перед списанием (заявка 2).
     # 🔴 Пользователь — тем же помощником, что маршруты кабинета: со связями. Голый `select(User)` в свежей
     # async-сессии роняет `get_primary_promo_group()` ленивой подгрузкой (MissingGreenlet) — отказ у каждого.
     from app.database.crud.user import get_user_by_id
 
-    user = await get_user_by_id(db, payment.user_id)
+    user_id = payment.user_id  # после `rollback` объекты протухают (ловушка 3) — номер берём сейчас
+    user = await get_user_by_id(db, user_id)
     reason, public_id, price = await _topup_intent_refusal(db, user=user, intent=intent)
     if reason is None:
         try:
@@ -1897,15 +2046,18 @@ async def _complete_topup_intent(
             )
             if resolved.checkout.source == TOPUP_INTENT_SOURCE:
                 state['own'] = resolved.checkout.id
-            if resolved.proceed_to_payment:
+            if not resolved.proceed_to_payment:
+                reason, public_id = 'open_order', resolved.checkout.public_id
+            else:
+                reason = await _topup_intent_recheck_locked(db, payment_id=payment_id, user_id=user_id, intent=intent)
+            if reason is None:
                 state['charged'] = resolved.checkout.id
                 checkout = await commit_direct_wallet_checkout(
-                    db, public_id=resolved.checkout.public_id, user_id=user.id
+                    db, public_id=resolved.checkout.public_id, user_id=user_id
                 )
                 return await _record_topup_intent_outcome(
                     db, payment_id=payment_id, status='fulfilled', checkout_public_id=checkout.public_id
                 )
-            reason, public_id = 'open_order', resolved.checkout.public_id
         except DeviceFirstError as error:
             reason = error.code
     sold = await _close_own_topup_checkout(db, state)
@@ -1913,8 +2065,8 @@ async def _complete_topup_intent(
         return await _record_topup_intent_outcome(
             db, payment_id=payment_id, status='fulfilled', checkout_public_id=sold
         )
-    return await _record_topup_intent_outcome(
-        db, payment_id=payment_id, status='refused', reason=reason, checkout_public_id=public_id
+    return await _topup_intent_refused(
+        db, payment_id=payment_id, user_id=user_id, intent=intent, raw=reason, public_id=public_id
     )
 
 

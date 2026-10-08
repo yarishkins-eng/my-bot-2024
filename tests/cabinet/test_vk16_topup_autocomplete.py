@@ -101,7 +101,13 @@ def buy(monkeypatch, session, db, env, checkouts):
         session.commit()
         return checkout
 
+    async def identity(db_, user_id):
+        # Подписка «сейчас» под замком — та же, что видит сверка (`build_purchase_options` подменён); настоящий
+        # запрос колонками сторожит отдельный тест заявки 2.
+        return env.options.return_value.get('current_subscription')
+
     monkeypatch.setattr(dfc, '_topup_intent_session', own_session)
+    monkeypatch.setattr(dfc, '_subscription_identity', identity)
     monkeypatch.setattr(dfc, 'create_or_resume_direct_checkout', create)
     monkeypatch.setattr(dfc, 'commit_direct_wallet_checkout', commit)
     return calls
@@ -313,7 +319,8 @@ async def test_refused_commit_closes_its_own_order_so_it_locks_nothing(session, 
 
     _, stored = await _complete(session)
 
-    assert (stored['status'], stored['reason']) == ('refused', 'reprice_required')
+    # Заявка 2: причина — закрытый набор, сырой код оформления — в `detail`.
+    assert (stored['status'], stored['reason'], stored['detail']) == ('refused', 'price_changed', 'reprice_required')
     own = session.get(SubscriptionCheckout, 501)
     assert (own.lifecycle_state, own.terminal_reason) == ('cancelled', 'topup_intent_refused')
     assert session.get(User, 1).balance_kopeks == BALANCE + TOP_UP_30_1
@@ -579,9 +586,16 @@ async def test_webhook_credits_then_completes_then_runs_side_effects_and_skips_t
     text_ = webhook.bot.send_message.await_args.args[1]
     assert 'Оплата получена: 99' in text_ and 'Заказ оформлен с баланса' in text_
     assert 'Пополнение успешно' not in text_ and 'ХВОСТ' not in text_
+    # Мина OT (заявка 2): «готова» не обещается безусловно, остаток назван — ПОСЛЕ списания, а не до.
+    left = settings.format_price(BALANCE + TOP_UP_30_1 - PRICE_30_1)
+    assert 'не придёт за 10 минут — напишите в поддержку' in text_ and f'На балансе осталось: {left}' in text_
     assert webhook.bot.send_message.await_args.kwargs.get('reply_markup') is None
     webhook.email.assert_awaited_once()
-    assert webhook.admin[0]['auto_next_step'] == 'заказ на 30 дн., устройств 1 оформлен сам с баланса'
+    assert webhook.email.await_args.kwargs == {'balance_kopeks': BALANCE + TOP_UP_30_1 - PRICE_30_1}
+    assert webhook.admin[0]['auto_next_step'] == (
+        f'заказ на 30 дн., устройств 1 оформлен сам с баланса, на балансе осталось {left}'
+    )
+    assert webhook.admin[0]['intent_refused'] is None
     webhook.erasure.assert_awaited_once()
     webhook.carts.delete_user_cart.assert_awaited_once_with(1)
     webhook.carts.clear_topup_intent.assert_awaited_once_with(1)
@@ -622,12 +636,14 @@ async def test_refused_intent_still_tells_about_the_money_but_not_through_the_ol
     assert dfc.topup_intent_outcome(session.get(PlategaPayment, 97)) == ('refused', None, 'subscription_changed')
     webhook.bot.send_message.assert_awaited_once()
     text_ = webhook.bot.send_message.await_args.args[1]
-    assert 'Пополнение успешно' in text_
-    # Хвост «оформите сами» на месте (клиент 106): корзина с её меткой погашены ДО него, заборы автоплатежа остаются.
-    assert text_.endswith('ХВОСТ')
+    # Заявка 2: вместо «Пополнение успешно» с общим хвостом — ОДНО сообщение об отказе с кнопкой по причине
+    # (`test_vk16_topup_refusals.py`). Корзина с её меткой погашены до него, старой цепочки нет.
+    assert 'Оплата получена: 99' in text_ and 'ваша подписка изменилась' in text_
+    assert 'Пополнение успешно' not in text_ and 'ХВОСТ' not in text_
     assert webhook.carts_cleared_before_message == [True]
     assert 'cart_chain' not in webhook.order
     assert webhook.admin[0]['auto_next_step'] is None
+    assert 'бот сам не оформил (subscription_changed)' in webhook.admin[0]['intent_refused']
     webhook.erasure.assert_awaited_once()
 
 
@@ -639,7 +655,13 @@ async def test_refusal_over_an_open_order_does_not_push_to_buy_again(db, session
     await _pay(db, webhook)
 
     text_ = webhook.bot.send_message.await_args.args[1]
-    assert 'ХВОСТ' not in text_ and 'Пополнение успешно' in text_
+    assert 'ХВОСТ' not in text_ and 'Оплата получена' in text_
+    callbacks = {
+        b.callback_data
+        for row in webhook.bot.send_message.await_args.kwargs['reply_markup'].inline_keyboard
+        for b in row
+    }
+    assert not any(str(data).startswith(('df:a2:', 'df:e2')) for data in callbacks)  # к покупке не толкаем
 
 
 async def test_refusal_after_a_purchase_by_another_path_does_not_push_to_buy_again(db, session, webhook):

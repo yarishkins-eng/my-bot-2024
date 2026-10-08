@@ -551,14 +551,17 @@ class PlategaPaymentMixin:
                     if result is not None:
                         payment = result
             elif status_changed:
-                # Non-success status change — safe to persist without lock
-                payment.status = remote_status
-                if not self._is_direct_device_first_payment(payment):
-                    payment.metadata_json = {
-                        **(getattr(payment, 'metadata_json', {}) or {}),
-                        'remote_status': remote_payload,
-                    }
-                payment.updated_at = datetime.now(UTC)
+                # 🔴 Мина OQ (ВК-16, 16а-2, заявка 2): метаданные пишем на перечитанной под замком строке и дописываем
+                # только своё поле. Прежняя запись присваивала их целиком из снимка начала прохода (автопроверка, «Проверить»
+                # клиента и админа, кнопки чат-админки) — метка «заменено»/«отменено» и исход доплаты откатывались бы.
+                platega_crud = import_module('app.database.crud.platega')
+                locked = await platega_crud.get_platega_payment_by_id_for_update(db, payment.id)
+                if locked is not None and not locked.is_paid:
+                    payment = locked
+                    payment.status = remote_status
+                    if not self._is_direct_device_first_payment(payment):
+                        payment.metadata_json = {**(payment.metadata_json or {}), 'remote_status': remote_payload}
+                    payment.updated_at = datetime.now(UTC)
                 await db.commit()
 
         return {
@@ -751,6 +754,10 @@ class PlategaPaymentMixin:
             # Финальная запись ниже присваивает метаданные ЦЕЛИКОМ из этого словаря — без строки исход затёрся бы.
             metadata[dfc.TOPUP_INTENT_KEY] = topup_intent
         fulfilled = topup_intent is not None and topup_intent.get('status') == 'fulfilled'
+        # Списание шло в своей сессии: `user` здесь помнит баланс ДО него — для слов человеку и владельцу читаем свежий.
+        balance_left = (
+            await db.scalar(select(User.balance_kopeks).where(User.id == user.id)) if fulfilled else user.balance_kopeks
+        )
         if has_topup_intent:
             # Старая корзина и автопродление эти деньги не тратят (ловушка 8 стартера) — гасим корзину и её метку ДО
             # сообщения и карточки: иначе хвост промолчит «автопокупка объяснится сама», кнопка поведёт в удалённую
@@ -811,8 +818,14 @@ class PlategaPaymentMixin:
                     db=db,
                     auto_next_step=(
                         f'заказ на {topup_intent.get("period_days")} дн., устройств {topup_intent.get("devices")} '
-                        'оформлен сам с баланса'
+                        f'оформлен сам с баланса, на балансе осталось {settings.format_price(balance_left)}'
                         if fulfilled
+                        else None
+                    ),
+                    intent_refused=(
+                        f'Заказ по доплате бот сам не оформил ({topup_intent.get("reason")}) — деньги остались на '
+                        'балансе, клиенту ушло сообщение с кнопкой'
+                        if topup_intent is not None and not fulfilled
                         else None
                     ),
                 )
@@ -824,6 +837,8 @@ class PlategaPaymentMixin:
         # Оформленному «Пополнение успешно… подписка сама не оплатится» было бы ложью; «✅ Ваша VPN-подписка готова» и
         # меню подписчика придут из очереди выдачи — но только когда панель выдаст доступ (при сбое — повтор через
         # минуты, при разборе — никогда). Поэтому о деньгах говорим сразу и честно: получены, заказ оформлен.
+        # 🔴 Мина OT: «готова» не придёт, если выдача ушла на разбор или панель молчит, — поэтому не обещаем его
+        # безусловно, а говорим, что делать, если его нет, и называем остаток на балансе.
         if getattr(self, 'bot', None) and user.telegram_id and fulfilled:
             try:
                 english = getattr(user, 'language', None) == 'en'
@@ -831,17 +846,32 @@ class PlategaPaymentMixin:
                     user.telegram_id,
                     (
                         f'✅ <b>Payment received: {settings.format_price(payment.amount_kopeks)}</b>\n\n'
-                        'Your order is paid from the balance — we are connecting your subscription. '
-                        'A message will follow as soon as it is ready.'
+                        'Your order is paid from the balance — we are connecting your subscription, usually within '
+                        'a minute. If the «subscription is ready» message has not arrived in 10 minutes, please '
+                        f'contact support.\n\nBalance left: {settings.format_price(balance_left)}'
                         if english
                         else f'✅ <b>Оплата получена: {settings.format_price(payment.amount_kopeks)}</b>\n\n'
-                        'Заказ оформлен с баланса — подключаем подписку. Как только она будет готова, придёт сообщение.'
+                        'Заказ оформлен с баланса — подключаем подписку, обычно это минута. Если сообщение '
+                        '«подписка готова» не придёт за 10 минут — напишите в поддержку.\n\n'
+                        f'На балансе осталось: {settings.format_price(balance_left)}'
                     ),
                     parse_mode='HTML',
                 )
             except Exception as error:
                 logger.error('Ошибка отправки уведомления пользователю Platega', error=error)
-        if getattr(self, 'bot', None) and user.telegram_id and not fulfilled:
+        if getattr(self, 'bot', None) and user.telegram_id and topup_intent is not None and not fulfilled:
+            # Отказ автооформления — ОДНО сообщение с кнопкой по причине вместо «Пополнение успешно» с общим хвостом
+            # (замысел v2, правило 5; план ВК, 16а-2, заявка 2).
+            try:
+                from app.handlers.subscription.device_first import topup_intent_refusal_message
+
+                text, keyboard = topup_intent_refusal_message(
+                    user, topup_intent, amount_kopeks=payment.amount_kopeks, balance_kopeks=user.balance_kopeks
+                )
+                await self.bot.send_message(user.telegram_id, text, parse_mode='HTML', reply_markup=keyboard)
+            except Exception as error:
+                logger.error('Ошибка отправки отказа автооформления доплаты', user_id=user.id, error=error)
+        elif getattr(self, 'bot', None) and user.telegram_id and not fulfilled:
             try:
                 keyboard = await self.build_topup_success_keyboard(user)
                 # 🔴 Последняя строка сообщения РАЗНАЯ у двух разных людей, и это решение, а не
@@ -856,15 +886,9 @@ class PlategaPaymentMixin:
                 # с `parse_mode='HTML'`. Одна угловая скобка от переводчика — и `send_message`
                 # бросит, а `except` ниже только пишет в лог: человек не получит НИЧЕГО о своих
                 # деньгах. Раньше хвост был литералом в коде, и достать его было некому.
-                # Отказ автооформления: корзина и её метка уже погашены, так что хвост не ждёт старую автопокупку,
-                # а заборы автоплатежа и длинной подписки остаются. Купившему другим путём и тому, у кого есть
-                # заказ, «выберите срок» толкало бы ко второй покупке — молчим (сообщение с кнопкой по причине —
-                # заявка 2).
-                refusal = (topup_intent or {}).get('reason')
-                if refusal in {'already_purchased', 'open_order', 'order_on_review'}:
-                    hint = None
-                else:
-                    hint = await topup_pending_purchase_hint(user)
+                # Доплата под заказ сюда попадает, только если её исход не записался вовсе: корзина и её метка уже
+                # погашены, так что хвост не ждёт старую автопокупку, а заборы автоплатежа и длинной подписки остаются.
+                hint = await topup_pending_purchase_hint(user)
                 tail = html.escape(hint or 'Баланс пополнен автоматически!')
                 await self.bot.send_message(
                     user.telegram_id,
@@ -894,7 +918,7 @@ class PlategaPaymentMixin:
                 from app.services.payment.common import notify_email_user_topup
 
                 if not await mark_late_legacy_payment_for_manual_review(db, user):
-                    await notify_email_user_topup(user, payment.amount_kopeks)
+                    await notify_email_user_topup(user, payment.amount_kopeks, balance_kopeks=balance_left)
         except Exception as error:
             logger.error(
                 'Ошибка при работе с сохраненной корзиной для пользователя',
@@ -909,6 +933,13 @@ class PlategaPaymentMixin:
             'credited_at': datetime.now(UTC).isoformat(),
         }
         metadata['balance_credited'] = True
+        if has_topup_intent:
+            # 🔴 Метаданные ниже присваиваются ЦЕЛИКОМ. Намерение берём со строки под её замком: исход пишет оформление
+            # в своей сессии, метку отмены — кнопка бота; снимок начала прохода вернул бы `pending` (план ВК, 16а-2 (в)).
+            platega_crud = import_module('app.database.crud.platega')
+            fresh_intent = dfc.topup_intent_of(await platega_crud.get_platega_payment_by_id_for_update(db, payment.id))
+            if fresh_intent is not None:
+                metadata[dfc.TOPUP_INTENT_KEY] = fresh_intent
 
         await payment_module.update_platega_payment(
             db,

@@ -89,6 +89,7 @@ class OwnerCartHint(NamedTuple):
     text: str  # «продление подписки на 30 дней (Базовый)»
     auto: bool  # спишет ли бот сам следом (тогда придёт карточка покупки)
     by_client: bool = False  # списание ждёт нажатия клиента в кабинете (докупка устройств)
+    final: bool = False  # исход уже известен (отказ автооформления доплаты, ВК-16) — печатается как есть
 
 
 def platega_method_label(method_code: int | None) -> str:
@@ -848,7 +849,9 @@ class AdminNotificationService:
         # Что будет с деньгами, бот знает по корзине И по тем же трём условиям, по которым
         # автопокупка решит списывать (`_owner_cart_hint`): обещать карточку, которой не будет,
         # нельзя — владелец её ждал бы. Корзины нет — деньги просто остались на балансе.
-        if cart_hint and cart_hint.by_client:
+        if cart_hint and cart_hint.final:
+            what += f'. {cart_hint.text}'
+        elif cart_hint and cart_hint.by_client:
             what += f'. Дальше — {cart_hint.text}, когда клиент подтвердит в кабинете'
         elif cart_hint and cart_hint.auto:
             what += f'. Дальше — {cart_hint.text}, карточка придёт следом'
@@ -958,11 +961,14 @@ class AdminNotificationService:
         db: AsyncSession | None = None,
         next_step: str | None = None,
         auto_next_step: str | None = None,
+        intent_refused: str | None = None,
     ) -> bool:
         """`next_step` — за что деньги на пути, который корзину не смотрит (пополнение под докупку
         устройств): подсказка по корзине там была бы ложью в обе стороны. Само списание там ждёт
         нажатия клиента в кабинете (`POST /devices/intents/{id}/purchase`), сервер сам не спишет.
-        `auto_next_step` — бот уже оформил сам (доплата под заказ, ВК-16): «карточка придёт следом»."""
+        `auto_next_step` — бот уже оформил сам (доплата под заказ, ВК-16): «карточка придёт следом».
+        `intent_refused` — доплата под заказ пришла, а бот сам не оформил (ВК-16): корзины у неё нет, подсказка по
+        корзине соврала бы."""
         logger.info('Начинаем отправку уведомления о пополнении баланса')
 
         if db:
@@ -999,6 +1005,8 @@ class AdminNotificationService:
             cart_hint = OwnerCartHint(next_step, False, True)
         elif auto_next_step:
             cart_hint = OwnerCartHint(auto_next_step, True)
+        elif intent_refused:
+            cart_hint = OwnerCartHint(intent_refused, False, final=True)
         else:
             cart_hint = await self._owner_cart_hint(user)
         try:
