@@ -242,6 +242,7 @@ def _purchase(
     transaction: bool = True,
     lifecycle_state: str = 'ready',
     source: str = 'cabinet',
+    funding_mode: str = 'wallet',
 ) -> None:
     """Покупка ЛЮБЫМ путём (заявка 3а, мина OP): проводка покупки подписки и, если назван номер, заказ новой кассы,
     к которому она привязана (`device_first_checkout_id`, как у `direct-sale:`). `transaction=False` с заказом — счёт
@@ -258,6 +259,7 @@ def _purchase(
             selected_device_limit=devices,
             lifecycle_state=lifecycle_state,
             financial_committed_at=at,
+            funding_mode=funding_mode,
         )
         session.add(checkout)
         session.flush()

@@ -514,6 +514,7 @@ async def test_cancel_after_the_order_was_already_charged_says_fulfilled_and_lea
             selected_device_limit=1,
             lifecycle_state='fulfilling',
             financial_committed_at=after,
+            funding_mode='wallet',
         )
     )
     session.add(Transaction(user_id=1, type='subscription_payment', amount_kopeks=PRICE_30_1, created_at=after))
@@ -1108,6 +1109,7 @@ async def test_money_known_only_by_the_transaction_link_counts_as_arrived(db, se
             selected_device_limit=1,
             lifecycle_state='fulfilling',
             financial_committed_at=after,
+            funding_mode='wallet',
         )
     )
     session.commit()

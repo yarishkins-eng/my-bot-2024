@@ -1661,7 +1661,10 @@ async def prepare_topup_intent(
         if state == 'invoice' and (found['period_days'], found['devices']) == requested and same_method:
             same_live.append(payment)
     purchase = await _recent_purchase(db, user_id=user.id, since=now - TOPUP_INTENT_TTL)
-    if purchase is not None and (confirmed_purchase_at is None or purchase[0] > confirmed_purchase_at):
+    # «Да» сравниваем с запасом в секунду и как UTC: экран может прислать момент без пояса или срезать микросекунды
+    # (`toISOString`), и тогда вопрос возвращался бы вечно, а дата без пояса роняла бы сравнение (волна 2 заявки 3а).
+    confirmed = _intent_time(confirmed_purchase_at) if confirmed_purchase_at is not None else None
+    if purchase is not None and (confirmed is None or purchase[0] > confirmed + timedelta(seconds=1)):
         # 🔴 Мина OP: вечная кнопка в чате после покупки любым путём купила бы второй срок молча (замысел v2, правило
         # 6) — спрашиваем «Уже оформлено до …. Оплатить ещё период?», а не запрещаем. Цена — за запрошенный срок сейчас.
         bought = purchase[1]
@@ -1874,15 +1877,17 @@ def _topup_intent_session():
 
 
 async def _topup_intent_charged_since(db: AsyncSession, *, user_id: int, since: datetime | None) -> bool:
-    """Списал ли заказ автооформления доплаты после `since`: у списания с баланса `financial_committed_at` ставится в
-    момент списания (`commit_direct_wallet_checkout`), а не при выставлении счёта, как у карты."""
+    """Прошло ли после `since` списание С БАЛАНСА заказом новой кассы: у него `financial_committed_at` ставится в момент
+    списания (`commit_direct_wallet_checkout`), а не при выставлении счёта, как у карты. Не только свой заказ
+    автооформления (`source='topup_intent'`): оно может возобновить чужой ручной заказ той же конфигурации, и тот
+    сохраняет прежний `source` (волна 2 заявки 3а)."""
     if since is None:
         return False
     charged = await db.scalar(
         select(SubscriptionCheckout.id)
         .where(
             SubscriptionCheckout.user_id == user_id,
-            SubscriptionCheckout.source == TOPUP_INTENT_SOURCE,
+            SubscriptionCheckout.funding_mode == 'wallet',
             SubscriptionCheckout.financial_committed_at >= since,
         )
         .limit(1)

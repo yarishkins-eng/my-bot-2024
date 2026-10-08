@@ -194,6 +194,42 @@ async def test_money_already_on_its_way_is_named_before_the_question(db, session
     assert decision.status == 'already_paid'
 
 
+async def test_yes_without_a_time_zone_is_read_as_utc_not_a_crash(db, session, ends):
+    # Волна 2: дата без пояса роняла сравнение (`TypeError`) — маршрут ответил бы 500.
+    _purchase(session, minutes_ago=20)
+    asked = await _decide(db, session)
+
+    naive = asked.purchased_at.astimezone(UTC).replace(tzinfo=None)
+    decision = await _decide(db, session, confirmed_purchase_at=naive)
+
+    assert decision.status == 'accepted'
+
+
+async def test_yes_with_milliseconds_only_is_still_the_same_yes(db, session, ends):
+    # Экран может срезать микросекунды (`new Date(...).toISOString()`) — вопрос не должен возвращаться вечно.
+    _purchase(session, minutes_ago=20)
+    asked = await _decide(db, session)
+    cut = asked.purchased_at.replace(microsecond=asked.purchased_at.microsecond // 1000 * 1000)
+
+    assert (await _decide(db, session, confirmed_purchase_at=cut)).status == 'accepted'
+
+
+async def test_route_yes_survives_the_json_round_trip(db, session, provider, ends):
+    from app.cabinet.schemas.balance import TopUpIntent, TopUpResponse
+
+    _purchase(session, minutes_ago=15, checkout_public_id='chk-card-7')
+    asked = await balance_route_topup(db, session)
+    echoed = TopUpIntent.model_validate(
+        {
+            'period_days': 30,
+            'devices': 1,
+            'confirmed_purchase_at': TopUpResponse.model_validate(asked).model_dump(mode='json')['purchased_at'],
+        }
+    ).confirmed_purchase_at
+
+    assert (await balance_route_topup(db, session, confirmed_purchase_at=echoed)).intent_status == 'accepted'
+
+
 async def test_an_old_yes_does_not_cover_a_newer_purchase(db, session, ends):
     # 🔴 P2 волны 1: «да» было голым флагом — повтор старого запроса (вкладка, «назад») после того, как «да» уже
     # оформило второй срок, выставил бы счёт третьего без вопроса. «Да» привязано к моменту покупки из вопроса.
@@ -358,11 +394,28 @@ async def test_cancel_after_a_purchase_by_another_path_says_money_is_on_the_bala
     # 🔴 Мина OV, вторая половина: купил другим путём (касса, докупка), пока доплата оформлялась, — оформление откажет
     # «уже была оплата», деньги останутся на балансе. «Оплата с баланса прошла» было бы неправдой.
     _intent_payment(session, payment_id=91, is_paid=True, created_ago=timedelta(minutes=2))
-    _purchase(session, minutes_ago=1, checkout_public_id='chk-cashier-2')
-    _purchase(session, minutes_ago=1)
+    _purchase(session, minutes_ago=1, checkout_public_id='chk-cashier-2', funding_mode='platega')  # картой
+    _purchase(session, minutes_ago=1)  # докупка устройств или суточное: проводка без заказа
 
     assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
     assert dfc.topup_intent_of(session.get(PlategaPayment, 91))['status'] == 'cancelled'
+
+
+async def test_cancel_after_a_resumed_manual_order_was_charged_from_the_balance_says_fulfilled(db, session):
+    # Волна 2: автооформление может возобновить чужой ручной заказ — у него прежний `source`, а списание с баланса было.
+    _intent_payment(session, payment_id=91, is_paid=True, created_ago=timedelta(minutes=2))
+    _purchase(session, minutes_ago=1, checkout_public_id='chk-resumed-3', source='telegram')
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'fulfilled'
+    assert dfc.topup_intent_of(session.get(PlategaPayment, 91))['status'] == 'pending'
+
+
+async def test_card_invoice_issued_after_the_top_up_is_not_a_charge(db, session):
+    # Счёт картой ставит `financial_committed_at` при выставлении — денег с баланса не было.
+    _intent_payment(session, payment_id=91, is_paid=True, created_ago=timedelta(minutes=2))
+    _purchase(session, minutes_ago=1, checkout_public_id='chk-card-4', transaction=False, funding_mode='platega')
+
+    assert await dfc.cancel_topup_intents(db, user_id=1) == 'paid'
 
 
 async def test_own_charge_before_the_top_up_was_chosen_does_not_count(db, session):
