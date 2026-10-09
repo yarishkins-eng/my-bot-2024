@@ -131,3 +131,20 @@ def test_restricted_customer_does_not_get_auto_order_promise(session, env, restr
         user, balance_kopeks=BALANCE, price_kopeks=PRICE_30_1, top_up_button=SimpleNamespace(), has_methods=True
     )
     assert 'оформится сама' not in ru
+
+
+def test_balance_exactly_equal_to_price_keeps_wallet_instruction(session, env):
+    assert _money_block(
+        _user(session, 2),
+        balance_kopeks=PRICE_30_1,
+        price_kopeks=PRICE_30_1,
+        top_up_button=None,
+        has_methods=True,
+    ) == ('Оплатите с баланса.', 'Pay from your balance.')
+
+
+@pytest.mark.parametrize('rollout', ['ALL', 'All', ' all', 'all ', 'stands ', 'STANDS'])
+@pytest.mark.parametrize('user_id', [1, 2])
+def test_misspelled_rollout_stays_disabled_for_stand_and_customer(session, env, monkeypatch, rollout, user_id):
+    monkeypatch.setattr(dfc, 'TOPUP_INTENT_ROLLOUT', rollout)
+    assert dfc.topup_intent_enabled_for(_user(session, user_id)) is False
