@@ -1380,6 +1380,8 @@ async def create_platega_attempt(
     user_id: int,
     method_key: str,
     allow_direct_pre_attempt_recovery: bool = False,
+    purchase_context: str | None = None,
+    confirmed_purchase_id: int | None = None,
 ) -> CheckoutPaymentAttempt:
     method_code = PLATEGA_METHODS.get(method_key)
     payment_user = await db.get(User, user_id)
@@ -1404,6 +1406,8 @@ async def create_platega_attempt(
             method_code=method_code,
             was_financially_committed=checkout.financial_committed_at is not None,
             allow_pre_attempt_recovery=allow_direct_pre_attempt_recovery,
+            purchase_context=purchase_context,
+            confirmed_purchase_id=confirmed_purchase_id,
         )
     checkout = await get_owned_checkout(
         db,
@@ -1570,6 +1574,8 @@ async def _create_direct_platega_attempt(
     method_code: int,
     was_financially_committed: bool,
     allow_pre_attempt_recovery: bool = False,
+    purchase_context: str | None = None,
+    confirmed_purchase_id: int | None = None,
 ) -> CheckoutPaymentAttempt:
     """Create one full-price v2 invoice after the funding choice is durable."""
     return_url = _direct_checkout_return_url(checkout_public_id)
@@ -1582,6 +1588,8 @@ async def _create_direct_platega_attempt(
         public_id=checkout_public_id,
         user_id=user_id,
         commit=False,
+        purchase_context=purchase_context,
+        confirmed_purchase_id=confirmed_purchase_id,
     )
     existing = await get_pending_platega_attempt(db, checkout_id=checkout.id)
     if existing is not None:

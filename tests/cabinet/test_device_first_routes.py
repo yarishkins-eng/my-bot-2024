@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from app.cabinet.dependencies import get_current_native_launch_user
 from app.cabinet.routes.device_first import (
     CheckoutCommitRequest,
+    CheckoutCreateRequest,
     NativeCheckoutLaunchRequest,
     PaymentAttemptRequest,
     _checkout_command,
@@ -135,11 +136,7 @@ async def test_new_different_cabinet_selection_archives_only_the_old_direct_invo
         patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()),
     ):
         response = await checkout_create(
-            SimpleNamespace(
-                period_days=90,
-                selected_device_limit=2,
-                model_dump=lambda: {'period_days': 90, 'selected_device_limit': 2},
-            ),
+            CheckoutCreateRequest(period_days=90, selected_device_limit=2),
             idempotency_key='new-different-choice',
             user=user,
             db=db,
@@ -182,11 +179,7 @@ async def test_new_different_cabinet_selection_discards_a_quote_without_invoice(
         patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()),
     ):
         response = await checkout_create(
-            SimpleNamespace(
-                period_days=90,
-                selected_device_limit=4,
-                model_dump=lambda: {'period_days': 90, 'selected_device_limit': 4},
-            ),
+            CheckoutCreateRequest(period_days=90, selected_device_limit=4),
             idempotency_key='replace-quote-without-invoice',
             user=user,
             db=db,
@@ -225,11 +218,7 @@ async def test_same_cabinet_selection_resumes_a_live_invoice_instead_of_abandoni
         patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
     ):
         response = await checkout_create(
-            SimpleNamespace(
-                period_days=30,
-                selected_device_limit=4,
-                model_dump=lambda: {'period_days': 30, 'selected_device_limit': 4},
-            ),
+            CheckoutCreateRequest(period_days=30, selected_device_limit=4),
             idempotency_key='same-choice',
             user=user,
             db=db,
@@ -272,11 +261,7 @@ async def test_different_selection_keeps_the_current_checkout_when_abandon_loses
         patch('app.cabinet.routes.device_first.store_mutation_result', AsyncMock()) as store,
     ):
         response = await checkout_create(
-            SimpleNamespace(
-                period_days=90,
-                selected_device_limit=2,
-                model_dump=lambda: {'period_days': 90, 'selected_device_limit': 2},
-            ),
+            CheckoutCreateRequest(period_days=90, selected_device_limit=2),
             idempotency_key='changed-choice-after-settlement',
             user=user,
             db=db,

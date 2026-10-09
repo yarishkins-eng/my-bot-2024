@@ -124,10 +124,11 @@ def _event(name: str, checkout: SubscriptionCheckout, **fields: Any) -> None:
 
 
 class DeviceFirstError(RuntimeError):
-    def __init__(self, code: str, message: str, *, status_code: int = 409):
+    def __init__(self, code: str, message: str, *, status_code: int = 409, detail: dict[str, Any] | None = None):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.detail = detail or {}
 
 
 def round_device_first_quote_kopeks(amount_kopeks: int) -> int:
@@ -959,6 +960,8 @@ async def create_checkout(
     source: str,
     mutation: DeviceFirstMutation | None = None,
     initial_lifecycle_state: str = 'draft',
+    purchase_context: str | None = None,
+    confirmed_purchase_id: int | None = None,
 ) -> SubscriptionCheckout:
     """Persist one checkout; ``initial_lifecycle_state`` never changes legacy births.
 
@@ -975,6 +978,9 @@ async def create_checkout(
     # new quote.  Every direct financial commit takes this same lock before it
     # can create an invoice or debit the wallet.
     user = (await db.execute(select(User).where(User.id == user.id).with_for_update())).scalar_one()
+    await assert_recent_purchase_confirmed(
+        db, user_id=user.id, purchase_context=purchase_context, confirmed_purchase_id=confirmed_purchase_id
+    )
     if getattr(user, 'account_erasure_requested_at', None) is not None:
         raise DeviceFirstError(
             'account_closing',
@@ -1268,6 +1274,8 @@ async def create_or_resume_direct_checkout(
     method_key: str | None,
     source: str,
     mutation: DeviceFirstMutation | None = None,
+    purchase_context: str | None = None,
+    confirmed_purchase_id: int | None = None,
 ) -> FusedDirectCheckout:
     """Resolve the one direct checkout at the moment of payment.
 
@@ -1329,6 +1337,20 @@ async def create_or_resume_direct_checkout(
     # before the per-user fence, so the abandon path keeps its canonical
     # P -> U -> A -> C lock order.
     existing = await get_open_checkout_for_user(db, user_id=user.id)
+    if purchase_context == 'chat_autostart' and (
+        existing is None
+        or (
+            existing.lifecycle_state in {'draft', 'confirmed', 'awaiting_funds'}
+            and (
+                existing.financial_committed_at is None
+                or existing.period_days != period_days
+                or existing.selected_device_limit != selected_device_limit
+            )
+        )
+    ):
+        await assert_recent_purchase_confirmed(
+            db, user_id=user.id, purchase_context=purchase_context, confirmed_purchase_id=confirmed_purchase_id
+        )
     if existing is not None and settlement_mode(existing) == DIRECT_SETTLEMENT_MODE:
         same_configuration = (
             existing.period_days == period_days and existing.selected_device_limit == selected_device_limit
@@ -1432,6 +1454,8 @@ async def create_or_resume_direct_checkout(
         source=source,
         mutation=mutation,
         initial_lifecycle_state='confirmed',
+        purchase_context=purchase_context,
+        confirmed_purchase_id=confirmed_purchase_id,
     )
     return FusedDirectCheckout(checkout=checkout, proceed_to_payment=True)
 
@@ -1585,8 +1609,8 @@ async def topup_intent_paid_predecessor(db: AsyncSession, payment: Any) -> Plate
 
     Человек открыл счёт, потом сменил способ (старый — `replaced`) или отменил заказ в боте и открыл новый (старый —
     `cancelled`, без ссылки на новый), а заплатил по СТАРОЙ ссылке. Экран нового счёта ждал бы свои деньги 10 минут; его
-    ответ отдаёт исход того старого, чьи деньги пришли ПОСЛЕ открытия нового. Момент прихода — момент исхода
-    (`decided_at`: оформление пишет его в том же вебхуке), без исхода — момент проводки зачисления `completed_at` (не
+    ответ отдаёт исход того старого, чьи деньги пришли ПОСЛЕ открытия нового. Момент прихода — проводка
+    зачисления `completed_at` (не `decided_at`: он означает решение об оформлении; не
     `created_at`: Platega пишет туда время ВЫСТАВЛЕНИЯ счёта; и не `updated_at`: его сдвигает любая поздняя запись строки,
     мина OH — волна 2 заявки 3б). Оплаченный ДО открытия нового сюда не попадает: тогда `/topup`
     ответил бы `already_paid`, а не выставил новый счёт.
@@ -1603,10 +1627,7 @@ async def topup_intent_paid_predecessor(db: AsyncSession, payment: Any) -> Plate
             continue
         if not (older.is_paid or older.transaction_id is not None):
             continue
-        arrived = _intent_time(older_intent.get('decided_at'))
-        if arrived is None and older.transaction_id is not None:
-            deposit_at = await db.scalar(select(Transaction.completed_at).where(Transaction.id == older.transaction_id))
-            arrived = _intent_time(deposit_at) if deposit_at is not None else None
+        arrived = await _topup_intent_paid_at(db, older)
         if arrived is not None and arrived >= created_at and (found_at is None or arrived > found_at):
             found, found_at = older, arrived
     return found
@@ -1623,6 +1644,9 @@ async def topup_intent_screen_view(db: AsyncSession, payment: Any) -> dict[str, 
     раньше), и опрос тогда скажет `bought` там, где бот написал «к моему заказу», — редкий край, денег не стоит."""
     source = await topup_intent_paid_predecessor(db, payment) or payment
     fields = topup_intent_screen_fields(source)
+    if fields:
+        paid_at = await _topup_intent_paid_at(db, source)
+        fields['intent_paid_at'] = paid_at.isoformat() if paid_at is not None else None
     intent = topup_intent_of(source) or {}
     since = _intent_time(intent.get('created_at'))
     purchase = None
@@ -1644,6 +1668,13 @@ async def topup_intent_screen_view(db: AsyncSession, payment: Any) -> dict[str, 
                 intent_offer_tariff_name=None,
             )
     return fields
+
+
+async def _topup_intent_paid_at(db: AsyncSession, payment: Any) -> datetime | None:
+    if payment.transaction_id is None:
+        return None
+    completed = await db.scalar(select(Transaction.completed_at).where(Transaction.id == payment.transaction_id))
+    return _intent_time(completed).astimezone(UTC) if completed is not None else None
 
 
 def _topup_intent_state(payment: PlategaPayment, intent: dict[str, Any], *, now: datetime) -> str | None:
@@ -1689,9 +1720,14 @@ async def recent_purchase(
     🔴 Не по `financial_committed_at` заказа: его ставит уже ВЫСТАВЛЕНИЕ счёта картой (`prepare_direct_external_checkout`)
     и не снимает отмена — брошенный неоплаченный счёт выглядел бы покупкой (волна 1 заявки 3а; на боевом 08.10 таких
     отменённых заказов 29)."""
-    row = (
+    row = await _recent_purchase_row(db, user_id=user_id, since=since)
+    return None if row is None else (_intent_time(row[0]), row[1])
+
+
+async def _recent_purchase_row(db: AsyncSession, *, user_id: int, since: datetime):
+    return (
         await db.execute(
-            select(Transaction.created_at, SubscriptionCheckout)
+            select(Transaction.created_at, SubscriptionCheckout, Transaction.id)
             .outerjoin(SubscriptionCheckout, SubscriptionCheckout.id == Transaction.device_first_checkout_id)
             .where(
                 Transaction.user_id == user_id,
@@ -1702,7 +1738,31 @@ async def recent_purchase(
             .limit(1)
         )
     ).first()
-    return None if row is None else (_intent_time(row[0]), row[1])
+
+
+async def recent_purchase_summary(db: AsyncSession, *, user_id: int) -> dict[str, Any] | None:
+    row = await _recent_purchase_row(db, user_id=user_id, since=datetime.now(UTC) - timedelta(hours=1))
+    if row is None:
+        return None
+    return {
+        'transaction_id': row[2],
+        'purchased_at': _intent_time(row[0]).astimezone(UTC).isoformat(),
+        'checkout_public_id': row[1].public_id if row[1] is not None else None,
+    }
+
+
+async def assert_recent_purchase_confirmed(
+    db: AsyncSession, *, user_id: int, purchase_context: str | None, confirmed_purchase_id: int | None
+) -> None:
+    if purchase_context != 'chat_autostart':
+        return
+    purchase = await recent_purchase_summary(db, user_id=user_id)
+    if purchase is not None and purchase['transaction_id'] != confirmed_purchase_id:
+        raise DeviceFirstError(
+            'recent_purchase_confirmation_required',
+            'Confirm another period after the recent purchase',
+            detail={'recent_purchase': purchase},
+        )
 
 
 async def prepare_topup_intent(
@@ -2938,6 +2998,8 @@ async def prepare_direct_external_checkout(
     public_id: str,
     user_id: int,
     commit: bool = True,
+    purchase_context: str | None = None,
+    confirmed_purchase_id: int | None = None,
 ) -> SubscriptionCheckout:
     """Freeze a full-price external sale before the provider POST.
 
@@ -2964,6 +3026,9 @@ async def prepare_direct_external_checkout(
         ):
             raise DeviceFirstError('invalid_state', 'Checkout cannot accept another payment invoice')
         return checkout
+    await assert_recent_purchase_confirmed(
+        db, user_id=user_id, purchase_context=purchase_context, confirmed_purchase_id=confirmed_purchase_id
+    )
     entitlement = await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff)
     if entitlement is None:
         raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')
@@ -3408,6 +3473,8 @@ async def commit_direct_wallet_checkout(
     *,
     public_id: str,
     user_id: int,
+    purchase_context: str | None = None,
+    confirmed_purchase_id: int | None = None,
 ) -> SubscriptionCheckout:
     """The explicit full-wallet path; partial balance is never combined with Platega."""
     checkout, user, target, tariff = await _lock_direct_context(db, public_id=public_id, user_id=user_id)
@@ -3417,6 +3484,9 @@ async def commit_direct_wallet_checkout(
         if checkout.funding_mode != 'wallet':
             raise DeviceFirstError('funding_mode_locked', 'Funding method is already fixed')
         return checkout
+    await assert_recent_purchase_confirmed(
+        db, user_id=user_id, purchase_context=purchase_context, confirmed_purchase_id=confirmed_purchase_id
+    )
     entitlement = await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff)
     if entitlement is None:
         raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')

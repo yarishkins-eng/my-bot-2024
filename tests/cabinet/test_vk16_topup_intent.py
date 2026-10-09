@@ -1040,10 +1040,12 @@ async def test_own_metadata_cannot_override_the_base_keys(db, session, env):
 
 
 @pytest.mark.parametrize(('user_id', 'enabled'), [(1, True), (2, True)])
-async def test_purchase_options_tell_the_screens_whom_it_is_enabled_for(session, env, monkeypatch, user_id, enabled):
+async def test_purchase_options_tell_the_screens_whom_it_is_enabled_for(
+    session, db, env, monkeypatch, user_id, enabled
+):
     monkeypatch.setattr(device_first_route, 'build_purchase_options', AsyncMock(return_value=_options()))
 
-    result = await device_first_route.purchase_options(user=_user(session, user_id), db=AsyncMock())
+    result = await device_first_route.purchase_options(user=_user(session, user_id), db=db)
 
     assert result['topup_intent_enabled'] is enabled
 
@@ -1110,11 +1112,11 @@ async def test_older_without_decision_time_is_left_alone(db, session, env):
     assert dfc.topup_intent_of(session.get(PlategaPayment, 10))['status'] == 'pending'
 
 
-async def test_purchase_options_flag_follows_the_shared_rule_not_just_the_stand_list(session, env, monkeypatch):
+async def test_purchase_options_flag_follows_the_shared_rule_not_just_the_stand_list(session, db, env, monkeypatch):
     monkeypatch.setattr(device_first_route, 'build_purchase_options', AsyncMock(return_value=_options()))
     _set_user(session, restriction_subscription=1)
 
-    result = await device_first_route.purchase_options(user=_user(session, 1), db=AsyncMock())
+    result = await device_first_route.purchase_options(user=_user(session, 1), db=db)
 
     assert result['topup_intent_enabled'] is False
 

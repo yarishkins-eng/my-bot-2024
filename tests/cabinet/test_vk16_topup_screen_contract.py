@@ -425,6 +425,7 @@ async def test_old_invoice_paid_before_the_new_one_without_outcome_is_not_moved_
 
 async def test_newest_of_two_paid_old_invoices_wins(db, session):
     _replaced_then_paid(session, paid_ago=timedelta(seconds=90), reason='replaced')
+    session.add(Transaction(id=969, user_id=1, type='deposit', completed_at=datetime.now(UTC) - timedelta(seconds=20)))
     _intent_payment(
         session,
         payment_id=69,
@@ -739,12 +740,18 @@ async def test_old_invoice_counts_as_paid_by_either_sign(db, session, paid_by):
         payment.is_paid = False  # мина OH
     session.commit()
 
-    assert (await _by_id(db, session, 71)).intent_payment_id == 70
+    response = await _by_id(db, session, 71)
+    assert response.intent_payment_id == (71 if paid_by == 'is_paid' else 70)
+    if paid_by == 'is_paid':
+        assert response.intent_paid_at is None  # без проводки время прихода неизвестно
 
 
 @pytest.mark.parametrize(('ago_68', 'ago_69', 'winner'), [(10, 50, 68), (50, 10, 69)])
 async def test_the_old_invoice_whose_money_came_last_wins_regardless_of_its_number(db, session, ago_68, ago_69, winner):
     # Номер строки и порядок прихода денег — разные вещи: побеждает пришедший позже, в обоих порядках номеров.
+    now = datetime.now(UTC)
+    session.add(Transaction(id=968, user_id=1, type='deposit', completed_at=now - timedelta(seconds=ago_68)))
+    session.add(Transaction(id=969, user_id=1, type='deposit', completed_at=now - timedelta(seconds=ago_69)))
     _intent_payment(
         session,
         payment_id=68,
