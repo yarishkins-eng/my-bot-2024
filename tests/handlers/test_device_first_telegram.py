@@ -41,6 +41,9 @@ def _no_topup_intents(monkeypatch):
     # ВК-16 (16а-2, заявка 2): кнопки отмены и «Изменить» сначала гасят доплату под заказ. Здесь база — заглушка;
     # само гашение и тексты после него сторожит `tests/cabinet/test_vk16_topup_refusals.py` на настоящем движке.
     monkeypatch.setattr('app.handlers.subscription.device_first.cancel_topup_intents', AsyncMock(return_value=None))
+    # Экранные заглушки пользователя не содержат полей запретов. 09.10 обычный разрешённый клиент получает
+    # автооформление; реальный предикат, запреты и режимы отката проверяет test_vk16_rollout_all.py.
+    monkeypatch.setattr('app.handlers.subscription.device_first.topup_intent_enabled_for', lambda _user: True)
 
 
 # Адрес двери доплаты, которую этап БК ставит на экран заказа.
@@ -1504,8 +1507,11 @@ async def test_fused_confirmation_shows_the_wallet_and_a_top_up_door_on_a_partia
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 199 ₽' in caption
-    # Обратная дорога названа ДО того, как человек ушёл платить: доплата заказ не оформляет.
-    assert 'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне.' in caption
+    # ВК-16, перевод 09.10: доплата теперь оформляет заказ сама (решение владельца 05.10).
+    assert (
+        'Ваш баланс уже учтён в строке «Не хватает». После оплаты подписка оформится сама — больше ничего нажимать не нужно.'
+        in caption
+    )
     # 🔴 РЕК-16.3 переписал это ожидание, и это ЗАЯВЛЕНИЕ, а не подкрутка под новый текст.
     # Здесь требовалась строка «этот экран не обновится: его кнопки возьмут полную цену».
     # С этапа РЕК-8а она неверна: кнопки способов — `web_app` в кабинет с `autostart=1`, а
@@ -1669,7 +1675,10 @@ async def test_direct_payment_methods_screen_shows_the_wallet_and_the_top_up_doo
     assert '5 устройств · 3 месяца' in caption
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 1 139 ₽' in caption
-    assert 'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне.' in caption
+    assert (
+        'Ваш баланс уже учтён в строке «Не хватает». После оплаты подписка оформится сама — больше ничего нажимать не нужно.'
+        in caption
+    )
     # РЕК-16.3: см. объяснение у первого такого забора выше.
     assert 'не обновится' not in caption
     assert 'Или оплатите полной суммой: деньги с баланса при этом не спишутся.' in caption
@@ -1833,7 +1842,7 @@ async def test_fused_confirmation_speaks_english_to_an_english_customer() -> Non
     assert '💳 Balance: ₽50' in caption
     assert '⚠️ Shortage: ₽199' in caption
     assert (
-        'Your balance is already counted in the «Shortage» line. Top up and finish the purchase in the same window.'
+        'Your balance is already counted in the «Shortage» line. After payment, your subscription will be set up automatically — no more taps needed.'
         in caption
     )
     # РЕК-16.3: обе половины снятого предупреждения — и по-английски тоже.

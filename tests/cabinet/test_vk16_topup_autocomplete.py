@@ -54,13 +54,15 @@ def checkouts(session):
     session.commit()
 
 
-def _add_checkout(session, *, checkout_id: int, source: str, lifecycle_state: str = 'confirmed', **values):
+def _add_checkout(
+    session, *, checkout_id: int, source: str, lifecycle_state: str = 'confirmed', user_id: int = 1, **values
+):
     session.execute(
         text(
             'INSERT INTO subscription_checkouts (id, public_id, user_id, source, lifecycle_state, period_days, '
-            'selected_device_limit) VALUES (:id, :pid, 1, :source, :state, 30, 1)'
+            'selected_device_limit) VALUES (:id, :pid, :uid, :source, :state, 30, 1)'
         ),
-        {'id': checkout_id, 'pid': f'chk-{checkout_id}', 'source': source, 'state': lifecycle_state},
+        {'id': checkout_id, 'pid': f'chk-{checkout_id}', 'uid': user_id, 'source': source, 'state': lifecycle_state},
     )
     for name, value in values.items():
         session.execute(
@@ -83,7 +85,9 @@ def buy(monkeypatch, session, db, env, checkouts):
         calls.create.append(kwargs)
         if calls.resume is not None:
             return dfc.FusedDirectCheckout(checkout=calls.resume, proceed_to_payment=True)
-        checkout = _add_checkout(session, checkout_id=500 + len(calls.create), source=kwargs['source'])
+        checkout = _add_checkout(
+            session, checkout_id=500 + len(calls.create), source=kwargs['source'], user_id=kwargs['user'].id
+        )
         return dfc.FusedDirectCheckout(checkout=checkout, proceed_to_payment=True)
 
     async def commit(db_, *, public_id, user_id):
@@ -291,7 +295,9 @@ async def test_account_that_cannot_buy_is_refused(session, buy, user_id_or_value
     assert buy.create == []
 
 
-async def test_not_rolled_out_to_this_person_is_refused(session, buy):
+async def test_stands_mode_refuses_ordinary_customer_paid_intent(session, buy, monkeypatch):
+    # 09.10: прежнее ожидание — теперь сторож возврата к `stands`, не умолчания для клиентов.
+    monkeypatch.setattr(dfc, 'TOPUP_INTENT_ROLLOUT', 'stands')
     _intent_payment(session, payment_id=97, user_id=2, **TRIAL)
 
     _, stored = await _complete(session)

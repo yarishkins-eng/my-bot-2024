@@ -41,6 +41,7 @@ from app.services.device_first_checkout_service import (
     recent_purchase,
     serialize_checkout,
     settlement_mode,
+    topup_intent_enabled_for,
     topup_intent_refusal_kind,
     topup_intent_refusal_reason,
 )
@@ -315,9 +316,11 @@ def _top_up_button(
     action, so both screens ask for the same amount and return the customer to
     his own order: ``from=checkout`` is the only marker that reseeds the period
     and the device count, and the Cabinet validates the return address by it.
-    Auto-submit is deliberately not requested — the bot reads the raw provider
-    minimum while the Cabinet reads the admin-narrowed one, so a diverging
-    amount must stay editable instead of dying on a refusal.
+    With top-up intents enabled, the Cabinet opens its order payment screen,
+    requests the invoice on entry and uses the server's amount. Otherwise it
+    opens the ordinary editable balance top-up screen. The bot does not add
+    ``auto=1``; the Cabinet chooses the screen using ``topup_intent_enabled``.
+    Owner rule 09.10.2026: do not set a Platega minimum override in the Cabinet.
 
     Returns ``None`` whenever the top-up road is not the honest one to offer.
     """
@@ -412,44 +415,17 @@ def _money_block(
             wallet_ru + 'Выберите способ оплаты: деньги с баланса при этом не спишутся.',
             wallet_en + 'Choose a payment method: your balance stays untouched.',
         )
-    # 🔴 Сказать про обратную дорогу НАДО ДО того, как человек ушёл платить. Доплата заказ не
-    # оформляет: у device-first нет корзины, и довести покупку должен он сам. Если промолчать,
-    # он оплатит недостачу, получит в чат «✅ Пополнение успешно!» и останется без подписки,
-    # считая покупку завершённой.
-    # 🔴 РЕК-16.3. Здесь стояла ВТОРАЯ строка — «После доплаты этот экран в чате не обновится:
-    # его кнопки возьмут полную цену». Она СТАЛА НЕПРАВДОЙ, и снята поэтому, а не ради краткости.
-    # Кнопки способов оплаты в этом сообщении — `web_app` в кабинет с `autostart=1`, и с этапа
-    # РЕК-8а кабинет по ним счёт больше НЕ выставляет: ветка «не стрелять» держит автозапуск
-    # всегда, когда на счету есть деньги, а округлённая недостача меньше цены
-    # (`DeviceFirstConfigurator.tsx`, `autostartHold`). Это ровно то состояние, в котором
-    # печатается этот абзац, — и после доплаты оно тем более верно. Человек попадает не на счёт
-    # полной цены, а на экран, где его деньги посчитаны.
-    # ⛔ Проверено на ОБОИХ краях, прежде чем снимать: доплатил частично — недостача осталась,
-    # держим; доплатил полностью — недостача ноль, `0 < цена` истинно, держим и показываем
-    # «Списать … и оформить». Ветки, в которой кнопка чата взяла бы полную цену при деньгах на
-    # счету, не осталось ни одной.
-    # ⛔ Само сообщение в чате действительно не перерисовывается (боту при нажатии `web_app` не
-    # приходит ничего, а деньги зачисляет вебхук) — но это больше ничем человеку не грозит, и
-    # предупреждать о безобидном значит тратить его внимание на нашу внутреннюю механику.
-    # 🔴 РЕК-8б. Две строки выше называют ЧИСЛА, но ни одна не называет СВЯЗЬ: человек читает
-    # «Баланс» — слово из банковского приложения — и сам должен догадаться, что недостача уже
-    # посчитана с его деньгами. Говорим это словами, не повторяя чисел: они стоят строкой выше,
-    # и третье их упоминание превратило бы блок в ребус.
-    # ⛔ Глагол «вычтены» тут стоял и снят волной ревью: в совершенном виде он утверждает
-    # СОБЫТИЕ, которого не было — деньги на счету лежат нетронутыми, и при оплате картой так и
-    # останутся. Это ровно мина DE, от которой на этом же экране стоит сторож «деньги с баланса
-    # при этом не спишутся» двумя строками ниже. Указываем на СТРОКУ экрана: недостача и правда
-    # посчитана как цена минус баланс, и это проверяемо глазами.
-    # ⛔ Слово «подарок»/«бонус» здесь НЕ писать: на балансе может лежать сдача, возврат или
-    # собственное пополнение, а происхождение денег этот экран не знает.
-    # ⛔ Хвост «— ваш выбор сохранится» снят по прямому замечанию владельца 02.09.2026: человек
-    # о потере выбора не думает, пока ему о ней не скажут. Обещание при этом истинно (адрес
-    # возврата несёт `from=checkout` со сроком и числом устройств), поэтому снимается ЛИШНЕЕ
-    # слово, а не защита: строка по-прежнему говорит главное — покупка не закончена доплатой.
-    hint_ru = 'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне.'
-    hint_en = (
-        'Your balance is already counted in the «Shortage» line. Top up and finish the purchase in the same window.'
-    )
+    # ВК-16, перевод на всех 09.10: решение «оформляется само» от 05.10 заменяет ручной шаг
+    # только когда сервер принимает намерение. Режим отката, запреты и выключенный Platega —
+    # прежнее пополнение с самостоятельным оформлением; полная цена остаётся до части 16б.
+    hint_ru = 'Ваш баланс уже учтён в строке «Не хватает». '
+    hint_en = 'Your balance is already counted in the «Shortage» line. '
+    if topup_intent_enabled_for(user):
+        hint_ru += 'После оплаты подписка оформится сама — больше ничего нажимать не нужно.'
+        hint_en += 'After payment, your subscription will be set up automatically — no more taps needed.'
+    else:
+        hint_ru += 'Доплатите и продолжите покупку в том же окне.'
+        hint_en += 'Top up and finish the purchase in the same window.'
     # Второе число появляется, только когда провайдерский минимум больше недостачи: тогда в
     # сводке одна сумма, а на кнопке другая, и без объяснения это читается как ошибка.
     surplus = device_first_top_up_surplus_kopeks(price_kopeks=price_kopeks, balance_kopeks=balance_kopeks)

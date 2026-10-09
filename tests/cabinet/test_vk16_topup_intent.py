@@ -279,7 +279,9 @@ def _purchase(
 # --- кому включено ----------------------------------------------------------------------------------------------
 
 
-async def test_not_a_stand_gets_ordinary_top_up_without_a_single_check_below(db, session, env):
+async def test_stands_mode_gives_ordinary_customer_only_an_ordinary_top_up(db, session, env, monkeypatch):
+    # 09.10 перевод на всех: прежнее ожидание сохраняется как проверка режима отката `stands`.
+    monkeypatch.setattr(dfc, 'TOPUP_INTENT_ROLLOUT', 'stands')
     decision = await _decide(db, session, user_id=2)
 
     assert (decision.status, decision.reason) == ('ordinary', 'disabled')
@@ -291,9 +293,15 @@ async def test_who_gets_it_is_a_code_constant_not_an_admin_switch(session, env, 
     # Ответ владельца 07.10.2026 17:10: «не городить переключатели в админке» — флаг автопокупки не влияет.
     monkeypatch.setattr(settings, 'AUTO_PURCHASE_AFTER_TOPUP_ENABLED', False, raising=False)
     stand, client = _user(session, 1), _user(session, 2)
-    assert (dfc.topup_intent_enabled_for(stand), dfc.topup_intent_enabled_for(client)) == (True, False)
+    # 09.10: владелец закрыл живой проход и поручил перевод на всех, прежнее `stands` больше не умолчание.
+    assert (dfc.topup_intent_enabled_for(stand), dfc.topup_intent_enabled_for(client)) == (True, True)
     # Всех включает только точное 'all'; 'off' и опечатка — выключают, а не раздают всем.
-    for rollout, expected in (('all', (True, True)), ('off', (False, False)), ('stand', (False, False))):
+    for rollout, expected in (
+        ('all', (True, True)),
+        ('stands', (True, False)),
+        ('off', (False, False)),
+        ('stand', (False, False)),
+    ):
         monkeypatch.setattr(dfc, 'TOPUP_INTENT_ROLLOUT', rollout)
         assert (dfc.topup_intent_enabled_for(stand), dfc.topup_intent_enabled_for(client)) == expected, rollout
 
@@ -690,7 +698,9 @@ async def test_route_with_intent_ignores_a_bogus_client_amount(db, session, prov
     assert (response.intent_status, response.amount_kopeks) == ('accepted', TOP_UP_30_1)
 
 
-async def test_route_ordinary_top_up_still_checks_the_client_amount(db, session, provider):
+async def test_route_ordinary_top_up_still_checks_the_client_amount(db, session, provider, monkeypatch):
+    # 09.10: обычное пополнение при намерении осталось у клиента в режиме отката `stands`.
+    monkeypatch.setattr(dfc, 'TOPUP_INTENT_ROLLOUT', 'stands')
     with pytest.raises(HTTPException) as error:
         await balance_route.create_topup(request=_request(amount_kopeks=1), user=_user(session, 2), db=db)
 
@@ -775,7 +785,9 @@ async def test_route_outcome_without_invoice_never_calls_the_provider(db, sessio
     assert provider.calls == []
 
 
-async def test_route_disabled_intent_is_an_ordinary_top_up_for_the_client_amount(db, session, provider):
+async def test_route_disabled_intent_is_an_ordinary_top_up_for_the_client_amount(db, session, provider, monkeypatch):
+    # Снятый default `stands` проверяем явно: при откате клиент получает прежнее пополнение.
+    monkeypatch.setattr(dfc, 'TOPUP_INTENT_ROLLOUT', 'stands')
     response = await balance_route.create_topup(request=_request(), user=_user(session, 2), db=db)
 
     assert (response.intent_status, response.intent_reason) == ('ordinary', 'disabled')
@@ -1027,7 +1039,7 @@ async def test_own_metadata_cannot_override_the_base_keys(db, session, env):
     assert stored.metadata_json[dfc.TOPUP_INTENT_KEY] == {'status': 'pending'}
 
 
-@pytest.mark.parametrize(('user_id', 'enabled'), [(1, True), (2, False)])
+@pytest.mark.parametrize(('user_id', 'enabled'), [(1, True), (2, True)])
 async def test_purchase_options_tell_the_screens_whom_it_is_enabled_for(session, env, monkeypatch, user_id, enabled):
     monkeypatch.setattr(device_first_route, 'build_purchase_options', AsyncMock(return_value=_options()))
 
