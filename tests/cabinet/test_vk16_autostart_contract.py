@@ -64,6 +64,13 @@ async def test_options_expose_real_latest_purchase_identity_and_ignore_an_unpaid
     }
 
 
+async def test_purchase_older_than_one_hour_without_newer_sale_is_not_recent(db, session, monkeypatch):
+    _sale(session, at=datetime.now(UTC) - timedelta(minutes=61))
+    monkeypatch.setattr(route, 'build_purchase_options', AsyncMock(return_value=_options()))
+    result = await route.purchase_options(user=_user(session), db=db)
+    assert result['recent_purchase'] is None
+
+
 async def test_purchase_identity_includes_its_owned_checkout(db, session):
     _purchase(session, checkout_public_id='paid-owned', minutes_ago=2)
     summary = await dfc.recent_purchase_summary(db, user_id=1)
