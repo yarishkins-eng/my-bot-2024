@@ -21,6 +21,7 @@ async def test_options_explicitly_report_legacy_permission_independent_of_eligib
     payload = {'eligible': eligible, 'reason': 'eligible_tariff_count_not_one' if not eligible else 'eligible'}
     build = AsyncMock(return_value=payload)
     monkeypatch.setattr(device_first, 'build_purchase_options', build)
+    monkeypatch.setattr(device_first, 'recent_purchase_summary', AsyncMock(return_value=None))
     # 09.10: `all` проверяет поля запретов и удаления у всех; нужен настоящий User, а не только его номер.
     monkeypatch.setattr(type(device_first.settings), 'is_platega_enabled', lambda self: True)
     db, user = AsyncMock(), User(id=1, telegram_id=None)
@@ -28,7 +29,12 @@ async def test_options_explicitly_report_legacy_permission_independent_of_eligib
     result = await device_first.purchase_options(user=user, db=db)
 
     # ВК-16, перевод 09.10 после живого прохода: прежнее «не стенд — выключено» заменено решением «для всех».
-    assert result == {**payload, 'legacy_tariff_purchase_allowed': not public_rollout, 'topup_intent_enabled': True}
+    assert result == {
+        **payload,
+        'legacy_tariff_purchase_allowed': not public_rollout,
+        'topup_intent_enabled': True,
+        'recent_purchase': None,
+    }
     assert 'legacy_tariff_purchase_allowed' not in payload
     build.assert_awaited_once_with(db, user)
     db.commit.assert_not_awaited()

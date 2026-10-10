@@ -198,6 +198,7 @@ class PendingPaymentResponse(BaseModel):
     intent_refusal_kind: str | None = None
     intent_payment_id: int | None = None
     intent_paid: bool | None = None
+    intent_paid_at: datetime | None = None
     intent_amount_kopeks: int | None = None
     intent_period_days: int | None = None
     intent_devices: int | None = None

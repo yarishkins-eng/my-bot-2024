@@ -23,3 +23,5 @@ class DirectCheckoutCommitRequest(BaseModel):
     funding_mode: str = Field(..., pattern='^(wallet|platega)$')
     method_key: str | None = Field(None, min_length=1, max_length=32)
     expected_tariff_total_kopeks: int = Field(..., gt=0)
+    purchase_context: str | None = Field(None, pattern='^chat_autostart$')
+    confirmed_purchase_id: int | None = Field(None, gt=0)

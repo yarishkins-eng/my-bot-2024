@@ -28,6 +28,7 @@ from app.services.device_first_checkout_service import (
     DIRECT_SETTLEMENT_MODE,
     DeviceFirstError,
     arm_checkout,
+    assert_recent_purchase_confirmed,
     build_purchase_options,
     cancel_checkout,
     cancel_checkout_for_new_calculation,
@@ -39,6 +40,7 @@ from app.services.device_first_checkout_service import (
     fulfill_checkout,
     get_open_checkout_for_user,
     get_owned_checkout,
+    recent_purchase_summary,
     request_hash,
     serialize_checkout,
     store_mutation_result,
@@ -66,6 +68,8 @@ router = APIRouter(prefix='/device-first', tags=['Cabinet Device First'])
 class CheckoutCreateRequest(BaseModel):
     period_days: int = Field(..., gt=0)
     selected_device_limit: int = Field(..., gt=0)
+    purchase_context: str | None = Field(None, pattern='^chat_autostart$')
+    confirmed_purchase_id: int | None = Field(None, gt=0)
 
 
 class PaymentAttemptRequest(BaseModel):
@@ -77,12 +81,16 @@ class CheckoutCommitRequest(BaseModel):
 
     funding_mode: str = Field(..., pattern='^(wallet|platega)$')
     method_key: str | None = Field(None, min_length=1, max_length=32)
+    purchase_context: str | None = Field(None, pattern='^chat_autostart$')
+    confirmed_purchase_id: int | None = Field(None, gt=0)
 
 
 class NativeCheckoutLaunchRequest(BaseModel):
     """A provider method selected from a Telegram-native Mini App button."""
 
     method_key: str = Field(..., min_length=1, max_length=32)
+    purchase_context: str | None = Field(None, pattern='^chat_autostart$')
+    confirmed_purchase_id: int | None = Field(None, gt=0)
 
 
 class ReconciliationResolutionRequest(BaseModel):
@@ -91,10 +99,26 @@ class ReconciliationResolutionRequest(BaseModel):
     resolution: str = Field(..., pattern='^(refund_requested|transfer_to_wallet|hold)$')
 
 
+def _error_response(error: DeviceFirstError) -> dict[str, Any]:
+    return {'code': error.code, 'message': str(error), **error.detail}
+
+
+def _purchase_context(request: Any) -> dict[str, Any]:
+    return (
+        {'purchase_context': request.purchase_context, 'confirmed_purchase_id': request.confirmed_purchase_id}
+        if request.purchase_context is not None
+        else {}
+    )
+
+
+def _purchase_payload(request: Any) -> dict[str, Any]:
+    return {**request.model_dump(exclude={'purchase_context', 'confirmed_purchase_id'}), **_purchase_context(request)}
+
+
 def _raise(error: DeviceFirstError) -> None:
     raise HTTPException(
         status_code=error.status_code,
-        detail={'code': error.code, 'message': str(error)},
+        detail=_error_response(error),
     ) from error
 
 
@@ -289,6 +313,7 @@ async def purchase_options(
         # ВК-16 (16а-1): доплата под заказ оформится сама — по этому признаку экраны (16в-3, 16б) показывают новое
         # поведение только тем, кому оно включено, и сами откатываются к старому виду, когда его снимут.
         'topup_intent_enabled': topup_intent_enabled_for(user),
+        'recent_purchase': await recent_purchase_summary(db, user_id=user.id),
     }
 
 
@@ -313,7 +338,7 @@ async def checkout_create(
         user_id=user.id,
         action='create',
         key=idempotency_key,
-        payload=request.model_dump(),
+        payload=_purchase_payload(request),
     )
     if replay is not None:
         return replay
@@ -347,6 +372,13 @@ async def checkout_create(
                 mutation.checkout_id = existing.id
                 await store_mutation_result(db, mutation, response=response)
                 return response
+
+            await assert_recent_purchase_confirmed(
+                db,
+                user_id=user.id,
+                purchase_context=request.purchase_context,
+                confirmed_purchase_id=request.confirmed_purchase_id,
+            )
 
             abandoned = await abandon_direct_checkout_for_new_calculation(
                 db,
@@ -383,12 +415,13 @@ async def checkout_create(
             selected_device_limit=request.selected_device_limit,
             source='cabinet',
             mutation=mutation,
+            **_purchase_context(request),
         )
     except DeviceFirstError as error:
         await store_mutation_result(
             db,
             mutation,
-            response={'code': error.code, 'message': str(error)},
+            response=_error_response(error),
             status_code=error.status_code,
         )
         _raise(error)
@@ -537,7 +570,7 @@ async def _commit_checkout(
         user_id=user.id,
         action=action,
         key=idempotency_key,
-        payload={'checkout_id': checkout_id, **request.model_dump()},
+        payload={'checkout_id': checkout_id, **_purchase_payload(request)},
     )
     if replay is not None:
         return await _rehydrate_owned_direct_redirect(db, user=user, stored_response=replay)
@@ -551,7 +584,9 @@ async def _commit_checkout(
                 raise DeviceFirstError(
                     'invalid_funding_request', 'Wallet checkout has no provider method', status_code=422
                 )
-            checkout = await commit_direct_wallet_checkout(db, public_id=checkout_id, user_id=user.id)
+            checkout = await commit_direct_wallet_checkout(
+                db, public_id=checkout_id, user_id=user.id, **_purchase_context(request)
+            )
             await db.refresh(user)
             response = {'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)}
         else:
@@ -562,6 +597,7 @@ async def _commit_checkout(
                 checkout_public_id=checkout_id,
                 user_id=user.id,
                 method_key=request.method_key,
+                **_purchase_context(request),
             )
             payment = await db.get(PlategaPayment, attempt.platega_payment_id)
             checkout = await get_owned_checkout(db, public_id=checkout_id, user_id=user.id)
@@ -583,7 +619,7 @@ async def _commit_checkout(
         await store_mutation_result(
             db,
             mutation,
-            response={'code': error.code, 'message': str(error)},
+            response=_error_response(error),
             status_code=error.status_code,
         )
         _raise(error)
@@ -627,7 +663,9 @@ async def checkout_native_launch(
     """
     return await _commit_checkout(
         checkout_id=checkout_id,
-        request=CheckoutCommitRequest(funding_mode='platega', method_key=request.method_key),
+        request=CheckoutCommitRequest(
+            funding_mode='platega', method_key=request.method_key, **_purchase_context(request)
+        ),
         idempotency_key=idempotency_key,
         user=user,
         db=db,
@@ -656,10 +694,16 @@ async def _fused_commit_checkout(
         user_id=user.id,
         action=action,
         key=idempotency_key,
-        payload=request.model_dump(),
+        payload=_purchase_payload(request),
     )
     if replay is not None:
         return await _rehydrate_owned_direct_redirect(db, user=user, stored_response=replay)
+    if mutation.checkout_id is not None:
+        bound = await db.get(SubscriptionCheckout, mutation.checkout_id)
+        if bound is not None and bound.user_id == user.id and bound.financial_committed_at is not None:
+            response = {'checkout': await _serialize_cabinet_checkout(db, bound, balance_kopeks=user.balance_kopeks)}
+            await store_mutation_result(db, mutation, response=response)
+            return await _rehydrate_owned_direct_redirect(db, user=user, stored_response=response)
     try:
         if request.funding_mode == 'wallet':
             if request.method_key is not None:
@@ -678,6 +722,7 @@ async def _fused_commit_checkout(
             method_key=request.method_key,
             source='cabinet',
             mutation=mutation,
+            **_purchase_context(request),
         )
         checkout = resolved.checkout
         mutation.checkout_id = checkout.id
@@ -686,7 +731,9 @@ async def _fused_commit_checkout(
             # answer with that canonical checkout state, never a second order.
             response = {'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)}
         elif request.funding_mode == 'wallet':
-            checkout = await commit_direct_wallet_checkout(db, public_id=checkout.public_id, user_id=user.id)
+            checkout = await commit_direct_wallet_checkout(
+                db, public_id=checkout.public_id, user_id=user.id, **_purchase_context(request)
+            )
             await db.refresh(user)
             response = {'checkout': await _serialize_cabinet_checkout(db, checkout, balance_kopeks=user.balance_kopeks)}
         else:
@@ -695,6 +742,7 @@ async def _fused_commit_checkout(
                 checkout_public_id=checkout.public_id,
                 user_id=user.id,
                 method_key=request.method_key,
+                **_purchase_context(request),
             )
             payment = await db.get(PlategaPayment, attempt.platega_payment_id)
             checkout = await get_owned_checkout(db, public_id=checkout.public_id, user_id=user.id)
@@ -716,7 +764,7 @@ async def _fused_commit_checkout(
         await store_mutation_result(
             db,
             mutation,
-            response={'code': error.code, 'message': str(error)},
+            response=_error_response(error),
             status_code=error.status_code,
         )
         _raise(error)
