@@ -24,7 +24,17 @@ def environment(monkeypatch):
     monkeypatch.setattr(screen, '_shown_at', lambda: 1_791_000_000)
 
 
-async def _render(surface, language, balance, *, methods=True, cabinet=True, in_flight=False, **user_flags):
+async def _render(
+    surface,
+    language,
+    balance,
+    *,
+    methods=True,
+    cabinet=True,
+    in_flight=False,
+    method_keys=('sbp', 'cards_ru', 'crypto'),
+    **user_flags,
+):
     user = SimpleNamespace(
         id=17,
         language=language,
@@ -58,7 +68,7 @@ async def _render(surface, language, balance, *, methods=True, cabinet=True, in_
         patch.object(
             screen,
             'available_platega_methods_for_db',
-            AsyncMock(return_value=[{'key': key} for key in ('sbp', 'cards_ru', 'crypto')] if methods else []),
+            AsyncMock(return_value=[{'key': key} for key in method_keys] if methods else []),
         ),
         patch(
             'app.utils.miniapp_buttons.build_cabinet_url',
@@ -242,3 +252,30 @@ async def test_zero_and_full_balance_keep_their_exact_screen(environment, surfac
                 if surface == 'fused'
                 else {'checkout': ['receipt-order'], 'method': [method], 'autostart': ['1']}
             )
+
+
+@pytest.mark.parametrize('surface', ['fused', 'existing'])
+@pytest.mark.parametrize('language', ['ru', 'en'])
+@pytest.mark.parametrize('method', ['sbp', 'cards_ru', 'crypto'])
+@pytest.mark.parametrize('rollout', ['all', 'off'])
+async def test_one_available_method_only_promotes_supported_auto_order(
+    environment, monkeypatch, surface, language, method, rollout
+):
+    # Волны1/2: 05.10.2026 не обещает автоматическое оформление через медленную крипту.
+    # При crypto-only сохраняем доступную прямую оплату; в откате старая ручная доплата жива.
+    monkeypatch.setattr(checkout_service, 'TOPUP_INTENT_ROLLOUT', rollout)
+    caption, rows, _ = await _render(surface, language, 5000, method_keys=(method,))
+    auto_order = rollout == 'all' and method != 'crypto'
+    assert (('оформится сама' if language == 'ru' else 'set up automatically') in caption) == auto_order
+    payments = [button for row in rows for button in row if button.web_app]
+    if auto_order:
+        assert len(payments) == 1
+        assert payments[0].text == ('💰 Оплатить 99 ₽' if language == 'ru' else '💰 Pay ₽99')
+    else:
+        assert ('С вашего баланса' if language == 'ru' else 'From your balance') not in caption
+        expected_count = 2 if rollout == 'off' else 1
+        assert len(payments) == expected_count
+        assert parse_qs(urlsplit(payments[-1].web_app.url).query)['method'] == [method]
+        assert payments[-1].text.endswith(' · 149 ₽' if language == 'ru' else ' · ₽149')
+        if rollout == 'off':
+            assert payments[0].text == ('💰 Доплатить 99 ₽' if language == 'ru' else '💰 Top up ₽99')

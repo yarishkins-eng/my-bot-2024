@@ -1063,6 +1063,11 @@ async def _render_direct_payment_methods(
         if has_partial_wallet and methods and not getattr(checkout, 'funding_mode', None)
         else None
     )
+    # 05.10.2026: единственная доплата должна вести к оплате. TopUpOrder и намерение не
+    # поддерживают медленную крипту; при crypto-only оставляем прямую оплату без обещания.
+    if top_up_button is not None and topup_intent_enabled_for(user):
+        if not any(item['key'] in ('sbp', 'cards_ru') for item in methods):
+            top_up_button = None
     auto_top_up = top_up_button is not None and topup_intent_enabled_for(user)
     if has_partial_wallet:
         logger.info(
@@ -1182,6 +1187,10 @@ async def _render_fused_confirmation(
     top_up_button = (
         _top_up_button(user, days=days, devices=devices, price=price) if has_partial_wallet and methods else None
     )
+    # Тот же забор поддерживаемой доплаты (05.10.2026), что у существующего заказа выше.
+    if top_up_button is not None and topup_intent_enabled_for(user):
+        if not any(item['key'] in ('sbp', 'cards_ru') for item in methods):
+            top_up_button = None
     if top_up_button is not None and await _has_order_in_flight(db, user_id=user.id):
         top_up_button = None
     auto_top_up = top_up_button is not None and topup_intent_enabled_for(user)
