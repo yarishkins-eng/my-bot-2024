@@ -199,9 +199,11 @@ def _main_menu(user: User) -> InlineKeyboardButton:
     )
 
 
-def _change_selection(user: User, checkout_id: str) -> InlineKeyboardButton:
+def _change_selection(user: User, checkout_id: str, *, short: bool = False) -> InlineKeyboardButton:
     return InlineKeyboardButton(
-        text=_text(user, '‹ Изменить параметры', '‹ Change options'),
+        text=_text(user, '‹ Изменить', '‹ Change')
+        if short
+        else _text(user, '‹ Изменить параметры', '‹ Change options'),
         callback_data=f'df:e:{checkout_id}',
     )
 
@@ -213,10 +215,12 @@ def _cancel_order(user: User, checkout_id: str) -> InlineKeyboardButton:
     )
 
 
-def _change_selection_fused(user: User) -> InlineKeyboardButton:
+def _change_selection_fused(user: User, *, short: bool = False) -> InlineKeyboardButton:
     """Restart the checkout-free showcase; no order exists to reference."""
     return InlineKeyboardButton(
-        text=_text(user, '‹ Изменить параметры', '‹ Change options'),
+        text=_text(user, '‹ Изменить', '‹ Change')
+        if short
+        else _text(user, '‹ Изменить параметры', '‹ Change options'),
         callback_data='df:e2',
     )
 
@@ -342,7 +346,11 @@ def _top_up_button(
         return None
     amount = _money(user, top_up)
     return InlineKeyboardButton(
-        text=_text(user, f'💰 Доплатить {amount} ₽', f'💰 Top up ₽{amount}'),
+        text=(
+            _text(user, f'💰 Оплатить {amount} ₽', f'💰 Pay ₽{amount}')
+            if topup_intent_enabled_for(user)
+            else _text(user, f'💰 Доплатить {amount} ₽', f'💰 Top up ₽{amount}')
+        ),
         web_app=types.WebAppInfo(url=cabinet_url),
     )
 
@@ -415,17 +423,34 @@ def _money_block(
             wallet_ru + 'Выберите способ оплаты: деньги с баланса при этом не спишутся.',
             wallet_en + 'Choose a payment method: your balance stays untouched.',
         )
-    # ВК-16, перевод на всех 09.10: решение «оформляется само» от 05.10 заменяет ручной шаг
-    # только когда сервер принимает намерение. Режим отката, запреты и выключенный Platega —
-    # прежнее пополнение с самостоятельным оформлением; полная цена остаётся до части 16б.
-    hint_ru = 'Ваш баланс уже учтён в строке «Не хватает». '
-    hint_en = 'Your balance is already counted in the «Shortage» line. '
+    # ВК-16 · 16б: решение владельца 05.10.2026 заменяет правило 02.09 «одно нажатие»:
+    # разрешённая доплата оформляет заказ сама, с чеком и одной кнопкой. При запрете/откате
+    # остаётся прежняя ручная дорога. Округление и минимум могут оставить часть старого баланса:
+    # в чеке показываем только использованную часть, чтобы цена = с баланса + к оплате.
     if topup_intent_enabled_for(user):
-        hint_ru += 'После оплаты подписка оформится сама — больше ничего нажимать не нужно.'
-        hint_en += 'After payment, your subscription will be set up automatically — no more taps needed.'
-    else:
-        hint_ru += 'Доплатите и продолжите покупку в том же окне.'
-        hint_en += 'Top up and finish the purchase in the same window.'
+        top_up = device_first_top_up_kopeks(price_kopeks=price_kopeks, balance_kopeks=balance_kopeks)
+        used_balance = price_kopeks - top_up
+        receipt_ru = (
+            f'Цена: <b>{_money(user, price_kopeks)} ₽</b>\n'
+            f'С вашего баланса: −{_money(user, used_balance)} ₽\n'
+            f'К оплате: <b>{_money(user, top_up)} ₽</b>\n\n'
+            'После оплаты подписка оформится сама — больше ничего нажимать не нужно.'
+        )
+        receipt_en = (
+            f'Price: <b>₽{_money(user, price_kopeks)}</b>\n'
+            f'From your balance: −₽{_money(user, used_balance)}\n'
+            f'To pay: <b>₽{_money(user, top_up)}</b>\n\n'
+            'After payment, your subscription will be set up automatically — no more taps needed.'
+        )
+        surplus = device_first_top_up_surplus_kopeks(price_kopeks=price_kopeks, balance_kopeks=balance_kopeks)
+        if surplus > 0:
+            receipt_ru += f'\nПосле оформления {_money(user, surplus)} ₽ останется на балансе.'
+            receipt_en += f'\n₽{_money(user, surplus)} will remain on your balance after the order.'
+        return receipt_ru, receipt_en
+    hint_ru = 'Ваш баланс уже учтён в строке «Не хватает». Доплатите и продолжите покупку в том же окне.'
+    hint_en = (
+        'Your balance is already counted in the «Shortage» line. Top up and finish the purchase in the same window.'
+    )
     # Второе число появляется, только когда провайдерский минимум больше недостачи: тогда в
     # сводке одна сумма, а на кнопке другая, и без объяснения это читается как ошибка.
     surplus = device_first_top_up_surplus_kopeks(price_kopeks=price_kopeks, balance_kopeks=balance_kopeks)
@@ -1038,6 +1063,7 @@ async def _render_direct_payment_methods(
         if has_partial_wallet and methods and not getattr(checkout, 'funding_mode', None)
         else None
     )
+    auto_top_up = top_up_button is not None and topup_intent_enabled_for(user)
     if has_partial_wallet:
         logger.info(
             'Экран заказа показал баланс и недостачу',
@@ -1068,6 +1094,8 @@ async def _render_direct_payment_methods(
                 )
             ]
         ]
+    elif auto_top_up:
+        rows = [[top_up_button]]
     else:
         rows = [
             [_native_payment_button(user, checkout_id=checkout.public_id, method_key=item['key'], total=total)]
@@ -1079,13 +1107,15 @@ async def _render_direct_payment_methods(
             '💳 <b>Ваш заказ</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, checkout.selected_device_limit)} · {_period_short_label(user, checkout.period_days)}\n'
-            f'К оплате: <b>{total} ₽</b>\n\n' + tail_ru
+            + ('' if auto_top_up else f'К оплате: <b>{total} ₽</b>\n\n')
+            + tail_ru
         ).rstrip(),
         (
             '💳 <b>Your order</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, checkout.selected_device_limit)} · {_period_short_label(user, checkout.period_days)}\n'
-            f'To pay: <b>₽{total}</b>\n\n' + tail_en
+            + ('' if auto_top_up else f'To pay: <b>₽{total}</b>\n\n')
+            + tail_en
         ).rstrip(),
     )
     if not has_full_wallet_balance and not methods:
@@ -1103,12 +1133,12 @@ async def _render_direct_payment_methods(
             [_change_selection(user, checkout.public_id)],
         ]
     elif methods or has_full_wallet_balance:
-        if top_up_button is not None:
+        if top_up_button is not None and not auto_top_up:
             # Первой — по тому же решению, что и на первом экране: у 114 человек рекламный
             # полтинник снимает пятую часть цены. Вставляем ПОСЛЕ ветки «платить нечем»:
             # там клавиатура заменяется целиком, и доплате в ней места нет.
             rows.insert(0, [top_up_button])
-        rows.append([_change_selection(user, checkout.public_id)])
+        rows.append([_change_selection(user, checkout.public_id, short=auto_top_up)])
     await edit_or_answer_photo(
         callback=callback,
         caption=caption,
@@ -1154,6 +1184,7 @@ async def _render_fused_confirmation(
     )
     if top_up_button is not None and await _has_order_in_flight(db, user_id=user.id):
         top_up_button = None
+    auto_top_up = top_up_button is not None and topup_intent_enabled_for(user)
     rows: list[list[InlineKeyboardButton]]
     if has_full_wallet_balance:
         rows = [
@@ -1168,6 +1199,9 @@ async def _render_fused_confirmation(
                 )
             ]
         ]
+    elif auto_top_up:
+        # 05.10.2026: полную цену рядом с доплатой убираем; оформление после неё автоматическое.
+        rows = [[top_up_button]]
     else:
         rows = [
             [
@@ -1204,13 +1238,15 @@ async def _render_fused_confirmation(
             '💳 <b>Ваш заказ</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
-            f'К оплате: <b>{total} ₽</b>\n\n' + tail_ru
+            + ('' if auto_top_up else f'К оплате: <b>{total} ₽</b>\n\n')
+            + tail_ru
         ).rstrip(),
         (
             '💳 <b>Your order</b>\n\n'
             f'<b>{tariff_name}</b>\n'
             f'{_device_label(user, devices)} · {_period_short_label(user, days)}\n'
-            f'To pay: <b>₽{total}</b>\n\n' + tail_en
+            + ('' if auto_top_up else f'To pay: <b>₽{total}</b>\n\n')
+            + tail_en
         ).rstrip(),
     )
     if notice:
@@ -1228,13 +1264,13 @@ async def _render_fused_confirmation(
                 )
             ]
         ]
-    elif top_up_button is not None:
+    elif top_up_button is not None and not auto_top_up:
         # Первой — это решение, а не копия: у 114 человек рекламный полтинник снимает пятую
         # часть цены, и ради этого этап и делается. Вставляем ПОСЛЕ ветки «платить нечем»:
         # там клавиатура заменяется целиком, и доплате в ней места нет — она идёт к тому же
         # провайдеру, которого в тот момент нет.
         rows.insert(0, [top_up_button])
-    rows.append([_change_selection_fused(user), _cancel_order_fused(user)])
+    rows.append([_change_selection_fused(user, short=auto_top_up), _cancel_order_fused(user)])
     await edit_or_answer_photo(
         callback=callback,
         caption=caption,
