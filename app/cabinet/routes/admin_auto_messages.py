@@ -1,15 +1,16 @@
 """Раздел кабинета «Автосообщения» — то, что бот отправляет клиентам сам, без их нажатия.
 
 🔴 ГРАНИЦА КАТАЛОГА, не расширять молча. Здесь сообщения, которые рождает СЛУЖБА
-МОНИТОРИНГА и служба суточных подписок, и письмо в момент конца подписки: его с ВК-4
+МОНИТОРИНГА и служба суточных подписок, первое письмо после активации пробного (АП-2а),
+и письмо в момент конца подписки: его с ВК-4
 шлёт бот по событию панели «срок вышел» той же функцией монитора. Пока НЕ входят:
 письма самой панели, которые бот пересылает («скоро истекает», «новое устройство»,
-«первое подключение» и другие — больше тысячи в месяц), подтверждения после действия
+«первое подключение» и другие — больше тысячи в месяц), другие подтверждения после действия
 клиента (квитанции об оплате; авто-продление и авто-покупка после пополнения —
 ``subscription_auto_purchase_service``, восемь отправок) и сообщения рефералки. Добавляя
 их, править и обещание на экране (`admin.autoMessages.scope` в кабинете).
 
-После АС-2 выключатель есть у девятнадцати сообщений из двадцати. Двадцатое —
+После АП-2а выключатель есть у двадцати двух сообщений из двадцати трёх. Двадцать третье —
 бонусные дни: там рычаг гасит не письмо, а сам бонус, поэтому ``control`` честно
 говорит «настроек нет», а ``PATCH`` по нему отвечает 409. Обратное правило важнее:
 нарисованный выключатель обязан правда запирать отправку, иначе экран врёт.
@@ -193,10 +194,42 @@ def _assert_in_range(value: int, low: int, high: int, what: str) -> None:
 
 AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
     {
+        'id': 'trial-started',
+        'group': 'trial',
+        'title': 'Пробный начался',
+        'when': 'Сразу после включения пробного, текстом без картинки; дата окончания по Москве.',
+        'control': 'toggle',
+        'settings_key': 'trial_started',
+        'params': (),
+        'quiet_check': 'trial_start_available',
+        'warning': (
+            'Выключите — пробный включится, но это сообщение не придёт. Старое меню новичка удаляется; '
+            'новое меню клиент откроет командой /start. Включение не рассылает прежние активации заново.\n\n'
+            'Дата и лимит берутся из выданной пробной подписки. '
+            'Отправки пока не записываются, счётчика и истории у этого сообщения нет.'
+        ),
+        'buttons': [
+            {'label': 'Подключить VPN', 'target': 'Кабинет, экран подключения', 'tracked': False},
+            {'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
+            {'label': '👤 Личный кабинет', 'target': 'Кабинет, главная', 'tracked': False},
+            {'label': '💳 Тарифы', 'target': 'Бот, сроки подписки', 'tracked': False},
+            {
+                'label': '🔗 Моя ссылка для подключения',
+                'target': 'Бот, ссылка; только при готовой ссылке',
+                'tracked': False,
+            },
+            {
+                'label': '🎁 Привести друга — получить бонус',
+                'target': 'Приглашения; только если программа включена',
+                'tracked': False,
+            },
+        ],
+    },
+    {
         'id': 'trial-not-connected',
         'group': 'trial',
         'title': 'Пробный идёт, а VPN не подключён',
-        'when': 'Через {not_connected_after_hours} после начала пробного — тем, у кого не было подключений',
+        'when': 'Через {not_connected_after_hours} после начала пробного — при накопленном расходе меньше 1 МБ',
         'control': 'toggle',
         'settings_key': 'trial_not_connected',
         'params': ('not_connected_after_hours',),
@@ -208,8 +241,9 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
             'уже поздно.\n\n'
             'Включите — и письмо сразу уйдёт всем, кто сидит без подключения дольше выбранного '
             'срока. Дальше по одному-двум в сутки.\n\n'
-            'Тем, кто уже подключился, письмо не придёт: бот сверяется с панелью. Панель не '
-            'ответила — бот промолчит, но не скажет «вы не подключились» человеку с работающим VPN.'
+            'При расходе от 1 МБ (1 000 000 байт) письмо не придёт: бот читает накопленный трафик панели, '
+            'который не обнуляется каждую ночь. Автопроверка серверов приложением не считается использованием. '
+            'Нет достоверного счётчика или профиля — бот промолчит до следующей проверки.'
         ),
         'buttons': [
             {'label': '📲 Подключиться', 'target': 'Кабинет, экран подключения', 'tracked': False},
@@ -696,6 +730,7 @@ class AutoMessageDetail(AutoMessageItem):
     text_has_english: bool = False
     # Уходит ли письмо фотографией с логотипом. Только у таких потолок подписи что-то значит.
     text_with_logo: bool = False
+    text_only: bool = False
     # Пределы длины приезжают с сервера, а не зашиты в экране: правило раздела с этапа АС-1.
     text_limits: dict[str, int] = {}
 
@@ -767,6 +802,16 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
     )
     if not trial_tariff_marked:
         reasons['trial_tariff_marked'] = 'ни один тариф не помечен пробным — отбирать не по чему'
+        fallback_id = settings.get_trial_tariff_id()
+        fallback_exists = fallback_id and await db.scalar(
+            select(func.count())
+            .select_from(Tariff)
+            .where(Tariff.id == fallback_id, Tariff.entitlement_mode != 'access_point_managed')
+        )
+        if not fallback_exists:
+            reasons['trial_start_available'] = reasons['trial_tariff_marked']
+    if not settings.FUNNEL_MENU_ENABLED or not settings.is_cabinet_mode():
+        reasons['trial_start_available'] = 'меню воронки или кабинетный режим выключены на сервере'
 
     if not settings.CHANNEL_IS_REQUIRED_SUB:
         reasons['channel_required'] = 'подписка на канал не обязательна'
@@ -990,6 +1035,7 @@ def _build_item(
 #   * константа рядом с отправителем — 8 сообщений, которых в словаре нет вовсе.
 
 _LOCALE_TEXT_KEYS: dict[str, str] = {
+    'trial-started': 'FUNNEL_TRIAL_ACTIVATED',
     'trial-expired': 'TRIAL_EXPIRED_NOTIFICATION',
     'trial-discount': 'TRIAL_EXPIRED_DISCOUNT',
     'paid-3d': 'SUBSCRIPTION_EXPIRING_PAID',
@@ -1015,6 +1061,11 @@ _LOCALE_TEXT_KEYS: dict[str, str] = {
 # ОДНОЙ активной платной подписки из 60 (замер 05.09.2026).
 # Условия списаны с ветвлений отправителя `_send_subscription_expiring_notification`.
 _INSERT_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
+    'traffic_text': (
+        ('FUNNEL_TRIAL_TRAFFIC_DAILY', 'лимит больше нуля и сбрасывается каждый день'),
+        ('FUNNEL_TRIAL_TRAFFIC_TOTAL', 'лимит больше нуля, сброс не ежедневный'),
+        ('FUNNEL_TRIAL_TRAFFIC_UNLIMITED', 'лимит равен нулю — трафик не ограничен'),
+    ),
     'autopay_status': (
         ('AUTOPAY_STATUS_CARD_ACTIVE', 'автоплатёж включён, карта привязана'),
         ('AUTOPAY_STATUS_NO_CARD', 'автоплатёж включён, карты нет'),
@@ -1140,6 +1191,8 @@ _MARKER_HINTS: dict[str, tuple[str, str]] = {
 # владельца дописать «₽» там, где он уже есть, и клиент получил бы «199 ₽ ₽».
 # Нашла линза текстов, сверив КАЖДУЮ метку с её отправителем.
 _MARKER_HINTS_BY_MESSAGE: dict[tuple[str, str], tuple[str, str]] = {
+    ('trial-started', 'end_date'): ('дата и время окончания выданного пробного, по Москве', '14.10.2026 14:35'),
+    ('trial-started', 'limit_gb'): ('только в строке лимита: гигабайты выданной подписки', '5'),
     ('autopay-ok', 'amount'): ('сумма списания вместе с рублём', '199 ₽'),
     ('autopay-fail', 'balance'): ('остаток на счету вместе с рублём', '340 ₽'),
     ('autopay-fail', 'required'): ('сколько нужно списать целиком, вместе с рублём', '199 ₽'),
@@ -1460,6 +1513,7 @@ def _text_facts(message_id: str, params: dict[str, int] | None = None) -> dict[s
         'text_markers': markers,
         'text_has_english': bool(key and load_locale('en').get(key)),
         'text_with_logo': message_id in _WITH_LOGO_IDS,
+        'text_only': message_id == 'trial-started',
         'text_limits': {'max': _TEXT_LIMIT, 'caption': _CAPTION_LIMIT},
     }
 
