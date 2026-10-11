@@ -149,6 +149,10 @@ async def notify_trial_menu(db, user) -> None:
         if subscription is None or not subscription.is_trial:
             return
         trial_tariff = await get_trial_tariff(db)
+        if trial_tariff is None and (fallback_id := settings.get_trial_tariff_id()):
+            from app.database.crud.tariff import get_tariff_by_id
+
+            trial_tariff = await get_tariff_by_id(db, fallback_id)
         if trial_tariff is None or subscription.tariff_id != trial_tariff.id:
             return
         await send_funnel_trial_menu(user, trial_tariff=trial_tariff)

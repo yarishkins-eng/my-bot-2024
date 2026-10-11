@@ -801,8 +801,13 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
     )
     if not trial_tariff_marked:
         reasons['trial_tariff_marked'] = 'ни один тариф не помечен пробным — отбирать не по чему'
-        reasons['trial_start_available'] = reasons['trial_tariff_marked']
-    elif not settings.FUNNEL_MENU_ENABLED or not settings.is_cabinet_mode():
+        fallback_id = settings.get_trial_tariff_id()
+        fallback_exists = fallback_id and await db.scalar(
+            select(func.count()).select_from(Tariff).where(Tariff.id == fallback_id)
+        )
+        if not fallback_exists:
+            reasons['trial_start_available'] = reasons['trial_tariff_marked']
+    if not settings.FUNNEL_MENU_ENABLED or not settings.is_cabinet_mode():
         reasons['trial_start_available'] = 'меню воронки или кабинетный режим выключены на сервере'
 
     if not settings.CHANNEL_IS_REQUIRED_SUB:

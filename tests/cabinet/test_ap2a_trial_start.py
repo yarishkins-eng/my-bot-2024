@@ -282,3 +282,54 @@ async def test_existing_card_api_exposes_text_only_and_switches_new_letter(stora
     assert storage.is_enabled('trial_started') is False
     await cards.patch_auto_message('trial-started', cards.AutoMessagePatch(enabled=True), object(), object())
     assert storage.is_enabled('trial_started') is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('marked', [True, False])
+async def test_start_letter_keeps_trial_activation_tariff_fallback(storage, monkeypatch, marked):
+    tariff = _tariff()
+    _trial_lookup(monkeypatch, tariff if marked else None)
+    fallback = AsyncMock(return_value=tariff)
+    monkeypatch.setattr('app.database.crud.tariff.get_tariff_by_id', fallback)
+    monkeypatch.setattr(funnel_notify.settings, 'TRIAL_TARIFF_ID', 5)
+    send = AsyncMock()
+    monkeypatch.setattr(funnel_notify, 'send_funnel_trial_menu', send)
+    db = SimpleNamespace(refresh=AsyncMock())
+    user = _user()
+    await funnel_notify.notify_trial_menu(db, user)
+    send.assert_awaited_once_with(user, trial_tariff=tariff)
+    if marked:
+        fallback.assert_not_awaited()
+    else:
+        fallback.assert_awaited_once_with(db, 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fallback_exists', [True, False])
+async def test_start_card_state_matches_configured_fallback_tariff(storage, monkeypatch, fallback_exists):
+    from sqlalchemy import create_engine, text
+    from app.services.daily_subscription_service import daily_subscription_service
+
+    monkeypatch.setattr(funnel_notify.settings, 'TRIAL_TARIFF_ID', 5)
+    monkeypatch.setattr(funnel_notify.settings, 'FUNNEL_MENU_ENABLED', True)
+    monkeypatch.setattr(funnel_notify.settings, 'MAIN_MENU_MODE', 'cabinet')
+    monkeypatch.setattr(daily_subscription_service, 'is_enabled', lambda: False)
+    engine = create_engine('sqlite://')
+    with engine.begin() as connection:
+        connection.execute(text('CREATE TABLE tariffs (id INTEGER PRIMARY KEY, is_trial_available BOOLEAN)'))
+        connection.execute(
+            text(
+                'CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, status TEXT, '
+                'traffic_limit_gb INTEGER, autopay_enabled BOOLEAN, is_trial BOOLEAN, tariff_id INTEGER)'
+            )
+        )
+        if fallback_exists:
+            connection.execute(text('INSERT INTO tariffs VALUES (5, 0)'))
+
+        async def scalar(statement):
+            return connection.scalar(statement)
+
+        reasons, notes = await cards._quiet_facts(SimpleNamespace(scalar=scalar))
+        assert ('trial_start_available' not in reasons) is fallback_exists
+        assert 'trial_tariff_marked' in reasons, 'other trial letters still require a marked tariff'
+    engine.dispose()
