@@ -94,6 +94,13 @@ def test_trial_started_card_uses_the_sender_source_and_defaults_enabled(storage)
     assert {'end_date', 'traffic_text', 'limit_gb'} <= explained
 
 
+@pytest.mark.parametrize(
+    'language,settings_word,claim', [('ru', 'настройки', 'вы подключились'), ('en', 'settings', 'you connected')]
+)
+def test_first_connection_text_describes_receiving_settings(storage, language, settings_word, claim):
+    text = get_texts(language).t('WEBHOOK_SUB_FIRST_CONNECTED').lower()
+    assert settings_word in text
+    assert claim not in text
 
 
 @pytest.mark.asyncio

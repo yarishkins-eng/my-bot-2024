@@ -1813,7 +1813,7 @@
   "WEBHOOK_SUB_EXPIRES_48H": "⏳ <b>Subscription{tariff_label} expires in 2 days</b>\n\nRenew your subscription in advance to maintain VPN access.",
   "WEBHOOK_SUB_EXPIRES_24H": "🔴 <b>Subscription{tariff_label} expires tomorrow!</b>\n\nLess than 24 hours left. Renew your subscription now.",
   "WEBHOOK_SUB_EXPIRED_24H_AGO": "💤 <b>Subscription{tariff_label} expired yesterday</b>\n\nYour subscription has ended. Renew now to restore VPN access.",
-  "WEBHOOK_SUB_FIRST_CONNECTED": "🎉 <b>First connection!</b>\n\nYou connected to the VPN{tariff_label} for the first time. Welcome!",
+  "WEBHOOK_SUB_FIRST_CONNECTED": "<b>VPN settings received</b>\n\nThe app received your VPN settings{tariff_label}.\nTurn on the VPN in the app to start using it.",
   "WEBHOOK_SUB_BANDWIDTH_THRESHOLD": "📊 <b>{percent}% traffic used</b>\n\nYou have used a significant portion of traffic for your subscription{tariff_label}. Monitor your usage.",
   "WEBHOOK_RENEW_BUTTON": "🔄 Renew subscription",
   "WEBHOOK_USER_NOT_CONNECTED": "📡 <b>Not connected yet</b>\n\nYour subscription{tariff_label} is active but no VPN connection has been made. Connect to start using the service.",
