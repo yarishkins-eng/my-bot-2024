@@ -115,10 +115,11 @@ def test_no_english_machine_text_reaches_the_wallet_history() -> None:
     # писала «Device-first: 30 дн., 2 устр., checkout <uuid>». Путь спит, но имя сторожа
     # обещало больше, чем он делал.
     assert 'дн., ' not in source or 'устр., checkout' not in source
-    # А это — то, что человек обязан увидеть вместо них.
-    assert 'Платёж картой получен' in source
+    # А это — то, что человек обязан увидеть вместо них. Способ оплаты подставляется по коду
+    # метода (до 11.10.2026 там стояло «картой» и при СБП — см. сторож ниже).
+    assert "f'Платёж{method} получен: подписка на " in source
     assert 'Оплата подписки с баланса' in source
-    assert 'Оплата подписки картой' in source
+    assert "f'Оплата подписки{method}: '" in source
     # 🔴 Добавлено после мутационного прогона: без этих двух строк мутация «печатать срок
     # числом дней вместо помощника» переживала весь набор. Прежний сторож проверял САМ
     # помощник (`format_period_description(180) == '6 месяцев'`) — то есть совпадение, а не
@@ -126,7 +127,23 @@ def test_no_english_machine_text_reaches_the_wallet_history() -> None:
     assert source.count('format_period_description(int(snapshot["period_days"]))') == 2
     # Источник денег обязан различаться: «с баланса» при оплате кошельком — ложь при оплате
     # картой, потому что баланс тогда не двигался вовсе.
-    assert "if checkout.funding_mode == 'wallet' else 'Оплата подписки картой: '" in source
+    assert "if checkout.funding_mode == 'wallet' else f'Оплата подписки{method}: '" in source
+
+
+def test_direct_sale_names_the_method_that_actually_paid() -> None:
+    """Подпись прямой продажи называет способ оплаты по коду метода, а не «картой» всегда.
+
+    🔴 С 02.08 по 11.10.2026 из 45 прямых покупок 36 оплачены по СБП, а клиент видел в
+    истории «Платёж картой получен». Код метода берётся с той попытки, что заплатила;
+    без этой передачи подпись молча станет «Платёж получен» — сторож ниже.
+    """
+    from app.services.device_first_checkout_service import _direct_sale_method_word
+
+    assert _direct_sale_method_word(2) == 'по СБП'
+    assert _direct_sale_method_word(11) == 'картой'
+    assert _direct_sale_method_word(None) == ''
+    assert _direct_sale_method_word(999) == ''
+    assert 'provider_method_code=owned_attempt.provider_method_code' in _service_source()
 
 
 def test_sale_descriptions_are_not_mistaken_for_addons() -> None:
@@ -142,19 +159,22 @@ def test_sale_descriptions_are_not_mistaken_for_addons() -> None:
     Сторож привязан к ЖИВОМУ списку шаблонов: добавят новый — проверка ужесточится сама.
     """
     from app.database.crud.transaction import ADDON_DESCRIPTION_PATTERNS
+    from app.services.admin_notification_service import _PLATEGA_METHOD_LABELS
 
     source = _service_source()
     prefixes = (
-        'Платёж картой получен: подписка на ',
+        'Платёж{method} получен: подписка на ',
         'Оплата подписки с баланса: ',
-        'Оплата подписки картой: ',
+        'Оплата подписки{method}: ',
     )
     for prefix in prefixes:
         assert prefix in source, f'подпись {prefix!r} исчезла'
 
+    # Слово способа оплаты встаёт в подпись — его тоже проверяем на шаблоны допов.
+    filled = [prefix.replace('{method}', f' {word}') for prefix in prefixes for word in _PLATEGA_METHOD_LABELS.values()]
     for pattern in ADDON_DESCRIPTION_PATTERNS:
         word = pattern.strip('%').lower()
-        for prefix in prefixes:
+        for prefix in (*prefixes, *filled):
             assert word not in prefix.lower(), f'подпись {prefix!r} уводит продажу в статистику допов'
 
     assert 'лимит устройств' not in source
