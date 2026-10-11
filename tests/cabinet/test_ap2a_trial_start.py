@@ -308,6 +308,7 @@ async def test_start_letter_keeps_trial_activation_tariff_fallback(storage, monk
 @pytest.mark.parametrize('fallback_exists', [True, False])
 async def test_start_card_state_matches_configured_fallback_tariff(storage, monkeypatch, fallback_exists):
     from sqlalchemy import create_engine, text
+
     from app.services.daily_subscription_service import daily_subscription_service
 
     monkeypatch.setattr(funnel_notify.settings, 'TRIAL_TARIFF_ID', 5)
