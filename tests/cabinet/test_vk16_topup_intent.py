@@ -27,6 +27,7 @@ from app.cabinet.schemas.balance import PaymentMethodResponse, TopUpIntent, TopU
 from app.config import settings
 from app.database.models import (
     CheckoutPaymentAttempt,
+    DeviceAddonIntent,
     DeviceAddonTopupAttempt,
     PlategaPayment,
     PromoGroup,
@@ -87,6 +88,7 @@ def _new_session() -> Session:
             User.__table__,
             PlategaPayment.__table__,
             CheckoutPaymentAttempt.__table__,
+            DeviceAddonIntent.__table__,
             DeviceAddonTopupAttempt.__table__,
             Transaction.__table__,
             Subscription.__table__,

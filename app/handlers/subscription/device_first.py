@@ -2701,9 +2701,9 @@ def topup_intent_refusal_message(
     if kind == 'bought':
         why = _text(
             user,
-            'пока шла оплата, на вашем аккаунте прошла ещё одна оплата — '
-            'чтобы случайно не взять деньги дважды, мы ничего не оформляли',
-            'while the payment was going through, another payment went through on your account — '
+            'после выбора заказа на вашем аккаунте уже прошла оплата — '
+            'чтобы не взять деньги дважды, мы ничего не оформляли',
+            'after you chose the order, a payment already went through on your account — '
             'to avoid charging you twice, we did not place the order',
         )
     elif kind == 'order':

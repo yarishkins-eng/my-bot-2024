@@ -18,7 +18,7 @@ import pytest
 from sqlalchemy import text
 
 from app.config import settings
-from app.database.models import PlategaPayment, SubscriptionCheckout, Transaction, User
+from app.database.models import DeviceAddonIntent, PlategaPayment, SubscriptionCheckout, Transaction, User
 from app.services import device_first_checkout_service as dfc, device_first_payment_service
 from app.services.payment.platega import PlategaPaymentMixin
 from tests.cabinet.test_vk16_topup_intent import (  # noqa: F401 -- фикстуры стенда 16а-1
@@ -650,7 +650,8 @@ async def test_refused_intent_still_tells_about_the_money_but_not_through_the_ol
     assert webhook.carts_cleared_before_message == [True]
     assert 'cart_chain' not in webhook.order
     assert webhook.admin[0]['auto_next_step'] is None
-    assert 'бот сам не оформил: подписка клиента изменилась, пока шла оплата' in webhook.admin[0]['intent_refused']
+    # ИСПР-1, решение 11.10: утверждаем проверенный момент «после заказа», не процесс оплаты в банке.
+    assert 'бот сам не оформил: подписка клиента изменилась после заказа' in webhook.admin[0]['intent_refused']
     webhook.erasure.assert_awaited_once()
 
 
@@ -791,7 +792,17 @@ async def test_own_session_loads_the_user_with_promo_groups_so_pricing_does_not_
 
     engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "own.db"}')
     async with engine.begin() as connection:
-        models = (User, PlategaPayment, Transaction, Subscription, Tariff, PromoGroup, UserPromoGroup, ServerSquad)
+        models = (
+            User,
+            PlategaPayment,
+            Transaction,
+            DeviceAddonIntent,
+            Subscription,
+            Tariff,
+            PromoGroup,
+            UserPromoGroup,
+            ServerSquad,
+        )
         for table in [model.__table__ for model in models] + [server_squad_promo_groups]:
             columns = ', '.join(
                 'id INTEGER PRIMARY KEY' if column.name == 'id' else column.name for column in table.columns
