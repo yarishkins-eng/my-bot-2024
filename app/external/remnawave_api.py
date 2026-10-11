@@ -1743,9 +1743,13 @@ class RemnaWaveAPI:
 
         lifetime = traffic_data.get('lifetimeUsedTrafficBytes')
         lifetime_available = type(lifetime) is int and lifetime >= 0
+        try:
+            lifetime_bytes = int(lifetime or 0)
+        except (TypeError, ValueError, OverflowError):
+            lifetime_bytes = 0
         return UserTraffic(
             used_traffic_bytes=int(traffic_data.get('usedTrafficBytes', 0)),
-            lifetime_used_traffic_bytes=lifetime if lifetime_available else 0,
+            lifetime_used_traffic_bytes=lifetime_bytes,
             online_at=self._parse_optional_datetime(traffic_data.get('onlineAt')),
             first_connected_at=self._parse_optional_datetime(traffic_data.get('firstConnectedAt')),
             last_connected_node_uuid=traffic_data.get('lastConnectedNodeUuid'),

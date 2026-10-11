@@ -664,3 +664,10 @@ async def test_real_where_excludes_team_even_when_its_trial_flag_and_dates_match
     service._send_trial_not_connected_notification.assert_awaited_once_with(trial.user, trial)
     wired.assert_awaited_once()
     assert wired.await_args[0][2] == trial.id
+
+
+@pytest.mark.parametrize('lifetime', ['2000000', 2_000_000.0])
+def test_shared_parser_preserves_numeric_display_without_certifying_help_usage(lifetime) -> None:
+    traffic = _traffic_parser()._parse_user_traffic({'usedTrafficBytes': 0, 'lifetimeUsedTrafficBytes': lifetime})
+    assert traffic.lifetime_used_traffic_bytes == 2_000_000
+    assert traffic.lifetime_traffic_available is False
