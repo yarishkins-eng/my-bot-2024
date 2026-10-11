@@ -305,8 +305,10 @@ async def test_start_letter_keeps_trial_activation_tariff_fallback(storage, monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('fallback_exists', [True, False])
-async def test_start_card_state_matches_configured_fallback_tariff(storage, monkeypatch, fallback_exists):
+@pytest.mark.parametrize(
+    ('fallback_exists', 'mode'), [(True, 'legacy_snapshot'), (False, 'legacy_snapshot'), (True, 'access_point_managed')]
+)
+async def test_start_card_state_matches_configured_fallback_tariff(storage, monkeypatch, fallback_exists, mode):
     from sqlalchemy import create_engine, text
 
     from app.services.daily_subscription_service import daily_subscription_service
@@ -317,7 +319,9 @@ async def test_start_card_state_matches_configured_fallback_tariff(storage, monk
     monkeypatch.setattr(daily_subscription_service, 'is_enabled', lambda: False)
     engine = create_engine('sqlite://')
     with engine.begin() as connection:
-        connection.execute(text('CREATE TABLE tariffs (id INTEGER PRIMARY KEY, is_trial_available BOOLEAN)'))
+        connection.execute(
+            text('CREATE TABLE tariffs (id INTEGER PRIMARY KEY, is_trial_available BOOLEAN, entitlement_mode TEXT)')
+        )
         connection.execute(
             text(
                 'CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, status TEXT, '
@@ -325,12 +329,12 @@ async def test_start_card_state_matches_configured_fallback_tariff(storage, monk
             )
         )
         if fallback_exists:
-            connection.execute(text('INSERT INTO tariffs VALUES (5, 0)'))
+            connection.execute(text('INSERT INTO tariffs VALUES (5, 0, :mode)'), {'mode': mode})
 
         async def scalar(statement):
             return connection.scalar(statement)
 
         reasons, notes = await cards._quiet_facts(SimpleNamespace(scalar=scalar))
-        assert ('trial_start_available' not in reasons) is fallback_exists
+        assert ('trial_start_available' not in reasons) is (fallback_exists and mode != 'access_point_managed')
         assert 'trial_tariff_marked' in reasons, 'other trial letters still require a marked tariff'
     engine.dispose()
