@@ -48,7 +48,7 @@ def _no_topup_intents(monkeypatch):
 
 # Адрес двери доплаты, которую этап БК ставит на экран заказа.
 TOP_UP_PREFIX = '/balance/top-up/'
-TOP_UP_LABEL = 'Доплатить'
+TOP_UP_LABELS = ('Доплатить', 'Оплатить')
 
 
 def _db(*, open_order: bool = False):
@@ -488,16 +488,16 @@ async def test_choose_devices_renders_a_checkout_free_pay_confirmation() -> None
     assert '5 устройств · 3 месяца' in caption
     assert '1 090 ₽' in caption
     assert keyboard[0][0].web_app.url == 'https://cabinet.example/subscription/purchase?safe'
-    assert keyboard[1][0].web_app.url == 'https://cabinet.example/subscription/purchase?safe'
-    # Адреса проверяются оба и по порядку: первой стоит дверь доплаты, за ней — прежняя
-    # кнопка способа оплаты, у которой метка `autostart=1` не тронута ни на знак.
+    # 05.10.2026: полной оплаты рядом с разрешённой доплатой больше нет.
+    assert len(keyboard) == 2
+    assert keyboard[1][0].callback_data == 'df:e2'
+    # 05.10.2026: адрес только один, полной оплаты рядом с доплатой больше нет.
+    # Нулевой баланс сохраняет прежний native-autostart (отдельный сторож ниже).
     assert build_cabinet_url.call_args_list[0].args[0] == (
         '/balance/top-up/platega?returnTo=%2Fsubscription%2Fpurchase'
         '%3Ffrom%3Dcheckout%26period%3D90%26devices%3D5&amount=590'
     )
-    assert build_cabinet_url.call_args_list[1].args[0] == (
-        '/subscription/purchase?period=90&devices=5&method=sbp&autostart=1'
-    )
+    assert build_cabinet_url.call_count == 1
     callbacks = [button.callback_data for row in keyboard for button in row if button.callback_data]
     assert callbacks == ['df:e2', 'df:x2']
 
@@ -1505,28 +1505,17 @@ async def test_fused_confirmation_shows_the_wallet_and_a_top_up_door_on_a_partia
 
     caption = render.await_args.kwargs['caption']
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    assert '💳 Баланс: 50 ₽' in caption
-    assert '⚠️ Не хватает: 199 ₽' in caption
-    # ВК-16, перевод 09.10: доплата теперь оформляет заказ сама (решение владельца 05.10).
-    assert (
-        'Ваш баланс уже учтён в строке «Не хватает». После оплаты подписка оформится сама — больше ничего нажимать не нужно.'
-        in caption
-    )
-    # 🔴 РЕК-16.3 переписал это ожидание, и это ЗАЯВЛЕНИЕ, а не подкрутка под новый текст.
-    # Здесь требовалась строка «этот экран не обновится: его кнопки возьмут полную цену».
-    # С этапа РЕК-8а она неверна: кнопки способов — `web_app` в кабинет с `autostart=1`, а
-    # кабинет по ним счёт не выставляет, пока на счету есть деньги, а округлённая недостача
-    # меньше цены. Это ровно состояние, в котором печатается абзац. Предупреждение о вреде,
-    # которого больше нет, — такая же ложь, как молчание о настоящем.
-    # ⚠️ Граница честно: забор стережёт отсутствие СНЯТОГО обещания по его словам. Новую
-    # неправду другими словами он не поймает — это цена любого текстового сторожа.
+    # ВК-16 · 16б: решение05.10 заменяет ручное оформление02.09 и альтернативу полной цены.
+    # Сторож прежнего «Или оплатите полной суммой» переписан: теперь одна финансовая кнопка.
+    assert 'Цена: <b>249 ₽</b>\nС вашего баланса: −50 ₽\nК оплате: <b>199 ₽</b>' in caption
+    assert 'После оплаты подписка оформится сама' in caption
     assert 'не обновится' not in caption
-    assert 'полную цену' not in caption
-    # Остаток мины DE: строка про баланс без этой оговорки читается как «зачтётся».
-    assert 'Или оплатите полной суммой: деньги с баланса при этом не спишутся.' in caption
+    assert 'полной суммой' not in caption
+    assert len(keyboard) == 2
+    assert len(keyboard[0]) == 1
     # Провайдерский минимум здесь меньше недостачи, значит второго числа на экране нет.
     assert 'останется на балансе' not in caption
-    assert keyboard[0][0].text == '💰 Доплатить 199 ₽'
+    assert keyboard[0][0].text == '💰 Оплатить 199 ₽'
     assert build_cabinet_url.call_args_list[0].args[0] == (
         '/balance/top-up/platega?returnTo=%2Fsubscription%2Fpurchase'
         '%3Ffrom%3Dcheckout%26period%3D30%26devices%3D2&amount=199'
@@ -1579,7 +1568,7 @@ async def test_fused_confirmation_hides_the_top_up_door_while_an_order_is_open()
     # отдаёт одно и то же всем. А адрес доплаты код собирает и выбрасывает намеренно:
     # дешёвые признаки считаются раньше запроса к базе.
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    assert not any(TOP_UP_LABEL in button.text for row in keyboard for button in row)
+    assert not any(label in button.text for row in keyboard for button in row for label in TOP_UP_LABELS)
     # ⚠️ Адресной проверки здесь быть НЕ МОЖЕТ, и это следствие порядка вычислений:
     # забор «есть заказ в работе» стоит ПОСЛЕ дешёвых признаков, поэтому адрес доплаты
     # успевает собраться и выбрасывается. Проверять нечего — кнопки на экране нет.
@@ -1626,7 +1615,7 @@ async def test_fused_confirmation_hides_the_top_up_door_when_it_would_cost_the_f
     # отдаёт одно и то же всем. А адрес доплаты код собирает и выбрасывает намеренно:
     # дешёвые признаки считаются раньше запроса к базе.
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    assert not any(TOP_UP_LABEL in button.text for row in keyboard for button in row)
+    assert not any(label in button.text for row in keyboard for button in row for label in TOP_UP_LABELS)
     # Слова на кнопке мало: та же дверь под другой надписью прошла бы мимо. Здесь забор
     # срабатывает ДО сборки адреса, поэтому адрес можно проверить — и он не запрашивался.
     assert not any(call.args[0].startswith(TOP_UP_PREFIX) for call in build_cabinet_url.call_args_list)
@@ -1673,16 +1662,13 @@ async def test_direct_payment_methods_screen_shows_the_wallet_and_the_top_up_doo
     caption = render.await_args.kwargs['caption']
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
     assert '5 устройств · 3 месяца' in caption
-    assert '💳 Баланс: 50 ₽' in caption
-    assert '⚠️ Не хватает: 1 139 ₽' in caption
-    assert (
-        'Ваш баланс уже учтён в строке «Не хватает». После оплаты подписка оформится сама — больше ничего нажимать не нужно.'
-        in caption
-    )
-    # РЕК-16.3: см. объяснение у первого такого забора выше.
+    # 05.10.2026: тот же чек и одна кнопка у существующего незакреплённого заказа.
+    assert 'Цена: <b>1 189 ₽</b>\nС вашего баланса: −50 ₽\nК оплате: <b>1 139 ₽</b>' in caption
+    assert 'После оплаты подписка оформится сама' in caption
     assert 'не обновится' not in caption
-    assert 'Или оплатите полной суммой: деньги с баланса при этом не спишутся.' in caption
-    assert keyboard[0][0].text == '💰 Доплатить 1 139 ₽'
+    assert 'полной суммой' not in caption
+    assert len(keyboard) == 2
+    assert keyboard[0][0].text == '💰 Оплатить 1 139 ₽'
     # Адрес возврата несёт СРОК И УСТРОЙСТВА ЭТОГО ЗАКАЗА, а не выбор из состояния диалога:
     # на этом экране состояния может уже не быть, а строка заказа есть всегда.
     assert build_cabinet_url.call_args_list[0].args[0] == (
@@ -1767,7 +1753,7 @@ async def test_direct_payment_methods_screen_hides_the_door_when_the_funding_mod
     assert '💳 Баланс: 50 ₽' in caption
     assert '⚠️ Не хватает: 199 ₽' in caption
     assert 'уже учтён в строке' not in caption
-    assert not any(TOP_UP_LABEL in button.text for row in keyboard for button in row)
+    assert not any(label in button.text for row in keyboard for button in row for label in TOP_UP_LABELS)
     # Слова на кнопке мало: та же дверь под другой надписью прошла бы мимо. Здесь забор
     # срабатывает ДО сборки адреса, поэтому адрес можно проверить — и он не запрашивался.
     assert not any(call.args[0].startswith(TOP_UP_PREFIX) for call in build_cabinet_url.call_args_list)
@@ -1804,11 +1790,11 @@ async def test_fused_confirmation_explains_the_change_when_the_provider_minimum_
 
     caption = render.await_args.kwargs['caption']
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    # Недостача честная (49 ₽), а счёт выставят на минимум провайдера (100 ₽) — и разницу
-    # экран называет сам, теми же словами, что и кабинет.
-    assert '⚠️ Не хватает: 49 ₽' in caption
+    # 05.10.2026: в чеке реальные использованные149 ₽, платёж100 ₽; прежняя недостача49
+    # не выдаётся за сумму оплаты. Остальные51 ₽ честно остаются на балансе.
+    assert 'С вашего баланса: −149 ₽\nК оплате: <b>100 ₽</b>' in caption
     assert 'После оформления 51 ₽ останется на балансе.' in caption
-    assert keyboard[0][0].text == '💰 Доплатить 100 ₽'
+    assert keyboard[0][0].text == '💰 Оплатить 100 ₽'
     assert build_cabinet_url.call_args_list[0].args[0].endswith('&amount=100')
 
 
@@ -1839,17 +1825,14 @@ async def test_fused_confirmation_speaks_english_to_an_english_customer() -> Non
 
     caption = render.await_args.kwargs['caption']
     keyboard = render.await_args.kwargs['keyboard'].inline_keyboard
-    assert '💳 Balance: ₽50' in caption
-    assert '⚠️ Shortage: ₽199' in caption
-    assert (
-        'Your balance is already counted in the «Shortage» line. After payment, your subscription will be set up automatically — no more taps needed.'
-        in caption
-    )
-    # РЕК-16.3: обе половины снятого предупреждения — и по-английски тоже.
+    # 05.10.2026: английская половина того же чека, без ручного шага и полной цены.
+    assert 'Price: <b>₽249</b>\nFrom your balance: −₽50\nTo pay: <b>₽199</b>' in caption
+    assert 'After payment, your subscription will be set up automatically' in caption
     assert 'will not refresh' not in caption
     assert 'charge the full price' not in caption
-    assert 'Or pay the full amount: your balance stays untouched.' in caption
-    assert keyboard[0][0].text == '💰 Top up ₽199'
+    assert 'Or pay the full amount' not in caption
+    assert keyboard[0][0].text == '💰 Pay ₽199'
+    assert len(keyboard) == 2
 
 
 @pytest.mark.asyncio
@@ -1906,10 +1889,10 @@ def test_fused_pay_callbacks_fit_the_telegram_byte_budget() -> None:
     for method_key in PLATEGA_METHODS:
         data = f'df:y2:{method_key}:365:10:9999999'
         assert len(data.encode()) <= 64, data
-    assert len(b'df:a2:365:10:9999999') <= 64
+    assert len(b'df:a2:365:10:9999999:1791000000') <= 64
     # The fused prefixes must never collide with the legacy startswith filters.
     assert not 'df:y2:sbp:30:2:36900'.startswith('df:y:')
-    assert not 'df:a2:30:2:36900'.startswith('df:a:')
+    assert not 'df:a2:30:2:36900:1791000000'.startswith('df:a:')
 
 
 @pytest.mark.asyncio
