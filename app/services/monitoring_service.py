@@ -1399,15 +1399,30 @@ class MonitoringService:
             return None
         return connected
 
-    async def _check_trial_not_connected(self, db: AsyncSession):
-        """Письмо тем, у кого идёт пробный период, а первого подключения так и не было.
+    async def _fetch_trial_panel_usage(self) -> dict[str, int] | None:
+        """Достоверный накопленный расход по UUID; суточный сброс его не обнуляет.
 
-        🔴 Признак подключения берётся ТОЛЬКО из панели (`userTraffic.firstConnectedAt`).
-        `Subscription.traffic_used_gb` для этого негоден: он обновляется лишь тогда, когда
-        клиент сам открыл экран подписки в мини-приложении, фоновой синхронизации трафика
-        в проекте нет. У неподключившегося и у подключившегося, но не заходившего в кабинет,
-        там одинаковый ноль.
+        Отсутствующий профиль/счётчик — неизвестное использование, а не ноль.
+        firstConnectedAt отражает и автопроверку приложения. Утренний отчёт использует
+        свой прежний reader; локальный округлённый traffic_used_gb здесь не подходит.
         """
+        if not self.subscription_service.is_configured:
+            return None
+        try:
+            async with self.subscription_service.get_api_client() as api:
+                panel_users = await api.get_all_users_stream(size=500)
+        except Exception as exc:
+            logger.warning('Не удалось прочитать трафик пробных из панели', error=exc)
+            return None
+        usage = {
+            panel_user.uuid: panel_user.user_traffic.lifetime_used_traffic_bytes
+            for panel_user in panel_users
+            if panel_user.user_traffic is not None and panel_user.user_traffic.lifetime_traffic_available
+        }
+        return usage or None
+
+    async def _check_trial_not_connected(self, db: AsyncSession):
+        """Помощь каноническому пробному с накопленным расходом меньше 1 МБ (1 000 000 байт)."""
         if not self.bot:
             return
         if not NotificationSettingsService.is_enabled('trial_not_connected'):
@@ -1468,28 +1483,25 @@ class MonitoringService:
             if not pending:
                 return
 
-            connected_uuids = await self._fetch_connected_panel_uuids()
-            if connected_uuids is None:
-                logger.warning('Панель не ответила: письма о неподключении пропущены до следующего обхода')
+            panel_usage = await self._fetch_trial_panel_usage()
+            if panel_usage is None:
+                logger.warning('Нет достоверного трафика панели: письма о неподключении пропущены до следующего обхода')
                 return
 
             sent = 0
             for subscription in pending:
                 user = subscription.user
 
-                uuids = {subscription.remnawave_uuid, user.remnawave_uuid} - {None, ''}
-                if not uuids:
-                    # 🔴 Сравнивать не с чем: у подписки нет учётки в панели. Это то же
-                    # «мы не знаем», что и молчание панели, и трактовать его как
-                    # «не подключался» нельзя — человек мог подключаться, а мог вообще
-                    # не иметь профиля, и тогда подключаться ему нечем.
+                uuid = subscription.remnawave_uuid or user.remnawave_uuid
+                if not uuid or uuid not in panel_usage:
+                    # Профиль или его достоверный счётчик отсутствует: использование неизвестно.
                     logger.warning(
-                        'У пробной подписки нет учётки в панели: письмо о неподключении не отправлено',
+                        'Нет достоверного расхода пробной подписки: письмо о неподключении не отправлено',
                         subscription_id=subscription.id,
                     )
                     continue
 
-                if uuids & connected_uuids:
+                if panel_usage[uuid] >= 1_000_000:
                     continue
 
                 if not (subscription.connected_squads or []):

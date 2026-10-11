@@ -45,6 +45,7 @@ class UserTraffic:
     online_at: datetime | None = None
     first_connected_at: datetime | None = None
     last_connected_node_uuid: str | None = None
+    lifetime_traffic_available: bool = False
 
 
 @dataclass
@@ -1740,12 +1741,15 @@ class RemnaWaveAPI:
         if not traffic_data:
             return None
 
+        lifetime = traffic_data.get('lifetimeUsedTrafficBytes')
+        lifetime_available = type(lifetime) is int and lifetime >= 0
         return UserTraffic(
             used_traffic_bytes=int(traffic_data.get('usedTrafficBytes', 0)),
-            lifetime_used_traffic_bytes=int(traffic_data.get('lifetimeUsedTrafficBytes', 0)),
+            lifetime_used_traffic_bytes=lifetime if lifetime_available else 0,
             online_at=self._parse_optional_datetime(traffic_data.get('onlineAt')),
             first_connected_at=self._parse_optional_datetime(traffic_data.get('firstConnectedAt')),
             last_connected_node_uuid=traffic_data.get('lastConnectedNodeUuid'),
+            lifetime_traffic_available=lifetime_available,
         )
 
     def _parse_user(self, user_data: dict) -> RemnaWaveUser:
