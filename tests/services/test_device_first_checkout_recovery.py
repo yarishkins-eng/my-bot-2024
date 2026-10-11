@@ -160,7 +160,7 @@ async def test_reversed_direct_attempt_cannot_fulfil_after_operator_review_wins_
 
 @pytest.mark.asyncio
 async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliation():
-    attempt = SimpleNamespace(id=41, status='paid_processing')
+    attempt = SimpleNamespace(id=41, status='paid_processing', provider_method_code=2)
     user = SimpleNamespace(id=7)
     checkout = SimpleNamespace(
         id=9,
@@ -193,7 +193,7 @@ async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliat
 async def test_paid_pre_release_direct_checkout_is_held_if_a_legacy_trial_is_still_pending(monkeypatch):
     """A paid direct callback never overwrites the entitlement of an old trial invoice."""
     user = SimpleNamespace(id=7)
-    attempt = SimpleNamespace(id=41, status='paid_processing', reconciliation_reason=None)
+    attempt = SimpleNamespace(id=41, status='paid_processing', reconciliation_reason=None, provider_method_code=2)
     checkout = SimpleNamespace(
         id=9,
         public_id='checkout-9',
@@ -239,7 +239,7 @@ async def test_paid_pre_release_direct_checkout_is_held_if_a_legacy_trial_is_sti
 async def test_direct_fulfilment_uses_the_same_user_attempt_checkout_lock_order_as_reversal():
     """A post-paid reversal and its fulfilment cannot circularly wait on their fence rows."""
     user = SimpleNamespace(id=7)
-    attempt = SimpleNamespace(id=41, status='paid_processing')
+    attempt = SimpleNamespace(id=41, status='paid_processing', provider_method_code=2)
     checkout = SimpleNamespace(
         id=9,
         settlement_mode=DIRECT_SETTLEMENT_MODE,
@@ -273,7 +273,7 @@ async def test_direct_fulfilment_uses_the_same_user_attempt_checkout_lock_order_
 async def test_direct_fulfilment_kicks_only_its_own_post_commit_outbox_when_generic_auto_check_is_off(monkeypatch):
     """A verified direct callback never waits for the generic top-up checker."""
     user = SimpleNamespace(id=7)
-    attempt = SimpleNamespace(id=41, status='paid_processing')
+    attempt = SimpleNamespace(id=41, status='paid_processing', provider_method_code=2)
     checkout = SimpleNamespace(
         id=9,
         user_id=7,
@@ -320,7 +320,7 @@ async def test_direct_fulfilment_kicks_only_its_own_post_commit_outbox_when_gene
 @pytest.mark.asyncio
 async def test_direct_fulfilment_keeps_durable_sale_when_immediate_outbox_kick_fails():
     user = SimpleNamespace(id=7)
-    attempt = SimpleNamespace(id=41, status='paid_processing')
+    attempt = SimpleNamespace(id=41, status='paid_processing', provider_method_code=2)
     checkout = SimpleNamespace(
         id=9,
         user_id=7,
@@ -505,7 +505,7 @@ async def test_direct_fulfilment_wakes_the_referral_queue_and_does_not_leave_it_
     Живая проверка дня выкладки прочитала бы это как «не сработало».
     """
     user = SimpleNamespace(id=7)
-    attempt = SimpleNamespace(id=41, status='paid_processing')
+    attempt = SimpleNamespace(id=41, status='paid_processing', provider_method_code=2)
     checkout = SimpleNamespace(
         id=9,
         user_id=7,

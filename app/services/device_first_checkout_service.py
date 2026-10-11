@@ -3158,6 +3158,18 @@ async def _consume_promo_offer_for_sale(
         )
 
 
+def _direct_sale_method_word(provider_method_code: int | None) -> str:
+    """«по СБП» / «картой» для подписи прямой продажи; неизвестный код — пустая строка.
+
+    🔴 До 11.10.2026 подпись была «картой» всегда, и 36 оплат по СБП из 45 клиент видел в
+    истории как оплату картой. Коды — те же, что у карточки продажи владельцу. Неизвестный
+    код даёт подпись без способа: лучше промолчать, чем соврать снова.
+    """
+    from app.services.admin_notification_service import _PLATEGA_METHOD_LABELS
+
+    return _PLATEGA_METHOD_LABELS.get(provider_method_code, '')
+
+
 async def _complete_direct_sale_locked(
     db: AsyncSession,
     *,
@@ -3165,6 +3177,7 @@ async def _complete_direct_sale_locked(
     user: User,
     target: Subscription | None,
     provider_payment_id: str | None = None,
+    provider_method_code: int | None = None,
 ) -> SubscriptionCheckout:
     """Create exactly one direct-sale ledger and local subscription in this transaction."""
     await _require_no_legacy_pending_trial(db, user_id=user.id, checkout=checkout)
@@ -3340,6 +3353,9 @@ async def _complete_direct_sale_locked(
             'operator_review_required', 'The captured access term requires operator reconciliation'
         ) from error
 
+    # Способ оплаты в подписях — с той попытки, что заплатила; у кошелька его нет.
+    method_word = _direct_sale_method_word(provider_method_code)
+    method = f' {method_word}' if method_word else ''
     if checkout.funding_mode == 'wallet':
         user.balance_kopeks -= total
     else:
@@ -3364,7 +3380,7 @@ async def _complete_direct_sale_locked(
                 # Поймано вопросом владельца «а это безопасно?», сторож рядом.
                 # ⛔ Старую формулировку сюда не возвращать: на неё стоит растяжка в тестах.
                 description=(
-                    f'Платёж картой получен: подписка на {format_period_description(int(snapshot["period_days"]))}'
+                    f'Платёж{method} получен: подписка на {format_period_description(int(snapshot["period_days"]))}'
                 ),
                 payment_method='platega',
                 external_id=provider_payment_id,
@@ -3412,7 +3428,7 @@ async def _complete_direct_sale_locked(
             # ложью вместо старой. Оба варианта верны буквально.
             # ⛔ Про отсутствие числа устройств — см. комментарий у прихода выше.
             description=(
-                ('Оплата подписки с баланса: ' if checkout.funding_mode == 'wallet' else 'Оплата подписки картой: ')
+                ('Оплата подписки с баланса: ' if checkout.funding_mode == 'wallet' else f'Оплата подписки{method}: ')
                 + f'{format_period_description(int(snapshot["period_days"]))}'
             ),
             payment_method='balance' if checkout.funding_mode == 'wallet' else 'platega',
@@ -3589,6 +3605,7 @@ async def fulfill_direct_external_checkout(
             user=user,
             target=target,
             provider_payment_id=provider_payment_id,
+            provider_method_code=owned_attempt.provider_method_code,
         )
     except DeviceFirstError as error:
         if error.code in {'legacy_trial_reconciliation_required', 'operator_review_required'}:
@@ -4684,7 +4701,7 @@ async def _send_owner_sale_card(db: AsyncSession, *, bot, checkout: Subscription
 
     Явными — потому что авто-определение «первая/продление» в сборщике читает флаг, который
     сама продажа уже перевернула; способ оплаты берём из кода метода провайдера, а не из
-    описания транзакции («Оплата подписки картой: …» пишется и при СБП); скидку — из
+    описания транзакции (до 11.10.2026 там писалось «картой» и при СБП); скидку — из
     замороженной разбивки заказа, иначе разложение цены в карточке молча промолчит.
     False = слать некуда (уведомления или категория выключены) — строка станет `obsolete`.
     Отказ доставки — исключение → строка `failed`, без повторов (см. SALE_NOTIFICATION_PREFIX).
