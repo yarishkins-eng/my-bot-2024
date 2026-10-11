@@ -2683,6 +2683,35 @@ _TOPUP_REFUSAL_WHY = {
 }
 
 
+def topup_intent_fulfilled_message(
+    user: User, *, amount_kopeks: int, balance_kopeks: int
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Один и тот же денежный чек вебхука и добора после прерывания."""
+    english = getattr(user, 'language', None) == 'en'
+    support_url = settings.get_support_contact_url()
+    message = (
+        f'✅ <b>Payment received: {settings.format_price(amount_kopeks)}</b>\n\n'
+        'Your order is paid from the balance. When the subscription is connected, you will get the '
+        '"Your VPN subscription is ready" message. If it has not arrived in 10 minutes, please '
+        f'contact support.\n\nBalance left: {settings.format_price(balance_kopeks)}'
+        if english
+        else f'✅ <b>Оплата получена: {settings.format_price(amount_kopeks)}</b>\n\n'
+        'Заказ оформлен с баланса. Когда подписка подключится, придёт сообщение «Ваша VPN-подписка '
+        'готова». Если его нет через 10 минут — напишите в поддержку.\n\n'
+        f'На балансе осталось: {settings.format_price(balance_kopeks)}'
+    )
+    markup = (
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text='Contact support' if english else 'Написать в поддержку', url=support_url)]
+            ]
+        )
+        if support_url
+        else None
+    )
+    return message, markup
+
+
 def topup_intent_refusal_message(
     user: User, intent: dict, *, amount_kopeks: int, balance_kopeks: int
 ) -> tuple[str, InlineKeyboardMarkup]:

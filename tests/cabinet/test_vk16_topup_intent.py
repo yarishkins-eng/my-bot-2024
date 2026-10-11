@@ -992,7 +992,11 @@ async def test_intent_payment_is_credited_by_the_real_generic_top_up(db, session
     stored = session.get(PlategaPayment, 97)
     assert (stored.is_paid, stored.transaction_id is not None) == (True, True)
     complete.assert_awaited_once_with(payment_id=97)
-    assert dfc.topup_intent_of(stored) == completed
+    # ИСПР-1/B: общая доставка добавляет только две свои отметки, исход оформления не затирается.
+    actual = dict(dfc.topup_intent_of(stored))
+    assert dfc._intent_time(actual.pop('notified_at')) is not None
+    assert actual.pop('delivery') == 'failed'  # у этого экземпляра mixin нет bot
+    assert actual == completed
 
 
 async def test_late_orphan_cancel_keeps_the_intent_outcome(db, session):

@@ -20,6 +20,7 @@ from app.database.database import AsyncSessionLocal
 from app.database.models import (
     AdvertisingCampaign,
     AdvertisingCampaignRegistration,
+    PlategaPayment,
     ReferralEarning,
     Subscription,
     SubscriptionEvent,
@@ -397,6 +398,42 @@ class ReportingService:
             ),
         ]
 
+    async def _topup_intent_block(self, start_utc: datetime, end_utc: datetime) -> list[str]:
+        from app.services import device_first_checkout_service as dfc
+
+        try:
+            async with AsyncSessionLocal() as session:
+                rows = (
+                    await session.execute(
+                        select(PlategaPayment, Transaction.completed_at)
+                        .join(Transaction, Transaction.id == PlategaPayment.transaction_id)
+                        .where(PlategaPayment.status.is_distinct_from('CHARGEBACKED'))
+                    )
+                ).all()
+                recovered, refused, pending = 0, 0, 0
+                for payment, completed in rows:
+                    intent = dfc.topup_intent_of(payment) or {}
+                    recovered_at = dfc._intent_time(intent.get('recovered_at'))
+                    if recovered_at and start_utc <= recovered_at < end_utc:
+                        recovered += 1
+                        refused += int(intent.get('status') == 'refused')
+                    if (
+                        intent
+                        and not intent.get('decided_at')
+                        and completed
+                        and dfc._intent_time(completed) < datetime.now(UTC) - timedelta(minutes=15)
+                    ):
+                        pending += 1
+            lines = []
+            if recovered:
+                lines.append(f'Доплаты, оформленные после сбоя: {recovered} (отказ {refused})')
+            if pending:
+                lines.append(f'Оплаченные доплаты без итога дольше 15 минут: {pending}')
+            return lines
+        except Exception as error:
+            logger.error('topup_intent_report_failed', error=type(error).__name__)
+            return []
+
     # --------------------------------------
 
     async def _build_report(
@@ -419,6 +456,7 @@ class ReportingService:
             totals = await self._collect_current_totals(session)
             losses = await self._collect_loss_stats(session, start_utc, end_utc, stats['trial_takers'])
         referral_lines = await self._referral_block(start_utc, end_utc)
+        topup_lines = await self._topup_intent_block(start_utc, end_utc)
         # Панель — после базы: её ожидание (до 45 секунд) не держит транзакцию открытой
         connected = await self._connected_panel_uuids() if losses['takers'] or losses['earlier'] else set()
 
@@ -489,6 +527,7 @@ class ReportingService:
             '',
             # РЕФ-2: рефералка — отдельным блоком, всегда, даже с нулями (решение владельца 29.09)
             *referral_lines,
+            *topup_lines,
             '',
             # Четыре строки потерь — решения владельца 24.09.2026 (ВК-0, ОТЧ-8), хвост «N из M (взяли дата)» — тоже
             # его; «нет данных из панели» вместо числа, когда первые подключения не прочитаны: ноль был бы ложью

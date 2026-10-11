@@ -443,7 +443,76 @@ class PaymentCommonMixin:
             return False
 
 
-async def notify_email_user_topup(user: Any, amount_kopeks: int, *, balance_kopeks: int | None = None) -> None:
+async def send_topup_intent_notice(db: AsyncSession, *, payment_id: int, user: Any, bot: Any) -> str:
+    """Вебхук и страховка делят замок и отметку попытки доставки; 403 не повторяем."""
+    from app.database.crud.platega import get_platega_payment_by_id_for_update
+    from app.handlers.subscription.device_first import topup_intent_fulfilled_message, topup_intent_refusal_message
+    from app.services import device_first_checkout_service as dfc
+    from app.services.account_erasure_service import mark_late_legacy_payment_for_manual_review
+
+    # Забор может коммитить: он вызывается ДО замка доставки, иначе отпустил бы его посреди отправки.
+    erasing = await mark_late_legacy_payment_for_manual_review(db, user)
+    payment = await get_platega_payment_by_id_for_update(db, payment_id)
+    intent = dfc.topup_intent_of(payment) or {}
+    if intent.get('notified_at'):
+        await db.commit()
+        return intent.get('delivery', 'failed')
+    if payment.status == 'CHARGEBACKED':
+        await db.commit()
+        return 'chargebacked'
+    await db.refresh(user, attribute_names=['balance_kopeks'])
+    delivery = 'failed'
+    try:
+        if user.telegram_id and bot:
+            try:
+                receipt = (
+                    topup_intent_fulfilled_message(
+                        user, amount_kopeks=payment.amount_kopeks, balance_kopeks=user.balance_kopeks
+                    )
+                    if intent.get('status') == 'fulfilled'
+                    else topup_intent_refusal_message(
+                        user, intent, amount_kopeks=payment.amount_kopeks, balance_kopeks=user.balance_kopeks
+                    )
+                )
+                delivery = 'telegram'
+            except Exception as error:
+                logger.error('topup_intent_receipt_failed', payment_id=payment_id, error=type(error).__name__)
+                english = getattr(user, 'language', None) == 'en'
+                receipt = (
+                    (
+                        f'✅ <b>Balance topped up: {settings.format_price(payment.amount_kopeks)}</b>\n\n'
+                        f'Balance: {settings.format_price(user.balance_kopeks)}. Please contact support for the order result.'
+                        if english
+                        else f'✅ <b>Пополнение успешно: {settings.format_price(payment.amount_kopeks)}</b>\n\n'
+                        f'На балансе: {settings.format_price(user.balance_kopeks)}. Результат заказа уточните в поддержке.'
+                    ),
+                    None,
+                )
+                delivery = 'telegram_plain'
+            await bot.send_message(user.telegram_id, receipt[0], parse_mode='HTML', reply_markup=receipt[1])
+        elif erasing:
+            delivery = 'account_erasure'
+        if not erasing:
+            emailed = await notify_email_user_topup(user, payment.amount_kopeks, balance_kopeks=user.balance_kopeks)
+            if not user.telegram_id:
+                delivery = 'email_or_cabinet' if emailed else 'failed' if user.email else 'no_contact'
+    except Exception as error:
+        delivery = 'failed'
+        logger.error('topup_intent_notice_failed', payment_id=payment_id, error=type(error).__name__)
+    # Только свои поля на свежем намерении (OQ), включая неудачную доставку: владельцу нужна одна тревога.
+    payment.metadata_json = {
+        **payment.metadata_json,
+        dfc.TOPUP_INTENT_KEY: {
+            **intent,
+            'notified_at': datetime.now(UTC).isoformat(),
+            'delivery': delivery,
+        },
+    }
+    await db.commit()
+    return delivery
+
+
+async def notify_email_user_topup(user: Any, amount_kopeks: int, *, balance_kopeks: int | None = None) -> bool:
     """«Пополнение успешно» для юзеров без Telegram (#2952).
 
     Провайдерские webhook-обработчики шлют это сообщение только в Telegram
@@ -454,7 +523,7 @@ async def notify_email_user_topup(user: Any, amount_kopeks: int, *, balance_kope
     уведомление не должно ронять webhook после зачисления денег.
     """
     if user is None or getattr(user, 'telegram_id', None) or not getattr(user, 'email', None):
-        return
+        return False
     # Баланс после автооформления доплаты (ВК-16) передаёт вызывающий: объект пользователя помнит его ДО списания.
     balance = (getattr(user, 'balance_kopeks', 0) or 0) if balance_kopeks is None else balance_kopeks
     try:
@@ -463,7 +532,7 @@ async def notify_email_user_topup(user: Any, amount_kopeks: int, *, balance_kope
             notification_delivery_service,
         )
 
-        await notification_delivery_service.send_notification(
+        return await notification_delivery_service.send_notification(
             user=user,
             notification_type=NotificationType.BALANCE_TOPUP,
             context={
@@ -480,6 +549,7 @@ async def notify_email_user_topup(user: Any, amount_kopeks: int, *, balance_kope
             user_id=getattr(user, 'id', None),
             error=error,
         )
+        return False
 
 
 async def send_cart_notification_after_topup(
