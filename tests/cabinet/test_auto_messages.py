@@ -518,6 +518,7 @@ _NAMED_GETTER_KEYS = {
 
 
 _SENDING_MODULES = (
+    'app/utils/funnel_notify.py',
     'app/services/monitoring_service.py',
     'app/services/daily_subscription_service.py',
     # 🔴 Письма о канале уходят из ЧЕТЫРЁХ мест, а не из одного: почасовая служба,

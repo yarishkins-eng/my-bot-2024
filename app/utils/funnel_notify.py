@@ -17,12 +17,14 @@
 import asyncio
 import os
 import time
+from zoneinfo import ZoneInfo
 
 import redis.asyncio as aioredis
 import structlog
 
 from app.config import settings
-from app.utils.scenario_media import cache_scenario_media_file_id, get_scenario_media
+from app.database.crud.tariff import get_trial_tariff
+from app.services.notification_settings_service import NotificationSettingsService
 
 
 logger = structlog.get_logger(__name__)
@@ -143,12 +145,18 @@ async def notify_trial_menu(db, user) -> None:
     """Обновляет свежую подписку и best-effort шлёт меню активного триала."""
     try:
         await db.refresh(user, ['subscriptions'])
+        subscription = user.subscription
+        if subscription is None or not subscription.is_trial:
+            return
+        trial_tariff = await get_trial_tariff(db)
+        if trial_tariff is None or subscription.tariff_id != trial_tariff.id:
+            return
+        await send_funnel_trial_menu(user, trial_tariff=trial_tariff)
     except Exception as exc:
         logger.debug('notify_trial_menu refresh failed', error=exc)
-    await send_funnel_trial_menu(user)
 
 
-async def send_funnel_trial_menu(user) -> None:
+async def send_funnel_trial_menu(user, *, trial_tariff=None) -> None:
     """Шлёт пользователю меню активного триала после активации.
 
     Дополнительно удаляет предыдущее меню (новичка), если оно было запомнено, и
@@ -172,9 +180,23 @@ async def send_funnel_trial_menu(user) -> None:
         from app.bot_factory import create_bot
         from app.keyboards.inline import build_funnel_menu_keyboard
         from app.localization.texts import get_texts
+        from app.services.subscription_service import get_traffic_reset_strategy
         from app.utils.funnel_state import FunnelState
+        from app.utils.miniapp_buttons import build_miniapp_or_callback_button
         from app.utils.subscription_link_access import get_user_subscription_with_available_link
 
+        subscription = getattr(user, 'subscription', None)
+        if (
+            subscription is None
+            or not subscription.is_trial
+            or trial_tariff is None
+            or subscription.tariff_id != trial_tariff.id
+            or subscription.end_date is None
+        ):
+            return
+        if not NotificationSettingsService.is_enabled('trial_started'):
+            await clear_funnel_menu(user)
+            return
         language = getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE
         texts = get_texts(language)
         keyboard = build_funnel_menu_keyboard(
@@ -186,26 +208,35 @@ async def send_funnel_trial_menu(user) -> None:
         if keyboard is None:
             return
 
-        text = texts.t('FUNNEL_TRIAL_ACTIVATED', '🎉 Готово! Пробный период активирован.')
+        keyboard.inline_keyboard.insert(
+            0,
+            [
+                build_miniapp_or_callback_button(
+                    text=texts.get('FUNNEL_CONNECT_VPN'),
+                    callback_data='subscription_connect',
+                    cabinet_path='/connection',
+                )
+            ],
+        )
+        limit_gb = subscription.traffic_limit_gb or 0
+        if limit_gb <= 0:
+            traffic_key = 'FUNNEL_TRIAL_TRAFFIC_UNLIMITED'
+        elif get_traffic_reset_strategy(trial_tariff).value == 'DAY':
+            traffic_key = 'FUNNEL_TRIAL_TRAFFIC_DAILY'
+        else:
+            traffic_key = 'FUNNEL_TRIAL_TRAFFIC_TOTAL'
+        text = texts.get('FUNNEL_TRIAL_ACTIVATED').format(
+            end_date=subscription.end_date.astimezone(ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y %H:%M'),
+            traffic_text=texts.get(traffic_key).format(limit_gb=limit_gb),
+        )
         bot = create_bot()
         try:
-            media = get_scenario_media('trial_active', language) if settings.ENABLE_LOGO_MODE else None
-            if media is None:
-                sent = await bot.send_message(
-                    chat_id=user.telegram_id,
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode='HTML',
-                )
-            else:
-                sent = await bot.send_photo(
-                    chat_id=user.telegram_id,
-                    photo=media,
-                    caption=text,
-                    reply_markup=keyboard,
-                    parse_mode='HTML',
-                )
-                cache_scenario_media_file_id('trial_active', language, sent)
+            sent = await bot.send_message(
+                chat_id=user.telegram_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode='HTML',
+            )
             # Старое меню новичка теперь мусор — удаляем; новое запоминаем.
             await _delete_remembered_menu(bot, user.telegram_id)
             if sent is not None:

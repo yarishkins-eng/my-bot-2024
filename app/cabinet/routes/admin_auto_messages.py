@@ -193,6 +193,38 @@ def _assert_in_range(value: int, low: int, high: int, what: str) -> None:
 
 AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
     {
+        'id': 'trial-started',
+        'group': 'trial',
+        'title': 'Пробный начался',
+        'when': 'Сразу после включения пробного, текстом без картинки; дата окончания по Москве.',
+        'control': 'toggle',
+        'settings_key': 'trial_started',
+        'params': (),
+        'quiet_check': 'trial_start_available',
+        'warning': (
+            'Выключите — пробный включится, но это сообщение не придёт. Старое меню новичка удаляется; '
+            'новое меню клиент откроет командой /start. Включение не рассылает прежние активации заново.\n\n'
+            'Дата и лимит берутся из выданной пробной подписки. '
+            'Отправки пока не записываются, счётчика и истории у этого сообщения нет.'
+        ),
+        'buttons': [
+            {'label': 'Подключить VPN', 'target': 'Кабинет, экран подключения', 'tracked': False},
+            {'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
+            {'label': '👤 Личный кабинет', 'target': 'Кабинет, главная', 'tracked': False},
+            {'label': '💳 Тарифы', 'target': 'Бот, сроки подписки', 'tracked': False},
+            {
+                'label': '🔗 Моя ссылка для подключения',
+                'target': 'Бот, ссылка; только при готовой ссылке',
+                'tracked': False,
+            },
+            {
+                'label': '🎁 Привести друга — получить бонус',
+                'target': 'Приглашения; только если программа включена',
+                'tracked': False,
+            },
+        ],
+    },
+    {
         'id': 'trial-not-connected',
         'group': 'trial',
         'title': 'Пробный идёт, а VPN не подключён',
@@ -697,6 +729,7 @@ class AutoMessageDetail(AutoMessageItem):
     text_has_english: bool = False
     # Уходит ли письмо фотографией с логотипом. Только у таких потолок подписи что-то значит.
     text_with_logo: bool = False
+    text_only: bool = False
     # Пределы длины приезжают с сервера, а не зашиты в экране: правило раздела с этапа АС-1.
     text_limits: dict[str, int] = {}
 
@@ -768,6 +801,9 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
     )
     if not trial_tariff_marked:
         reasons['trial_tariff_marked'] = 'ни один тариф не помечен пробным — отбирать не по чему'
+        reasons['trial_start_available'] = reasons['trial_tariff_marked']
+    elif not settings.FUNNEL_MENU_ENABLED or not settings.is_cabinet_mode():
+        reasons['trial_start_available'] = 'меню воронки или кабинетный режим выключены на сервере'
 
     if not settings.CHANNEL_IS_REQUIRED_SUB:
         reasons['channel_required'] = 'подписка на канал не обязательна'
@@ -991,6 +1027,7 @@ def _build_item(
 #   * константа рядом с отправителем — 8 сообщений, которых в словаре нет вовсе.
 
 _LOCALE_TEXT_KEYS: dict[str, str] = {
+    'trial-started': 'FUNNEL_TRIAL_ACTIVATED',
     'trial-expired': 'TRIAL_EXPIRED_NOTIFICATION',
     'trial-discount': 'TRIAL_EXPIRED_DISCOUNT',
     'paid-3d': 'SUBSCRIPTION_EXPIRING_PAID',
@@ -1016,6 +1053,11 @@ _LOCALE_TEXT_KEYS: dict[str, str] = {
 # ОДНОЙ активной платной подписки из 60 (замер 05.09.2026).
 # Условия списаны с ветвлений отправителя `_send_subscription_expiring_notification`.
 _INSERT_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
+    'traffic_text': (
+        ('FUNNEL_TRIAL_TRAFFIC_DAILY', 'лимит больше нуля и сбрасывается каждый день'),
+        ('FUNNEL_TRIAL_TRAFFIC_TOTAL', 'лимит больше нуля, сброс не ежедневный'),
+        ('FUNNEL_TRIAL_TRAFFIC_UNLIMITED', 'лимит равен нулю — трафик не ограничен'),
+    ),
     'autopay_status': (
         ('AUTOPAY_STATUS_CARD_ACTIVE', 'автоплатёж включён, карта привязана'),
         ('AUTOPAY_STATUS_NO_CARD', 'автоплатёж включён, карты нет'),
@@ -1141,6 +1183,8 @@ _MARKER_HINTS: dict[str, tuple[str, str]] = {
 # владельца дописать «₽» там, где он уже есть, и клиент получил бы «199 ₽ ₽».
 # Нашла линза текстов, сверив КАЖДУЮ метку с её отправителем.
 _MARKER_HINTS_BY_MESSAGE: dict[tuple[str, str], tuple[str, str]] = {
+    ('trial-started', 'end_date'): ('дата и время окончания выданного пробного, по Москве', '14.10.2026 14:35'),
+    ('trial-started', 'limit_gb'): ('только в строке лимита: гигабайты выданной подписки', '5'),
     ('autopay-ok', 'amount'): ('сумма списания вместе с рублём', '199 ₽'),
     ('autopay-fail', 'balance'): ('остаток на счету вместе с рублём', '340 ₽'),
     ('autopay-fail', 'required'): ('сколько нужно списать целиком, вместе с рублём', '199 ₽'),
@@ -1461,6 +1505,7 @@ def _text_facts(message_id: str, params: dict[str, int] | None = None) -> dict[s
         'text_markers': markers,
         'text_has_english': bool(key and load_locale('en').get(key)),
         'text_with_logo': message_id in _WITH_LOGO_IDS,
+        'text_only': message_id == 'trial-started',
         'text_limits': {'max': _TEXT_LIMIT, 'caption': _CAPTION_LIMIT},
     }
 

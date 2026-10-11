@@ -42,6 +42,7 @@ class NotificationSettingsService:
     _readonly: bool = False
 
     _DEFAULTS: dict[str, dict[str, Any]] = {
+        'trial_started': {'enabled': True},
         'trial_channel_unsubscribed': {'enabled': True},
         'expired_1d': {'enabled': True},
         'expired_second_wave': {
@@ -441,6 +442,7 @@ class NotificationSettingsService:
     EDITABLE_TEXT_NAMES: frozenset[str] = frozenset(
         {
             # 13 ключей словаря локалей
+            'FUNNEL_TRIAL_ACTIVATED',
             'TRIAL_EXPIRED_NOTIFICATION',
             'TRIAL_EXPIRED_DISCOUNT',
             'SUBSCRIPTION_EXPIRING_PAID',
