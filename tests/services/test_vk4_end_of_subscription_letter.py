@@ -465,7 +465,7 @@ async def test_day_after_letter_from_the_panel_skips_the_trial_only(env, monkeyp
     service._notify_user.assert_not_awaited()
 
     await service._handle_user_expiration(AsyncMock(), _user(), _sub(), {'_meta': {'expiration': -24}})
-    assert service._notify_user.await_args.args[1] == 'WEBHOOK_SUB_EXPIRES_24H', 'до конца — пока панель (АП-2)'
+    service._notify_user.assert_not_awaited()  # Фактический срок уже вышел: старое предупреждение не возвращаем.
 
     for tariff_id, flag in ((PAID_TARIFF_ID, False), (TEAM_TARIFF_ID, True)):
         service._notify_user.reset_mock()
@@ -1394,3 +1394,109 @@ async def test_the_sweep_loads_the_tariff_up_front_and_rereads_the_row(env) -> N
         for element in option.context
     ), 'тариф должен подгружаться заранее'
     assert statement.get_execution_options().get('populate_existing') is True
+
+
+@pytest.fixture
+def warning_service(env, monkeypatch):
+    service = _webhook(monkeypatch)
+    service.bot = env.bot
+    monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_USER_ENABLED', True)
+    monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_SUB_EXPIRING', True)
+
+    async def deliver(**kwargs):
+        await env.bot.send_message(
+            chat_id=kwargs['user'].telegram_id,
+            text=kwargs['telegram_message'],
+            reply_markup=kwargs['telegram_markup'],
+            disable_notification=kwargs['telegram_silent'],
+        )
+        return True
+
+    monkeypatch.setattr(monitoring_module.notification_delivery_service, 'send_notification', deliver)
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [48, 24])
+async def test_trial_warning_replaces_old_and_new_panel_events_once(env, db, warning_service, hours):
+    subscription = _sub(status='active', end=timedelta(hours=hours))
+    user = _user(balance=5000)
+    legacy = warning_service._handle_expires_in_48h if hours == 48 else warning_service._handle_expires_in_24h
+    await legacy(db, user, subscription, {})
+    await warning_service._handle_user_expiration(db, user, subscription, {'_meta': {'expiration': -hours}})
+    env.bot.send_message.assert_awaited_once()
+    warning_service._notify_user.assert_not_awaited()
+    sent = env.bot.send_message.await_args.kwargs
+    assert 'Пробный период' in sent['text'] and 'с вашими 50 ₽ на балансе — 99 ₽' in sent['text']
+    assert ('через 2 дня' if hours == 48 else 'завтра') in sent['text']
+    assert 'Продлите' not in sent['text']
+    assert [b.text for row in sent['reply_markup'].inline_keyboard for b in row] == ['💎 Оформить подписку']
+    assert [b.callback_data for row in sent['reply_markup'].inline_keyboard for b in row] == ['menu_buy']
+    assert await _marks(db) == {(USER_ID, 233, f'trial_expiring_{hours}h')}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [48, 24])
+async def test_switch_off_does_not_restore_panel_letter_or_switch_off_the_other(
+    env, db, warning_service, monkeypatch, hours
+):
+    off = f'trial_expiring_{hours}h'
+    monkeypatch.setattr(NotificationSettingsService, 'is_enabled', classmethod(lambda cls, key: key != off))
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=hours)), {'_meta': {'expiration': -hours}}
+    )
+    env.bot.send_message.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    other = 24 if hours == 48 else 48
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=other)), {'_meta': {'expiration': -other}}
+    )
+    env.bot.send_message.assert_awaited_once()
+    assert await _marks(db) == {(USER_ID, 233, f'trial_expiring_{other}h')}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('status', 'end'), [('active', -1), ('disabled', 24), ('active', 168)])
+async def test_stale_or_disabled_trial_warning_does_not_write(env, db, warning_service, status, end):
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status=status, end=timedelta(hours=end)), {'_meta': {'expiration': -24}}
+    )
+    env.bot.send_message.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    assert not await _marks(db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tariff_id', [PAID_TARIFF_ID, TEAM_TARIFF_ID])
+@pytest.mark.parametrize('hours', [48, 24])
+async def test_paid_or_team_with_trial_flag_keeps_panel_warning(env, db, warning_service, tariff_id, hours):
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(tariff_id=tariff_id, is_trial=True), {'_meta': {'expiration': -hours}}
+    )
+    assert warning_service._notify_user.await_args.args[1] == f'WEBHOOK_SUB_EXPIRES_{hours}H'
+    env.bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('utc_hour', 'minute', 'silent'), [(21, 0, True), (4, 59, True), (5, 0, False), (20, 59, False)]
+)
+async def test_warning_uses_moscow_quiet_night(env, db, warning_service, monkeypatch, utc_hour, minute, silent):
+    moment = datetime(2026, 10, 12, utc_hour, minute, tzinfo=UTC)
+    monkeypatch.setattr(monitoring_module, 'is_quiet_night', lambda: is_quiet_night(moment))
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=24)), {'_meta': {'expiration': -24}}
+    )
+    assert env.bot.send_message.await_args.kwargs['disable_notification'] is silent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [False, RuntimeError('delivery interrupted')])
+async def test_failed_warning_has_no_mark_and_no_panel_fallback(env, db, warning_service, monkeypatch, failure):
+    delivery = AsyncMock(return_value=False, side_effect=failure if isinstance(failure, Exception) else None)
+    monkeypatch.setattr(monitoring_module.notification_delivery_service, 'send_notification', delivery)
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=24)), {'_meta': {'expiration': -24}}
+    )
+    assert not await _marks(db)
+    warning_service._notify_user.assert_not_awaited()
