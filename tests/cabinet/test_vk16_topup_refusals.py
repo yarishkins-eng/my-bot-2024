@@ -18,7 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
-from app.database.models import PlategaPayment, SubscriptionCheckout, Transaction, User
+from app.database.models import DeviceAddonIntent, PlategaPayment, SubscriptionCheckout, Transaction, User
 from app.handlers.subscription import device_first as handlers
 from app.services import device_first_checkout_service as dfc
 from app.services.payment.platega import PlategaPaymentMixin
@@ -329,9 +329,9 @@ def _message(reason: str, language: str = 'ru', **intent):
 def test_already_bought_has_no_button_to_buy_again():
     text_, keyboard = _message('already_purchased')
 
-    assert 'Оплата получена: 99 ₽' in text_ and 'чтобы случайно не взять деньги дважды' in text_
-    # «ещё одна оплата», а не «списание с баланса»: купивший картой баланса не трогал (прогон сценария, D1).
-    assert 'на вашем аккаунте прошла ещё одна оплата' in text_ and 'с вашего баланса' not in text_
+    assert 'Оплата получена: 99 ₽' in text_ and 'чтобы не взять деньги дважды' in text_
+    # ИСПР-1, решение 11.10: оплата после выбора заказа; картой тоже, не только с баланса.
+    assert 'после выбора заказа на вашем аккаунте уже прошла оплата' in text_ and 'с вашего баланса' not in text_
     assert 'На балансе: 149,37 ₽' in text_.split('\n')
     assert _buttons(keyboard) == [('В главное меню', 'back_to_menu', None)]
 
@@ -422,7 +422,7 @@ async def test_webhook_refusal_is_one_message_with_the_button_and_the_owner_hear
     buttons = _buttons(webhook.bot.send_message.await_args.kwargs['reply_markup'])
     assert buttons[0][1].startswith(f'df:a2:30:1:{PRICE_30_1}:')  # + момент показа (заявка 3б)
     assert webhook.admin[0]['intent_refused'] == (
-        'Заказ по доплате бот сам не оформил: подписка клиента изменилась, пока шла оплата — деньги остались на '
+        'Заказ по доплате бот сам не оформил: подписка клиента изменилась после заказа — деньги остались на '
         'балансе, клиенту отправлено объяснение'
     )
 
@@ -943,7 +943,17 @@ async def test_recheck_on_a_real_async_session_keeps_the_promo_group_loaded_and_
 
     engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "recheck.db"}')
     async with engine.begin() as connection:
-        models = (User, PlategaPayment, Transaction, Subscription, Tariff, PromoGroup, UserPromoGroup, ServerSquad)
+        models = (
+            User,
+            PlategaPayment,
+            Transaction,
+            DeviceAddonIntent,
+            Subscription,
+            Tariff,
+            PromoGroup,
+            UserPromoGroup,
+            ServerSquad,
+        )
         for table in [model.__table__ for model in models] + [server_squad_promo_groups]:
             columns = ', '.join(
                 'id INTEGER PRIMARY KEY' if column.name == 'id' else column.name for column in table.columns

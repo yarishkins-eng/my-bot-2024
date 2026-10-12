@@ -828,6 +828,7 @@ class AdminNotificationService:
         subscription: Subscription | None,
         promo_group: PromoGroup | None,
         cart_hint: OwnerCartHint | None = None,
+        referred_bonus_kopeks: int | None = None,
     ) -> str:
         # Тариф берём только уже загруженным: ленивая подгрузка здесь падала (УВ-1), и
         # ради названия тарифа ходить в базу из этого сборщика нельзя.
@@ -842,10 +843,14 @@ class AdminNotificationService:
         what = (
             f'На балансе было {settings.format_price(old_balance)}, стало {settings.format_price(user.balance_kopeks)}'
         )
-        bonus = int(user.balance_kopeks or 0) - int(old_balance or 0) - amount
-        if bonus > 0:
-            # Баланс вырос больше, чем пришло денег: бонус новичку за первое пополнение
-            what += f' (в т.ч. бонус {settings.format_price(bonus)})'
+        bonus = (
+            int(user.balance_kopeks or 0) - int(old_balance or 0) - amount
+            if referred_bonus_kopeks is None
+            else referred_bonus_kopeks
+        )
+        if bonus > 0 and (referred_bonus_kopeks is None or bonus <= int(user.balance_kopeks or 0)):
+            label = 'бонус' if referred_bonus_kopeks is None else 'бонус за приглашение'
+            what += f' (в т.ч. {label} {settings.format_price(bonus)})'
         # Доплата под заказ (ВК-16, решение 05.10.2026 «Оформляется само») корзину не смотрит: исход оформления уже
         # известен — `auto` (оформлено) или `final` (отказ, текст печатается как есть).
         # Что будет с деньгами, бот знает по корзине И по тем же трём условиям, по которым
@@ -964,6 +969,7 @@ class AdminNotificationService:
         next_step: str | None = None,
         auto_next_step: str | None = None,
         intent_refused: str | None = None,
+        referred_bonus_kopeks: int | None = None,
     ) -> bool:
         """`next_step` — за что деньги на пути, который корзину не смотрит (пополнение под докупку
         устройств): подсказка по корзине там была бы ложью в обе стороны. Само списание там ждёт
@@ -1022,6 +1028,7 @@ class AdminNotificationService:
                 subscription=subscription,
                 promo_group=promo_group,
                 cart_hint=cart_hint,
+                referred_bonus_kopeks=referred_bonus_kopeks,
             )
             logger.info('Сообщение уведомления создано успешно')
         except Exception as error:
@@ -1072,6 +1079,7 @@ class AdminNotificationService:
                     subscription=subscription,
                     promo_group=promo_group,
                     cart_hint=cart_hint,
+                    referred_bonus_kopeks=referred_bonus_kopeks,
                 )
                 logger.info('Сообщение успешно создано после перезагрузки данных')
             except Exception as rebuild_error:

@@ -9,7 +9,7 @@ from importlib import import_module
 from typing import Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -20,6 +20,7 @@ from app.database.models import (
     DeviceFirstOutbox,
     PaymentMethod,
     SubscriptionCheckout,
+    Transaction,
     TransactionType,
     User,
 )
@@ -30,13 +31,13 @@ from app.utils.user_utils import format_referrer_info
 
 # Причина отказа автооформления доплаты (ВК-16) — словами для карточки владельцу: он не программист.
 _OWNER_REFUSAL_WHY = {
-    'expired': 'клиент оплатил позже чем через час',
+    'expired': 'деньги пришли позже часа после выбора заказа',
     'replaced': 'клиент открыл новый счёт на доплату',
     'cancelled': 'клиент отменил или изменил заказ в боте',
     'disabled': 'автооформление выключено для этого клиента',
     'price_changed': 'цена изменилась',
     'balance_short': 'не хватило баланса',
-    'subscription_changed': 'подписка клиента изменилась, пока шла оплата',
+    'subscription_changed': 'подписка клиента изменилась после заказа',
     'already_purchased': 'после заказа было другое списание за подписку',
     'open_order': 'у клиента открыт другой заказ',
     'order_on_review': 'у клиента заказ на разборе — загляните в «Заказы на разборе»',
@@ -807,16 +808,35 @@ class PlategaPaymentMixin:
         )
 
         topup_status = '🆕 Первое пополнение' if was_first_topup else '🔄 Пополнение'
+        received_bonus = 0
 
         try:
             from app.services.referral_service import process_referral_topup
 
+            bonus_after_id = (
+                await db.scalar(select(func.max(Transaction.id)).where(Transaction.user_id == user.id))
+                if has_topup_intent
+                else None
+            )
             await process_referral_topup(
                 db,
                 user.id,
                 payment.amount_kopeks,
                 getattr(self, 'bot', None),
             )
+            if has_topup_intent:
+                await db.refresh(user, attribute_names=['balance_kopeks'])
+                balance_left = user.balance_kopeks
+                # Источник остатка — настоящая проводка бонуса, а не любая параллельная перемена баланса.
+                received_bonus = await db.scalar(
+                    select(func.coalesce(func.sum(Transaction.amount_kopeks), 0)).where(
+                        Transaction.user_id == user.id,
+                        Transaction.id > (bonus_after_id or 0),
+                        Transaction.type == TransactionType.REFERRAL_REWARD.value,
+                        Transaction.description == 'Бонус новичка за первую оплату',
+                        Transaction.is_completed.is_(True),
+                    )
+                )
         except Exception as error:
             logger.error('Ошибка обработки реферального пополнения Platega', error=error)
 
@@ -826,6 +846,13 @@ class PlategaPaymentMixin:
             await db.refresh(user)
 
         method_title = settings.get_platega_method_display_title(payment.payment_method_code)
+        bonus_note = (
+            ' (бонус за приглашение)'
+            if received_bonus and balance_left == received_bonus
+            else f' (в т.ч. бонус за приглашение {settings.format_price(received_bonus)})'
+            if received_bonus and balance_left > received_bonus
+            else ''
+        )
 
         # Оформленному «Пополнение успешно… подписка сама не оплатится» было бы ложью; «✅ Ваша VPN-подписка готова» и
         # меню подписчика придут из очереди выдачи — но только когда панель выдаст доступ (при сбое — повтор через
@@ -932,9 +959,10 @@ class PlategaPaymentMixin:
                     subscription=subscription,
                     promo_group=promo_group,
                     db=db,
+                    referred_bonus_kopeks=received_bonus if has_topup_intent else None,
                     auto_next_step=(
                         f'заказ на {topup_intent.get("period_days")} дн., устройств {topup_intent.get("devices")} '
-                        f'оформлен сам с баланса, на балансе осталось {settings.format_price(balance_left)}'
+                        f'оформлен сам с баланса, на балансе осталось {settings.format_price(balance_left)}{bonus_note}'
                         if fulfilled
                         else None
                     ),
@@ -952,6 +980,11 @@ class PlategaPaymentMixin:
                             else 'клиенту ушло обычное «Пополнение успешно» без объяснения'
                             if refusal is None and plain_sent
                             else 'сообщение клиенту не дошло — напишите ему сами: деньги на балансе, заказ не оформлен'
+                        )
+                        + (
+                            f'. На балансе осталось {settings.format_price(balance_left)}{bonus_note}'
+                            if bonus_note
+                            else ''
                         )
                         if topup_intent is not None and not fulfilled
                         else None
