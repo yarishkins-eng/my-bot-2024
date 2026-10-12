@@ -66,6 +66,7 @@ from app.external.remnawave_api import (
 )
 from app.localization.texts import get_texts
 from app.services.notification_delivery_service import (
+    NotificationType,
     notification_delivery_service,
 )
 from app.services.notification_settings_service import NotificationSettingsService
@@ -2718,6 +2719,98 @@ class MonitoringService:
         )
         return found is not None
 
+    async def handle_trial_expiring(
+        self, db: AsyncSession, user: User, subscription: Subscription, *, hours: int, bot, panel_expire_at=None
+    ) -> bool:
+        """True означает, что пробный обработан: даже при выключении письмо панели не возвращается."""
+        if not await is_canonical_trial(db, subscription):
+            return False
+        key = 'trial_expiring_48h' if hours == 48 else 'trial_expiring_24h'
+        text_key = 'TRIAL_EXPIRING_48H' if hours == 48 else 'TRIAL_EXPIRING_24H'
+        now = datetime.now(UTC)
+
+        def skipped(reason: str) -> bool:
+            logger.info(
+                'Предупреждение пробному не отправлено', subscription_id=subscription.id, hours=hours, reason=reason
+            )
+            return True
+
+        # Панель 2.8.1 выбирает минутный интервал; допускаем до часа задержки доставки.
+        # Старое «через 2 дня» через сутки после события уже не соответствует текущему сроку.
+        if not now + timedelta(hours=hours - 1) <= subscription.end_date <= now + timedelta(hours=hours, minutes=1):
+            return skipped('stale_event')
+        if panel_expire_at is not None:
+            try:
+                panel_end = datetime.fromisoformat(str(panel_expire_at).replace('Z', '+00:00'))
+                if abs((panel_end - subscription.end_date).total_seconds()) > 1:
+                    return skipped('different_term')
+            except (TypeError, ValueError):
+                return skipped('invalid_panel_term')
+        if subscription.status not in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.LIMITED.value):
+            return skipped('not_active')
+        if user.status != UserStatus.ACTIVE.value:
+            return skipped('inactive_user')
+        if hours == 48 and not NotificationSettingsService.is_enabled('trial_expiring_48h'):
+            return skipped('switched_off')
+        if hours == 24 and not NotificationSettingsService.is_enabled('trial_expiring_24h'):
+            return skipped('switched_off')
+        if not settings.WEBHOOK_NOTIFY_USER_ENABLED or not settings.WEBHOOK_NOTIFY_SUB_EXPIRING:
+            return skipped('server_switch_off')
+        # Между чтением отметки и доставкой второй webhook не должен отправить то же письмо.
+        # Замок только уведомления: строки подписки/покупки не блокирует; commit отметки освобождает его.
+        if not await db.scalar(select(func.pg_try_advisory_xact_lock(202610000 + hours, subscription.id))):
+            return skipped('concurrent_event')
+        found = await db.scalar(
+            select(SentNotification.id)
+            .where(
+                SentNotification.subscription_id == subscription.id,
+                SentNotification.notification_type == key,
+                SentNotification.created_at >= subscription.end_date - timedelta(hours=hours + 1),
+            )
+            .limit(1)
+        )
+        if found is not None:
+            return skipped('already_sent')
+        try:
+            texts = get_texts(user.language)
+            price_lines = await self._trial_price_lines(db, user)
+            message = texts.get(text_key).format(price_lines=price_lines).strip()
+            from aiogram.types import InlineKeyboardMarkup
+
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        build_miniapp_or_callback_button(
+                            text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
+                            callback_data='menu_buy',
+                            cabinet_path='/subscription/purchase',
+                        )
+                    ]
+                ]
+            )
+            delivered = await notification_delivery_service.send_notification(
+                user=user,
+                notification_type=NotificationType.WEBHOOK_SUB_EXPIRING,
+                context={'text_key': text_key, 'price_lines': price_lines},
+                bot=bot,
+                telegram_message=message,
+                telegram_markup=keyboard,
+                telegram_silent=is_quiet_night(),
+            )
+            if not delivered:
+                return skipped('not_delivered')
+            await clear_notification_by_type(db, subscription.id, key, commit=False)
+            if hours == 48:
+                await record_notification(db, user.id, subscription.id, 'trial_expiring_48h')
+            else:
+                await record_notification(db, user.id, subscription.id, 'trial_expiring_24h')
+            logger.info('Предупреждение пробному отправлено', subscription_id=subscription.id, hours=hours)
+        except Exception as error:
+            logger.warning(
+                'Предупреждение пробному не отправлено', subscription_id=subscription.id, hours=hours, error=error
+            )
+        return True
+
     async def _trial_price_lines(self, db: AsyncSession, user: User) -> str:
         """Строки цены в письме о конце пробного (решение владельца 07.10.2026) — из кассы этого человека.
 
@@ -2743,6 +2836,12 @@ class MonitoringService:
             if month:
                 balance = int(user.balance_kopeks or 0)
                 top_up = device_first_top_up_kopeks(price_kopeks=month, balance_kopeks=balance)
+                if balance >= month:
+                    return texts.t(
+                        'TRIAL_EXPIRED_PRICE_LINES_FUNDED',
+                        '1 месяц — {month_price}\nНа балансе хватает на месяц. '
+                        '{month_price} спишутся с баланса, доплачивать не нужно.',
+                    ).format(month_price=settings.format_price(month, round_kopeks=False))
                 # Остаток — в целых рублях вниз: «с вашими N ₽» плюс доплата «M ₽» дают цену месяца, а M — ровно то,
                 # что попросит касса. Меньше рубля на балансе или доплата не меньше цены — строки баланса нет (касса
                 # такую доплату тоже не предлагает).
@@ -2750,16 +2849,19 @@ class MonitoringService:
                 if whole_rubles > 0 and 0 < top_up < month:
                     return texts.t(
                         'TRIAL_EXPIRED_PRICE_LINES_BALANCE',
-                        '1 месяц — {month_price}\nс вашими {balance} на балансе — {top_up}',
+                        '1 месяц — {month_price}\nс вашими {balance} на балансе — доплатить {top_up}',
                     ).format(
-                        month_price=settings.format_price(month),
+                        month_price=settings.format_price(month, round_kopeks=False),
                         balance=settings.format_price(whole_rubles),
                         top_up=settings.format_price(top_up),
                     )
                 if quarter:
                     return texts.t(
                         'TRIAL_EXPIRED_PRICE_LINES', '1 месяц — {month_price}\n3 месяца — {quarter_price}'
-                    ).format(month_price=settings.format_price(month), quarter_price=settings.format_price(quarter))
+                    ).format(
+                        month_price=settings.format_price(month, round_kopeks=False),
+                        quarter_price=settings.format_price(quarter, round_kopeks=False),
+                    )
             logger.info('Письмо о конце пробного уйдёт без цены', user_id=user.id, reason=options.get('reason'))
             return ''
         except Exception as error:
@@ -3477,8 +3579,8 @@ class MonitoringService:
                 'TRIAL_EXPIRED_DISCOUNT',
                 (
                     '🎁 <b>Персональная скидка {percent}%</b>\n\n'
-                    'Ваш пробный период закончился. Оформите первую подписку со скидкой — '
-                    'предложение действует до {expires_at}.'
+                    'Ваш пробный период закончился. Нажмите «Получить скидку», чтобы включить её '
+                    'и узнать свою цену. Предложение можно получить до {expires_at}.'
                 ),
             )
             message = template.format(

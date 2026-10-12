@@ -265,6 +265,40 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         ],
     },
     {
+        'id': 'trial-2d',
+        'group': 'trial',
+        'title': 'Пробный закончится через 2 дня',
+        'when': 'За 2 дня до конца пробного, по событию панели. С 00:00 до 08:00 МСК без звука.',
+        'control': 'toggle',
+        'settings_key': 'trial_expiring_48h',
+        'params': (),
+        'sent_type': 'trial_expiring_48h',
+        'quiet_check': 'trial_warning_available',
+        'stops_reminder': True,
+        'warning': 'Если выключить, этого предупреждения не будет, письмо панели его не заменит. '
+        'Остальные письма пробного управляются отдельно. Цена из кассы на момент отправки; '
+        'если касса не назвала цену, письмо уйдёт без неё. Отправки считаются отметками текущего срока; '
+        'покупка стирает отметки. Пропущенные события при включении не рассылаются заново.',
+        'buttons': [{'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False}],
+    },
+    {
+        'id': 'trial-1d',
+        'group': 'trial',
+        'title': 'Пробный закончится завтра',
+        'when': 'За день до конца пробного, по событию панели. С 00:00 до 08:00 МСК без звука.',
+        'control': 'toggle',
+        'settings_key': 'trial_expiring_24h',
+        'params': (),
+        'sent_type': 'trial_expiring_24h',
+        'quiet_check': 'trial_warning_available',
+        'stops_reminder': True,
+        'warning': 'Если выключить, предупреждения за день не будет, письмо панели его не заменит. '
+        'Письмо за 2 дня и письмо о конце управляются отдельно. Цена из кассы на момент отправки; '
+        'если касса не назвала цену, письмо уйдёт без неё. Отправки считаются отметками текущего срока; '
+        'покупка стирает отметки. Пропущенные события при включении не рассылаются заново.',
+        'buttons': [{'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False}],
+    },
+    {
         'id': 'trial-expired',
         'group': 'trial',
         'title': 'Пробный истёк',
@@ -303,7 +337,8 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'claim_type': 'trial_expired_discount',
         'warning': (
             'Если выключить, пробному через сутки после конца бот ничего не напомнит: письмо панели «Подписка '
-            'истекла вчера» пробным больше не пересылается.'
+            'истекла вчера» пробным больше не пересылается. Цена появится в ответе после «Получить скидку». '
+            'Кнопка «Оформить подписку» сама скидку пока не включает.'
         ),
         'buttons': [
             {'label': '🎁 Получить скидку', 'target': 'Выдаёт скидку', 'tracked': True},
@@ -649,6 +684,7 @@ class AutoMessageItem(BaseModel):
     shares_switch_with: str | None = None
     # Что случится с клиентом, если это выключить. Только там, где последствие настоящее.
     warning: str | None = None
+    stops_reminder: bool = False
     params: dict[str, int] | None = None
     sent_count: int | None = None
     claimed_count: int | None = None
@@ -812,6 +848,10 @@ async def _quiet_facts(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]
             reasons['trial_start_available'] = reasons['trial_tariff_marked']
     if not settings.FUNNEL_MENU_ENABLED or not settings.is_cabinet_mode():
         reasons['trial_start_available'] = 'меню воронки или кабинетный режим выключены на сервере'
+    if not trial_tariff_marked:
+        reasons['trial_warning_available'] = reasons['trial_tariff_marked']
+    elif not settings.WEBHOOK_NOTIFY_USER_ENABLED or not settings.WEBHOOK_NOTIFY_SUB_EXPIRING:
+        reasons['trial_warning_available'] = 'предупреждения панели выключены на сервере: WEBHOOK_NOTIFY_*'
 
     if not settings.CHANNEL_IS_REQUIRED_SUB:
         reasons['channel_required'] = 'подписка на канал не обязательна'
@@ -1014,6 +1054,7 @@ def _build_item(
         note=note,
         shares_switch_with=entry.get('shares_switch_with'),
         warning=entry.get('warning'),
+        stops_reminder=entry.get('stops_reminder', False),
         params=params,
         sent_count=_sent_for(entry, sent_counts),
         claimed_count=claimed_counts.get(claim_type, 0) if claim_type else None,
@@ -1035,6 +1076,8 @@ def _build_item(
 #   * константа рядом с отправителем — 8 сообщений, которых в словаре нет вовсе.
 
 _LOCALE_TEXT_KEYS: dict[str, str] = {
+    'trial-2d': 'TRIAL_EXPIRING_48H',
+    'trial-1d': 'TRIAL_EXPIRING_24H',
     'trial-started': 'FUNNEL_TRIAL_ACTIVATED',
     'trial-expired': 'TRIAL_EXPIRED_NOTIFICATION',
     'trial-discount': 'TRIAL_EXPIRED_DISCOUNT',
@@ -1082,9 +1125,10 @@ _INSERT_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
     'price_lines': (
         (
             'TRIAL_EXPIRED_PRICE_LINES',
-            'в кассе есть цены на 1 и на 3 месяца, а на балансе меньше рубля или хватает на месяц',
+            'в кассе есть цены на 1 и на 3 месяца, а на балансе меньше рубля или касса не предлагает доплату',
         ),
         ('TRIAL_EXPIRED_PRICE_LINES_BALANCE', 'в кассе есть цена месяца, а на балансе от рубля, но меньше этой цены'),
+        ('TRIAL_EXPIRED_PRICE_LINES_FUNDED', 'в кассе есть цена месяца и денег на балансе уже хватает'),
     ),
 }
 
@@ -1210,6 +1254,15 @@ _MARKER_HINTS_BY_MESSAGE: dict[tuple[str, str], tuple[str, str]] = {
     ),
     ('trial-expired', 'top_up'): ('только в строках цены ниже: сколько доплатить за месяц, с рублём', '99 ₽'),
 }
+
+_MARKER_HINTS_BY_MESSAGE.update(
+    {
+        (message_id, name): hint
+        for (source_id, name), hint in list(_MARKER_HINTS_BY_MESSAGE.items())
+        if source_id == 'trial-expired'
+        for message_id in ('trial-2d', 'trial-1d')
+    }
+)
 
 # Метки, значение которых владелец задаёт ЗДЕСЬ ЖЕ, полем на этой карточке. Для них
 # показываем не пример, а его сегодняшнее число — прямая просьба владельца 06.09.2026.

@@ -150,6 +150,8 @@ class _AsyncOverSync:
 def _new_db() -> _AsyncOverSync:
     engine = create_engine('sqlite://')
     with engine.begin() as connection:
+        # SQLite проверяет отбор/отметки, а настоящий замок — отдельный PostgreSQL-тест.
+        connection.connection.driver_connection.create_function('pg_try_advisory_xact_lock', 2, lambda *_: True)
         _create_schema(connection)
     return _AsyncOverSync(Session(engine, expire_on_commit=False, autoflush=False))
 
@@ -325,12 +327,15 @@ async def test_team_with_a_trial_flag_gets_the_paid_letter_without_top_up_button
     [
         (0, '1 месяц — 149 ₽\n3 месяца — 399 ₽'),
         (50, '1 месяц — 149 ₽\n3 месяца — 399 ₽'),  # меньше рубля: «с вашими 0 ₽» не пишем
-        (5000, '1 месяц — 149 ₽\nс вашими 50 ₽ на балансе — 99 ₽'),
-        (4975, '1 месяц — 149 ₽\nс вашими 49 ₽ на балансе — 100 ₽'),  # 49 + 100 = 149: рубли вниз, доплата кассы
-        (1490, '1 месяц — 149 ₽\nс вашими 14 ₽ на балансе — 135 ₽'),
-        (14899, '1 месяц — 149 ₽\nс вашими 148 ₽ на балансе — 1 ₽'),
-        (14900, '1 месяц — 149 ₽\n3 месяца — 399 ₽'),
-        (60000, '1 месяц — 149 ₽\n3 месяца — 399 ₽'),
+        (5000, '1 месяц — 149 ₽\nс вашими 50 ₽ на балансе — доплатить 99 ₽'),
+        (
+            4975,
+            '1 месяц — 149 ₽\nс вашими 49 ₽ на балансе — доплатить 100 ₽',
+        ),  # 49 + 100 = 149: рубли вниз, доплата кассы
+        (1490, '1 месяц — 149 ₽\nс вашими 14 ₽ на балансе — доплатить 135 ₽'),
+        (14899, '1 месяц — 149 ₽\nс вашими 148 ₽ на балансе — доплатить 1 ₽'),
+        (14900, '1 месяц — 149 ₽\nНа балансе хватает на месяц. 149 ₽ спишутся с баланса, доплачивать не нужно.'),
+        (60000, '1 месяц — 149 ₽\nНа балансе хватает на месяц. 149 ₽ спишутся с баланса, доплачивать не нужно.'),
     ],
 )
 async def test_price_lines_come_from_the_cashier(env, db, balance, expected) -> None:
@@ -465,7 +470,7 @@ async def test_day_after_letter_from_the_panel_skips_the_trial_only(env, monkeyp
     service._notify_user.assert_not_awaited()
 
     await service._handle_user_expiration(AsyncMock(), _user(), _sub(), {'_meta': {'expiration': -24}})
-    assert service._notify_user.await_args.args[1] == 'WEBHOOK_SUB_EXPIRES_24H', 'до конца — пока панель (АП-2)'
+    service._notify_user.assert_not_awaited()  # Фактический срок уже вышел: старое предупреждение не возвращаем.
 
     for tariff_id, flag in ((PAID_TARIFF_ID, False), (TEAM_TARIFF_ID, True)):
         service._notify_user.reset_mock()
@@ -946,9 +951,36 @@ async def test_another_live_subscription_means_the_same_person_and_really_live(e
 async def test_edge_balances_give_the_plain_price_lines(env, db, monkeypatch, cells, balance, minimum) -> None:
     monkeypatch.setattr(monitoring_module.settings, 'PLATEGA_MIN_AMOUNT_KOPEKS', minimum)
     env.cashier.return_value = _options(cells=cells)
-    assert (
-        await monitoring_service._trial_price_lines(db, _user(balance=balance)) == '1 месяц — 149 ₽\n3 месяца — 399 ₽'
+    assert await monitoring_service._trial_price_lines(db, _user(balance=balance)) == (
+        '1 месяц — 149.5 ₽\n3 месяца — 399 ₽' if cells[(30, 1)] == 14950 else '1 месяц — 149 ₽\n3 месяца — 399 ₽'
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('balance', [0, 5000, 13410, 20000])
+async def test_discount_price_lines_match_the_cashier_engine_without_hiding_kopeks(env, db, balance) -> None:
+    """Direct-v2 сохраняет копейки, а доплату округляет вверх; старые134/84 здесь недофинансировали бы заказ."""
+    from app.services.device_first_checkout_service import device_first_top_up_kopeks
+    from app.services.pricing_engine import pricing_engine
+
+    user = _user(balance=balance)
+    user.promo_offer_discount_percent = 10
+    tariff = Tariff(id=31, device_limit=1, is_daily=False, period_prices={'30': 14900, '90': 39900})
+    cells = {}
+    for days in (30, 90):
+        quote = await pricing_engine.calculate_tariff_purchase_price(tariff, days, device_limit=1, user=user)
+        cells[(days, 1)] = quote.final_total
+    env.cashier.return_value = _options(cells=cells)
+    lines = await monitoring_service._trial_price_lines(db, user)
+    assert cells[(30, 1)] == 13410 and cells[(90, 1)] == 35910
+    assert '1 месяц — 134.1 ₽' in lines
+    if balance == 0:
+        assert '3 месяца — 359.1 ₽' in lines
+    elif balance < cells[(30, 1)]:
+        assert device_first_top_up_kopeks(price_kopeks=cells[(30, 1)], balance_kopeks=balance) == 8500
+        assert 'с вашими 50 ₽ на балансе — доплатить 85 ₽' in lines.split('\n')
+    else:
+        assert '134.1 ₽ спишутся с баланса, доплачивать не нужно.' in lines
 
 
 @pytest.mark.asyncio
@@ -1089,7 +1121,7 @@ def test_the_price_lines_card_names_when_each_variant_is_used() -> None:
     (insert_,) = [item for item in _text_facts('trial-expired')['text_inserts'] if item.name == 'price_lines']
     whens = {variant.text: variant.when for variant in insert_.variants}
     assert 'меньше рубля' in whens['1 месяц — {month_price}\n3 месяца — {quarter_price}']
-    assert 'от рубля' in whens['1 месяц — {month_price}\nс вашими {balance} на балансе — {top_up}']
+    assert 'от рубля' in whens['1 месяц — {month_price}\nс вашими {balance} на балансе — доплатить {top_up}']
 
 
 def test_price_markers_are_explained_only_on_their_own_card() -> None:
@@ -1367,3 +1399,186 @@ async def test_the_sweep_loads_the_tariff_up_front_and_rereads_the_row(env) -> N
         for element in option.context
     ), 'тариф должен подгружаться заранее'
     assert statement.get_execution_options().get('populate_existing') is True
+
+
+@pytest.fixture
+def warning_service(env, monkeypatch):
+    service = _webhook(monkeypatch)
+    service.bot = env.bot
+    monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_USER_ENABLED', True)
+    monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_SUB_EXPIRING', True)
+
+    async def deliver(**kwargs):
+        await env.bot.send_message(
+            chat_id=kwargs['user'].telegram_id,
+            text=kwargs['telegram_message'],
+            reply_markup=kwargs['telegram_markup'],
+            disable_notification=kwargs['telegram_silent'],
+        )
+        return True
+
+    monkeypatch.setattr(monitoring_module.notification_delivery_service, 'send_notification', deliver)
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [48, 24])
+async def test_trial_warning_replaces_old_and_new_panel_events_once(env, db, warning_service, hours):
+    subscription = _sub(status='active', end=timedelta(hours=hours))
+    user = _user(balance=5000)
+    legacy = warning_service._handle_expires_in_48h if hours == 48 else warning_service._handle_expires_in_24h
+    await legacy(db, user, subscription, {})
+    await warning_service._handle_user_expiration(db, user, subscription, {'_meta': {'expiration': -hours}})
+    env.bot.send_message.assert_awaited_once()
+    warning_service._notify_user.assert_not_awaited()
+    sent = env.bot.send_message.await_args.kwargs
+    assert 'Пробный период' in sent['text'] and 'с вашими 50 ₽ на балансе — доплатить 99 ₽' in sent['text']
+    assert ('через 2 дня' if hours == 48 else 'завтра') in sent['text']
+    assert 'Продлите' not in sent['text']
+    assert [b.text for row in sent['reply_markup'].inline_keyboard for b in row] == ['💎 Оформить подписку']
+    assert [b.callback_data for row in sent['reply_markup'].inline_keyboard for b in row] == ['menu_buy']
+    assert await _marks(db) == {(USER_ID, 233, f'trial_expiring_{hours}h')}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [48, 24])
+async def test_switch_off_does_not_restore_panel_letter_or_switch_off_the_other(
+    env, db, warning_service, monkeypatch, hours
+):
+    off = f'trial_expiring_{hours}h'
+    monkeypatch.setattr(NotificationSettingsService, 'is_enabled', classmethod(lambda cls, key: key != off))
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=hours)), {'_meta': {'expiration': -hours}}
+    )
+    env.bot.send_message.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    other = 24 if hours == 48 else 48
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=other)), {'_meta': {'expiration': -other}}
+    )
+    env.bot.send_message.assert_awaited_once()
+    assert await _marks(db) == {(USER_ID, 233, f'trial_expiring_{other}h')}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('status', 'end'), [('active', -1), ('disabled', 24), ('active', 168), ('active', 10)])
+async def test_stale_or_disabled_trial_warning_does_not_write(env, db, warning_service, status, end):
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status=status, end=timedelta(hours=end)), {'_meta': {'expiration': -24}}
+    )
+    env.bot.send_message.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    assert not await _marks(db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [-30, -55])
+async def test_nonstandard_expiration_keeps_the_existing_panel_path(env, db, warning_service, hours):
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=-hours)), {'_meta': {'expiration': hours}}
+    )
+    assert warning_service._notify_user.await_args.args[1] == (
+        'WEBHOOK_SUB_EXPIRES_24H' if hours == -30 else 'WEBHOOK_SUB_EXPIRES_48H'
+    )
+    env.bot.send_message.assert_not_awaited()
+    assert not await _marks(db)
+
+
+@pytest.mark.asyncio
+async def test_old_panel_term_does_not_warn_the_current_trial(env, db, warning_service):
+    subscription = _sub(status='active', end=timedelta(hours=24))
+    await warning_service._handle_user_expiration(
+        db,
+        _user(),
+        subscription,
+        {'_meta': {'expiration': -24}, 'expireAt': (subscription.end_date - timedelta(days=1)).isoformat()},
+    )
+    env.bot.send_message.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    assert not await _marks(db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tariff_id', [PAID_TARIFF_ID, TEAM_TARIFF_ID])
+@pytest.mark.parametrize('hours', [48, 24])
+async def test_paid_or_team_with_trial_flag_keeps_panel_warning(env, db, warning_service, tariff_id, hours):
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(tariff_id=tariff_id, is_trial=True), {'_meta': {'expiration': -hours}}
+    )
+    assert warning_service._notify_user.await_args.args[1] == f'WEBHOOK_SUB_EXPIRES_{hours}H'
+    env.bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('utc_hour', 'minute', 'silent'), [(21, 0, True), (4, 59, True), (5, 0, False), (20, 59, False)]
+)
+async def test_warning_uses_moscow_quiet_night(env, db, warning_service, monkeypatch, utc_hour, minute, silent):
+    moment = datetime(2026, 10, 12, utc_hour, minute, tzinfo=UTC)
+    monkeypatch.setattr(monitoring_module, 'is_quiet_night', lambda: is_quiet_night(moment))
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=24)), {'_meta': {'expiration': -24}}
+    )
+    assert env.bot.send_message.await_args.kwargs['disable_notification'] is silent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [False, RuntimeError('delivery interrupted')])
+async def test_failed_warning_has_no_mark_and_no_panel_fallback(env, db, warning_service, monkeypatch, failure):
+    delivery = AsyncMock(return_value=False, side_effect=failure if isinstance(failure, Exception) else None)
+    monkeypatch.setattr(monitoring_module.notification_delivery_service, 'send_notification', delivery)
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=24)), {'_meta': {'expiration': -24}}
+    )
+    assert not await _marks(db)
+    warning_service._notify_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['no_channel', 'inactive', 'master_off', 'expiring_off', 'invalid_term', 'naive_term'])
+async def test_warning_rejects_ineligible_recipient_server_switch_and_invalid_term(
+    env, db, warning_service, monkeypatch, case
+):
+    user = _user(
+        telegram_id=None if case == 'no_channel' else TELEGRAM_ID, status='blocked' if case == 'inactive' else 'active'
+    )
+    if case == 'master_off':
+        monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_USER_ENABLED', False)
+    if case == 'expiring_off':
+        monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_SUB_EXPIRING', False)
+    data = {'_meta': {'expiration': -24}}
+    if case == 'no_channel':
+        delivery = monitoring_module.notification_delivery_service
+        monkeypatch.setattr(delivery, 'send_notification', type(delivery).send_notification.__get__(delivery))
+    if case in ('invalid_term', 'naive_term'):
+        data['expireAt'] = 'not-a-date' if case == 'invalid_term' else '2026-10-13T12:00:00'
+    await warning_service._handle_user_expiration(db, user, _sub(status='active', end=timedelta(hours=24)), data)
+    env.bot.send_message.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    assert not await _marks(db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('ws_sent', [True, False])
+async def test_warning_keeps_the_unified_channel_for_verified_email_user(
+    env, db, warning_service, monkeypatch, ws_sent
+):
+    user = _user(telegram_id=None)
+    user.email, user.email_verified = 'trial@example.test', True
+    delivery = monitoring_module.notification_delivery_service
+    monkeypatch.setattr(delivery, 'send_notification', type(delivery).send_notification.__get__(delivery))
+    telegram, email = AsyncMock(), AsyncMock(return_value=False)
+    ws = AsyncMock(return_value=ws_sent)
+    monkeypatch.setattr(delivery, '_send_telegram_notification', telegram)
+    monkeypatch.setattr(delivery, '_send_email_notification', email)
+    monkeypatch.setattr(delivery, '_ws_manager', SimpleNamespace(send_to_user=ws))
+    await warning_service._handle_user_expiration(
+        db, user, _sub(status='active', end=timedelta(hours=24)), {'_meta': {'expiration': -24}}
+    )
+    ws.assert_awaited_once()
+    assert ws.await_args.args[1]['type'] == 'notification.webhook_sub_expiring'
+    assert ws.await_args.args[1]['text_key'] == 'TRIAL_EXPIRING_24H'
+    assert '1 месяц — 149 ₽' in ws.await_args.args[1]['price_lines']
+    telegram.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    assert await _marks(db) == ({(USER_ID, 233, 'trial_expiring_24h')} if ws_sent else set())

@@ -387,6 +387,12 @@ async def claim_discount_offer(
             ]
         ]
     )
+    if getattr(offer, 'notification_type', None) == 'trial_expired_discount':
+        from app.services.monitoring_service import monitoring_service
+
+        price_lines = await monitoring_service._trial_price_lines(db, db_user)
+        if price_lines:
+            success_message += f'\n\n{price_lines}'
     await callback.message.answer(success_message, reply_markup=buy_keyboard)
 
 

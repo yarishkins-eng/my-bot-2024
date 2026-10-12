@@ -1675,6 +1675,12 @@ class RemnaWaveWebhookService:
         if not subscription:
             logger.info('Webhook expires_48h: подписка не найдена в БД, пропуск', user_id=user.id)
             return
+        from app.services.monitoring_service import monitoring_service
+
+        if await monitoring_service.handle_trial_expiring(
+            db, user, subscription, hours=48, bot=self.bot, panel_expire_at=data.get('expireAt')
+        ):
+            return
         await self._notify_user(
             user,
             'WEBHOOK_SUB_EXPIRES_48H',
@@ -1687,6 +1693,12 @@ class RemnaWaveWebhookService:
     ) -> None:
         if not subscription:
             logger.info('Webhook expires_24h: подписка не найдена в БД, пропуск', user_id=user.id)
+            return
+        from app.services.monitoring_service import monitoring_service
+
+        if await monitoring_service.handle_trial_expiring(
+            db, user, subscription, hours=24, bot=self.bot, panel_expire_at=data.get('expireAt')
+        ):
             return
         await self._notify_user(
             user,
@@ -1748,6 +1760,14 @@ class RemnaWaveWebhookService:
                 hours=hours,
                 text_key=text_key,
             )
+
+        if hours in (-48, -24):
+            from app.services.monitoring_service import monitoring_service
+
+            if await monitoring_service.handle_trial_expiring(
+                db, user, subscription, hours=-hours, bot=self.bot, panel_expire_at=data.get('expireAt')
+            ):
+                return
 
         if text_key == 'WEBHOOK_SUB_EXPIRED_24H_AGO':
             # ВК-4 (решение владельца 07.10.2026): пробному «💤 Подписка истекла вчера… продлите» не шлём — в тот же

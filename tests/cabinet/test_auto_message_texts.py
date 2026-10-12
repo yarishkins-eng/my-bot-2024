@@ -136,6 +136,8 @@ async def test_the_shown_text_is_the_one_that_is_actually_sent() -> None:
 # показывала бы письмо про баланс), и подмена константы на выдуманную копию, то есть
 # ровно то, что владелец запретил прямым текстом.
 _SENDER_OF: dict[str, tuple[str, str, str]] = {
+    'trial-2d': (_MONITORING, 'handle_trial_expiring', 'TRIAL_EXPIRING_48H'),
+    'trial-1d': (_MONITORING, 'handle_trial_expiring', 'TRIAL_EXPIRING_24H'),
     'trial-started': ('app/utils/funnel_notify.py', 'send_funnel_trial_menu', 'FUNNEL_TRIAL_ACTIVATED'),
     # id: (модуль, функция-отправитель, имя ключа локали ИЛИ имя константы)
     'trial-not-connected': (_MONITORING, '_send_trial_not_connected_notification', 'TRIAL_NOT_CONNECTED_TEXT'),

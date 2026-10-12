@@ -77,6 +77,8 @@ class NotificationSettingsService:
         # ВК-4: «Пробный истёк» и «Подписка истекла» больше не делят выключатель — письмо выбирает пробный или
         # платный по тарифу и проверяет свой ключ.
         'trial_expired': {'enabled': True},
+        'trial_expiring_48h': {'enabled': True},
+        'trial_expiring_24h': {'enabled': True},
         'subscription_expired': {'enabled': True},
         'subscription_expiring': {'enabled': True},  # «истекает через 3 дня» И «истекает завтра»
         'traffic_warning': {'enabled': True},
@@ -443,6 +445,8 @@ class NotificationSettingsService:
         {
             # 13 ключей словаря локалей
             'FUNNEL_TRIAL_ACTIVATED',
+            'TRIAL_EXPIRING_48H',
+            'TRIAL_EXPIRING_24H',
             'TRIAL_EXPIRED_NOTIFICATION',
             'TRIAL_EXPIRED_DISCOUNT',
             'SUBSCRIPTION_EXPIRING_PAID',
