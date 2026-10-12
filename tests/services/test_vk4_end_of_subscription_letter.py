@@ -549,7 +549,7 @@ async def test_every_attempt_leaves_a_log_line_with_its_outcome(env, db, monkeyp
         ('Письмо о конце подписки отправлено', None, 233),
         ('Письмо о конце подписки не отправлено', 'already_sent', 233),
         ('Письмо о конце подписки не отправлено', 'not_delivered', 51),
-        ('Письмо о конце подписки не отправлено', 'no_channel', 52),
+        ('Письмо о конце подписки не отправлено', 'no_telegram', 52),
         ('Письмо о конце подписки не отправлено', 'switched_off', 53),
     ]
     assert all(fields['source'] == 'test' and fields['end_date'] is not None for _, fields in lines)
