@@ -1656,11 +1656,27 @@ class RemnaWaveWebhookService:
     ) -> None:
         logger.info('Webhook: user created externally in panel', user_id=user.id, data=data.get('uuid'))
 
+    async def _skip_panel_expiration(
+        self, db: AsyncSession, subscription: Subscription, hours: int, *, trial_handled: bool = False
+    ) -> bool:
+        """АП-7: после перехвата пробных панель остаётся только флаговым на непробном тарифе.
+
+        Правило ВК-4 для «истекла вчера» сохраняется и в legacy: настоящему пробному его не пересылаем.
+        """
+        from app.services.monitoring_service import is_canonical_trial
+
+        if trial_handled or await is_canonical_trial(db, subscription) or not subscription.is_trial:
+            logger.info('письмо панели о конце не пересылаем', hours=hours, subscription_id=subscription.id)
+            return True
+        return False
+
     async def _handle_expires_in_72h(
         self, db: AsyncSession, user: User, subscription: Subscription | None, data: dict
     ) -> None:
         if not subscription:
             logger.info('Webhook expires_72h: подписка не найдена в БД, пропуск', user_id=user.id)
+            return
+        if await self._skip_panel_expiration(db, subscription, -72):
             return
         await self._notify_user(
             user,
@@ -1677,9 +1693,10 @@ class RemnaWaveWebhookService:
             return
         from app.services.monitoring_service import monitoring_service
 
-        if await monitoring_service.handle_trial_expiring(
+        trial_handled = await monitoring_service.handle_trial_expiring(
             db, user, subscription, hours=48, bot=self.bot, panel_expire_at=data.get('expireAt')
-        ):
+        )
+        if await self._skip_panel_expiration(db, subscription, -48, trial_handled=trial_handled):
             return
         await self._notify_user(
             user,
@@ -1696,9 +1713,10 @@ class RemnaWaveWebhookService:
             return
         from app.services.monitoring_service import monitoring_service
 
-        if await monitoring_service.handle_trial_expiring(
+        trial_handled = await monitoring_service.handle_trial_expiring(
             db, user, subscription, hours=24, bot=self.bot, panel_expire_at=data.get('expireAt')
-        ):
+        )
+        if await self._skip_panel_expiration(db, subscription, -24, trial_handled=trial_handled):
             return
         await self._notify_user(
             user,
@@ -1712,6 +1730,8 @@ class RemnaWaveWebhookService:
     ) -> None:
         if not subscription:
             logger.info('Webhook expired_24h_ago: подписка не найдена в БД, пропуск', user_id=user.id)
+            return
+        if await self._skip_panel_expiration(db, subscription, 24):
             return
         await self._notify_user(
             user,
@@ -1761,26 +1781,16 @@ class RemnaWaveWebhookService:
                 text_key=text_key,
             )
 
+        trial_handled = False
         if hours in (-48, -24):
             from app.services.monitoring_service import monitoring_service
 
-            if await monitoring_service.handle_trial_expiring(
+            trial_handled = await monitoring_service.handle_trial_expiring(
                 db, user, subscription, hours=-hours, bot=self.bot, panel_expire_at=data.get('expireAt')
-            ):
-                return
+            )
 
-        if text_key == 'WEBHOOK_SUB_EXPIRED_24H_AGO':
-            # ВК-4 (решение владельца 07.10.2026): пробному «💤 Подписка истекла вчера… продлите» не шлём — в тот же
-            # час уходит наше письмо со скидкой на первую подписку. Пробный — по тарифу; платным письмо остаётся.
-            from app.services.monitoring_service import is_canonical_trial
-
-            if await is_canonical_trial(db, subscription):
-                logger.info(
-                    'Webhook user.expiration: «истекла вчера» пробному не шлём',
-                    user_id=user.id,
-                    subscription_id=subscription.id,
-                )
-                return
+        if await self._skip_panel_expiration(db, subscription, hours, trial_handled=trial_handled):
+            return
 
         await self._notify_user(
             user,
