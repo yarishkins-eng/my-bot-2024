@@ -2720,7 +2720,7 @@ class MonitoringService:
         return found is not None
 
     async def handle_trial_expiring(
-        self, db: AsyncSession, user: User, subscription: Subscription, *, hours: int, bot
+        self, db: AsyncSession, user: User, subscription: Subscription, *, hours: int, bot, panel_expire_at=None
     ) -> bool:
         """True означает, что пробный обработан: даже при выключении письмо панели не возвращается."""
         if not await is_canonical_trial(db, subscription):
@@ -2735,8 +2735,17 @@ class MonitoringService:
             )
             return True
 
-        if subscription.end_date <= now or subscription.end_date > now + timedelta(hours=hours + 1):
+        # Панель 2.8.1 выбирает минутный интервал; допускаем до часа задержки доставки.
+        # Старое «через 2 дня» через сутки после события уже не соответствует текущему сроку.
+        if not now + timedelta(hours=hours - 1) <= subscription.end_date <= now + timedelta(hours=hours, minutes=1):
             return skipped('stale_event')
+        if panel_expire_at is not None:
+            try:
+                panel_end = datetime.fromisoformat(str(panel_expire_at).replace('Z', '+00:00'))
+                if abs((panel_end - subscription.end_date).total_seconds()) > 1:
+                    return skipped('different_term')
+            except (TypeError, ValueError):
+                return skipped('invalid_panel_term')
         if subscription.status not in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.LIMITED.value):
             return skipped('not_active')
         if not user.telegram_id or user.status != UserStatus.ACTIVE.value:

@@ -1458,10 +1458,37 @@ async def test_switch_off_does_not_restore_panel_letter_or_switch_off_the_other(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('status', 'end'), [('active', -1), ('disabled', 24), ('active', 168)])
+@pytest.mark.parametrize(('status', 'end'), [('active', -1), ('disabled', 24), ('active', 168), ('active', 10)])
 async def test_stale_or_disabled_trial_warning_does_not_write(env, db, warning_service, status, end):
     await warning_service._handle_user_expiration(
         db, _user(), _sub(status=status, end=timedelta(hours=end)), {'_meta': {'expiration': -24}}
+    )
+    env.bot.send_message.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    assert not await _marks(db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [-30, -55])
+async def test_nonstandard_expiration_keeps_the_existing_panel_path(env, db, warning_service, hours):
+    await warning_service._handle_user_expiration(
+        db, _user(), _sub(status='active', end=timedelta(hours=-hours)), {'_meta': {'expiration': hours}}
+    )
+    assert warning_service._notify_user.await_args.args[1] == (
+        'WEBHOOK_SUB_EXPIRES_24H' if hours == -30 else 'WEBHOOK_SUB_EXPIRES_48H'
+    )
+    env.bot.send_message.assert_not_awaited()
+    assert not await _marks(db)
+
+
+@pytest.mark.asyncio
+async def test_old_panel_term_does_not_warn_the_current_trial(env, db, warning_service):
+    subscription = _sub(status='active', end=timedelta(hours=24))
+    await warning_service._handle_user_expiration(
+        db,
+        _user(),
+        subscription,
+        {'_meta': {'expiration': -24}, 'expireAt': (subscription.end_date - timedelta(days=1)).isoformat()},
     )
     env.bot.send_message.assert_not_awaited()
     warning_service._notify_user.assert_not_awaited()

@@ -1677,7 +1677,9 @@ class RemnaWaveWebhookService:
             return
         from app.services.monitoring_service import monitoring_service
 
-        if await monitoring_service.handle_trial_expiring(db, user, subscription, hours=48, bot=self.bot):
+        if await monitoring_service.handle_trial_expiring(
+            db, user, subscription, hours=48, bot=self.bot, panel_expire_at=data.get('expireAt')
+        ):
             return
         await self._notify_user(
             user,
@@ -1694,7 +1696,9 @@ class RemnaWaveWebhookService:
             return
         from app.services.monitoring_service import monitoring_service
 
-        if await monitoring_service.handle_trial_expiring(db, user, subscription, hours=24, bot=self.bot):
+        if await monitoring_service.handle_trial_expiring(
+            db, user, subscription, hours=24, bot=self.bot, panel_expire_at=data.get('expireAt')
+        ):
             return
         await self._notify_user(
             user,
@@ -1757,11 +1761,12 @@ class RemnaWaveWebhookService:
                 text_key=text_key,
             )
 
-        if text_key in ('WEBHOOK_SUB_EXPIRES_48H', 'WEBHOOK_SUB_EXPIRES_24H'):
+        if hours in (-48, -24):
             from app.services.monitoring_service import monitoring_service
 
-            hours = 48 if text_key == 'WEBHOOK_SUB_EXPIRES_48H' else 24
-            if await monitoring_service.handle_trial_expiring(db, user, subscription, hours=hours, bot=self.bot):
+            if await monitoring_service.handle_trial_expiring(
+                db, user, subscription, hours=-hours, bot=self.bot, panel_expire_at=data.get('expireAt')
+            ):
                 return
 
         if text_key == 'WEBHOOK_SUB_EXPIRED_24H_AGO':
