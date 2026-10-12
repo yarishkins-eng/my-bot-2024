@@ -44,6 +44,7 @@ def _expired(*, is_trial: bool, days_ago: float):
         user=user,
         user_id=user.id,
         tariff=None,
+        tariff_id=17 if is_trial else 31,
         is_trial=is_trial,
         in_grace=False,
         end_date=datetime.now(UTC) - timedelta(days=days_ago),
@@ -98,6 +99,7 @@ async def test_trial_wave_offer_carries_a_discount_lifetime(monkeypatch):
     """Третья волна делала это правильно и до правки — сторожим, чтобы не убрали."""
     offers: list[dict] = []
     monitor = _monitor(monkeypatch, offers)
+    monkeypatch.setattr(service, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=17)))
     settings_service = service.NotificationSettingsService
     monkeypatch.setattr(settings_service, 'is_trial_expired_discount_enabled', staticmethod(lambda: True))
     monkeypatch.setattr(settings_service, 'get_trial_expired_discount_trigger_days', staticmethod(lambda: 1))

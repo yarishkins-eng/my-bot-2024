@@ -1312,6 +1312,9 @@ class MonitoringService:
         if not NotificationSettingsService.is_enabled('trial_2h'):
             return
         try:
+            trial_tariff = await get_trial_tariff(db)
+            if trial_tariff is None:
+                return
             warn_hours = NotificationSettingsService.get_trial_warn_hours()
             threshold_time = datetime.now(UTC) + timedelta(hours=warn_hours)
 
@@ -1329,6 +1332,7 @@ class MonitoringService:
                     and_(
                         Subscription.status == SubscriptionStatus.ACTIVE.value,
                         Subscription.is_trial == True,
+                        Subscription.tariff_id == trial_tariff.id,
                         Subscription.end_date <= threshold_time,
                         Subscription.end_date > datetime.now(UTC),
                         User.status == UserStatus.ACTIVE.value,
@@ -2051,7 +2055,7 @@ class MonitoringService:
 
         Через trigger_days дней после окончания триала создаёт персональный промо-оффер
         и шлёт предложение со скидкой. Под отдельным флагом (по умолчанию ВЫКЛ).
-        Платные подписки НЕ затрагивает (фильтр is_trial==True + has_had_paid==False).
+        Пробный определяется по помеченному тарифу вместе с is_trial; прежней оплаты не было.
         """
         if not NotificationSettingsService.are_notifications_globally_enabled():
             return
@@ -2061,6 +2065,9 @@ class MonitoringService:
             return
 
         try:
+            trial_tariff = await get_trial_tariff(db)
+            if trial_tariff is None:
+                return
             now = datetime.now(UTC)
             lookback = now - timedelta(days=30)
             trigger_days = NotificationSettingsService.get_trial_expired_discount_trigger_days()
@@ -2079,6 +2086,7 @@ class MonitoringService:
                 .where(
                     and_(
                         Subscription.is_trial == True,
+                        Subscription.tariff_id == trial_tariff.id,
                         Subscription.status == SubscriptionStatus.EXPIRED.value,
                         Subscription.end_date <= now,
                         Subscription.end_date >= lookback,

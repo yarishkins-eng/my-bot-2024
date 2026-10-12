@@ -114,6 +114,15 @@ def test_trial_end_letter_goes_quiet_without_a_marked_trial_tariff(monkeypatch) 
     assert _state_of(CATALOG_BY_ID['trial-expired'], {}, {})[0] == 'live'
 
 
+@pytest.mark.parametrize('card_id', ['trial-2h', 'trial-discount'])
+def test_ap7_trial_cards_go_quiet_without_a_marked_trial_tariff(monkeypatch, card_id) -> None:
+    """АП-7: без пробного тарифа оба sender молчат, экран не должен обещать «работает»."""
+    monkeypatch.setattr(NotificationSettingsService, 'is_enabled', classmethod(lambda cls, key: True))
+    reason = 'ни один тариф не помечен пробным — отбирать не по чему'
+    assert _state_of(CATALOG_BY_ID[card_id], {'trial_tariff_marked': reason}, {})[:2] == ('quiet', reason)
+    assert _state_of(CATALOG_BY_ID[card_id], {}, {})[0] == 'live'
+
+
 def test_catalog_days_match_the_bot_settings() -> None:
     """Дни у «истекает через N» зашиты в каталог, а бот берёт их из настройки.
 

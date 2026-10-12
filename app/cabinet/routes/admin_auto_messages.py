@@ -259,6 +259,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'settings_key': 'trial_2h',
         'params': ('warn_hours',),
         'sent_type': 'trial_2h',
+        'quiet_check': 'trial_tariff_marked',
         'buttons': [
             {'label': '💎 Купить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
             {'label': '💰 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
@@ -334,6 +335,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'settings_key': 'trial_expired_discount',
         'params': ('discount_percent', 'valid_hours', 'trigger_days'),
         'sent_type': 'trial_expired_discount',
+        'quiet_check': 'trial_tariff_marked',
         'claim_type': 'trial_expired_discount',
         'warning': (
             'Если выключить, пробному через сутки после конца бот ничего не напомнит: письмо панели «Подписка '
