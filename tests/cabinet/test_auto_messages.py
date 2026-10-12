@@ -635,7 +635,16 @@ def test_messages_sharing_a_switch_say_so() -> None:
 
 def test_dangerous_messages_explain_the_consequence() -> None:
     """Там, где выключение оставит клиента без объяснения, это написано словами."""
-    dangerous = {'trial-expired', 'paid-expired', 'traffic-80', 'daily-paused', 'autopay-final'}
+    dangerous = {
+        'trial-expired',
+        'paid-expired',
+        'paid-3d',
+        'paid-1d',
+        'return-day1',
+        'traffic-80',
+        'daily-paused',
+        'autopay-final',
+    }
     for message_id in dangerous:
         warning = CATALOG_BY_ID[message_id].get('warning')
         assert warning, f'{message_id}: последствие выключения не названо'

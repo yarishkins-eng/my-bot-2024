@@ -461,8 +461,8 @@ async def test_trial_letter_is_silent_only_at_night(env, db, monkeypatch, night)
 
 
 @pytest.mark.asyncio
-async def test_day_after_letter_from_the_panel_skips_the_trial_only(env, monkeypatch) -> None:
-    """Пробному «💤 Подписка истекла вчера» не уходит — в тот же час наша скидка; платному и Team — как раньше."""
+async def test_day_after_panel_letter_remains_only_for_flagged_nontrial(env, monkeypatch) -> None:
+    """Решение12.10: платным только бот; «истекла вчера» остаётся друзьям с флагом на непробном тарифе."""
     service = _webhook(monkeypatch)
     day_after = {'_meta': {'expiration': 24}}
 
@@ -475,7 +475,10 @@ async def test_day_after_letter_from_the_panel_skips_the_trial_only(env, monkeyp
     for tariff_id, flag in ((PAID_TARIFF_ID, False), (TEAM_TARIFF_ID, True)):
         service._notify_user.reset_mock()
         await service._handle_user_expiration(AsyncMock(), _user(), _sub(tariff_id=tariff_id, is_trial=flag), day_after)
-        assert service._notify_user.await_args.args[1] == 'WEBHOOK_SUB_EXPIRED_24H_AGO'
+        if flag:
+            assert service._notify_user.await_args.args[1] == 'WEBHOOK_SUB_EXPIRED_24H_AGO'
+        else:
+            service._notify_user.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -1473,13 +1476,12 @@ async def test_stale_or_disabled_trial_warning_does_not_write(env, db, warning_s
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('hours', [-30, -55])
-async def test_nonstandard_expiration_keeps_the_existing_panel_path(env, db, warning_service, hours):
+async def test_nonstandard_expiration_does_not_forward_to_canonical_trial(env, db, warning_service, hours):
+    """Решение12.10 гасит общие письма панели настоящим пробным и при нестандартных часах; 48/24 неизменны."""
     await warning_service._handle_user_expiration(
         db, _user(), _sub(status='active', end=timedelta(hours=-hours)), {'_meta': {'expiration': hours}}
     )
-    assert warning_service._notify_user.await_args.args[1] == (
-        'WEBHOOK_SUB_EXPIRES_24H' if hours == -30 else 'WEBHOOK_SUB_EXPIRES_48H'
-    )
+    warning_service._notify_user.assert_not_awaited()
     env.bot.send_message.assert_not_awaited()
     assert not await _marks(db)
 
@@ -1502,11 +1504,143 @@ async def test_old_panel_term_does_not_warn_the_current_trial(env, db, warning_s
 @pytest.mark.parametrize('tariff_id', [PAID_TARIFF_ID, TEAM_TARIFF_ID])
 @pytest.mark.parametrize('hours', [48, 24])
 async def test_paid_or_team_with_trial_flag_keeps_panel_warning(env, db, warning_service, tariff_id, hours):
+    """Владелец12.10 «Как сейчас»: флаговым на Базовом/Team панель сохранена; это не настоящие пробные."""
     await warning_service._handle_user_expiration(
         db, _user(), _sub(tariff_id=tariff_id, is_trial=True), {'_meta': {'expiration': -hours}}
     )
     assert warning_service._notify_user.await_args.args[1] == f'WEBHOOK_SUB_EXPIRES_{hours}H'
     env.bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [48, 24])
+@pytest.mark.parametrize('legacy', [False, True])
+async def test_ap7_dispatch_still_delivers_one_trial_warning(env, db, warning_service, monkeypatch, hours, legacy):
+    """Настоящий dispatcher и sender48/24: gate после перехвата не лишает пробного письма АП-2б."""
+    user = _user()
+    subscription = _sub(status='active', end=timedelta(hours=hours))
+    monkeypatch.setattr(warning_service, '_resolve_user_and_subscription', AsyncMock(return_value=(user, subscription)))
+    event = f'user.expires_in_{hours}_hours' if legacy else 'user.expiration'
+    data = {} if legacy else {'_meta': {'expiration': -hours}}
+    assert await warning_service.process_event(db, event, data) is True
+    env.bot.send_message.assert_awaited_once()
+    warning_service._notify_user.assert_not_awaited()
+    assert await _marks(db) == {(USER_ID, 233, f'trial_expiring_{hours}h')}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [-72, 24, -30, 48])
+async def test_ap7_current_dispatch_does_not_forward_extra_panel_letters_to_trials(
+    env, db, warning_service, monkeypatch, hours
+):
+    """Решение12.10: настоящему пробному не пересылаем 72ч/+24/нестандартное даже в едином событии.
+
+    Мутация только unified−72 проходила legacy-сторожи; этот тест исполняет реальный dispatcher и классификатор.
+    """
+    user = _user()
+    subscription = _sub(status='active', end=timedelta(hours=abs(hours)))
+    monkeypatch.setattr(warning_service, '_resolve_user_and_subscription', AsyncMock(return_value=(user, subscription)))
+    log = MagicMock()
+    monkeypatch.setattr('app.services.remnawave_webhook_service.logger.info', log)
+    assert await warning_service.process_event(db, 'user.expiration', {'_meta': {'expiration': hours}}) is True
+    warning_service._notify_user.assert_not_awaited()
+    env.bot.send_message.assert_not_awaited()
+    log.assert_any_call('письмо панели о конце не пересылаем', hours=hours, subscription_id=subscription.id)
+    assert not await _marks(db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'event,hours',
+    [
+        ('user.expires_in_72_hours', -72),
+        ('user.expires_in_48_hours', -48),
+        ('user.expires_in_24_hours', -24),
+        ('user.expired_24_hours_ago', 24),
+    ],
+)
+@pytest.mark.parametrize('cohort', ['paid', 'trial', 'flagged_friend'])
+async def test_ap7_legacy_dispatch_preserves_only_flagged_friends(
+    env, db, warning_service, monkeypatch, event, hours, cohort
+):
+    """Решение12.10 действует и на старые события: друзья сохраняют пересылку, paid/trial получают только бот."""
+    user = _user()
+    tariff = TRIAL_TARIFF_ID if cohort == 'trial' else TEAM_TARIFF_ID
+    subscription = _sub(tariff_id=tariff, is_trial=cohort != 'paid', status='active', end=timedelta(hours=abs(hours)))
+    monkeypatch.setattr(warning_service, '_resolve_user_and_subscription', AsyncMock(return_value=(user, subscription)))
+    assert await warning_service.process_event(db, event, {}) is True
+    assert warning_service._notify_user.await_count == (1 if cohort == 'flagged_friend' else 0)
+    assert env.bot.send_message.await_count == (1 if cohort == 'trial' and hours in (-48, -24) else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [-72, -24, 24])
+async def test_ap7_paid_cycle_has_one_bot_letter_and_no_panel_letter(env, db, warning_service, monkeypatch, hours):
+    """Решение12.10: actual dispatcher и часовой цикл дают письмо бота при снятой пересылке панели.
+
+    WHERE/JOIN работают в SQLite; eager-loading отключён, человек подставлен reader-ом.
+    Внешняя доставка/цена подменены, отметки настоящие. Это не живой Telegram-smoke.
+    """
+    user = _user()
+    subscription = _sub(
+        tariff_id=PAID_TARIFF_ID,
+        is_trial=False,
+        status='expired' if hours > 0 else 'active',
+        end=timedelta(hours=-25 if hours > 0 else -hours),
+    )
+    subscription.user = user
+    users = Table('users', MetaData(), Column('id', Integer), Column('telegram_id', Integer), Column('status', String))
+    await db.execute(insert(users).values(id=USER_ID, telegram_id=TELEGRAM_ID, status='active'))
+    await db.execute(
+        insert(Subscription).values(
+            id=subscription.id,
+            user_id=USER_ID,
+            tariff_id=PAID_TARIFF_ID,
+            is_trial=False,
+            status=subscription.status,
+            end_date=subscription.end_date,
+            in_grace=False,
+            remnawave_short_id='ap7-paid',
+        )
+    )
+    await db.commit()
+    real_execute = db.execute
+
+    async def execute(statement, *args, **kwargs):
+        if (
+            getattr(statement, 'column_descriptions', ())
+            and statement.column_descriptions[0].get('entity') is Subscription
+        ):
+            selection = statement.with_only_columns(Subscription.id)
+            selection._with_options = ()
+            ids = (await real_execute(selection, *args, **kwargs)).scalars().all()
+            return SimpleNamespace(
+                scalars=lambda: SimpleNamespace(all=lambda: [subscription for sid in ids if sid == subscription.id])
+            )
+        return await real_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, 'execute', execute)
+    monkeypatch.setattr(monitoring_module, 'get_user_by_id', AsyncMock(return_value=user))
+    monkeypatch.setattr(monitoring_service, '_log_monitoring_event', AsyncMock())
+    monkeypatch.setattr(
+        NotificationSettingsService, 'are_notifications_globally_enabled', classmethod(lambda cls: True)
+    )
+    monkeypatch.setattr(NotificationSettingsService, 'is_expired_1d_enabled', classmethod(lambda cls: True))
+    monkeypatch.setattr(
+        'app.services.pricing_engine.pricing_engine.calculate_renewal_price',
+        AsyncMock(return_value=SimpleNamespace(final_total=14900)),
+    )
+    monkeypatch.setattr(warning_service, '_resolve_user_and_subscription', AsyncMock(return_value=(user, subscription)))
+    assert await warning_service.process_event(db, 'user.expiration', {'_meta': {'expiration': hours}}) is True
+    if hours < 0:
+        await monitoring_service._check_expiring_subscriptions(db)
+    else:
+        await monitoring_service._check_expired_subscription_followups(db)
+    warning_service._notify_user.assert_not_awaited()
+    env.logo.assert_awaited_once()
+    assert 'подписк' in env.logo.await_args.kwargs['text'].lower()
+    mark = 'expiring' if hours < 0 else 'expired_1d'
+    assert await _marks(db) == {(USER_ID, subscription.id, mark)}
 
 
 @pytest.mark.asyncio

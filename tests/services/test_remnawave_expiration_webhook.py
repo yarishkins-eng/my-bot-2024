@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from app.services.remnawave_webhook_service import RemnaWaveWebhookService
 
 
@@ -24,11 +26,11 @@ def _user() -> MagicMock:
     return u
 
 
-def _sub() -> MagicMock:
+def _sub(*, flagged_friend=False) -> MagicMock:
     s = MagicMock()
     s.id = 42
-    # Платная: «истекла вчера» платным уходит как раньше — ВК-4 снимает его только пробным (по тарифу).
-    s.is_trial = False
+    s.is_trial = flagged_friend
+    s.tariff_id = 31
     return s
 
 
@@ -68,7 +70,9 @@ async def test_new_and_old_events_both_registered():
         assert old in svc._user_handlers
 
 
-async def test_canonical_hours_map_to_legacy_messages():
+async def test_canonical_hours_map_to_legacy_messages_for_flagged_friends(monkeypatch):
+    """Решение12.10: маппинг сохраняется друзьям с флагом на обычном тарифе, платным пересылка снята."""
+    monkeypatch.setattr('app.services.monitoring_service.is_canonical_trial', AsyncMock(return_value=False))
     cases = {
         -72: 'WEBHOOK_SUB_EXPIRES_72H',
         -48: 'WEBHOOK_SUB_EXPIRES_48H',
@@ -77,38 +81,46 @@ async def test_canonical_hours_map_to_legacy_messages():
     }
     for hours, expected in cases.items():
         svc = _service()
-        await svc._handle_user_expiration(None, _user(), _sub(), _receiver_data(hours))
+        await svc._handle_user_expiration(None, _user(), _sub(flagged_friend=True), _receiver_data(hours))
         svc._notify_user.assert_awaited_once()
         assert _sent_key(svc) == expected
 
 
-async def test_reads_receiver_meta_key_not_raw_meta():
+async def test_reads_receiver_meta_key_not_raw_meta(monkeypatch):
     """Regression: the handler reads data['_meta'] (receiver contract). A payload
     carrying the RAW envelope key 'meta' (i.e. receiver injection skipped) must
     NOT produce a notification — this is exactly the bug that silently dropped
     every user.expiration notification on 2.8.0."""
+    # АП-7: выбираем оставшуюся пересылаемую когорту, чтобы новый paid-gate не маскировал ошибку разбора meta.
+    monkeypatch.setattr('app.services.monitoring_service.is_canonical_trial', AsyncMock(return_value=False))
     svc = _service()
-    await svc._handle_user_expiration(None, _user(), _sub(), {'meta': {'expiration': -24}})
+    await svc._handle_user_expiration(None, _user(), _sub(flagged_friend=True), {'meta': {'expiration': -24}})
     svc._notify_user.assert_not_awaited()
 
 
-async def test_non_canonical_negative_picks_nearest_before_message():
+async def test_non_canonical_negative_picks_nearest_before_message_for_flagged_friends(monkeypatch):
+    """Решение12.10: нестандартный интервал продолжает nearest-пересылку только флаговым непробным."""
+    monkeypatch.setattr('app.services.monitoring_service.is_canonical_trial', AsyncMock(return_value=False))
     svc = _service()
     # -30 is closest to -24 → "expires in <24h" message.
-    await svc._handle_user_expiration(None, _user(), _sub(), _receiver_data(-30))
+    await svc._handle_user_expiration(None, _user(), _sub(flagged_friend=True), _receiver_data(-30))
     assert _sent_key(svc) == 'WEBHOOK_SUB_EXPIRES_24H'
 
 
-async def test_non_canonical_positive_uses_expired_message():
+async def test_non_canonical_positive_uses_expired_message_for_flagged_friends(monkeypatch):
+    """Решение12.10: общее «после» сохранено друзьям; платным его больше не пересылаем."""
+    monkeypatch.setattr('app.services.monitoring_service.is_canonical_trial', AsyncMock(return_value=False))
     svc = _service()
-    await svc._handle_user_expiration(None, _user(), _sub(), _receiver_data(48))
+    await svc._handle_user_expiration(None, _user(), _sub(flagged_friend=True), _receiver_data(48))
     assert _sent_key(svc) == 'WEBHOOK_SUB_EXPIRED_24H_AGO'
 
 
-async def test_missing_or_invalid_meta_sends_nothing():
+async def test_missing_or_invalid_meta_sends_nothing(monkeypatch):
+    """АП-7: ошибка meta должна молчать даже у друзей, которым пересылка по решению владельца сохранена."""
+    monkeypatch.setattr('app.services.monitoring_service.is_canonical_trial', AsyncMock(return_value=False))
     for data in ({'_meta': {}}, {'_meta': {'expiration': 'oops'}}, {}, {'_meta': None}):
         svc = _service()
-        await svc._handle_user_expiration(None, _user(), _sub(), data)
+        await svc._handle_user_expiration(None, _user(), _sub(flagged_friend=True), data)
         svc._notify_user.assert_not_awaited()
 
 
@@ -116,6 +128,24 @@ async def test_no_subscription_sends_nothing():
     svc = _service()
     await svc._handle_user_expiration(None, _user(), None, _receiver_data(-24))
     svc._notify_user.assert_not_awaited()
+
+
+@pytest.mark.parametrize('hours', [-72, -48, -24, 24, -30, -55, -1, 0, 48, 100])
+async def test_ap7_paid_panel_expiration_is_not_forwarded(hours):
+    """Владелец12.10 выбрал только письма бота платным, включая нестандартные часы панели."""
+    svc = _service()
+    await svc._handle_user_expiration(None, _user(), _sub(), _receiver_data(hours))
+    svc._notify_user.assert_not_awaited()
+
+
+@pytest.mark.parametrize('hours', [-72, -48, -24, 24, -30, 48])
+async def test_ap7_every_suppressed_expiration_has_hours_and_subscription_in_log(monkeypatch, hours):
+    """Журнал позволяет принять отсутствие пересылки на настоящем событии, не по отсутствию доставки."""
+    logger = MagicMock()
+    monkeypatch.setattr('app.services.remnawave_webhook_service.logger.info', logger)
+    svc = _service()
+    await svc._handle_user_expiration(None, _user(), _sub(), _receiver_data(hours))
+    logger.assert_any_call('письмо панели о конце не пересылаем', hours=hours, subscription_id=42)
 
 
 async def test_new_2_8_0_api_token_admin_events_registered():
