@@ -1872,8 +1872,11 @@ async def handle_extend_subscription(
     # Триальная подписка с тарифом — направляем на покупку этого тарифа
     if subscription.is_trial:
         if subscription.tariff_id and settings.is_tariffs_mode():
+            from .device_first import show_device_first_entry
             from .tariff_purchase import show_tariff_extend
 
+            if await show_device_first_entry(callback, db_user, db, state, origin_callback='back_to_menu'):
+                return
             await show_tariff_extend(callback, db_user, db)
             return
         # Триал без тарифа — предлагаем выбрать
@@ -1911,8 +1914,11 @@ async def handle_extend_subscription(
 
         if tariff:
             # У подписки есть тариф - перенаправляем на продление по тарифу
+            from .device_first import show_device_first_entry
             from .tariff_purchase import show_tariff_extend
 
+            if await show_device_first_entry(callback, db_user, db, state, origin_callback='back_to_menu'):
+                return
             await show_tariff_extend(callback, db_user, db)
             return
 
