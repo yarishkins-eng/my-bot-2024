@@ -2748,8 +2748,8 @@ class MonitoringService:
                 return skipped('invalid_panel_term')
         if subscription.status not in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.LIMITED.value):
             return skipped('not_active')
-        if not user.telegram_id or user.status != UserStatus.ACTIVE.value:
-            return skipped('no_telegram')
+        if user.status != UserStatus.ACTIVE.value:
+            return skipped('inactive_user')
         if hours == 48 and not NotificationSettingsService.is_enabled('trial_expiring_48h'):
             return skipped('switched_off')
         if hours == 24 and not NotificationSettingsService.is_enabled('trial_expiring_24h'):

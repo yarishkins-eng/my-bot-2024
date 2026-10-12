@@ -549,7 +549,7 @@ async def test_every_attempt_leaves_a_log_line_with_its_outcome(env, db, monkeyp
         ('Письмо о конце подписки отправлено', None, 233),
         ('Письмо о конце подписки не отправлено', 'already_sent', 233),
         ('Письмо о конце подписки не отправлено', 'not_delivered', 51),
-        ('Письмо о конце подписки не отправлено', 'no_telegram', 52),
+        ('Письмо о конце подписки не отправлено', 'no_channel', 52),
         ('Письмо о конце подписки не отправлено', 'switched_off', 53),
     ]
     assert all(fields['source'] == 'test' and fields['end_date'] is not None for _, fields in lines)
@@ -1535,23 +1535,50 @@ async def test_failed_warning_has_no_mark_and_no_panel_fallback(env, db, warning
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'case', ['no_telegram', 'inactive', 'master_off', 'expiring_off', 'invalid_term', 'naive_term']
-)
+@pytest.mark.parametrize('case', ['no_channel', 'inactive', 'master_off', 'expiring_off', 'invalid_term', 'naive_term'])
 async def test_warning_rejects_ineligible_recipient_server_switch_and_invalid_term(
     env, db, warning_service, monkeypatch, case
 ):
     user = _user(
-        telegram_id=None if case == 'no_telegram' else TELEGRAM_ID, status='blocked' if case == 'inactive' else 'active'
+        telegram_id=None if case == 'no_channel' else TELEGRAM_ID, status='blocked' if case == 'inactive' else 'active'
     )
     if case == 'master_off':
         monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_USER_ENABLED', False)
     if case == 'expiring_off':
         monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_SUB_EXPIRING', False)
     data = {'_meta': {'expiration': -24}}
+    if case == 'no_channel':
+        delivery = monitoring_module.notification_delivery_service
+        monkeypatch.setattr(delivery, 'send_notification', type(delivery).send_notification.__get__(delivery))
     if case in ('invalid_term', 'naive_term'):
         data['expireAt'] = 'not-a-date' if case == 'invalid_term' else '2026-10-13T12:00:00'
     await warning_service._handle_user_expiration(db, user, _sub(status='active', end=timedelta(hours=24)), data)
     env.bot.send_message.assert_not_awaited()
     warning_service._notify_user.assert_not_awaited()
     assert not await _marks(db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('ws_sent', [True, False])
+async def test_warning_keeps_the_unified_channel_for_verified_email_user(
+    env, db, warning_service, monkeypatch, ws_sent
+):
+    user = _user(telegram_id=None)
+    user.email, user.email_verified = 'trial@example.test', True
+    delivery = monitoring_module.notification_delivery_service
+    monkeypatch.setattr(delivery, 'send_notification', type(delivery).send_notification.__get__(delivery))
+    telegram, email = AsyncMock(), AsyncMock(return_value=False)
+    ws = AsyncMock(return_value=ws_sent)
+    monkeypatch.setattr(delivery, '_send_telegram_notification', telegram)
+    monkeypatch.setattr(delivery, '_send_email_notification', email)
+    monkeypatch.setattr(delivery, '_ws_manager', SimpleNamespace(send_to_user=ws))
+    await warning_service._handle_user_expiration(
+        db, user, _sub(status='active', end=timedelta(hours=24)), {'_meta': {'expiration': -24}}
+    )
+    ws.assert_awaited_once()
+    assert ws.await_args.args[1]['type'] == 'notification.webhook_sub_expiring'
+    assert ws.await_args.args[1]['text_key'] == 'TRIAL_EXPIRING_24H'
+    assert '1 месяц — 149 ₽' in ws.await_args.args[1]['price_lines']
+    telegram.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    assert await _marks(db) == ({(USER_ID, 233, 'trial_expiring_24h')} if ws_sent else set())
