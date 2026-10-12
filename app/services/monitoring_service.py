@@ -2747,6 +2747,10 @@ class MonitoringService:
             return skipped('switched_off')
         if not settings.WEBHOOK_NOTIFY_USER_ENABLED or not settings.WEBHOOK_NOTIFY_SUB_EXPIRING:
             return skipped('server_switch_off')
+        # Между чтением отметки и доставкой второй webhook не должен отправить то же письмо.
+        # Замок только уведомления: строки подписки/покупки не блокирует; commit отметки освобождает его.
+        if not await db.scalar(select(func.pg_try_advisory_xact_lock(202610000 + hours, subscription.id))):
+            return skipped('concurrent_event')
         found = await db.scalar(
             select(SentNotification.id)
             .where(

@@ -150,6 +150,8 @@ class _AsyncOverSync:
 def _new_db() -> _AsyncOverSync:
     engine = create_engine('sqlite://')
     with engine.begin() as connection:
+        # SQLite проверяет отбор/отметки, а настоящий замок — отдельный PostgreSQL-тест.
+        connection.connection.driver_connection.create_function('pg_try_advisory_xact_lock', 2, lambda *_: True)
         _create_schema(connection)
     return _AsyncOverSync(Session(engine, expire_on_commit=False, autoflush=False))
 
