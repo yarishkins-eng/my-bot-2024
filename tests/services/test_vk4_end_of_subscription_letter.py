@@ -1529,6 +1529,27 @@ async def test_ap7_dispatch_still_delivers_one_trial_warning(env, db, warning_se
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('hours', [-72, 24, -30, 48])
+async def test_ap7_current_dispatch_does_not_forward_extra_panel_letters_to_trials(
+    env, db, warning_service, monkeypatch, hours
+):
+    """Решение12.10: настоящему пробному не пересылаем 72ч/+24/нестандартное даже в едином событии.
+
+    Мутация только unified−72 проходила legacy-сторожи; этот тест исполняет реальный dispatcher и классификатор.
+    """
+    user = _user()
+    subscription = _sub(status='active', end=timedelta(hours=abs(hours)))
+    monkeypatch.setattr(warning_service, '_resolve_user_and_subscription', AsyncMock(return_value=(user, subscription)))
+    log = MagicMock()
+    monkeypatch.setattr('app.services.remnawave_webhook_service.logger.info', log)
+    assert await warning_service.process_event(db, 'user.expiration', {'_meta': {'expiration': hours}}) is True
+    warning_service._notify_user.assert_not_awaited()
+    env.bot.send_message.assert_not_awaited()
+    log.assert_any_call('письмо панели о конце не пересылаем', hours=hours, subscription_id=subscription.id)
+    assert not await _marks(db)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     'event,hours',
     [
