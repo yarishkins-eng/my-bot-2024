@@ -2310,7 +2310,7 @@ async def _record_topup_intent_outcome(db: AsyncSession, *, payment_id: int, **o
     """Исход — под замком строки платежа в своей сессии (план ВК 16а-2 (г)); вызывающий кладёт его и в свой словарь."""
     payment = await get_platega_payment_by_id_for_update(db, payment_id)
     intent = topup_intent_of(payment)
-    if intent is None:
+    if intent is None or payment.status == 'CHARGEBACKED':
         await db.rollback()
         return None
     if intent.get('status') in {'fulfilled', 'refused'}:
@@ -2324,6 +2324,11 @@ async def _record_topup_intent_outcome(db: AsyncSession, *, payment_id: int, **o
         if own_charge is not None:
             return own_charge
     final = {**intent, **outcome, 'decided_at': datetime.now(UTC).isoformat()}
+    try:
+        paid_reference = await _topup_intent_paid_reference(db, payment, intent)
+    except Exception:
+        # Сбой чтения диагностической даты не превращает своё состоявшееся списание в отказ.
+        paid_reference = datetime.now(UTC)
     payment.metadata_json = {**payment.metadata_json, TOPUP_INTENT_KEY: final}
     await db.commit()
     logger.info(
@@ -2333,6 +2338,7 @@ async def _record_topup_intent_outcome(db: AsyncSession, *, payment_id: int, **o
         status=final.get('status'),
         reason=final.get('reason'),
         checkout_id=final.get('checkout_public_id'),
+        paid_reference=paid_reference.isoformat(),
     )
     return final
 
@@ -2378,7 +2384,7 @@ async def _complete_topup_intent(
 ) -> dict[str, Any] | None:
     payment = await get_platega_payment_by_id_for_update(db, payment_id)
     intent = topup_intent_of(payment)
-    if intent is None:
+    if intent is None or payment.status == 'CHARGEBACKED':
         await db.rollback()
         return None
     if intent.get('status') in {'fulfilled', 'refused'}:
@@ -2422,6 +2428,10 @@ async def _complete_topup_intent(
             if reason is None:
                 state['charged'] = resolved.checkout.id
                 locked = await get_platega_payment_by_id_for_update(db, payment_id)
+                if locked.status == 'CHARGEBACKED':
+                    await db.rollback()
+                    await _close_own_topup_checkout(db, state)
+                    return None
                 locked.metadata_json = {
                     **locked.metadata_json,
                     TOPUP_INTENT_KEY: {**topup_intent_of(locked), 'charging_checkout_id': resolved.checkout.id},
@@ -2444,7 +2454,7 @@ async def _complete_topup_intent(
     )
 
 
-async def complete_topup_intent(*, payment_id: int) -> dict[str, Any] | None:
+async def complete_topup_intent(*, payment_id: int, outcome_failure: dict | None = None) -> dict[str, Any] | None:
     """Оформить заказ доплаты после зачисления (решение владельца 05.10.2026 «Оформляется само»; план ВК, 16а-2).
 
     Зовётся из `_finalize_platega_payment` СРАЗУ после коммита депозита и ДО побочных эффектов (ловушка 11 стартера).
@@ -2459,7 +2469,12 @@ async def complete_topup_intent(*, payment_id: int) -> dict[str, Any] | None:
         try:
             return await _complete_topup_intent(db, payment_id=payment_id, state=state)
         except Exception as error:
-            logger.exception('topup_intent_autocomplete_failed', payment_id=payment_id, error=str(error))
+            logger.exception(
+                'topup_intent_autocomplete_failed',
+                payment_id=payment_id,
+                error=str(error),
+                _admin_notified=outcome_failure is not None,
+            )
         try:
             await db.rollback()
             sold = await _close_own_topup_checkout(db, state)
@@ -2470,7 +2485,14 @@ async def complete_topup_intent(*, payment_id: int) -> dict[str, Any] | None:
             )
             return await _record_topup_intent_outcome(db, payment_id=payment_id, **outcome)
         except Exception as error:
-            logger.exception('topup_intent_outcome_failed', payment_id=payment_id, error=str(error))
+            logger.exception(
+                'topup_intent_outcome_failed',
+                payment_id=payment_id,
+                error=str(error),
+                _admin_notified=outcome_failure is not None,
+            )
+            if outcome_failure is not None:
+                outcome_failure['failed'] = True
             return None
 
 

@@ -8,7 +8,6 @@ from datetime import UTC, datetime
 from importlib import import_module
 from typing import Any
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -859,58 +858,17 @@ class PlategaPaymentMixin:
         # минуты, при разборе — никогда). Поэтому о деньгах говорим сразу и честно: получены, заказ оформлен.
         # 🔴 Мина OT: «готова» не придёт, если выдача ушла на разбор или панель молчит, — поэтому не обещаем его
         # безусловно, а говорим, что делать, если его нет, и называем остаток на балансе.
-        if getattr(self, 'bot', None) and user.telegram_id and fulfilled:
-            try:
-                english = getattr(user, 'language', None) == 'en'
-                support_url = settings.get_support_contact_url()
-                await self.bot.send_message(
-                    user.telegram_id,
-                    (
-                        f'✅ <b>Payment received: {settings.format_price(payment.amount_kopeks)}</b>\n\n'
-                        'Your order is paid from the balance. When the subscription is connected, you will get the '
-                        '"Your VPN subscription is ready" message. If it has not arrived in 10 minutes, please '
-                        f'contact support.\n\nBalance left: {settings.format_price(balance_left)}'
-                        if english
-                        else f'✅ <b>Оплата получена: {settings.format_price(payment.amount_kopeks)}</b>\n\n'
-                        'Заказ оформлен с баланса. Когда подписка подключится, придёт сообщение «Ваша VPN-подписка '
-                        'готова». Если его нет через 10 минут — напишите в поддержку.\n\n'
-                        f'На балансе осталось: {settings.format_price(balance_left)}'
-                    ),
-                    parse_mode='HTML',
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [
-                                InlineKeyboardButton(
-                                    text='Contact support' if english else 'Написать в поддержку', url=support_url
-                                )
-                            ]
-                        ]
-                    )
-                    if support_url
-                    else None,
-                )
-            except Exception as error:
-                logger.error('Ошибка отправки уведомления пользователю Platega', error=error)
         refusal, refusal_sent, plain_sent = None, False, False
-        if getattr(self, 'bot', None) and user.telegram_id and topup_intent is not None and not fulfilled:
-            # Отказ автооформления — ОДНО сообщение с кнопкой по причине вместо «Пополнение успешно» с общим хвостом
-            # (замысел v2, правило 5; план ВК, 16а-2, заявка 2). Не собралось — ниже прежнее «Пополнение успешно»:
-            # никогда не тишина (правило 3).
-            try:
-                from app.handlers.subscription.device_first import topup_intent_refusal_message
+        if topup_intent is not None:
+            from app.services.payment.common import send_topup_intent_notice
 
-                refusal = topup_intent_refusal_message(
-                    user, topup_intent, amount_kopeks=payment.amount_kopeks, balance_kopeks=balance_left
-                )
-            except Exception as error:
-                logger.error('Не собралось сообщение отказа автооформления доплаты', user_id=user.id, error=error)
-        if refusal is not None:
-            try:
-                await self.bot.send_message(user.telegram_id, refusal[0], parse_mode='HTML', reply_markup=refusal[1])
-                refusal_sent = True
-            except Exception as error:
-                logger.error('Ошибка отправки отказа автооформления доплаты', user_id=user.id, error=error)
-        elif getattr(self, 'bot', None) and user.telegram_id and not fulfilled:
+            delivery = await send_topup_intent_notice(
+                db, payment_id=payment.id, user=user, bot=getattr(self, 'bot', None)
+            )
+            refusal_sent = not fulfilled and delivery == 'telegram'
+            plain_sent = delivery == 'telegram_plain'
+            refusal = (None, None) if not fulfilled and not plain_sent else None
+        if getattr(self, 'bot', None) and user.telegram_id and topup_intent is None:
             try:
                 keyboard = await self.build_topup_success_keyboard(user)
                 # 🔴 Последняя строка сообщения РАЗНАЯ у двух разных людей, и это решение, а не
@@ -998,7 +956,7 @@ class PlategaPaymentMixin:
 
             if not has_topup_intent:
                 await send_cart_notification_after_topup(user, payment.amount_kopeks, db, getattr(self, 'bot', None))
-            else:
+            elif topup_intent is None:
                 # Деньги доплаты под заказ: старая цепочка (суточная, корзина, автопродление истёкшей) их не трогает —
                 # иначе вторая покупка поверх оформленной. Из неё зовём забор удаления аккаунта и письмо тем, у кого
                 # нет Telegram (им сообщение выше не уходит).
