@@ -2849,7 +2849,7 @@ class MonitoringService:
                 if whole_rubles > 0 and 0 < top_up < month:
                     return texts.t(
                         'TRIAL_EXPIRED_PRICE_LINES_BALANCE',
-                        '1 месяц — {month_price}\nс вашими {balance} на балансе — {top_up}',
+                        '1 месяц — {month_price}\nс вашими {balance} на балансе — доплатить {top_up}',
                     ).format(
                         month_price=settings.format_price(month, round_kopeks=False),
                         balance=settings.format_price(whole_rubles),

@@ -327,10 +327,13 @@ async def test_team_with_a_trial_flag_gets_the_paid_letter_without_top_up_button
     [
         (0, '1 месяц — 149 ₽\n3 месяца — 399 ₽'),
         (50, '1 месяц — 149 ₽\n3 месяца — 399 ₽'),  # меньше рубля: «с вашими 0 ₽» не пишем
-        (5000, '1 месяц — 149 ₽\nс вашими 50 ₽ на балансе — 99 ₽'),
-        (4975, '1 месяц — 149 ₽\nс вашими 49 ₽ на балансе — 100 ₽'),  # 49 + 100 = 149: рубли вниз, доплата кассы
-        (1490, '1 месяц — 149 ₽\nс вашими 14 ₽ на балансе — 135 ₽'),
-        (14899, '1 месяц — 149 ₽\nс вашими 148 ₽ на балансе — 1 ₽'),
+        (5000, '1 месяц — 149 ₽\nс вашими 50 ₽ на балансе — доплатить 99 ₽'),
+        (
+            4975,
+            '1 месяц — 149 ₽\nс вашими 49 ₽ на балансе — доплатить 100 ₽',
+        ),  # 49 + 100 = 149: рубли вниз, доплата кассы
+        (1490, '1 месяц — 149 ₽\nс вашими 14 ₽ на балансе — доплатить 135 ₽'),
+        (14899, '1 месяц — 149 ₽\nс вашими 148 ₽ на балансе — доплатить 1 ₽'),
         (14900, '1 месяц — 149 ₽\nНа балансе хватает на месяц. 149 ₽ спишутся с баланса, доплачивать не нужно.'),
         (60000, '1 месяц — 149 ₽\nНа балансе хватает на месяц. 149 ₽ спишутся с баланса, доплачивать не нужно.'),
     ],
@@ -975,7 +978,7 @@ async def test_discount_price_lines_match_the_cashier_engine_without_hiding_kope
         assert '3 месяца — 359.1 ₽' in lines
     elif balance < cells[(30, 1)]:
         assert device_first_top_up_kopeks(price_kopeks=cells[(30, 1)], balance_kopeks=balance) == 8500
-        assert 'с вашими 50 ₽ на балансе — 85 ₽' in lines
+        assert 'с вашими 50 ₽ на балансе — доплатить 85 ₽' in lines.split('\n')
     else:
         assert '134.1 ₽ спишутся с баланса, доплачивать не нужно.' in lines
 
@@ -1118,7 +1121,7 @@ def test_the_price_lines_card_names_when_each_variant_is_used() -> None:
     (insert_,) = [item for item in _text_facts('trial-expired')['text_inserts'] if item.name == 'price_lines']
     whens = {variant.text: variant.when for variant in insert_.variants}
     assert 'меньше рубля' in whens['1 месяц — {month_price}\n3 месяца — {quarter_price}']
-    assert 'от рубля' in whens['1 месяц — {month_price}\nс вашими {balance} на балансе — {top_up}']
+    assert 'от рубля' in whens['1 месяц — {month_price}\nс вашими {balance} на балансе — доплатить {top_up}']
 
 
 def test_price_markers_are_explained_only_on_their_own_card() -> None:
@@ -1429,7 +1432,7 @@ async def test_trial_warning_replaces_old_and_new_panel_events_once(env, db, war
     env.bot.send_message.assert_awaited_once()
     warning_service._notify_user.assert_not_awaited()
     sent = env.bot.send_message.await_args.kwargs
-    assert 'Пробный период' in sent['text'] and 'с вашими 50 ₽ на балансе — 99 ₽' in sent['text']
+    assert 'Пробный период' in sent['text'] and 'с вашими 50 ₽ на балансе — доплатить 99 ₽' in sent['text']
     assert ('через 2 дня' if hours == 48 else 'завтра') in sent['text']
     assert 'Продлите' not in sent['text']
     assert [b.text for row in sent['reply_markup'].inline_keyboard for b in row] == ['💎 Оформить подписку']

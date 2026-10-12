@@ -73,7 +73,7 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
     assert quotes == {30: 13410, 90: 35910}
     assert '1 месяц — 134.1 ₽' in message
     if balance == 5000:
-        assert 'с вашими 50 ₽ на балансе — 85 ₽' in message
+        assert 'с вашими 50 ₽ на балансе — доплатить 85 ₽' in message.split('\n')
     elif balance == 0:
         assert '3 месяца — 359.1 ₽' in message
     else:
