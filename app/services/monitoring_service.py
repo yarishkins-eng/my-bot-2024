@@ -66,6 +66,7 @@ from app.external.remnawave_api import (
 )
 from app.localization.texts import get_texts
 from app.services.notification_delivery_service import (
+    NotificationType,
     notification_delivery_service,
 )
 from app.services.notification_settings_service import NotificationSettingsService
@@ -2718,6 +2719,85 @@ class MonitoringService:
         )
         return found is not None
 
+    async def handle_trial_expiring(
+        self, db: AsyncSession, user: User, subscription: Subscription, *, hours: int, bot
+    ) -> bool:
+        """True означает, что пробный обработан: даже при выключении письмо панели не возвращается."""
+        if not await is_canonical_trial(db, subscription):
+            return False
+        key = 'trial_expiring_48h' if hours == 48 else 'trial_expiring_24h'
+        text_key = 'TRIAL_EXPIRING_48H' if hours == 48 else 'TRIAL_EXPIRING_24H'
+        now = datetime.now(UTC)
+
+        def skipped(reason: str) -> bool:
+            logger.info(
+                'Предупреждение пробному не отправлено', subscription_id=subscription.id, hours=hours, reason=reason
+            )
+            return True
+
+        if subscription.end_date <= now or subscription.end_date > now + timedelta(hours=hours + 1):
+            return skipped('stale_event')
+        if subscription.status not in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.LIMITED.value):
+            return skipped('not_active')
+        if not user.telegram_id or user.status != UserStatus.ACTIVE.value:
+            return skipped('no_telegram')
+        if hours == 48 and not NotificationSettingsService.is_enabled('trial_expiring_48h'):
+            return skipped('switched_off')
+        if hours == 24 and not NotificationSettingsService.is_enabled('trial_expiring_24h'):
+            return skipped('switched_off')
+        if not settings.WEBHOOK_NOTIFY_USER_ENABLED or not settings.WEBHOOK_NOTIFY_SUB_EXPIRING:
+            return skipped('server_switch_off')
+        found = await db.scalar(
+            select(SentNotification.id)
+            .where(
+                SentNotification.subscription_id == subscription.id,
+                SentNotification.notification_type == key,
+                SentNotification.created_at >= subscription.end_date - timedelta(hours=hours + 1),
+            )
+            .limit(1)
+        )
+        if found is not None:
+            return skipped('already_sent')
+        try:
+            texts = get_texts(user.language)
+            price_lines = await self._trial_price_lines(db, user)
+            message = texts.get(text_key).format(price_lines=price_lines).strip()
+            from aiogram.types import InlineKeyboardMarkup
+
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        build_miniapp_or_callback_button(
+                            text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
+                            callback_data='menu_buy',
+                            cabinet_path='/subscription/purchase',
+                        )
+                    ]
+                ]
+            )
+            delivered = await notification_delivery_service.send_notification(
+                user=user,
+                notification_type=NotificationType.WEBHOOK_SUB_EXPIRING,
+                context={'text_key': text_key, 'price_lines': price_lines},
+                bot=bot,
+                telegram_message=message,
+                telegram_markup=keyboard,
+                telegram_silent=is_quiet_night(),
+            )
+            if not delivered:
+                return skipped('not_delivered')
+            await clear_notification_by_type(db, subscription.id, key, commit=False)
+            if hours == 48:
+                await record_notification(db, user.id, subscription.id, 'trial_expiring_48h')
+            else:
+                await record_notification(db, user.id, subscription.id, 'trial_expiring_24h')
+            logger.info('Предупреждение пробному отправлено', subscription_id=subscription.id, hours=hours)
+        except Exception as error:
+            logger.warning(
+                'Предупреждение пробному не отправлено', subscription_id=subscription.id, hours=hours, error=error
+            )
+        return True
+
     async def _trial_price_lines(self, db: AsyncSession, user: User) -> str:
         """Строки цены в письме о конце пробного (решение владельца 07.10.2026) — из кассы этого человека.
 
@@ -3486,8 +3566,8 @@ class MonitoringService:
                 'TRIAL_EXPIRED_DISCOUNT',
                 (
                     '🎁 <b>Персональная скидка {percent}%</b>\n\n'
-                    'Ваш пробный период закончился. Оформите первую подписку со скидкой — '
-                    'предложение действует до {expires_at}.'
+                    'Ваш пробный период закончился. Нажмите «Получить скидку», чтобы включить её '
+                    'и узнать свою цену. Предложение можно получить до {expires_at}.'
                 ),
             )
             message = template.format(
