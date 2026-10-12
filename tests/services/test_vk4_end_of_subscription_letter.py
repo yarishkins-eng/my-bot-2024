@@ -1532,3 +1532,26 @@ async def test_failed_warning_has_no_mark_and_no_panel_fallback(env, db, warning
     )
     assert not await _marks(db)
     warning_service._notify_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'case', ['no_telegram', 'inactive', 'master_off', 'expiring_off', 'invalid_term', 'naive_term']
+)
+async def test_warning_rejects_ineligible_recipient_server_switch_and_invalid_term(
+    env, db, warning_service, monkeypatch, case
+):
+    user = _user(
+        telegram_id=None if case == 'no_telegram' else TELEGRAM_ID, status='blocked' if case == 'inactive' else 'active'
+    )
+    if case == 'master_off':
+        monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_USER_ENABLED', False)
+    if case == 'expiring_off':
+        monkeypatch.setattr(monitoring_module.settings, 'WEBHOOK_NOTIFY_SUB_EXPIRING', False)
+    data = {'_meta': {'expiration': -24}}
+    if case in ('invalid_term', 'naive_term'):
+        data['expireAt'] = 'not-a-date' if case == 'invalid_term' else '2026-10-13T12:00:00'
+    await warning_service._handle_user_expiration(db, user, _sub(status='active', end=timedelta(hours=24)), data)
+    env.bot.send_message.assert_not_awaited()
+    warning_service._notify_user.assert_not_awaited()
+    assert not await _marks(db)
