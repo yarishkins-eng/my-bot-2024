@@ -329,8 +329,8 @@ async def test_team_with_a_trial_flag_gets_the_paid_letter_without_top_up_button
         (4975, '1 месяц — 149 ₽\nс вашими 49 ₽ на балансе — 100 ₽'),  # 49 + 100 = 149: рубли вниз, доплата кассы
         (1490, '1 месяц — 149 ₽\nс вашими 14 ₽ на балансе — 135 ₽'),
         (14899, '1 месяц — 149 ₽\nс вашими 148 ₽ на балансе — 1 ₽'),
-        (14900, '1 месяц — 149 ₽\n3 месяца — 399 ₽'),
-        (60000, '1 месяц — 149 ₽\n3 месяца — 399 ₽'),
+        (14900, '1 месяц — 149 ₽\nНа балансе хватает на месяц. 149 ₽ спишутся с баланса, доплачивать не нужно.'),
+        (60000, '1 месяц — 149 ₽\nНа балансе хватает на месяц. 149 ₽ спишутся с баланса, доплачивать не нужно.'),
     ],
 )
 async def test_price_lines_come_from_the_cashier(env, db, balance, expected) -> None:
@@ -946,9 +946,36 @@ async def test_another_live_subscription_means_the_same_person_and_really_live(e
 async def test_edge_balances_give_the_plain_price_lines(env, db, monkeypatch, cells, balance, minimum) -> None:
     monkeypatch.setattr(monitoring_module.settings, 'PLATEGA_MIN_AMOUNT_KOPEKS', minimum)
     env.cashier.return_value = _options(cells=cells)
-    assert (
-        await monitoring_service._trial_price_lines(db, _user(balance=balance)) == '1 месяц — 149 ₽\n3 месяца — 399 ₽'
+    assert await monitoring_service._trial_price_lines(db, _user(balance=balance)) == (
+        '1 месяц — 149.5 ₽\n3 месяца — 399 ₽' if cells[(30, 1)] == 14950 else '1 месяц — 149 ₽\n3 месяца — 399 ₽'
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('balance', [0, 5000, 13410, 20000])
+async def test_discount_price_lines_match_the_cashier_engine_without_hiding_kopeks(env, db, balance) -> None:
+    """Direct-v2 сохраняет копейки, а доплату округляет вверх; старые134/84 здесь недофинансировали бы заказ."""
+    from app.services.device_first_checkout_service import device_first_top_up_kopeks
+    from app.services.pricing_engine import pricing_engine
+
+    user = _user(balance=balance)
+    user.promo_offer_discount_percent = 10
+    tariff = Tariff(id=31, device_limit=1, is_daily=False, period_prices={'30': 14900, '90': 39900})
+    cells = {}
+    for days in (30, 90):
+        quote = await pricing_engine.calculate_tariff_purchase_price(tariff, days, device_limit=1, user=user)
+        cells[(days, 1)] = quote.final_total
+    env.cashier.return_value = _options(cells=cells)
+    lines = await monitoring_service._trial_price_lines(db, user)
+    assert cells[(30, 1)] == 13410 and cells[(90, 1)] == 35910
+    assert '1 месяц — 134.1 ₽' in lines
+    if balance == 0:
+        assert '3 месяца — 359.1 ₽' in lines
+    elif balance < cells[(30, 1)]:
+        assert device_first_top_up_kopeks(price_kopeks=cells[(30, 1)], balance_kopeks=balance) == 8500
+        assert 'с вашими 50 ₽ на балансе — 85 ₽' in lines
+    else:
+        assert '134.1 ₽ спишутся с баланса, доплачивать не нужно.' in lines
 
 
 @pytest.mark.asyncio

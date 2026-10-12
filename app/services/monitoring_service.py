@@ -2743,6 +2743,12 @@ class MonitoringService:
             if month:
                 balance = int(user.balance_kopeks or 0)
                 top_up = device_first_top_up_kopeks(price_kopeks=month, balance_kopeks=balance)
+                if balance >= month:
+                    return texts.t(
+                        'TRIAL_EXPIRED_PRICE_LINES_FUNDED',
+                        '1 месяц — {month_price}\nНа балансе хватает на месяц. '
+                        '{month_price} спишутся с баланса, доплачивать не нужно.',
+                    ).format(month_price=settings.format_price(month, round_kopeks=False))
                 # Остаток — в целых рублях вниз: «с вашими N ₽» плюс доплата «M ₽» дают цену месяца, а M — ровно то,
                 # что попросит касса. Меньше рубля на балансе или доплата не меньше цены — строки баланса нет (касса
                 # такую доплату тоже не предлагает).
@@ -2752,14 +2758,17 @@ class MonitoringService:
                         'TRIAL_EXPIRED_PRICE_LINES_BALANCE',
                         '1 месяц — {month_price}\nс вашими {balance} на балансе — {top_up}',
                     ).format(
-                        month_price=settings.format_price(month),
+                        month_price=settings.format_price(month, round_kopeks=False),
                         balance=settings.format_price(whole_rubles),
                         top_up=settings.format_price(top_up),
                     )
                 if quarter:
                     return texts.t(
                         'TRIAL_EXPIRED_PRICE_LINES', '1 месяц — {month_price}\n3 месяца — {quarter_price}'
-                    ).format(month_price=settings.format_price(month), quarter_price=settings.format_price(quarter))
+                    ).format(
+                        month_price=settings.format_price(month, round_kopeks=False),
+                        quarter_price=settings.format_price(quarter, round_kopeks=False),
+                    )
             logger.info('Письмо о конце пробного уйдёт без цены', user_id=user.id, reason=options.get('reason'))
             return ''
         except Exception as error:

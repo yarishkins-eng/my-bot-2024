@@ -1582,6 +1582,7 @@
   "TRIAL_EXPIRED_NOTIFICATION": "🎁 <b>Пробный период завершён</b>\n\nБесплатный доступ закончился. Выберите тариф, чтобы продолжить пользоваться VPN.\n\n{price_lines}",
   "TRIAL_EXPIRED_PRICE_LINES": "1 месяц — {month_price}\n3 месяца — {quarter_price}",
   "TRIAL_EXPIRED_PRICE_LINES_BALANCE": "1 месяц — {month_price}\nс вашими {balance} на балансе — {top_up}",
+  "TRIAL_EXPIRED_PRICE_LINES_FUNDED": "1 месяц — {month_price}\nНа балансе хватает на месяц. {month_price} спишутся с баланса, доплачивать не нужно.",
   "TRIAL_EXPIRED_DISCOUNT": "🎁 <b>Персональная скидка {percent}%</b>\n\nВаш пробный период закончился. Оформите первую подписку со скидкой — предложение действует до {expires_at}.",
   "SUB_STATUS_DISABLED": "⚫ Отключена",
   "SUB_STATUS_PENDING": "⏳ Ожидает активации",

@@ -1582,6 +1582,7 @@
   "TRIAL_EXPIRED_NOTIFICATION": "🎁 <b>دوره آزمایشی شما به پایان رسید</b>\n\nدسترسی رایگان شما پایان یافت. برای ادامه استفاده از VPN یک طرح انتخاب کنید.\n\n{price_lines}",
   "TRIAL_EXPIRED_PRICE_LINES": "۱ ماه — {month_price}\n۳ ماه — {quarter_price}",
   "TRIAL_EXPIRED_PRICE_LINES_BALANCE": "۱ ماه — {month_price}\nبا {balance} موجودی شما — {top_up}",
+  "TRIAL_EXPIRED_PRICE_LINES_FUNDED": "۱ ماه — {month_price}\nموجودی شما برای یک ماه کافی است. {month_price} از موجودی کسر می‌شود؛ نیازی به شارژ نیست.",
   "TRIAL_EXPIRED_DISCOUNT": "🎁 <b>تخفیف شخصی {percent}٪</b>\n\nدوره آزمایشی شما به پایان رسید. اولین اشتراک خود را با تخفیف تهیه کنید — این پیشنهاد تا {expires_at} معتبر است.",
   "SUB_STATUS_DISABLED": "🚫 غیرفعال",
   "SUB_STATUS_PENDING": "⏳ در انتظار",
