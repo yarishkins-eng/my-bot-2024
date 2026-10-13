@@ -3210,7 +3210,7 @@ class MonitoringService:
         self, user: User, subscription: Subscription, warn_hours: int | None = None, *, price_lines: str = ''
     ) -> bool:
         try:
-            texts = get_texts(user.language)
+            texts = get_texts((user.language or settings.DEFAULT_LANGUAGE).lower().split('-')[0])
 
             tariff_label = ''
             if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
