@@ -1273,7 +1273,7 @@ _MARKER_HINTS_BY_MESSAGE.update(
         (message_id, name): hint
         for (source_id, name), hint in list(_MARKER_HINTS_BY_MESSAGE.items())
         if source_id == 'trial-expired'
-        for message_id in ('trial-2d', 'trial-1d')
+        for message_id in ('trial-2d', 'trial-1d', 'trial-2h')
     }
 )
 
@@ -1558,7 +1558,7 @@ def _text_facts(message_id: str, params: dict[str, int] | None = None) -> dict[s
             ],
         )
         for name, variants in _INSERT_KEYS.items()
-        if body and '{' + name + '}' in body
+        if body and ('{' + name + '}' in body or (message_id == 'trial-2h' and name == 'price_lines'))
     ]
 
     markers = _markers_of(message_id, body, params)

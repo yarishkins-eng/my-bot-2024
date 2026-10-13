@@ -3223,7 +3223,7 @@ class MonitoringService:
 
             window_hours = warn_hours if warn_hours is not None else NotificationSettingsService.get_trial_warn_hours()
             hours = trial_hours_left(subscription.end_date, window_hours)
-            hours_text = format_hours_declension(hours, 'en' if texts.language.split('-')[0] == 'en' else 'ru')
+            hours_text = format_hours_declension(hours, 'en' if texts.language.lower().split('-')[0] == 'en' else 'ru')
             message = texts.t('TRIAL_ENDING_TEXT', TRIAL_ENDING_TEXT).format(
                 tariff_label=tariff_label, hours_text=hours_text
             )

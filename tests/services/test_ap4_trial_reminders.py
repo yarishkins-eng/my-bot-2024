@@ -43,7 +43,7 @@ def _objects(language='ru'):
     return monitor, user, subscription
 
 
-@pytest.mark.parametrize('language', ['ru', 'en', 'ua', 'fa', 'zh'])
+@pytest.mark.parametrize('language', ['ru', 'en', 'ua', 'fa', 'zh', 'ru-RU', 'en-US', 'EN'])
 async def test_owner_template_and_language_do_not_mix(monkeypatch, language):
     monitor, user, subscription = _objects(language)
     NotificationSettingsService._data['message_texts'] = {'TRIAL_ENDING_TEXT': 'OWNER {hours_text}.'}
@@ -51,17 +51,18 @@ async def test_owner_template_and_language_do_not_mix(monkeypatch, language):
     sent = monitor.bot.send_message.await_args.kwargs
     body = sent['text']
     assert body.endswith('\n\nPRICE TAIL') and '{' not in body
-    if language == 'ru':
+    base_language = language.lower().split('-')[0]
+    if base_language == 'ru':
         assert body.startswith('OWNER 3 часа.')
-    elif language == 'en':
+    elif base_language == 'en':
         assert 'Your trial ends in 3 hours.' in body and 'OWNER' not in body
     else:
         assert '3 часа' in body and 'OWNER' not in body
     buttons = [button for row in sent['reply_markup'].inline_keyboard for button in row]
     assert len(buttons) == 1
     assert buttons[0].web_app.url == 'https://cabinet.example/subscription/purchase'
-    if language in ('ru', 'en'):
-        assert buttons[0].text == ('💎 Get a subscription' if language == 'en' else '💎 Оформить подписку')
+    if base_language in ('ru', 'en'):
+        assert buttons[0].text == ('💎 Get a subscription' if base_language == 'en' else '💎 Оформить подписку')
 
 
 @pytest.mark.parametrize('language', ['ru', 'en', 'ua', 'fa', 'zh'])
@@ -74,6 +75,9 @@ def test_locale_markers_and_catalog_match_the_sender(language):
     facts = _text_facts('trial-2h')
     assert facts['text_has_english'] is True
     assert '{price_lines}' not in facts['text']
+    price_insert = next(insert for insert in facts['text_inserts'] if insert.name == 'price_lines')
+    assert len(price_insert.variants) == 3
+    assert {marker.name for marker in facts['text_markers']} >= {'month_price', 'quarter_price', 'balance', 'top_up'}
 
 
 @pytest.mark.parametrize(('hour', 'minute', 'silent'), [(20, 59, False), (21, 0, True), (4, 59, True), (5, 0, False)])
