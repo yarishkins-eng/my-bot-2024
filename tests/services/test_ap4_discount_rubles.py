@@ -175,9 +175,9 @@ def test_receipt_never_shows_negative_wallet_contribution(monkeypatch, balance, 
     )
     assert '−-' not in ru and '−₽-' not in en
     if language == 'ru':
-        assert f'С вашего баланса: −{ru_amount} ₽' in ru
+        assert f'С вашего баланса: −{ru_amount} ₽' in ru.splitlines()
     else:
-        assert f'From your balance: −₽{en_amount}' in en
+        assert f'From your balance: −₽{en_amount}' in en.splitlines()
 
 
 @pytest.mark.asyncio
