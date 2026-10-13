@@ -1,4 +1,4 @@
-"""Цена после успешного claim считается настоящим движком уже с включённой скидкой."""
+"""Цена после claim считается настоящим движком; АП-4 округляет сам итог личной скидки до рублей."""
 
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -70,12 +70,12 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
     monkeypatch.setattr('app.services.device_first_checkout_service.build_purchase_options', options)
     await promo.claim_discount_offer(callback, user, db)
     message = callback.message.answer.await_args.args[0]
-    assert quotes == {30: 13410, 90: 35910}
-    assert '1 месяц — 134.1 ₽' in message
+    assert quotes == {30: 13400, 90: 35900}
+    assert '1 месяц — 134 ₽' in message
     if balance == 5000:
-        assert 'с вашими 50 ₽ на балансе — доплатить 85 ₽' in message.split('\n')
+        assert 'с вашими 50 ₽ на балансе — доплатить 84 ₽' in message.split('\n')
     elif balance == 0:
-        assert '3 месяца — 359.1 ₽' in message
+        assert '3 месяца — 359 ₽' in message
     else:
         assert 'спишутся с баланса, доплачивать не нужно.' in message
 

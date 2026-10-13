@@ -960,9 +960,9 @@ async def test_edge_balances_give_the_plain_price_lines(env, db, monkeypatch, ce
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('balance', [0, 5000, 13410, 20000])
-async def test_discount_price_lines_match_the_cashier_engine_without_hiding_kopeks(env, db, balance) -> None:
-    """Direct-v2 сохраняет копейки, а доплату округляет вверх; старые134/84 здесь недофинансировали бы заказ."""
+@pytest.mark.parametrize('balance', [0, 5000, 13400, 20000])
+async def test_discount_price_lines_match_the_cashier_engine_with_ruble_discount(env, db, balance) -> None:
+    """АП-4 меняет цену в общем ядре по решению владельца: теперь134/84 совпадают с direct-v2, копейки без скидки прежние."""
     from app.services.device_first_checkout_service import device_first_top_up_kopeks
     from app.services.pricing_engine import pricing_engine
 
@@ -975,15 +975,15 @@ async def test_discount_price_lines_match_the_cashier_engine_without_hiding_kope
         cells[(days, 1)] = quote.final_total
     env.cashier.return_value = _options(cells=cells)
     lines = await monitoring_service._trial_price_lines(db, user)
-    assert cells[(30, 1)] == 13410 and cells[(90, 1)] == 35910
-    assert '1 месяц — 134.1 ₽' in lines
+    assert cells[(30, 1)] == 13400 and cells[(90, 1)] == 35900
+    assert '1 месяц — 134 ₽' in lines
     if balance == 0:
-        assert '3 месяца — 359.1 ₽' in lines
+        assert '3 месяца — 359 ₽' in lines
     elif balance < cells[(30, 1)]:
-        assert device_first_top_up_kopeks(price_kopeks=cells[(30, 1)], balance_kopeks=balance) == 8500
-        assert 'с вашими 50 ₽ на балансе — доплатить 85 ₽' in lines.split('\n')
+        assert device_first_top_up_kopeks(price_kopeks=cells[(30, 1)], balance_kopeks=balance) == 8400
+        assert 'с вашими 50 ₽ на балансе — доплатить 84 ₽' in lines.split('\n')
     else:
-        assert '134.1 ₽ спишутся с баланса, доплачивать не нужно.' in lines
+        assert '134 ₽ спишутся с баланса, доплачивать не нужно.' in lines
 
 
 @pytest.mark.asyncio
