@@ -65,11 +65,22 @@ async def test_personal_discount_rounds_the_whole_tariff_down(days, devices, per
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('raw', 'percent', 'total'),
-    [(14950, 0, 14950), (100, 10, 100), (150, 99, 100), (0, 10, 0), (14900, 100, 0), (50, 10, 45)],
+    ('raw', 'percent', 'total', 'expired'),
+    [
+        (14950, 0, 14950, False),
+        (100, 10, 100, False),
+        (150, 99, 100, False),
+        (0, 10, 0, False),
+        (14900, 100, 0, False),
+        (50, 10, 45, False),
+        (14950, 10, 14950, True),
+    ],
 )
-async def test_undiscounted_free_and_subruble_prices_keep_their_contract(raw, percent, total):
-    price = await pricing_engine.calculate_tariff_purchase_price(_tariff(raw), 30, user=_user(percent))
+async def test_undiscounted_free_and_subruble_prices_keep_their_contract(raw, percent, total, expired):
+    user = _user(percent)
+    if expired:
+        user.promo_offer_discount_expires_at = datetime.now(UTC) - timedelta(days=1)
+    price = await pricing_engine.calculate_tariff_purchase_price(_tariff(raw), 30, user=user)
     assert price.final_total == total
     assert price.original_total == raw
     assert price.promo_offer_discount >= 0
