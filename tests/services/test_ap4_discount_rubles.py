@@ -27,13 +27,13 @@ def _tariff(price=14900):
     )
 
 
-def _user(percent=10, balance=5000, group=None):
+def _user(percent=10, balance=5000, group=None, source='trial_expired_discount'):
     return SimpleNamespace(
         id=7,
         language='ru',
         balance_kopeks=balance,
         promo_offer_discount_percent=percent,
-        promo_offer_discount_source='trial_expired_discount',
+        promo_offer_discount_source=source,
         promo_offer_discount_expires_at=None,
         promo_group=group,
         get_primary_promo_group=lambda: group,
@@ -41,6 +41,7 @@ def _user(percent=10, balance=5000, group=None):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('source', ['trial_expired_discount', 'purchase_discount', 'promocode_custom'])
 @pytest.mark.parametrize(
     ('days', 'devices', 'percent', 'total'),
     [
@@ -52,9 +53,9 @@ def _user(percent=10, balance=5000, group=None):
         (30, 1, 30, 10400),
     ],
 )
-async def test_personal_discount_rounds_the_whole_tariff_down(days, devices, percent, total):
+async def test_personal_discount_rounds_the_whole_tariff_down(days, devices, percent, total, source):
     price = await pricing_engine.calculate_tariff_purchase_price(
-        _tariff(), days, device_limit=devices, user=_user(percent)
+        _tariff(), days, device_limit=devices, user=_user(percent, source=source)
     )
     original = _tariff().period_prices[str(days)] + (devices - 1) * 5000 * price.breakdown['months_in_period']
     assert price.final_total == total
@@ -64,7 +65,8 @@ async def test_personal_discount_rounds_the_whole_tariff_down(days, devices, per
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('raw', 'percent', 'total'), [(14950, 0, 14950), (150, 99, 100), (0, 10, 0), (14900, 100, 0), (50, 10, 45)]
+    ('raw', 'percent', 'total'),
+    [(14950, 0, 14950), (100, 10, 100), (150, 99, 100), (0, 10, 0), (14900, 100, 0), (50, 10, 45)],
 )
 async def test_undiscounted_free_and_subruble_prices_keep_their_contract(raw, percent, total):
     price = await pricing_engine.calculate_tariff_purchase_price(_tariff(raw), 30, user=_user(percent))
@@ -83,7 +85,8 @@ async def test_group_discount_keeps_its_amount_and_original_price(percent, total
 
 
 @pytest.mark.asyncio
-async def test_cashier_cell_real_rechecks_and_topup_intent_agree(monkeypatch):
+@pytest.mark.parametrize('drift', ['none', 'before_lock', 'after_lock', 'revision_before', 'revision_after'])
+async def test_cashier_cell_real_rechecks_and_topup_intent_agree(monkeypatch, drift):
     tariff, user = _tariff(), _user()
     db = SimpleNamespace(scalar=AsyncMock(return_value=tariff), commit=AsyncMock())
     eligibility = SimpleNamespace(
@@ -119,10 +122,26 @@ async def test_cashier_cell_real_rechecks_and_topup_intent_agree(monkeypatch):
         'app.services.public_location_entitlement_service.resolve_tariff_entitlement',
         AsyncMock(return_value=entitlement),
     )
-    assert (
-        await checkout._validate_direct_pre_commit(db, checkout=order, user=user, target=None, tariff=tariff)
-        == entitlement
-    )
+    # Первый снимок и строка под замком различаются: каждая из двух проверок обязана отказать сама.
+    if drift == 'before_lock':
+        tariff.period_prices['30'] = 15900
+        db.scalar.return_value = _tariff()
+    elif drift == 'after_lock':
+        db.scalar.return_value = _tariff(15900)
+    elif drift == 'revision_before':
+        tariff.pricing_revision = 10
+        db.scalar.return_value = _tariff()
+    elif drift == 'revision_after':
+        db.scalar.return_value = _tariff()
+        db.scalar.return_value.pricing_revision = 10
+    validated = await checkout._validate_direct_pre_commit(db, checkout=order, user=user, target=None, tariff=tariff)
+    if drift != 'none':
+        assert validated is None
+        assert order.lifecycle_state == 'reprice_required'
+        assert order.terminal_reason == 'price_changed'
+        db.commit.assert_awaited_once()
+        return
+    assert validated == entitlement
     db.commit.assert_not_awaited()
 
     monkeypatch.setattr(checkout, 'topup_intent_unavailable_reason', lambda _user: None)
@@ -137,15 +156,57 @@ async def test_cashier_cell_real_rechecks_and_topup_intent_agree(monkeypatch):
     assert decision.intent['quote_kopeks'] == cell['price_kopeks']
 
 
-@pytest.mark.parametrize('balance', [1, 10, 99, 5000])
-def test_receipt_never_shows_negative_wallet_contribution(monkeypatch, balance):
+@pytest.mark.parametrize('language', ['ru', 'en'])
+@pytest.mark.parametrize(
+    ('balance', 'ru_amount', 'en_amount'),
+    [(1, '0', '0'), (10, '0,10', '0.10'), (99, '0,10', '0.10'), (5000, '49,10', '49.10')],
+)
+def test_receipt_never_shows_negative_wallet_contribution(monkeypatch, balance, ru_amount, en_amount, language):
     monkeypatch.setattr(handler, 'topup_intent_enabled_for', lambda _user: True)
     monkeypatch.setattr(checkout.settings, 'PLATEGA_MIN_AMOUNT_KOPEKS', 100)
+    user = _user(balance=balance)
+    user.language = language
     ru, en = handler._money_block(
-        _user(balance=balance),
+        user,
         balance_kopeks=balance,
         price_kopeks=13410,
         top_up_button=SimpleNamespace(),
         has_methods=True,
     )
     assert '−-' not in ru and '−₽-' not in en
+    if language == 'ru':
+        assert f'С вашего баланса: −{ru_amount} ₽' in ru
+    else:
+        assert f'From your balance: −₽{en_amount}' in en
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('raw', 'group_percent', 'total', 'group_discount', 'offer'), [(100, 10, 81, 10, 9), (10000, 99, 100, 9900, 0)]
+)
+async def test_the_ruble_boundary_is_applied_after_the_group(raw, group_percent, total, group_discount, offer):
+    group = SimpleNamespace(id=1, get_discount_percent=lambda *_args: group_percent)
+    price = await pricing_engine.calculate_tariff_purchase_price(_tariff(raw), 30, user=_user(group=group))
+    assert (price.final_total, price.promo_group_discount, price.promo_offer_discount) == (total, group_discount, offer)
+    assert price.original_total == raw
+
+
+@pytest.mark.asyncio
+async def test_traffic_is_part_of_the_one_discounted_total():
+    tariff = _tariff()
+    tariff.get_price_for_custom_traffic = lambda _gb: 105
+    price = await pricing_engine.calculate_tariff_purchase_price(tariff, 30, custom_traffic_gb=1, user=_user())
+    assert (price.final_total, price.original_total, price.traffic_price, price.promo_offer_discount) == (
+        13500,
+        15005,
+        105,
+        1505,
+    )
+
+
+@pytest.mark.asyncio
+async def test_components_are_not_rounded_separately():
+    tariff = _tariff(14950)
+    tariff.device_price_kopeks = 5050
+    price = await pricing_engine.calculate_tariff_purchase_price(tariff, 30, device_limit=2, user=_user())
+    assert (price.final_total, price.original_total, price.promo_offer_discount) == (18000, 20000, 2000)
