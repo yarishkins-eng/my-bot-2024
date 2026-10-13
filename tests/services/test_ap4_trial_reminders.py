@@ -66,6 +66,32 @@ async def test_owner_template_and_language_do_not_mix(monkeypatch, language):
         assert buttons[0].text == ('💎 Get a subscription' if base_language == 'en' else '💎 Оформить подписку')
 
 
+@pytest.mark.parametrize(
+    ('owner_template', 'expected_last_line'),
+    [
+        pytest.param(None, None, id='default'),
+        pytest.param('OWNER {hours_text}.\n', 'OWNER 3 часа.', id='owner-newline'),
+        pytest.param('OWNER {hours_text}.\n\n', 'OWNER 3 часа.', id='owner-two-newlines'),
+        pytest.param('OWNER {hours_text}. \u00a0\n', 'OWNER 3 часа. \u00a0', id='owner-space-nbsp'),
+    ],
+)
+async def test_trial_ending_price_has_one_blank_line_and_preserves_spaces(owner_template, expected_last_line):
+    monitor, user, subscription = _objects()
+    if owner_template is None:
+        locale = json.loads((Path(__file__).parents[2] / 'app/localization/locales/ru.json').read_text())
+        template = locale['TRIAL_ENDING_TEXT']
+        assert template.endswith('\n')
+        expected_last_line = template.format(tariff_label='', hours_text='3 часа').splitlines()[-1]
+    else:
+        NotificationSettingsService._data['message_texts'] = {'TRIAL_ENDING_TEXT': owner_template}
+    price = '1 месяц — 149 ₽'
+
+    assert await monitor._send_trial_ending_notification(user, subscription, 6, price_lines=price)
+
+    body = monitor.bot.send_message.await_args.kwargs['text']
+    assert body.endswith(f'{expected_last_line}\n\n{price}')
+
+
 @pytest.mark.parametrize('language', ['ru', 'en', 'ua', 'fa', 'zh'])
 def test_locale_markers_and_catalog_match_the_sender(language):
     data = json.loads((Path(__file__).parents[2] / 'app/localization/locales' / f'{language}.json').read_text())

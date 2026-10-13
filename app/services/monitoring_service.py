@@ -3233,7 +3233,7 @@ class MonitoringService:
                 tariff_label=tariff_label, hours_text=hours_text
             )
             if price_lines:
-                message += f'\n\n{price_lines}'
+                message = message.rstrip('\n') + f'\n\n{price_lines}'
 
             from aiogram.types import InlineKeyboardMarkup
 
