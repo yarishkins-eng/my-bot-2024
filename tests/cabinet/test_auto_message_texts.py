@@ -253,8 +253,8 @@ def test_every_template_is_filled_with_exactly_the_names_it_asks_for() -> None:
         def formatted_const(call: ast.Call) -> str | None:
             """Имя константы, к которой применён `.format(...)`.
 
-            Форм две, и обе законные: голая константа и обёртка `text_for('ИМЯ', ИМЯ)`,
-            через которую с этапа АС-11 проходит правка владельца. Сторож обязан знать обе,
+            Формы законные: голая константа, `text_for('ИМЯ', ИМЯ)` и АП-4 `texts.t('ИМЯ', ИМЯ)`.
+            Через них проходит правка владельца. Сторож обязан знать каждую,
             иначе после обёртки он молча перестал бы проверять что-либо.
             """
             if not (isinstance(call.func, ast.Attribute) and call.func.attr == 'format'):
@@ -265,7 +265,7 @@ def test_every_template_is_filled_with_exactly_the_names_it_asks_for() -> None:
             if (
                 isinstance(target, ast.Call)
                 and isinstance(target.func, ast.Attribute)
-                and target.func.attr == 'text_for'
+                and target.func.attr in {'text_for', 't'}
                 and len(target.args) == 2
                 and isinstance(target.args[1], ast.Name)
                 and target.args[1].id in const_names

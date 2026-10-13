@@ -1654,6 +1654,7 @@
   "TRIAL_ACTIVATION_ERROR": "❌ An error occurred during trial activation. Funds have been returned to your balance.",
   "TRIAL_PAYMENT_CHARGED_NOTE": "💳 {amount} has been deducted from your balance.",
   "TRIAL_CHANNEL_UNSUBSCRIBED": "\n🚫 <b>Access paused</b>\n\nWe couldn't find your subscription to our channel, so the trial plan has been disabled.\n\nJoin the channel and tap “{check_button}” to restore access.",
+  "TRIAL_ENDING_TEXT": "\n🎁 <b>Your trial subscription{tariff_label} ends soon!</b>\n\nYour trial ends in {hours_text}.\n\n💎 <b>Keep your VPN working</b>\nGet a subscription before your trial ends.\n",
   "TRIAL_ENDING_SOON": "\n🎁 <b>The trial subscription is ending soon!</b>\n\nYour trial expires in a few hours.\n\n💎 <b>Don't want to lose VPN access?</b>\nSwitch to the full subscription!\n\n🔥 <b>Special offer:</b>\n• 30 days for {price}\n• Unlimited traffic\n• All servers available\n• Speeds up to 1 Gbit/s\n\n⚡️ Activate before the trial ends!\n",
   "TRIAL_INACTIVE_1H": "⏳ <b>An hour has passed and we haven't seen any traffic yet</b>\n\nOpen the connection guide and follow the steps. We're always ready to help!",
   "TRIAL_INACTIVE_24H": "⏳ <b>A full day passed without activity</b>\n\nWe still don't see traffic from your test subscription. Use the guide or message support and we'll help you connect!",

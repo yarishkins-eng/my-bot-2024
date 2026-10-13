@@ -197,7 +197,10 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'trial-started',
         'group': 'trial',
         'title': 'Пробный начался',
-        'when': 'Сразу после включения пробного, текстом без картинки; дата окончания по Москве.',
+        'when': (
+            'Сразу после включения пробного, текстом без картинки; дата окончания по Москве. '
+            'С 00:00 до 08:00 МСК без звука.'
+        ),
         'control': 'toggle',
         'settings_key': 'trial_started',
         'params': (),
@@ -229,7 +232,10 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'trial-not-connected',
         'group': 'trial',
         'title': 'Пробный идёт, а VPN не подключён',
-        'when': 'Через {not_connected_after_hours} после начала пробного — при накопленном расходе меньше 1 МБ',
+        'when': (
+            'Через {not_connected_after_hours} после начала пробного — при накопленном расходе меньше 1 МБ. '
+            'С 00:00 до 08:00 МСК без звука.'
+        ),
         'control': 'toggle',
         'settings_key': 'trial_not_connected',
         'params': ('not_connected_after_hours',),
@@ -254,15 +260,18 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'trial-2h',
         'group': 'trial',
         'title': 'Пробный скоро истекает',
-        'when': 'За {warn_hours} до конца — каждому, у кого идёт пробный',
+        'when': (
+            'За {warn_hours} до конца — каждому на пробном тарифе, включая исчерпавших трафик. '
+            'С 00:00 до 08:00 МСК без звука.'
+        ),
         'control': 'toggle',
         'settings_key': 'trial_2h',
         'params': ('warn_hours',),
         'sent_type': 'trial_2h',
         'quiet_check': 'trial_tariff_marked',
+        'warning': 'Цены и доплата из кассы клиента добавляются после текста автоматически; метки в шаблон не нужны.',
         'buttons': [
-            {'label': '💎 Купить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
-            {'label': '💰 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
+            {'label': '💎 Оформить подписку', 'target': 'Кабинет, касса', 'tracked': False},
         ],
     },
     {
@@ -1088,6 +1097,7 @@ def _build_item(
 #   * константа рядом с отправителем — 8 сообщений, которых в словаре нет вовсе.
 
 _LOCALE_TEXT_KEYS: dict[str, str] = {
+    'trial-2h': 'TRIAL_ENDING_TEXT',
     'trial-2d': 'TRIAL_EXPIRING_48H',
     'trial-1d': 'TRIAL_EXPIRING_24H',
     'trial-started': 'FUNNEL_TRIAL_ACTIVATED',
@@ -1158,7 +1168,6 @@ _CONST_SOURCE_NAMES: dict[str, str] = {
     'grace-2d': 'GRACE_STARTED_TEXT',
     'autopay-legacy': 'AUTOPAY_LEGACY_TEXT',
     'paid-expired': 'SUBSCRIPTION_EXPIRED_TEXT',
-    'trial-2h': 'TRIAL_ENDING_TEXT',
     'trial-not-connected': 'TRIAL_NOT_CONNECTED_TEXT',
     'daily-charge': 'DAILY_CHARGE_TEXT',
     'daily-paused': 'DAILY_PAUSED_TEXT',
@@ -1177,7 +1186,6 @@ def _const_texts() -> dict[str, str]:
         AUTOPAY_LEGACY_TEXT,
         GRACE_STARTED_TEXT,
         SUBSCRIPTION_EXPIRED_TEXT,
-        TRIAL_ENDING_TEXT,
         TRIAL_NOT_CONNECTED_TEXT,
     )
 
@@ -1185,7 +1193,6 @@ def _const_texts() -> dict[str, str]:
         'grace-2d': GRACE_STARTED_TEXT,
         'autopay-legacy': AUTOPAY_LEGACY_TEXT,
         'paid-expired': SUBSCRIPTION_EXPIRED_TEXT,
-        'trial-2h': TRIAL_ENDING_TEXT,
         'trial-not-connected': TRIAL_NOT_CONNECTED_TEXT,
         'daily-charge': DAILY_CHARGE_TEXT,
         'daily-paused': DAILY_PAUSED_TEXT,
@@ -1272,7 +1279,7 @@ _MARKER_HINTS_BY_MESSAGE.update(
         (message_id, name): hint
         for (source_id, name), hint in list(_MARKER_HINTS_BY_MESSAGE.items())
         if source_id == 'trial-expired'
-        for message_id in ('trial-2d', 'trial-1d')
+        for message_id in ('trial-2d', 'trial-1d', 'trial-2h')
     }
 )
 
@@ -1557,7 +1564,7 @@ def _text_facts(message_id: str, params: dict[str, int] | None = None) -> dict[s
             ],
         )
         for name, variants in _INSERT_KEYS.items()
-        if body and '{' + name + '}' in body
+        if body and ('{' + name + '}' in body or (message_id == 'trial-2h' and name == 'price_lines'))
     ]
 
     markers = _markers_of(message_id, body, params)
