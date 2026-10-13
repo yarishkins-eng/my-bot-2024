@@ -14,6 +14,7 @@ from app.cabinet.routes.admin_auto_messages import CATALOG_BY_ID, _text_facts
 from app.services import monitoring_service as module
 from app.services.notification_settings_service import NotificationSettingsService
 from app.utils import funnel_notify
+from app.utils.telegram_html import telegram_visible_length
 from tests.services.test_ap7_trial_letters_by_tariff import TRIAL_ID, _SelectionDB, _subscription
 
 
@@ -184,7 +185,7 @@ async def test_real_trial_selection_only_records_delivered(monkeypatch, status, 
         db.close()
 
 
-@pytest.mark.parametrize('kind', ['photo', 'oversize', 'fallback'])
+@pytest.mark.parametrize('kind', ['photo', 'oversize', 'fallback', 'exact1024', 'exact1025'])
 async def test_photo_and_text_fallback_keep_silence(monkeypatch, kind):
     monitor, user, subscription = _objects()
     monkeypatch.setattr(module.settings, 'ENABLE_LOGO_MODE', True)
@@ -197,8 +198,11 @@ async def test_photo_and_text_fallback_keep_silence(monkeypatch, kind):
             method=SendMessage(chat_id=user.telegram_id, text='probe'), message='invalid photo'
         )
     tail = 'PRICE ' + ('x' * 1100 if kind == 'oversize' else '149')
+    if kind.startswith('exact'):
+        NotificationSettingsService._data['message_texts'] = {'TRIAL_ENDING_TEXT': 'OWNER {hours_text}.'}
+        tail = 'x' * (int(kind.removeprefix('exact')) - telegram_visible_length('OWNER 3 часа.\n\n'))
     assert await monitor._send_trial_ending_notification(user, subscription, 6, price_lines=tail)
-    if kind == 'photo':
+    if kind in ('photo', 'exact1024'):
         monitor.bot.send_photo.assert_awaited_once()
         monitor.bot.send_message.assert_not_awaited()
         kwargs = monitor.bot.send_photo.await_args.kwargs
@@ -280,3 +284,55 @@ async def test_paid_checks_do_not_record_an_unreachable_letter(monkeypatch, kind
         if outcome == 'success':
             record.assert_awaited_once_with(db, user.id, subscription.id, 'expiring', days)
     assert record.await_count == int(outcome == 'success')
+
+
+@pytest.mark.parametrize('language', ['en', 'en-US', 'EN'])
+@pytest.mark.parametrize('status', ['active', 'limited'])
+async def test_real_selector_price_tail_and_sender_share_the_language(monkeypatch, language, status):
+    monitor, _, _ = _objects()
+    subscription = _subscription(81, TRIAL_ID, True, 'soon')
+    subscription.status, subscription.tariff = status, None
+    subscription.user.language, subscription.user.status, subscription.user.balance_kopeks = language, 'active', 5000
+    monkeypatch.setattr(module, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=TRIAL_ID)))
+    monkeypatch.setattr(NotificationSettingsService, 'is_enabled', lambda _key: True)
+    monkeypatch.setattr(NotificationSettingsService, 'get_trial_warn_hours', lambda: 6)
+    monkeypatch.setattr(module, 'notification_sent', AsyncMock(return_value=False))
+    recorded = AsyncMock()
+    monkeypatch.setattr(module, 'record_notification', recorded)
+    monitor._log_monitoring_event = AsyncMock()
+    matrix = AsyncMock(
+        return_value={
+            'tariff': {'base_device_limit': 2},
+            'price_matrix': [
+                {'period_days': 30, 'prices': [{'device_limit': 2, 'price_kopeks': 14900}]},
+                {'period_days': 90, 'prices': [{'device_limit': 2, 'price_kopeks': 39900}]},
+            ],
+        }
+    )
+    monkeypatch.setattr('app.services.device_first_checkout_service.build_purchase_options', matrix)
+
+    class DB(_SelectionDB):
+        def begin_nested(self):
+            transaction = self.session.begin_nested()
+
+            class Nested:
+                async def __aenter__(self):
+                    return transaction.__enter__()
+
+                async def __aexit__(self, *args):
+                    return transaction.__exit__(*args)
+
+            return Nested()
+
+    db = DB([subscription])
+    try:
+        await monitor._check_trial_expiring_soon(db)
+        matrix.assert_awaited_once_with(db, subscription.user)
+        monitor.bot.send_message.assert_awaited_once()
+        recorded.assert_awaited_once_with(db, 81, 81, 'trial_2h')
+        assert subscription.user.language == language
+        text = monitor.bot.send_message.await_args.kwargs['text']
+        assert 'Your trial ends in 3 hours.' in text
+        assert '\n\n1 month — 149' in text and '1 месяц' not in text
+    finally:
+        db.close()

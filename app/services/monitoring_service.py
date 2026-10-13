@@ -1361,7 +1361,12 @@ class MonitoringService:
 
                 if self.bot:
                     success = await self._send_trial_ending_notification(
-                        user, subscription, warn_hours, price_lines=await self._trial_price_lines(db, user)
+                        user,
+                        subscription,
+                        warn_hours,
+                        price_lines=await self._trial_price_lines(
+                            db, user, language=(user.language or settings.DEFAULT_LANGUAGE).lower().split('-')[0]
+                        ),
                     )
                     if success:
                         await record_notification(db, user.id, subscription.id, 'trial_2h')
@@ -2832,7 +2837,7 @@ class MonitoringService:
             )
         return True
 
-    async def _trial_price_lines(self, db: AsyncSession, user: User) -> str:
+    async def _trial_price_lines(self, db: AsyncSession, user: User, *, language: str | None = None) -> str:
         """Строки цены в письме о конце пробного (решение владельца 07.10.2026) — из кассы этого человека.
 
         Цены те же, что он увидит, нажав «Оформить подписку»: ячейки 1 и 3 месяца на базовое число устройств из
@@ -2853,7 +2858,7 @@ class MonitoringService:
                 if cell.get('device_limit') == base
             }
             month, quarter = prices.get(30), prices.get(90)
-            texts = get_texts(user.language)
+            texts = get_texts(language or user.language)
             if month:
                 balance = int(user.balance_kopeks or 0)
                 top_up = device_first_top_up_kopeks(price_kopeks=month, balance_kopeks=balance)
