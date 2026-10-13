@@ -31,6 +31,7 @@ from app.services.device_first_checkout_service import (
     cancel_checkout_for_new_calculation,
     cancel_topup_intents,
     checkout_money_state,
+    checkout_ready_message,
     commit_direct_wallet_checkout,
     confirm_checkout,
     create_or_resume_direct_checkout,
@@ -1605,7 +1606,9 @@ async def _render_checkout(callback: types.CallbackQuery, user: User, db: AsyncS
                 callback_data='open_subscription_link',
             )
         )
-        caption = _text(user, '✅ <b>VPN готов</b>', '✅ <b>VPN is ready</b>')
+        caption = checkout_ready_message(
+            checkout, user.language, fallback=_text(user, '✅ <b>VPN готов</b>', '✅ <b>VPN is ready</b>')
+        )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[button], [_main_menu(user)]])
     elif result['ui_state'] == 'cancelled':
         provider_terminal = str(getattr(checkout, 'terminal_reason', '')).startswith('provider_terminal:')

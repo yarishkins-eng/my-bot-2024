@@ -362,7 +362,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'sent_type': 'expiring',
         'sent_days': 3,
         'buttons': [
-            {'label': '⏰ Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '⏰ Продлить подписку', 'target': 'Кабинет, касса продления', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
             {'label': '📱 Моя подписка', 'target': 'Кабинет, экран подписки', 'tracked': False},
         ],
@@ -384,7 +384,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'sent_type': 'expiring',
         'sent_days': 1,
         'buttons': [
-            {'label': '⏰ Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '⏰ Продлить подписку', 'target': 'Кабинет, касса продления', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
             {'label': '📱 Моя подписка', 'target': 'Кабинет, экран подписки', 'tracked': False},
         ],
@@ -406,7 +406,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
             'подписка кончилась за последние 6 часов.'
         ),
         'buttons': [
-            {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '💎 Продлить подписку', 'target': 'Кабинет, касса продления', 'tracked': False},
         ],
     },
     {
@@ -422,7 +422,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         '«Подписка истекла вчера» больше не пересылается. Следующее письмо — скидка на продление второй волны, '
         'если она включена. Письмо в минуту конца управляется отдельно.',
         'buttons': [
-            {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '💎 Продлить подписку', 'target': 'Кабинет, касса продления', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
             {'label': '🆘 Поддержка', 'target': 'Экран поддержки в боте', 'tracked': False},
         ],
@@ -439,7 +439,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'claim_type': 'expired_discount_wave2',
         'buttons': [
             {'label': '🎁 Получить скидку', 'target': 'Выдаёт скидку', 'tracked': True},
-            {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '💎 Продлить подписку', 'target': 'Кабинет, касса продления', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
             {'label': '🆘 Поддержка', 'target': 'Экран поддержки в боте', 'tracked': False},
         ],
@@ -456,7 +456,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'claim_type': 'expired_discount_wave3',
         'buttons': [
             {'label': '🎁 Получить скидку', 'target': 'Выдаёт скидку', 'tracked': True},
-            {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '💎 Продлить подписку', 'target': 'Кабинет, касса продления', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
             {'label': '🆘 Поддержка', 'target': 'Экран поддержки в боте', 'tracked': False},
         ],
@@ -510,7 +510,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'control': 'server',
         'quiet_check': 'grace_enabled',
         'buttons': [
-            {'label': '💎 Продлить подписку', 'target': 'Кабинет, экран подписки', 'tracked': False},
+            {'label': '💎 Продлить подписку', 'target': 'Кабинет, касса продления', 'tracked': False},
             {'label': '💳 Пополнить баланс', 'target': 'Кабинет, экран пополнения', 'tracked': False},
         ],
     },

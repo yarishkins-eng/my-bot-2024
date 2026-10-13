@@ -124,9 +124,15 @@ def build_funnel_menu_keyboard(
         rows = []
         cabinet_url = build_cabinet_url('/')
         renew_text = texts.t('FUNNEL_RENEW_CTA', '💎 Продлить подписку')
+        renew_url = build_cabinet_url('/subscription/purchase')
         link_text = texts.t('FUNNEL_MY_CONNECTION_LINK', '🔗 Моя ссылка для подключения')
         invite_text = texts.t('FUNNEL_INVITE_FRIEND', '🎁 Привести друга — получить бонус')
         referral_on = settings.is_referral_program_enabled()
+
+        def _renew_button() -> InlineKeyboardButton:
+            if renew_url:
+                return InlineKeyboardButton(text=renew_text, web_app=types.WebAppInfo(url=renew_url))
+            return InlineKeyboardButton(text=renew_text, callback_data='subscription_extend')
 
         def _cabinet_button() -> InlineKeyboardButton:
             cabinet_text = texts.t('FUNNEL_CABINET', '👤 Личный кабинет')
@@ -137,7 +143,7 @@ def build_funnel_menu_keyboard(
         if state == FunnelState.PAID_EXPIRED:
             # Закончилась: акцент на продление. «Моя ссылка» прячем (без активной
             # подписки сервер не пускает по ней). Рефералку оставляем — на ней зарабатывают.
-            rows.append([InlineKeyboardButton(text=renew_text, callback_data='subscription_extend')])
+            rows.append([_renew_button()])
             rows.append([_cabinet_button()])
             if referral_on:
                 rows.append([InlineKeyboardButton(text=invite_text, callback_data='menu_referrals')])
@@ -145,7 +151,7 @@ def build_funnel_menu_keyboard(
 
         # PAID_ACTIVE / PAID_EXPIRING: «Продлить» сверху только когда заканчивается
         if state == FunnelState.PAID_EXPIRING:
-            rows.append([InlineKeyboardButton(text=renew_text, callback_data='subscription_extend')])
+            rows.append([_renew_button()])
         rows.append([_cabinet_button()])
         # Каждая кнопка — отдельным рядом (во всю ширину): длинные подписи «Моя ссылка для
         # подключения» / «Привести друга — получить бонус» в два столбца обрезались.

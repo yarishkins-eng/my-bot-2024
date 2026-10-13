@@ -10,6 +10,7 @@ import math
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
+from zoneinfo import ZoneInfo
 
 import structlog
 from aiogram.types import InlineKeyboardMarkup
@@ -4736,6 +4737,26 @@ def _client_ready_keyboard(user: User) -> InlineKeyboardMarkup:
     )
 
 
+CLIENT_READY_RENEWAL_TEXT = {
+    'ru': '✅ Ваша VPN-подписка готова — продлена до {date} (МСК). VPN работает как раньше.',
+    'en': '✅ Your VPN subscription is ready — extended until {date} (Moscow time). Your VPN keeps working as before.',
+}
+
+
+def checkout_ready_message(checkout: SubscriptionCheckout, language: str, *, fallback: str) -> str:
+    """K1 is shared by the chat receipt and native screen; formatting cannot stop delivery."""
+    try:
+        if (checkout.target_snapshot or {}).get('is_trial') is not False or checkout.fulfilled_end_at is None:
+            return fallback
+        end = checkout.fulfilled_end_at
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        date = end.astimezone(ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')
+        return CLIENT_READY_RENEWAL_TEXT['en' if language == 'en' else 'ru'].format(date=date)
+    except Exception:
+        return fallback
+
+
 async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: SubscriptionCheckout) -> None:
     user = await db.get(User, checkout.user_id)
     if user is None or not user.telegram_id:
@@ -4745,6 +4766,7 @@ async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: Subscri
         if user.language == 'en'
         else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
     )
+    text = checkout_ready_message(checkout, user.language, fallback=text)
     await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
 
 

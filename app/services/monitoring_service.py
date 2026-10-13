@@ -1041,7 +1041,13 @@ class MonitoringService:
             extend_callback = f'se:{subscription.id}' if settings.is_multi_tariff_enabled() else 'subscription_extend'
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [build_miniapp_or_callback_button(text='💎 Продлить подписку', callback_data=extend_callback)],
+                    [
+                        build_miniapp_or_callback_button(
+                            text='💎 Продлить подписку',
+                            callback_data=extend_callback,
+                            cabinet_path='/subscription/purchase' if not settings.is_multi_tariff_enabled() else None,
+                        )
+                    ],
                     [build_miniapp_or_callback_button(text='💳 Пополнить баланс', callback_data='balance_topup')],
                 ]
             )
@@ -2954,7 +2960,13 @@ class MonitoringService:
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     # Без «Пополнить баланс» (ВК-4): крюк через пополнение — путь, который чинит ВК-5.
-                    [build_miniapp_or_callback_button(text='💎 Продлить подписку', callback_data=extend_callback)],
+                    [
+                        build_miniapp_or_callback_button(
+                            text='💎 Продлить подписку',
+                            callback_data=extend_callback,
+                            cabinet_path='/subscription/purchase' if not settings.is_multi_tariff_enabled() else None,
+                        )
+                    ],
                 ]
             )
 
@@ -3146,7 +3158,7 @@ class MonitoringService:
                         build_miniapp_or_callback_button(
                             text=texts.t('BTN_RENEW_SUBSCRIPTION', '⏰ Продлить подписку'),
                             callback_data=extend_callback,
-                            cabinet_path='/subscription',
+                            cabinet_path='/subscription/purchase' if not settings.is_multi_tariff_enabled() else None,
                         )
                     ],
                     [
@@ -3430,6 +3442,7 @@ class MonitoringService:
                         build_miniapp_or_callback_button(
                             text=texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку'),
                             callback_data=extend_callback,
+                            cabinet_path='/subscription/purchase' if not settings.is_multi_tariff_enabled() else None,
                         )
                     ],
                     [
@@ -3532,6 +3545,7 @@ class MonitoringService:
                         build_miniapp_or_callback_button(
                             text=texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку'),
                             callback_data=extend_callback,
+                            cabinet_path='/subscription/purchase' if not settings.is_multi_tariff_enabled() else None,
                         )
                     ],
                     [
