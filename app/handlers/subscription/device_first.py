@@ -430,7 +430,7 @@ def _money_block(
     # в чеке показываем только использованную часть, чтобы цена = с баланса + к оплате.
     if topup_intent_enabled_for(user):
         top_up = device_first_top_up_kopeks(price_kopeks=price_kopeks, balance_kopeks=balance_kopeks)
-        used_balance = price_kopeks - top_up
+        used_balance = max(0, price_kopeks - top_up)
         receipt_ru = (
             f'Цена: <b>{_money(user, price_kopeks)} ₽</b>\n'
             f'С вашего баланса: −{_money(user, used_balance)} ₽\n'

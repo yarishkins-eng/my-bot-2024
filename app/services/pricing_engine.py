@@ -649,6 +649,10 @@ class PricingEngine:
 
         subtotal = discounted_base + discounted_devices + discounted_traffic
         after_offer = self.apply_discount(subtotal, offer_pct)
+        # АП-4: личная скидка даёт целые рубли во всех тарифных котировках и перепроверках.
+        # Бесплатные и субрублёвые цены сохраняют договор; скидка не может стать отрицательной.
+        if offer_pct > 0 and subtotal >= 100 and after_offer > 0:
+            after_offer = max(100, after_offer // 100 * 100)
         offer_discount = subtotal - after_offer
         final_total = after_offer
 
