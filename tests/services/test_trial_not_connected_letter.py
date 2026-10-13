@@ -207,6 +207,8 @@ async def test_letter_says_the_connection_is_missing_not_the_service(monkeypatch
 
     async def fake_send(**kwargs):
         sent.update(kwargs)
+        # АП-4 PR-1: перехват текста изображает доставку; None теперь означает отказ.
+        return SimpleNamespace(message_id=7)
 
     service._send_message_with_logo = fake_send
     user = SimpleNamespace(telegram_id=5207068834, language='ru')

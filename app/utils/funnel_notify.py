@@ -184,6 +184,7 @@ async def send_funnel_trial_menu(user, *, trial_tariff=None) -> None:
         from app.bot_factory import create_bot
         from app.keyboards.inline import build_funnel_menu_keyboard
         from app.localization.texts import get_texts
+        from app.services.monitoring_service import is_quiet_night
         from app.services.subscription_service import get_traffic_reset_strategy
         from app.utils.funnel_state import FunnelState
         from app.utils.miniapp_buttons import build_miniapp_or_callback_button
@@ -240,6 +241,7 @@ async def send_funnel_trial_menu(user, *, trial_tariff=None) -> None:
                 text=text,
                 reply_markup=keyboard,
                 parse_mode='HTML',
+                disable_notification=is_quiet_night(),
             )
             # Старое меню новичка теперь мусор — удаляем; новое запоминаем.
             await _delete_remembered_menu(bot, user.telegram_id)

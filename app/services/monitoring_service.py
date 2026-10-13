@@ -388,6 +388,7 @@ class MonitoringService:
         reply_markup=None,
         parse_mode: str | None = 'HTML',
         user: User | None = None,
+        disable_notification: bool = False,
     ):
         """Отправляет сообщение, добавляя логотип при необходимости."""
         if not self.bot:
@@ -423,6 +424,7 @@ class MonitoringService:
                         caption=text,
                         reply_markup=reply_markup,
                         parse_mode=parse_mode,
+                        disable_notification=disable_notification,
                     ),
                     timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
                 )
@@ -449,6 +451,7 @@ class MonitoringService:
                     text=text,
                     reply_markup=reply_markup,
                     parse_mode=parse_mode,
+                    disable_notification=disable_notification,
                 ),
                 timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
             )
@@ -1336,7 +1339,7 @@ class MonitoringService:
                 )
                 .where(
                     and_(
-                        Subscription.status == SubscriptionStatus.ACTIVE.value,
+                        Subscription.status.in_([SubscriptionStatus.ACTIVE.value, SubscriptionStatus.LIMITED.value]),
                         Subscription.is_trial == True,
                         Subscription.tariff_id == trial_tariff.id,
                         Subscription.end_date <= threshold_time,
@@ -1347,6 +1350,7 @@ class MonitoringService:
             )
             trial_expiring = result.scalars().all()
 
+            sent_count = 0
             for subscription in trial_expiring:
                 user = subscription.user
                 if not user:
@@ -1356,20 +1360,23 @@ class MonitoringService:
                     continue
 
                 if self.bot:
-                    success = await self._send_trial_ending_notification(user, subscription, warn_hours)
+                    success = await self._send_trial_ending_notification(
+                        user, subscription, warn_hours, price_lines=await self._trial_price_lines(db, user)
+                    )
                     if success:
                         await record_notification(db, user.id, subscription.id, 'trial_2h')
+                        sent_count += 1
                         logger.info(
                             '🎁 Пользователю отправлено предупреждение о конце пробного',
                             telegram_id=user.telegram_id,
                         )
 
-            if trial_expiring:
+            if sent_count:
                 await self._log_monitoring_event(
                     db,
                     'trial_expiring_notifications_sent',
-                    f'Отправлено {len(trial_expiring)} уведомлений об окончании тестовых подписок',
-                    {'count': len(trial_expiring)},
+                    f'Отправлено {sent_count} уведомлений об окончании тестовых подписок',
+                    {'count': sent_count},
                 )
 
         except Exception as e:
@@ -3171,17 +3178,17 @@ class MonitoringService:
                 ]
             )
 
-            await self._send_message_with_logo(
+            sent = await self._send_message_with_logo(
                 chat_id=user.telegram_id,
                 text=message,
                 parse_mode='HTML',
                 reply_markup=keyboard,
             )
-            return True
+            return sent is not None
 
         except (TelegramForbiddenError, TelegramBadRequest) as exc:
             if await self._handle_unreachable_user(user, exc, 'уведомление об истекающей подписке'):
-                return True
+                return False
             logger.error(
                 'Ошибка Telegram API при отправке уведомления об истечении подписки пользователю',
                 telegram_id=user.telegram_id,
@@ -3200,10 +3207,10 @@ class MonitoringService:
             return False
 
     async def _send_trial_ending_notification(
-        self, user: User, subscription: Subscription, warn_hours: int | None = None
+        self, user: User, subscription: Subscription, warn_hours: int | None = None, *, price_lines: str = ''
     ) -> bool:
         try:
-            get_texts(user.language)
+            texts = get_texts(user.language)
 
             tariff_label = ''
             if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
@@ -3216,32 +3223,40 @@ class MonitoringService:
 
             window_hours = warn_hours if warn_hours is not None else NotificationSettingsService.get_trial_warn_hours()
             hours = trial_hours_left(subscription.end_date, window_hours)
-            hours_text = format_hours_declension(hours)
-            message = NotificationSettingsService.text_for('TRIAL_ENDING_TEXT', TRIAL_ENDING_TEXT).format(
+            hours_text = format_hours_declension(hours, 'en' if texts.language.split('-')[0] == 'en' else 'ru')
+            message = texts.t('TRIAL_ENDING_TEXT', TRIAL_ENDING_TEXT).format(
                 tariff_label=tariff_label, hours_text=hours_text
             )
+            if price_lines:
+                message += f'\n\n{price_lines}'
 
             from aiogram.types import InlineKeyboardMarkup
 
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [build_miniapp_or_callback_button(text='💎 Купить подписку', callback_data='menu_buy')],
-                    [build_miniapp_or_callback_button(text='💰 Пополнить баланс', callback_data='balance_topup')],
+                    [
+                        build_miniapp_or_callback_button(
+                            text=texts.get('FUNNEL_SUBSCRIBE_CTA'),
+                            callback_data='menu_buy',
+                            cabinet_path='/subscription/purchase',
+                        )
+                    ],
                 ]
             )
 
-            await self._send_message_with_logo(
+            sent = await self._send_message_with_logo(
                 chat_id=user.telegram_id,
                 text=message,
                 parse_mode='HTML',
                 reply_markup=keyboard,
                 user=user,
+                disable_notification=is_quiet_night(),
             )
-            return True
+            return sent is not None
 
         except (TelegramForbiddenError, TelegramBadRequest) as exc:
             if await self._handle_unreachable_user(user, exc, 'уведомление о завершении тестовой подписки'):
-                return True
+                return False
             logger.error(
                 'Ошибка Telegram API при отправке уведомления о завершении тестовой подписки пользователю',
                 telegram_id=user.telegram_id,
@@ -3292,18 +3307,19 @@ class MonitoringService:
                 ]
             )
 
-            await self._send_message_with_logo(
+            sent = await self._send_message_with_logo(
                 chat_id=user.telegram_id,
                 text=message,
                 parse_mode='HTML',
                 reply_markup=keyboard,
                 user=user,
+                disable_notification=is_quiet_night(),
             )
-            return True
+            return sent is not None
 
         except (TelegramForbiddenError, TelegramBadRequest) as exc:
             if await self._handle_unreachable_user(user, exc, 'письмо о неподключённом VPN'):
-                return True
+                return False
             logger.error(
                 'Ошибка Telegram API при отправке письма о неподключённом VPN',
                 telegram_id=user.telegram_id,
@@ -3459,17 +3475,17 @@ class MonitoringService:
                 ]
             )
 
-            await self._send_message_with_logo(
+            sent = await self._send_message_with_logo(
                 chat_id=user.telegram_id,
                 text=message,
                 parse_mode='HTML',
                 reply_markup=keyboard,
             )
-            return True
+            return sent is not None
 
         except (TelegramForbiddenError, TelegramBadRequest) as exc:
             if await self._handle_unreachable_user(user, exc, 'напоминание об истекшей подписке'):
-                return True
+                return False
             logger.error(
                 'Ошибка Telegram API при отправке напоминания об истекшей подписке пользователю',
                 telegram_id=user.telegram_id,
