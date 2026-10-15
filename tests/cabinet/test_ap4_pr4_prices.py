@@ -75,6 +75,22 @@ async def test_quote_guard_refreshes_locked_group_and_tariff(price_env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('changed', ['access', 'default_group'])
+async def test_locked_refresh_cannot_enable_a_stale_default_group_quote(price_env, changed):
+    tariff, group = price_env
+
+    async def refresh(obj, **_kwargs):
+        if changed == 'access' and obj is tariff:
+            tariff.allowed_promo_groups = [PromoGroup(id=999)]
+        elif changed == 'default_group' and obj is group:
+            group.is_default = False
+
+    db = AsyncMock()
+    db.refresh.side_effect = refresh
+    assert await api._discount_examples(db, lock=True) == ({}, {})
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('reason', ['no_month', 'multiple', 'disabled', 'free'])
 async def test_unavailable_cashier_never_invents_price(price_env, monkeypatch, reason):
     tariff, _ = price_env

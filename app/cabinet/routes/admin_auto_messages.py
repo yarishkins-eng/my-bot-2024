@@ -1157,11 +1157,19 @@ async def _discount_examples(db: AsyncSession, *, lock: bool = False) -> tuple[d
     group = await get_default_promo_group(db)
     if lock and group is not None:
         await db.refresh(group, with_for_update=True)
+        if not group.is_default:
+            return {}, {}
     tariffs = await get_tariffs_for_user(db, group.id if group else None)
     if lock:
         for tariff in tariffs:
             await db.refresh(tariff, with_for_update=True)
             await db.refresh(tariff, attribute_names=['allowed_promo_groups'])
+        tariffs = [
+            tariff
+            for tariff in tariffs
+            if not tariff.allowed_promo_groups
+            or (group is not None and any(allowed.id == group.id for allowed in tariff.allowed_promo_groups))
+        ]
     eligible = resolve_single_eligible_tariff(tariffs, subscription=None)
     if not eligible.eligible or 30 not in eligible.period_options:
         return {}, {}
@@ -1812,12 +1820,14 @@ async def get_auto_message(
     if message_id == 'trial-ending-discount':
         item.sent_count, history_note, history = await _trial_discount_stats(db)
     text_facts = _text_facts(message_id, item.params)
-    if message_id == _discount_context()['carrier_id']:
+    context = _discount_context()
+    if context['enabled'] and message_id == context['carrier_id']:
         _, options = await _discount_examples(db)
         if options:
             text_facts['text_inserts'] = [
                 insert for insert in text_facts['text_inserts'] if insert.name != 'price_lines'
             ] + [AutoMessageInsert(name='price_lines', variants=_discount_previews(options))]
+            text_facts['text_markers'] = _markers_of(message_id, text_facts['text'], item.params)
     return AutoMessageDetail(
         **item.model_dump(),
         **text_facts,
@@ -1926,6 +1936,7 @@ async def _trial_discount_stats(db: AsyncSession) -> tuple[int, str, list[AutoMe
         )
         return 0, note, []
     rules = await _owner_rules(db)
+    now = datetime.now(UTC)
     offers = (
         await db.execute(
             select(DiscountOffer.user_id, DiscountOffer.created_at, DiscountOffer.extra_data)
@@ -1933,12 +1944,13 @@ async def _trial_discount_stats(db: AsyncSession) -> tuple[int, str, list[AutoMe
             .where(
                 DiscountOffer.notification_type == 'trial_ending_discount',
                 DiscountOffer.created_at >= since,
+                DiscountOffer.created_at <= now,
                 rules.people,
             )
             .order_by(DiscountOffer.created_at.desc())
         )
     ).all()
-    now, delivered, history = datetime.now(UTC), set(), []
+    delivered, history = set(), []
     for user_id, created, extra in offers:
         try:
             value = (extra if isinstance(extra, dict) else {}).get('delivered_at')
@@ -1957,6 +1969,7 @@ async def _trial_discount_stats(db: AsyncSession) -> tuple[int, str, list[AutoMe
                 .where(
                     rules.people,
                     SubscriptionCheckout.fulfilled_at >= since,
+                    SubscriptionCheckout.fulfilled_at <= now,
                     SubscriptionCheckout.funding_state == 'funded',
                     SubscriptionCheckout.fulfillment_state == 'fulfilled',
                     SubscriptionCheckout.lifecycle_state.in_(('fulfilling', 'ready')),

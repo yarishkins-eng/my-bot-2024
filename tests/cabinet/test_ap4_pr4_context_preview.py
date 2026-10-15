@@ -91,8 +91,18 @@ async def test_selected_existing_carrier_keeps_owner_text_and_gets_real_examples
     monkeypatch.setattr(api, '_claimed_counts', AsyncMock(return_value={}))
     monkeypatch.setattr(api, '_history_for', AsyncMock(return_value=[]))
     assert Settings.set_text_override('TRIAL_EXPIRING_24H', 'Текст владельца\n\n{price_lines}')
+    before = api._text_facts('trial-1d')
+    off = await api.get_auto_message('trial-1d', None, AsyncMock(), None)
+    assert off.text_inserts == before['text_inserts']
+    assert Settings.set_trial_ending_discount_enabled(True)
     detail = await api.get_auto_message('trial-1d', None, AsyncMock(), None)
     assert detail.text == 'Текст владельца\n\n{price_lines}'
     insert = next(item for item in detail.text_inserts if item.name == 'price_lines')
     assert len(insert.variants) == 3 and '119 ₽' in insert.variants[0].text
     assert detail.text_source == 'custom'
+    assert detail.text_markers == []
+    assert Settings.set_trial_ending_discount_carrier(0)
+    assert Settings.set_text_override('TRIAL_ENDING_TEXT', 'До конца {hours_text}.')
+    last_hours = await api.get_auto_message('trial-2h', None, AsyncMock(), None)
+    assert [marker.name for marker in last_hours.text_markers] == ['hours_text']
+    assert any(insert.name == 'price_lines' for insert in last_hours.text_inserts)

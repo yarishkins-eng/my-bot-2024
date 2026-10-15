@@ -122,12 +122,15 @@ async def test_own_delivered_people_and_successful_orders_are_separate(db):
     db.order(lifecycle='operator_review')  # Post-paid reversal retains old funded/fulfilled fields.
     db.order(fulfillment='not_started')
     db.order(at=SINCE - timedelta(seconds=1))
+    db.order(at=NOW + timedelta(days=1))
+    db.offer(created=NOW + timedelta(days=1))
     count, note, history = await api._trial_discount_stats(db)
     assert count == 1 and 'получили 1' in note and 'купили со скидкой 2' in note
     assert 'отдано 110 ₽' in note and 'медианный чек 219 ₽' in note
     assert '27 из 100' in note and 'Разница может быть случайной.' in note
     assert len(history) == 2 and all(row.user_ref == 'Клиент #1' for row in history)
     assert all(row.claimed is None for row in history)
+    assert (NOW + timedelta(days=1)).strftime('%d.%m.%Y') not in note
 
 
 @pytest.mark.asyncio
