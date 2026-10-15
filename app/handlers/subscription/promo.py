@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -390,9 +391,25 @@ async def claim_discount_offer(
     if getattr(offer, 'notification_type', None) == 'trial_expired_discount':
         from app.services.monitoring_service import monitoring_service
 
-        price_lines = await monitoring_service._trial_price_lines(db, db_user, subscription=subscription)
-        if price_lines:
-            success_message += f'\n\n{price_lines}'
+        price_lines = await monitoring_service._trial_price_lines(db, db_user, subscription=subscription, claim=True)
+        success_message = price_lines or texts.t('TRIAL_DISCOUNT_ACTIVATED').format(percent=discount_percent)
+        if not price_lines:
+            if discount_expires_at:
+                deadline = discount_expires_at.astimezone(ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y, %H:%M')
+                deadline += ' (MSK)' if texts.language == 'en' else ' (МСК)'
+                success_message += '\n\n' + texts.t('TRIAL_DISCOUNT_UNTIL').format(deadline=deadline)
+            success_message += '\n' + texts.t('TRIAL_DISCOUNT_ANY_SELECTION')
+        buy_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    build_miniapp_or_callback_button(
+                        text=texts.t('TRIAL_DISCOUNT_CTA'),
+                        callback_data='menu_buy',
+                        cabinet_path='/subscription/purchase',
+                    )
+                ]
+            ]
+        )
     await callback.message.answer(success_message, reply_markup=buy_keyboard)
 
 

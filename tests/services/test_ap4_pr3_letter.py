@@ -34,10 +34,10 @@ def options(*, percent=10, end='2026-10-15T21:30:00+00:00', trial=True):
     'balance,minimum,expected',
     [
         (0, 100, '1 месяц — 134 ₽ вместо <s>149 ₽</s>'),
-        (5000, 100, 'с вашими 50 ₽ на балансе — доплатить 84 ₽'),
-        (5000, 10000, 'с вашими 34 ₽ на балансе — доплатить 100 ₽'),
-        (13400, 100, '134 ₽ спишутся с баланса, доплачивать не нужно.'),
-        (1490, 100, 'с вашими 14 ₽ на балансе — доплатить 120 ₽'),
+        (5000, 100, 'с баланса 50 ₽, доплатить 84 ₽'),
+        (5000, 10000, 'с баланса 34 ₽, доплатить 100 ₽'),
+        (13400, 100, 'хватит баланса, доплачивать не нужно'),
+        (1490, 100, 'с баланса 14 ₽, доплатить 120 ₽'),
     ],
 )
 def test_discount_receipt_uses_exact_breakdown(monkeypatch, balance, minimum, expected):
@@ -48,6 +48,10 @@ def test_discount_receipt_uses_exact_breakdown(monkeypatch, balance, minimum, ex
     assert '3 месяца — 359 ₽ вместо <s>399 ₽</s>' in text
     assert 'до 16.10.2026, 00:30 (МСК)' in text
     assert 'любой срок и число устройств' in text
+    assert text.count('134 ₽') == text.count('1 месяц') == 1
+    assert all(line.endswith(('.', ':')) for line in text.splitlines())
+    if balance:
+        assert expected in next(line for line in text.splitlines() if line.startswith('1 месяц'))
 
 
 @pytest.mark.parametrize('language,zone', [('ru', 'МСК'), ('en', 'MSK')])
@@ -61,6 +65,8 @@ def test_traffic_and_deadline_are_honest(language, zone, traffic, shown):
     )
     assert f'16.10.2026, 00:30 ({zone})' in text
     assert ('ГБ' in text or 'GB' in text) is shown
+    if shown:
+        assert 'ГБ' in text.splitlines()[0] or 'GB' in text.splitlines()[0]
 
 
 @pytest.mark.parametrize(
@@ -85,3 +91,17 @@ def test_no_personal_benefit_means_ordinary_letter():
     data = options()
     data['price_matrix'][0]['prices'][0]['breakdown']['promo_offer_discount_kopeks'] = 0
     assert module.format_trial_discount_lines(data, SimpleNamespace(balance_kopeks=0), get_texts('ru')) == ''
+
+
+@pytest.mark.parametrize('balance', [0, 5000, 50000])
+def test_claim_is_owner_exact_short_text_without_wallet_or_repeated_deadline(balance):
+    actual = module.format_trial_discount_lines(
+        options(), SimpleNamespace(balance_kopeks=balance), get_texts('ru'), 2 * 1024**3, claim=True
+    )
+    assert actual == (
+        '🎉 Скидка 10% активирована!\n\n'
+        'До 16.10.2026, 00:30 (МСК):\n'
+        '1 месяц — 134 ₽ вместо <s>149 ₽</s>\n'
+        '3 месяца — 359 ₽ вместо <s>399 ₽</s>\n'
+        'Скидка — на любой срок и число устройств.'
+    )

@@ -266,14 +266,9 @@ SUBSCRIPTION_EXPIRED_TEXT = """
 """
 
 TRIAL_ENDING_TEXT = """
-🎁 <b>Тестовая подписка{tariff_label} скоро закончится!</b>
+🎁 <b>Пробный период{tariff_label} закончится через {hours_text}.</b>
 
-Ваша тестовая подписка истекает через {hours_text}.
-
-💎 <b>Не хотите остаться без VPN?</b>
-Переходите на полную подписку!
-
-⚡️ Успейте оформить до окончания тестового периода!
+Чтобы продолжить пользоваться VPN, оформите подписку.
 """
 
 TRIAL_NOT_CONNECTED_TEXT = """
@@ -321,7 +316,9 @@ class TrialDiscountPriceLines(str):  # noqa: SLOT000 -- str subclasses need a di
     offer_id: int | None = None
 
 
-def format_trial_discount_lines(options: dict, user: User, texts, lifetime_bytes: int | None = None) -> str:
+def format_trial_discount_lines(
+    options: dict, user: User, texts, lifetime_bytes: int | None = None, *, claim: bool = False
+) -> str:
     from app.services.device_first_checkout_service import device_first_top_up_kopeks
 
     base = (options.get('tariff') or {}).get('base_device_limit')
@@ -338,42 +335,55 @@ def format_trial_discount_lines(options: dict, user: User, texts, lifetime_bytes
         return ''
     english = texts.language.lower().split('-')[0] == 'en'
     deadline = offer.get('expires_at')
-    until = ''
+    until, deadline_text = '', ''
     if deadline:
         end = datetime.fromisoformat(deadline.replace('Z', '+00:00')).astimezone(_MOSCOW)
-        until = (' until ' if english else ' до ') + end.strftime('%d.%m.%Y, %H:%M')
-        until += ' (MSK)' if english else ' (МСК)'
-    lines = [texts.t('TRIAL_DISCOUNT_HEADING').format(percent=offer['discount_percent'], until=until)]
+        deadline_text = end.strftime('%d.%m.%Y, %H:%M') + (' (MSK)' if english else ' (МСК)')
+        until = (' until ' if english else ' до ') + deadline_text
+    if claim:
+        lines = [texts.t('TRIAL_DISCOUNT_ACTIVATED').format(percent=offer['discount_percent']), '']
+        if deadline_text:
+            lines.append(texts.t('TRIAL_DISCOUNT_UNTIL').format(deadline=deadline_text))
+    else:
+        lines = []
+        if type(lifetime_bytes) is int and lifetime_bytes >= 1024**3:
+            traffic = f'{lifetime_bytes / 1024**3:.1f}'
+            lines.append(
+                texts.t('TRIAL_DISCOUNT_TRAFFIC').format(traffic=traffic if english else traffic.replace('.', ','))
+            )
+        lines.append(texts.t('TRIAL_DISCOUNT_HEADING').format(percent=offer['discount_percent'], until=until))
 
     def money(amount):
         return settings.format_price(amount, round_kopeks=False)
 
+    net, balance = month['price_kopeks'], int(user.balance_kopeks or 0)
+    top_up = device_first_top_up_kopeks(price_kopeks=net, balance_kopeks=balance)
     for days, label in [(30, '1 month' if english else '1 месяц'), (90, '3 months' if english else '3 месяца')]:
         cell = cells.get(days) or {}
         net = cell.get('price_kopeks')
         saving = (cell.get('breakdown') or {}).get('promo_offer_discount_kopeks')
         if net and saving:
-            lines.append(texts.t('TRIAL_DISCOUNT_PRICE').format(term=label, net=money(net), before=money(net + saving)))
-    net, balance = month['price_kopeks'], int(user.balance_kopeks or 0)
-    top_up = device_first_top_up_kopeks(price_kopeks=net, balance_kopeks=balance)
-    if balance >= net:
-        lines.append(texts.t('TRIAL_DISCOUNT_FUNDED').format(price=money(net)))
-    elif balance >= 100 and 0 < top_up < net:
-        lines.append(texts.t('TRIAL_DISCOUNT_BALANCE').format(balance=money(net - top_up), top_up=money(top_up)))
+            line = texts.t('TRIAL_DISCOUNT_PRICE').format(term=label, net=money(net), before=money(net + saving))
+            if days == 30 and not claim:
+                if balance >= net:
+                    line += f' ({texts.t("TRIAL_DISCOUNT_FUNDED")})'
+                elif balance >= 100 and 0 < top_up < net:
+                    line += (
+                        ' ('
+                        + texts.t('TRIAL_DISCOUNT_BALANCE').format(balance=money(net - top_up), top_up=money(top_up))
+                        + ')'
+                    )
+            lines.append(line + ('' if claim else '.'))
     lines.append(texts.t('TRIAL_DISCOUNT_ANY_SELECTION'))
     current = options.get('current_subscription') or {}
     if (
-        current.get('is_trial') is True
+        not claim
+        and current.get('is_trial') is True
         and current.get('tariff_id') is not None
         and current['tariff_id'] != (options.get('tariff') or {}).get('id')
         and (settings.TARIFF_SWITCH_RESET_FREE_DAYS or not settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID)
     ):
         lines.append(texts.t('TRIAL_DISCOUNT_START_NOW'))
-    if type(lifetime_bytes) is int and lifetime_bytes >= 1024**3:
-        traffic = f'{lifetime_bytes / 1024**3:.1f}'
-        lines.append(
-            texts.t('TRIAL_DISCOUNT_TRAFFIC').format(traffic=traffic if english else traffic.replace('.', ','))
-        )
     return '\n'.join(lines)
 
 
@@ -1384,7 +1394,6 @@ class MonitoringService:
 
         def skipped(reason):
             logger.info('trial_ending_discount_skipped', user_id=user.id, reason=reason)
-            return None
 
         config = NotificationSettingsService.get_trial_ending_discount_settings()
         if not config['enabled'] or config['carrier'] != carrier or subscription is None:
@@ -3082,6 +3091,7 @@ class MonitoringService:
         language: str | None = None,
         subscription: Subscription | None = None,
         lifetime_bytes: int | None = None,
+        claim: bool = False,
     ) -> str:
         """Строки цены в письме о конце пробного (решение владельца 07.10.2026) — из кассы этого человека.
 
@@ -3096,7 +3106,7 @@ class MonitoringService:
             async with db.begin_nested():
                 options = await build_purchase_options(db, user, subscription=subscription)
                 texts = get_texts(language or user.language)
-                discount_lines = format_trial_discount_lines(options, user, texts, lifetime_bytes)
+                discount_lines = format_trial_discount_lines(options, user, texts, lifetime_bytes, claim=claim)
                 if discount_lines:
                     lines = TrialDiscountPriceLines(discount_lines)
                     if getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount':
@@ -3113,6 +3123,8 @@ class MonitoringService:
                             .limit(1)
                         )
                     return lines
+            if claim:
+                return ''
             base = (options.get('tariff') or {}).get('base_device_limit')
             prices = {
                 row.get('period_days'): cell.get('price_kopeks')
@@ -3128,8 +3140,7 @@ class MonitoringService:
                 if balance >= month:
                     return texts.t(
                         'TRIAL_EXPIRED_PRICE_LINES_FUNDED',
-                        '1 месяц — {month_price}\nНа балансе хватает на месяц. '
-                        '{month_price} спишутся с баланса, доплачивать не нужно.',
+                        '1 месяц — {month_price} с баланса, доплачивать не нужно.',
                     ).format(month_price=settings.format_price(month, round_kopeks=False))
                 # Остаток — в целых рублях вниз: «с вашими N ₽» плюс доплата «M ₽» дают цену месяца, а M — ровно то,
                 # что попросит касса. Меньше рубля на балансе или доплата не меньше цены — строки баланса нет (касса

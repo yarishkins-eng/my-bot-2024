@@ -15,7 +15,8 @@ from app.services.pricing_engine import pricing_engine
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('balance', [0, 5000, 14900])
-async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, balance):
+@pytest.mark.parametrize('duration', [None, 24])
+async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, balance, duration):
     user = SimpleNamespace(
         id=7,
         language='ru',
@@ -36,7 +37,7 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
         effect_type='percent_discount',
         discount_percent=10,
         notification_type='trial_expired_discount',
-        extra_data={},
+        extra_data={'active_discount_hours': duration},
         bonus_amount_kopeks=0,
     )
     callback = SimpleNamespace(
@@ -65,7 +66,27 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
         for days in (30, 90):
             result = await pricing_engine.calculate_tariff_purchase_price(tariff, days, device_limit=1, user=user)
             quotes[days] = result.final_total
-            matrix.append({'period_days': days, 'prices': [{'device_limit': 1, 'price_kopeks': result.final_total}]})
+            matrix.append(
+                {
+                    'period_days': days,
+                    'prices': [
+                        {
+                            'device_limit': 1,
+                            'price_kopeks': result.final_total,
+                            'breakdown': {
+                                'promo_offer_discount_kopeks': result.promo_offer_discount,
+                                'promo_offer': {
+                                    'discount_percent': 10,
+                                    'source': 'trial_expired_discount',
+                                    'expires_at': user.promo_offer_discount_expires_at.isoformat()
+                                    if user.promo_offer_discount_expires_at
+                                    else None,
+                                },
+                            },
+                        }
+                    ],
+                }
+            )
         return {'eligible': True, 'tariff': {'base_device_limit': 1}, 'price_matrix': matrix}
 
     monkeypatch.setattr('app.services.device_first_checkout_service.build_purchase_options', options)
@@ -73,12 +94,15 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
     message = callback.message.answer.await_args.args[0]
     assert quotes == {30: 13400, 90: 35900}
     assert '1 месяц — 134 ₽' in message
-    if balance == 5000:
-        assert 'с вашими 50 ₽ на балансе — доплатить 84 ₽' in message.split('\n')
-    elif balance == 0:
-        assert '3 месяца — 359 ₽' in message
-    else:
-        assert 'спишутся с баланса, доплачивать не нужно.' in message
+    # Owner15.10: claim is the same short answer for every balance; money calculation is still real.
+    assert '3 месяца — 359 ₽' in message
+    assert message.startswith('🎉 Скидка 10% активирована!\n\n')
+    assert message.count('(МСК)') == int(duration is not None)
+    assert message.count('1 месяц') == message.count('134 ₽') == 1
+    assert 'автоматически' not in message and 'баланса' not in message
+    assert (
+        callback.message.answer.await_args.kwargs['reply_markup'].inline_keyboard[0][0].text == '🎁 Оформить со скидкой'
+    )
 
 
 @pytest.mark.asyncio
@@ -143,4 +167,4 @@ async def test_claim_passes_its_existing_subscription_to_price_helper(monkeypatc
     quote = AsyncMock(return_value='')
     monkeypatch.setattr(monitoring_service, '_trial_price_lines', quote)
     await promo.claim_discount_offer(callback, user, db)
-    quote.assert_awaited_once_with(db, user, subscription=existing)
+    quote.assert_awaited_once_with(db, user, subscription=existing, claim=True)

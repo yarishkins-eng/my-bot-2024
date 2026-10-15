@@ -107,9 +107,10 @@ async def issue_letter(sessions, monkeypatch, args):
         assert '20%' in msg and '119' in msg and '149' in msg and '319' in msg and '399' in msg
         assert ('МСК' in msg) if user.language == 'ru' else ('MSK' in msg)
         if user.balance_kopeks == 5000:
-            assert (
-                ('За месяц' in msg and '69' in msg) if user.language == 'ru' else ('For 1 month' in msg and '69' in msg)
-            )
+            # Owner15.10 moved the same 50/69 receipt inline into the month price.
+            month = next(line for line in msg.splitlines() if line.startswith(('1 месяц', '1 month')))
+            assert '50' in month and '69' in month
+            assert msg.count('119') == msg.count('319') == 1
         button = delivered[0]['telegram_markup'].inline_keyboard[0][0]
         assert button.text == get_texts(user.language).t('TRIAL_DISCOUNT_CTA')
         assert button.web_app.url == 'https://example.invalid/subscription/purchase'
