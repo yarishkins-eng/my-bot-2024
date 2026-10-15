@@ -156,6 +156,9 @@ class NotificationSettingsService:
         changed = False
         for key, defaults in cls._DEFAULTS.items():
             current = cls._data.get(key)
+            if key == 'trial_ending_discount' and key in cls._data:
+                # A partial enabled file must not acquire issuance parameters from defaults.
+                continue
             if not isinstance(current, dict):
                 cls._data[key] = deepcopy(defaults)
                 changed = True

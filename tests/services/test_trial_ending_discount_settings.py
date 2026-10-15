@@ -203,3 +203,12 @@ async def test_chat_legacy_trial_percent_enforces_its_actual_limits(storage, val
         state.clear.assert_not_awaited()
         assert storage.get_trial_expired_discount_percent() == before
         assert '1' in message.answer.call_args.args[0] and '50' in message.answer.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    'config', [{'enabled': True}, {'enabled': True, 'discount_percent': 20, 'carrier': 24, 'audience': 1}]
+)
+def test_cold_load_cannot_complete_partial_enabled_configuration(storage, config):
+    storage._storage_path.write_text(json.dumps({KEY: config}))
+    storage._loaded = False
+    assert storage.get_trial_ending_discount_settings()['enabled'] is False
