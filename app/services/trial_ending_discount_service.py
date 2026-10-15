@@ -120,7 +120,6 @@ async def prepare_trial_ending_discount(
 
     def skipped(reason):
         logger.info('trial_ending_discount_skipped', user_id=user_id, reason=reason)
-        return None
 
     if type(carrier) is not int or carrier not in (0, 24, 48) or not isinstance(panel_uuid, str) or not panel_uuid:
         return skipped('invalid_carrier_or_uuid')
