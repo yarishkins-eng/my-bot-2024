@@ -104,3 +104,43 @@ async def test_rejected_claim_does_not_ask_for_a_discounted_price(monkeypatch, k
     )
     quote.assert_not_awaited()
     callback.message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_claim_passes_its_existing_subscription_to_price_helper(monkeypatch):
+    from app.handlers.subscription import promo
+
+    existing = SimpleNamespace(id=44, tariff_id=99, is_active=False, is_trial=True)
+    user = SimpleNamespace(
+        id=7,
+        language='ru',
+        balance_kopeks=0,
+        subscription=existing,
+        promo_offer_discount_percent=0,
+        promo_offer_discount_source=None,
+        promo_offer_discount_expires_at=None,
+    )
+    offer = SimpleNamespace(
+        id=77,
+        user_id=7,
+        claimed_at=None,
+        is_active=True,
+        expires_at=datetime.now(UTC) + timedelta(hours=24),
+        effect_type='percent_discount',
+        discount_percent=10,
+        notification_type='trial_expired_discount',
+        extra_data={},
+        bonus_amount_kopeks=0,
+    )
+    callback = SimpleNamespace(
+        data='claim_discount_77',
+        answer=AsyncMock(),
+        message=SimpleNamespace(answer=AsyncMock()),
+    )
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
+    monkeypatch.setattr(promo, 'get_offer_by_id', AsyncMock(return_value=offer))
+    monkeypatch.setattr(promo, 'mark_offer_claimed', AsyncMock())
+    quote = AsyncMock(return_value='')
+    monkeypatch.setattr(monitoring_service, '_trial_price_lines', quote)
+    await promo.claim_discount_offer(callback, user, db)
+    quote.assert_awaited_once_with(db, user, subscription=existing)
