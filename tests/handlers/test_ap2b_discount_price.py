@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.handlers.subscription import promo
+from app.localization.texts import get_texts
 from app.services import monitoring_service as monitoring_module
 from app.services.monitoring_service import monitoring_service
 from app.services.pricing_engine import pricing_engine
@@ -168,3 +169,52 @@ async def test_claim_passes_its_existing_subscription_to_price_helper(monkeypatc
     monkeypatch.setattr(monitoring_service, '_trial_price_lines', quote)
     await promo.claim_discount_offer(callback, user, db)
     quote.assert_awaited_once_with(db, user, subscription=existing, claim=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('language', ['ru', 'en'])
+@pytest.mark.parametrize('price', ['exception', 'ordinary', 'ineligible'])
+async def test_claim_real_helper_falls_back_without_unconfirmed_price(monkeypatch, language, price):
+    user = SimpleNamespace(id=7, language=language, subscription=None, balance_kopeks=0)
+    offer = SimpleNamespace(
+        id=77,
+        user_id=7,
+        claimed_at=None,
+        is_active=True,
+        expires_at=datetime.now(UTC) + timedelta(hours=24),
+        effect_type='percent_discount',
+        discount_percent=10,
+        notification_type='trial_expired_discount',
+        extra_data={'active_discount_hours': 24},
+        bonus_amount_kopeks=0,
+    )
+    callback = SimpleNamespace(
+        data='claim_discount_77', answer=AsyncMock(), message=SimpleNamespace(answer=AsyncMock())
+    )
+
+    @asynccontextmanager
+    async def nested():
+        yield
+
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock(), begin_nested=nested)
+    monkeypatch.setattr(promo, 'get_offer_by_id', AsyncMock(return_value=offer))
+    monkeypatch.setattr(promo, 'mark_offer_claimed', AsyncMock())
+    options = {
+        'eligible': price != 'ineligible',
+        'tariff': {'base_device_limit': 1},
+        'price_matrix': [
+            {'period_days': 30, 'prices': [{'device_limit': 1, 'price_kopeks': 14900}]},
+        ],
+    }
+    cashier = (
+        AsyncMock(side_effect=RuntimeError('unavailable')) if price == 'exception' else AsyncMock(return_value=options)
+    )
+    monkeypatch.setattr('app.services.device_first_checkout_service.build_purchase_options', cashier)
+    await promo.claim_discount_offer(callback, user, db)
+    body = callback.message.answer.await_args.args[0]
+    texts = get_texts(language)
+    assert body.startswith(texts.t('TRIAL_DISCOUNT_ACTIVATED').format(percent=10) + '\n\n')
+    assert body.endswith(texts.t('TRIAL_DISCOUNT_ANY_SELECTION'))
+    assert body.count('(МСК)' if language == 'ru' else '(MSK)') == 1
+    assert body.count('10%') == 1 and '149' not in body and '₽' not in body
+    assert '{' not in body
