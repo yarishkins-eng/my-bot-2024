@@ -29,7 +29,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -105,6 +105,9 @@ _NUMERIC_FIELDS: tuple[str, ...] = (
     'valid_hours',
     'trigger_days',
     'not_connected_after_hours',
+    'carrier',
+    'audience',
+    'post_trial_hours',
 )
 
 FIELD_TITLES: dict[str, str] = {
@@ -113,6 +116,9 @@ FIELD_TITLES: dict[str, str] = {
     'valid_hours': 'Сколько действует',
     'trigger_days': 'Через сколько дней',
     'not_connected_after_hours': 'Через сколько часов после начала',
+    'carrier': 'Письмо со скидкой',
+    'audience': 'Кому',
+    'post_trial_hours': 'После конца пробного',
 }
 
 
@@ -142,14 +148,16 @@ async def _max_promo_group_percent(db: AsyncSession) -> int:
     return worst
 
 
-async def _assert_discount_is_safe(db: AsyncSession, percent: int) -> None:
+async def _assert_discount_is_safe(
+    db: AsyncSession, percent: int, *, max_percent: int = MAX_OFFER_DISCOUNT_PERCENT
+) -> None:
     """Отбить процент, от которого цена уходит в ноль. 422 с внятной причиной."""
-    if percent < MIN_OFFER_DISCOUNT_PERCENT or percent > MAX_OFFER_DISCOUNT_PERCENT:
+    if percent < MIN_OFFER_DISCOUNT_PERCENT or percent > max_percent:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f'Размер скидки: допустимо от {MIN_OFFER_DISCOUNT_PERCENT} '
-                f'до {MAX_OFFER_DISCOUNT_PERCENT}%. Чтобы сообщение перестало уходить, '
+                f'до {max_percent}%. Чтобы сообщение перестало уходить, '
                 'выключите его, а не ставьте ноль.'
             ),
         )
@@ -334,6 +342,18 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
             {'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
             {'label': '💳 Тарифы', 'target': 'Список тарифов в боте', 'tracked': False},
         ],
+    },
+    {
+        'id': 'trial-ending-discount',
+        'group': 'trial',
+        'title': 'Скидка до конца пробного',
+        'when': 'Дополняет выбранное письмо о конце пробного. Превью — в его карточке.',
+        'control': 'toggle',
+        'settings_key': 'trial_ending_discount',
+        'params': ('discount_percent', 'carrier', 'audience', 'post_trial_hours'),
+        'quiet_check': 'trial_ending_available',
+        'warning': 'Выключение остановит новые выдачи. Уже созданная доплата со скидкой сохранится.',
+        'buttons': [{'label': '🎁 Оформить со скидкой', 'target': 'Кабинет, касса', 'tracked': False}],
     },
     {
         'id': 'trial-discount',
@@ -662,6 +682,15 @@ GETTER_NAMES: dict[tuple[str, str], str] = {
     ('trial_not_connected', 'not_connected_after_hours'): 'get_trial_not_connected_after_hours',
 }
 
+for _field, _suffix in (
+    ('discount_percent', 'percent'),
+    ('carrier', 'carrier'),
+    ('audience', 'audience'),
+    ('post_trial_hours', 'post_trial_hours'),
+):
+    SETTER_NAMES['trial_ending_discount', _field] = f'set_trial_ending_discount_{_suffix}'
+    GETTER_NAMES['trial_ending_discount', _field] = f'get_trial_ending_discount_{_suffix}'
+
 # Нижняя граница «через сколько дней» у сообщений РАЗНАЯ: у третьей волны сеттер
 # поднимает единицу до двойки, у скидки после пробного двойка не нужна. Общая
 # константа врала бы одному из двух: приняли бы 1, а записалось бы 2, и ответ
@@ -675,6 +704,7 @@ TRIGGER_DAYS_MIN: dict[str, int] = {
 # НЕ всё: проверено по monitoring_service — are_notifications_globally_enabled()
 # стоит только на трёх проверках из десяти.
 GLOBALLY_SWITCHED_IDS = frozenset({'trial-discount', 'return-day1', 'return-wave2', 'return-wave3', 'channel-left'})
+DISCOUNT_RELATED_IDS = frozenset({'trial-2d', 'trial-1d', 'trial-2h', 'trial-discount', 'trial-ending-discount'})
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +745,17 @@ class AutoMessageItem(BaseModel):
     limits: dict[str, list[int]] | None = None
     # Заполняется только ответом на сохранение текста: «сохранено, но письмо уйдёт без логотипа».
     text_warning: str | None = None
+    choices: dict[str, list[dict[str, Any]]] | None = None
+    discount_prices: dict[str, list[dict[str, int]]] | None = None
+    discount_context: dict[str, Any] | None = None
+
+    @model_serializer(mode='wrap')
+    def omit_absent_discount_fields(self, serializer):
+        data = serializer(self)
+        for field in ('choices', 'discount_prices', 'discount_context'):
+            if data.get(field) is None:
+                data.pop(field, None)
+        return data
 
 
 class AutoMessageSummary(BaseModel):
@@ -799,10 +840,13 @@ class AutoMessagePatch(BaseModel):
 
     enabled: bool | None = None
     warn_hours: int | None = Field(default=None, ge=MIN_WARN_HOURS, le=MAX_WARN_HOURS)
-    discount_percent: int | None = Field(default=None, ge=0, le=100)
+    discount_percent: int | None = Field(default=None, ge=0, le=100, strict=True)
     valid_hours: int | None = Field(default=None, ge=MIN_VALID_HOURS, le=MAX_VALID_HOURS)
     trigger_days: int | None = Field(default=None, ge=1, le=MAX_TRIGGER_DAYS)
     not_connected_after_hours: int | None = Field(default=None, ge=MIN_NOT_CONNECTED_HOURS, le=MAX_NOT_CONNECTED_HOURS)
+    carrier: int | None = Field(default=None, ge=0, le=48, strict=True)
+    audience: int | None = Field(default=None, ge=0, le=1, strict=True)
+    post_trial_hours: int | None = Field(default=None, ge=1, le=48, strict=True)
     # Новый текст письма. Пустая строка не принимается — чтобы стереть правку, есть reset_text.
     text: str | None = None
     # Вернуть текст, который лежит в коде.
@@ -988,6 +1032,16 @@ def _state_of(
     """
     if _is_enabled(entry) is False:
         return 'quiet', 'выключено в этом разделе', None
+    if entry['id'] == 'trial-ending-discount':
+        carrier = _discount_context()['carrier_id']
+        state, reason, _ = _state_of(CATALOG_BY_ID[carrier], reasons, notes)
+        if state == 'quiet':
+            return 'quiet', f'письмо-носитель молчит: {reason}', None
+        if not NotificationSettingsService.are_notifications_globally_enabled():
+            return 'quiet', 'уведомления выключены в настройках бота', None
+        if reasons.get('trial_ending_available'):
+            return 'quiet', reasons['trial_ending_available'], None
+        return 'live', None, 'выдача только тестовым стендам'
     if not NotificationSettingsService.are_notifications_globally_enabled() and entry['id'] in GLOBALLY_SWITCHED_IDS:
         return 'quiet', 'выключено общим переключателем в настройках бота', None
     check = entry.get('quiet_check')
@@ -1041,7 +1095,12 @@ def _limits_for(entry: dict[str, Any]) -> dict[str, list[int]] | None:
     bounds: dict[str, list[int]] = {}
     for name in names:
         if name == 'discount_percent':
-            bounds[name] = [MIN_OFFER_DISCOUNT_PERCENT, MAX_OFFER_DISCOUNT_PERCENT]
+            bounds[name] = [
+                MIN_OFFER_DISCOUNT_PERCENT,
+                30 if key == 'trial_ending_discount' else MAX_OFFER_DISCOUNT_PERCENT,
+            ]
+        elif name in ('carrier', 'audience', 'post_trial_hours'):
+            bounds[name] = {'carrier': [0, 48], 'audience': [0, 1], 'post_trial_hours': [1, 48]}[name]
         elif name == 'valid_hours':
             bounds[name] = [MIN_VALID_HOURS, MAX_VALID_HOURS]
         elif name == 'trigger_days':
@@ -1051,6 +1110,34 @@ def _limits_for(entry: dict[str, Any]) -> dict[str, list[int]] | None:
         elif name == 'not_connected_after_hours':
             bounds[name] = [MIN_NOT_CONNECTED_HOURS, MAX_NOT_CONNECTED_HOURS]
     return bounds
+
+
+def _choices_for(entry: dict[str, Any]) -> dict[str, list[dict[str, Any]]] | None:
+    if entry['id'] != 'trial-ending-discount':
+        return None
+    hours = NotificationSettingsService.get_trial_warn_hours()
+    saved_hours = NotificationSettingsService.get_trial_ending_discount_post_trial_hours()
+    return {
+        'carrier': [
+            {'value': 0, 'label': f'За {format_hours_declension(hours)}'},
+            {'value': 24, 'label': 'За сутки'},
+            {'value': 48, 'label': 'За двое суток'},
+        ],
+        'audience': [{'value': 1, 'label': 'Включавшим VPN'}, {'value': 0, 'label': 'Всем на пробном'}],
+        'post_trial_hours': [
+            {'value': hours, 'label': format_hours_declension(hours)} for hours in sorted({6, 12, 24, 48, saved_hours})
+        ],
+    }
+
+
+def _discount_context() -> dict[str, Any]:
+    config = NotificationSettingsService.get_trial_ending_discount_settings()
+    return {
+        'carrier_id': {0: 'trial-2h', 24: 'trial-1d', 48: 'trial-2d'}[config['carrier']],
+        'percent': config['discount_percent'],
+        'enabled': config['enabled'],
+        'legacy_enabled': NotificationSettingsService.is_enabled('trial_expired_discount'),
+    }
 
 
 def _build_item(
@@ -1081,6 +1168,8 @@ def _build_item(
         claimed_count=claimed_counts.get(claim_type, 0) if claim_type else None,
         claim_tracked=bool(claim_type),
         limits=_limits_for(entry),
+        choices=_choices_for(entry),
+        discount_context=_discount_context() if entry['id'] in DISCOUNT_RELATED_IDS else None,
     )
 
 
