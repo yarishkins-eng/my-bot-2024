@@ -1489,7 +1489,7 @@
   "TRIAL_EXPIRED_NOTIFICATION": "🎁 <b>试用期已结束</b>\n\n您的免费访问已结束。请选择套餐以继续使用 VPN。\n\n{price_lines}",
   "TRIAL_EXPIRED_PRICE_LINES": "1 个月 — {month_price}\n3 个月 — {quarter_price}",
   "TRIAL_EXPIRED_PRICE_LINES_BALANCE": "1 个月 — {month_price}\n使用您余额中的 {balance} — 还需支付 {top_up}",
-  "TRIAL_EXPIRED_PRICE_LINES_FUNDED": "1个月 — {month_price}\n余额足够购买一个月。将从余额扣除 {month_price}，无需充值。",
+  "TRIAL_EXPIRED_PRICE_LINES_FUNDED": "余额足够购买一个月。将从余额扣除 {month_price}，无需充值。",
   "TRIAL_EXPIRED_DISCOUNT": "🎁 <b>专属 {percent}% 折扣</b>\n\n您的试用期已结束。点击礼物按钮激活折扣并查看您的价格。请在 {expires_at} 前领取此优惠。",
   "SUB_STATUS_DISABLED": "⚫已禁用",
   "SUB_STATUS_PENDING": "⏳等待激活",
