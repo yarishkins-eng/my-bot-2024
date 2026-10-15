@@ -2,7 +2,7 @@ import json
 import os
 import string
 from copy import deepcopy
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +71,7 @@ class NotificationSettingsService:
             'carrier': 24,
             'audience': 1,
             'post_trial_hours': 6,
+            'stats_since': None,
         },
         # --- АС-2: выключатели остальным сообщениям ---
         # Умолчание True у всех: появление ключа не должно ничего менять в поведении.
@@ -157,7 +158,13 @@ class NotificationSettingsService:
         for key, defaults in cls._DEFAULTS.items():
             current = cls._data.get(key)
             if key == 'trial_ending_discount' and key in cls._data:
-                # A partial enabled file must not acquire issuance parameters from defaults.
+                # Only the complete previous schema can migrate; partial ON files stay invalid.
+                old_keys = cls._DEFAULTS[key].keys() - {'stats_since'}
+                if isinstance(current, dict) and current.keys() == old_keys:
+                    migrated = {**current, 'stats_since': None}
+                    if cls._valid_trial_ending_discount_settings(migrated):
+                        cls._data[key] = migrated
+                        changed = True
                 continue
             if not isinstance(current, dict):
                 cls._data[key] = deepcopy(defaults)
@@ -412,6 +419,13 @@ class NotificationSettingsService:
             and 1 <= config['post_trial_hours'] <= 48
         ):
             return False
+        since = config['stats_since']
+        if since is not None:
+            try:
+                if not isinstance(since, str) or datetime.fromisoformat(since).utcoffset() is None:
+                    return False
+            except ValueError:
+                return False
         try:
             timedelta(hours=config['post_trial_hours'])
         except OverflowError:
@@ -429,7 +443,7 @@ class NotificationSettingsService:
 
     @classmethod
     def set_trial_ending_discount_settings(cls, **changes: Any) -> bool:
-        if changes.keys() - cls._DEFAULTS['trial_ending_discount'].keys():
+        if 'stats_since' in changes or changes.keys() - cls._DEFAULTS['trial_ending_discount'].keys():
             return False
         cls._load()
         current = cls._data.get('trial_ending_discount', cls._DEFAULTS['trial_ending_discount'])
@@ -438,6 +452,8 @@ class NotificationSettingsService:
         config = {**current, **changes}
         if not cls._valid_trial_ending_discount_settings(config):
             return False
+        if not current.get('enabled') and config['enabled'] and config['stats_since'] is None:
+            config['stats_since'] = datetime.now(UTC).isoformat()
         candidate = {**cls._data, 'trial_ending_discount': config}
         if not cls._save(candidate):
             return False
@@ -479,6 +495,11 @@ class NotificationSettingsService:
     @classmethod
     def get_trial_ending_discount_post_trial_hours(cls) -> int:
         return cls.get_trial_ending_discount_settings()['post_trial_hours']
+
+    @classmethod
+    def get_trial_ending_discount_stats_since(cls) -> datetime | None:
+        value = cls.get_trial_ending_discount_settings()['stats_since']
+        return datetime.fromisoformat(value) if value else None
 
     @classmethod
     def set_trial_ending_discount_post_trial_hours(cls, hours: int) -> bool:
