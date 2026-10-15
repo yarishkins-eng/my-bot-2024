@@ -1820,6 +1820,7 @@ async def get_auto_message(
     if message_id == 'trial-ending-discount':
         item.sent_count, history_note, history = await _trial_discount_stats(db)
     text_facts = _text_facts(message_id, item.params)
+    buttons = [AutoMessageButton(**button) for button in entry.get('buttons', [])]
     context = _discount_context()
     if context['enabled'] and message_id == context['carrier_id']:
         _, options = await _discount_examples(db)
@@ -1828,10 +1829,18 @@ async def get_auto_message(
                 insert for insert in text_facts['text_inserts'] if insert.name != 'price_lines'
             ] + [AutoMessageInsert(name='price_lines', variants=_discount_previews(options))]
             text_facts['text_markers'] = _markers_of(message_id, text_facts['text'], item.params)
+            for button in buttons:
+                button.target += '; без личной скидки'
+            buttons.insert(
+                0,
+                AutoMessageButton(
+                    label='🎁 Оформить со скидкой', target='Кабинет, касса; при личной скидке', tracked=False
+                ),
+            )
     return AutoMessageDetail(
         **item.model_dump(),
         **text_facts,
-        buttons=[AutoMessageButton(**button) for button in entry.get('buttons', [])],
+        buttons=buttons,
         history=history,
         history_note=history_note,
     )

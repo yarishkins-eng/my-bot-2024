@@ -101,6 +101,9 @@ async def test_selected_existing_carrier_keeps_owner_text_and_gets_real_examples
     assert len(insert.variants) == 3 and '119 ₽' in insert.variants[0].text
     assert detail.text_source == 'custom'
     assert detail.text_markers == []
+    assert detail.buttons[0].label == '🎁 Оформить со скидкой'
+    assert 'при личной скидке' in detail.buttons[0].target
+    assert all('без личной скидки' in button.target for button in detail.buttons[1:])
     assert Settings.set_trial_ending_discount_carrier(0)
     assert Settings.set_text_override('TRIAL_ENDING_TEXT', 'До конца {hours_text}.')
     last_hours = await api.get_auto_message('trial-2h', None, AsyncMock(), None)
