@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 
 class BalanceResponse(BaseModel):
@@ -134,6 +134,16 @@ class TopUpResponse(BaseModel):
     subscription_end_date: datetime | None = None
     purchased_at: datetime | None = None
     payment_option: str | None = None
+    promo_offer: dict[str, Any] | None = None
+    promo_offer_discount_kopeks: int | None = None
+
+    @model_serializer(mode='wrap')
+    def _serialize_own_offer(self, handler):
+        result = handler(self)
+        for name in ('promo_offer', 'promo_offer_discount_kopeks'):
+            if name not in self.model_fields_set:
+                result.pop(name, None)
+        return result
 
 
 class StarsInvoiceRequest(BaseModel):

@@ -55,6 +55,7 @@ from app.services.device_first_eligibility import resolve_single_eligible_tariff
 from app.services.pricing_engine import pricing_engine
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
 from app.utils.pricing_utils import format_period_description
+from app.utils.promo_offer import PromoPricingUser, without_trial_ending_promo
 
 
 OPEN_STATES = {'draft', 'confirmed', 'awaiting_funds', 'armed', 'fulfilling'}
@@ -258,6 +259,8 @@ def serialize_checkout(
     balance_kopeks: int | None = None,
 ) -> dict[str, Any]:
     target_snapshot = checkout.target_snapshot or {}
+    sale_snapshot = getattr(checkout, 'sale_snapshot', None)
+    own_breakdown = (sale_snapshot.get('price_breakdown') or {}) if sale_snapshot else (checkout.price_breakdown or {})
     snapshot_end = target_snapshot.get('end_date')
     try:
         parsed_end = datetime.fromisoformat(snapshot_end) if snapshot_end else None
@@ -284,6 +287,7 @@ def serialize_checkout(
         'target_subscription_id': checkout.target_subscription_id,
         'period_days': checkout.period_days,
         'selected_device_limit': checkout.selected_device_limit,
+        **({'promo_offer': own_breakdown['promo_offer']} if 'promo_offer' in own_breakdown else {}),
         'price_breakdown': checkout.price_breakdown,
         'quoted_price_kopeks': checkout.quoted_price_kopeks,
         'max_price_kopeks': checkout.max_price_kopeks,
@@ -883,7 +887,89 @@ async def _report_entitlement_drift_without_blocking(
         )
 
 
-async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]:
+class _PaidIntentPromoContext(NamedTuple):
+    payment_id: int
+    user_id: int
+    created_at: datetime
+    percent: int
+    deadline: datetime
+
+    @property
+    def binding(self):
+        return {'payment_id': self.payment_id, 'created_at': self.created_at.isoformat()}
+
+
+def _paid_promo_slot_matches(user: User, context: _PaidIntentPromoContext) -> bool:
+    slot = (
+        getattr(user, 'promo_offer_discount_source', None),
+        int(getattr(user, 'promo_offer_discount_percent', 0) or 0),
+        getattr(user, 'promo_offer_discount_expires_at', None),
+    )
+    return (
+        user.id == context.user_id
+        and not getattr(user, 'has_had_paid_subscription', False)
+        and slot in {(None, 0, None), ('trial_ending_discount', context.percent, context.deadline)}
+    )
+
+
+def _paid_intent_promo_context(payment, intent, user, paid_reference) -> _PaidIntentPromoContext | None:
+    own = intent.get('promo_offer')
+    if not isinstance(own, dict) or own.get('source') != 'trial_ending_discount':
+        return None
+    created, deadline = _intent_time(intent.get('created_at')), _intent_time(own.get('expires_at'))
+    percent = own.get('discount_percent')
+    if (
+        intent.get('status') != 'pending'
+        or payment.user_id != user.id
+        or payment.status == 'CHARGEBACKED'
+        or not (payment.is_paid or payment.transaction_id is not None)
+        or type(percent) is not int
+        or not 1 <= percent <= 30
+        or not created
+        or not deadline
+        or created >= deadline
+        or paid_reference is None
+        or paid_reference < created
+        or paid_reference > created + TOPUP_INTENT_TTL
+    ):
+        return None
+    context = _PaidIntentPromoContext(payment.id, user.id, created, percent, deadline)
+    return context if _paid_promo_slot_matches(user, context) else None
+
+
+def _paid_promo_pricing_user(user: User, context: _PaidIntentPromoContext | None):
+    if context is None:
+        return user
+    if not isinstance(context, _PaidIntentPromoContext) or not _paid_promo_slot_matches(user, context):
+        raise DeviceFirstError('price_changed', 'The paid offer no longer matches')
+    view = PromoPricingUser(user, percent=context.percent, expires_at=None)
+    view.promo_offer_discount_source = 'trial_ending_discount'
+    return view
+
+
+def _paid_promo_kwargs(context):
+    return {'paid_intent_promo_context': context} if context is not None else {}
+
+
+_SUBSCRIPTION_UNSET = object()
+
+
+def _price_promo_offer(user: User, price, context: _PaidIntentPromoContext | None = None) -> dict[str, Any] | None:
+    percent = int((getattr(price, 'breakdown', None) or {}).get('offer_discount_pct') or 0)
+    if percent <= 0:
+        return None
+    deadline = context.deadline if context else getattr(user, 'promo_offer_discount_expires_at', None)
+    source = 'trial_ending_discount' if context else getattr(user, 'promo_offer_discount_source', None)
+    return {'discount_percent': percent, 'source': source, 'expires_at': deadline.isoformat() if deadline else None}
+
+
+async def build_purchase_options(
+    db: AsyncSession,
+    user: User,
+    *,
+    subscription: Subscription | None | object = _SUBSCRIPTION_UNSET,
+    paid_intent_promo_context: _PaidIntentPromoContext | None = None,
+) -> dict[str, Any]:
     if not device_first_new_checkouts_enabled():
         return {'eligible': False, 'reason': 'feature_disabled'}
     if not is_device_first_canary_user(user):
@@ -892,7 +978,8 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
     if promo_group is None:
         promo_group = getattr(user, 'promo_group', None)
     tariffs = await get_tariffs_for_user(db, promo_group.id if promo_group else None)
-    subscription = await _current_subscription(db, user.id)
+    if subscription is _SUBSCRIPTION_UNSET:
+        subscription = await _current_subscription(db, user.id)
     eligibility = resolve_single_eligible_tariff(tariffs, subscription=subscription)
     if not eligibility.eligible or eligibility.tariff is None:
         return {'eligible': False, 'reason': eligibility.reason}
@@ -908,7 +995,7 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
                 tariff,
                 days,
                 device_limit=devices,
-                user=user,
+                user=_paid_promo_pricing_user(user, paid_intent_promo_context),
                 upgrade_from_device_limit=upgrade_from,
                 upgrade_remaining_days=upgrade_days,
             )
@@ -926,6 +1013,9 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
                         'devices_price_kopeks': price.devices_price,
                         'promo_group_discount_kopeks': price.promo_group_discount,
                         'promo_offer_discount_kopeks': price.promo_offer_discount,
+                        'promo_offer': _price_promo_offer(user, price, paid_intent_promo_context),
+                        'promo_group_id': getattr(pricing_engine.resolve_promo_group(user), 'id', None),
+                        'group_discount_pct': price_breakdown.get('group_discount_pct'),
                         'upgrade_from_device_limit': upgrade_from,
                         'upgrade_remaining_days': upgrade_days,
                         'upgrade_prorate_kopeks': int(price_breakdown.get('upgrade_prorate_kopeks', 0) or 0),
@@ -933,6 +1023,13 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
                 }
             )
         matrix.append({'period_days': days, 'prices': prices})
+    if paid_intent_promo_context is None and any(
+        (cell['breakdown']['promo_offer'] or {}).get('source') == 'trial_ending_discount'
+        and (_intent_time(cell['breakdown']['promo_offer'].get('expires_at')) or datetime.now(UTC)) <= datetime.now(UTC)
+        for row in matrix
+        for cell in row['prices']
+    ):
+        return await build_purchase_options(db, without_trial_ending_promo(user), subscription=subscription)
     return {
         'eligible': True,
         'version': 2,
@@ -950,6 +1047,7 @@ async def build_purchase_options(db: AsyncSession, user: User) -> dict[str, Any]
         'current_subscription': _subscription_snapshot(subscription) or None,
         'balance_kopeks': user.balance_kopeks,
         'price_matrix': matrix,
+        'promo_offer': matrix[0]['prices'][0]['breakdown']['promo_offer'] if matrix else None,
     }
 
 
@@ -964,6 +1062,7 @@ async def create_checkout(
     initial_lifecycle_state: str = 'draft',
     purchase_context: str | None = None,
     confirmed_purchase_id: int | None = None,
+    paid_intent_promo_context: _PaidIntentPromoContext | None = None,
 ) -> SubscriptionCheckout:
     """Persist one checkout; ``initial_lifecycle_state`` never changes legacy births.
 
@@ -1070,7 +1169,7 @@ async def create_checkout(
     if stale_pre_invoice:
         await db.flush()
 
-    options = await build_purchase_options(db, user)
+    options = await build_purchase_options(db, user, **_paid_promo_kwargs(paid_intent_promo_context))
     if not options.get('eligible'):
         raise DeviceFirstError('legacy_only', 'Device-first checkout is unavailable', status_code=404)
     current_subscription = options.get('current_subscription') or {}
@@ -1134,7 +1233,10 @@ async def create_checkout(
         target_snapshot=_subscription_snapshot(subscription),
         period_days=period_days,
         selected_device_limit=selected_device_limit,
-        price_breakdown=selected['breakdown'],
+        price_breakdown={
+            **selected['breakdown'],
+            **({'paid_intent_binding': paid_intent_promo_context.binding} if paid_intent_promo_context else {}),
+        },
         quoted_price_kopeks=selected['price_kopeks'],
         max_price_kopeks=selected['price_kopeks'],
         settlement_mode=DIRECT_SETTLEMENT_MODE,
@@ -1918,6 +2020,23 @@ async def replace_older_topup_intents(db: AsyncSession, *, user_id: int, newer_p
         return 0
     now = datetime.now(UTC)
     older = []
+    selected_breakdown = next(
+        (
+            cell.get('breakdown') or {}
+            for row in options['price_matrix']
+            if row['period_days'] == period_days
+            for cell in row['prices']
+            if cell['device_limit'] == devices
+        ),
+        {},
+    )
+    own_offer = selected_breakdown.get('promo_offer')
+    if (
+        isinstance(own_offer, dict)
+        and own_offer.get('source') == 'trial_ending_discount'
+        and (_intent_time(own_offer.get('expires_at')) or now) <= datetime.now(UTC)
+    ):
+        return TopUpIntentDecision('ordinary', 'unavailable')
     for payment in await _recent_topup_intent_payments(db, user_id=user_id, now=now):
         created_at = _intent_time(topup_intent_of(payment).get('created_at'))
         if payment.id != newer_payment_id and created_at is not None and created_at < newer_created_at:
@@ -1929,6 +2048,11 @@ async def replace_older_topup_intents(db: AsyncSession, *, user_id: int, newer_p
                 select(PlategaPayment)
                 .where(PlategaPayment.id == payment_id)
                 .with_for_update()
+            **{
+                key: selected_breakdown[key]
+                for key in ('promo_offer', 'promo_offer_discount_kopeks')
+                if key in selected_breakdown
+            },
                 .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
@@ -3076,7 +3200,11 @@ def _direct_sale_snapshot(
         # две линзы ревью разошлись в этом месте, разобрано по коду. Без этой строки гасилось
         # бы то, что лежит на нём в момент вебхука, а не то, что вошло в цену, — и клиент
         # терял бы неиспользованную скидку. Нашли две линзы ревью независимо.
-        'promo_offer_source': getattr(user, 'promo_offer_discount_source', None),
+        'promo_offer_source': (
+            (checkout.price_breakdown['promo_offer'] or {}).get('source')
+            if 'promo_offer' in (checkout.price_breakdown or {})
+            else getattr(user, 'promo_offer_discount_source', None)
+        ),
         'expires_at': checkout.quote_expires_at.isoformat(),
     }
 
