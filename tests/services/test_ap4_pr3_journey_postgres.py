@@ -10,6 +10,7 @@ from app.database.models import (
     CheckoutPaymentAttempt,
     DiscountOffer,
     PlategaPayment,
+    PromoOfferLog,
     SentNotification,
     Subscription,
     SubscriptionCheckout,
@@ -207,8 +208,8 @@ async def test_connected_letter_selection_sale_replay(sessions, monkeypatch, fun
         )
 
 
-@pytest.mark.parametrize('foreign', [False, True])
-async def test_connected_letter_topup_after_discount_deadline(sessions, monkeypatch, foreign):
+@pytest.mark.parametrize('foreign,cleared', [(False, False), (False, True), (True, False)])
+async def test_connected_letter_topup_after_discount_deadline(sessions, monkeypatch, foreign, cleared):
     args = await prepare(sessions, monkeypatch)
     prepared = await issue_letter(sessions, monkeypatch, args)
     clock = {'now': prepared.expires_at - timedelta(minutes=10)}
@@ -252,6 +253,10 @@ async def test_connected_letter_topup_after_discount_deadline(sessions, monkeypa
         fresh = await s.build_purchase_options(db, owner)
         assert fresh['promo_offer'] is None
         assert next(r for r in fresh['price_matrix'] if r['period_days'] == 30)['prices'][0]['price_kopeks'] == 14900
+        if cleared:
+            owner.promo_offer_discount_percent = 0
+            owner.promo_offer_discount_source = owner.promo_offer_discount_expires_at = None
+            await db.commit()
     outcome = await s.complete_topup_intent(payment_id=payment_id)
     assert outcome['status'] == ('refused' if foreign else 'fulfilled'), outcome
     replay = await s.complete_topup_intent(payment_id=payment_id)
@@ -260,6 +265,8 @@ async def test_connected_letter_topup_after_discount_deadline(sessions, monkeypa
         owner = await db.get(User, args['user_id'])
         count = await db.scalar(select(func.count(Transaction.id)).where(Transaction.type == 'subscription_payment'))
         assert count == (0 if foreign else 1)
+        consumed = await db.scalar(select(func.count(PromoOfferLog.id)).where(PromoOfferLog.action == 'consumed'))
+        assert consumed == (0 if foreign else 1)
         assert owner.balance_kopeks == (11900 if foreign else 0)
         if not foreign:
             checkout = await db.scalar(select(SubscriptionCheckout))

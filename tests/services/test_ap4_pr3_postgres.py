@@ -68,7 +68,7 @@ async def sessions(monkeypatch):
             created = True
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
-        maker = async_sessionmaker(engine, expire_on_commit=False)
+        maker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
         monkeypatch.setattr(issuer, 'AsyncSessionLocal', maker)
         config = {'enabled': True, 'discount_percent': 20, 'carrier': 24, 'audience': 1, 'post_trial_hours': 6}
         monkeypatch.setattr(

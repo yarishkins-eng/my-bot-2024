@@ -2362,6 +2362,8 @@ async def _topup_intent_recheck_locked(
             user.promo_offer_discount_source = 'trial_ending_discount'
             user.promo_offer_discount_percent = current_context.percent
             user.promo_offer_discount_expires_at = current_context.deadline
+            # Production autoflush=False: the next locked refresh must see this restored slot.
+            await db.flush()
         return None
     return await _topup_intent_drift(
         db,

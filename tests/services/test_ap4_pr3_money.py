@@ -170,7 +170,7 @@ async def test_paid_final_recheck_refreshes_slot_and_restores_only_own_empty(
                 owner.promo_offer_discount_percent = 0
                 owner.promo_offer_discount_expires_at = None
 
-    db = SimpleNamespace(execute=AsyncMock(), get=AsyncMock(return_value=owner), refresh=refresh)
+    db = SimpleNamespace(execute=AsyncMock(), get=AsyncMock(return_value=owner), refresh=refresh, flush=AsyncMock())
     monkeypatch.setattr(service, 'get_platega_payment_by_id_for_update', AsyncMock(return_value=payment))
     monkeypatch.setattr(service, '_topup_intent_paid_reference', AsyncMock(return_value=reference))
     monkeypatch.setattr(service, '_topup_intent_rolled_out', lambda _: True)
@@ -180,6 +180,7 @@ async def test_paid_final_recheck_refreshes_slot_and_restores_only_own_empty(
         db, payment_id=9, user_id=7, intent=intent, paid_intent_promo_context=context, checkout_id=11
     )
     assert result == expected
+    assert db.flush.await_count == int(fresh_source is None and expected is None)
     if expected is None:
         assert owner.promo_offer_discount_expires_at == context.deadline
         assert get_user_active_promo_discount_percent(owner) == 0
