@@ -1764,6 +1764,8 @@ async def list_auto_messages(
     claimed_counts = await _claimed_counts(db)
 
     items = [_build_item(entry, reasons, notes, sent_counts, claimed_counts) for entry in AUTO_MESSAGE_CATALOG]
+    for item in items:
+        await _discount_item(db, item)
 
     last_cycle_at = await db.scalar(
         select(func.max(MonitoringLog.created_at)).where(MonitoringLog.event_type == 'monitoring_cycle_completed')
@@ -1773,7 +1775,7 @@ async def list_auto_messages(
         total_count=len(items),
         live_count=sum(1 for item in items if item.state == 'live'),
         configurable_count=sum(1 for item in items if item.control == 'toggle'),
-        sent_total=sum(item.sent_count or 0 for item in items),
+        sent_total=sum(item.sent_count or 0 for item in items if item.id != 'trial-ending-discount'),
         claimed_total=sum(item.claimed_count or 0 for item in items),
         global_enabled=NotificationSettingsService.are_notifications_globally_enabled(),
         global_affects=len(GLOBALLY_SWITCHED_IDS),
@@ -1795,18 +1797,28 @@ async def get_auto_message(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Сообщение не найдено')
 
     reasons, notes = await _quiet_facts(db)
-    item = _build_item(entry, reasons, notes, await _sent_counts(db), await _claimed_counts(db))
+    item = await _discount_item(
+        db, _build_item(entry, reasons, notes, await _sent_counts(db), await _claimed_counts(db))
+    )
 
     history = await _history_for(db, entry, user, request)
+    history_note = (
+        'Строки исчезают, когда клиент продлевает подписку или покупает её после пробного: так сегодня '
+        'устроена защита от повторной отправки. Показаны последние 50 отправок.'
+    )
+    text_facts = _text_facts(message_id, item.params)
+    if message_id == _discount_context()['carrier_id']:
+        _, options = await _discount_examples(db)
+        if options:
+            text_facts['text_inserts'] = [
+                insert for insert in text_facts['text_inserts'] if insert.name != 'price_lines'
+            ] + [AutoMessageInsert(name='price_lines', variants=_discount_previews(options))]
     return AutoMessageDetail(
         **item.model_dump(),
-        **_text_facts(message_id, item.params),
+        **text_facts,
         buttons=[AutoMessageButton(**button) for button in entry.get('buttons', [])],
         history=history,
-        history_note=(
-            'Строки исчезают, когда клиент продлевает подписку или покупает её после пробного: так сегодня '
-            'устроена защита от повторной отправки. Показаны последние 50 отправок.'
-        ),
+        history_note=history_note,
     )
 
 
@@ -1925,6 +1937,33 @@ async def _discount_item(db: AsyncSession, item: AutoMessageItem) -> AutoMessage
         if item.enabled and not item.discount_prices and item.state == 'live':
             item.state, item.quiet_reason = 'quiet', 'касса не назвала цену месяца'
     return item
+
+
+def _discount_previews(options: dict) -> list[AutoMessageInsertVariant]:
+    from copy import deepcopy
+
+    from app.localization.texts import get_texts
+    from app.services.monitoring_service import format_trial_discount_lines, format_trial_regular_price_lines
+
+    config = NotificationSettingsService.get_trial_ending_discount_settings()
+    result = []
+    for balance, used, label in [
+        (0, True, 'Включал VPN, без баланса'),
+        (5000, True, 'Включал VPN, с балансом'),
+        (0, False, 'Не включал VPN'),
+    ]:
+        person = SimpleNamespace(balance_kopeks=balance)
+        sample = deepcopy(options)
+        if not used and config['audience'] == 1:
+            for row in sample['price_matrix']:
+                for cell in row['prices']:
+                    cell['price_kopeks'] += cell['breakdown']['promo_offer_discount_kopeks']
+                    cell['breakdown'] = {}
+        text = format_trial_discount_lines(sample, person, get_texts('ru'))
+        if not text:
+            text = format_trial_regular_price_lines(sample, person, get_texts('ru'))
+        result.append(AutoMessageInsertVariant(text=text, when=label))
+    return result
 
 
 def _apply_text_change(message_id: str, payload: AutoMessagePatch) -> str | None:
