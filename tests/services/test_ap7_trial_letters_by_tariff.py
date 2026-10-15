@@ -61,6 +61,9 @@ class _SelectionDB:
         self.session.close()
         self.engine.dispose()
 
+    async def commit(self):
+        self.session.commit()
+
 
 def _subscription(sid, tariff_id, is_trial, kind):
     user = SimpleNamespace(id=sid, telegram_id=7800000000 + sid, language='ru', has_had_paid_subscription=False)

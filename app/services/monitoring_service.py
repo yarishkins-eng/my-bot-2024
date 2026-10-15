@@ -1481,103 +1481,114 @@ class MonitoringService:
 
             sent_count = 0
             for subscription in trial_expiring:
-                user = subscription.user
-                if not user:
-                    continue
+                try:
+                    user = subscription.user
+                    if not user:
+                        continue
 
-                if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
-                    continue
+                    if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
+                        continue
 
-                if self.bot:
-                    binding = (
-                        subscription.end_date,
-                        getattr(subscription, 'remnawave_uuid', None),
-                        getattr(user, 'test_reset_started_at', None),
-                    )
-                    prepared = await self.prepare_trial_discount(db, user, subscription, 0)
-                    if (
-                        prepared is not None
-                        or getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount'
-                    ):
-                        from app.services.device_first_checkout_service import _subscription_identity
-                        from app.services.trial_ending_discount_service import validate_prepared
-
-                        await db.scalar(select(User.id).where(User.id == user.id).with_for_update())
-                        await db.refresh(
-                            user,
-                            attribute_names=[
-                                'test_reset_started_at',
-                                'test_reset_state',
-                                'has_had_paid_subscription',
-                                'status',
-                                'telegram_id',
-                                'restriction_subscription',
-                                'account_erasure_requested_at',
-                                'account_erased_at',
-                                'promo_offer_discount_percent',
-                                'promo_offer_discount_source',
-                                'promo_offer_discount_expires_at',
-                            ],
-                        )
-                        await db.refresh(
-                            subscription,
-                            attribute_names=[
-                                'end_date',
-                                'status',
-                                'is_trial',
-                                'tariff_id',
-                                'remnawave_uuid',
-                            ],
-                        )
-                        fresh_binding = (
+                    if self.bot:
+                        binding = (
                             subscription.end_date,
                             getattr(subscription, 'remnawave_uuid', None),
-                            user.test_reset_started_at,
+                            getattr(user, 'test_reset_started_at', None),
                         )
+                        prepared = await self.prepare_trial_discount(db, user, subscription, 0)
                         if (
-                            fresh_binding != binding
-                            or user.has_had_paid_subscription
-                            or user.test_reset_state in ('resetting', 'failed')
-                            or user.restriction_subscription
-                            or user.account_erasure_requested_at is not None
-                            or user.account_erased_at is not None
-                            or not subscription.is_trial
-                            or subscription.tariff_id != trial_tariff.id
-                            or subscription.status not in ('active', 'limited')
-                            or user.status != 'active'
+                            prepared is not None
+                            or getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount'
                         ):
-                            continue
-                        if prepared is not None and not validate_prepared(prepared, user, subscription):
-                            continue
-                        current = await _subscription_identity(db, user.id)
-                        if current is None or current['id'] != subscription.id:
-                            continue
-                        if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
-                            continue
-                    price_lines = await self._trial_price_lines(
-                        db,
-                        user,
-                        language=(user.language or settings.DEFAULT_LANGUAGE).lower().split('-')[0],
-                        subscription=subscription,
-                        lifetime_bytes=getattr(prepared, 'lifetime_bytes', None),
-                    )
-                    success = await self._send_trial_ending_notification(
-                        user,
-                        subscription,
-                        warn_hours,
-                        price_lines=price_lines,
-                    )
-                    if success:
-                        if getattr(price_lines, 'offer_id', None):
-                            from app.services.trial_ending_discount_service import mark_trial_discount_delivered
+                            from app.services.device_first_checkout_service import _subscription_identity
+                            from app.services.trial_ending_discount_service import validate_prepared
 
-                            await mark_trial_discount_delivered(db, offer_id=price_lines.offer_id, user_id=user.id)
-                        await record_notification(db, user.id, subscription.id, 'trial_2h')
-                        sent_count += 1
-                        logger.info(
-                            '🎁 Пользователю отправлено предупреждение о конце пробного',
-                            telegram_id=user.telegram_id,
+                            await db.scalar(select(User.id).where(User.id == user.id).with_for_update())
+                            await db.refresh(
+                                user,
+                                attribute_names=[
+                                    'test_reset_started_at',
+                                    'test_reset_state',
+                                    'has_had_paid_subscription',
+                                    'status',
+                                    'telegram_id',
+                                    'restriction_subscription',
+                                    'account_erasure_requested_at',
+                                    'account_erased_at',
+                                    'promo_offer_discount_percent',
+                                    'promo_offer_discount_source',
+                                    'promo_offer_discount_expires_at',
+                                ],
+                            )
+                            await db.refresh(
+                                subscription,
+                                attribute_names=[
+                                    'end_date',
+                                    'status',
+                                    'is_trial',
+                                    'tariff_id',
+                                    'remnawave_uuid',
+                                ],
+                            )
+                            fresh_binding = (
+                                subscription.end_date,
+                                getattr(subscription, 'remnawave_uuid', None),
+                                user.test_reset_started_at,
+                            )
+                            if (
+                                fresh_binding != binding
+                                or user.has_had_paid_subscription
+                                or user.test_reset_state in ('resetting', 'failed')
+                                or user.restriction_subscription
+                                or user.account_erasure_requested_at is not None
+                                or user.account_erased_at is not None
+                                or not subscription.is_trial
+                                or subscription.tariff_id != trial_tariff.id
+                                or subscription.status not in ('active', 'limited')
+                                or user.status != 'active'
+                            ):
+                                continue
+                            if prepared is not None and not validate_prepared(prepared, user, subscription):
+                                continue
+                            current = await _subscription_identity(db, user.id)
+                            if current is None or current['id'] != subscription.id:
+                                continue
+                            if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
+                                continue
+                        price_lines = await self._trial_price_lines(
+                            db,
+                            user,
+                            language=(user.language or settings.DEFAULT_LANGUAGE).lower().split('-')[0],
+                            subscription=subscription,
+                            lifetime_bytes=getattr(prepared, 'lifetime_bytes', None),
                         )
+                        success = await self._send_trial_ending_notification(
+                            user,
+                            subscription,
+                            warn_hours,
+                            price_lines=price_lines,
+                        )
+                        if success:
+                            if getattr(price_lines, 'offer_id', None):
+                                from app.services.trial_ending_discount_service import mark_trial_discount_delivered
+
+                                await mark_trial_discount_delivered(db, offer_id=price_lines.offer_id, user_id=user.id)
+                            await record_notification(db, user.id, subscription.id, 'trial_2h')
+                            sent_count += 1
+                            logger.info(
+                                '🎁 Пользователю отправлено предупреждение о конце пробного',
+                                telegram_id=user.telegram_id,
+                            )
+
+                except Exception as error:
+                    logger.warning(
+                        'Trial ending letter failed; continuing next user',
+                        subscription_id=subscription.id,
+                        error=type(error).__name__,
+                    )
+                finally:
+                    # Release this user lock on every skip, failed send and successful send.
+                    await db.commit()
 
             if sent_count:
                 await self._log_monitoring_event(

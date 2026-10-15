@@ -155,6 +155,34 @@ async def _read_user(db, user_id):
     )
 
 
+@pytest.mark.parametrize('skip', [False, True])
+async def test_polling_releases_user_row_after_failed_send_or_fresh_skip(sessions, monkeypatch, skip):
+    args = await _seed(sessions)
+    async with sessions() as db:
+        owner = await db.get(User, args['user_id'])
+        owner.promo_offer_discount_source = 'trial_ending_discount'
+        owner.promo_offer_discount_percent = 20
+        owner.promo_offer_discount_expires_at = datetime.now(UTC) + timedelta(days=2)
+        owner.restriction_subscription = skip
+        sub = await db.get(Subscription, args['subscription_id'])
+        sub.end_date = datetime.now(UTC) + timedelta(hours=3)
+        await db.commit()
+    monitor = monitoring.MonitoringService.__new__(monitoring.MonitoringService)
+    monitor.bot = object()
+    monitor.prepare_trial_discount = AsyncMock(return_value=None)
+    monitor._trial_price_lines = AsyncMock(return_value=monitoring.TrialDiscountPriceLines('own offer'))
+    monitor._send_trial_ending_notification = AsyncMock(side_effect=TimeoutError('telegram'))
+    async with sessions() as db:
+        await monitor._check_trial_expiring_soon(db)
+        assert not db.in_transaction()
+        async with sessions() as other:
+            assert (
+                await other.scalar(select(User.id).where(User.id == args['user_id']).with_for_update(nowait=True))
+                == args['user_id']
+            )
+    assert monitor._send_trial_ending_notification.await_count == int(not skip)
+
+
 async def _assert_grant(maker, args, prepared):
     async with maker() as db:
         offers = (await db.scalars(select(DiscountOffer).where(DiscountOffer.user_id == args['user_id']))).all()
