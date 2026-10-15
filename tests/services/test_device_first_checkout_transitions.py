@@ -406,6 +406,7 @@ async def test_new_quote_does_not_bulk_expire_an_exact_paid_checkout_waiting_for
             ]
         ),
         commit=AsyncMock(),
+        refresh=AsyncMock(),
     )
     monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
     monkeypatch.setattr(
@@ -444,6 +445,7 @@ async def test_new_direct_quote_is_blocked_while_a_paid_order_needs_operator_rev
             ]
         ),
         commit=AsyncMock(),
+        refresh=AsyncMock(),
     )
     monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
     build_options = AsyncMock()
@@ -475,6 +477,7 @@ async def test_new_direct_quote_never_reuses_a_historical_pending_paid_trial(mon
             ]
         ),
         commit=AsyncMock(),
+        refresh=AsyncMock(),
     )
     monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
     legacy_pending = AsyncMock(return_value=True)
@@ -719,6 +722,7 @@ async def test_create_rejects_a_direct_cross_tariff_device_downgrade_before_crea
         ),
         commit=AsyncMock(),
         get=AsyncMock(),
+        refresh=AsyncMock(),
     )
     monkeypatch.setattr(service.settings, 'DEVICE_FIRST_NEW_CHECKOUTS_ENABLED', True)
     monkeypatch.setattr(
@@ -763,6 +767,7 @@ async def test_fulfillment_conflicts_before_debit_when_live_paid_target_would_be
         commit=AsyncMock(),
         add=AsyncMock(),
         flush=AsyncMock(),
+        refresh=AsyncMock(),
     )
     monkeypatch.setattr(service, 'get_owned_checkout', AsyncMock(return_value=checkout))
     monkeypatch.setattr(
@@ -802,6 +807,7 @@ async def test_fulfillment_reprices_before_debit_when_the_current_price_changes(
         commit=AsyncMock(),
         add=AsyncMock(),
         flush=AsyncMock(),
+        refresh=AsyncMock(),
     )
     monkeypatch.setattr(service, 'get_owned_checkout', AsyncMock(return_value=checkout))
     monkeypatch.setattr(
@@ -895,6 +901,7 @@ async def test_handcrafted_zero_price_checkout_never_debits_or_converts_a_trial(
         commit=AsyncMock(),
         add=AsyncMock(),
         flush=AsyncMock(),
+        refresh=AsyncMock(),
     )
     monkeypatch.setattr(service, 'get_owned_checkout', AsyncMock(return_value=checkout))
     monkeypatch.setattr(
@@ -940,6 +947,7 @@ async def test_spent_exact_payment_loses_its_expiry_exemption_and_requires_a_new
         commit=AsyncMock(),
         add=AsyncMock(),
         flush=AsyncMock(),
+        refresh=AsyncMock(),
     )
     monkeypatch.setattr(service, 'get_owned_checkout', AsyncMock(return_value=checkout))
     monkeypatch.setattr(
