@@ -47,6 +47,7 @@ def letter_user():
     owner = sub.user
     for field, value in {
         'balance_kopeks': 5000,
+        'test_account_enabled': True,
         'status': 'active',
         'test_reset_started_at': None,
         'test_reset_state': 'ready',

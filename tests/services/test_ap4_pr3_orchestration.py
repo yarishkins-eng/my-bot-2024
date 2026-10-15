@@ -59,14 +59,11 @@ async def test_issue_before_reset_lock_and_revalidate(monkeypatch, event, hours,
 
 @pytest.mark.parametrize('raw', [None, True, -1, '1000000', 1.0, 1_000_000])
 async def test_payload_reader_is_strict_and_bound_before_network(monkeypatch, raw):
-    user = SimpleNamespace(id=1, test_reset_started_at=None)
-    sub = SimpleNamespace(id=2, remnawave_uuid='current', end_date=datetime.now(UTC) + timedelta(hours=24))
+    from tests.services.test_ap4_pr3_delivery_guards import letter_user
+
+    user, sub = letter_user()
     monitor = module.MonitoringService.__new__(module.MonitoringService)
-    fetched = SimpleNamespace(
-        uuid='current',
-        user_traffic=SimpleNamespace(lifetime_traffic_available=True, lifetime_used_traffic_bytes=2_000_000),
-    )
-    api = SimpleNamespace(get_user_by_uuid=AsyncMock(return_value=fetched))
+    api = SimpleNamespace(get_user_lifetime_traffic_once=AsyncMock(return_value=2_000_000))
 
     class Client:
         async def __aenter__(self):
@@ -76,6 +73,7 @@ async def test_payload_reader_is_strict_and_bound_before_network(monkeypatch, ra
             pass
 
     monitor.subscription_service = SimpleNamespace(get_api_client=lambda: Client())
+    monkeypatch.setattr(module, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=sub.tariff_id)))
     monkeypatch.setattr(
         NotificationSettingsService,
         'get_trial_ending_discount_settings',
@@ -88,14 +86,14 @@ async def test_payload_reader_is_strict_and_bound_before_network(monkeypatch, ra
         db, user, sub, 24, data={'uuid': 'current', 'userTraffic': {'lifetimeUsedTrafficBytes': raw}}
     )
     assert prepare.await_args.kwargs['lifetime_bytes'] == (raw if type(raw) is int and raw >= 0 else 2_000_000)
-    assert api.get_user_by_uuid.await_count == int(not (type(raw) is int and raw >= 0))
+    assert api.get_user_lifetime_traffic_once.await_count == int(not (type(raw) is int and raw >= 0))
     prepare.reset_mock()
-    api.get_user_by_uuid.reset_mock()
+    api.get_user_lifetime_traffic_once.reset_mock()
     await monitor.prepare_trial_discount(
         db, user, sub, 24, data={'uuid': 'retired', 'userTraffic': {'lifetimeUsedTrafficBytes': raw}}
     )
     prepare.assert_not_awaited()
-    api.get_user_by_uuid.assert_not_awaited()
+    api.get_user_lifetime_traffic_once.assert_not_awaited()
 
 
 @pytest.mark.parametrize('change', ['none', 'reset', 'sale', 'term', 'uuid', 'primary'])

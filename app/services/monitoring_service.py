@@ -1379,33 +1379,46 @@ class MonitoringService:
             logger.error('Ошибка проверки истекающих подписок', error=e)
 
     async def prepare_trial_discount(self, db, user, subscription, carrier, *, data=None):
-        from app.services.trial_ending_discount_service import prepare_trial_ending_discount
+        from app.services import trial_ending_discount_service as issuer
+        from app.services.user_service import is_test_account
+
+        def skipped(reason):
+            logger.info('trial_ending_discount_skipped', user_id=user.id, reason=reason)
+            return None
 
         config = NotificationSettingsService.get_trial_ending_discount_settings()
         if not config['enabled'] or config['carrier'] != carrier or subscription is None:
-            return None
+            return skipped('settings_or_subscription')
+        if not (
+            issuer.TRIAL_ENDING_DISCOUNT_ROLLOUT == 'all'
+            or (issuer.TRIAL_ENDING_DISCOUNT_ROLLOUT == 'stands' and is_test_account(user))
+        ):
+            return skipped('rollout')
+        if not issuer._eligible_person(user, user.test_reset_started_at):
+            return skipped('person_ineligible')
+        if not subscription.is_trial or subscription.status not in ('active', 'limited'):
+            return skipped('not_trial')
+        trial = await get_trial_tariff(db)
+        if trial is None or subscription.tariff_id != trial.id:
+            return skipped('not_trial_tariff')
         # A private session cannot wait on pending writes held by its own caller.
         if any(isinstance(obj, (User, Subscription)) for obj in getattr(db, 'dirty', ())):
-            logger.info('Trial discount skipped', user_id=user.id, reason='pending_outer_write')
-            return None
+            return skipped('pending_outer_write')
         payload = data or {}
         nested = payload.get('user') if isinstance(payload.get('user'), dict) else {}
         panel_uuid = payload.get('uuid') or payload.get('userUuid') or nested.get('uuid')
         if data is None:
             panel_uuid = subscription.remnawave_uuid
         if not panel_uuid or panel_uuid != subscription.remnawave_uuid:
-            return None
+            return skipped('panel_uuid_mismatch')
         traffic = payload.get('userTraffic') or nested.get('userTraffic')
         lifetime = traffic.get('lifetimeUsedTrafficBytes') if isinstance(traffic, dict) else None
         lifetime = lifetime if type(lifetime) is int and lifetime >= 0 else None
         try:
             if lifetime is None and config['audience'] == 1:
-                async with self.subscription_service.get_api_client() as api:
-                    panel_user = await api.get_user_by_uuid(panel_uuid)
-                usage = panel_user.user_traffic if panel_user and panel_user.uuid == panel_uuid else None
-                if usage and usage.lifetime_traffic_available:
-                    lifetime = usage.lifetime_used_traffic_bytes
-            prepared = await prepare_trial_ending_discount(
+                async with asyncio.timeout(3), self.subscription_service.get_api_client() as api:
+                    lifetime = await api.get_user_lifetime_traffic_once(panel_uuid)
+            prepared = await issuer.prepare_trial_ending_discount(
                 user_id=user.id,
                 subscription_id=subscription.id,
                 carrier=carrier,
@@ -1425,7 +1438,12 @@ class MonitoringService:
                 )
             return prepared
         except Exception as error:
-            logger.warning('Trial discount skipped', user_id=user.id, reason='preparation_failed', error=error)
+            logger.info(
+                'trial_ending_discount_skipped',
+                user_id=user.id,
+                reason='preparation_failed',
+                error=type(error).__name__,
+            )
             return None
 
     async def _check_trial_expiring_soon(self, db: AsyncSession):
