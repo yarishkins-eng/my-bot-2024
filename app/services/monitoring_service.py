@@ -318,6 +318,67 @@ def is_quiet_night(moment: datetime | None = None) -> bool:
     return (moment or datetime.now(UTC)).astimezone(_MOSCOW).hour < QUIET_NIGHT_END_HOUR
 
 
+class TrialDiscountPriceLines(str):  # noqa: SLOT000 -- str subclasses need a dict for delivery metadata.
+    offer_id: int | None = None
+
+
+def format_trial_discount_lines(options: dict, user: User, texts, lifetime_bytes: int | None = None) -> str:
+    from app.services.device_first_checkout_service import device_first_top_up_kopeks
+
+    base = (options.get('tariff') or {}).get('base_device_limit')
+    cells = {
+        row.get('period_days'): cell
+        for row in options.get('price_matrix') or []
+        for cell in row.get('prices') or []
+        if cell.get('device_limit') == base
+    }
+    month = cells.get(30) or {}
+    breakdown = month.get('breakdown') or {}
+    offer = breakdown.get('promo_offer') or {}
+    if not month.get('price_kopeks') or not breakdown.get('promo_offer_discount_kopeks') or not offer:
+        return ''
+    english = texts.language.lower().split('-')[0] == 'en'
+    deadline = offer.get('expires_at')
+    until = ''
+    if deadline:
+        end = datetime.fromisoformat(deadline.replace('Z', '+00:00')).astimezone(_MOSCOW)
+        until = (' until ' if english else ' до ') + end.strftime('%d.%m.%Y, %H:%M')
+        until += ' (MSK)' if english else ' (МСК)'
+    lines = [texts.t('TRIAL_DISCOUNT_HEADING').format(percent=offer['discount_percent'], until=until)]
+
+    def money(amount):
+        return settings.format_price(amount, round_kopeks=False)
+
+    for days, label in [(30, '1 month' if english else '1 месяц'), (90, '3 months' if english else '3 месяца')]:
+        cell = cells.get(days) or {}
+        net = cell.get('price_kopeks')
+        saving = (cell.get('breakdown') or {}).get('promo_offer_discount_kopeks')
+        if net and saving:
+            lines.append(texts.t('TRIAL_DISCOUNT_PRICE').format(term=label, net=money(net), before=money(net + saving)))
+    net, balance = month['price_kopeks'], int(user.balance_kopeks or 0)
+    top_up = device_first_top_up_kopeks(price_kopeks=net, balance_kopeks=balance)
+    if balance >= net:
+        lines.append(texts.t('TRIAL_DISCOUNT_FUNDED').format(price=money(net)))
+    elif balance >= 100 and 0 < top_up < net:
+        lines.append(texts.t('TRIAL_DISCOUNT_BALANCE').format(balance=money(net - top_up), top_up=money(top_up)))
+    lines.append(texts.t('TRIAL_DISCOUNT_ANY_SELECTION'))
+    current = options.get('current_subscription') or {}
+    if (
+        current.get('is_trial') is True
+        and current.get('tariff_id') is not None
+        and current['tariff_id'] != (options.get('tariff') or {}).get('id')
+        and (settings.TARIFF_SWITCH_RESET_FREE_DAYS or not settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID)
+    ):
+        lines.append(texts.t('TRIAL_DISCOUNT_START_NOW'))
+    if type(lifetime_bytes) is int and lifetime_bytes >= 1024**3:
+        traffic = f'{lifetime_bytes / 1024**3:.1f}'
+        lines.append(
+            texts.t('TRIAL_DISCOUNT_TRAFFIC').format(traffic=traffic if english else traffic.replace('.', ','))
+        )
+    return '\n'.join(lines)
+
+
+
 async def is_canonical_trial(db: AsyncSession, subscription: Subscription) -> bool:
     """Пробная ли подписка — по пробному тарифу, а не по одному флагу.
 
@@ -2746,7 +2807,15 @@ class MonitoringService:
         return found is not None
 
     async def handle_trial_expiring(
-        self, db: AsyncSession, user: User, subscription: Subscription, *, hours: int, bot, panel_expire_at=None
+        self,
+        db: AsyncSession,
+        user: User,
+        subscription: Subscription,
+        *,
+        hours: int,
+        bot,
+        panel_expire_at=None,
+        prepared_discount=None,
     ) -> bool:
         """True означает, что пробный обработан: даже при выключении письмо панели не возвращается."""
         if not await is_canonical_trial(db, subscription):
@@ -2799,7 +2868,12 @@ class MonitoringService:
             return skipped('already_sent')
         try:
             texts = get_texts(user.language)
-            price_lines = await self._trial_price_lines(db, user)
+            price_lines = await self._trial_price_lines(
+                db,
+                user,
+                subscription=subscription,
+                lifetime_bytes=getattr(prepared_discount, 'lifetime_bytes', None),
+            )
             message = texts.get(text_key).format(price_lines=price_lines).strip()
             from aiogram.types import InlineKeyboardMarkup
 
@@ -2807,7 +2881,11 @@ class MonitoringService:
                 inline_keyboard=[
                     [
                         build_miniapp_or_callback_button(
-                            text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
+                            text=(
+                                texts.t('TRIAL_DISCOUNT_CTA')
+                                if isinstance(price_lines, TrialDiscountPriceLines)
+                                else texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку')
+                            ),
                             callback_data='menu_buy',
                             cabinet_path='/subscription/purchase',
                         )
@@ -2825,6 +2903,10 @@ class MonitoringService:
             )
             if not delivered:
                 return skipped('not_delivered')
+            if getattr(price_lines, 'offer_id', None):
+                from app.services.trial_ending_discount_service import mark_trial_discount_delivered
+
+                await mark_trial_discount_delivered(db, offer_id=price_lines.offer_id, user_id=user.id)
             await clear_notification_by_type(db, subscription.id, key, commit=False)
             if hours == 48:
                 await record_notification(db, user.id, subscription.id, 'trial_expiring_48h')
@@ -2837,7 +2919,15 @@ class MonitoringService:
             )
         return True
 
-    async def _trial_price_lines(self, db: AsyncSession, user: User, *, language: str | None = None) -> str:
+    async def _trial_price_lines(
+        self,
+        db: AsyncSession,
+        user: User,
+        *,
+        language: str | None = None,
+        subscription: Subscription | None = None,
+        lifetime_bytes: int | None = None,
+    ) -> str:
         """Строки цены в письме о конце пробного (решение владельца 07.10.2026) — из кассы этого человека.
 
         Цены те же, что он увидит, нажав «Оформить подписку»: ячейки 1 и 3 месяца на базовое число устройств из
@@ -2849,7 +2939,25 @@ class MonitoringService:
         try:
             # Точка сохранения: сбой запроса внутри кассы не должен сломать транзакцию — следом пишется отметка.
             async with db.begin_nested():
-                options = await build_purchase_options(db, user)
+                options = await build_purchase_options(db, user, subscription=subscription)
+                texts = get_texts(language or user.language)
+                discount_lines = format_trial_discount_lines(options, user, texts, lifetime_bytes)
+                if discount_lines:
+                    lines = TrialDiscountPriceLines(discount_lines)
+                    if getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount':
+                        from app.database.models import DiscountOffer
+
+                        lines.offer_id = await db.scalar(
+                            select(DiscountOffer.id)
+                            .where(
+                                DiscountOffer.user_id == user.id,
+                                DiscountOffer.notification_type == 'trial_ending_discount',
+                                DiscountOffer.discount_percent == user.promo_offer_discount_percent,
+                                DiscountOffer.expires_at == user.promo_offer_discount_expires_at,
+                            )
+                            .limit(1)
+                        )
+                    return lines
             base = (options.get('tariff') or {}).get('base_device_limit')
             prices = {
                 row.get('period_days'): cell.get('price_kopeks')
@@ -3045,7 +3153,11 @@ class MonitoringService:
                 inline_keyboard=[
                     [
                         build_miniapp_or_callback_button(
-                            text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
+                            text=(
+                                texts.t('TRIAL_DISCOUNT_CTA')
+                                if isinstance(price_lines, TrialDiscountPriceLines)
+                                else texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку')
+                            ),
                             callback_data='menu_buy',
                             cabinet_path='/subscription/purchase',
                         )
@@ -3241,7 +3353,11 @@ class MonitoringService:
                 inline_keyboard=[
                     [
                         build_miniapp_or_callback_button(
-                            text=texts.get('FUNNEL_SUBSCRIBE_CTA'),
+                            text=(
+                                texts.t('TRIAL_DISCOUNT_CTA')
+                                if isinstance(price_lines, TrialDiscountPriceLines)
+                                else texts.get('FUNNEL_SUBSCRIBE_CTA')
+                            ),
                             callback_data='menu_buy',
                             cabinet_path='/subscription/purchase',
                         )

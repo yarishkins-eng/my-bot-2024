@@ -2022,5 +2022,13 @@
   "REFERRAL_LIST_ITEM_JOINED_TODAY": "   📅 Пришёл сегодня",
   "REFERRAL_LIST_ITEM_JOINED_YESTERDAY": "   📅 Пришёл вчера",
   "REFERRAL_LIST_LEGEND": "💰 — платил · ⏳ — ещё нет",
-  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ Подписка активна! Вот твоё меню:"
+  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ Подписка активна! Вот твоё меню:",
+  "TRIAL_DISCOUNT_HEADING": "🎁 Для вас −{percent}%{until}:",
+  "TRIAL_DISCOUNT_PRICE": "{term} — {net} вместо <s>{before}</s>",
+  "TRIAL_DISCOUNT_FUNDED": "За месяц: {price} спишутся с баланса, доплачивать не нужно.",
+  "TRIAL_DISCOUNT_BALANCE": "За месяц с вашими {balance} на балансе — доплатить {top_up}",
+  "TRIAL_DISCOUNT_ANY_SELECTION": "Скидка — на любой срок и число устройств.",
+  "TRIAL_DISCOUNT_START_NOW": "Подписка начнётся сразу после оплаты.",
+  "TRIAL_DISCOUNT_TRAFFIC": "За время пробного прошло {traffic} ГБ.",
+  "TRIAL_DISCOUNT_CTA": "🎁 Оформить со скидкой"
 }

@@ -2022,5 +2022,13 @@
   "REFERRAL_LIST_ITEM_JOINED_TODAY": "   📅 今天加入",
   "REFERRAL_LIST_ITEM_JOINED_YESTERDAY": "   📅 昨天加入",
   "REFERRAL_LIST_LEGEND": "💰 — 已充值 · ⏳ — 还没有",
-  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ 订阅已激活！这是你的菜单："
+  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ 订阅已激活！这是你的菜单：",
+  "TRIAL_DISCOUNT_HEADING": "🎁 Your discount: −{percent}%{until}:",
+  "TRIAL_DISCOUNT_PRICE": "{term} — {net} instead of <s>{before}</s>",
+  "TRIAL_DISCOUNT_FUNDED": "For 1 month: {price} will be debited from your balance. No top-up needed.",
+  "TRIAL_DISCOUNT_BALANCE": "For 1 month, with {balance} from your balance — pay {top_up}",
+  "TRIAL_DISCOUNT_ANY_SELECTION": "The discount applies to any period and number of devices.",
+  "TRIAL_DISCOUNT_START_NOW": "Your subscription starts immediately after payment.",
+  "TRIAL_DISCOUNT_TRAFFIC": "You used {traffic} GB during your trial.",
+  "TRIAL_DISCOUNT_CTA": "🎁 Subscribe with a discount"
 }
