@@ -38,6 +38,8 @@ LOCK_NAMESPACE = 202610024
 
 @pytest_asyncio.fixture
 async def sessions(monkeypatch):
+    if not DATABASE_URL:
+        pytest.skip('AP4_PR3_TEST_DATABASE_URL requires disposable local PostgreSQL')
     url = make_url(DATABASE_URL)
     if (
         url.drivername != 'postgresql+asyncpg'
