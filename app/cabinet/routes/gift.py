@@ -30,7 +30,7 @@ from app.services.guest_purchase_service import (
 )
 from app.services.payment_method_config_service import get_enabled_methods_for_user
 from app.utils.cache import RateLimitCache
-from app.utils.promo_offer import get_user_active_promo_discount_percent
+from app.utils.promo_offer import get_user_active_promo_discount_percent, without_trial_ending_promo
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 from ..schemas.gift import (
@@ -96,7 +96,7 @@ async def get_gift_config(
     promo_group_name = promo_group.name if promo_group else None
 
     # Get active promo offer discount
-    promo_offer_discount_percent = get_user_active_promo_discount_percent(user)
+    promo_offer_discount_percent = get_user_active_promo_discount_percent(without_trial_ending_promo(user))
 
     # Используем pricing_engine как единственный источник правды для расчёта цены.
     # Раньше config считал цену "вручную" (применял promo_group скидку безусловно),
@@ -120,7 +120,7 @@ async def get_gift_config(
                     tariff,
                     days,
                     device_limit=tariff.device_limit,
-                    user=user,
+                    user=without_trial_ending_promo(user),
                 )
             except Exception as error:
                 logger.warning(
@@ -285,7 +285,7 @@ async def create_gift_purchase(
         tariff,
         body.period_days,
         device_limit=tariff.device_limit,
-        user=user,
+        user=without_trial_ending_promo(user),
     )
     price_kopeks = max(1, pricing_result.final_total)
     consume_promo = pricing_result.promo_offer_discount > 0
