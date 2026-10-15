@@ -79,14 +79,15 @@ def common(monkeypatch):
 
 
 @pytest.mark.parametrize('delivered', [True, False])
-async def test_48_24_delivery_fact_follows_sender(monkeypatch, delivered):
+@pytest.mark.parametrize('hours', [24, 48])
+async def test_48_24_delivery_fact_follows_sender(monkeypatch, delivered, hours):
     marked, recorded = common(monkeypatch)
     sender = AsyncMock(return_value=delivered)
     monkeypatch.setattr(m.notification_delivery_service, 'send_notification', sender)
     owner, sub = letter_user()
-    sub.end_date = datetime.now(UTC) + timedelta(hours=23, minutes=59)
+    sub.end_date = datetime.now(UTC) + timedelta(hours=hours, minutes=-1)
     monitor = m.MonitoringService.__new__(m.MonitoringService)
-    assert await monitor.handle_trial_expiring(LetterDB(), owner, sub, hours=24, bot=object())
+    assert await monitor.handle_trial_expiring(LetterDB(), owner, sub, hours=hours, bot=object())
     assert marked.await_count == recorded.await_count == int(delivered)
     sent = sender.await_args.kwargs
     assert isinstance(sent['context']['price_lines'], m.TrialDiscountPriceLines)
