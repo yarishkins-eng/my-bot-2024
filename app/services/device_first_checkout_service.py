@@ -1079,6 +1079,19 @@ async def create_checkout(
     # new quote.  Every direct financial commit takes this same lock before it
     # can create an invoice or debit the wallet.
     user = (await db.execute(select(User).where(User.id == user.id).with_for_update())).scalar_one()
+    await db.refresh(
+        user,
+        attribute_names=[
+            'balance_kopeks',
+            'promo_offer_discount_percent',
+            'promo_offer_discount_source',
+            'promo_offer_discount_expires_at',
+            'has_had_paid_subscription',
+            'restriction_subscription',
+            'account_erasure_requested_at',
+            'account_erased_at',
+        ],
+    )
     await assert_recent_purchase_confirmed(
         db, user_id=user.id, purchase_context=purchase_context, confirmed_purchase_id=confirmed_purchase_id
     )
@@ -1380,6 +1393,7 @@ async def create_or_resume_direct_checkout(
     mutation: DeviceFirstMutation | None = None,
     purchase_context: str | None = None,
     confirmed_purchase_id: int | None = None,
+    paid_intent_promo_context: _PaidIntentPromoContext | None = None,
 ) -> FusedDirectCheckout:
     """Resolve the one direct checkout at the moment of payment.
 
@@ -1414,7 +1428,7 @@ async def create_or_resume_direct_checkout(
     # ``_lock_direct_context``) take the fence first and re-validate under it.
 
     # Phase 1: optimistic, lock-free price and selection validation.
-    options = await build_purchase_options(db, user)
+    options = await build_purchase_options(db, user, **_paid_promo_kwargs(paid_intent_promo_context))
     if not options.get('eligible'):
         raise DeviceFirstError('legacy_only', 'Device-first checkout is unavailable', status_code=404)
     server_price_kopeks = _fused_selection_price(
@@ -1441,6 +1455,12 @@ async def create_or_resume_direct_checkout(
     # before the per-user fence, so the abandon path keeps its canonical
     # P -> U -> A -> C lock order.
     existing = await get_open_checkout_for_user(db, user_id=user.id)
+    if (
+        paid_intent_promo_context is not None
+        and existing is not None
+        and (existing.price_breakdown or {}).get('paid_intent_binding') != paid_intent_promo_context.binding
+    ):
+        return FusedDirectCheckout(checkout=existing, proceed_to_payment=False)
     if purchase_context == 'chat_autostart' and (
         existing is None
         or (
@@ -1510,7 +1530,26 @@ async def create_or_resume_direct_checkout(
     # Phase 4: the authoritative pass under the per-user fence.  Everything
     # above was optimistic; re-read and re-price before any INSERT.
     user = (await db.execute(select(User).where(User.id == user.id).with_for_update())).scalar_one()
+    await db.refresh(
+        user,
+        attribute_names=[
+            'balance_kopeks',
+            'promo_offer_discount_percent',
+            'promo_offer_discount_source',
+            'promo_offer_discount_expires_at',
+            'has_had_paid_subscription',
+            'restriction_subscription',
+            'account_erasure_requested_at',
+            'account_erased_at',
+        ],
+    )
     fenced_open = await get_open_checkout_for_user(db, user_id=user.id)
+    if (
+        paid_intent_promo_context is not None
+        and fenced_open is not None
+        and (fenced_open.price_breakdown or {}).get('paid_intent_binding') != paid_intent_promo_context.binding
+    ):
+        return FusedDirectCheckout(checkout=fenced_open, proceed_to_payment=False)
     if fenced_open is not None and settlement_mode(fenced_open) == DIRECT_SETTLEMENT_MODE:
         fenced_same_configuration = (
             fenced_open.period_days == period_days and fenced_open.selected_device_limit == selected_device_limit
@@ -1533,7 +1572,7 @@ async def create_or_resume_direct_checkout(
             mutation.checkout_id = fenced_open.id
         return FusedDirectCheckout(checkout=fenced_open, proceed_to_payment=False)
 
-    fenced_options = await build_purchase_options(db, user)
+    fenced_options = await build_purchase_options(db, user, **_paid_promo_kwargs(paid_intent_promo_context))
     if not fenced_options.get('eligible'):
         raise DeviceFirstError('legacy_only', 'Device-first checkout is unavailable', status_code=404)
     fenced_price_kopeks = _fused_selection_price(
@@ -1557,6 +1596,7 @@ async def create_or_resume_direct_checkout(
         selected_device_limit=selected_device_limit,
         source=source,
         mutation=mutation,
+        **_paid_promo_kwargs(paid_intent_promo_context),
         initial_lifecycle_state='confirmed',
         purchase_context=purchase_context,
         confirmed_purchase_id=confirmed_purchase_id,
@@ -1980,6 +2020,23 @@ async def prepare_topup_intent(
         # Только вместо «принято»: открытый заказ, оплаченный или живой счёт, «уже оформлено» и «баланса хватает»
         # крипте отвечают так же, как СБП, — иначе обычный счёт поверх них толкал бы ко второй оплате (волна 1, 3б).
         return TopUpIntentDecision('ordinary', 'method_not_supported')
+    selected_breakdown = next(
+        (
+            cell.get('breakdown') or {}
+            for row in options['price_matrix']
+            if row['period_days'] == period_days
+            for cell in row['prices']
+            if cell['device_limit'] == devices
+        ),
+        {},
+    )
+    own_offer = selected_breakdown.get('promo_offer')
+    if (
+        isinstance(own_offer, dict)
+        and own_offer.get('source') == 'trial_ending_discount'
+        and (_intent_time(own_offer.get('expires_at')) or now) <= datetime.now(UTC)
+    ):
+        return TopUpIntentDecision('ordinary', 'unavailable')
     current = options.get('current_subscription') or {}
     return TopUpIntentDecision(
         'accepted',
@@ -1991,6 +2048,11 @@ async def prepare_topup_intent(
             'period_days': period_days,
             'devices': devices,
             'quote_kopeks': price,
+            **{
+                key: selected_breakdown[key]
+                for key in ('promo_offer', 'promo_offer_discount_kopeks')
+                if key in selected_breakdown
+            },
             'tariff_id': options['tariff']['id'],
             'method': method_code,
             'had_subscription': bool(current),
@@ -2020,23 +2082,6 @@ async def replace_older_topup_intents(db: AsyncSession, *, user_id: int, newer_p
         return 0
     now = datetime.now(UTC)
     older = []
-    selected_breakdown = next(
-        (
-            cell.get('breakdown') or {}
-            for row in options['price_matrix']
-            if row['period_days'] == period_days
-            for cell in row['prices']
-            if cell['device_limit'] == devices
-        ),
-        {},
-    )
-    own_offer = selected_breakdown.get('promo_offer')
-    if (
-        isinstance(own_offer, dict)
-        and own_offer.get('source') == 'trial_ending_discount'
-        and (_intent_time(own_offer.get('expires_at')) or now) <= datetime.now(UTC)
-    ):
-        return TopUpIntentDecision('ordinary', 'unavailable')
     for payment in await _recent_topup_intent_payments(db, user_id=user_id, now=now):
         created_at = _intent_time(topup_intent_of(payment).get('created_at'))
         if payment.id != newer_payment_id and created_at is not None and created_at < newer_created_at:
@@ -2048,11 +2093,6 @@ async def replace_older_topup_intents(db: AsyncSession, *, user_id: int, newer_p
                 select(PlategaPayment)
                 .where(PlategaPayment.id == payment_id)
                 .with_for_update()
-            **{
-                key: selected_breakdown[key]
-                for key in ('promo_offer', 'promo_offer_discount_kopeks')
-                if key in selected_breakdown
-            },
                 .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
@@ -2248,7 +2288,13 @@ async def _topup_intent_drift(
 
 
 async def _topup_intent_recheck_locked(
-    db: AsyncSession, *, payment_id: int, user_id: int, intent: dict[str, Any]
+    db: AsyncSession,
+    *,
+    payment_id: int,
+    user_id: int,
+    intent: dict[str, Any],
+    paid_intent_promo_context: _PaidIntentPromoContext | None = None,
+    checkout_id: int | None = None,
 ) -> str | None:
     """Последний момент перед списанием (план ВК, 16а-2, заявка 2): замки строки платежа и пользователя держатся до
     коммита списания в `commit_direct_wallet_checkout`, поэтому ни отмена, ни покупка другим путём между этой
@@ -2260,13 +2306,63 @@ async def _topup_intent_recheck_locked(
     баланс поверх зачисления, пришедшего в эти секунды (второй платёж, начисление админа). С заявки 3а то же делает и
     `_lock_direct_context` (мина OW) — здесь освежение остаётся, потому что сверка смотрит баланс до списания.
     """
-    fresh = topup_intent_of(await get_platega_payment_by_id_for_update(db, payment_id)) or {}
+    payment = await get_platega_payment_by_id_for_update(db, payment_id)
+    fresh = topup_intent_of(payment) or {}
     await db.execute(select(User.id).where(User.id == user_id).with_for_update())
     # Освежаем ТОЛЬКО баланс: `populate_existing` по всему объекту сбросил бы загруженные связи (промогруппа), и цена в
     # `_validate_direct_pre_commit` упала бы ленивой подгрузкой (MissingGreenlet) — отказ у каждого (волна 2, P0).
     await db.refresh(await db.get(User, user_id), attribute_names=['balance_kopeks'])
     if fresh.get('status') != 'pending':
         return str(fresh.get('status'))
+    if paid_intent_promo_context is not None:
+        user = await db.get(User, user_id)
+        await db.refresh(
+            user,
+            attribute_names=[
+                'promo_offer_discount_percent',
+                'promo_offer_discount_source',
+                'promo_offer_discount_expires_at',
+                'has_had_paid_subscription',
+                'account_erasure_requested_at',
+                'account_erased_at',
+                'restriction_subscription',
+            ],
+        )
+        current_context = _paid_intent_promo_context(
+            payment, fresh, user, await _topup_intent_paid_reference(db, payment, fresh)
+        )
+        if (
+            current_context != paid_intent_promo_context
+            or payment.id != payment_id
+            or fresh.get('charging_checkout_id') not in {None, checkout_id}
+            or any(
+                fresh.get(key) != intent.get(key)
+                for key in ('period_days', 'devices', 'quote_kopeks', 'tariff_id', 'created_at')
+            )
+        ):
+            return 'price_changed'
+        if (
+            not _topup_intent_rolled_out(user)
+            or user.account_erasure_requested_at is not None
+            or user.account_erased_at is not None
+            or user.restriction_subscription
+        ):
+            return 'restricted'
+        drift = await _topup_intent_drift(
+            db,
+            user_id=user_id,
+            intent=fresh,
+            created_at=current_context.created_at,
+            current=await _subscription_identity(db, user_id),
+        )
+        if drift:
+            return drift
+        # The original date stays original: public quotes remain expired.
+        if user.promo_offer_discount_source is None:
+            user.promo_offer_discount_source = 'trial_ending_discount'
+            user.promo_offer_discount_percent = current_context.percent
+            user.promo_offer_discount_expires_at = current_context.deadline
+        return None
     return await _topup_intent_drift(
         db,
         user_id=user_id,
@@ -2341,7 +2437,12 @@ async def _topup_intent_refused(
 
 
 async def _topup_intent_refusal(
-    db: AsyncSession, *, user: User, intent: dict[str, Any], paid_reference: datetime | None = None
+    db: AsyncSession,
+    *,
+    user: User,
+    intent: dict[str, Any],
+    paid_reference: datetime | None = None,
+    paid_intent_promo_context: _PaidIntentPromoContext | None = None,
 ) -> tuple[str | None, str | None, int | None]:
     """Сверка перед оформлением (замысел v2, правило 2; план ВК 16а-2 (д), (е)): (причина отказа, номер заказа, цена).
 
@@ -2370,7 +2471,7 @@ async def _topup_intent_refusal(
     if open_checkout is not None and open_checkout.lifecycle_state not in {'draft', 'confirmed'}:
         on_review = open_checkout.lifecycle_state == 'operator_review'
         return ('order_on_review' if on_review else 'open_order'), open_checkout.public_id, None
-    options = await build_purchase_options(db, user)
+    options = await build_purchase_options(db, user, **_paid_promo_kwargs(paid_intent_promo_context))
     drift = await _topup_intent_drift(
         db, user_id=user.id, intent=intent, created_at=created_at, current=options.get('current_subscription')
     )
@@ -2528,7 +2629,29 @@ async def _complete_topup_intent(
 
     user_id = payment.user_id  # после `rollback` объекты протухают (ловушка 3) — номер берём сейчас
     user = await get_user_by_id(db, user_id)
-    reason, public_id, price = await _topup_intent_refusal(db, user=user, intent=intent, paid_reference=paid_reference)
+    context = None
+    if isinstance(intent.get('promo_offer'), dict) and intent['promo_offer'].get('source') == 'trial_ending_discount':
+        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+        await db.refresh(
+            user,
+            attribute_names=[
+                'promo_offer_discount_percent',
+                'promo_offer_discount_source',
+                'promo_offer_discount_expires_at',
+                'has_had_paid_subscription',
+            ],
+        )
+        context = _paid_intent_promo_context(payment, intent, user, paid_reference)
+    reason, public_id, price = await _topup_intent_refusal(
+        db, user=user, intent=intent, paid_reference=paid_reference, **_paid_promo_kwargs(context)
+    )
+    if (
+        reason is None
+        and isinstance(intent.get('promo_offer'), dict)
+        and intent['promo_offer'].get('source') == 'trial_ending_discount'
+        and context is None
+    ):
+        reason = 'price_changed'
     if reason is None:
         try:
             resolved = await create_or_resume_direct_checkout(
@@ -2540,8 +2663,12 @@ async def _complete_topup_intent(
                 funding_mode='wallet',
                 method_key=None,
                 source=TOPUP_INTENT_SOURCE,
+                **_paid_promo_kwargs(context),
             )
-            if resolved.checkout.source == TOPUP_INTENT_SOURCE:
+            if resolved.checkout.source == TOPUP_INTENT_SOURCE and (
+                context is None
+                or (resolved.checkout.price_breakdown or {}).get('paid_intent_binding') == context.binding
+            ):
                 state['own'] = resolved.checkout.id
             if not resolved.proceed_to_payment:
                 reason, public_id = 'open_order', resolved.checkout.public_id
@@ -2549,7 +2676,13 @@ async def _complete_topup_intent(
                 # Возобновление заказа держит замок пользователя без коммита: отпускаем, чтобы перепроверка взяла
                 # замки в общем порядке «платёж → пользователь».
                 await db.commit()
-                reason = await _topup_intent_recheck_locked(db, payment_id=payment_id, user_id=user_id, intent=intent)
+                reason = await _topup_intent_recheck_locked(
+                    db,
+                    payment_id=payment_id,
+                    user_id=user_id,
+                    intent=intent,
+                    **({**_paid_promo_kwargs(context), 'checkout_id': resolved.checkout.id} if context else {}),
+                )
             if reason is None:
                 state['charged'] = resolved.checkout.id
                 locked = await get_platega_payment_by_id_for_update(db, payment_id)
@@ -2562,7 +2695,7 @@ async def _complete_topup_intent(
                     TOPUP_INTENT_KEY: {**topup_intent_of(locked), 'charging_checkout_id': resolved.checkout.id},
                 }
                 checkout = await commit_direct_wallet_checkout(
-                    db, public_id=resolved.checkout.public_id, user_id=user_id
+                    db, public_id=resolved.checkout.public_id, user_id=user_id, **_paid_promo_kwargs(context)
                 )
                 return await _record_topup_intent_outcome(
                     db, payment_id=payment_id, status='fulfilled', checkout_public_id=checkout.public_id
@@ -2735,6 +2868,19 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
     now = datetime.now(UTC)
 
     user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one()
+    await db.refresh(
+        user,
+        attribute_names=[
+            'balance_kopeks',
+            'promo_offer_discount_percent',
+            'promo_offer_discount_source',
+            'promo_offer_discount_expires_at',
+            'has_had_paid_subscription',
+            'restriction_subscription',
+            'account_erasure_requested_at',
+            'account_erased_at',
+        ],
+    )
     target = None
     if checkout.target_subscription_id is not None:
         target = (
@@ -2844,6 +2990,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
     checkout.quote_state = 'committed'
     user.balance_kopeks -= charge
     await _queue_owner_sale_row(db, checkout=checkout, user=user)  # до переворота флага ниже
+    was_first_paid_sale = not user.has_had_paid_subscription
     user.has_had_paid_subscription = True
     # Скидку меряем ПЕРЕСЧИТАННОЙ ценой, а не замороженной разбивкой заказа: выше
     # стоит забор `charge != checkout.quoted_price_kopeks`, но он сверяет ИТОГ, а не
@@ -2853,6 +3000,7 @@ async def fulfill_checkout(db: AsyncSession, public_id: str, user_id: int) -> Su
         user=user,
         checkout=checkout,
         applied_discount_kopeks=int(current_price.promo_offer_discount or 0),
+        was_first_paid_sale=was_first_paid_sale,
         # Здесь цена пересчитана ПРЯМО СЕЙЧАС из текущего предложения человека, поэтому
         # применённое и гасимое — одно и то же по построению, и сверка тождественна.
         # Окна, в которое предложение могло смениться, у этой ветки нет.
@@ -2936,10 +3084,22 @@ async def _lock_direct_context(
 ) -> tuple[SubscriptionCheckout, User, Subscription | None, Tariff]:
     """Lock direct commits in the canonical order: user → checkout → sub → tariff."""
     user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one()
+    await db.refresh(
+        user,
+        attribute_names=[
+            'balance_kopeks',
+            'promo_offer_discount_percent',
+            'promo_offer_discount_source',
+            'promo_offer_discount_expires_at',
+            'has_had_paid_subscription',
+            'restriction_subscription',
+            'account_erasure_requested_at',
+            'account_erased_at',
+        ],
+    )
     # 🔴 Мина OW: сессия отдаёт уже загруженный объект, и списание (`balance_kopeks -= total`) записало бы баланс,
-    # прочитанный ДО замка, поверх зачисления этих секунд. Освежаем ТОЛЬКО баланс: `populate_existing` сбросил бы
+    # прочитанный ДО замка, поверх зачисления этих секунд. Освежаем баланс и поля права на скидку: `populate_existing` сбросил бы
     # загруженные связи (промогруппа), и цена упала бы ленивой подгрузкой (MissingGreenlet) — урок заявки 2.
-    await db.refresh(user, attribute_names=['balance_kopeks'])
     checkout = await get_owned_checkout(db, public_id=public_id, user_id=user_id, for_update=True)
     if settlement_mode(checkout) != DIRECT_SETTLEMENT_MODE:
         raise DeviceFirstError('legacy_checkout', 'This older checkout uses its original settlement path')
@@ -2981,6 +3141,60 @@ async def _lock_direct_context(
     return checkout, user, target, tariff
 
 
+def _own_promo_expired(checkout: SubscriptionCheckout, user: User) -> bool:
+    breakdown = checkout.price_breakdown or {}
+    own = breakdown.get('promo_offer')
+    if not isinstance(own, dict) or int(breakdown.get('promo_offer_discount_kopeks') or 0) <= 0:
+        return False
+    deadline = _intent_time(own.get('expires_at'))
+    return bool(
+        deadline
+        and deadline <= datetime.now(UTC)
+        and own.get('source') == getattr(user, 'promo_offer_discount_source', None)
+        and own.get('discount_percent') == getattr(user, 'promo_offer_discount_percent', None)
+        and deadline == getattr(user, 'promo_offer_discount_expires_at', None)
+        and not (own.get('source') == 'trial_ending_discount' and user.has_had_paid_subscription)
+    )
+
+
+async def _expired_own_promo_reason(checkout, user, tariff, price, *, upgrade_from, upgrade_days) -> str:
+    """Called only after the target, tariff revision and entitlement have matched."""
+    saved = checkout.price_breakdown or {}
+    if (
+        not _own_promo_expired(checkout, user)
+        or int(tariff.pricing_revision or 1) != checkout.pricing_revision
+        or 'promo_group_id' not in saved
+        or 'group_discount_pct' not in saved
+        or saved['promo_group_id'] != getattr(pricing_engine.resolve_promo_group(user), 'id', None)
+        or saved['group_discount_pct'] != (price.breakdown or {}).get('group_discount_pct')
+    ):
+        return 'price_changed'
+    if any(
+        saved.get(key) != value
+        for key, value in {
+            'base_price_kopeks': price.base_price,
+            'devices_price_kopeks': price.devices_price,
+            'promo_group_discount_kopeks': price.promo_group_discount,
+            'upgrade_prorate_kopeks': int((price.breakdown or {}).get('upgrade_prorate_kopeks') or 0),
+        }.items()
+    ):
+        return 'price_changed'
+    counterfactual = await pricing_engine.calculate_tariff_purchase_price(
+        tariff,
+        checkout.period_days,
+        device_limit=checkout.selected_device_limit,
+        user=PromoPricingUser(user, percent=saved['promo_offer']['discount_percent'], expires_at=None),
+        upgrade_from_device_limit=upgrade_from,
+        upgrade_remaining_days=upgrade_days,
+    )
+    return (
+        'promo_offer_expired'
+        if counterfactual.final_total == checkout.tariff_total_kopeks
+        and counterfactual.promo_offer_discount == saved['promo_offer_discount_kopeks']
+        else 'price_changed'
+    )
+
+
 async def _validate_direct_pre_commit(
     db: AsyncSession,
     *,
@@ -2988,6 +3202,7 @@ async def _validate_direct_pre_commit(
     user: User,
     target: Subscription | None,
     tariff: Tariff,
+    paid_intent_promo_context: _PaidIntentPromoContext | None = None,
 ):
     """Fail before money if price, target or entitlement quote drifted.
 
@@ -3006,7 +3221,12 @@ async def _validate_direct_pre_commit(
         await db.commit()
         return None
     if checkout.expect_no_subscription:
-        if await _current_subscription(db, user.id) is not None:
+        current = (
+            await _subscription_identity(db, user.id)
+            if paid_intent_promo_context is not None
+            else await _current_subscription(db, user.id)
+        )
+        if current is not None:
             checkout.lifecycle_state = 'conflict'
             checkout.terminal_reason = 'subscription_appeared'
             await db.commit()
@@ -3040,14 +3260,15 @@ async def _validate_direct_pre_commit(
         tariff,
         checkout.period_days,
         device_limit=checkout.selected_device_limit,
-        user=user,
+        user=_paid_promo_pricing_user(user, paid_intent_promo_context),
         upgrade_from_device_limit=live_upgrade_from,
         upgrade_remaining_days=frozen_upgrade_days,
     )
-    if (
+    price_changed = (
         int(tariff.pricing_revision or 1) != checkout.pricing_revision
         or current_price.final_total != checkout.tariff_total_kopeks
-    ):
+    )
+    if price_changed and not _own_promo_expired(checkout, user):
         checkout.lifecycle_state = 'reprice_required'
         checkout.quote_state = 'price_changed'
         checkout.terminal_reason = 'price_changed'
@@ -3085,14 +3306,15 @@ async def _validate_direct_pre_commit(
             tariff,
             checkout.period_days,
             device_limit=checkout.selected_device_limit,
-            user=user,
+            user=_paid_promo_pricing_user(user, paid_intent_promo_context),
             upgrade_from_device_limit=live_upgrade_from,
             upgrade_remaining_days=frozen_upgrade_days,
         )
-        if (
+        price_changed = (
             int(tariff.pricing_revision or 1) != checkout.pricing_revision
             or locked_price.final_total != checkout.tariff_total_kopeks
-        ):
+        )
+        if price_changed and not _own_promo_expired(checkout, user):
             checkout.lifecycle_state = 'reprice_required'
             checkout.quote_state = 'price_changed'
             checkout.terminal_reason = 'price_changed'
@@ -3114,17 +3336,23 @@ async def _validate_direct_pre_commit(
         current_entitlement = None
     if current_entitlement is None or current_entitlement.snapshot_hash != quoted_entitlement.snapshot_hash:
         # Host title-only presentation changes do not change the AP
-    was_first_paid_sale = not user.has_had_paid_subscription
         # fingerprint/hash.  A policy, mapping or health drift does.
         checkout.lifecycle_state = 'reprice_required'
         checkout.quote_state = 'price_changed'
         checkout.terminal_reason = 'entitlement_changed'
         await db.commit()
         return None
+    if price_changed:
+        checkout.lifecycle_state = 'reprice_required'
+        checkout.quote_state = 'price_changed'
+        checkout.terminal_reason = await _expired_own_promo_reason(
+            checkout, user, tariff, locked_price, upgrade_from=live_upgrade_from, upgrade_days=frozen_upgrade_days
+        )
+        await db.commit()
+        return None
     return quoted_entitlement
 
 
-        was_first_paid_sale=was_first_paid_sale,
 def _entitlement_from_payload(raw_entitlement: object):
     """Deserialize immutable quote/sale evidence without consulting tariff state."""
 
@@ -3248,7 +3476,9 @@ async def prepare_direct_external_checkout(
     )
     entitlement = await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff)
     if entitlement is None:
-        raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')
+        raise DeviceFirstError(
+            'reprice_required', 'The quote changed; create a new checkout', detail={'reason': checkout.terminal_reason}
+        )
     total = checkout.tariff_total_kopeks
     checkout.wallet_applied_kopeks = 0
     checkout.external_payable_kopeks = total
@@ -3274,6 +3504,7 @@ async def _consume_promo_offer_for_sale(
     checkout: SubscriptionCheckout,
     applied_discount_kopeks: int,
     expected_source: str | None,
+    was_first_paid_sale: bool = False,
 ) -> None:
     """Погасить применённую скидку; новое trial-ending право — при первой продаже, даже с нулевой выгодой.
 
@@ -3635,7 +3866,6 @@ async def _complete_direct_sale_locked(
         )
 
     sale_key = f'direct-sale:{checkout.id}'
-    was_first_paid_sale: bool = False,
     sale = (
         await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == sale_key))
     ).scalar_one_or_none()
@@ -3662,6 +3892,7 @@ async def _complete_direct_sale_locked(
         db.add(sale)
         await db.flush()
     await _queue_owner_sale_row(db, checkout=checkout, user=user)  # до переворота флага ниже
+    was_first_paid_sale = not user.has_had_paid_subscription
     user.has_had_paid_subscription = True
     # Читаем из СНИМКА, а не из колонки заказа. Сегодня они совпадают (колонка пишется один
     # раз при создании), но вся остальная функция построена на снимке именно потому, что
@@ -3672,6 +3903,7 @@ async def _complete_direct_sale_locked(
         user=user,
         checkout=checkout,
         applied_discount_kopeks=int(_frozen_breakdown.get('promo_offer_discount_kopeks') or 0),
+        was_first_paid_sale=was_first_paid_sale,
         # Заказы, заведённые ДО этой правки, личности предложения не несут. Для них
         # запасное значение делает сверку тождественной — то есть прежнее правило «по сумме».
         expected_source=(checkout.sale_snapshot or {}).get(
@@ -3712,6 +3944,7 @@ async def commit_direct_wallet_checkout(
     user_id: int,
     purchase_context: str | None = None,
     confirmed_purchase_id: int | None = None,
+    paid_intent_promo_context: _PaidIntentPromoContext | None = None,
 ) -> SubscriptionCheckout:
     """The explicit full-wallet path; partial balance is never combined with Platega."""
     checkout, user, target, tariff = await _lock_direct_context(db, public_id=public_id, user_id=user_id)
@@ -3724,9 +3957,18 @@ async def commit_direct_wallet_checkout(
     await assert_recent_purchase_confirmed(
         db, user_id=user_id, purchase_context=purchase_context, confirmed_purchase_id=confirmed_purchase_id
     )
-    entitlement = await _validate_direct_pre_commit(db, checkout=checkout, user=user, target=target, tariff=tariff)
+    if (
+        paid_intent_promo_context is not None
+        and (checkout.price_breakdown or {}).get('paid_intent_binding') != paid_intent_promo_context.binding
+    ):
+        raise DeviceFirstError('price_changed', 'The checkout belongs to another paid intent')
+    entitlement = await _validate_direct_pre_commit(
+        db, checkout=checkout, user=user, target=target, tariff=tariff, **_paid_promo_kwargs(paid_intent_promo_context)
+    )
     if entitlement is None:
-        raise DeviceFirstError('reprice_required', 'The quote changed; create a new checkout')
+        raise DeviceFirstError(
+            'reprice_required', 'The quote changed; create a new checkout', detail={'reason': checkout.terminal_reason}
+        )
     total = checkout.tariff_total_kopeks
     if user.balance_kopeks < total:
         raise DeviceFirstError('wallet_insufficient', 'The balance does not cover this checkout', status_code=422)
@@ -4020,7 +4262,6 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
                 checkout.lifecycle_state = 'operator_review'
                 checkout.terminal_reason = error
                 _event('operator_review', checkout, reason=error)
-    was_first_paid_sale = not user.has_had_paid_subscription
             if ok and bot is not None:
                 user = await db.get(User, checkout.user_id)
                 if user and user.telegram_id:
@@ -4031,7 +4272,6 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
                             else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
                         )
                         await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
-        was_first_paid_sale=was_first_paid_sale,
                     except Exception as delivery_error:
                         logger.warning(
                             'Device-first notification delivery failed',
