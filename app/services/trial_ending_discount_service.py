@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.database.crud.discount_offer import get_latest_claimed_offer_for_user
+from app.database.crud.promo_offer_log import log_promo_offer_action
 from app.database.crud.tariff import get_trial_tariff
 from app.database.database import AsyncSessionLocal
 from app.database.models import DiscountOffer, SentNotification, Subscription, User, UserPromoGroup
@@ -287,3 +289,74 @@ async def mark_trial_discount_delivered(db: AsyncSession, *, offer_id: int, user
     await db.flush()
     return True
 
+
+async def cleanup_expired_discounts_safely(db: AsyncSession) -> int:
+    """Compare all three stale slot fields before clearing; preserve ordinary offer expiration/logging."""
+    now = datetime.now(UTC)
+    candidates = (
+        await db.execute(
+            select(
+                User.id,
+                User.promo_offer_discount_percent,
+                User.promo_offer_discount_source,
+                User.promo_offer_discount_expires_at,
+            ).where(User.promo_offer_discount_percent > 0, User.promo_offer_discount_expires_at <= now)
+        )
+    ).all()
+    payloads = []
+    for user_id, percent, source, expiry in candidates:
+        cleared = await db.execute(
+            update(User)
+            .where(
+                User.id == user_id,
+                User.promo_offer_discount_percent == percent,
+                User.promo_offer_discount_source.is_not_distinct_from(source),
+                User.promo_offer_discount_expires_at == expiry,
+                User.promo_offer_discount_expires_at <= now,
+            )
+            .values(
+                promo_offer_discount_percent=0,
+                promo_offer_discount_source=None,
+                promo_offer_discount_expires_at=None,
+                updated_at=now,
+            )
+            .returning(User.id)
+            .execution_options(synchronize_session=False)
+        )
+        if cleared.scalar_one_or_none() is None:
+            continue
+        offer = None
+        if source:
+            try:
+                offer = await get_latest_claimed_offer_for_user(db, user_id, source)
+            except Exception as lookup_error:
+                logger.warning(
+                    'Failed to fetch latest claimed promo offer for user during expiration cleanup',
+                    user_id=user_id,
+                    lookup_error=lookup_error,
+                )
+        payloads.append(
+            dict(
+                user_id=user_id,
+                offer_id=offer.id if offer else None,
+                source=source,
+                percent=percent,
+                effect_type=offer.effect_type if offer else None,
+            )
+        )
+    if candidates:
+        await db.commit()
+    for payload in payloads:
+        try:
+            await log_promo_offer_action(db, **payload, action='disabled', details={'reason': 'offer_expired'})
+        except Exception as log_error:
+            logger.warning(
+                'Failed to log promo offer expiration for user', user_id=payload['user_id'], log_error=log_error
+            )
+            try:
+                await db.rollback()
+            except Exception as rollback_error:
+                logger.warning(
+                    'Failed to rollback session after promo offer expiration log failure', rollback_error=rollback_error
+                )
+    return len(payloads)
