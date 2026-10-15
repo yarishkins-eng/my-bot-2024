@@ -6,10 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, update
 from sqlalchemy.orm import Session
 
 from app.database.models import (
+    CheckoutPaymentAttempt,
     Subscription,
     SubscriptionCheckout,
     Tariff,
@@ -213,3 +214,52 @@ async def test_public_request_loaded_before_first_sale_must_not_reuse_new_offer(
         await s.commit_direct_wallet_checkout(db2, public_id=resolved.checkout.public_id, user_id=1)
     assert refused.value.code == 'reprice_required'
     assert waiting.query(Transaction).filter(Transaction.type == 'subscription_payment').count() == 1
+
+
+@pytest.mark.asyncio
+async def test_external_fulfillment_passes_fresh_user_to_sale(chain, monkeypatch):
+    checkout = SubscriptionCheckout(
+        id=88,
+        public_id='money-probe-88',
+        user_id=1,
+        settlement_mode=s.DIRECT_SETTLEMENT_MODE,
+        lifecycle_state='fulfilling',
+        funding_state='paid',
+        fulfillment_state='not_started',
+        target_subscription_id=None,
+    )
+    attempt = CheckoutPaymentAttempt(
+        id=89,
+        checkout_id=88,
+        settlement_mode=s.DIRECT_SETTLEMENT_MODE,
+        status='paid_processing',
+        provider_method_code=2,
+    )
+    chain.session.add_all([checkout, attempt])
+    chain.session.commit()
+    assert chain.owner.promo_offer_discount_source == 'trial_ending_discount'
+    with chain.session.bind.begin() as conn:
+        conn.execute(
+            update(User)
+            .where(User.id == 1)
+            .values(
+                promo_offer_discount_source='foreign',
+                promo_offer_discount_percent=10,
+                has_had_paid_subscription=True,
+            )
+        )
+    assert chain.owner.promo_offer_discount_source == 'trial_ending_discount'
+
+    async def verify_fresh(db, *, user, **kwargs):
+        assert user.promo_offer_discount_source == 'foreign', 'stale promo source reached the sale'
+        assert user.has_had_paid_subscription is True
+        return checkout
+
+    monkeypatch.setattr(s, '_complete_direct_sale_locked', verify_fresh)
+    monkeypatch.setattr(s, '_kick_direct_referral_post_commit', AsyncMock())
+    await s.fulfill_direct_external_checkout(
+        chain.db,
+        checkout_id=88,
+        provider_payment_id='probe',
+        payment_attempt_id=89,
+    )

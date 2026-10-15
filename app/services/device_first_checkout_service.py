@@ -4012,6 +4012,19 @@ async def fulfill_direct_external_checkout(
     if checkout_owner_id is None:
         raise DeviceFirstError('invalid_state', 'Direct checkout is no longer eligible for fulfilment')
     user = (await db.execute(select(User).where(User.id == checkout_owner_id).with_for_update())).scalar_one()
+    await db.refresh(
+        user,
+        attribute_names=[
+            'balance_kopeks',
+            'promo_offer_discount_percent',
+            'promo_offer_discount_source',
+            'promo_offer_discount_expires_at',
+            'has_had_paid_subscription',
+            'restriction_subscription',
+            'account_erasure_requested_at',
+            'account_erased_at',
+        ],
+    )
     attempt_predicates = [
         CheckoutPaymentAttempt.id == payment_attempt_id,
         CheckoutPaymentAttempt.checkout_id == checkout_id,
