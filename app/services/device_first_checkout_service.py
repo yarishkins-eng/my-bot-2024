@@ -2990,6 +2990,7 @@ async def _validate_direct_pre_commit(
         current_entitlement = None
     if current_entitlement is None or current_entitlement.snapshot_hash != quoted_entitlement.snapshot_hash:
         # Host title-only presentation changes do not change the AP
+    was_first_paid_sale = not user.has_had_paid_subscription
         # fingerprint/hash.  A policy, mapping or health drift does.
         checkout.lifecycle_state = 'reprice_required'
         checkout.quote_state = 'price_changed'
@@ -2999,6 +3000,7 @@ async def _validate_direct_pre_commit(
     return quoted_entitlement
 
 
+        was_first_paid_sale=was_first_paid_sale,
 def _entitlement_from_payload(raw_entitlement: object):
     """Deserialize immutable quote/sale evidence without consulting tariff state."""
 
@@ -3145,7 +3147,7 @@ async def _consume_promo_offer_for_sale(
     applied_discount_kopeks: int,
     expected_source: str | None,
 ) -> None:
-    """Погасить одноразовую скидку, которую эта продажа ДЕЙСТВИТЕЛЬНО применила.
+    """Погасить применённую скидку; новое trial-ending право — при первой продаже, даже с нулевой выгодой.
 
     🔴 Гасим по ФАКТУ применения (сколько копеек скидки ушло в цену), а не по праву
     на скидку. Право бывает и тогда, когда скидка на эту покупку вышла нулевой, — и
@@ -3163,7 +3165,10 @@ async def _consume_promo_offer_for_sale(
     `MissingGreenlet`. Здесь коммита ещё не было: запись в отдельной сессии
     пережила бы откат продажи и соврала бы, что скидка потрачена.
     """
-    if applied_discount_kopeks <= 0:
+    first_trial_sale = (
+        was_first_paid_sale and getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount'
+    )
+    if applied_discount_kopeks <= 0 and not first_trial_sale:
         return
     try:
         percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0)
@@ -3173,7 +3178,7 @@ async def _consume_promo_offer_for_sale(
         return
 
     source = getattr(user, 'promo_offer_discount_source', None)
-    if source != expected_source:
+    if source != expected_source and not first_trial_sale:
         # Предложение сменилось между расчётом цены и приходом денег. Гасить нельзя:
         # человек потерял бы предложение, которого эта покупка не применяла. Несовпадение
         # всегда решаем в пользу клиента — оставить скидку дешевле, чем сжечь чужую.
@@ -3502,6 +3507,7 @@ async def _complete_direct_sale_locked(
         )
 
     sale_key = f'direct-sale:{checkout.id}'
+    was_first_paid_sale: bool = False,
     sale = (
         await db.execute(select(Transaction).where(Transaction.device_first_ledger_key == sale_key))
     ).scalar_one_or_none()
@@ -3886,6 +3892,7 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
                 checkout.lifecycle_state = 'operator_review'
                 checkout.terminal_reason = error
                 _event('operator_review', checkout, reason=error)
+    was_first_paid_sale = not user.has_had_paid_subscription
             if ok and bot is not None:
                 user = await db.get(User, checkout.user_id)
                 if user and user.telegram_id:
@@ -3896,6 +3903,7 @@ async def process_provisioning_outbox(db: AsyncSession, *, limit: int = 20, bot=
                             else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
                         )
                         await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
+        was_first_paid_sale=was_first_paid_sale,
                     except Exception as delivery_error:
                         logger.warning(
                             'Device-first notification delivery failed',
