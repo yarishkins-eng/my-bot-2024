@@ -54,8 +54,34 @@ async def test_previews_use_real_sender_formatters_and_do_not_issue_or_mutate(pr
     assert '119 ₽' in api._discount_previews(options)[2].text
 
 
+@pytest.mark.asyncio
+async def test_catalog_summary_does_not_count_the_same_carrier_twice(price_env, monkeypatch):
+    monkeypatch.setattr(api, '_quiet_facts', AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(api, '_sent_counts', AsyncMock(return_value={('trial_expiring_24h', None): 7}))
+    monkeypatch.setattr(api, '_claimed_counts', AsyncMock(return_value={}))
+    monkeypatch.setattr(api, '_trial_discount_stats', AsyncMock(return_value=(3, 'Delivered', [])))
+    db = AsyncMock()
+    db.scalar.return_value = None
+    response = await api.list_auto_messages(db, None)
+    new = next(item for item in response.items if item.id == 'trial-ending-discount')
+    assert new.sent_count == 3 and new.claimed_count is None and new.claim_tracked is False
+    assert response.summary.sent_total == 7
+    assert new.discount_prices['20'][0]['price_kopeks'] == 11900
 
 
+@pytest.mark.asyncio
+async def test_new_card_has_visible_history_note_and_no_second_text_editor(price_env, monkeypatch):
+    monkeypatch.setattr(api, '_quiet_facts', AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(api, '_sent_counts', AsyncMock(return_value={}))
+    monkeypatch.setattr(api, '_claimed_counts', AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        api, '_trial_discount_stats', AsyncMock(return_value=(0, 'Отсчёт начнётся после включения.', []))
+    )
+    detail = await api.get_auto_message('trial-ending-discount', None, AsyncMock(), None)
+    assert detail.sent_count == 0 and 'после включения' in detail.history_note
+    assert detail.text is None and detail.text_markers == []
+    assert detail.buttons[0].label == '🎁 Оформить со скидкой'
+    assert detail.discount_context['carrier_id'] == 'trial-1d'
 
 
 @pytest.mark.asyncio

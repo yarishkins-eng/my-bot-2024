@@ -15,6 +15,7 @@ def endpoint(price_env, monkeypatch):
     monkeypatch.setattr(api, '_sent_counts', AsyncMock(return_value={}))
     monkeypatch.setattr(api, '_claimed_counts', AsyncMock(return_value={}))
     monkeypatch.setattr(api, '_max_promo_group_percent', AsyncMock(return_value=0))
+    monkeypatch.setattr(api, '_trial_discount_stats', AsyncMock(return_value=(0, 'No deliveries yet', [])))
     return AsyncMock()
 
 
