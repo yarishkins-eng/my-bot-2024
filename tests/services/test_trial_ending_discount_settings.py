@@ -51,7 +51,7 @@ def test_complete_patch_saves_once_and_survives_reload(storage, monkeypatch):
     [('discount_percent', value) for value in (0, 31, 100, True, False, 20.0, '20', None)]
     + [('carrier', value) for value in (-1, 1, 2, 23, 25, True, False, 24.0, '24', None)]
     + [('audience', value) for value in (-1, 2, True, False, 1.0, '1', None)]
-    + [('post_trial_hours', value) for value in (0, -1, True, False, 6.0, '6', None, 10**100)]
+    + [('post_trial_hours', value) for value in (0, -1, 49, 10**8, True, False, 6.0, '6', None, 10**100)]
     + [('enabled', value) for value in (0, 1, 'true', None)],
 )
 def test_invalid_patch_never_changes_memory_or_file(storage, monkeypatch, field, value):
@@ -84,9 +84,11 @@ def test_all_numeric_choices_and_percent_boundaries_are_accepted(storage, carrie
     }
 
 
-def test_hours_have_no_unagreed_product_maximum(storage):
-    assert storage.set_trial_ending_discount_post_trial_hours(100_000) is True
-    assert storage.get_trial_ending_discount_post_trial_hours() == 100_000
+@pytest.mark.parametrize('hours', [1, 6, 12, 24, 48])
+def test_hours_use_owner_approved_one_to_forty_eight_range(storage, hours):
+    """Owner15.10 chose the same ceiling as cabinet choices; old unbounded contract is superseded."""
+    assert storage.set_trial_ending_discount_post_trial_hours(hours) is True
+    assert storage.get_trial_ending_discount_post_trial_hours() == hours
 
 
 @pytest.mark.parametrize('changes', [{'carrier': 48, 'discount_percent': 31}, {'carrier': 48, 'unknown': 1}])

@@ -409,7 +409,7 @@ class NotificationSettingsService:
             1 <= config['discount_percent'] <= 30
             and config['carrier'] in (0, 24, 48)
             and config['audience'] in (0, 1)
-            and config['post_trial_hours'] >= 1
+            and 1 <= config['post_trial_hours'] <= 48
         ):
             return False
         try:
