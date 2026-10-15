@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
@@ -1140,6 +1141,75 @@ def _discount_context() -> dict[str, Any]:
     }
 
 
+async def _discount_examples(db: AsyncSession, *, lock: bool = False) -> tuple[dict, dict]:
+    from app.database.crud.promo_group import get_default_promo_group
+    from app.database.crud.tariff import get_tariffs_for_user, get_trial_tariff
+    from app.services.device_first_checkout_service import device_first_new_checkouts_enabled
+    from app.services.device_first_eligibility import resolve_single_eligible_tariff
+    from app.services.pricing_engine import pricing_engine
+    from app.services.trial_ending_discount_service import _discount_expiry
+
+    if not device_first_new_checkouts_enabled():
+        return {}, {}
+    group = await get_default_promo_group(db)
+    if lock and group is not None:
+        await db.refresh(group, with_for_update=True)
+    tariffs = await get_tariffs_for_user(db, group.id if group else None)
+    if lock:
+        for tariff in tariffs:
+            await db.refresh(tariff, with_for_update=True)
+            await db.refresh(tariff, attribute_names=['allowed_promo_groups'])
+    eligible = resolve_single_eligible_tariff(tariffs, subscription=None)
+    if not eligible.eligible or 30 not in eligible.period_options:
+        return {}, {}
+    config = NotificationSettingsService.get_trial_ending_discount_settings()
+    end = datetime.now(UTC) + timedelta(hours=config['carrier'] or NotificationSettingsService.get_trial_warn_hours())
+    expiry = _discount_expiry(end, config['post_trial_hours'])
+    trial = await get_trial_tariff(db)
+    tariff = eligible.tariff
+    person = SimpleNamespace(
+        promo_group=group,
+        promo_offer_discount_source='trial_ending_discount',
+        promo_offer_discount_expires_at=expiry,
+        has_had_paid_subscription=False,
+    )
+    prices, options = {}, {}
+    for percent in range(1, 31):
+        person.promo_offer_discount_percent = percent
+        rows, matrix = [], []
+        for days in eligible.period_options:
+            quote = await pricing_engine.calculate_tariff_purchase_price(tariff, days, user=person)
+            if type(quote.final_total) is not int or not 0 < quote.final_total <= 2**53 - 1:
+                continue
+            rows.append({'period_days': days, 'price_kopeks': quote.final_total})
+            matrix.append(
+                {
+                    'period_days': days,
+                    'prices': [
+                        {
+                            'device_limit': tariff.device_limit,
+                            'price_kopeks': quote.final_total,
+                            'breakdown': {
+                                'promo_offer_discount_kopeks': quote.promo_offer_discount,
+                                'promo_offer': {'discount_percent': percent, 'expires_at': expiry.isoformat()},
+                            },
+                        }
+                    ],
+                }
+            )
+        if not any(row['period_days'] == 30 for row in rows):
+            return {}, {}
+        prices[str(percent)] = rows
+        if percent == config['discount_percent']:
+            options = {
+                'eligible': True,
+                'tariff': {'id': tariff.id, 'base_device_limit': tariff.device_limit},
+                'current_subscription': {'is_trial': True, 'tariff_id': trial.id} if trial else {},
+                'price_matrix': matrix,
+            }
+    return prices, options
+
+
 def _build_item(
     entry: dict[str, Any],
     reasons: dict[str, str],
@@ -1826,6 +1896,37 @@ def _has_numeric_change(payload: AutoMessagePatch) -> bool:
     return any(getattr(payload, field, None) is not None for field in _NUMERIC_FIELDS)
 
 
+async def _patch_trial_discount(db: AsyncSession, changes: dict[str, Any]) -> None:
+    before = NotificationSettingsService.get_config()['trial_ending_discount']
+    candidate = {**before, **changes} if isinstance(before, dict) else {}
+    if not NotificationSettingsService._valid_trial_ending_discount_settings(candidate):
+        raise HTTPException(422, 'Проверьте настройки скидки: процент, письмо, аудиторию и запас после пробного.')
+    if 'discount_percent' in changes or candidate['enabled']:
+        await _assert_discount_is_safe(db, candidate['discount_percent'], max_percent=30)
+    if candidate['enabled']:
+        prices, _ = await _discount_examples(db, lock=True)
+        month = next(
+            (row for row in prices.get(str(candidate['discount_percent']), []) if row['period_days'] == 30), None
+        )
+        if month is None or type(month['price_kopeks']) is not int or month['price_kopeks'] <= 0:
+            raise HTTPException(422, 'Касса не назвала цену месяца. Скидка не включена — проверьте тариф.')
+    # Awaited price checks must never overwrite another request's successful update.
+    if NotificationSettingsService.get_config()['trial_ending_discount'] != before:
+        raise HTTPException(409, 'Настройки изменились во время проверки. Обновите карточку и проверьте их снова.')
+    if not NotificationSettingsService.set_trial_ending_discount_settings(
+        **{field: value for field, value in candidate.items() if field != 'stats_since'}
+    ):
+        raise HTTPException(500, 'Не удалось сохранить настройки. Прежние значения сохранены.')
+
+
+async def _discount_item(db: AsyncSession, item: AutoMessageItem) -> AutoMessageItem:
+    if item.id == 'trial-ending-discount':
+        item.discount_prices, _ = await _discount_examples(db)
+        if item.enabled and not item.discount_prices and item.state == 'live':
+            item.state, item.quiet_reason = 'quiet', 'касса не назвала цену месяца'
+    return item
+
+
 def _apply_text_change(message_id: str, payload: AutoMessagePatch) -> str | None:
     """Сохраняет или снимает правку текста. Возвращает предупреждение для экрана."""
     if payload.text is None and not payload.reset_text:
@@ -1949,6 +2050,14 @@ async def patch_auto_message(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f'У этого сообщения нет настройки «{FIELD_TITLES[field]}».',
             )
+
+    if settings_key == 'trial_ending_discount':
+        await _patch_trial_discount(db, changes)
+        logger.info('auto_messages_patched', message_id=message_id, changes=sorted(changes))
+        reasons, notes = await _quiet_facts(db)
+        return await _discount_item(
+            db, _build_item(entry, reasons, notes, await _sent_counts(db), await _claimed_counts(db))
+        )
 
     # Заборы ДО записи: половина применённых изменений хуже, чем ни одного.
     if 'discount_percent' in changes:
