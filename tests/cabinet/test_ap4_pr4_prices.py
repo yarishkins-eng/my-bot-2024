@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -102,4 +103,26 @@ async def test_unavailable_cashier_never_invents_price(price_env, monkeypatch, r
         monkeypatch.setattr(checkout, 'device_first_new_checkouts_enabled', lambda: False)
     else:
         tariff.period_prices = {'30': 0, '90': 0}
+    assert await api._discount_examples(AsyncMock()) == ({}, {})
+
+
+@pytest.mark.asyncio
+async def test_non_positive_other_period_rejects_whole_cashier(price_env, monkeypatch):
+    tariff, group = price_env
+    group.period_discounts = {'90': 100}
+    monkeypatch.setattr(checkout, 'get_tariffs_for_user', AsyncMock(return_value=[tariff]))
+    monkeypatch.setattr(checkout, 'is_device_first_canary_user', lambda _: True)
+    person = SimpleNamespace(
+        id=1,
+        balance_kopeks=0,
+        promo_group=group,
+        promo_offer_discount_percent=20,
+        promo_offer_discount_source='trial_ending_discount',
+        promo_offer_discount_expires_at=datetime.now(UTC) + timedelta(days=1),
+        has_had_paid_subscription=False,
+    )
+    assert await checkout.build_purchase_options(AsyncMock(), person, subscription=None) == {
+        'eligible': False,
+        'reason': 'non_positive_quote',
+    }
     assert await api._discount_examples(AsyncMock()) == ({}, {})

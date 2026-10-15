@@ -95,6 +95,19 @@ async def test_enable_requires_fresh_thirty_day_price(endpoint, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_enable_rejects_non_positive_other_period_without_writing(endpoint, price_env):
+    _, group = price_env
+    group.period_discounts = {'90': 100}
+    before = deepcopy(Settings._data)
+    raw = Settings._storage_path.read_bytes()
+    with pytest.raises(HTTPException) as exc:
+        await patch(endpoint, enabled=True)
+    assert exc.value.status_code == 422
+    assert Settings._data == before and Settings._storage_path.read_bytes() == raw
+    assert Settings.get_trial_ending_discount_stats_since() is None
+
+
+@pytest.mark.asyncio
 async def test_text_plus_new_number_and_unsupported_old_card_field_are_rejected(endpoint):
     before = deepcopy(Settings._data)
     with pytest.raises(HTTPException) as mixed:

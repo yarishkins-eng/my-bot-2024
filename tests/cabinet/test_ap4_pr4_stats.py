@@ -179,6 +179,20 @@ async def test_small_sample_disclaimer_disappears_and_history_stays_bounded(db):
 
 
 @pytest.mark.asyncio
+async def test_old_delivery_stays_in_overall_result_but_not_thirty_day_history(db, monkeypatch):
+    monkeypatch.setattr(
+        Settings, 'get_trial_ending_discount_stats_since', classmethod(lambda _: NOW - timedelta(days=60))
+    )
+    db.user()
+    db.offer(created=NOW - timedelta(days=45))
+    db.order(at=NOW - timedelta(days=45))
+    count, note, history = await api._trial_discount_stats(db)
+    assert count == 1 and 'купили со скидкой 1' in note and 'отдано 30 ₽' in note
+    assert note.startswith('Итог с ')
+    assert history == []
+
+
+@pytest.mark.asyncio
 async def test_no_start_date_does_not_fabricate_an_epoch_or_query_database(monkeypatch):
     monkeypatch.setattr(Settings, 'get_trial_ending_discount_stats_since', classmethod(lambda _: None))
     monkeypatch.setattr(Settings, 'is_trial_ending_discount_enabled', classmethod(lambda _: False))

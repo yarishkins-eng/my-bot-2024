@@ -1191,7 +1191,7 @@ async def _discount_examples(db: AsyncSession, *, lock: bool = False) -> tuple[d
         for days in eligible.period_options:
             quote = await pricing_engine.calculate_tariff_purchase_price(tariff, days, user=person)
             if type(quote.final_total) is not int or not 0 < quote.final_total <= 2**53 - 1:
-                continue
+                return {}, {}
             rows.append({'period_days': days, 'price_kopeks': quote.final_total})
             matrix.append(
                 {
@@ -1969,7 +1969,8 @@ async def _trial_discount_stats(db: AsyncSession) -> tuple[int, str, list[AutoMe
         except ValueError:
             continue
         delivered.add(user_id)
-        history.append(AutoMessageHistoryRow(sent_at=at, user_ref=f'Клиент #{user_id}', claimed=None))
+        if at >= now - timedelta(days=30):
+            history.append(AutoMessageHistoryRow(sent_at=at, user_ref=f'Клиент #{user_id}', claimed=None))
     sales = (
         (
             await db.execute(
@@ -2006,7 +2007,7 @@ async def _trial_discount_stats(db: AsyncSession) -> tuple[int, str, list[AutoMe
     zone = ZoneInfo('Europe/Moscow')
     last = max((row[1] for row in offers), default=None)
     note = (
-        f'С {since.astimezone(zone):%d.%m.%Y}: получили {len(delivered)} · купили со скидкой {len(totals)} · '
+        f'Итог с {since.astimezone(zone):%d.%m.%Y}: получили {len(delivered)} · купили со скидкой {len(totals)} · '
         f'отдано {money(sum(savings))} · медианный чек {money(int(median(totals))) if totals else "—"}. '
     )
     note += f'Последняя выдача: {last.astimezone(zone):%d.%m.%Y %H:%M} (МСК). ' if last else 'Выдач пока не было. '
