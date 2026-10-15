@@ -173,7 +173,8 @@ def test_legacy_trial_percent_keeps_its_own_one_to_fifty_limits(storage, value, 
     assert storage.set_trial_expired_discount_percent(value) is True
     assert storage.get_trial_expired_discount_percent() == expected
     storage._data['trial_expired_discount']['discount_percent'] = value
-    assert storage.get_trial_expired_discount_percent() == expected
+    # Reading the old file preserves zero (no offer); only new writes clamp to 1..50.
+    assert storage.get_trial_expired_discount_percent() == value
     assert storage.set_second_wave_discount_percent(100) is True
     assert storage.get_second_wave_discount_percent() == 100
 

@@ -353,7 +353,7 @@ class NotificationSettingsService:
     def get_trial_expired_discount_percent(cls) -> int:
         value = cls._get('trial_expired_discount').get('discount_percent', 10)
         try:
-            return max(1, min(50, int(value)))
+            return int(value)
         except (TypeError, ValueError):
             return 10
 
