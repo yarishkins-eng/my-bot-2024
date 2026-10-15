@@ -353,7 +353,8 @@ async def test_real_selector_price_tail_and_sender_share_the_language(monkeypatc
     db = DB([subscription])
     try:
         await monitor._check_trial_expiring_soon(db)
-        matrix.assert_awaited_once_with(db, subscription.user)
+        # Explicit checked subscription keeps status normalization from committing the notification transaction.
+        matrix.assert_awaited_once_with(db, subscription.user, subscription=subscription)
         monitor.bot.send_message.assert_awaited_once()
         recorded.assert_awaited_once_with(db, 81, 81, 'trial_2h')
         assert subscription.user.language == language

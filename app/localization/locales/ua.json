@@ -1493,7 +1493,7 @@
   "TRIAL_EXPIRED_NOTIFICATION": "🎁 <b>Пробний період завершено</b>\n\nБезкоштовний доступ закінчився. Виберіть тариф, щоб продовжити користуватися VPN.\n\n{price_lines}",
   "TRIAL_EXPIRED_PRICE_LINES": "1 місяць — {month_price}\n3 місяці — {quarter_price}",
   "TRIAL_EXPIRED_PRICE_LINES_BALANCE": "1 місяць — {month_price}\nз вашими {balance} на балансі — доплатити {top_up}",
-  "TRIAL_EXPIRED_PRICE_LINES_FUNDED": "1 місяць — {month_price}\nНа балансі вистачає на місяць. {month_price} спишуться з балансу, доплачувати не потрібно.",
+  "TRIAL_EXPIRED_PRICE_LINES_FUNDED": "На балансі вистачає на місяць. {month_price} спишуться з балансу, доплачувати не потрібно.",
   "TRIAL_EXPIRED_DISCOUNT": "🎁 <b>Персональна знижка {percent}%</b>\n\nВаш пробний період закінчився. Натисніть кнопку з подарунком, щоб увімкнути знижку й дізнатися свою ціну. Пропозицію можна отримати до {expires_at}.",
   "SUB_STATUS_DISABLED": "⚫ Вимкнена",
   "SUB_STATUS_PENDING": "⏳ Очікує активації",
@@ -2022,5 +2022,15 @@
   "REFERRAL_LIST_ITEM_JOINED_TODAY": "   📅 Прийшов сьогодні",
   "REFERRAL_LIST_ITEM_JOINED_YESTERDAY": "   📅 Прийшов учора",
   "REFERRAL_LIST_LEGEND": "💰 — поповнював · ⏳ — ще ні",
-  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ Підписка активна! Ось твоє меню:"
+  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ Підписка активна! Ось твоє меню:",
+  "TRIAL_DISCOUNT_HEADING": "🎁 Your discount: −{percent}%{until}:",
+  "TRIAL_DISCOUNT_PRICE": "{term} — {net} instead of <s>{before}</s>",
+  "TRIAL_DISCOUNT_FUNDED": "covered by your balance, no top-up needed",
+  "TRIAL_DISCOUNT_BALANCE": "{balance} from your balance, top up {top_up}",
+  "TRIAL_DISCOUNT_ANY_SELECTION": "The discount applies to any period and number of devices.",
+  "TRIAL_DISCOUNT_START_NOW": "Your subscription starts immediately after payment.",
+  "TRIAL_DISCOUNT_TRAFFIC": "You used {traffic} GB during your trial.",
+  "TRIAL_DISCOUNT_CTA": "🎁 Subscribe with a discount",
+  "TRIAL_DISCOUNT_ACTIVATED": "🎉 Your {percent}% discount is active!",
+  "TRIAL_DISCOUNT_UNTIL": "Until {deadline}:"
 }

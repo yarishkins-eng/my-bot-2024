@@ -1584,7 +1584,7 @@
   "TRIAL_EXPIRED_NOTIFICATION": "🎁 <b>دوره آزمایشی شما به پایان رسید</b>\n\nدسترسی رایگان شما پایان یافت. برای ادامه استفاده از VPN یک طرح انتخاب کنید.\n\n{price_lines}",
   "TRIAL_EXPIRED_PRICE_LINES": "۱ ماه — {month_price}\n۳ ماه — {quarter_price}",
   "TRIAL_EXPIRED_PRICE_LINES_BALANCE": "۱ ماه — {month_price}\nبا {balance} موجودی شما — باید {top_up} اضافه کنید",
-  "TRIAL_EXPIRED_PRICE_LINES_FUNDED": "۱ ماه — {month_price}\nموجودی شما برای یک ماه کافی است. {month_price} از موجودی کسر می‌شود؛ نیازی به شارژ نیست.",
+  "TRIAL_EXPIRED_PRICE_LINES_FUNDED": "موجودی شما برای یک ماه کافی است. {month_price} از موجودی کسر می‌شود؛ نیازی به شارژ نیست.",
   "TRIAL_EXPIRED_DISCOUNT": "🎁 <b>تخفیف شخصی {percent}%</b>\n\nدوره آزمایشی شما تمام شده است. دکمه هدیه را بزنید تا تخفیف فعال شود و قیمت خود را ببینید. این پیشنهاد را تا {expires_at} دریافت کنید.",
   "SUB_STATUS_DISABLED": "🚫 غیرفعال",
   "SUB_STATUS_PENDING": "⏳ در انتظار",
@@ -2022,5 +2022,15 @@
   "REFERRAL_LIST_ITEM_JOINED_TODAY": "   📅 امروز پیوست",
   "REFERRAL_LIST_ITEM_JOINED_YESTERDAY": "   📅 دیروز پیوست",
   "REFERRAL_LIST_LEGEND": "💰 — شارژ کرده · ⏳ — هنوز نه",
-  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ اشتراک فعال است! این هم منوی تو:"
+  "FUNNEL_SUBSCRIPTION_ACTIVE": "✅ اشتراک فعال است! این هم منوی تو:",
+  "TRIAL_DISCOUNT_HEADING": "🎁 Your discount: −{percent}%{until}:",
+  "TRIAL_DISCOUNT_PRICE": "{term} — {net} instead of <s>{before}</s>",
+  "TRIAL_DISCOUNT_FUNDED": "covered by your balance, no top-up needed",
+  "TRIAL_DISCOUNT_BALANCE": "{balance} from your balance, top up {top_up}",
+  "TRIAL_DISCOUNT_ANY_SELECTION": "The discount applies to any period and number of devices.",
+  "TRIAL_DISCOUNT_START_NOW": "Your subscription starts immediately after payment.",
+  "TRIAL_DISCOUNT_TRAFFIC": "You used {traffic} GB during your trial.",
+  "TRIAL_DISCOUNT_CTA": "🎁 Subscribe with a discount",
+  "TRIAL_DISCOUNT_ACTIVATED": "🎉 Your {percent}% discount is active!",
+  "TRIAL_DISCOUNT_UNTIL": "Until {deadline}:"
 }

@@ -676,7 +676,7 @@ async def edit_trial_discount_percent(callback: CallbackQuery, state: FSMContext
         'trial_expired_discount',
         'percent',
         'NOTIFY_PROMPT_TRIAL_PERCENT',
-        'Введите процент скидки после триала (0-100):',
+        'Введите процент скидки после триала (1-50):',
     )
 
 
@@ -1757,8 +1757,8 @@ async def process_notification_value_input(message: Message, state: FSMContext):
             await message.answer('❌ Количество дней должно быть не менее 2.')
             return
     elif key == 'trial_expired_discount' and field == 'percent':
-        if value < 0 or value > 100:
-            await message.answer('❌ Процент скидки должен быть от 0 до 100.')
+        if value < 1 or value > 50:
+            await message.answer('❌ Процент скидки должен быть от 1 до 50.')
             return
     elif key == 'trial_expired_discount' and field == 'hours':
         if value < 1 or value > 168:

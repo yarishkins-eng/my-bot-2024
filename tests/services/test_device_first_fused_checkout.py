@@ -91,7 +91,8 @@ class _Savepoint:
 
 
 def _db_with_user(user):
-    return SimpleNamespace(execute=AsyncMock(side_effect=[ScalarResult(user)]), commit=AsyncMock())
+    # Model the authoritative scalar refresh after the User fence.
+    return SimpleNamespace(execute=AsyncMock(side_effect=[ScalarResult(user)]), commit=AsyncMock(), refresh=AsyncMock())
 
 
 def _patch_options(monkeypatch, options):

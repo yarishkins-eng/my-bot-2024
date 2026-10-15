@@ -23,6 +23,7 @@ from app.services.device_first_checkout_service import (
     TopUpIntentDecision,
     prepare_topup_intent,
     replace_older_topup_intents,
+    topup_intent_of,
     topup_intent_screen_fields,
     topup_intent_screen_view,
 )
@@ -376,7 +377,10 @@ def _topup_intent_response(decision: TopUpIntentDecision) -> TopUpResponse:
     payment = decision.payment
     amount = int(payment.amount_kopeks) if payment is not None else 0
     reusable = decision.status == 'already_paying'
+    own = topup_intent_of(payment) if payment is not None else decision.intent
+    own_fields = {key: own[key] for key in ('promo_offer', 'promo_offer_discount_kopeks') if own and key in own}
     return TopUpResponse(
+        **own_fields,
         payment_id=str(payment.id) if payment is not None else None,
         payment_url=payment.redirect_url if reusable else None,
         amount_kopeks=amount,
@@ -1207,6 +1211,11 @@ async def create_topup(
         amount_rubles=amount_kopeks / 100,
         status='pending',
         expires_at=None,
+        **{
+            key: intent_decision.intent[key]
+            for key in ('promo_offer', 'promo_offer_discount_kopeks')
+            if intent_decision and intent_decision.intent and key in intent_decision.intent
+        },
         intent_status=intent_status,
         intent_reason=intent_reason,
         period_days=intent_decision.period_days if intent_decision else None,

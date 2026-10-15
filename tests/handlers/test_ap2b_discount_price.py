@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.handlers.subscription import promo
+from app.localization.texts import get_texts
 from app.services import monitoring_service as monitoring_module
 from app.services.monitoring_service import monitoring_service
 from app.services.pricing_engine import pricing_engine
@@ -15,7 +16,8 @@ from app.services.pricing_engine import pricing_engine
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('balance', [0, 5000, 14900])
-async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, balance):
+@pytest.mark.parametrize('duration', [None, 24])
+async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, balance, duration):
     user = SimpleNamespace(
         id=7,
         language='ru',
@@ -36,7 +38,7 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
         effect_type='percent_discount',
         discount_percent=10,
         notification_type='trial_expired_discount',
-        extra_data={},
+        extra_data={'active_discount_hours': duration},
         bonus_amount_kopeks=0,
     )
     callback = SimpleNamespace(
@@ -54,8 +56,9 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
     monkeypatch.setattr(monitoring_module.settings, 'PLATEGA_MIN_AMOUNT_KOPEKS', 100)
     quotes = {}
 
-    async def options(actual_db, actual_user):
+    async def options(actual_db, actual_user, *, subscription):
         assert actual_db is db and actual_user is user
+        assert subscription is None  # Explicit read-only context replaces status-normalizing lookup.
         assert saved.await_count == 1 and user.promo_offer_discount_percent == 10
         tariff = SimpleNamespace(
             id=3, device_limit=1, device_price_kopeks=5000, is_daily=False, period_prices={'30': 14900, '90': 39900}
@@ -64,7 +67,27 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
         for days in (30, 90):
             result = await pricing_engine.calculate_tariff_purchase_price(tariff, days, device_limit=1, user=user)
             quotes[days] = result.final_total
-            matrix.append({'period_days': days, 'prices': [{'device_limit': 1, 'price_kopeks': result.final_total}]})
+            matrix.append(
+                {
+                    'period_days': days,
+                    'prices': [
+                        {
+                            'device_limit': 1,
+                            'price_kopeks': result.final_total,
+                            'breakdown': {
+                                'promo_offer_discount_kopeks': result.promo_offer_discount,
+                                'promo_offer': {
+                                    'discount_percent': 10,
+                                    'source': 'trial_expired_discount',
+                                    'expires_at': user.promo_offer_discount_expires_at.isoformat()
+                                    if user.promo_offer_discount_expires_at
+                                    else None,
+                                },
+                            },
+                        }
+                    ],
+                }
+            )
         return {'eligible': True, 'tariff': {'base_device_limit': 1}, 'price_matrix': matrix}
 
     monkeypatch.setattr('app.services.device_first_checkout_service.build_purchase_options', options)
@@ -72,12 +95,15 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
     message = callback.message.answer.await_args.args[0]
     assert quotes == {30: 13400, 90: 35900}
     assert '1 месяц — 134 ₽' in message
-    if balance == 5000:
-        assert 'с вашими 50 ₽ на балансе — доплатить 84 ₽' in message.split('\n')
-    elif balance == 0:
-        assert '3 месяца — 359 ₽' in message
-    else:
-        assert 'спишутся с баланса, доплачивать не нужно.' in message
+    # Owner15.10: claim is the same short answer for every balance; money calculation is still real.
+    assert '3 месяца — 359 ₽' in message
+    assert message.startswith('🎉 Скидка 10% активирована!\n\n')
+    assert message.count('(МСК)') == int(duration is not None)
+    assert message.count('1 месяц') == message.count('134 ₽') == 1
+    assert 'автоматически' not in message and 'баланса' not in message
+    assert (
+        callback.message.answer.await_args.kwargs['reply_markup'].inline_keyboard[0][0].text == '🎁 Оформить со скидкой'
+    )
 
 
 @pytest.mark.asyncio
@@ -103,3 +129,92 @@ async def test_rejected_claim_does_not_ask_for_a_discounted_price(monkeypatch, k
     )
     quote.assert_not_awaited()
     callback.message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_claim_passes_its_existing_subscription_to_price_helper(monkeypatch):
+    from app.handlers.subscription import promo
+
+    existing = SimpleNamespace(id=44, tariff_id=99, is_active=False, is_trial=True)
+    user = SimpleNamespace(
+        id=7,
+        language='ru',
+        balance_kopeks=0,
+        subscription=existing,
+        promo_offer_discount_percent=0,
+        promo_offer_discount_source=None,
+        promo_offer_discount_expires_at=None,
+    )
+    offer = SimpleNamespace(
+        id=77,
+        user_id=7,
+        claimed_at=None,
+        is_active=True,
+        expires_at=datetime.now(UTC) + timedelta(hours=24),
+        effect_type='percent_discount',
+        discount_percent=10,
+        notification_type='trial_expired_discount',
+        extra_data={},
+        bonus_amount_kopeks=0,
+    )
+    callback = SimpleNamespace(
+        data='claim_discount_77',
+        answer=AsyncMock(),
+        message=SimpleNamespace(answer=AsyncMock()),
+    )
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
+    monkeypatch.setattr(promo, 'get_offer_by_id', AsyncMock(return_value=offer))
+    monkeypatch.setattr(promo, 'mark_offer_claimed', AsyncMock())
+    quote = AsyncMock(return_value='')
+    monkeypatch.setattr(monitoring_service, '_trial_price_lines', quote)
+    await promo.claim_discount_offer(callback, user, db)
+    quote.assert_awaited_once_with(db, user, subscription=existing, claim=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('language', ['ru', 'en'])
+@pytest.mark.parametrize('price', ['exception', 'ordinary', 'ineligible'])
+async def test_claim_real_helper_falls_back_without_unconfirmed_price(monkeypatch, language, price):
+    user = SimpleNamespace(id=7, language=language, subscription=None, balance_kopeks=0)
+    offer = SimpleNamespace(
+        id=77,
+        user_id=7,
+        claimed_at=None,
+        is_active=True,
+        expires_at=datetime.now(UTC) + timedelta(hours=24),
+        effect_type='percent_discount',
+        discount_percent=10,
+        notification_type='trial_expired_discount',
+        extra_data={'active_discount_hours': 24},
+        bonus_amount_kopeks=0,
+    )
+    callback = SimpleNamespace(
+        data='claim_discount_77', answer=AsyncMock(), message=SimpleNamespace(answer=AsyncMock())
+    )
+
+    @asynccontextmanager
+    async def nested():
+        yield
+
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock(), begin_nested=nested)
+    monkeypatch.setattr(promo, 'get_offer_by_id', AsyncMock(return_value=offer))
+    monkeypatch.setattr(promo, 'mark_offer_claimed', AsyncMock())
+    options = {
+        'eligible': price != 'ineligible',
+        'tariff': {'base_device_limit': 1},
+        'price_matrix': [
+            {'period_days': 30, 'prices': [{'device_limit': 1, 'price_kopeks': 14900}]},
+        ],
+    }
+    cashier = (
+        AsyncMock(side_effect=RuntimeError('unavailable')) if price == 'exception' else AsyncMock(return_value=options)
+    )
+    monkeypatch.setattr('app.services.device_first_checkout_service.build_purchase_options', cashier)
+    await promo.claim_discount_offer(callback, user, db)
+    body = callback.message.answer.await_args.args[0]
+    texts = get_texts(language)
+    assert body.startswith(texts.t('TRIAL_DISCOUNT_ACTIVATED').format(percent=10) + '\n\n')
+    assert body.endswith(texts.t('TRIAL_DISCOUNT_ANY_SELECTION'))
+    assert body.count('(МСК)' if language == 'ru' else '(MSK)') == 1
+    assert body.count('10%') == 1 and '149' not in body and '₽' not in body
+    assert '{' not in body

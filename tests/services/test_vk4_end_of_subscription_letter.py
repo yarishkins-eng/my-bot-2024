@@ -334,8 +334,8 @@ async def test_team_with_a_trial_flag_gets_the_paid_letter_without_top_up_button
         ),  # 49 + 100 = 149: рубли вниз, доплата кассы
         (1490, '1 месяц — 149 ₽\nс вашими 14 ₽ на балансе — доплатить 135 ₽'),
         (14899, '1 месяц — 149 ₽\nс вашими 148 ₽ на балансе — доплатить 1 ₽'),
-        (14900, '1 месяц — 149 ₽\nНа балансе хватает на месяц. 149 ₽ спишутся с баланса, доплачивать не нужно.'),
-        (60000, '1 месяц — 149 ₽\nНа балансе хватает на месяц. 149 ₽ спишутся с баланса, доплачивать не нужно.'),
+        (14900, '1 месяц — 149 ₽ с баланса, доплачивать не нужно.'),
+        (60000, '1 месяц — 149 ₽ с баланса, доплачивать не нужно.'),
     ],
 )
 async def test_price_lines_come_from_the_cashier(env, db, balance, expected) -> None:
@@ -983,7 +983,7 @@ async def test_discount_price_lines_match_the_cashier_engine_with_ruble_discount
         assert device_first_top_up_kopeks(price_kopeks=cells[(30, 1)], balance_kopeks=balance) == 8400
         assert 'с вашими 50 ₽ на балансе — доплатить 84 ₽' in lines.split('\n')
     else:
-        assert '134 ₽ спишутся с баланса, доплачивать не нужно.' in lines
+        assert '1 месяц — 134 ₽ с баланса, доплачивать не нужно.' in lines
 
 
 @pytest.mark.asyncio

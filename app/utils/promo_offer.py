@@ -22,6 +22,10 @@ def _escape_format_braces(text: str) -> str:
 def get_user_active_promo_discount_percent(user: User | None) -> int:
     if not user:
         return 0
+    if getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount' and getattr(
+        user, 'has_had_paid_subscription', False
+    ):
+        return 0
 
     try:
         percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0)
@@ -33,6 +37,24 @@ def get_user_active_promo_discount_percent(user: User | None) -> int:
         return 0
 
     return max(0, min(100, percent))
+
+
+class PromoPricingUser:
+    """Ephemeral price-only view; never changes ORM state or public offer dates."""
+
+    def __init__(self, user: User, *, percent: int, expires_at: datetime | None):
+        self._user = user
+        self.promo_offer_discount_percent = percent
+        self.promo_offer_discount_expires_at = expires_at
+
+    def __getattr__(self, name):
+        return getattr(self._user, name)
+
+
+def without_trial_ending_promo(user: User) -> User | PromoPricingUser:
+    if getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount':
+        return PromoPricingUser(user, percent=0, expires_at=None)
+    return user
 
 
 async def consume_user_promo_offer(db: AsyncSession, user_id: int) -> bool:

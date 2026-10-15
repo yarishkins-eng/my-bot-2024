@@ -40,7 +40,6 @@ from app.database.crud.subscription import (
 )
 from app.database.crud.tariff import get_trial_tariff
 from app.database.crud.user import (
-    cleanup_expired_promo_offer_discounts,
     get_inactive_users,
     get_user_by_id,
     subtract_user_balance,
@@ -267,14 +266,9 @@ SUBSCRIPTION_EXPIRED_TEXT = """
 """
 
 TRIAL_ENDING_TEXT = """
-🎁 <b>Тестовая подписка{tariff_label} скоро закончится!</b>
+🎁 <b>Пробный период{tariff_label} закончится через {hours_text}.</b>
 
-Ваша тестовая подписка истекает через {hours_text}.
-
-💎 <b>Не хотите остаться без VPN?</b>
-Переходите на полную подписку!
-
-⚡️ Успейте оформить до окончания тестового периода!
+Чтобы продолжить пользоваться VPN, оформите подписку.
 """
 
 TRIAL_NOT_CONNECTED_TEXT = """
@@ -316,6 +310,81 @@ END_OF_SUBSCRIPTION_MARKS = ('trial_expired', 'subscription_expired')
 def is_quiet_night(moment: datetime | None = None) -> bool:
     """С 00:00 до 07:59 по Москве письмо пробному уходит без звука (решение владельца 07.10.2026)."""
     return (moment or datetime.now(UTC)).astimezone(_MOSCOW).hour < QUIET_NIGHT_END_HOUR
+
+
+class TrialDiscountPriceLines(str):  # noqa: SLOT000 -- str subclasses need a dict for delivery metadata.
+    offer_id: int | None = None
+
+
+def format_trial_discount_lines(
+    options: dict, user: User, texts, lifetime_bytes: int | None = None, *, claim: bool = False
+) -> str:
+    from app.services.device_first_checkout_service import device_first_top_up_kopeks
+
+    base = (options.get('tariff') or {}).get('base_device_limit')
+    cells = {
+        row.get('period_days'): cell
+        for row in options.get('price_matrix') or []
+        for cell in row.get('prices') or []
+        if cell.get('device_limit') == base
+    }
+    month = cells.get(30) or {}
+    breakdown = month.get('breakdown') or {}
+    offer = breakdown.get('promo_offer') or {}
+    if not month.get('price_kopeks') or not breakdown.get('promo_offer_discount_kopeks') or not offer:
+        return ''
+    english = texts.language.lower().split('-')[0] == 'en'
+    deadline = offer.get('expires_at')
+    until, deadline_text = '', ''
+    if deadline:
+        end = datetime.fromisoformat(deadline.replace('Z', '+00:00')).astimezone(_MOSCOW)
+        deadline_text = end.strftime('%d.%m.%Y, %H:%M') + (' (MSK)' if english else ' (МСК)')
+        until = (' until ' if english else ' до ') + deadline_text
+    if claim:
+        lines = [texts.t('TRIAL_DISCOUNT_ACTIVATED').format(percent=offer['discount_percent']), '']
+        if deadline_text:
+            lines.append(texts.t('TRIAL_DISCOUNT_UNTIL').format(deadline=deadline_text))
+    else:
+        lines = []
+        if type(lifetime_bytes) is int and lifetime_bytes >= 1024**3:
+            traffic = f'{lifetime_bytes / 1024**3:.1f}'
+            lines.append(
+                texts.t('TRIAL_DISCOUNT_TRAFFIC').format(traffic=traffic if english else traffic.replace('.', ','))
+            )
+        lines.append(texts.t('TRIAL_DISCOUNT_HEADING').format(percent=offer['discount_percent'], until=until))
+
+    def money(amount):
+        return settings.format_price(amount, round_kopeks=False)
+
+    net, balance = month['price_kopeks'], int(user.balance_kopeks or 0)
+    top_up = device_first_top_up_kopeks(price_kopeks=net, balance_kopeks=balance)
+    for days, label in [(30, '1 month' if english else '1 месяц'), (90, '3 months' if english else '3 месяца')]:
+        cell = cells.get(days) or {}
+        net = cell.get('price_kopeks')
+        saving = (cell.get('breakdown') or {}).get('promo_offer_discount_kopeks')
+        if net and saving:
+            line = texts.t('TRIAL_DISCOUNT_PRICE').format(term=label, net=money(net), before=money(net + saving))
+            if days == 30 and not claim:
+                if balance >= net:
+                    line += f' ({texts.t("TRIAL_DISCOUNT_FUNDED")})'
+                elif balance >= 100 and 0 < top_up < net:
+                    line += (
+                        ' ('
+                        + texts.t('TRIAL_DISCOUNT_BALANCE').format(balance=money(net - top_up), top_up=money(top_up))
+                        + ')'
+                    )
+            lines.append(line + ('' if claim else '.'))
+    lines.append(texts.t('TRIAL_DISCOUNT_ANY_SELECTION'))
+    current = options.get('current_subscription') or {}
+    if (
+        not claim
+        and current.get('is_trial') is True
+        and current.get('tariff_id') is not None
+        and current['tariff_id'] != (options.get('tariff') or {}).get('id')
+        and (settings.TARIFF_SWITCH_RESET_FREE_DAYS or not settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID)
+    ):
+        lines.append(texts.t('TRIAL_DISCOUNT_START_NOW'))
+    return '\n'.join(lines)
 
 
 async def is_canonical_trial(db: AsyncSession, subscription: Subscription) -> bool:
@@ -615,7 +684,9 @@ class MonitoringService:
                 if expired_offers:
                     logger.info('🧹 Деактивировано просроченных скидочных предложений', expired_offers=expired_offers)
 
-                expired_active_discounts = await cleanup_expired_promo_offer_discounts(db)
+                from app.services.trial_ending_discount_service import cleanup_expired_discounts_safely
+
+                expired_active_discounts = await cleanup_expired_discounts_safely(db)
                 if expired_active_discounts:
                     logger.info(
                         '🧹 Сброшено активных скидок промо-предложений с истекшим сроком',
@@ -1317,6 +1388,73 @@ class MonitoringService:
         except Exception as e:
             logger.error('Ошибка проверки истекающих подписок', error=e)
 
+    async def prepare_trial_discount(self, db, user, subscription, carrier, *, data=None):
+        from app.services import trial_ending_discount_service as issuer
+        from app.services.user_service import is_test_account
+
+        def skipped(reason):
+            logger.info('trial_ending_discount_skipped', user_id=user.id, reason=reason)
+
+        config = NotificationSettingsService.get_trial_ending_discount_settings()
+        if not config['enabled'] or config['carrier'] != carrier or subscription is None:
+            return skipped('settings_or_subscription')
+        if not (
+            issuer.TRIAL_ENDING_DISCOUNT_ROLLOUT == 'all'
+            or (issuer.TRIAL_ENDING_DISCOUNT_ROLLOUT == 'stands' and is_test_account(user))
+        ):
+            return skipped('rollout')
+        if not issuer._eligible_person(user, user.test_reset_started_at):
+            return skipped('person_ineligible')
+        if not subscription.is_trial or subscription.status not in ('active', 'limited'):
+            return skipped('not_trial')
+        trial = await get_trial_tariff(db)
+        if trial is None or subscription.tariff_id != trial.id:
+            return skipped('not_trial_tariff')
+        # A private session cannot wait on pending writes held by its own caller.
+        if any(isinstance(obj, (User, Subscription)) for obj in getattr(db, 'dirty', ())):
+            return skipped('pending_outer_write')
+        payload = data or {}
+        nested = payload.get('user') if isinstance(payload.get('user'), dict) else {}
+        panel_uuid = payload.get('uuid') or payload.get('userUuid') or nested.get('uuid')
+        if data is None:
+            panel_uuid = subscription.remnawave_uuid
+        if not panel_uuid or panel_uuid != subscription.remnawave_uuid:
+            return skipped('panel_uuid_mismatch')
+        traffic = payload.get('userTraffic') or nested.get('userTraffic')
+        lifetime = traffic.get('lifetimeUsedTrafficBytes') if isinstance(traffic, dict) else None
+        lifetime = lifetime if type(lifetime) is int and lifetime >= 0 else None
+        try:
+            if lifetime is None and config['audience'] == 1:
+                async with asyncio.timeout(3), self.subscription_service.get_api_client() as api:
+                    lifetime = await api.get_user_lifetime_traffic_once(panel_uuid)
+            prepared = await issuer.prepare_trial_ending_discount(
+                user_id=user.id,
+                subscription_id=subscription.id,
+                carrier=carrier,
+                panel_uuid=panel_uuid,
+                panel_end=payload.get('expireAt', subscription.end_date),
+                lifetime_bytes=lifetime,
+                reset_started_at=getattr(user, 'test_reset_started_at', None),
+            )
+            if prepared is not None:
+                await db.refresh(
+                    user,
+                    attribute_names=[
+                        'promo_offer_discount_percent',
+                        'promo_offer_discount_source',
+                        'promo_offer_discount_expires_at',
+                    ],
+                )
+            return prepared
+        except Exception as error:
+            logger.info(
+                'trial_ending_discount_skipped',
+                user_id=user.id,
+                reason='preparation_failed',
+                error=type(error).__name__,
+            )
+            return None
+
     async def _check_trial_expiring_soon(self, db: AsyncSession):
         if not NotificationSettingsService.is_enabled('trial_2h'):
             return
@@ -1352,29 +1490,114 @@ class MonitoringService:
 
             sent_count = 0
             for subscription in trial_expiring:
-                user = subscription.user
-                if not user:
-                    continue
+                try:
+                    user = subscription.user
+                    if not user:
+                        continue
 
-                if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
-                    continue
+                    if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
+                        continue
 
-                if self.bot:
-                    success = await self._send_trial_ending_notification(
-                        user,
-                        subscription,
-                        warn_hours,
-                        price_lines=await self._trial_price_lines(
-                            db, user, language=(user.language or settings.DEFAULT_LANGUAGE).lower().split('-')[0]
-                        ),
-                    )
-                    if success:
-                        await record_notification(db, user.id, subscription.id, 'trial_2h')
-                        sent_count += 1
-                        logger.info(
-                            '🎁 Пользователю отправлено предупреждение о конце пробного',
-                            telegram_id=user.telegram_id,
+                    if self.bot:
+                        binding = (
+                            subscription.end_date,
+                            getattr(subscription, 'remnawave_uuid', None),
+                            getattr(user, 'test_reset_started_at', None),
                         )
+                        prepared = await self.prepare_trial_discount(db, user, subscription, 0)
+                        if (
+                            prepared is not None
+                            or getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount'
+                        ):
+                            from app.services.device_first_checkout_service import _subscription_identity
+                            from app.services.trial_ending_discount_service import validate_prepared
+
+                            await db.scalar(select(User.id).where(User.id == user.id).with_for_update())
+                            await db.refresh(
+                                user,
+                                attribute_names=[
+                                    'test_reset_started_at',
+                                    'test_reset_state',
+                                    'has_had_paid_subscription',
+                                    'status',
+                                    'telegram_id',
+                                    'restriction_subscription',
+                                    'account_erasure_requested_at',
+                                    'account_erased_at',
+                                    'promo_offer_discount_percent',
+                                    'promo_offer_discount_source',
+                                    'promo_offer_discount_expires_at',
+                                ],
+                            )
+                            await db.refresh(
+                                subscription,
+                                attribute_names=[
+                                    'end_date',
+                                    'status',
+                                    'is_trial',
+                                    'tariff_id',
+                                    'remnawave_uuid',
+                                ],
+                            )
+                            fresh_binding = (
+                                subscription.end_date,
+                                getattr(subscription, 'remnawave_uuid', None),
+                                user.test_reset_started_at,
+                            )
+                            if (
+                                fresh_binding != binding
+                                or user.has_had_paid_subscription
+                                or user.test_reset_state in ('resetting', 'failed')
+                                or user.restriction_subscription
+                                or user.account_erasure_requested_at is not None
+                                or user.account_erased_at is not None
+                                or not subscription.is_trial
+                                or subscription.tariff_id != trial_tariff.id
+                                or subscription.status not in ('active', 'limited')
+                                or user.status != 'active'
+                            ):
+                                continue
+                            if prepared is not None and not validate_prepared(prepared, user, subscription):
+                                continue
+                            current = await _subscription_identity(db, user.id)
+                            if current is None or current['id'] != subscription.id:
+                                continue
+                            if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
+                                continue
+                        price_lines = await self._trial_price_lines(
+                            db,
+                            user,
+                            language=(user.language or settings.DEFAULT_LANGUAGE).lower().split('-')[0],
+                            subscription=subscription,
+                            lifetime_bytes=getattr(prepared, 'lifetime_bytes', None),
+                        )
+                        success = await self._send_trial_ending_notification(
+                            user,
+                            subscription,
+                            warn_hours,
+                            price_lines=price_lines,
+                        )
+                        if success:
+                            if getattr(price_lines, 'offer_id', None):
+                                from app.services.trial_ending_discount_service import mark_trial_discount_delivered
+
+                                await mark_trial_discount_delivered(db, offer_id=price_lines.offer_id, user_id=user.id)
+                            await record_notification(db, user.id, subscription.id, 'trial_2h')
+                            sent_count += 1
+                            logger.info(
+                                '🎁 Пользователю отправлено предупреждение о конце пробного',
+                                telegram_id=user.telegram_id,
+                            )
+
+                except Exception as error:
+                    logger.warning(
+                        'Trial ending letter failed; continuing next user',
+                        subscription_id=subscription.id,
+                        error=type(error).__name__,
+                    )
+                finally:
+                    # Release this user lock on every skip, failed send and successful send.
+                    await db.commit()
 
             if sent_count:
                 await self._log_monitoring_event(
@@ -2704,7 +2927,9 @@ class MonitoringService:
 
         if trial:
             delivered = await self._send_trial_expired_notification(
-                user, price_lines=await self._trial_price_lines(db, user), silent=is_quiet_night()
+                user,
+                price_lines=await self._trial_price_lines(db, user, subscription=subscription),
+                silent=is_quiet_night(),
             )
         else:
             delivered = await self._send_subscription_expired_notification(user, subscription, tariff_name=tariff_name)
@@ -2746,7 +2971,15 @@ class MonitoringService:
         return found is not None
 
     async def handle_trial_expiring(
-        self, db: AsyncSession, user: User, subscription: Subscription, *, hours: int, bot, panel_expire_at=None
+        self,
+        db: AsyncSession,
+        user: User,
+        subscription: Subscription,
+        *,
+        hours: int,
+        bot,
+        panel_expire_at=None,
+        prepared_discount=None,
     ) -> bool:
         """True означает, что пробный обработан: даже при выключении письмо панели не возвращается."""
         if not await is_canonical_trial(db, subscription):
@@ -2799,7 +3032,12 @@ class MonitoringService:
             return skipped('already_sent')
         try:
             texts = get_texts(user.language)
-            price_lines = await self._trial_price_lines(db, user)
+            price_lines = await self._trial_price_lines(
+                db,
+                user,
+                subscription=subscription,
+                lifetime_bytes=getattr(prepared_discount, 'lifetime_bytes', None),
+            )
             message = texts.get(text_key).format(price_lines=price_lines).strip()
             from aiogram.types import InlineKeyboardMarkup
 
@@ -2807,7 +3045,11 @@ class MonitoringService:
                 inline_keyboard=[
                     [
                         build_miniapp_or_callback_button(
-                            text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
+                            text=(
+                                texts.t('TRIAL_DISCOUNT_CTA')
+                                if isinstance(price_lines, TrialDiscountPriceLines)
+                                else texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку')
+                            ),
                             callback_data='menu_buy',
                             cabinet_path='/subscription/purchase',
                         )
@@ -2825,6 +3067,10 @@ class MonitoringService:
             )
             if not delivered:
                 return skipped('not_delivered')
+            if getattr(price_lines, 'offer_id', None):
+                from app.services.trial_ending_discount_service import mark_trial_discount_delivered
+
+                await mark_trial_discount_delivered(db, offer_id=price_lines.offer_id, user_id=user.id)
             await clear_notification_by_type(db, subscription.id, key, commit=False)
             if hours == 48:
                 await record_notification(db, user.id, subscription.id, 'trial_expiring_48h')
@@ -2837,7 +3083,16 @@ class MonitoringService:
             )
         return True
 
-    async def _trial_price_lines(self, db: AsyncSession, user: User, *, language: str | None = None) -> str:
+    async def _trial_price_lines(
+        self,
+        db: AsyncSession,
+        user: User,
+        *,
+        language: str | None = None,
+        subscription: Subscription | None = None,
+        lifetime_bytes: int | None = None,
+        claim: bool = False,
+    ) -> str:
         """Строки цены в письме о конце пробного (решение владельца 07.10.2026) — из кассы этого человека.
 
         Цены те же, что он увидит, нажав «Оформить подписку»: ячейки 1 и 3 месяца на базовое число устройств из
@@ -2849,7 +3104,27 @@ class MonitoringService:
         try:
             # Точка сохранения: сбой запроса внутри кассы не должен сломать транзакцию — следом пишется отметка.
             async with db.begin_nested():
-                options = await build_purchase_options(db, user)
+                options = await build_purchase_options(db, user, subscription=subscription)
+                texts = get_texts(language or user.language)
+                discount_lines = format_trial_discount_lines(options, user, texts, lifetime_bytes, claim=claim)
+                if discount_lines:
+                    lines = TrialDiscountPriceLines(discount_lines)
+                    if getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount':
+                        from app.database.models import DiscountOffer
+
+                        lines.offer_id = await db.scalar(
+                            select(DiscountOffer.id)
+                            .where(
+                                DiscountOffer.user_id == user.id,
+                                DiscountOffer.notification_type == 'trial_ending_discount',
+                                DiscountOffer.discount_percent == user.promo_offer_discount_percent,
+                                DiscountOffer.expires_at == user.promo_offer_discount_expires_at,
+                            )
+                            .limit(1)
+                        )
+                    return lines
+            if claim:
+                return ''
             base = (options.get('tariff') or {}).get('base_device_limit')
             prices = {
                 row.get('period_days'): cell.get('price_kopeks')
@@ -2865,8 +3140,7 @@ class MonitoringService:
                 if balance >= month:
                     return texts.t(
                         'TRIAL_EXPIRED_PRICE_LINES_FUNDED',
-                        '1 месяц — {month_price}\nНа балансе хватает на месяц. '
-                        '{month_price} спишутся с баланса, доплачивать не нужно.',
+                        '1 месяц — {month_price} с баланса, доплачивать не нужно.',
                     ).format(month_price=settings.format_price(month, round_kopeks=False))
                 # Остаток — в целых рублях вниз: «с вашими N ₽» плюс доплата «M ₽» дают цену месяца, а M — ровно то,
                 # что попросит касса. Меньше рубля на балансе или доплата не меньше цены — строки баланса нет (касса
@@ -3045,7 +3319,11 @@ class MonitoringService:
                 inline_keyboard=[
                     [
                         build_miniapp_or_callback_button(
-                            text=texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку'),
+                            text=(
+                                texts.t('TRIAL_DISCOUNT_CTA')
+                                if isinstance(price_lines, TrialDiscountPriceLines)
+                                else texts.t('FUNNEL_SUBSCRIBE_CTA', '💎 Оформить подписку')
+                            ),
                             callback_data='menu_buy',
                             cabinet_path='/subscription/purchase',
                         )
@@ -3241,7 +3519,11 @@ class MonitoringService:
                 inline_keyboard=[
                     [
                         build_miniapp_or_callback_button(
-                            text=texts.get('FUNNEL_SUBSCRIBE_CTA'),
+                            text=(
+                                texts.t('TRIAL_DISCOUNT_CTA')
+                                if isinstance(price_lines, TrialDiscountPriceLines)
+                                else texts.get('FUNNEL_SUBSCRIBE_CTA')
+                            ),
                             callback_data='menu_buy',
                             cabinet_path='/subscription/purchase',
                         )

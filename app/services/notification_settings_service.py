@@ -2,6 +2,7 @@ import json
 import os
 import string
 from copy import deepcopy
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,13 @@ class NotificationSettingsService:
             'discount_percent': 10,
             'valid_hours': 24,
             'trigger_days': 1,
+        },
+        'trial_ending_discount': {
+            'enabled': False,
+            'discount_percent': 20,
+            'carrier': 24,
+            'audience': 1,
+            'post_trial_hours': 6,
         },
         # --- АС-2: выключатели остальным сообщениям ---
         # Умолчание True у всех: появление ключа не должно ничего менять в поведении.
@@ -148,6 +156,9 @@ class NotificationSettingsService:
         changed = False
         for key, defaults in cls._DEFAULTS.items():
             current = cls._data.get(key)
+            if key == 'trial_ending_discount' and key in cls._data:
+                # A partial enabled file must not acquire issuance parameters from defaults.
+                continue
             if not isinstance(current, dict):
                 cls._data[key] = deepcopy(defaults)
                 changed = True
@@ -160,7 +171,7 @@ class NotificationSettingsService:
         return changed
 
     @classmethod
-    def _save(cls) -> bool:
+    def _save(cls, data: dict[str, Any] | None = None) -> bool:
         if cls._readonly:
             logger.error('Refusing to overwrite unreadable notification settings file')
             return False
@@ -169,7 +180,7 @@ class NotificationSettingsService:
             # 🔴 Через временный файл и `os.replace`: обычная запись усекает файл ДО того,
             # как в него что-то легло, и убийство контейнера в этот миг оставляет рваный
             # JSON. С правкой текстов цена такого файла — все письма владельца разом.
-            payload = json.dumps(cls._data, ensure_ascii=False, indent=2)
+            payload = json.dumps(cls._data if data is None else data, ensure_ascii=False, indent=2)
             # Имя уникально: осиротевший от прошлого падения `.tmp` иначе молча
             # блокировал бы все будущие сохранения, и причину было бы неоткуда узнать.
             tmp = cls._storage_path.with_suffix(f'.json.{os.getpid()}.tmp')
@@ -196,6 +207,8 @@ class NotificationSettingsService:
 
     @classmethod
     def _set_field(cls, key: str, field: str, value: Any) -> bool:
+        if key == 'trial_ending_discount':
+            return cls.set_trial_ending_discount_settings(**{field: value})
         cls._load()
         section = cls._get(key)
         section[field] = value
@@ -204,10 +217,14 @@ class NotificationSettingsService:
 
     @classmethod
     def set_enabled(cls, key: str, enabled: bool) -> bool:
+        if key == 'trial_ending_discount':
+            return cls.set_trial_ending_discount_settings(enabled=enabled)
         return cls._set_field(key, 'enabled', bool(enabled))
 
     @classmethod
     def is_enabled(cls, key: str) -> bool:
+        if key == 'trial_ending_discount':
+            return cls.is_trial_ending_discount_enabled()
         return bool(cls._get(key).get('enabled', True))
 
     @classmethod
@@ -336,14 +353,14 @@ class NotificationSettingsService:
     def get_trial_expired_discount_percent(cls) -> int:
         value = cls._get('trial_expired_discount').get('discount_percent', 10)
         try:
-            return max(0, min(100, int(value)))
+            return int(value)
         except (TypeError, ValueError):
             return 10
 
     @classmethod
     def set_trial_expired_discount_percent(cls, percent: int) -> bool:
         try:
-            percent_int = max(0, min(100, int(percent)))
+            percent_int = max(1, min(50, int(percent)))
         except (TypeError, ValueError):
             return False
         return cls._set_field('trial_expired_discount', 'discount_percent', percent_int)
@@ -379,6 +396,93 @@ class NotificationSettingsService:
         except (TypeError, ValueError):
             return False
         return cls._set_field('trial_expired_discount', 'trigger_days', days_int)
+
+    @classmethod
+    def _valid_trial_ending_discount_settings(cls, config: Any) -> bool:
+        if not isinstance(config, dict) or config.keys() != cls._DEFAULTS['trial_ending_discount'].keys():
+            return False
+        if type(config['enabled']) is not bool or any(
+            type(config[field]) is not int for field in ('discount_percent', 'carrier', 'audience', 'post_trial_hours')
+        ):
+            return False
+        if not (
+            1 <= config['discount_percent'] <= 30
+            and config['carrier'] in (0, 24, 48)
+            and config['audience'] in (0, 1)
+            and 1 <= config['post_trial_hours'] <= 48
+        ):
+            return False
+        try:
+            timedelta(hours=config['post_trial_hours'])
+        except OverflowError:
+            return False
+        return True
+
+    @classmethod
+    def get_trial_ending_discount_settings(cls) -> dict[str, Any]:
+        """Return one validated snapshot; corrupt configuration cannot enable issuance."""
+        cls._load()
+        config = cls._data.get('trial_ending_discount')
+        if not cls._valid_trial_ending_discount_settings(config):
+            config = cls._DEFAULTS['trial_ending_discount']
+        return deepcopy(config)
+
+    @classmethod
+    def set_trial_ending_discount_settings(cls, **changes: Any) -> bool:
+        if changes.keys() - cls._DEFAULTS['trial_ending_discount'].keys():
+            return False
+        cls._load()
+        current = cls._data.get('trial_ending_discount', cls._DEFAULTS['trial_ending_discount'])
+        if not isinstance(current, dict):
+            return False
+        config = {**current, **changes}
+        if not cls._valid_trial_ending_discount_settings(config):
+            return False
+        candidate = {**cls._data, 'trial_ending_discount': config}
+        if not cls._save(candidate):
+            return False
+        cls._data = candidate
+        return True
+
+    @classmethod
+    def is_trial_ending_discount_enabled(cls) -> bool:
+        return cls.get_trial_ending_discount_settings()['enabled']
+
+    @classmethod
+    def set_trial_ending_discount_enabled(cls, enabled: bool) -> bool:
+        return cls.set_trial_ending_discount_settings(enabled=enabled)
+
+    @classmethod
+    def get_trial_ending_discount_percent(cls) -> int:
+        return cls.get_trial_ending_discount_settings()['discount_percent']
+
+    @classmethod
+    def set_trial_ending_discount_percent(cls, percent: int) -> bool:
+        return cls.set_trial_ending_discount_settings(discount_percent=percent)
+
+    @classmethod
+    def get_trial_ending_discount_carrier(cls) -> int:
+        return cls.get_trial_ending_discount_settings()['carrier']
+
+    @classmethod
+    def set_trial_ending_discount_carrier(cls, carrier: int) -> bool:
+        return cls.set_trial_ending_discount_settings(carrier=carrier)
+
+    @classmethod
+    def get_trial_ending_discount_audience(cls) -> int:
+        return cls.get_trial_ending_discount_settings()['audience']
+
+    @classmethod
+    def set_trial_ending_discount_audience(cls, audience: int) -> bool:
+        return cls.set_trial_ending_discount_settings(audience=audience)
+
+    @classmethod
+    def get_trial_ending_discount_post_trial_hours(cls) -> int:
+        return cls.get_trial_ending_discount_settings()['post_trial_hours']
+
+    @classmethod
+    def set_trial_ending_discount_post_trial_hours(cls, hours: int) -> bool:
+        return cls.set_trial_ending_discount_settings(post_trial_hours=hours)
 
     @classmethod
     def get_trial_warn_hours(cls) -> int:

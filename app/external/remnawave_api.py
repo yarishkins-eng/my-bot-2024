@@ -652,6 +652,28 @@ class RemnaWaveAPI:
                 return None
             raise
 
+    async def get_user_lifetime_traffic_once(self, uuid: str) -> int | None:
+        """One read-only, redacted traffic GET; no retries or subscription-link enrichment."""
+        try:
+            response = await self._make_request(
+                'GET',
+                f'/api/users/{uuid}',
+                log_endpoint='/api/users/{redacted-traffic-uuid}',
+                redact_error_details=True,
+                log_http_errors_as_warning=True,
+                max_retries=0,
+            )
+        except RemnaWaveAPIError as error:
+            if error.status_code == 404:
+                return None
+            raise
+        raw = response.get('response') if isinstance(response, Mapping) else None
+        if not isinstance(raw, Mapping) or raw.get('uuid') != uuid:
+            return None
+        usage = raw.get('userTraffic')
+        lifetime = usage.get('lifetimeUsedTrafficBytes') if isinstance(usage, Mapping) else None
+        return lifetime if type(lifetime) is int and lifetime >= 0 else None
+
     async def get_user_by_uuid_shadow_once(self, uuid: str) -> dict[str, object] | None:
         """One redacted GET for the rate-limited entitlement shadow.
 
