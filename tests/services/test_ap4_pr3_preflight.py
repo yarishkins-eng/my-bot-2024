@@ -1,5 +1,6 @@
 """Cheap rejection precedes private locks and panel I/O; traffic GET is redacted and one-shot."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -73,3 +74,51 @@ async def test_traffic_transport_is_one_get_without_enrichment(uuid, traffic, ex
         max_retries=0,
     )
     api.enrich_user_with_happ_link.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase', ['client', 'get'])
+async def test_three_second_budget_cancels_client_or_get_and_never_issues(monkeypatch, phase):
+    user, sub = letter_user()
+    entered, cancelled, budgets = [], [], []
+    real_timeout = asyncio.timeout
+
+    def short_budget(seconds):
+        budgets.append(seconds)
+        return real_timeout(0.001)
+
+    async def pending(*_args):
+        entered.append(phase)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(phase)
+
+    api = SimpleNamespace(get_user_lifetime_traffic_once=AsyncMock(side_effect=pending))
+
+    class Client:
+        async def __aenter__(self):
+            if phase == 'client':
+                await pending()
+            return api
+
+        async def __aexit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(m.asyncio, 'timeout', short_budget)
+    monkeypatch.setattr(
+        m.NotificationSettingsService,
+        'get_trial_ending_discount_settings',
+        lambda: {'enabled': True, 'carrier': 24, 'audience': 1},
+    )
+    monkeypatch.setattr(m, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=sub.tariff_id)))
+    issue = AsyncMock()
+    monkeypatch.setattr(issuer, 'prepare_trial_ending_discount', issue)
+    monitor = m.MonitoringService.__new__(m.MonitoringService)
+    monitor.subscription_service = SimpleNamespace(get_api_client=Client)
+    assert (
+        await asyncio.wait_for(monitor.prepare_trial_discount(SimpleNamespace(dirty=set()), user, sub, 24), timeout=1)
+        is None
+    )
+    assert budgets == [3] and entered == cancelled == [phase]
+    issue.assert_not_awaited()
