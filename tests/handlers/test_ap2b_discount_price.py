@@ -54,8 +54,9 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
     monkeypatch.setattr(monitoring_module.settings, 'PLATEGA_MIN_AMOUNT_KOPEKS', 100)
     quotes = {}
 
-    async def options(actual_db, actual_user):
+    async def options(actual_db, actual_user, *, subscription):
         assert actual_db is db and actual_user is user
+        assert subscription is None  # Explicit read-only context replaces status-normalizing lookup.
         assert saved.await_count == 1 and user.promo_offer_discount_percent == 10
         tariff = SimpleNamespace(
             id=3, device_limit=1, device_price_kopeks=5000, is_daily=False, period_prices={'30': 14900, '90': 39900}

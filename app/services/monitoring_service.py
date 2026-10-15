@@ -40,7 +40,6 @@ from app.database.crud.subscription import (
 )
 from app.database.crud.tariff import get_trial_tariff
 from app.database.crud.user import (
-    cleanup_expired_promo_offer_discounts,
     get_inactive_users,
     get_user_by_id,
     subtract_user_balance,
@@ -378,7 +377,6 @@ def format_trial_discount_lines(options: dict, user: User, texts, lifetime_bytes
     return '\n'.join(lines)
 
 
-
 async def is_canonical_trial(db: AsyncSession, subscription: Subscription) -> bool:
     """Пробная ли подписка — по пробному тарифу, а не по одному флагу.
 
@@ -676,7 +674,9 @@ class MonitoringService:
                 if expired_offers:
                     logger.info('🧹 Деактивировано просроченных скидочных предложений', expired_offers=expired_offers)
 
-                expired_active_discounts = await cleanup_expired_promo_offer_discounts(db)
+                from app.services.trial_ending_discount_service import cleanup_expired_discounts_safely
+
+                expired_active_discounts = await cleanup_expired_discounts_safely(db)
                 if expired_active_discounts:
                     logger.info(
                         '🧹 Сброшено активных скидок промо-предложений с истекшим сроком',
@@ -1378,6 +1378,56 @@ class MonitoringService:
         except Exception as e:
             logger.error('Ошибка проверки истекающих подписок', error=e)
 
+    async def prepare_trial_discount(self, db, user, subscription, carrier, *, data=None):
+        from app.services.trial_ending_discount_service import prepare_trial_ending_discount
+
+        config = NotificationSettingsService.get_trial_ending_discount_settings()
+        if not config['enabled'] or config['carrier'] != carrier or subscription is None:
+            return None
+        # A private session cannot wait on pending writes held by its own caller.
+        if any(isinstance(obj, (User, Subscription)) for obj in getattr(db, 'dirty', ())):
+            logger.info('Trial discount skipped', user_id=user.id, reason='pending_outer_write')
+            return None
+        payload = data or {}
+        nested = payload.get('user') if isinstance(payload.get('user'), dict) else {}
+        panel_uuid = payload.get('uuid') or payload.get('userUuid') or nested.get('uuid')
+        if data is None:
+            panel_uuid = subscription.remnawave_uuid
+        if not panel_uuid or panel_uuid != subscription.remnawave_uuid:
+            return None
+        traffic = payload.get('userTraffic') or nested.get('userTraffic')
+        lifetime = traffic.get('lifetimeUsedTrafficBytes') if isinstance(traffic, dict) else None
+        lifetime = lifetime if type(lifetime) is int and lifetime >= 0 else None
+        try:
+            if lifetime is None and config['audience'] == 1:
+                async with self.subscription_service.get_api_client() as api:
+                    panel_user = await api.get_user_by_uuid(panel_uuid)
+                usage = panel_user.user_traffic if panel_user and panel_user.uuid == panel_uuid else None
+                if usage and usage.lifetime_traffic_available:
+                    lifetime = usage.lifetime_used_traffic_bytes
+            prepared = await prepare_trial_ending_discount(
+                user_id=user.id,
+                subscription_id=subscription.id,
+                carrier=carrier,
+                panel_uuid=panel_uuid,
+                panel_end=payload.get('expireAt', subscription.end_date),
+                lifetime_bytes=lifetime,
+                reset_started_at=getattr(user, 'test_reset_started_at', None),
+            )
+            if prepared is not None:
+                await db.refresh(
+                    user,
+                    attribute_names=[
+                        'promo_offer_discount_percent',
+                        'promo_offer_discount_source',
+                        'promo_offer_discount_expires_at',
+                    ],
+                )
+            return prepared
+        except Exception as error:
+            logger.warning('Trial discount skipped', user_id=user.id, reason='preparation_failed', error=error)
+            return None
+
     async def _check_trial_expiring_soon(self, db: AsyncSession):
         if not NotificationSettingsService.is_enabled('trial_2h'):
             return
@@ -1421,15 +1471,85 @@ class MonitoringService:
                     continue
 
                 if self.bot:
+                    binding = (
+                        subscription.end_date,
+                        getattr(subscription, 'remnawave_uuid', None),
+                        getattr(user, 'test_reset_started_at', None),
+                    )
+                    prepared = await self.prepare_trial_discount(db, user, subscription, 0)
+                    if (
+                        prepared is not None
+                        or getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount'
+                    ):
+                        from app.services.trial_ending_discount_service import validate_prepared
+
+                        await db.scalar(select(User.id).where(User.id == user.id).with_for_update())
+                        await db.refresh(
+                            user,
+                            attribute_names=[
+                                'test_reset_started_at',
+                                'test_reset_state',
+                                'has_had_paid_subscription',
+                                'status',
+                                'telegram_id',
+                                'restriction_subscription',
+                                'account_erasure_requested_at',
+                                'account_erased_at',
+                                'promo_offer_discount_percent',
+                                'promo_offer_discount_source',
+                                'promo_offer_discount_expires_at',
+                            ],
+                        )
+                        await db.refresh(
+                            subscription,
+                            attribute_names=[
+                                'end_date',
+                                'status',
+                                'is_trial',
+                                'tariff_id',
+                                'remnawave_uuid',
+                            ],
+                        )
+                        fresh_binding = (
+                            subscription.end_date,
+                            getattr(subscription, 'remnawave_uuid', None),
+                            user.test_reset_started_at,
+                        )
+                        if (
+                            fresh_binding != binding
+                            or user.has_had_paid_subscription
+                            or user.test_reset_state in ('resetting', 'failed')
+                            or user.restriction_subscription
+                            or user.account_erasure_requested_at is not None
+                            or user.account_erased_at is not None
+                            or not subscription.is_trial
+                            or subscription.tariff_id != trial_tariff.id
+                            or subscription.status not in ('active', 'limited')
+                            or user.status != 'active'
+                        ):
+                            continue
+                        if prepared is not None and not validate_prepared(prepared, user, subscription):
+                            continue
+                        if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
+                            continue
+                    price_lines = await self._trial_price_lines(
+                        db,
+                        user,
+                        language=(user.language or settings.DEFAULT_LANGUAGE).lower().split('-')[0],
+                        subscription=subscription,
+                        lifetime_bytes=getattr(prepared, 'lifetime_bytes', None),
+                    )
                     success = await self._send_trial_ending_notification(
                         user,
                         subscription,
                         warn_hours,
-                        price_lines=await self._trial_price_lines(
-                            db, user, language=(user.language or settings.DEFAULT_LANGUAGE).lower().split('-')[0]
-                        ),
+                        price_lines=price_lines,
                     )
                     if success:
+                        if getattr(price_lines, 'offer_id', None):
+                            from app.services.trial_ending_discount_service import mark_trial_discount_delivered
+
+                            await mark_trial_discount_delivered(db, offer_id=price_lines.offer_id, user_id=user.id)
                         await record_notification(db, user.id, subscription.id, 'trial_2h')
                         sent_count += 1
                         logger.info(
@@ -2765,7 +2885,9 @@ class MonitoringService:
 
         if trial:
             delivered = await self._send_trial_expired_notification(
-                user, price_lines=await self._trial_price_lines(db, user), silent=is_quiet_night()
+                user,
+                price_lines=await self._trial_price_lines(db, user, subscription=subscription),
+                silent=is_quiet_night(),
             )
         else:
             delivered = await self._send_subscription_expired_notification(user, subscription, tariff_name=tariff_name)

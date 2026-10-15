@@ -372,10 +372,30 @@ class RemnaWaveWebhookService:
 
         user_id = user.id
         try:
+            prepared_discount = None
+            carrier = {'user.expires_in_48_hours': 48, 'user.expires_in_24_hours': 24}.get(event_name)
+            if event_name == 'user.expiration':
+                meta = data.get('_meta') if isinstance(data.get('_meta'), dict) else {}
+                raw_hours = meta.get('expiration', data.get('expiration'))
+                try:
+                    carrier = {-48: 48, -24: 24}.get(int(raw_hours))
+                except (TypeError, ValueError):
+                    pass
+            if carrier is not None and subscription is not None:
+                from app.services.monitoring_service import monitoring_service
+
+                prepared_discount = await monitoring_service.prepare_trial_discount(
+                    db, user, subscription, carrier, data=data
+                )
+                data = {**data, '_trial_discount_prepared': prepared_discount}
             # Retired test identities must never resolve to a later generation
             # by Telegram ID. This survives worker restart and unregistering a
             # fixture; ordinary users keep the existing webhook contract.
-            if isinstance(getattr(user, 'test_reset_started_at', None), datetime):
+            if (
+                prepared_discount is not None
+                or getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount'
+                or isinstance(getattr(user, 'test_reset_started_at', None), datetime)
+            ):
                 from sqlalchemy import select
 
                 from app.services.account_test_reset_service import reset_is_busy
@@ -397,6 +417,11 @@ class RemnaWaveWebhookService:
                     current.remnawave_uuid,
                 }:
                     return True
+                if prepared_discount is not None:
+                    from app.services.trial_ending_discount_service import validate_prepared
+
+                    if not validate_prepared(prepared_discount, user, subscription):
+                        return True
             await handler(db, user, subscription, data)
             return True
         except (StaleDataError, PendingRollbackError):
@@ -1694,7 +1719,13 @@ class RemnaWaveWebhookService:
         from app.services.monitoring_service import monitoring_service
 
         trial_handled = await monitoring_service.handle_trial_expiring(
-            db, user, subscription, hours=48, bot=self.bot, panel_expire_at=data.get('expireAt')
+            db,
+            user,
+            subscription,
+            hours=48,
+            bot=self.bot,
+            panel_expire_at=data.get('expireAt'),
+            prepared_discount=data.get('_trial_discount_prepared'),
         )
         if await self._skip_panel_expiration(db, subscription, -48, trial_handled=trial_handled):
             return
@@ -1714,7 +1745,13 @@ class RemnaWaveWebhookService:
         from app.services.monitoring_service import monitoring_service
 
         trial_handled = await monitoring_service.handle_trial_expiring(
-            db, user, subscription, hours=24, bot=self.bot, panel_expire_at=data.get('expireAt')
+            db,
+            user,
+            subscription,
+            hours=24,
+            bot=self.bot,
+            panel_expire_at=data.get('expireAt'),
+            prepared_discount=data.get('_trial_discount_prepared'),
         )
         if await self._skip_panel_expiration(db, subscription, -24, trial_handled=trial_handled):
             return
@@ -1786,7 +1823,13 @@ class RemnaWaveWebhookService:
             from app.services.monitoring_service import monitoring_service
 
             trial_handled = await monitoring_service.handle_trial_expiring(
-                db, user, subscription, hours=-hours, bot=self.bot, panel_expire_at=data.get('expireAt')
+                db,
+                user,
+                subscription,
+                hours=-hours,
+                bot=self.bot,
+                panel_expire_at=data.get('expireAt'),
+                prepared_discount=data.get('_trial_discount_prepared'),
             )
 
         if await self._skip_panel_expiration(db, subscription, hours, trial_handled=trial_handled):
