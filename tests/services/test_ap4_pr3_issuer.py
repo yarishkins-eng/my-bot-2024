@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -173,6 +173,37 @@ async def test_unknown_or_unused_panel_evidence_never_enters_transaction(setup, 
     args['lifetime_bytes'] = value
     assert await service.prepare_trial_ending_discount(**args) is None
     assert db.queries == [] and db.offers == []
+
+
+@pytest.mark.parametrize(
+    'gate,reason',
+    [
+        ('traffic', 'unknown_or_unused_panel_traffic'),
+        ('rollout', 'rollout'),
+        ('paid', 'person_ineligible'),
+        ('current', 'not_current_subscription'),
+        ('offer', 'personal_offer_exists'),
+        ('sent', 'carrier_already_sent'),
+    ],
+)
+async def test_each_rejection_has_exactly_one_info_reason(setup, monkeypatch, gate, reason):
+    db, _config, args, _seen = setup
+    if gate == 'traffic':
+        args['lifetime_bytes'] = None
+    if gate == 'rollout':
+        monkeypatch.setattr(service, 'TRIAL_ENDING_DISCOUNT_ROLLOUT', 'off')
+    if gate == 'paid':
+        db.user.has_had_paid_subscription = True
+    if gate == 'current':
+        db.current_id = 99
+    if gate == 'offer':
+        db.user.promo_offer_discount_percent = 10
+    if gate == 'sent':
+        db.sent_id = 1
+    log = Mock()
+    monkeypatch.setattr(service.logger, 'info', log)
+    assert await service.prepare_trial_ending_discount(**args) is None
+    log.assert_called_once_with('trial_ending_discount_skipped', user_id=args['user_id'], reason=reason)
 
 
 @pytest.mark.parametrize(

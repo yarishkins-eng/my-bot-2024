@@ -117,16 +117,20 @@ async def prepare_trial_ending_discount(
     *, user_id, subscription_id, carrier, panel_uuid, panel_end, lifetime_bytes, reset_started_at
 ) -> TrialEndingDiscountResult | None:
     """Call before the outer lifecycle User lock; all HTTP evidence is already bound to this UUID."""
-    if type(carrier) is not int or carrier not in (0, 24, 48) or not isinstance(panel_uuid, str) or not panel_uuid:
+
+    def skipped(reason):
+        logger.info('trial_ending_discount_skipped', user_id=user_id, reason=reason)
         return None
+
+    if type(carrier) is not int or carrier not in (0, 24, 48) or not isinstance(panel_uuid, str) or not panel_uuid:
+        return skipped('invalid_carrier_or_uuid')
     panel_end = _aware_time(panel_end)
     snapshot = _settings_snapshot(carrier)
     if panel_end is None or snapshot is None:
-        return None
+        return skipped('invalid_term_or_settings')
     config = dict(snapshot[0])
     if config['audience'] == 1 and (type(lifetime_bytes) is not int or lifetime_bytes < 1_000_000):
-        logger.info('trial_ending_discount_skipped', user_id=user_id, reason='unknown_or_unused_panel_traffic')
-        return None
+        return skipped('unknown_or_unused_panel_traffic')
     try:
         async with AsyncSessionLocal() as db, db.begin():
             user = await db.scalar(
@@ -141,13 +145,15 @@ async def prepare_trial_ending_discount(
             rolled_out = TRIAL_ENDING_DISCOUNT_ROLLOUT == 'all' or (
                 TRIAL_ENDING_DISCOUNT_ROLLOUT == 'stands' and user is not None and is_test_account(user)
             )
-            if not rolled_out or not _eligible_person(user, reset_started_at):
-                return None
+            if not rolled_out:
+                return skipped('rollout')
+            if not _eligible_person(user, reset_started_at):
+                return skipped('person_ineligible')
             subscription = await db.scalar(
                 select(Subscription).where(Subscription.id == subscription_id).with_for_update()
             )
             if subscription is None or abs((subscription.end_date - panel_end).total_seconds()) > 1:
-                return None
+                return skipped('different_term')
             current_id = await db.scalar(
                 select(Subscription.id)
                 .where(Subscription.user_id == user_id)
@@ -159,7 +165,7 @@ async def prepare_trial_ending_discount(
                 .limit(1)
             )
             if current_id != subscription_id:
-                return None
+                return skipped('not_current_subscription')
             panel_end = subscription.end_date  # Freeze the precise local term, not the panel's rounded timestamp.
             trial = await get_trial_tariff(db)
             if (
@@ -168,12 +174,12 @@ async def prepare_trial_ending_discount(
                 or subscription.tariff_id != trial.id
                 or not _event_window(panel_end, carrier, snapshot[1])
             ):
-                return None
+                return skipped('trial_or_window_mismatch')
             now = datetime.now(UTC)
             if user.promo_offer_discount_percent > 0 and (
                 user.promo_offer_discount_expires_at is None or user.promo_offer_discount_expires_at > now
             ):
-                return None
+                return skipped('personal_offer_exists')
             if await db.scalar(
                 select(DiscountOffer.id)
                 .where(
@@ -181,7 +187,7 @@ async def prepare_trial_ending_discount(
                 )
                 .limit(1)
             ):
-                return None
+                return skipped('already_issued')
             if await db.scalar(
                 select(SentNotification.id)
                 .where(
@@ -191,11 +197,11 @@ async def prepare_trial_ending_discount(
                 )
                 .limit(1)
             ):
-                return None
+                return skipped('carrier_already_sent')
             if not _positive_options(await build_purchase_options(db, user, subscription=subscription)):
-                return None
+                return skipped('checkout_ineligible')
             if _settings_snapshot(carrier) != snapshot:
-                return None
+                return skipped('settings_changed')
             expiry = _discount_expiry(panel_end, config['post_trial_hours'])
             previous = tuple(getattr(user, field) for field in _PROMO_FIELDS)
             async with db.begin_nested():
@@ -212,7 +218,7 @@ async def prepare_trial_ending_discount(
                 or _settings_snapshot(carrier) != snapshot
                 or not _event_window(panel_end, carrier, snapshot[1])
             ):
-                return None
+                return skipped('candidate_or_settings_changed')
             offer = DiscountOffer(
                 user_id=user_id,
                 subscription_id=subscription_id,
@@ -252,7 +258,7 @@ async def prepare_trial_ending_discount(
             )
         return result
     except Exception as error:
-        logger.warning('trial_ending_discount_issue_failed', user_id=user_id, error=type(error).__name__)
+        logger.info('trial_ending_discount_skipped', user_id=user_id, reason='issue_failed', error=type(error).__name__)
         return None
 
 
