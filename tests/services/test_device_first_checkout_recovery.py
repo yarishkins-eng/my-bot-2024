@@ -145,7 +145,9 @@ def test_missing_settlement_mode_requires_operator_review():
 @pytest.mark.asyncio
 async def test_reversed_direct_attempt_cannot_fulfil_after_operator_review_wins_race():
     """A late success handler must not issue a subscription over an operator hold."""
-    db = SimpleNamespace(scalar=AsyncMock(return_value=7), execute=AsyncMock(return_value=Result(None)))
+    db = SimpleNamespace(
+        refresh=AsyncMock(), scalar=AsyncMock(return_value=7), execute=AsyncMock(return_value=Result(None))
+    )
 
     with pytest.raises(DeviceFirstError) as raised:
         await fulfill_direct_external_checkout(
@@ -170,6 +172,7 @@ async def test_already_fulfilled_direct_sale_is_idempotent_for_later_reconciliat
         fulfillment_state='fulfilled',
     )
     db = SimpleNamespace(
+        refresh=AsyncMock(),
         scalar=AsyncMock(return_value=7),
         # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
         # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
@@ -206,6 +209,7 @@ async def test_paid_pre_release_direct_checkout_is_held_if_a_legacy_trial_is_sti
         terminal_reason=None,
     )
     db = SimpleNamespace(
+        refresh=AsyncMock(),
         scalar=AsyncMock(return_value=7),
         # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
         # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
@@ -248,6 +252,7 @@ async def test_direct_fulfilment_uses_the_same_user_attempt_checkout_lock_order_
         fulfillment_state='fulfilled',
     )
     db = SimpleNamespace(
+        refresh=AsyncMock(),
         scalar=AsyncMock(return_value=7),
         # Четвёртый ответ — поиск прихода в `_kick_direct_referral_post_commit` (РФ-1 п.1.2б).
         # Здесь `_complete_direct_sale_locked` подменён целиком, прихода не существует, побудка
