@@ -1481,6 +1481,7 @@ class MonitoringService:
                         prepared is not None
                         or getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount'
                     ):
+                        from app.services.device_first_checkout_service import _subscription_identity
                         from app.services.trial_ending_discount_service import validate_prepared
 
                         await db.scalar(select(User.id).where(User.id == user.id).with_for_update())
@@ -1529,6 +1530,9 @@ class MonitoringService:
                         ):
                             continue
                         if prepared is not None and not validate_prepared(prepared, user, subscription):
+                            continue
+                        current = await _subscription_identity(db, user.id)
+                        if current is None or current['id'] != subscription.id:
                             continue
                         if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
                             continue

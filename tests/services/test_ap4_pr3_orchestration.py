@@ -97,7 +97,7 @@ async def test_payload_reader_is_strict_and_bound_before_network(monkeypatch, ra
     api.get_user_by_uuid.assert_not_awaited()
 
 
-@pytest.mark.parametrize('change', ['none', 'reset', 'sale', 'term', 'uuid'])
+@pytest.mark.parametrize('change', ['none', 'reset', 'sale', 'term', 'uuid', 'primary'])
 async def test_previous_issue_does_not_bypass_fresh_polling_fence(monkeypatch, change):
     from tests.services.test_ap7_trial_letters_by_tariff import TRIAL_ID, _SelectionDB, _subscription
 
@@ -123,6 +123,10 @@ async def test_previous_issue_does_not_bypass_fresh_polling_fence(monkeypatch, c
     monitor.prepare_trial_discount = AsyncMock(return_value=None)
     monitor._trial_price_lines = AsyncMock(return_value=module.TrialDiscountPriceLines('STALE 20%'))
     monitor._send_trial_ending_notification = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        'app.services.device_first_checkout_service._subscription_identity',
+        AsyncMock(return_value={'id': sub.id + int(change == 'primary')}),
+    )
 
     async def refresh(obj, **kwargs):
         if obj is user:
