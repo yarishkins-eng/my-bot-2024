@@ -46,14 +46,15 @@ async def test_issue_before_reset_lock_and_revalidate(monkeypatch, event, hours,
 
     async def handler(*args):
         trace.append('send')
-        assert args[3]['_trial_discount_prepared'] is prepared
+        assert args[3]['_trial_discount_prepared'] is (prepared if valid else None)
 
     service = webhook.RemnaWaveWebhookService(bot=None)
     service._resolve_user_and_subscription = AsyncMock(return_value=(user, sub))
     monkeypatch.setattr(module.monitoring_service, 'prepare_trial_discount', prepare)
     monkeypatch.setattr(issuer, 'validate_prepared', lambda *args: valid)
     assert await service._process_user_event(SimpleNamespace(scalar=lock), event, {'uuid': 'fresh', **data}, handler)
-    assert trace == ['issue-commit', 'outer-user-lock'] + (['send'] if valid else [])
+    # An invalid discount proof falls back to the ordinary letter; reset/retired fences remain above it.
+    assert trace == ['issue-commit', 'outer-user-lock', 'send']
 
 
 @pytest.mark.parametrize('raw', [None, True, -1, '1000000', 1.0, 1_000_000])

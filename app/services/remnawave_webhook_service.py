@@ -421,7 +421,7 @@ class RemnaWaveWebhookService:
                     from app.services.trial_ending_discount_service import validate_prepared
 
                     if not validate_prepared(prepared_discount, user, subscription):
-                        return True
+                        data = {**data, '_trial_discount_prepared': None}
             await handler(db, user, subscription, data)
             return True
         except (StaleDataError, PendingRollbackError):
