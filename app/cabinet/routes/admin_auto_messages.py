@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta
-from statistics import median
 from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -33,7 +32,7 @@ from zoneinfo import ZoneInfo
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_serializer
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import (
@@ -120,9 +119,9 @@ FIELD_TITLES: dict[str, str] = {
     'valid_hours': 'Сколько действует',
     'trigger_days': 'Через сколько дней',
     'not_connected_after_hours': 'Через сколько часов после начала',
-    'carrier': 'Письмо со скидкой',
+    'carrier': 'В каком письме',
     'audience': 'Кому',
-    'post_trial_hours': 'После конца пробного',
+    'post_trial_hours': 'Скидка действует после пробного',
 }
 
 
@@ -297,10 +296,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'sent_type': 'trial_expiring_48h',
         'quiet_check': 'trial_warning_available',
         'stops_reminder': True,
-        'warning': 'Если выключить, этого предупреждения не будет, письмо панели его не заменит. '
-        'Остальные письма пробного управляются отдельно. Цена из кассы на момент отправки; '
-        'если касса не назвала цену, письмо уйдёт без неё. Отправки считаются отметками текущего срока; '
-        'покупка стирает отметки. Пропущенные события при включении не рассылаются заново.',
+        'warning': 'Если выключить, предупреждения за 2 дня не будет — панель его не заменит. Пропущенные письма потом не досылаются.',
         'buttons': [{'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False}],
     },
     {
@@ -314,10 +310,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'sent_type': 'trial_expiring_24h',
         'quiet_check': 'trial_warning_available',
         'stops_reminder': True,
-        'warning': 'Если выключить, предупреждения за день не будет, письмо панели его не заменит. '
-        'Письмо за 2 дня и письмо о конце управляются отдельно. Цена из кассы на момент отправки; '
-        'если касса не назвала цену, письмо уйдёт без неё. Отправки считаются отметками текущего срока; '
-        'покупка стирает отметки. Пропущенные события при включении не рассылаются заново.',
+        'warning': 'Если выключить, предупреждения за день не будет — панель его не заменит. Пропущенные письма потом не досылаются.',
         'buttons': [{'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False}],
     },
     {
@@ -351,12 +344,11 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'id': 'trial-ending-discount',
         'group': 'trial',
         'title': 'Скидка до конца пробного',
-        'when': 'Дополняет выбранное письмо о конце пробного. Превью — в его карточке.',
+        'when': 'Приходит в письме «{carrier_title}».',
         'control': 'toggle',
         'settings_key': 'trial_ending_discount',
         'params': ('discount_percent', 'carrier', 'audience', 'post_trial_hours'),
-        'quiet_check': 'trial_ending_available',
-        'warning': 'Выключение остановит новые выдачи. Уже созданная доплата со скидкой сохранится.',
+        'warning': 'Если выключить — скидку перестанут выдавать.',
         'buttons': [{'label': '🎁 Оформить со скидкой', 'target': 'Кабинет, касса', 'tracked': False}],
     },
     {
@@ -370,11 +362,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'sent_type': 'trial_expired_discount',
         'quiet_check': 'trial_tariff_marked',
         'claim_type': 'trial_expired_discount',
-        'warning': (
-            'Если выключить, пробному через сутки после конца бот ничего не напомнит: письмо панели «Подписка '
-            'истекла вчера» пробным больше не пересылается. Цена появится в ответе после «Получить скидку». '
-            'Кнопка «Оформить подписку» сама скидку пока не включает.'
-        ),
+        'warning': 'Если выключить, через сутки после конца пробного клиенту ничего не придёт.',
         'buttons': [
             {'label': '🎁 Получить скидку', 'target': 'Выдаёт скидку', 'tracked': True},
             {'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
@@ -1006,6 +994,8 @@ def _resolve_when(entry: dict[str, Any], params: dict[str, int] | None) -> str:
     то враньё, за которое владелец и зацепился.
     """
     when = entry['when']
+    if '{carrier_title}' in when:
+        when = when.replace('{carrier_title}', CATALOG_BY_ID[_discount_context()['carrier_id']]['title'])
     values = params or {}
     if '{trigger_days}' in when:
         days = values.get('trigger_days')
@@ -1037,15 +1027,15 @@ def _state_of(
     if _is_enabled(entry) is False:
         return 'quiet', 'выключено в этом разделе', None
     if entry['id'] == 'trial-ending-discount':
-        carrier = _discount_context()['carrier_id']
+        context = _discount_context()
+        carrier = context['carrier_id']
         state, reason, _ = _state_of(CATALOG_BY_ID[carrier], reasons, notes)
         if state == 'quiet':
-            return 'quiet', f'письмо-носитель молчит: {reason}', None
+            action = 'выключено' if not _is_enabled(CATALOG_BY_ID[carrier]) else 'молчит'
+            return 'quiet', f'{action} письмо «{CATALOG_BY_ID[carrier]["title"]}»', None
         if not NotificationSettingsService.are_notifications_globally_enabled():
             return 'quiet', 'уведомления выключены в настройках бота', None
-        if reasons.get('trial_ending_available'):
-            return 'quiet', reasons['trial_ending_available'], None
-        return 'live', None, 'выдача только тестовым стендам'
+        return 'live', None, context['rollout_note']
     if not NotificationSettingsService.are_notifications_globally_enabled() and entry['id'] in GLOBALLY_SWITCHED_IDS:
         return 'quiet', 'выключено общим переключателем в настройках бота', None
     check = entry.get('quiet_check')
@@ -1135,12 +1125,15 @@ def _choices_for(entry: dict[str, Any]) -> dict[str, list[dict[str, Any]]] | Non
 
 
 def _discount_context() -> dict[str, Any]:
+    from app.services.trial_ending_discount_service import TRIAL_ENDING_DISCOUNT_ROLLOUT
+
     config = NotificationSettingsService.get_trial_ending_discount_settings()
     return {
         'carrier_id': {0: 'trial-2h', 24: 'trial-1d', 48: 'trial-2d'}[config['carrier']],
         'percent': config['discount_percent'],
         'enabled': config['enabled'],
         'legacy_enabled': NotificationSettingsService.is_enabled('trial_expired_discount'),
+        'rollout_note': 'Пока только тестовым аккаунтам' if TRIAL_ENDING_DISCOUNT_ROLLOUT == 'stands' else None,
     }
 
 
@@ -1818,7 +1811,9 @@ async def get_auto_message(
         'устроена защита от повторной отправки. Показаны последние 50 отправок.'
     )
     if message_id == 'trial-ending-discount':
-        item.sent_count, history_note, history = await _trial_discount_stats(db)
+        item.sent_count, history_note, history = await _trial_discount_stats(
+            db, may_see_names=await _may_see_names(db, user, request)
+        )
     text_facts = _text_facts(message_id, item.params)
     buttons = [AutoMessageButton(**button) for button in entry.get('buttons', [])]
     context = _discount_context()
@@ -1846,6 +1841,20 @@ async def get_auto_message(
     )
 
 
+async def _may_see_names(db: AsyncSession, viewer: User, request: Request) -> bool:
+    if viewer is None or request is None:
+        return False
+    from app.services.permission_service import PermissionService
+
+    from ..ip_utils import get_client_ip
+
+    try:
+        client_ip = get_client_ip(request)
+    except HTTPException:
+        client_ip = None
+    return (await PermissionService.check_permission(db, viewer, 'users:read', ip_address=client_ip))[0]
+
+
 async def _history_for(
     db: AsyncSession, entry: dict[str, Any], viewer: User, request: Request
 ) -> list[AutoMessageHistoryRow]:
@@ -1858,15 +1867,7 @@ async def _history_for(
     if not sent_type:
         return []
 
-    from app.services.permission_service import PermissionService
-
-    from ..ip_utils import get_client_ip
-
-    try:
-        client_ip = get_client_ip(request)
-    except HTTPException:
-        client_ip = None
-    may_see_names, _ = await PermissionService.check_permission(db, viewer, 'users:read', ip_address=client_ip)
+    may_see_names = await _may_see_names(db, viewer, request)
 
     since = datetime.now(UTC) - timedelta(days=30)
     conditions = [SentNotification.notification_type == sent_type, SentNotification.created_at >= since]
@@ -1932,35 +1933,54 @@ def _has_numeric_change(payload: AutoMessagePatch) -> bool:
     return any(getattr(payload, field, None) is not None for field in _NUMERIC_FIELDS)
 
 
-async def _trial_discount_stats(db: AsyncSession) -> tuple[int, str, list[AutoMessageHistoryRow]]:
+async def _trial_discount_stats(
+    db: AsyncSession, *, may_see_names: bool = False
+) -> tuple[int, str, list[AutoMessageHistoryRow]]:
     from app.cabinet.routes.admin_sales_stats import _owner_rules
     from app.config import settings
+    from app.services.trial_ending_discount_service import TRIAL_ENDING_DISCOUNT_ROLLOUT
+    from app.services.user_service import test_account_telegram_ids
 
     since = NotificationSettingsService.get_trial_ending_discount_stats_since()
     if since is None:
         note = (
             'Дата начала не записана; итог пока недоступен.'
             if NotificationSettingsService.is_trial_ending_discount_enabled()
-            else 'Отсчёт начнётся после первого включения.'
+            else 'Итог появится после первого включения.'
         )
         return 0, note, []
     rules = await _owner_rules(db)
+    stands = TRIAL_ENDING_DISCOUNT_ROLLOUT == 'stands'
+    test_account = case(
+        (User.telegram_id.is_(None), False),
+        (User.telegram_id == 0, False),
+        else_=func.coalesce(User.test_account_enabled, User.telegram_id.in_(tuple(test_account_telegram_ids()))),
+    )
+    people = test_account if stands else rules.people
     now = datetime.now(UTC)
     offers = (
         await db.execute(
-            select(DiscountOffer.user_id, DiscountOffer.created_at, DiscountOffer.extra_data)
+            select(
+                DiscountOffer.user_id,
+                DiscountOffer.created_at,
+                DiscountOffer.extra_data,
+                User.telegram_id,
+                User.username,
+                User.first_name,
+            )
             .join(User, User.id == DiscountOffer.user_id)
             .where(
                 DiscountOffer.notification_type == 'trial_ending_discount',
                 DiscountOffer.created_at >= since,
                 DiscountOffer.created_at <= now,
-                rules.people,
+                people,
+                User.status.is_distinct_from('deleted'),
             )
             .order_by(DiscountOffer.created_at.desc())
         )
     ).all()
     delivered, history = set(), []
-    for user_id, created, extra in offers:
+    for user_id, created, extra, telegram_id, username, first_name in offers:
         try:
             value = (extra if isinstance(extra, dict) else {}).get('delivered_at')
             at = datetime.fromisoformat(value) if isinstance(value, str) else None
@@ -1970,14 +1990,20 @@ async def _trial_discount_stats(db: AsyncSession) -> tuple[int, str, list[AutoMe
             continue
         delivered.add(user_id)
         if at >= now - timedelta(days=30):
-            history.append(AutoMessageHistoryRow(sent_at=at, user_ref=f'Клиент #{user_id}', claimed=None))
+            label = f'@{username}' if username else (first_name or f'id {telegram_id or user_id}')
+            history.append(
+                AutoMessageHistoryRow(
+                    sent_at=at, user_ref=label if may_see_names else f'Клиент #{user_id}', claimed=None
+                )
+            )
     sales = (
         (
             await db.execute(
                 select(SubscriptionCheckout.sale_snapshot)
                 .join(User, User.id == SubscriptionCheckout.user_id)
                 .where(
-                    rules.people,
+                    people,
+                    User.status.is_distinct_from('deleted'),
                     SubscriptionCheckout.fulfilled_at >= since,
                     SubscriptionCheckout.fulfilled_at <= now,
                     SubscriptionCheckout.funding_state == 'funded',
@@ -2004,16 +2030,17 @@ async def _trial_discount_stats(db: AsyncSession) -> tuple[int, str, list[AutoMe
     def money(value):
         return settings.format_price(value, round_kopeks=False)
 
-    zone = ZoneInfo('Europe/Moscow')
-    last = max((row[1] for row in offers), default=None)
-    note = (
-        f'Итог с {since.astimezone(zone):%d.%m.%Y}: получили {len(delivered)} · купили со скидкой {len(totals)} · '
-        f'отдано {money(sum(savings))} · медианный чек {money(int(median(totals))) if totals else "—"}. '
-    )
-    note += f'Последняя выдача: {last.astimezone(zone):%d.%m.%Y %H:%M} (МСК). ' if last else 'Выдач пока не было. '
-    note += 'До скидки из включавших VPN платили около 27 из 100.'
-    if len(delivered) < 30:
-        note += ' Разница может быть случайной.'
+    prefix = 'Тестовые аккаунты' if stands else f'С {since.astimezone(ZoneInfo("Europe/Moscow")):%d.%m.%Y}'
+    note = f'{prefix}: получили {len(delivered)} · купили со скидкой {len(totals)}'
+    if totals:
+        note += f' · заплатили {money(sum(totals))} · скидок на {money(sum(savings))}'
+    note += '.'
+    if not stands:
+        if not delivered and not totals:
+            note = 'Клиенты скидку ещё не получали.'
+        elif NotificationSettingsService.get_trial_ending_discount_audience() == 1:
+            note += ' Раньше из включавших VPN платили около 27 из 100'
+            note += ' — пока данных мало, сравнивать рано.' if len(delivered) < 30 else ', считая покупки без скидки.'
     history.sort(key=lambda row: row.sent_at, reverse=True)
     return len(delivered), note, history[:50]
 
@@ -2021,8 +2048,12 @@ async def _trial_discount_stats(db: AsyncSession) -> tuple[int, str, list[AutoMe
 async def _patch_trial_discount(db: AsyncSession, changes: dict[str, Any]) -> None:
     before = NotificationSettingsService.get_config()['trial_ending_discount']
     candidate = {**before, **changes} if isinstance(before, dict) else {}
+    if type(candidate.get('discount_percent')) is int and not 1 <= candidate['discount_percent'] <= 30:
+        raise HTTPException(422, 'Размер скидки: от 1 до 30%.')
     if not NotificationSettingsService._valid_trial_ending_discount_settings(candidate):
-        raise HTTPException(422, 'Проверьте настройки скидки: процент, письмо, аудиторию и запас после пробного.')
+        raise HTTPException(
+            422, 'Проверьте поля «Размер скидки», «В каком письме», «Кому», «Скидка действует после пробного».'
+        )
     if 'discount_percent' in changes or candidate['enabled']:
         await _assert_discount_is_safe(db, candidate['discount_percent'], max_percent=30)
     if candidate['enabled']:
@@ -2043,7 +2074,12 @@ async def _patch_trial_discount(db: AsyncSession, changes: dict[str, Any]) -> No
 
 async def _discount_item(db: AsyncSession, item: AutoMessageItem, *, with_count: bool = True) -> AutoMessageItem:
     if item.id == 'trial-ending-discount':
-        item.discount_prices, _ = await _discount_examples(db)
+        try:
+            item.discount_prices, _ = await _discount_examples(db)
+        except Exception:
+            logger.warning('auto_message_discount_price_unavailable', exc_info=True)
+            item.discount_prices = {}
+            item.state, item.quiet_reason = 'quiet', 'касса не назвала цену месяца'
         if item.enabled and not item.discount_prices and item.state == 'live':
             item.state, item.quiet_reason = 'quiet', 'касса не назвала цену месяца'
         if with_count:
@@ -2059,11 +2095,11 @@ def _discount_previews(options: dict) -> list[AutoMessageInsertVariant]:
 
     config = NotificationSettingsService.get_trial_ending_discount_settings()
     result = []
-    for balance, used, label in [
-        (0, True, 'Включал VPN, без баланса'),
-        (5000, True, 'Включал VPN, с балансом'),
-        (0, False, 'Не включал VPN'),
-    ]:
+    examples = [(0, True, 'баланса нет'), (5000, True, 'есть баланс')]
+    if config['audience'] == 1:
+        examples = [(balance, used, f'включал VPN и {label}') for balance, used, label in examples]
+        examples.append((0, False, 'не включал VPN'))
+    for balance, used, label in examples:
         person = SimpleNamespace(balance_kopeks=balance)
         sample = deepcopy(options)
         if not used and config['audience'] == 1:

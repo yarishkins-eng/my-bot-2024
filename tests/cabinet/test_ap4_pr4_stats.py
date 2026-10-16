@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from app.cabinet.routes import admin_auto_messages as api, admin_sales_stats as sales
-from app.services import user_service
+from app.services import trial_ending_discount_service as rollout, user_service
 from app.services.notification_settings_service import NotificationSettingsService as Settings
 
 
@@ -30,10 +30,17 @@ class Database:
     async def execute(self, query):
         return self.session.execute(query)
 
-    def user(self, user_id=1, *, status='active', test=False, telegram=None, team=False):
+    def user(self, user_id=1, *, status='active', test=False, telegram=..., team=False, username=None, first_name=None):
         self.session.execute(
-            text('INSERT INTO users VALUES (:id,:tg,:status,:test)'),
-            {'id': user_id, 'tg': telegram or 100000 + user_id, 'status': status, 'test': test},
+            text('INSERT INTO users VALUES (:id,:tg,:status,:test,:username,:first_name)'),
+            {
+                'id': user_id,
+                'tg': 100000 + user_id if telegram is ... else telegram,
+                'status': status,
+                'test': test,
+                'username': username,
+                'first_name': first_name,
+            },
         )
         if team:
             self.session.execute(text('INSERT INTO subscriptions VALUES (:id,:id,4)'), {'id': user_id})
@@ -87,6 +94,8 @@ class Database:
 
 @pytest.fixture
 def db(monkeypatch):
+    monkeypatch.setattr(rollout, 'TRIAL_ENDING_DISCOUNT_ROLLOUT', 'all')
+    monkeypatch.setattr(Settings, 'get_trial_ending_discount_audience', classmethod(lambda _: 1))
     monkeypatch.setattr(Settings, 'get_trial_ending_discount_stats_since', classmethod(lambda _: SINCE))
     monkeypatch.setattr(user_service, 'test_account_telegram_ids', lambda: {777})
     tariffs = [
@@ -98,7 +107,7 @@ def db(monkeypatch):
     engine = create_engine('sqlite://')
     with engine.begin() as connection:
         for ddl in [
-            'CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, status TEXT, test_account_enabled BOOLEAN)',
+            'CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, status TEXT, test_account_enabled BOOLEAN, username TEXT, first_name TEXT)',
             'CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, user_id INTEGER, tariff_id INTEGER)',
             'CREATE TABLE discount_offers (id INTEGER PRIMARY KEY, user_id INTEGER, created_at TIMESTAMP, extra_data JSON, notification_type TEXT)',
             'CREATE TABLE subscription_checkouts (id INTEGER PRIMARY KEY, user_id INTEGER, fulfilled_at TIMESTAMP, funding_state TEXT, fulfillment_state TEXT, lifecycle_state TEXT, sale_snapshot JSON, tariff_id INTEGER)',
@@ -126,8 +135,8 @@ async def test_own_delivered_people_and_successful_orders_are_separate(db):
     db.offer(created=NOW + timedelta(days=1))
     count, note, history = await api._trial_discount_stats(db)
     assert count == 1 and 'получили 1' in note and 'купили со скидкой 2' in note
-    assert 'отдано 110 ₽' in note and 'медианный чек 219 ₽' in note
-    assert '27 из 100' in note and 'Разница может быть случайной.' in note
+    assert 'скидок на 110 ₽' in note and 'заплатили 438 ₽' in note
+    assert '27 из 100' in note and 'пока данных мало, сравнивать рано.' in note
     assert len(history) == 2 and all(row.user_ref == 'Клиент #1' for row in history)
     assert all(row.claimed is None for row in history)
     assert (NOW + timedelta(days=1)).strftime('%d.%m.%Y') not in note
@@ -142,8 +151,8 @@ async def test_test_deleted_and_historical_team_people_do_not_enter_any_total(db
     db.offer()
     db.order()
     count, note, history = await api._trial_discount_stats(db)
-    assert count == 0 and 'получили 0' in note and 'купили со скидкой 0' in note
-    assert 'отдано 0 ₽' in note and history == []
+    assert count == 0 and note == 'Клиенты скидку ещё не получали.'
+    assert note == 'Клиенты скидку ещё не получали.' and history == []
 
 
 @pytest.mark.asyncio
@@ -165,7 +174,7 @@ async def test_only_strict_positive_own_saving_is_money(db, saving):
     db.user()
     db.order(saving=saving)
     _, note, _ = await api._trial_discount_stats(db)
-    assert 'купили со скидкой 0' in note and 'отдано 0 ₽' in note
+    assert note == 'Клиенты скидку ещё не получали.'
 
 
 @pytest.mark.asyncio
@@ -174,7 +183,7 @@ async def test_small_sample_disclaimer_disappears_and_history_stays_bounded(db):
         db.user(user_id)
         db.offer(user_id)
     count, note, history = await api._trial_discount_stats(db)
-    assert count == 51 and 'Разница может быть случайной' not in note
+    assert count == 51 and 'считая покупки без скидки.' in note
     assert len(history) == 50
 
 
@@ -187,8 +196,8 @@ async def test_old_delivery_stays_in_overall_result_but_not_thirty_day_history(d
     db.offer(created=NOW - timedelta(days=45))
     db.order(at=NOW - timedelta(days=45))
     count, note, history = await api._trial_discount_stats(db)
-    assert count == 1 and 'купили со скидкой 1' in note and 'отдано 30 ₽' in note
-    assert note.startswith('Итог с ')
+    assert count == 1 and 'купили со скидкой 1' in note and 'скидок на 30 ₽' in note
+    assert note.startswith('С ')
     assert history == []
 
 

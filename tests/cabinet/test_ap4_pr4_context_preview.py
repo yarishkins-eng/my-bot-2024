@@ -21,19 +21,19 @@ def test_context_is_limited_to_exact_five_cards_and_uses_real_carrier_id(price_e
                 'percent': 20,
                 'enabled': False,
                 'legacy_enabled': False,
+                'rollout_note': 'Пока только тестовым аккаунтам',
             }
     assert found == {'trial-2h', 'trial-2d', 'trial-1d', 'trial-discount', 'trial-ending-discount'}
 
 
-def test_quiet_reasons_follow_discount_then_carrier_then_price(price_env, monkeypatch):
+def test_quiet_reasons_follow_discount_then_carrier(price_env, monkeypatch):
     entry = api.CATALOG_BY_ID['trial-ending-discount']
-    reasons = {'trial_warning_available': 'панель молчит', 'trial_ending_available': 'касса закрыта'}
+    reasons = {'trial_warning_available': 'панель молчит'}
     assert api._state_of(entry, reasons, {})[1] == 'выключено в этом разделе'
     assert Settings.set_trial_ending_discount_enabled(True)
     monkeypatch.setattr(Settings, 'are_notifications_globally_enabled', classmethod(lambda _: True))
-    assert api._state_of(entry, reasons, {})[1] == 'письмо-носитель молчит: панель молчит'
-    assert api._state_of(entry, {'trial_ending_available': 'касса закрыта'}, {})[1] == 'касса закрыта'
-    assert api._state_of(entry, {}, {}) == ('live', None, 'выдача только тестовым стендам')
+    assert api._state_of(entry, reasons, {})[1] == 'молчит письмо «Пробный закончится завтра»'
+    assert api._state_of(entry, {}, {}) == ('live', None, 'Пока только тестовым аккаунтам')
 
 
 @pytest.mark.asyncio
@@ -51,7 +51,10 @@ async def test_previews_use_real_sender_formatters_and_do_not_issue_or_mutate(pr
     assert options == before and Settings.is_trial_ending_discount_enabled() is False
     assert Settings.get_trial_ending_discount_stats_since() is None
     assert Settings.set_trial_ending_discount_audience(0)
-    assert '119 ₽' in api._discount_previews(options)[2].text
+    examples = api._discount_previews(options)
+    assert len(examples) == 2
+    assert [row.when for row in examples] == ['баланса нет', 'есть баланс']
+    assert '119 ₽' in examples[0].text
 
 
 @pytest.mark.asyncio
