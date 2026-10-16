@@ -126,7 +126,20 @@ def test_real_fastapi_list_survives_cashier_failure_and_patch_is_atomic(endpoint
         assert response.status_code == 200 and response.json()['params']['audience'] == 0
         assert response.json()['enabled'] is True
         before = Settings._storage_path.read_bytes()
-        for percent in [0, 31, 100]:
+        for percent in [-1, 0, 31, 100, 101]:
             response = client.patch('/admin/auto-messages/trial-ending-discount', json={'discount_percent': percent})
             assert response.status_code == 422 and response.json()['detail'] == 'Размер скидки: от 1 до 30%.'
         assert Settings._storage_path.read_bytes() == before
+        for percent in [-1, 0, 51, 101]:
+            response = client.patch('/admin/auto-messages/trial-discount', json={'discount_percent': percent})
+            assert response.status_code == 422
+        assert Settings._storage_path.read_bytes() == before
+        monkeypatch.setattr(api, '_history_for', AsyncMock(return_value=[]))
+        assert client.patch('/admin/auto-messages/trial-discount', json={'discount_percent': 50}).status_code == 200
+        for percent in [True, '20', 20.5]:
+            assert (
+                client.patch(
+                    '/admin/auto-messages/trial-ending-discount', json={'discount_percent': percent}
+                ).status_code
+                == 422
+            )

@@ -832,7 +832,7 @@ class AutoMessagePatch(BaseModel):
 
     enabled: bool | None = None
     warn_hours: int | None = Field(default=None, ge=MIN_WARN_HOURS, le=MAX_WARN_HOURS)
-    discount_percent: int | None = Field(default=None, ge=0, le=100, strict=True)
+    discount_percent: int | None = Field(default=None, strict=True)
     valid_hours: int | None = Field(default=None, ge=MIN_VALID_HOURS, le=MAX_VALID_HOURS)
     trigger_days: int | None = Field(default=None, ge=1, le=MAX_TRIGGER_DAYS)
     not_connected_after_hours: int | None = Field(default=None, ge=MIN_NOT_CONNECTED_HOURS, le=MAX_NOT_CONNECTED_HOURS)
