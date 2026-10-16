@@ -101,7 +101,7 @@ def db(monkeypatch):
     tariffs = [
         SimpleNamespace(id=3, is_free=False, is_trial_available=False),
         SimpleNamespace(id=4, is_free=True, is_trial_available=False),
-        SimpleNamespace(id=5, is_free=True, is_trial_available=True),
+        SimpleNamespace(id=5, is_free=False, is_trial_available=True),
     ]
     monkeypatch.setattr(sales, 'get_all_tariffs', AsyncMock(return_value=tariffs))
     engine = create_engine('sqlite://')
