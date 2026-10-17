@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from pydantic import BaseModel, Field, model_serializer
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import (
@@ -39,6 +41,7 @@ from app.database.models import (
     PromoGroup,
     SentNotification,
     Subscription,
+    SubscriptionCheckout,
     SubscriptionStatus,
     Tariff,
     User,
@@ -105,6 +108,9 @@ _NUMERIC_FIELDS: tuple[str, ...] = (
     'valid_hours',
     'trigger_days',
     'not_connected_after_hours',
+    'carrier',
+    'audience',
+    'post_trial_hours',
 )
 
 FIELD_TITLES: dict[str, str] = {
@@ -113,6 +119,9 @@ FIELD_TITLES: dict[str, str] = {
     'valid_hours': 'Сколько действует',
     'trigger_days': 'Через сколько дней',
     'not_connected_after_hours': 'Через сколько часов после начала',
+    'carrier': 'В каком письме',
+    'audience': 'Кому',
+    'post_trial_hours': 'Скидка действует после пробного',
 }
 
 
@@ -142,14 +151,16 @@ async def _max_promo_group_percent(db: AsyncSession) -> int:
     return worst
 
 
-async def _assert_discount_is_safe(db: AsyncSession, percent: int) -> None:
+async def _assert_discount_is_safe(
+    db: AsyncSession, percent: int, *, max_percent: int = MAX_OFFER_DISCOUNT_PERCENT
+) -> None:
     """Отбить процент, от которого цена уходит в ноль. 422 с внятной причиной."""
-    if percent < MIN_OFFER_DISCOUNT_PERCENT or percent > MAX_OFFER_DISCOUNT_PERCENT:
+    if percent < MIN_OFFER_DISCOUNT_PERCENT or percent > max_percent:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f'Размер скидки: допустимо от {MIN_OFFER_DISCOUNT_PERCENT} '
-                f'до {MAX_OFFER_DISCOUNT_PERCENT}%. Чтобы сообщение перестало уходить, '
+                f'до {max_percent}%. Чтобы сообщение перестало уходить, '
                 'выключите его, а не ставьте ноль.'
             ),
         )
@@ -285,10 +296,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'sent_type': 'trial_expiring_48h',
         'quiet_check': 'trial_warning_available',
         'stops_reminder': True,
-        'warning': 'Если выключить, этого предупреждения не будет, письмо панели его не заменит. '
-        'Остальные письма пробного управляются отдельно. Цена из кассы на момент отправки; '
-        'если касса не назвала цену, письмо уйдёт без неё. Отправки считаются отметками текущего срока; '
-        'покупка стирает отметки. Пропущенные события при включении не рассылаются заново.',
+        'warning': 'Если выключить, предупреждения за 2 дня не будет — панель его не заменит. Пропущенные письма потом не досылаются.',
         'buttons': [{'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False}],
     },
     {
@@ -302,10 +310,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'sent_type': 'trial_expiring_24h',
         'quiet_check': 'trial_warning_available',
         'stops_reminder': True,
-        'warning': 'Если выключить, предупреждения за день не будет, письмо панели его не заменит. '
-        'Письмо за 2 дня и письмо о конце управляются отдельно. Цена из кассы на момент отправки; '
-        'если касса не назвала цену, письмо уйдёт без неё. Отправки считаются отметками текущего срока; '
-        'покупка стирает отметки. Пропущенные события при включении не рассылаются заново.',
+        'warning': 'Если выключить, предупреждения за день не будет — панель его не заменит. Пропущенные письма потом не досылаются.',
         'buttons': [{'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False}],
     },
     {
@@ -336,6 +341,17 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         ],
     },
     {
+        'id': 'trial-ending-discount',
+        'group': 'trial',
+        'title': 'Скидка до конца пробного',
+        'when': 'Приходит в письме «{carrier_title}».',
+        'control': 'toggle',
+        'settings_key': 'trial_ending_discount',
+        'params': ('discount_percent', 'carrier', 'audience', 'post_trial_hours'),
+        'warning': 'Если выключить — скидку перестанут выдавать.',
+        'buttons': [{'label': '🎁 Оформить со скидкой', 'target': 'Кабинет, касса', 'tracked': False}],
+    },
+    {
         'id': 'trial-discount',
         'group': 'trial',
         'title': 'Скидка на первую подписку',
@@ -346,11 +362,7 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         'sent_type': 'trial_expired_discount',
         'quiet_check': 'trial_tariff_marked',
         'claim_type': 'trial_expired_discount',
-        'warning': (
-            'Если выключить, пробному через сутки после конца бот ничего не напомнит: письмо панели «Подписка '
-            'истекла вчера» пробным больше не пересылается. Цена появится в ответе после «Получить скидку». '
-            'Кнопка «Оформить подписку» сама скидку пока не включает.'
-        ),
+        'warning': 'Если выключить, через сутки после конца пробного клиенту ничего не придёт.',
         'buttons': [
             {'label': '🎁 Получить скидку', 'target': 'Выдаёт скидку', 'tracked': True},
             {'label': '💎 Оформить подписку', 'target': 'Кабинет, экран покупки', 'tracked': False},
@@ -662,6 +674,15 @@ GETTER_NAMES: dict[tuple[str, str], str] = {
     ('trial_not_connected', 'not_connected_after_hours'): 'get_trial_not_connected_after_hours',
 }
 
+for _field, _suffix in (
+    ('discount_percent', 'percent'),
+    ('carrier', 'carrier'),
+    ('audience', 'audience'),
+    ('post_trial_hours', 'post_trial_hours'),
+):
+    SETTER_NAMES['trial_ending_discount', _field] = f'set_trial_ending_discount_{_suffix}'
+    GETTER_NAMES['trial_ending_discount', _field] = f'get_trial_ending_discount_{_suffix}'
+
 # Нижняя граница «через сколько дней» у сообщений РАЗНАЯ: у третьей волны сеттер
 # поднимает единицу до двойки, у скидки после пробного двойка не нужна. Общая
 # константа врала бы одному из двух: приняли бы 1, а записалось бы 2, и ответ
@@ -675,6 +696,7 @@ TRIGGER_DAYS_MIN: dict[str, int] = {
 # НЕ всё: проверено по monitoring_service — are_notifications_globally_enabled()
 # стоит только на трёх проверках из десяти.
 GLOBALLY_SWITCHED_IDS = frozenset({'trial-discount', 'return-day1', 'return-wave2', 'return-wave3', 'channel-left'})
+DISCOUNT_RELATED_IDS = frozenset({'trial-2d', 'trial-1d', 'trial-2h', 'trial-discount', 'trial-ending-discount'})
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +737,17 @@ class AutoMessageItem(BaseModel):
     limits: dict[str, list[int]] | None = None
     # Заполняется только ответом на сохранение текста: «сохранено, но письмо уйдёт без логотипа».
     text_warning: str | None = None
+    choices: dict[str, list[dict[str, Any]]] | None = None
+    discount_prices: dict[str, list[dict[str, int]]] | None = None
+    discount_context: dict[str, Any] | None = None
+
+    @model_serializer(mode='wrap')
+    def omit_absent_discount_fields(self, serializer):
+        data = serializer(self)
+        for field in ('choices', 'discount_prices', 'discount_context'):
+            if data.get(field) is None:
+                data.pop(field, None)
+        return data
 
 
 class AutoMessageSummary(BaseModel):
@@ -799,10 +832,13 @@ class AutoMessagePatch(BaseModel):
 
     enabled: bool | None = None
     warn_hours: int | None = Field(default=None, ge=MIN_WARN_HOURS, le=MAX_WARN_HOURS)
-    discount_percent: int | None = Field(default=None, ge=0, le=100)
+    discount_percent: int | None = Field(default=None, strict=True)
     valid_hours: int | None = Field(default=None, ge=MIN_VALID_HOURS, le=MAX_VALID_HOURS)
     trigger_days: int | None = Field(default=None, ge=1, le=MAX_TRIGGER_DAYS)
     not_connected_after_hours: int | None = Field(default=None, ge=MIN_NOT_CONNECTED_HOURS, le=MAX_NOT_CONNECTED_HOURS)
+    carrier: int | None = Field(default=None, ge=0, le=48, strict=True)
+    audience: int | None = Field(default=None, ge=0, le=1, strict=True)
+    post_trial_hours: int | None = Field(default=None, ge=1, le=48, strict=True)
     # Новый текст письма. Пустая строка не принимается — чтобы стереть правку, есть reset_text.
     text: str | None = None
     # Вернуть текст, который лежит в коде.
@@ -958,6 +994,8 @@ def _resolve_when(entry: dict[str, Any], params: dict[str, int] | None) -> str:
     то враньё, за которое владелец и зацепился.
     """
     when = entry['when']
+    if '{carrier_title}' in when:
+        when = when.replace('{carrier_title}', CATALOG_BY_ID[_discount_context()['carrier_id']]['title'])
     values = params or {}
     if '{trigger_days}' in when:
         days = values.get('trigger_days')
@@ -988,6 +1026,16 @@ def _state_of(
     """
     if _is_enabled(entry) is False:
         return 'quiet', 'выключено в этом разделе', None
+    if entry['id'] == 'trial-ending-discount':
+        context = _discount_context()
+        carrier = context['carrier_id']
+        state, reason, _ = _state_of(CATALOG_BY_ID[carrier], reasons, notes)
+        if state == 'quiet':
+            action = 'выключено' if not _is_enabled(CATALOG_BY_ID[carrier]) else 'молчит'
+            return 'quiet', f'{action} письмо «{CATALOG_BY_ID[carrier]["title"]}»', None
+        if not NotificationSettingsService.are_notifications_globally_enabled():
+            return 'quiet', 'уведомления выключены в настройках бота', None
+        return 'live', None, context['rollout_note']
     if not NotificationSettingsService.are_notifications_globally_enabled() and entry['id'] in GLOBALLY_SWITCHED_IDS:
         return 'quiet', 'выключено общим переключателем в настройках бота', None
     check = entry.get('quiet_check')
@@ -1041,7 +1089,12 @@ def _limits_for(entry: dict[str, Any]) -> dict[str, list[int]] | None:
     bounds: dict[str, list[int]] = {}
     for name in names:
         if name == 'discount_percent':
-            bounds[name] = [MIN_OFFER_DISCOUNT_PERCENT, MAX_OFFER_DISCOUNT_PERCENT]
+            bounds[name] = [
+                MIN_OFFER_DISCOUNT_PERCENT,
+                30 if key == 'trial_ending_discount' else MAX_OFFER_DISCOUNT_PERCENT,
+            ]
+        elif name in ('carrier', 'audience', 'post_trial_hours'):
+            bounds[name] = {'carrier': [0, 48], 'audience': [0, 1], 'post_trial_hours': [1, 48]}[name]
         elif name == 'valid_hours':
             bounds[name] = [MIN_VALID_HOURS, MAX_VALID_HOURS]
         elif name == 'trigger_days':
@@ -1051,6 +1104,114 @@ def _limits_for(entry: dict[str, Any]) -> dict[str, list[int]] | None:
         elif name == 'not_connected_after_hours':
             bounds[name] = [MIN_NOT_CONNECTED_HOURS, MAX_NOT_CONNECTED_HOURS]
     return bounds
+
+
+def _choices_for(entry: dict[str, Any]) -> dict[str, list[dict[str, Any]]] | None:
+    if entry['id'] != 'trial-ending-discount':
+        return None
+    hours = NotificationSettingsService.get_trial_warn_hours()
+    saved_hours = NotificationSettingsService.get_trial_ending_discount_post_trial_hours()
+    return {
+        'carrier': [
+            {'value': 0, 'label': f'За {format_hours_declension(hours)}'},
+            {'value': 24, 'label': 'За сутки'},
+            {'value': 48, 'label': 'За двое суток'},
+        ],
+        'audience': [{'value': 1, 'label': 'Включавшим VPN'}, {'value': 0, 'label': 'Всем на пробном'}],
+        'post_trial_hours': [
+            {'value': hours, 'label': format_hours_declension(hours)} for hours in sorted({6, 12, 24, 48, saved_hours})
+        ],
+    }
+
+
+def _discount_context() -> dict[str, Any]:
+    from app.services.trial_ending_discount_service import TRIAL_ENDING_DISCOUNT_ROLLOUT
+
+    config = NotificationSettingsService.get_trial_ending_discount_settings()
+    return {
+        'carrier_id': {0: 'trial-2h', 24: 'trial-1d', 48: 'trial-2d'}[config['carrier']],
+        'percent': config['discount_percent'],
+        'enabled': config['enabled'],
+        'legacy_enabled': NotificationSettingsService.is_enabled('trial_expired_discount'),
+        'rollout_note': 'Пока только тестовым аккаунтам' if TRIAL_ENDING_DISCOUNT_ROLLOUT == 'stands' else None,
+    }
+
+
+async def _discount_examples(db: AsyncSession, *, lock: bool = False) -> tuple[dict, dict]:
+    from app.database.crud.promo_group import get_default_promo_group
+    from app.database.crud.tariff import get_tariffs_for_user, get_trial_tariff
+    from app.services.device_first_checkout_service import device_first_new_checkouts_enabled
+    from app.services.device_first_eligibility import resolve_single_eligible_tariff
+    from app.services.pricing_engine import pricing_engine
+    from app.services.trial_ending_discount_service import _discount_expiry
+
+    if not device_first_new_checkouts_enabled():
+        return {}, {}
+    group = await get_default_promo_group(db)
+    if lock and group is not None:
+        await db.refresh(group, with_for_update=True)
+        if not group.is_default:
+            return {}, {}
+    tariffs = await get_tariffs_for_user(db, group.id if group else None)
+    if lock:
+        for tariff in tariffs:
+            await db.refresh(tariff, with_for_update=True)
+            await db.refresh(tariff, attribute_names=['allowed_promo_groups'])
+        tariffs = [
+            tariff
+            for tariff in tariffs
+            if not tariff.allowed_promo_groups
+            or (group is not None and any(allowed.id == group.id for allowed in tariff.allowed_promo_groups))
+        ]
+    eligible = resolve_single_eligible_tariff(tariffs, subscription=None)
+    if not eligible.eligible or 30 not in eligible.period_options:
+        return {}, {}
+    config = NotificationSettingsService.get_trial_ending_discount_settings()
+    end = datetime.now(UTC) + timedelta(hours=config['carrier'] or NotificationSettingsService.get_trial_warn_hours())
+    expiry = _discount_expiry(end, config['post_trial_hours'])
+    trial = await get_trial_tariff(db)
+    tariff = eligible.tariff
+    person = SimpleNamespace(
+        promo_group=group,
+        promo_offer_discount_source='trial_ending_discount',
+        promo_offer_discount_expires_at=expiry,
+        has_had_paid_subscription=False,
+    )
+    prices, options = {}, {}
+    for percent in range(1, 31):
+        person.promo_offer_discount_percent = percent
+        rows, matrix = [], []
+        for days in eligible.period_options:
+            quote = await pricing_engine.calculate_tariff_purchase_price(tariff, days, user=person)
+            if type(quote.final_total) is not int or not 0 < quote.final_total <= 2**53 - 1:
+                return {}, {}
+            rows.append({'period_days': days, 'price_kopeks': quote.final_total})
+            matrix.append(
+                {
+                    'period_days': days,
+                    'prices': [
+                        {
+                            'device_limit': tariff.device_limit,
+                            'price_kopeks': quote.final_total,
+                            'breakdown': {
+                                'promo_offer_discount_kopeks': quote.promo_offer_discount,
+                                'promo_offer': {'discount_percent': percent, 'expires_at': expiry.isoformat()},
+                            },
+                        }
+                    ],
+                }
+            )
+        if not any(row['period_days'] == 30 for row in rows):
+            return {}, {}
+        prices[str(percent)] = rows
+        if percent == config['discount_percent']:
+            options = {
+                'eligible': True,
+                'tariff': {'id': tariff.id, 'base_device_limit': tariff.device_limit},
+                'current_subscription': {'is_trial': True, 'tariff_id': trial.id} if trial else {},
+                'price_matrix': matrix,
+            }
+    return prices, options
 
 
 def _build_item(
@@ -1081,6 +1242,8 @@ def _build_item(
         claimed_count=claimed_counts.get(claim_type, 0) if claim_type else None,
         claim_tracked=bool(claim_type),
         limits=_limits_for(entry),
+        choices=_choices_for(entry),
+        discount_context=_discount_context() if entry['id'] in DISCOUNT_RELATED_IDS else None,
     )
 
 
@@ -1605,6 +1768,8 @@ async def list_auto_messages(
     claimed_counts = await _claimed_counts(db)
 
     items = [_build_item(entry, reasons, notes, sent_counts, claimed_counts) for entry in AUTO_MESSAGE_CATALOG]
+    for item in items:
+        await _discount_item(db, item)
 
     last_cycle_at = await db.scalar(
         select(func.max(MonitoringLog.created_at)).where(MonitoringLog.event_type == 'monitoring_cycle_completed')
@@ -1614,7 +1779,7 @@ async def list_auto_messages(
         total_count=len(items),
         live_count=sum(1 for item in items if item.state == 'live'),
         configurable_count=sum(1 for item in items if item.control == 'toggle'),
-        sent_total=sum(item.sent_count or 0 for item in items),
+        sent_total=sum(item.sent_count or 0 for item in items if item.id != 'trial-ending-discount'),
         claimed_total=sum(item.claimed_count or 0 for item in items),
         global_enabled=NotificationSettingsService.are_notifications_globally_enabled(),
         global_affects=len(GLOBALLY_SWITCHED_IDS),
@@ -1636,19 +1801,58 @@ async def get_auto_message(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Сообщение не найдено')
 
     reasons, notes = await _quiet_facts(db)
-    item = _build_item(entry, reasons, notes, await _sent_counts(db), await _claimed_counts(db))
+    item = await _discount_item(
+        db, _build_item(entry, reasons, notes, await _sent_counts(db), await _claimed_counts(db)), with_count=False
+    )
 
     history = await _history_for(db, entry, user, request)
+    history_note = (
+        'Строки исчезают, когда клиент продлевает подписку или покупает её после пробного: так сегодня '
+        'устроена защита от повторной отправки. Показаны последние 50 отправок.'
+    )
+    if message_id == 'trial-ending-discount':
+        item.sent_count, history_note, history = await _trial_discount_stats(
+            db, may_see_names=await _may_see_names(db, user, request)
+        )
+    text_facts = _text_facts(message_id, item.params)
+    buttons = [AutoMessageButton(**button) for button in entry.get('buttons', [])]
+    context = _discount_context()
+    if context['enabled'] and message_id == context['carrier_id']:
+        _, options = await _discount_examples(db)
+        if options:
+            text_facts['text_inserts'] = [
+                insert for insert in text_facts['text_inserts'] if insert.name != 'price_lines'
+            ] + [AutoMessageInsert(name='price_lines', variants=_discount_previews(options))]
+            text_facts['text_markers'] = _markers_of(message_id, text_facts['text'], item.params)
+            for button in buttons:
+                button.target += '; без личной скидки'
+            buttons.insert(
+                0,
+                AutoMessageButton(
+                    label='🎁 Оформить со скидкой', target='Кабинет, касса; при личной скидке', tracked=False
+                ),
+            )
     return AutoMessageDetail(
         **item.model_dump(),
-        **_text_facts(message_id, item.params),
-        buttons=[AutoMessageButton(**button) for button in entry.get('buttons', [])],
+        **text_facts,
+        buttons=buttons,
         history=history,
-        history_note=(
-            'Строки исчезают, когда клиент продлевает подписку или покупает её после пробного: так сегодня '
-            'устроена защита от повторной отправки. Показаны последние 50 отправок.'
-        ),
+        history_note=history_note,
     )
+
+
+async def _may_see_names(db: AsyncSession, viewer: User, request: Request) -> bool:
+    if viewer is None or request is None:
+        return False
+    from app.services.permission_service import PermissionService
+
+    from ..ip_utils import get_client_ip
+
+    try:
+        client_ip = get_client_ip(request)
+    except HTTPException:
+        client_ip = None
+    return (await PermissionService.check_permission(db, viewer, 'users:read', ip_address=client_ip))[0]
 
 
 async def _history_for(
@@ -1663,15 +1867,7 @@ async def _history_for(
     if not sent_type:
         return []
 
-    from app.services.permission_service import PermissionService
-
-    from ..ip_utils import get_client_ip
-
-    try:
-        client_ip = get_client_ip(request)
-    except HTTPException:
-        client_ip = None
-    may_see_names, _ = await PermissionService.check_permission(db, viewer, 'users:read', ip_address=client_ip)
+    may_see_names = await _may_see_names(db, viewer, request)
 
     since = datetime.now(UTC) - timedelta(days=30)
     conditions = [SentNotification.notification_type == sent_type, SentNotification.created_at >= since]
@@ -1735,6 +1931,187 @@ def _has_numeric_change(payload: AutoMessagePatch) -> bool:
     if payload.enabled is not None:
         return True
     return any(getattr(payload, field, None) is not None for field in _NUMERIC_FIELDS)
+
+
+async def _trial_discount_stats(
+    db: AsyncSession, *, may_see_names: bool = False
+) -> tuple[int, str, list[AutoMessageHistoryRow]]:
+    from app.cabinet.routes.admin_sales_stats import _owner_rules
+    from app.config import settings
+    from app.services.trial_ending_discount_service import TRIAL_ENDING_DISCOUNT_ROLLOUT
+    from app.services.user_service import test_account_telegram_ids
+
+    since = NotificationSettingsService.get_trial_ending_discount_stats_since()
+    if since is None:
+        note = (
+            'Дата начала не записана; итог пока недоступен.'
+            if NotificationSettingsService.is_trial_ending_discount_enabled()
+            else 'Итог появится после первого включения.'
+        )
+        return 0, note, []
+    rules = await _owner_rules(db)
+    stands = TRIAL_ENDING_DISCOUNT_ROLLOUT == 'stands'
+    test_account = case(
+        (User.telegram_id.is_(None), False),
+        (User.telegram_id == 0, False),
+        else_=func.coalesce(User.test_account_enabled, User.telegram_id.in_(tuple(test_account_telegram_ids()))),
+    )
+    people = test_account if stands else rules.people
+    now = datetime.now(UTC)
+    offers = (
+        await db.execute(
+            select(
+                DiscountOffer.user_id,
+                DiscountOffer.created_at,
+                DiscountOffer.extra_data,
+                User.telegram_id,
+                User.username,
+                User.first_name,
+            )
+            .join(User, User.id == DiscountOffer.user_id)
+            .where(
+                DiscountOffer.notification_type == 'trial_ending_discount',
+                DiscountOffer.created_at >= since,
+                DiscountOffer.created_at <= now,
+                people,
+                User.status.is_distinct_from('deleted'),
+            )
+            .order_by(DiscountOffer.created_at.desc())
+        )
+    ).all()
+    delivered, history = set(), []
+    for user_id, created, extra, telegram_id, username, first_name in offers:
+        try:
+            value = (extra if isinstance(extra, dict) else {}).get('delivered_at')
+            at = datetime.fromisoformat(value) if isinstance(value, str) else None
+            if at is None or at.utcoffset() is None or not since <= created <= at <= now:
+                continue
+        except ValueError:
+            continue
+        delivered.add(user_id)
+        if at >= now - timedelta(days=30):
+            label = f'@{username}' if username else (first_name or f'id {telegram_id or user_id}')
+            history.append(
+                AutoMessageHistoryRow(
+                    sent_at=at, user_ref=label if may_see_names else f'Клиент #{user_id}', claimed=None
+                )
+            )
+    sales = (
+        (
+            await db.execute(
+                select(SubscriptionCheckout.sale_snapshot)
+                .join(User, User.id == SubscriptionCheckout.user_id)
+                .where(
+                    people,
+                    User.status.is_distinct_from('deleted'),
+                    SubscriptionCheckout.fulfilled_at >= since,
+                    SubscriptionCheckout.fulfilled_at <= now,
+                    SubscriptionCheckout.funding_state == 'funded',
+                    SubscriptionCheckout.fulfillment_state == 'fulfilled',
+                    SubscriptionCheckout.lifecycle_state.in_(('fulfilling', 'ready')),
+                    SubscriptionCheckout.tariff_id.not_in(rules.not_paid_tariff_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    savings, totals = [], []
+    for snapshot in sales:
+        if not isinstance(snapshot, dict) or snapshot.get('promo_offer_source') != 'trial_ending_discount':
+            continue
+        breakdown = snapshot.get('price_breakdown')
+        saving = breakdown.get('promo_offer_discount_kopeks') if isinstance(breakdown, dict) else None
+        total = snapshot.get('tariff_total_kopeks')
+        if type(saving) is int and saving > 0 and type(total) is int and total > 0:
+            savings.append(saving)
+            totals.append(total)
+
+    def money(value):
+        return settings.format_price(value, round_kopeks=False)
+
+    prefix = 'Тестовые аккаунты' if stands else f'С {since.astimezone(ZoneInfo("Europe/Moscow")):%d.%m.%Y}'
+    note = f'{prefix}: получили {len(delivered)} · купили со скидкой {len(totals)}'
+    if totals:
+        note += f' · заплатили {money(sum(totals))} · скидок на {money(sum(savings))}'
+    note += '.'
+    if not stands:
+        if not delivered and not totals:
+            note = 'Клиенты скидку ещё не получали.'
+        elif NotificationSettingsService.get_trial_ending_discount_audience() == 1:
+            note += ' Раньше из включавших VPN платили около 27 из 100'
+            note += ' — пока данных мало, сравнивать рано.' if len(delivered) < 30 else ', считая покупки без скидки.'
+    history.sort(key=lambda row: row.sent_at, reverse=True)
+    return len(delivered), note, history[:50]
+
+
+async def _patch_trial_discount(db: AsyncSession, changes: dict[str, Any]) -> None:
+    before = NotificationSettingsService.get_config()['trial_ending_discount']
+    candidate = {**before, **changes} if isinstance(before, dict) else {}
+    if type(candidate.get('discount_percent')) is int and not 1 <= candidate['discount_percent'] <= 30:
+        raise HTTPException(422, 'Размер скидки: от 1 до 30%.')
+    if not NotificationSettingsService._valid_trial_ending_discount_settings(candidate):
+        raise HTTPException(
+            422, 'Проверьте поля «Размер скидки», «В каком письме», «Кому», «Скидка действует после пробного».'
+        )
+    if 'discount_percent' in changes or candidate['enabled']:
+        await _assert_discount_is_safe(db, candidate['discount_percent'], max_percent=30)
+    if candidate['enabled']:
+        prices, _ = await _discount_examples(db, lock=True)
+        month = next(
+            (row for row in prices.get(str(candidate['discount_percent']), []) if row['period_days'] == 30), None
+        )
+        if month is None or type(month['price_kopeks']) is not int or month['price_kopeks'] <= 0:
+            raise HTTPException(422, 'Касса не назвала цену месяца. Скидка не включена — проверьте тариф.')
+    # Awaited price checks must never overwrite another request's successful update.
+    if NotificationSettingsService.get_config()['trial_ending_discount'] != before:
+        raise HTTPException(409, 'Настройки изменились во время проверки. Обновите карточку и проверьте их снова.')
+    if not NotificationSettingsService.set_trial_ending_discount_settings(
+        **{field: value for field, value in candidate.items() if field != 'stats_since'}
+    ):
+        raise HTTPException(500, 'Не удалось сохранить настройки. Прежние значения сохранены.')
+
+
+async def _discount_item(db: AsyncSession, item: AutoMessageItem, *, with_count: bool = True) -> AutoMessageItem:
+    if item.id == 'trial-ending-discount':
+        try:
+            item.discount_prices, _ = await _discount_examples(db)
+        except Exception:
+            logger.warning('auto_message_discount_price_unavailable', exc_info=True)
+            item.discount_prices = {}
+            item.state, item.quiet_reason = 'quiet', 'касса не назвала цену месяца'
+        if item.enabled and not item.discount_prices and item.state == 'live':
+            item.state, item.quiet_reason = 'quiet', 'касса не назвала цену месяца'
+        if with_count:
+            item.sent_count, _, _ = await _trial_discount_stats(db)
+    return item
+
+
+def _discount_previews(options: dict) -> list[AutoMessageInsertVariant]:
+    from copy import deepcopy
+
+    from app.localization.texts import get_texts
+    from app.services.monitoring_service import format_trial_discount_lines, format_trial_regular_price_lines
+
+    config = NotificationSettingsService.get_trial_ending_discount_settings()
+    result = []
+    examples = [(0, True, 'баланса нет'), (5000, True, 'есть баланс')]
+    if config['audience'] == 1:
+        examples = [(balance, used, f'включал VPN и {label}') for balance, used, label in examples]
+        examples.append((0, False, 'не включал VPN'))
+    for balance, used, label in examples:
+        person = SimpleNamespace(balance_kopeks=balance)
+        sample = deepcopy(options)
+        if not used and config['audience'] == 1:
+            for row in sample['price_matrix']:
+                for cell in row['prices']:
+                    cell['price_kopeks'] += cell['breakdown']['promo_offer_discount_kopeks']
+                    cell['breakdown'] = {}
+        text = format_trial_discount_lines(sample, person, get_texts('ru'))
+        if not text:
+            text = format_trial_regular_price_lines(sample, person, get_texts('ru'))
+        result.append(AutoMessageInsertVariant(text=text, when=label))
+    return result
 
 
 def _apply_text_change(message_id: str, payload: AutoMessagePatch) -> str | None:
@@ -1860,6 +2237,14 @@ async def patch_auto_message(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f'У этого сообщения нет настройки «{FIELD_TITLES[field]}».',
             )
+
+    if settings_key == 'trial_ending_discount':
+        await _patch_trial_discount(db, changes)
+        logger.info('auto_messages_patched', message_id=message_id, changes=sorted(changes))
+        reasons, notes = await _quiet_facts(db)
+        return await _discount_item(
+            db, _build_item(entry, reasons, notes, await _sent_counts(db), await _claimed_counts(db))
+        )
 
     # Заборы ДО записи: половина применённых изменений хуже, чем ни одного.
     if 'discount_percent' in changes:

@@ -29,15 +29,28 @@ _MONITORING = 'app/services/monitoring_service.py'
 _DAILY = 'app/services/daily_subscription_service.py'
 _CHANNEL_CHECKER = 'app/middlewares/channel_checker.py'
 _SENDING_MODULES = (_MONITORING, _DAILY)
+# Эта карточка управляет вставкой в выбранное письмо, собственного редактора нет.
+_CONFIGURATION_ONLY_IDS = {'trial-ending-discount'}
 
 # Длиннее этого литерал уже не служебная строка, а письмо человеку.
 _LETTER_LENGTH = 60
 
 
-def test_every_card_shows_a_text() -> None:
+def test_every_letter_card_shows_a_text() -> None:
     """Пустая карточка — это ровно тот случай, ради которого этап затеян."""
-    silent = [entry['id'] for entry in AUTO_MESSAGE_CATALOG if not (_text_facts(entry['id'])['text'] or '').strip()]
+    silent = [
+        entry['id']
+        for entry in AUTO_MESSAGE_CATALOG
+        if entry['id'] not in _CONFIGURATION_ONLY_IDS and not (_text_facts(entry['id'])['text'] or '').strip()
+    ]
     assert not silent, 'карточка без текста письма: ' + ', '.join(silent)
+
+
+def test_configuration_card_has_no_second_editable_letter() -> None:
+    from app.cabinet.routes.admin_auto_messages import _source_name_of
+
+    assert _text_facts('trial-ending-discount')['text'] is None
+    assert _source_name_of('trial-ending-discount') is None
 
 
 def test_the_text_map_covers_the_catalog_exactly() -> None:
@@ -48,7 +61,8 @@ def test_the_text_map_covers_the_catalog_exactly() -> None:
     """
     known = set(_LOCALE_TEXT_KEYS) | set(_const_texts())
     catalog = {entry['id'] for entry in AUTO_MESSAGE_CATALOG}
-    assert known == catalog, f'лишние: {sorted(known - catalog)}; забытые: {sorted(catalog - known)}'
+    assert known.isdisjoint(_CONFIGURATION_ONLY_IDS)
+    assert known | _CONFIGURATION_ONLY_IDS == catalog
     assert not (set(_LOCALE_TEXT_KEYS) & set(_const_texts())), 'у сообщения два источника текста сразу'
 
 
@@ -211,7 +225,7 @@ def test_every_card_names_the_source_its_own_sender_uses() -> None:
 
 def test_the_map_covers_every_card_and_names_the_right_kind_of_source() -> None:
     """Таблица отправителей полна, и словарные не перепутаны с константными."""
-    assert set(_SENDER_OF) == {entry['id'] for entry in AUTO_MESSAGE_CATALOG}
+    assert set(_SENDER_OF) | _CONFIGURATION_ONLY_IDS == {entry['id'] for entry in AUTO_MESSAGE_CATALOG}
     for message_id, (_, _, name) in _SENDER_OF.items():
         if message_id in _LOCALE_TEXT_KEYS:
             assert _LOCALE_TEXT_KEYS[message_id] == name, f'{message_id}: карта указывает на другой ключ'
@@ -620,7 +634,9 @@ def test_the_white_list_covers_every_card_and_nothing_else() -> None:
     """
     from app.services.notification_settings_service import NotificationSettingsService as Settings
 
-    sources = {_SENDER_OF[entry['id']][2] for entry in AUTO_MESSAGE_CATALOG}
+    sources = {
+        _SENDER_OF[entry['id']][2] for entry in AUTO_MESSAGE_CATALOG if entry['id'] not in _CONFIGURATION_ONLY_IDS
+    }
     assert sources == Settings.EDITABLE_TEXT_NAMES, (
         f'лишние: {sorted(Settings.EDITABLE_TEXT_NAMES - sources)}; '
         f'недостающие: {sorted(sources - Settings.EDITABLE_TEXT_NAMES)}'

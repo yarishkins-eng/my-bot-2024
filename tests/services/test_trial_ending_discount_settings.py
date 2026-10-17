@@ -12,7 +12,14 @@ from app.services.notification_settings_service import NotificationSettingsServi
 
 
 KEY = 'trial_ending_discount'
-DEFAULTS = {'enabled': False, 'discount_percent': 20, 'carrier': 24, 'audience': 1, 'post_trial_hours': 6}
+DEFAULTS = {
+    'enabled': False,
+    'discount_percent': 20,
+    'carrier': 24,
+    'audience': 1,
+    'post_trial_hours': 6,
+    'stats_since': None,
+}
 
 
 @pytest.fixture
@@ -41,6 +48,7 @@ def test_complete_patch_saves_once_and_survives_reload(storage, monkeypatch):
     expected = {'enabled': True, 'discount_percent': 30, 'carrier': 48, 'audience': 0, 'post_trial_hours': 1}
     assert storage.set_trial_ending_discount_settings(**expected) is True
     save.assert_called_once()
+    expected['stats_since'] = storage.get_trial_ending_discount_stats_since().isoformat()
     assert json.loads(storage._storage_path.read_text())[KEY] == expected
     storage._loaded = False
     assert storage.get_trial_ending_discount_settings() == expected

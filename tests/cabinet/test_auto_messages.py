@@ -607,6 +607,26 @@ def test_every_switch_actually_guards_sending() -> None:
     for entry in AUTO_MESSAGE_CATALOG:
         if entry['control'] != 'toggle':
             continue
+        if entry['settings_key'] == 'trial_ending_discount':
+            # This control guards issuance before a shared carrier sends, through a complete snapshot.
+            from app.config import settings
+            from app.services.trial_ending_discount_service import _settings_snapshot
+
+            for carrier in (0, 24, 48):
+                config = {'enabled': True, 'carrier': carrier}
+                with (
+                    patch.object(
+                        NotificationSettingsService, 'get_trial_ending_discount_settings', return_value=config
+                    ),
+                    patch.object(NotificationSettingsService, 'is_enabled', return_value=True),
+                    patch.object(NotificationSettingsService, 'are_notifications_globally_enabled', return_value=True),
+                    patch.object(settings, 'WEBHOOK_NOTIFY_USER_ENABLED', True),
+                    patch.object(settings, 'WEBHOOK_NOTIFY_SUB_EXPIRING', True),
+                ):
+                    assert _settings_snapshot(carrier) is not None
+                    config['enabled'] = False
+                    assert _settings_snapshot(carrier) is None
+            continue
         if entry['settings_key'] not in live:
             missing.append(f'{entry["id"]} → {entry["settings_key"]}')
     assert not missing, 'переключатель есть, а забора в боте нет: ' + ', '.join(missing)

@@ -312,6 +312,46 @@ def is_quiet_night(moment: datetime | None = None) -> bool:
     return (moment or datetime.now(UTC)).astimezone(_MOSCOW).hour < QUIET_NIGHT_END_HOUR
 
 
+def format_trial_regular_price_lines(options: dict, user: User, texts) -> str:
+    from app.services.device_first_checkout_service import device_first_top_up_kopeks
+
+    base = (options.get('tariff') or {}).get('base_device_limit')
+    prices = {
+        row.get('period_days'): cell.get('price_kopeks')
+        for row in options.get('price_matrix') or []
+        for cell in row.get('prices') or []
+        if cell.get('device_limit') == base
+    }
+    month, quarter = prices.get(30), prices.get(90)
+    if month:
+        balance = int(user.balance_kopeks or 0)
+        top_up = device_first_top_up_kopeks(price_kopeks=month, balance_kopeks=balance)
+        if balance >= month:
+            return texts.t(
+                'TRIAL_EXPIRED_PRICE_LINES_FUNDED',
+                '1 месяц — {month_price} с баланса, доплачивать не нужно.',
+            ).format(month_price=settings.format_price(month, round_kopeks=False))
+        # Остаток — в целых рублях вниз: «с вашими N ₽» плюс доплата «M ₽» дают цену месяца, а M — ровно то,
+        # что попросит касса. Меньше рубля на балансе или доплата не меньше цены — строки баланса нет (касса
+        # такую доплату тоже не предлагает).
+        whole_rubles = balance // 100 * 100
+        if whole_rubles > 0 and 0 < top_up < month:
+            return texts.t(
+                'TRIAL_EXPIRED_PRICE_LINES_BALANCE',
+                '1 месяц — {month_price}\nс вашими {balance} на балансе — доплатить {top_up}',
+            ).format(
+                month_price=settings.format_price(month, round_kopeks=False),
+                balance=settings.format_price(whole_rubles),
+                top_up=settings.format_price(top_up),
+            )
+        if quarter:
+            return texts.t('TRIAL_EXPIRED_PRICE_LINES', '1 месяц — {month_price}\n3 месяца — {quarter_price}').format(
+                month_price=settings.format_price(month, round_kopeks=False),
+                quarter_price=settings.format_price(quarter, round_kopeks=False),
+            )
+    return ''
+
+
 class TrialDiscountPriceLines(str):  # noqa: SLOT000 -- str subclasses need a dict for delivery metadata.
     offer_id: int | None = None
 
@@ -3099,7 +3139,7 @@ class MonitoringService:
         `build_purchase_options`, доплата при деньгах на балансе — расчётом самой кассы. Касса цену не назвала или
         строки не собрались — письмо уходит без цены. 🔴 Запасной `PRICE_30_DAYS` (990 ₽) не подставлять никогда.
         """
-        from app.services.device_first_checkout_service import build_purchase_options, device_first_top_up_kopeks
+        from app.services.device_first_checkout_service import build_purchase_options
 
         try:
             # Точка сохранения: сбой запроса внутри кассы не должен сломать транзакцию — следом пишется отметка.
@@ -3125,43 +3165,9 @@ class MonitoringService:
                     return lines
             if claim:
                 return ''
-            base = (options.get('tariff') or {}).get('base_device_limit')
-            prices = {
-                row.get('period_days'): cell.get('price_kopeks')
-                for row in options.get('price_matrix') or []
-                for cell in row.get('prices') or []
-                if cell.get('device_limit') == base
-            }
-            month, quarter = prices.get(30), prices.get(90)
-            texts = get_texts(language or user.language)
-            if month:
-                balance = int(user.balance_kopeks or 0)
-                top_up = device_first_top_up_kopeks(price_kopeks=month, balance_kopeks=balance)
-                if balance >= month:
-                    return texts.t(
-                        'TRIAL_EXPIRED_PRICE_LINES_FUNDED',
-                        '1 месяц — {month_price} с баланса, доплачивать не нужно.',
-                    ).format(month_price=settings.format_price(month, round_kopeks=False))
-                # Остаток — в целых рублях вниз: «с вашими N ₽» плюс доплата «M ₽» дают цену месяца, а M — ровно то,
-                # что попросит касса. Меньше рубля на балансе или доплата не меньше цены — строки баланса нет (касса
-                # такую доплату тоже не предлагает).
-                whole_rubles = balance // 100 * 100
-                if whole_rubles > 0 and 0 < top_up < month:
-                    return texts.t(
-                        'TRIAL_EXPIRED_PRICE_LINES_BALANCE',
-                        '1 месяц — {month_price}\nс вашими {balance} на балансе — доплатить {top_up}',
-                    ).format(
-                        month_price=settings.format_price(month, round_kopeks=False),
-                        balance=settings.format_price(whole_rubles),
-                        top_up=settings.format_price(top_up),
-                    )
-                if quarter:
-                    return texts.t(
-                        'TRIAL_EXPIRED_PRICE_LINES', '1 месяц — {month_price}\n3 месяца — {quarter_price}'
-                    ).format(
-                        month_price=settings.format_price(month, round_kopeks=False),
-                        quarter_price=settings.format_price(quarter, round_kopeks=False),
-                    )
+            regular_lines = format_trial_regular_price_lines(options, user, get_texts(language or user.language))
+            if regular_lines:
+                return regular_lines
             logger.info('Письмо о конце пробного уйдёт без цены', user_id=user.id, reason=options.get('reason'))
             return ''
         except Exception as error:
