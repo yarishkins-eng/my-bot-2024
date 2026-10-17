@@ -8,7 +8,17 @@ naive substitution would produce ``happ://crypt4/happ://crypt5/...``.
 
 from __future__ import annotations
 
+import copy
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from app.cabinet.routes.subscription_modules import status as subscription_status
 from app.cabinet.routes.subscription_modules.status import _create_deep_link, _resolve_button_url
+from app.config import settings
 from app.handlers.subscription.common import create_deep_link as bot_create_deep_link, resolve_button_url
 
 
@@ -43,6 +53,14 @@ class TestBotResolveButtonUrl:
 
 
 class TestCreateDeepLink:
+    @pytest.mark.parametrize('crypto', [CRYPT4, CRYPT5, None, 'https://untrusted.example/'])
+    @pytest.mark.parametrize('direct', [False, True])
+    def test_real_panel_bare_happ_template(self, crypto, direct):
+        buttons = [{'type': 'subscriptionLink', 'link': '{{HAPP_CRYPT4_LINK}}'}]
+        app = {'name': 'Happ', **({'buttons': buttons} if direct else {'blocks': [{'buttons': buttons}]})}
+        expected = crypto if crypto in (CRYPT4, CRYPT5) else None
+        assert _create_deep_link(app, SUB_URL, crypto) == expected
+
     def test_crypto_app_returns_stored_full_link_as_is(self):
         app = {'urlScheme': 'happ://crypt4/', 'usesCryptoLink': True}
         assert _create_deep_link(app, SUB_URL, CRYPT5) == CRYPT5
@@ -74,3 +92,34 @@ class TestBotCreateDeepLink:
     def test_plain_scheme_with_https_payload_still_prepends(self):
         app = {'urlScheme': 'happ://add/'}
         assert bot_create_deep_link(app, SUB_URL) == f'happ://add/{SUB_URL}'
+
+
+@pytest.mark.parametrize('direct', [False, True])
+def test_external_only_app_never_inherits_a_happ_crypto_link(direct):
+    buttons = [{'type': 'external', 'link': 'https://example.invalid/download'}]
+    app = {'name': 'ExternalOnly', **({'buttons': buttons} if direct else {'blocks': [{'buttons': buttons}]})}
+    assert _create_deep_link(app, SUB_URL, CRYPT4) is None
+
+
+@pytest.mark.parametrize('platform', ['ios', 'android'])
+@pytest.mark.parametrize('app_name', ['INCY', 'Happ'])
+@pytest.mark.anyio('asyncio')
+async def test_get_app_config_with_real_panel_blocks(monkeypatch, platform, app_name):
+    panel = json.loads((Path(__file__).parent / 'fixtures/panel-20261017.json').read_text(encoding='utf-8'))
+    subscription = SimpleNamespace(
+        actual_status='active',
+        subscription_url=SUB_URL,
+        subscription_crypto_link=CRYPT4,
+    )
+    monkeypatch.setattr(type(settings), 'should_hide_subscription_link', lambda self: False)
+    monkeypatch.setattr(subscription_status, 'resolve_subscription', AsyncMock(return_value=subscription))
+    monkeypatch.setattr(subscription_status, '_load_app_config_async', AsyncMock(return_value=copy.deepcopy(panel)))
+    response = await subscription_status.get_app_config(
+        user=SimpleNamespace(), db=SimpleNamespace(), subscription_id=None
+    )
+    app = next(a for a in response['platforms'][platform]['apps'] if a['name'] == app_name)
+    original = next(a for a in panel['platforms'][platform]['apps'] if a['name'] == app_name)
+    assert app['blocks'][0]['buttons'] == original['blocks'][0]['buttons']
+    assert app['blocks'][0]['buttons'][0]['type'] == 'external'
+    assert app['deepLink'] == (f'incy://import/{SUB_URL}' if app_name == 'INCY' else CRYPT4)
+    assert app['blocks'][1]['buttons'][0]['resolvedUrl'] == app['deepLink']

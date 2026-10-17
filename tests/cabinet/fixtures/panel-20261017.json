@@ -1,0 +1,1063 @@
+{
+ "locales": [
+  "ru",
+  "en"
+ ],
+ "version": "1",
+ "uiConfig": {
+  "subscriptionInfoBlockType": "expanded",
+  "installationGuidesBlockType": "accordion"
+ },
+ "platforms": {
+  "ios": {
+   "apps": [
+    {
+     "name": "INCY",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://apps.apple.com/ru/app/incy/id6756943388",
+         "text": {
+          "en": "App Store",
+          "ru": "App Store"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Open the page in App Store and install INCY.",
+        "ru": "Откройте страницу в App Store и установите современный клиент INCY."
+       },
+       "svgIconColor": "violet"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "incy://import/{{SUBSCRIPTION_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below. INCY will open automatically and the subscription will be added.",
+        "ru": "Нажмите кнопку ниже — приложение INCY откроется, и подписка добавится автоматически!"
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "Open the app, select a server from the list, and tap connect.",
+        "ru": "Откройте приложение, выберите сервер из списка и включите VPN. Готово!"
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": true
+    },
+    {
+     "name": "Happ",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973",
+         "text": {
+          "en": "App Store (RU)",
+          "ru": "App Store (RU)"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        },
+        {
+         "link": "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215",
+         "text": {
+          "en": "App Store (Global)",
+          "ru": "App Store (Global)"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Open the page in App Store and install the app. Launch it, in the VPN configuration permission window click Allow and enter your passcode.",
+        "ru": "Откройте страницу в App Store и установите приложение. Запустите его, в окне разрешения VPN-конфигурации нажмите Allow и введите свой пароль."
+       },
+       "svgIconColor": "violet"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "{{HAPP_CRYPT4_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below — the app will open and the subscription will be added automatically",
+        "ru": "Нажмите кнопку ниже — приложение откроется, и подписка добавится автоматически."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "In the main section, click the large power button in the center to connect to VPN. Don't forget to select a server from the server list. If needed, choose another server from the server list.",
+        "ru": "В главном разделе нажмите большую кнопку включения в центре для подключения к VPN. Не забудьте выбрать сервер в списке серверов. При необходимости выберите другой сервер из списка серверов."
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": false
+    }
+   ],
+   "svgIconKey": "AppleIcon",
+   "displayName": {
+    "en": "iOS",
+    "ru": "iOS"
+   }
+  },
+  "macos": {
+   "apps": [
+    {
+     "name": "INCY",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://github.com/INCY-DEV/incy-platforms/releases/latest/download/incy-macos-arm64.dmg",
+         "text": {
+          "en": "Apple Silicon (M1/M2/M3)",
+          "ru": "Apple Silicon (M-процессоры)"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        },
+        {
+         "link": "https://github.com/INCY-DEV/incy-platforms/releases/latest/download/incy-macos-intel.dmg",
+         "text": {
+          "en": "Mac Intel",
+          "ru": "Mac Intel"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Choose the version for your Mac, click the button below and install the INCY app.",
+        "ru": "Выберите версию, подходящую для процессора вашего Mac, скачайте и установите приложение INCY."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "incy://import/{{SUBSCRIPTION_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below. INCY will open automatically and the subscription will be added.",
+        "ru": "Нажмите кнопку ниже — приложение INCY откроется, и подписка добавится автоматически!"
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "Open the app, choose a server, and turn on the VPN.",
+        "ru": "Откройте приложение INCY, выберите сервер и нажмите кнопку подключения."
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": true
+    },
+    {
+     "name": "Happ",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973",
+         "text": {
+          "en": "App Store (RU)",
+          "ru": "App Store (RU)"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        },
+        {
+         "link": "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215",
+         "text": {
+          "en": "App Store (Global)",
+          "ru": "App Store (Global)"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Choose the version for your device, click the button below and install the app.",
+        "ru": "Выберите подходящую версию для вашего устройства, нажмите на кнопку ниже и установите приложение."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "{{HAPP_CRYPT4_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below — the app will open and the subscription will be added automatically",
+        "ru": "Нажмите кнопку ниже — приложение откроется, и подписка добавится автоматически."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "In the main section, click the large power button in the center to connect to VPN. Don't forget to select a server from the server list. If needed, choose another server from the server list.",
+        "ru": "В главном разделе нажмите большую кнопку включения в центре для подключения к VPN. Не забудьте выбрать сервер в списке серверов. При необходимости выберите другой сервер из списка серверов."
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": false
+    }
+   ],
+   "svgIconKey": "macOS",
+   "displayName": {
+    "en": "macOS",
+    "ru": "macOS"
+   }
+  },
+  "android": {
+   "apps": [
+    {
+     "name": "INCY",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://play.google.com/store/apps/details?id=llc.itdev.incy",
+         "text": {
+          "en": "Google Play",
+          "ru": "Google Play"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        },
+        {
+         "link": "https://github.com/INCY-DEV/incy-platforms/releases/latest/download/Incy.apk",
+         "text": {
+          "en": "Download APK",
+          "ru": "Скачать APK"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Install INCY from Google Play or download the APK directly.",
+        "ru": "Установите INCY из Google Play или скачайте APK-файл напрямую."
+       },
+       "svgIconColor": "violet"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "incy://import/{{SUBSCRIPTION_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below. INCY will open automatically and the subscription will be added.",
+        "ru": "Нажмите кнопку ниже — приложение INCY откроется, и подписка добавится автоматически!"
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "Open the app, select a server from the list, and tap connect.",
+        "ru": "Откройте приложение, выберите сервер из списка и включите VPN. Готово!"
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": true
+    },
+    {
+     "name": "Happ",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://play.google.com/store/apps/details?id=com.happproxy",
+         "text": {
+          "en": "Open in Google Play",
+          "ru": "Открыть в Google Play"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        },
+        {
+         "link": "https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk",
+         "text": {
+          "en": "Download APK",
+          "ru": "Скачать APK"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Open the page in Google Play and install the app. Or install the app directly from the APK file if Google Play is not working.",
+        "ru": "Откройте страницу в Google Play и установите приложение. Или установите приложение из APK файла напрямую, если Google Play не работает."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "{{HAPP_CRYPT4_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below to add subscription",
+        "ru": "Нажмите кнопку ниже, чтобы добавить подписку"
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "Open the app and connect to the server",
+        "ru": "Откройте приложение и подключитесь к серверу"
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": false
+    }
+   ],
+   "svgIconKey": "Android",
+   "displayName": {
+    "en": "Android",
+    "ru": "Android"
+   }
+  },
+  "appleTV": {
+   "apps": [
+    {
+     "name": "INCY",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://apps.apple.com/ru/app/incy/id6756943388",
+         "text": {
+          "en": "App Store",
+          "ru": "App Store"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Open the page in the App Store on your Apple TV and install INCY.",
+        "ru": "Откройте поиск в App Store на вашем Apple TV, найдите приложение INCY и установите его."
+       },
+       "svgIconColor": "violet"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "incy://import/{{SUBSCRIPTION_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below to add your subscription to INCY.",
+        "ru": "Нажмите кнопку ниже, чтобы скопировать или передать подписку на ваш Apple TV."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "Open the app, select a server, and turn on the VPN.",
+        "ru": "Откройте приложение на ТВ, выберите нужную страну и нажмите кнопку подключения."
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": true
+    },
+    {
+     "name": "Happ",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://apps.apple.com/us/app/happ-proxy-utility-for-tv/id6748297274",
+         "text": {
+          "en": "App Store",
+          "ru": "App Store"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Open the page in the App Store on your Apple TV and install the app. Launch it, allow VPN configuration if prompted, and enter your passcode if required.",
+        "ru": "Откройте страницу в App Store на Apple TV и установите приложение. Запустите его, предоставьте разрешение на VPN-конфигурацию, если потребуется, и введите свой пароль."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Installation instructions",
+        "ru": "Инструкции по установке"
+       },
+       "buttons": [
+        {
+         "link": "https://www.happ.su/main/ru/faq/android-tv",
+         "text": {
+          "en": "In Russian",
+          "ru": "На русском"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        },
+        {
+         "link": "https://www.happ.su/main/faq/android-tv",
+         "text": {
+          "en": "In English",
+          "ru": "На английском"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "Gear",
+       "description": {
+        "en": "Detailed instructions to help you set up Happ on your device.",
+        "ru": "Подробные инструкции, чтобы помочь вам настроить Happ на вашем устройстве."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "{{HAPP_CRYPT4_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below to add subscription, if you opened the subscription page on your TV",
+        "ru": "Нажмите кнопку ниже, чтобы добавить подписку, если вы открыли страницу подписки на телевизоре"
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "Open the app and connect to the server",
+        "ru": "Откройте приложение и подключитесь к серверу"
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": false
+    }
+   ],
+   "svgIconKey": "TV",
+   "displayName": {
+    "en": "Apple TV",
+    "ru": "Apple TV"
+   }
+  },
+  "windows": {
+   "apps": [
+    {
+     "name": "INCY",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://github.com/INCY-DEV/incy-platforms/releases/latest/download/incy-windows-setup.exe",
+         "text": {
+          "en": "Windows Installer",
+          "ru": "Установщик Windows"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Download and run the installer to set up INCY on your PC.",
+        "ru": "Скачайте и запустите установщик для настройки INCY на вашем ПК."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "incy://import/{{SUBSCRIPTION_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below. INCY will open automatically and the subscription will be added.",
+        "ru": "Нажмите кнопку ниже — приложение INCY откроется, и подписка добавится автоматически!"
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "Open the app, choose a server, and turn on the VPN.",
+        "ru": "Откройте приложение INCY, выберите сервер и нажмите кнопку подключения."
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": true
+    },
+    {
+     "name": "Happ",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe",
+         "text": {
+          "en": "Windows",
+          "ru": "Windows"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Choose the version for your device, click the button below and install the app.",
+        "ru": "Выберите подходящую версию для вашего устройства, нажмите на кнопку ниже и установите приложение."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "{{HAPP_CRYPT4_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below — the app will open and the subscription will be added automatically",
+        "ru": "Нажмите кнопку ниже — приложение откроется, и подписка добавится автоматически."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "In the main section, click the large power button in the center to connect to VPN. Don't forget to select a server from the server list. If needed, choose another server from the server list.",
+        "ru": "В главном разделе нажмите большую кнопку включения в центре для подключения к VPN. Не забудьте выбрать сервер в списке серверов. При необходимости выберите другой сервер из списка серверов."
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": false
+    }
+   ],
+   "svgIconKey": "Windows",
+   "displayName": {
+    "en": "Windows",
+    "ru": "Windows"
+   }
+  },
+  "androidTV": {
+   "apps": [
+    {
+     "name": "INCY",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://play.google.com/store/apps/details?id=llc.itdev.incy",
+         "text": {
+          "en": "Google Play",
+          "ru": "Google Play"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        },
+        {
+         "link": "https://github.com/INCY-DEV/incy-platforms/releases/latest/download/Incy.apk",
+         "text": {
+          "en": "Download APK",
+          "ru": "Скачать APK"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Install INCY from Google Play or download the APK directly.",
+        "ru": "Установите INCY из Google Play или скачайте APK-файл напрямую."
+       },
+       "svgIconColor": "violet"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "incy://import/{{SUBSCRIPTION_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below. INCY will open automatically and the subscription will be added.",
+        "ru": "Нажмите кнопку ниже — приложение INCY откроется, и подписка добавится автоматически!"
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "Open the app, select a server from the list, and tap connect.",
+        "ru": "Откройте приложение, выберите сервер из списка и включите VPN. Готово!"
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": true
+    },
+    {
+     "name": "Happ",
+     "blocks": [
+      {
+       "title": {
+        "en": "App Installation",
+        "ru": "Установка приложения"
+       },
+       "buttons": [
+        {
+         "link": "https://play.google.com/store/apps/details?id=com.happproxy",
+         "text": {
+          "en": "Open in Google Play",
+          "ru": "Открыть в Google Play"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        },
+        {
+         "link": "https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk",
+         "text": {
+          "en": "Download APK",
+          "ru": "Скачать APK"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "DownloadIcon",
+       "description": {
+        "en": "Open the page in Google Play and install the app. Or install the app directly from the APK file if Google Play is not working.",
+        "ru": "Откройте страницу в Google Play и установите приложение. Или установите приложение из APK файла напрямую, если Google Play не работает."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Installation instructions",
+        "ru": "Инструкции по установке"
+       },
+       "buttons": [
+        {
+         "link": "https://www.happ.su/main/ru/faq/android-tv",
+         "text": {
+          "en": "In Russian",
+          "ru": "На русском"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        },
+        {
+         "link": "https://www.happ.su/main/faq/android-tv",
+         "text": {
+          "en": "In English",
+          "ru": "На английском"
+         },
+         "type": "external",
+         "svgIconKey": "ExternalLink"
+        }
+       ],
+       "svgIconKey": "Gear",
+       "description": {
+        "en": "Detailed instructions to help you set up Happ on your device.",
+        "ru": "Подробные инструкции, чтобы помочь вам настроить Happ на вашем устройстве."
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Add Subscription",
+        "ru": "Добавление подписки"
+       },
+       "buttons": [
+        {
+         "link": "{{HAPP_CRYPT4_LINK}}",
+         "text": {
+          "en": "Add Subscription",
+          "ru": "Добавить подписку"
+         },
+         "type": "subscriptionLink",
+         "svgIconKey": "Plus"
+        }
+       ],
+       "svgIconKey": "CloudDownload",
+       "description": {
+        "en": "Click the button below to add subscription, if you opened the subscription page on your TV",
+        "ru": "Нажмите кнопку ниже, чтобы добавить подписку, если вы открыли страницу подписки на телевизоре"
+       },
+       "svgIconColor": "cyan"
+      },
+      {
+       "title": {
+        "en": "Connect and use",
+        "ru": "Подключение и использование"
+       },
+       "buttons": [],
+       "svgIconKey": "Check",
+       "description": {
+        "en": "Open the app and connect to the server",
+        "ru": "Откройте приложение и подключитесь к серверу"
+       },
+       "svgIconColor": "teal"
+      }
+     ],
+     "featured": false
+    }
+   ],
+   "svgIconKey": "TV",
+   "displayName": {
+    "en": "Android TV",
+    "ru": "Android TV"
+   }
+  }
+ },
+ "baseSettings": {
+  "metaTitle": " Страница подписки ☀️ Teplo VPN",
+  "metaDescription": "Подключись и получи доступ в свободный интернет",
+  "hideGetLinkButton": false,
+  "showConnectionKeys": false
+ },
+ "baseTranslations": {
+  "name": {
+   "en": "Username",
+   "ru": "Имя пользователя"
+  },
+  "active": {
+   "en": "Active",
+   "ru": "Активна"
+  },
+  "status": {
+   "en": "Status",
+   "ru": "Статус"
+  },
+  "expired": {
+   "en": "Expired",
+   "ru": "Истекла"
+  },
+  "expires": {
+   "en": "Expires",
+   "ru": "Истекает"
+  },
+  "getLink": {
+   "en": "Get Link",
+   "ru": "Получение ссылки"
+  },
+  "unknown": {
+   "en": "Unknown",
+   "ru": "Неизвестно"
+  },
+  "copyLink": {
+   "en": "Copy link",
+   "ru": "Скопировать ссылку"
+  },
+  "inactive": {
+   "en": "Inactive",
+   "ru": "Неактивна"
+  },
+  "bandwidth": {
+   "en": "Bandwidth",
+   "ru": "Трафик"
+  },
+  "expiresIn": {
+   "en": "Expires in",
+   "ru": "Истекает"
+  },
+  "linkCopied": {
+   "en": "Likn copied",
+   "ru": "Ссылка скопирована"
+  },
+  "scanQrCode": {
+   "en": "Scan the QR code above in the client",
+   "ru": "Отсканируйте QR-код в приложении"
+  },
+  "indefinitely": {
+   "en": "Indefinitely",
+   "ru": "Бессрочно"
+  },
+  "scanToImport": {
+   "en": "Scan to import this key",
+   "ru": "Отсканируйте QR-код для импорта ключа"
+  },
+  "connectionKeysHeader": {
+   "en": "Connection Keys",
+   "ru": "Ключи подключения"
+  },
+  "linkCopiedToClipboard": {
+   "en": "Link copied to clipboard",
+   "ru": "Ссылка скопирована в буфер обмена"
+  },
+  "scanQrCodeDescription": {
+   "en": "Easily add the subscription to any client. There's another option: copy the link below and paste it into the client",
+   "ru": "Простое добавление подписки в любой клиент. Есть и другой вариант: скопируйте ссылку ниже и вставьте в клиент."
+  },
+  "installationGuideHeader": {
+   "en": "Installation",
+   "ru": "Установка"
+  }
+ },
+ "brandingSettings": {
+  "title": "☀️ Teplo VPN",
+  "logoUrl": "https://docs.rw/img/logo.svg",
+  "supportUrl": "https://t.me/teplo_vpnhelp"
+ }
+}
