@@ -8,6 +8,8 @@ naive substitution would produce ``happ://crypt4/happ://crypt5/...``.
 
 from __future__ import annotations
 
+import pytest
+
 from app.cabinet.routes.subscription_modules.status import _create_deep_link, _resolve_button_url
 from app.handlers.subscription.common import create_deep_link as bot_create_deep_link, resolve_button_url
 
@@ -43,6 +45,14 @@ class TestBotResolveButtonUrl:
 
 
 class TestCreateDeepLink:
+    @pytest.mark.parametrize('crypto', [CRYPT4, CRYPT5, None, 'https://untrusted.example/'])
+    @pytest.mark.parametrize('direct', [False, True])
+    def test_real_panel_bare_happ_template(self, crypto, direct):
+        buttons = [{'type': 'subscriptionLink', 'link': '{{HAPP_CRYPT4_LINK}}'}]
+        app = {'name': 'Happ', **({'buttons': buttons} if direct else {'blocks': [{'buttons': buttons}]})}
+        expected = crypto if crypto in (CRYPT4, CRYPT5) else None
+        assert _create_deep_link(app, SUB_URL, crypto) == expected
+
     def test_crypto_app_returns_stored_full_link_as_is(self):
         app = {'urlScheme': 'happ://crypt4/', 'usesCryptoLink': True}
         assert _create_deep_link(app, SUB_URL, CRYPT5) == CRYPT5

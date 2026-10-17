@@ -335,6 +335,8 @@ def _extract_scheme_from_buttons(buttons: list[dict[str, Any]]) -> tuple[str, bo
         # Check for {{HAPP_CRYPT4_LINK}} -- uses crypto link as payload
         if '{{HAPP_CRYPT4_LINK}}' in link_upper or 'HAPP_CRYPT4_LINK' in link_upper:
             scheme = re.sub(r'\{\{HAPP_CRYPT4_LINK\}\}', '', link, flags=re.IGNORECASE)
+            if link_upper.strip() == '{{HAPP_CRYPT4_LINK}}':
+                return '', True
             if scheme and '://' in scheme:
                 return scheme, True
 
@@ -374,14 +376,14 @@ def _get_url_scheme_for_app(app: dict[str, Any]) -> tuple[str, bool]:
             continue
         buttons = block.get('buttons', [])
         scheme, uses_crypto = _extract_scheme_from_buttons(buttons)
-        if scheme:
+        if scheme or uses_crypto:
             return scheme, uses_crypto
 
     # 3. Check buttons directly in app (alternative structure)
     direct_buttons = app.get('buttons', [])
     if direct_buttons:
         scheme, uses_crypto = _extract_scheme_from_buttons(direct_buttons)
-        if scheme:
+        if scheme or uses_crypto:
             return scheme, uses_crypto
 
     # No scheme found
@@ -437,6 +439,13 @@ def _create_deep_link(
         return None
 
     scheme, uses_crypto = _get_url_scheme_for_app(app)
+    if (
+        uses_crypto
+        and not scheme
+        and subscription_crypto_link
+        and subscription_crypto_link.lower().startswith('happ://')
+    ):
+        return subscription_crypto_link
     if not scheme:
         logger.debug('_create_deep_link: no urlScheme for app', get=app.get('name', 'unknown'))
         return None
