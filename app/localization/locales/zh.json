@@ -1,4 +1,7 @@
 {
+  "DISCOUNT_CLAIM_ACTIVE": "You already have a −{percent}% discount.",
+  "DISCOUNT_CLAIM_ACTIVE_WITH_EXPIRY": "You already have a −{percent}% discount until {expires_at} (MSK).",
+  "TRIAL_DISCOUNT_STILL_VALID": "🎁 Your −{percent}% discount is still valid{until}: {price}.",
   "ACCESS_DENIED": "❌拒绝访问",
   "ADDON_INSUFFICIENT_FUNDS_MESSAGE": "⚠️<b>资金不足</b>\n\n服务费用：{required}\n当前余额：{balance}\n缺少：{missing}\n\n请选择充值方式。金额将自动填入。",
   "ADD_COUNTRIES_BUTTON": "🌐添加国家",

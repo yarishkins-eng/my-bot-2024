@@ -18,10 +18,11 @@ def test_context_is_limited_to_exact_five_cards_and_uses_real_carrier_id(price_e
             found.add(entry['id'])
             assert item['discount_context'] == {
                 'carrier_id': card_id,
+                'carrier_title': api.CATALOG_BY_ID[card_id]['title'],
                 'percent': 20,
                 'enabled': False,
                 'legacy_enabled': False,
-                'rollout_note': 'Пока только тестовым аккаунтам',
+                'rollout_note': None,
             }
     assert found == {'trial-2h', 'trial-2d', 'trial-1d', 'trial-discount', 'trial-ending-discount'}
 
@@ -33,7 +34,7 @@ def test_quiet_reasons_follow_discount_then_carrier(price_env, monkeypatch):
     assert Settings.set_trial_ending_discount_enabled(True)
     monkeypatch.setattr(Settings, 'are_notifications_globally_enabled', classmethod(lambda _: True))
     assert api._state_of(entry, reasons, {})[1] == 'молчит письмо «Пробный закончится завтра»'
-    assert api._state_of(entry, {}, {}) == ('live', None, 'Пока только тестовым аккаунтам')
+    assert api._state_of(entry, {}, {}) == ('live', None, None)
 
 
 @pytest.mark.asyncio

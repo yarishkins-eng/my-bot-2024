@@ -49,7 +49,7 @@ async def test_claim_price_uses_the_activated_user_and_real_engine(monkeypatch, 
     async def nested():
         yield
 
-    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock(), begin_nested=nested)
+    db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock(), refresh=AsyncMock(), begin_nested=nested)
     monkeypatch.setattr(promo, 'get_offer_by_id', AsyncMock(return_value=offer))
     saved = AsyncMock()
     monkeypatch.setattr(promo, 'mark_offer_claimed', saved)
@@ -162,7 +162,7 @@ async def test_claim_passes_its_existing_subscription_to_price_helper(monkeypatc
         answer=AsyncMock(),
         message=SimpleNamespace(answer=AsyncMock()),
     )
-    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
+    db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock(), refresh=AsyncMock())
     monkeypatch.setattr(promo, 'get_offer_by_id', AsyncMock(return_value=offer))
     monkeypatch.setattr(promo, 'mark_offer_claimed', AsyncMock())
     quote = AsyncMock(return_value='')
@@ -196,7 +196,7 @@ async def test_claim_real_helper_falls_back_without_unconfirmed_price(monkeypatc
     async def nested():
         yield
 
-    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock(), begin_nested=nested)
+    db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock(), refresh=AsyncMock(), begin_nested=nested)
     monkeypatch.setattr(promo, 'get_offer_by_id', AsyncMock(return_value=offer))
     monkeypatch.setattr(promo, 'mark_offer_claimed', AsyncMock())
     options = {

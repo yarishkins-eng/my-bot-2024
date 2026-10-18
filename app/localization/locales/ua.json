@@ -1,4 +1,7 @@
 {
+  "DISCOUNT_CLAIM_ACTIVE": "You already have a −{percent}% discount.",
+  "DISCOUNT_CLAIM_ACTIVE_WITH_EXPIRY": "You already have a −{percent}% discount until {expires_at} (MSK).",
+  "TRIAL_DISCOUNT_STILL_VALID": "🎁 Your −{percent}% discount is still valid{until}: {price}.",
   "ACCESS_DENIED": "❌ Доступ заборонено",
   "ADDON_INSUFFICIENT_FUNDS_MESSAGE": "⚠️ <b>Недостатньо коштів</b>\n\nВартість послуги: {required}\nНа балансі: {balance}\nНе вистачає: {missing}\n\nОберіть спосіб поповнення. Сума підставиться автоматично.",
   "ADD_COUNTRIES_BUTTON": "🌐 Додати країни",

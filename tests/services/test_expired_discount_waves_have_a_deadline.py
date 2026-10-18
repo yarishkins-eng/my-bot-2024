@@ -106,7 +106,9 @@ async def test_trial_wave_offer_carries_a_discount_lifetime(monkeypatch):
     monkeypatch.setattr(settings_service, 'get_trial_expired_discount_percent', staticmethod(lambda: PERCENT))
     monkeypatch.setattr(settings_service, 'get_trial_expired_discount_valid_hours', staticmethod(lambda: VALID_HOURS))
     monkeypatch.setattr(monitor, '_send_trial_expired_discount_notification', AsyncMock(return_value=True))
-    db = SimpleNamespace(execute=AsyncMock(return_value=_Scalars([_expired(is_trial=True, days_ago=1.0)])))
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=_Scalars([_expired(is_trial=True, days_ago=1.0)])), refresh=AsyncMock()
+    )
 
     await monitor._check_trial_expired_discount(db)
 

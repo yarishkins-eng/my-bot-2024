@@ -47,7 +47,9 @@ async def test_the_claim_answer_never_carries_markup_or_line_breaks(monkeypatch,
         promo_offer_discount_expires_at=None,
         updated_at=None,
     )
-    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock(), flush=AsyncMock(), add=lambda _row: None)
+    db = SimpleNamespace(
+        commit=AsyncMock(), execute=AsyncMock(), refresh=AsyncMock(), flush=AsyncMock(), add=lambda _row: None
+    )
     monkeypatch.setattr(route, 'get_offer_by_id', AsyncMock(return_value=offer))
     monkeypatch.setattr(route, 'mark_offer_claimed', AsyncMock())
 
@@ -84,7 +86,9 @@ async def test_an_unknown_placeholder_never_turns_into_a_500(monkeypatch):
         promo_offer_discount_expires_at=None,
         updated_at=None,
     )
-    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock(), flush=AsyncMock(), add=lambda _row: None)
+    db = SimpleNamespace(
+        commit=AsyncMock(), execute=AsyncMock(), refresh=AsyncMock(), flush=AsyncMock(), add=lambda _row: None
+    )
     monkeypatch.setattr(route, 'get_offer_by_id', AsyncMock(return_value=offer))
     monkeypatch.setattr(route, 'mark_offer_claimed', AsyncMock())
     monkeypatch.setattr(

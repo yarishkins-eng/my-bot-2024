@@ -22,7 +22,7 @@ from app.services.user_service import is_test_account
 
 logger = structlog.get_logger(__name__)
 TRIAL_ENDING_DISCOUNT_SOURCE = 'trial_ending_discount'
-TRIAL_ENDING_DISCOUNT_ROLLOUT = 'stands'
+TRIAL_ENDING_DISCOUNT_ROLLOUT = 'all'
 _MOSCOW = ZoneInfo('Europe/Moscow')
 _PROMO_FIELDS = ('promo_offer_discount_percent', 'promo_offer_discount_source', 'promo_offer_discount_expires_at')
 
