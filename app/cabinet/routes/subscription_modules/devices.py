@@ -13,6 +13,7 @@ POST /subscription/devices/save-cart
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -31,6 +32,7 @@ from app.database.crud.user_device_alias import (
     set_alias,
 )
 from app.database.models import Subscription, User
+from app.external.remnawave_api import VPN_USED_MIN_BYTES
 from app.services.subscription_service import SubscriptionService
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
@@ -165,6 +167,7 @@ async def get_devices(
     subscription_id: int | None = QueryParam(None, description='Subscription ID for multi-tariff'),
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
+    traffic: bool = False,
 ) -> dict[str, Any]:
     """Get list of connected devices."""
     from app.services.remnawave_service import RemnaWaveService
@@ -178,11 +181,13 @@ async def get_devices(
         )
 
     _puuid = _resolve_panel_uuid(subscription, user)
+    traffic_result = {'vpn_working': None} if traffic else {}
     if not _puuid:
         # No panel uuid = account not provisioned yet (a brand-new user), NOT a
         # panel failure → panel_ok stays True so the screen still lights up
         # "Подключить". Distinct from the `except` branch below (real failure).
         return {
+            **traffic_result,
             'devices': [],
             'total': 0,
             'device_limit': subscription.device_limit or 0,
@@ -193,6 +198,13 @@ async def get_devices(
         service = RemnaWaveService()
         async with service.get_api_client() as api:
             response = await api.get_user_devices_all(_puuid)
+            if traffic and subscription.is_active:
+                try:
+                    async with asyncio.timeout(3):
+                        used = await api.get_user_lifetime_traffic_once(_puuid)
+                    traffic_result['vpn_working'] = used >= VPN_USED_MIN_BYTES if used is not None else None
+                except Exception:
+                    logger.warning('Failed to read VPN working traffic (panel slow/unavailable)')
 
             devices_list = response.get('devices', [])
             # Подтягиваем все локальные alias'ы юзера одним запросом — дешевле
@@ -230,6 +242,7 @@ async def get_devices(
                 )
 
             return {
+                **traffic_result,
                 'devices': formatted_devices,
                 'total': response.get('total', len(formatted_devices)),
                 'device_limit': subscription.device_limit or 0,
@@ -244,6 +257,7 @@ async def get_devices(
         # Real panel failure: panel_ok=False so the screen shows a "panel error"
         # state instead of a false "Подключить" on the degraded empty list.
         return {
+            **traffic_result,
             'devices': [],
             'total': 0,
             'device_limit': subscription.device_limit or 0,
