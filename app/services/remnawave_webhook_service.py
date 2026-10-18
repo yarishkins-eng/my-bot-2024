@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import html
 import re
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,6 +38,7 @@ from app.database.models import Subscription, SubscriptionServer, SubscriptionSt
 from app.localization.texts import get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.notification_delivery_service import NotificationType, notification_delivery_service
+from app.services.notification_settings_service import NotificationSettingsService
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
 
 
@@ -1845,6 +1847,10 @@ class RemnaWaveWebhookService:
     async def _handle_first_connected(
         self, db: AsyncSession, user: User, subscription: Subscription | None, data: dict
     ) -> None:
+        from app.database.crud.notification import notification_sent
+
+        if subscription and await notification_sent(db, user.id, subscription.id, 'trial_connect_reminder'):
+            return
         logger.info('Webhook: user first VPN connection', user_id=user.id)
         await self._notify_user(
             user,
@@ -1942,6 +1948,21 @@ class RemnaWaveWebhookService:
     async def _handle_device_added(
         self, db: AsyncSession, user: User, subscription: Subscription | None, data: dict
     ) -> None:
+        from app.services.monitoring_service import is_canonical_trial
+        from app.utils.trial_connect_reminder import trial_connect_queue
+
+        nested = data.get('user')
+        uuid = data.get('uuid') or data.get('userUuid') or (nested.get('uuid') if isinstance(nested, dict) else None)
+        if (
+            user.telegram_id
+            and uuid
+            and subscription
+            and uuid == (subscription.remnawave_uuid or user.remnawave_uuid)
+            and await is_canonical_trial(db, subscription)
+            and NotificationSettingsService.is_enabled('trial_connect_reminder')
+        ):
+            due = time.time() + NotificationSettingsService.get_connect_reminder_minutes() * 60
+            await trial_connect_queue('zadd', {uuid: due}, nx=True)
         device_name = self._extract_device_name(data)
         logger.info('Webhook: device added for user', user_id=user.id, device_name=device_name or '(empty)')
         await self._notify_user(

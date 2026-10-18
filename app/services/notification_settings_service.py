@@ -83,6 +83,7 @@ class NotificationSettingsService:
         # По умолчанию ВЫКЛЮЧЕНО: появление ключа не должно начать рассылку само,
         # включается вручную в кабинете. Тот же порядок, что у 'trial_expired_discount'.
         'trial_not_connected': {'enabled': False, 'not_connected_after_hours': 3},
+        'trial_connect_reminder': {'enabled': False, 'connect_reminder_minutes': 15},
         # ВК-4: «Пробный истёк» и «Подписка истекла» больше не делят выключатель — письмо выбирает пробный или
         # платный по тарифу и проверяет свой ключ.
         'trial_expired': {'enabled': True},
@@ -521,6 +522,17 @@ class NotificationSettingsService:
             return 2
 
     @classmethod
+    def get_connect_reminder_minutes(cls) -> int:
+        try:
+            return max(5, min(60, int(cls._get('trial_connect_reminder').get('connect_reminder_minutes', 15))))
+        except (TypeError, ValueError):
+            return 15
+
+    @classmethod
+    def set_connect_reminder_minutes(cls, minutes: int) -> bool:
+        return cls._set_field('trial_connect_reminder', 'connect_reminder_minutes', max(5, min(60, int(minutes))))
+
+    @classmethod
     def get_trial_not_connected_after_hours(cls) -> int:
         """Через сколько часов после начала пробного писать неподключившемуся.
 
@@ -591,6 +603,7 @@ class NotificationSettingsService:
             'SUBSCRIPTION_EXPIRED_TEXT',
             'TRIAL_ENDING_TEXT',
             'TRIAL_NOT_CONNECTED_TEXT',
+            'TRIAL_CONNECT_REMINDER',
             'DAILY_CHARGE_TEXT',
             'DAILY_PAUSED_TEXT',
             'TRAFFIC_RESET_TEXT',

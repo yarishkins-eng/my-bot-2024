@@ -1,6 +1,7 @@
 import asyncio
 import html
 import math
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -42,6 +43,7 @@ from app.database.crud.tariff import get_trial_tariff
 from app.database.crud.user import (
     get_inactive_users,
     get_user_by_id,
+    get_user_by_remnawave_uuid,
     subtract_user_balance,
 )
 from app.database.database import AsyncSessionLocal
@@ -59,6 +61,7 @@ from app.database.models import (
     UserStatus,
 )
 from app.external.remnawave_api import (
+    VPN_USED_MIN_BYTES,
     RemnaWaveAPIError,
     RemnaWaveUser,
     UserStatus as RemnaWaveUserStatus,
@@ -70,8 +73,10 @@ from app.services.notification_delivery_service import (
 )
 from app.services.notification_settings_service import NotificationSettingsService
 from app.services.promo_offer_service import promo_offer_service
+from app.services.remnawave_service import RemnaWaveService
 from app.services.subscription_service import SubscriptionService, get_traffic_reset_strategy
 from app.utils.cache import cache
+from app.utils.device_app import device_app_name
 from app.utils.grace import is_grace_eligible, is_in_grace
 from app.utils.message_patch import caption_exceeds_telegram_limit
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
@@ -80,6 +85,7 @@ from app.utils.subscription_utils import (
     resolve_hwid_device_limit_for_payload,
 )
 from app.utils.timezone import format_local_datetime
+from app.utils.trial_connect_reminder import MAX_LATENESS, trial_connect_queue
 
 
 def resolve_autopay_period_candidate(candidate, tariff) -> int | None:
@@ -230,6 +236,7 @@ LOGO_PATH = Path(settings.LOGO_FILE)
 # час», а следом «поставьте приложение и добавьте подписку» — предложение начать
 # настройку, на которую времени уже нет.
 TRIAL_NOT_CONNECTED_MIN_HOURS_LEFT = 12
+TRIAL_CONNECT_REMINDER_MIN_HOURS_LEFT = 1
 
 
 # ---------------------------------------------------------------------------
@@ -1707,6 +1714,95 @@ class MonitoringService:
         }
         return usage or None
 
+    async def _has_trial_connect_reminder(self, db, subscription) -> bool:
+        if await notification_sent(db, subscription.user.id, subscription.id, 'trial_connect_reminder'):
+            logger.info('trial_not_connected_skipped_reminder', subscription_id=subscription.id, reason='sent')
+            return True
+        if not NotificationSettingsService.is_enabled('trial_connect_reminder'):
+            return False
+        uuid = subscription.remnawave_uuid or subscription.user.remnawave_uuid
+        due = await trial_connect_queue('zscore', uuid) if uuid else None
+        live = due is not None and time.time() <= float(due) + MAX_LATENESS
+        if live:
+            logger.info('trial_not_connected_skipped_reminder', subscription_id=subscription.id, reason='queued')
+        return live
+
+    async def _check_trial_connect_reminders(self, db):
+        due = await trial_connect_queue('zrangebyscore', '-inf', time.time(), start=0, num=3, withscores=True)
+        for raw, due_at in due or []:
+            uuid = raw.decode() if isinstance(raw, bytes) else raw
+            try:
+                async with asyncio.timeout(15):
+                    if time.time() <= float(due_at) + MAX_LATENESS:
+                        await self._send_trial_connect_reminder(db, uuid)
+                    await db.commit()
+            except Exception as exc:
+                await db.rollback()
+                logger.warning('Напоминание о подключении пропущено', error=str(exc))
+            finally:
+                await trial_connect_queue('zrem', uuid)
+
+    @staticmethod
+    async def _trial_connect_eligible(db, user, subscription, uuid):
+        return not (
+            not user
+            or not user.telegram_id
+            or user.status != UserStatus.ACTIVE.value
+            or getattr(user, 'test_reset_state', None) in ('resetting', 'failed')
+            or not subscription
+            or (subscription.remnawave_uuid or user.remnawave_uuid) != uuid
+            or not subscription.is_active
+            or not subscription.connected_squads
+            or subscription.end_date <= datetime.now(UTC) + timedelta(hours=TRIAL_CONNECT_REMINDER_MIN_HOURS_LEFT)
+            or not await is_canonical_trial(db, subscription)
+        )
+
+    async def _send_trial_connect_reminder(self, db, uuid):
+        if not self.bot or not NotificationSettingsService.is_enabled('trial_connect_reminder'):
+            return
+        user = await get_user_by_remnawave_uuid(db, uuid)
+        subscription = user.subscription if user else None
+        if not await self._trial_connect_eligible(db, user, subscription, uuid):
+            return
+        # Общая транзакционная блокировка двух писем держится до записи отметки.
+        await db.execute(select(func.pg_advisory_xact_lock(0x544350, subscription.id)))
+        for kind in ('trial_connect_reminder', 'trial_not_connected'):
+            if await notification_sent(db, user.id, subscription.id, kind):
+                return
+        async with RemnaWaveService().get_api_client() as api:
+            traffic = await api.get_user_lifetime_traffic_once(uuid)
+            if traffic is None or traffic >= VPN_USED_MIN_BYTES:
+                return
+            devices = (await api.get_user_devices_all(uuid))['devices']
+        if not devices:
+            return
+        newest = max(devices, key=lambda d: datetime.fromisoformat(d['createdAt'].replace('Z', '+00:00')).timestamp())
+        app = {'incy': 'INCY', 'happ': 'Happ'}.get((device_app_name(newest) or '').lower())
+        await db.refresh(user, ['status', 'test_reset_state', 'telegram_id', 'remnawave_uuid'])
+        await db.refresh(
+            subscription, ['status', 'is_trial', 'tariff_id', 'connected_squads', 'end_date', 'remnawave_uuid']
+        )
+        if not await self._trial_connect_eligible(db, user, subscription, uuid):
+            return
+        if (
+            not app
+            or not NotificationSettingsService.is_enabled('trial_connect_reminder')
+            or await trial_connect_queue('zrem', uuid) != 1
+        ):
+            return
+        message = get_texts(user.language or 'ru').t('TRIAL_CONNECT_REMINDER').format(app=app)
+        await self.bot.send_message(
+            chat_id=user.telegram_id,
+            text=message,
+            parse_mode='HTML',
+            reply_markup=self._trial_connection_keyboard(),
+            disable_notification=is_quiet_night(),
+        )
+        await record_notification(db, user.id, subscription.id, 'trial_connect_reminder')
+        await self._log_monitoring_event(
+            db, 'trial_connect_reminder_notifications_sent', 'Отправлено напоминание о подключении', {'sent': 1}
+        )
+
     async def _check_trial_not_connected(self, db: AsyncSession):
         """Помощь каноническому пробному с накопленным расходом меньше 1 МБ (1 000 000 байт)."""
         if not self.bot:
@@ -1764,7 +1860,9 @@ class MonitoringService:
             # сверкой платежей, поэтому его зависание откладывает работу с деньгами.
             pending = []
             for subscription in candidates:
-                if not await notification_sent(db, subscription.user.id, subscription.id, 'trial_not_connected'):
+                if not await notification_sent(
+                    db, subscription.user.id, subscription.id, 'trial_not_connected'
+                ) and not await self._has_trial_connect_reminder(db, subscription):
                     pending.append(subscription)
             if not pending:
                 return
@@ -1799,6 +1897,10 @@ class MonitoringService:
                     )
                     continue
 
+                await db.execute(select(func.pg_advisory_xact_lock(0x544350, subscription.id)))
+                if await self._has_trial_connect_reminder(db, subscription):
+                    await db.commit()
+                    continue
                 if await self._send_trial_not_connected_notification(user, subscription):
                     await record_notification(db, user.id, subscription.id, 'trial_not_connected')
                     logger.info(
@@ -1806,6 +1908,7 @@ class MonitoringService:
                         telegram_id=user.telegram_id,
                     )
                     sent += 1
+                await db.commit()
 
             # Числа прохода в журнал мониторинга: у этого письма счётчик отправок в кабинете
             # стирается при продлении подписки, то есть ровно те, на ком оно сработало, из
@@ -3571,6 +3674,26 @@ class MonitoringService:
             )
             return False
 
+    @staticmethod
+    def _trial_connection_keyboard():
+        from aiogram.types import InlineKeyboardMarkup
+
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    build_miniapp_or_callback_button(
+                        text='📲 Подключиться',
+                        callback_data='subscription_connect',
+                        # 🔴 Явный адрес: без него кабинет уводит с /subscription на Главную,
+                        # где под нужной кнопкой стоит предложение купить подписку. Письмо
+                        # помощи застрявшему человеку не должно первым делом продавать.
+                        cabinet_path='/connection',
+                    )
+                ],
+                [build_miniapp_or_callback_button(text='💬 Написать в поддержку', callback_data='menu_support')],
+            ]
+        )
+
     async def _send_trial_not_connected_notification(self, user: User, subscription: Subscription) -> bool:
         """Письмо о том, что пробный идёт, а VPN не подключён.
 
@@ -3582,23 +3705,7 @@ class MonitoringService:
         try:
             message = NotificationSettingsService.text_for('TRIAL_NOT_CONNECTED_TEXT', TRIAL_NOT_CONNECTED_TEXT)
 
-            from aiogram.types import InlineKeyboardMarkup
-
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        build_miniapp_or_callback_button(
-                            text='📲 Подключиться',
-                            callback_data='subscription_connect',
-                            # 🔴 Явный адрес: без него кабинет уводит с /subscription на Главную,
-                            # где под нужной кнопкой стоит предложение купить подписку. Письмо
-                            # помощи застрявшему человеку не должно первым делом продавать.
-                            cabinet_path='/connection',
-                        )
-                    ],
-                    [build_miniapp_or_callback_button(text='💬 Написать в поддержку', callback_data='menu_support')],
-                ]
-            )
+            keyboard = self._trial_connection_keyboard()
 
             sent = await self._send_message_with_logo(
                 chat_id=user.telegram_id,
@@ -4512,6 +4619,12 @@ class MonitoringService:
                         await db.commit()
                     except Exception as e:
                         logger.error('Ошибка в SLA-проверке', error=e)
+                        await db.rollback()
+                    try:
+                        await self._check_trial_connect_reminders(db)
+                        await db.commit()
+                    except Exception as exc:
+                        logger.warning('Ошибка разбора напоминаний о подключении', error=str(exc))
                         await db.rollback()
             except asyncio.CancelledError:
                 break

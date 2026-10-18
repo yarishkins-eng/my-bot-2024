@@ -1,4 +1,5 @@
 {
+  "TRIAL_CONNECT_REMINDER": "🔌 <b>One step left</b>\n\nOpen {app} and tap the big round button. If your phone asks for permission, tap “Allow” and enter your passcode.",
   "ACCESS_DENIED": "❌ Access denied",
   "ADDON_INSUFFICIENT_FUNDS_MESSAGE": "⚠️ <b>Insufficient funds</b>\n\nService price: {required}\nBalance: {balance}\nMissing: {missing}\n\nChoose a top-up method. The amount will be filled in automatically.",
   "ADD_COUNTRIES_BUTTON": "🌐 Add countries",

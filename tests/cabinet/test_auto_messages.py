@@ -1074,3 +1074,57 @@ def test_not_connected_hours_are_clamped_to_their_own_ceiling() -> None:
     )
 
     NotificationSettingsService.set_trial_not_connected_after_hours(3)
+
+
+@pytest.mark.parametrize('minutes', [5, 60])
+@pytest.mark.asyncio
+async def test_connect_reminder_minutes_round_trip_and_counter(tmp_path, monkeypatch, minutes):
+    import json
+    from types import SimpleNamespace
+
+    from app.cabinet.routes import admin_auto_messages as route
+
+    storage = tmp_path / 'notification_settings.json'
+    storage.write_text(json.dumps({'trial_not_connected': {'enabled': True, 'not_connected_after_hours': 2}}))
+    monkeypatch.setattr(NotificationSettingsService, '_storage_path', storage)
+    monkeypatch.setattr(NotificationSettingsService, '_data', {})
+    monkeypatch.setattr(NotificationSettingsService, '_loaded', False)
+    monkeypatch.setattr(NotificationSettingsService, '_readonly', False)
+    assert NotificationSettingsService.is_enabled('trial_connect_reminder') is False
+    assert NotificationSettingsService.get_connect_reminder_minutes() == 15
+    assert NotificationSettingsService.get_trial_not_connected_after_hours() == 2
+    assert NotificationSettingsService.set_connect_reminder_minutes(minutes) is True
+    assert NotificationSettingsService.get_connect_reminder_minutes() == minutes
+    entry = CATALOG_BY_ID['trial-connect-reminder']
+    assert _params_for(entry) == {'connect_reminder_minutes': minutes}
+    assert _limits_for(entry) == {'connect_reminder_minutes': [5, 60]}
+    assert f'Через {minutes} мин' in _resolve_when(entry, _params_for(entry))
+    assert entry['sent_type'] == 'trial_connect_reminder'
+    item = route._build_item(entry, {}, {}, {('trial_connect_reminder', None): 17}, {})
+    assert item.sent_count == 17
+    monkeypatch.setattr(route, '_quiet_facts', AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(route, '_sent_counts', AsyncMock(return_value={}))
+    monkeypatch.setattr(route, '_claimed_counts', AsyncMock(return_value={}))
+    await route.patch_auto_message(
+        'trial-connect-reminder',
+        AutoMessagePatch(connect_reminder_minutes=minutes),
+        AsyncMock(),
+        SimpleNamespace(id=3),
+    )
+    assert NotificationSettingsService.get_connect_reminder_minutes() == minutes
+
+
+@pytest.mark.parametrize(
+    'payload',
+    [
+        {'connect_reminder_minutes': 4},
+        {'connect_reminder_minutes': 61},
+        {'connect_reminder_minutes': True},
+        {'connect_reminder_minutes': 15, 'unknown': 1},
+    ],
+)
+def test_connect_reminder_rejects_out_of_range_and_extra(payload):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        AutoMessagePatch(**payload)

@@ -654,13 +654,16 @@ async def test_real_where_excludes_team_even_when_its_trial_flag_and_dates_match
         )
 
         async def execute(statement):
+            if 'pg_advisory_xact_lock' in str(statement):
+                # WHERE исполняет SQLite; межсессионный PG-lock проверяется отдельной гонкой.
+                return None
             projected = select(Subscription.id).select_from(statement.get_final_froms()[0]).where(statement.whereclause)
             selected = [lookup[sub_id] for sub_id in connection.execute(projected).scalars()]
             return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: selected))
 
         service = _service()
         service._fetch_trial_panel_usage = AsyncMock(return_value={'panel-uuid-217': 0, 'team-profile': 0})
-        await service._check_trial_not_connected(SimpleNamespace(execute=execute))
+        await service._check_trial_not_connected(SimpleNamespace(execute=execute, commit=AsyncMock()))
 
     engine.dispose()
     service._send_trial_not_connected_notification.assert_awaited_once_with(trial.user, trial)

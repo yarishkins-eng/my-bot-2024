@@ -108,6 +108,7 @@ _NUMERIC_FIELDS: tuple[str, ...] = (
     'valid_hours',
     'trigger_days',
     'not_connected_after_hours',
+    'connect_reminder_minutes',
     'carrier',
     'audience',
     'post_trial_hours',
@@ -119,6 +120,7 @@ FIELD_TITLES: dict[str, str] = {
     'valid_hours': 'Сколько действует',
     'trigger_days': 'Через сколько дней',
     'not_connected_after_hours': 'Через сколько часов после начала',
+    'connect_reminder_minutes': 'Через сколько минут после появления устройства',
     'carrier': 'В каком письме',
     'audience': 'Кому',
     'post_trial_hours': 'Скидка действует после пробного',
@@ -240,11 +242,30 @@ AUTO_MESSAGE_CATALOG: list[dict[str, Any]] = [
         ],
     },
     {
+        'id': 'trial-connect-reminder',
+        'group': 'trial',
+        'title': 'Пробный: настройки есть, VPN не включён',
+        'when': (
+            'Через {connect_reminder_minutes} мин после появления устройства, если накопленный расход меньше 1 МБ. '
+            'С 00:00 до 08:00 МСК без звука.'
+        ),
+        'control': 'toggle',
+        'settings_key': 'trial_connect_reminder',
+        'params': ('connect_reminder_minutes',),
+        'sent_type': 'trial_connect_reminder',
+        'quiet_check': 'trial_tariff_marked',
+        'buttons': [
+            {'label': '📲 Подключиться', 'target': 'Кабинет, экран подключения', 'tracked': False},
+            {'label': '💬 Написать в поддержку', 'target': 'Кабинет, экран поддержки', 'tracked': False},
+        ],
+    },
+    {
         'id': 'trial-not-connected',
         'group': 'trial',
         'title': 'Пробный идёт, а VPN не подключён',
         'when': (
             'Через {not_connected_after_hours} после начала пробного — при накопленном расходе меньше 1 МБ. '
+            'Получившим напоминание «Остался один шаг» письмо не приходит. '
             'С 00:00 до 08:00 МСК без звука.'
         ),
         'control': 'toggle',
@@ -646,6 +667,7 @@ CATALOG_BY_ID = {entry['id']: entry for entry in AUTO_MESSAGE_CATALOG}
 # ограничитель диапазона. Общего set_field у сервиса нет, и обходить его записью
 # в файл нельзя — потеряются именно эти ограничители.
 SETTER_NAMES: dict[tuple[str, str], str] = {
+    ('trial_connect_reminder', 'connect_reminder_minutes'): 'set_connect_reminder_minutes',
     ('expired_second_wave', 'discount_percent'): 'set_second_wave_discount_percent',
     ('expired_second_wave', 'valid_hours'): 'set_second_wave_valid_hours',
     ('expired_third_wave', 'discount_percent'): 'set_third_wave_discount_percent',
@@ -662,6 +684,7 @@ SETTER_NAMES: dict[tuple[str, str], str] = {
 # и экран показывает ровно то число, которое применит бот. Чтение сырого JSON
 # показывало бы 0 там, где бот подставляет 2.
 GETTER_NAMES: dict[tuple[str, str], str] = {
+    ('trial_connect_reminder', 'connect_reminder_minutes'): 'get_connect_reminder_minutes',
     ('expired_second_wave', 'discount_percent'): 'get_second_wave_discount_percent',
     ('expired_second_wave', 'valid_hours'): 'get_second_wave_valid_hours',
     ('expired_third_wave', 'discount_percent'): 'get_third_wave_discount_percent',
@@ -835,6 +858,7 @@ class AutoMessagePatch(BaseModel):
     discount_percent: int | None = Field(default=None, strict=True)
     valid_hours: int | None = Field(default=None, ge=MIN_VALID_HOURS, le=MAX_VALID_HOURS)
     trigger_days: int | None = Field(default=None, ge=1, le=MAX_TRIGGER_DAYS)
+    connect_reminder_minutes: int | None = Field(default=None, ge=5, le=60, strict=True)
     not_connected_after_hours: int | None = Field(default=None, ge=MIN_NOT_CONNECTED_HOURS, le=MAX_NOT_CONNECTED_HOURS)
     carrier: int | None = Field(default=None, ge=0, le=48, strict=True)
     audience: int | None = Field(default=None, ge=0, le=1, strict=True)
@@ -1003,6 +1027,7 @@ def _resolve_when(entry: dict[str, Any], params: dict[str, int] | None) -> str:
     if '{warn_hours}' in when:
         hours = values.get('warn_hours')
         when = when.replace('{warn_hours}', format_hours_declension(hours) if hours else '—')
+    when = when.replace('{connect_reminder_minutes}', str(values.get('connect_reminder_minutes', '—')))
     if '{not_connected_after_hours}' in when:
         hours = values.get('not_connected_after_hours')
         when = when.replace('{not_connected_after_hours}', format_hours_declension(hours) if hours else '—')
@@ -1101,6 +1126,8 @@ def _limits_for(entry: dict[str, Any]) -> dict[str, list[int]] | None:
             bounds[name] = [TRIGGER_DAYS_MIN.get(key, 1), MAX_TRIGGER_DAYS]
         elif name == 'warn_hours':
             bounds[name] = [MIN_WARN_HOURS, MAX_WARN_HOURS]
+        elif name == 'connect_reminder_minutes':
+            bounds[name] = [5, 60]
         elif name == 'not_connected_after_hours':
             bounds[name] = [MIN_NOT_CONNECTED_HOURS, MAX_NOT_CONNECTED_HOURS]
     return bounds
@@ -1260,6 +1287,7 @@ def _build_item(
 #   * константа рядом с отправителем — 8 сообщений, которых в словаре нет вовсе.
 
 _LOCALE_TEXT_KEYS: dict[str, str] = {
+    'trial-connect-reminder': 'TRIAL_CONNECT_REMINDER',
     'trial-2h': 'TRIAL_ENDING_TEXT',
     'trial-2d': 'TRIAL_EXPIRING_48H',
     'trial-1d': 'TRIAL_EXPIRING_24H',
@@ -1391,6 +1419,7 @@ _WITH_LOGO_IDS = frozenset(
 
 
 _MARKER_HINTS: dict[str, tuple[str, str]] = {
+    'app': ('приложение новейшего устройства: INCY или Happ', 'INCY'),
     'amount': ('сумма списания', '199.00'),
     'balance': ('остаток на счету клиента', '340.00'),
     'days': ('на сколько дней продлили', '30'),
@@ -2256,6 +2285,8 @@ async def patch_auto_message(
     if 'trigger_days' in changes:
         min_days = TRIGGER_DAYS_MIN.get(settings_key, 1)
         _assert_in_range(changes['trigger_days'], min_days, MAX_TRIGGER_DAYS, FIELD_TITLES['trigger_days'])
+    if 'connect_reminder_minutes' in changes:
+        _assert_in_range(changes['connect_reminder_minutes'], 5, 60, FIELD_TITLES['connect_reminder_minutes'])
     if 'not_connected_after_hours' in changes:
         _assert_in_range(
             changes['not_connected_after_hours'],
