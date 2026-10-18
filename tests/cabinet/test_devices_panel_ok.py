@@ -72,6 +72,42 @@ def _patch_common(monkeypatch: pytest.MonkeyPatch, *, panel_uuid: str | None, de
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('agent', 'expected'),
+    [
+        ('INCY/2.1 (iOS)', 'INCY'),
+        ('Happ/3.0', 'Happ'),
+        ('  INCY extra/2 ', 'INCY'),
+        ('', None),
+        ('   ', None),
+        (None, None),
+    ],
+)
+async def test_device_app_from_user_agent(monkeypatch, agent, expected):
+    _patch_common(monkeypatch, panel_uuid='puuid-1')
+    row = {'hwid': 'h1', 'platform': 'iOS', 'deviceModel': 'iPhone', 'updatedAt': '2026-10-18T10:00:00Z'}
+    if agent is not None:
+        row['userAgent'] = agent
+    _install_service(monkeypatch, _FakeApi([row]))
+    result = await devices.get_devices(subscription_id=None, user=SimpleNamespace(id=1), db=object())
+    assert result == {
+        'devices': [
+            {
+                'hwid': 'h1',
+                'platform': 'iOS',
+                'device_model': 'iPhone',
+                'created_at': row['updatedAt'],
+                'app': expected,
+                'local_name': None,
+            }
+        ],
+        'total': 1,
+        'device_limit': 3,
+        'panel_ok': True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_panel_ok_true_when_account_not_provisioned(monkeypatch: pytest.MonkeyPatch) -> None:
     """No panel uuid (account not provisioned) is NOT a panel failure."""
     _patch_common(monkeypatch, panel_uuid=None, device_limit=2)
