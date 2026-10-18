@@ -214,6 +214,7 @@ async def get_devices(
                 platform = device.get('platform') or device.get('platformType') or 'Unknown'
                 model = device.get('deviceModel') or device.get('model') or device.get('name') or 'Unknown'
                 created_at = device.get('updatedAt') or device.get('lastSeen') or device.get('createdAt')
+                app_words = (device.get('userAgent') or '').strip().split('/', 1)[0].split()
 
                 formatted_devices.append(
                     {
@@ -221,6 +222,7 @@ async def get_devices(
                         'platform': platform,
                         'device_model': model,
                         'created_at': created_at,
+                        'app': app_words[0] if app_words else None,
                         # Локальное имя, заданное юзером. None — алиаса нет,
                         # фронт фоллбэчит на platform/device_model.
                         'local_name': aliases.get(hwid) or None,
