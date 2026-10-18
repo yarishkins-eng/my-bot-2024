@@ -19,6 +19,7 @@ from app.config import settings
 
 
 logger = structlog.get_logger(__name__)
+VPN_USED_MIN_BYTES = 1_000_000
 
 
 class UserStatus(Enum):
