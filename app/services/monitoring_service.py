@@ -1720,31 +1720,42 @@ class MonitoringService:
 
     async def _has_trial_connect_reminder(self, db, subscription) -> bool:
         if await notification_sent(db, subscription.user.id, subscription.id, 'trial_connect_reminder'):
-            logger.info('trial_not_connected_skipped_reminder', subscription_id=subscription.id, reason='sent')
+            logger.debug('trial_not_connected_skipped_reminder', subscription_id=subscription.id, reason='sent')
             return True
         if not NotificationSettingsService.is_enabled('trial_connect_reminder'):
             return False
         uuid = subscription.remnawave_uuid or subscription.user.remnawave_uuid
-        due = await trial_connect_queue('zscore', uuid) if uuid else None
+        try:
+            async with asyncio.timeout(0.25):
+                due = await trial_connect_queue('zscore', uuid) if uuid else None
+        except TimeoutError:
+            due = None
         live = due is not None and time.time() <= float(due) + MAX_LATENESS
         if live:
-            logger.info('trial_not_connected_skipped_reminder', subscription_id=subscription.id, reason='queued')
+            logger.debug('trial_not_connected_skipped_reminder', subscription_id=subscription.id, reason='queued')
         return live
 
     async def _check_trial_connect_reminders(self, db):
         due = await trial_connect_queue('zrangebyscore', '-inf', time.time(), start=0, num=3, withscores=True)
         for raw, due_at in due or []:
-            uuid = raw.decode() if isinstance(raw, bytes) else raw
+            uuid = raw
+            info, reason = {'user_id': None}, 'stale'
             try:
-                async with asyncio.timeout(15):
-                    if time.time() <= float(due_at) + MAX_LATENESS:
-                        await self._send_trial_connect_reminder(db, uuid)
-                    await db.commit()
+                uuid = raw.decode() if isinstance(raw, bytes) else raw
+                if time.time() <= float(due_at) + MAX_LATENESS:
+                    reason = await self._send_trial_connect_reminder(db, uuid, info)
+                else:
+                    async with asyncio.timeout(15):
+                        user = await get_user_by_remnawave_uuid(db, uuid)
+                        info['user_id'] = user.id if user else None
+                await db.commit()
             except Exception as exc:
+                reason = 'timeout' if isinstance(exc, TimeoutError) else 'error'
                 await db.rollback()
-                logger.warning('Напоминание о подключении пропущено', error=str(exc))
             finally:
                 await trial_connect_queue('zrem', uuid)
+                if reason:
+                    logger.info('trial_connect_reminder_skipped', reason=reason, user_id=info['user_id'])
 
     @staticmethod
     async def _trial_connect_eligible(db, user, subscription, uuid):
@@ -1761,51 +1772,56 @@ class MonitoringService:
             or not await is_canonical_trial(db, subscription)
         )
 
-    async def _send_trial_connect_reminder(self, db, uuid):
-        if not self.bot or not NotificationSettingsService.is_enabled('trial_connect_reminder'):
-            return
-        user = await get_user_by_remnawave_uuid(db, uuid)
-        subscription = user.subscription if user else None
-        if not await self._trial_connect_eligible(db, user, subscription, uuid):
-            return
-        # Общая транзакционная блокировка двух писем держится до записи отметки.
-        await db.execute(select(func.pg_advisory_xact_lock(0x544350, subscription.id)))
-        for kind in ('trial_connect_reminder', 'trial_not_connected'):
-            if await notification_sent(db, user.id, subscription.id, kind):
-                return
-        async with RemnaWaveService().get_api_client() as api:
-            traffic = await api.get_user_lifetime_traffic_once(uuid)
-            if traffic is None or traffic >= VPN_USED_MIN_BYTES:
-                return
-            devices = (await api.get_user_devices_all(uuid))['devices']
-        if not devices:
-            return
-        newest = max(devices, key=lambda d: datetime.fromisoformat(d['createdAt'].replace('Z', '+00:00')).timestamp())
-        app = {'incy': 'INCY', 'happ': 'Happ'}.get((device_app_name(newest) or '').lower())
-        await db.refresh(user, ['status', 'test_reset_state', 'telegram_id', 'remnawave_uuid'])
-        await db.refresh(
-            subscription, ['status', 'is_trial', 'tariff_id', 'connected_squads', 'end_date', 'remnawave_uuid']
-        )
-        if not await self._trial_connect_eligible(db, user, subscription, uuid):
-            return
-        if (
-            not app
-            or not NotificationSettingsService.is_enabled('trial_connect_reminder')
-            or await trial_connect_queue('zrem', uuid) != 1
-        ):
-            return
+    async def _send_trial_connect_reminder(self, db, uuid, info):
+        async with asyncio.timeout(15):
+            user = await get_user_by_remnawave_uuid(db, uuid)
+            info['user_id'] = user.id if user else None
+            if not self.bot or not NotificationSettingsService.is_enabled('trial_connect_reminder'):
+                return 'disabled'
+            subscription = user.subscription if user else None
+            if not await self._trial_connect_eligible(db, user, subscription, uuid):
+                return 'conditions'
+            # Общая транзакционная блокировка двух писем держится до записи отметки.
+            await db.execute(select(func.pg_advisory_xact_lock(0x544350, subscription.id)))
+            for kind in ('trial_connect_reminder', 'trial_not_connected'):
+                if await notification_sent(db, user.id, subscription.id, kind):
+                    return 'notified'
+            async with RemnaWaveService().get_api_client() as api:
+                traffic = await api.get_user_lifetime_traffic_once(uuid)
+                if traffic is None or traffic >= VPN_USED_MIN_BYTES:
+                    return 'traffic_unknown' if traffic is None else 'traffic_used'
+                devices = (await api.get_user_devices_all(uuid))['devices']
+            if not devices:
+                return 'devices'
+            newest = max(
+                devices, key=lambda d: datetime.fromisoformat(d['createdAt'].replace('Z', '+00:00')).timestamp()
+            )
+            app = {'incy': 'INCY', 'happ': 'Happ'}.get((device_app_name(newest) or '').lower())
+            await db.refresh(user, ['status', 'test_reset_state', 'telegram_id', 'remnawave_uuid'])
+            await db.refresh(
+                subscription, ['status', 'is_trial', 'tariff_id', 'connected_squads', 'end_date', 'remnawave_uuid']
+            )
+            if not await self._trial_connect_eligible(db, user, subscription, uuid):
+                return 'conditions'
+            if not app:
+                return 'application'
+            if not NotificationSettingsService.is_enabled('trial_connect_reminder'):
+                return 'disabled'
+        if await trial_connect_queue('zrem', uuid) != 1:
+            return 'claimed'
         message = get_texts(user.language or 'ru').t('TRIAL_CONNECT_REMINDER').format(app=app)
         await self.bot.send_message(
             chat_id=user.telegram_id,
             text=message,
             parse_mode='HTML',
-            reply_markup=self._trial_connection_keyboard(),
+            reply_markup=self._trial_connection_keyboard(user.language or 'ru'),
             disable_notification=is_quiet_night(),
         )
         await record_notification(db, user.id, subscription.id, 'trial_connect_reminder')
         await self._log_monitoring_event(
             db, 'trial_connect_reminder_notifications_sent', 'Отправлено напоминание о подключении', {'sent': 1}
         )
+        return None
 
     async def _check_trial_not_connected(self, db: AsyncSession):
         """Помощь каноническому пробному с накопленным расходом меньше 1 МБ (1 000 000 байт)."""
@@ -3702,14 +3718,15 @@ class MonitoringService:
             return False
 
     @staticmethod
-    def _trial_connection_keyboard():
+    def _trial_connection_keyboard(language=None):
+        texts = get_texts(language) if language else None
         from aiogram.types import InlineKeyboardMarkup
 
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     build_miniapp_or_callback_button(
-                        text='📲 Подключиться',
+                        text=texts.t('TRIAL_CONNECT_REMINDER_BUTTON') if texts else '📲 Подключиться',
                         callback_data='subscription_connect',
                         # 🔴 Явный адрес: без него кабинет уводит с /subscription на Главную,
                         # где под нужной кнопкой стоит предложение купить подписку. Письмо
@@ -3717,7 +3734,12 @@ class MonitoringService:
                         cabinet_path='/connection',
                     )
                 ],
-                [build_miniapp_or_callback_button(text='💬 Написать в поддержку', callback_data='menu_support')],
+                [
+                    build_miniapp_or_callback_button(
+                        text=texts.t('CONTACT_SUPPORT') if texts else '💬 Написать в поддержку',
+                        callback_data='menu_support',
+                    )
+                ],
             ]
         )
 

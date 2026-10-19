@@ -264,18 +264,21 @@ async def test_limit_three_and_record_timeout(wired, monkeypatch):
     await w.service._check_trial_connect_reminders(w.db)
     assert w.service._send_trial_connect_reminder.await_count == 3
     assert len(w.queue.items) == 4
-    # Exercise the real timeout context, without waiting 15 seconds.
+    # The real sender times only preflight, not a replacement mock.
     contexts = []
     real_timeout = asyncio.timeout
     monkeypatch.setattr(m.asyncio, 'timeout', lambda seconds: (contexts.append(seconds), real_timeout(0.001))[1])
+    w.service._send_trial_connect_reminder = m.MonitoringService._send_trial_connect_reminder.__get__(w.service)
+    w.queue.items = {w.user.remnawave_uuid: m.time.time() - 1}
 
     async def slow(*args):
         await asyncio.sleep(0.01)
 
-    w.service._send_trial_connect_reminder.side_effect = slow
+    w.api.get_user_devices_all.side_effect = slow
     await w.service._check_trial_connect_reminders(w.db)
-    assert contexts == [15, 15, 15]
-    assert len(w.queue.items) == 1
+    assert contexts == [15]
+    assert not w.queue.items
+    w.service.bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -521,7 +524,7 @@ async def test_letter_skip_has_a_subscription_log(wired, monkeypatch, reason):
     if reason == 'sent':
         w.marks.add('trial_connect_reminder')
     info = Mock()
-    monkeypatch.setattr(m.logger, 'info', info)
+    monkeypatch.setattr(m.logger, 'debug', info)
     assert await w.service._has_trial_connect_reminder(w.db, w.sub) is True
     info.assert_called_once_with('trial_not_connected_skipped_reminder', subscription_id=w.sub.id, reason=reason)
 
@@ -563,3 +566,177 @@ async def test_runtime_state_is_refreshed_after_panel_io(wired, change):
     w.record.assert_not_awaited()
     assert not w.queue.items
     assert w.db.refresh.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_delivery_and_record_survive_preflight_timeout_budget(wired, monkeypatch):
+    w = wired
+    original_timeout = asyncio.timeout
+    monkeypatch.setattr(m.asyncio, 'timeout', lambda seconds: original_timeout(0.001))
+
+    async def send(**kwargs):
+        await asyncio.sleep(0.02)
+        return Ns(message_id=42)
+
+    async def record(db, uid, sid, kind):
+        await asyncio.sleep(0.02)
+        w.marks.add(kind)
+
+    w.service.bot.send_message.side_effect = send
+    w.record.side_effect = record
+    await w.service._check_trial_connect_reminders(w.db)
+    w.service.bot.send_message.assert_awaited_once()
+    w.record.assert_awaited_once()
+    assert w.marks == {'trial_connect_reminder'}
+    assert not w.queue.items
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'case,reason,known_user',
+    [
+        ('stale', 'stale', True),
+        ('traffic', 'traffic_used', True),
+        ('unknown', 'traffic_unknown', True),
+        ('application', 'application', True),
+        ('conditions', 'conditions', True),
+        ('mark', 'notified', True),
+        ('disabled', 'disabled', True),
+        ('error', 'error', True),
+        ('missing', 'conditions', False),
+        ('devices', 'devices', True),
+        ('claimed', 'claimed', True),
+        ('timeout', 'timeout', True),
+    ],
+)
+async def test_each_discard_has_one_private_reason(wired, monkeypatch, case, reason, known_user):
+    from unittest.mock import Mock
+
+    w = wired
+    if case == 'stale':
+        w.queue.items[w.user.remnawave_uuid] = m.time.time() - 1801
+    if case == 'traffic':
+        w.api.get_user_lifetime_traffic_once.return_value = VPN_USED_MIN_BYTES
+    if case == 'unknown':
+        w.api.get_user_lifetime_traffic_once.return_value = None
+    if case == 'application':
+        w.api.get_user_devices_all.return_value = {
+            'devices': [{'createdAt': '2026-10-18T15:00:00Z', 'userAgent': 'Other/1'}]
+        }
+    if case == 'conditions':
+        w.sub.is_trial = False
+    if case == 'mark':
+        w.marks.add('trial_not_connected')
+    if case == 'disabled':
+        w.flags['trial_connect_reminder'] = False
+    if case == 'error':
+        w.api.get_user_devices_all.side_effect = OSError(w.user.remnawave_uuid)
+    if case == 'missing':
+        monkeypatch.setattr(m, 'get_user_by_remnawave_uuid', AsyncMock(return_value=None))
+    if case == 'devices':
+        w.api.get_user_devices_all.return_value = {'devices': []}
+    if case == 'claimed':
+        data = w.api.get_user_devices_all.return_value
+
+        async def devices(uuid):
+            w.queue.items.clear()
+            return data
+
+        w.api.get_user_devices_all.side_effect = devices
+    if case == 'timeout':
+        real_timeout = asyncio.timeout
+        monkeypatch.setattr(m.asyncio, 'timeout', lambda seconds: real_timeout(0.001))
+
+        async def slow(uuid):
+            await asyncio.sleep(0.02)
+
+        w.api.get_user_devices_all.side_effect = slow
+    info = Mock()
+    monkeypatch.setattr(m.logger, 'info', info)
+    await w.service._check_trial_connect_reminders(w.db)
+    info.assert_called_once_with(
+        'trial_connect_reminder_skipped', reason=reason, user_id=w.user.id if known_user else None
+    )
+    assert w.user.remnawave_uuid not in repr(info.call_args_list)
+    assert not w.queue.items
+    w.service.bot.send_message.assert_not_awaited()
+    w.record.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_english_reminder_buttons_and_unchanged_old_letter(wired):
+    w = wired
+    w.user.language = 'en'
+    await w.service._check_trial_connect_reminders(w.db)
+    payload = w.service.bot.send_message.await_args.kwargs
+    assert 'One step left' in payload['text']
+    labels = [button.text for row in payload['reply_markup'].inline_keyboard for button in row]
+    assert labels == ['📲 Connect', '💬 Contact support']
+    old = [button.text for row in w.service._trial_connection_keyboard().inline_keyboard for button in row]
+    assert old == ['📲 Подключиться', '💬 Написать в поддержку']
+
+
+@pytest.mark.asyncio
+async def test_redis_warning_only_enabled_once_per_ten_minutes(wired, monkeypatch):
+    from unittest.mock import Mock
+
+    w = wired
+    w.queue.broken = True
+    clock = [0]
+    monkeypatch.setattr(q, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(q, '_last_warning', float('-inf'))
+    warning = Mock()
+    monkeypatch.setattr(q.logger, 'warning', warning)
+    w.flags['trial_connect_reminder'] = False
+    assert await q.trial_connect_queue('zscore', w.user.remnawave_uuid) is None
+    warning.assert_not_called()
+    w.flags['trial_connect_reminder'] = True
+    for tick in [0, 1, 60, 599, 600, 601]:
+        clock[0] = tick
+        assert await q.trial_connect_queue('zscore', w.user.remnawave_uuid) is None
+    assert warning.call_count == 2
+    assert all(
+        call.args == ('trial_connect_reminder_redis_unavailable',) and not call.kwargs
+        for call in warning.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_redis_lookup_timeout_allows_the_old_letter(wired, monkeypatch):
+    w = wired
+
+    async def slow(*args):
+        await asyncio.sleep(0.02)
+
+    w.queue.zscore = slow
+    real_timeout = asyncio.timeout
+    budgets = []
+    monkeypatch.setattr(m.asyncio, 'timeout', lambda seconds: (budgets.append(seconds), real_timeout(0.001))[1])
+    w.db.execute.return_value = Ns(scalars=lambda: Ns(all=lambda: [w.sub]))
+    w.service._fetch_trial_panel_usage = AsyncMock(return_value={w.user.remnawave_uuid: 0})
+    w.service._send_trial_not_connected_notification = AsyncMock(return_value=True)
+    await w.service._check_trial_not_connected(w.db)
+    assert budgets == [0.25, 0.25]
+    w.service._fetch_trial_panel_usage.assert_awaited_once()
+    w.service._send_trial_not_connected_notification.assert_awaited_once()
+
+
+def test_card_explains_new_devices_only():
+    from app.cabinet.routes.admin_auto_messages import CATALOG_BY_ID, _params_for, _resolve_when
+
+    entry = CATALOG_BY_ID['trial-connect-reminder']
+    assert 'Действует для устройств, добавленных после включения.' in _resolve_when(entry, _params_for(entry))
+
+
+@pytest.mark.asyncio
+async def test_malformed_queue_member_is_removed_and_logged(wired, monkeypatch):
+    from unittest.mock import Mock
+
+    w = wired
+    w.queue.items = {bytes([255]): m.time.time() - 1}
+    info = Mock()
+    monkeypatch.setattr(m.logger, 'info', info)
+    await w.service._check_trial_connect_reminders(w.db)
+    info.assert_called_once_with('trial_connect_reminder_skipped', reason='error', user_id=None)
+    assert not w.queue.items
+    w.service.bot.send_message.assert_not_awaited()
