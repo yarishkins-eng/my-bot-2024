@@ -104,7 +104,7 @@ from app.utils.pricing_utils import (
     calculate_prorated_price,
     format_period_description,
 )
-from app.utils.promo_offer import get_user_active_promo_discount_percent
+from app.utils.promo_offer import active_personal_discount_notice, get_user_active_promo_discount_percent
 from app.utils.subscription_utils import get_happ_cryptolink_redirect_link
 from app.utils.telegram_webapp import (
     TelegramWebAppAuthError,
@@ -4447,6 +4447,11 @@ async def claim_promo_offer(
             status.HTTP_400_BAD_REQUEST,
             detail={'code': 'invalid_discount', 'message': 'Offer does not contain discount'},
         )
+
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    await db.refresh(user, attribute_names=['promo_offer_discount_percent', 'promo_offer_discount_expires_at'])
+    if notice := active_personal_discount_notice(user):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={'code': 'active_discount_exists', 'message': notice})
 
     user.promo_offer_discount_percent = discount_percent
     user.promo_offer_discount_source = offer.notification_type

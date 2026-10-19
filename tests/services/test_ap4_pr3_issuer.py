@@ -332,7 +332,9 @@ async def test_all_three_carriers_and_switches_bind_to_real_window(setup, carrie
     assert await service.prepare_trial_ending_discount(**args) is not None
 
 
-async def test_all_audience_and_owner_stand_override(setup):
+async def test_all_audience_and_owner_stand_override(setup, monkeypatch):
+    # This regression covers the retained stands fallback, not the new all default.
+    monkeypatch.setattr(service, 'TRIAL_ENDING_DISCOUNT_ROLLOUT', 'stands')
     db, config, args, _seen = setup
     config['audience'] = 0
     args['lifetime_bytes'] = None

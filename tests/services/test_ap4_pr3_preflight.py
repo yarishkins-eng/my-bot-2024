@@ -115,7 +115,7 @@ async def test_three_second_budget_cancels_client_or_get_and_never_issues(monkey
     issue = AsyncMock()
     monkeypatch.setattr(issuer, 'prepare_trial_ending_discount', issue)
     monitor = m.MonitoringService.__new__(m.MonitoringService)
-    monitor.subscription_service = SimpleNamespace(get_api_client=Client)
+    monkeypatch.setattr(m, 'SubscriptionService', lambda: SimpleNamespace(get_api_client=Client))
     assert (
         await asyncio.wait_for(monitor.prepare_trial_discount(SimpleNamespace(dirty=set()), user, sub, 24), timeout=1)
         is None

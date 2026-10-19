@@ -74,6 +74,8 @@ def test_master_switch_gates_the_new_card_and_rollout_note_comes_from_constant(p
     monkeypatch.setattr(Settings, 'are_notifications_globally_enabled', classmethod(lambda _: False))
     assert api._state_of(entry, {}, {}) == ('quiet', 'уведомления выключены в настройках бота', None)
     monkeypatch.setattr(Settings, 'are_notifications_globally_enabled', classmethod(lambda _: True))
+    assert api._state_of(entry, {}, {}) == ('live', None, None)
+    monkeypatch.setattr(rollout, 'TRIAL_ENDING_DISCOUNT_ROLLOUT', 'stands')
     assert api._state_of(entry, {}, {}) == ('live', None, 'Пока только тестовым аккаунтам')
     monkeypatch.setattr(rollout, 'TRIAL_ENDING_DISCOUNT_ROLLOUT', 'all')
     assert api._state_of(entry, {}, {}) == ('live', None, None)

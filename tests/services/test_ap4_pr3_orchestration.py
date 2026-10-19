@@ -72,7 +72,7 @@ async def test_payload_reader_is_strict_and_bound_before_network(monkeypatch, ra
         async def __aexit__(self, *args):
             pass
 
-    monitor.subscription_service = SimpleNamespace(get_api_client=lambda: Client())
+    monkeypatch.setattr(module, 'SubscriptionService', lambda: SimpleNamespace(get_api_client=Client))
     monkeypatch.setattr(module, 'get_trial_tariff', AsyncMock(return_value=SimpleNamespace(id=sub.tariff_id)))
     monkeypatch.setattr(
         NotificationSettingsService,

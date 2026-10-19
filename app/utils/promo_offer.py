@@ -4,6 +4,7 @@ import html
 import math
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +18,23 @@ def _escape_format_braces(text: str) -> str:
     """Escape braces so str.format treats them as literals."""
 
     return text.replace('{', '{{').replace('}', '}}')
+
+
+def has_active_personal_discount(user: User) -> bool:
+    percent = getattr(user, 'promo_offer_discount_percent', 0) or 0
+    expires = getattr(user, 'promo_offer_discount_expires_at', None)
+    return percent > 0 and (expires is None or expires > datetime.now(UTC))
+
+
+def active_personal_discount_notice(user: User) -> str | None:
+    from app.localization.texts import get_texts
+
+    if not has_active_personal_discount(user):
+        return None
+    expires = user.promo_offer_discount_expires_at
+    date = expires.astimezone(ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y, %H:%M') if expires else ''
+    key = 'DISCOUNT_CLAIM_ACTIVE_WITH_EXPIRY' if expires else 'DISCOUNT_CLAIM_ACTIVE'
+    return get_texts(user.language).t(key).format(percent=user.promo_offer_discount_percent, expires_at=date)
 
 
 def get_user_active_promo_discount_percent(user: User | None) -> int:
