@@ -1,4 +1,7 @@
 {
+  "DISCOUNT_CLAIM_ACTIVE": "У вас уже действует скидка −{percent}%.",
+  "DISCOUNT_CLAIM_ACTIVE_WITH_EXPIRY": "У вас уже действует скидка −{percent}% до {expires_at} (МСК).",
+  "TRIAL_DISCOUNT_STILL_VALID": "🎁 Скидка −{percent}% ещё действует{until}: {price}.",
   "ACCESS_DENIED": "❌ Доступ запрещен",
   "ADDON_INSUFFICIENT_FUNDS_MESSAGE": "⚠️ <b>Недостаточно средств</b>\n\nСтоимость услуги: {required}\nНа балансе: {balance}\nНе хватает: {missing}\n\nВыберите способ пополнения. Сумма подставится автоматически.",
   "ADD_COUNTRIES_BUTTON": "🌐 Добавить страны",

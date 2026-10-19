@@ -1128,8 +1128,10 @@ def _discount_context() -> dict[str, Any]:
     from app.services.trial_ending_discount_service import TRIAL_ENDING_DISCOUNT_ROLLOUT
 
     config = NotificationSettingsService.get_trial_ending_discount_settings()
+    carrier_id = {0: 'trial-2h', 24: 'trial-1d', 48: 'trial-2d'}[config['carrier']]
     return {
-        'carrier_id': {0: 'trial-2h', 24: 'trial-1d', 48: 'trial-2d'}[config['carrier']],
+        'carrier_id': carrier_id,
+        'carrier_title': CATALOG_BY_ID[carrier_id]['title'],
         'percent': config['discount_percent'],
         'enabled': config['enabled'],
         'legacy_enabled': NotificationSettingsService.is_enabled('trial_expired_discount'),
@@ -1832,6 +1834,13 @@ async def get_auto_message(
                     label='🎁 Оформить со скидкой', target='Кабинет, касса; при личной скидке', tracked=False
                 ),
             )
+    order = ['trial-2d', 'trial-1d', 'trial-2h', 'trial-expired']
+    if context['enabled'] and message_id in order and order.index(message_id) > order.index(context['carrier_id']):
+        _, options = await _discount_examples(db)
+        if options:
+            for insert in text_facts['text_inserts']:
+                if insert.name == 'price_lines':
+                    insert.variants.extend(_discount_previews(options, short=True))
     return AutoMessageDetail(
         **item.model_dump(),
         **text_facts,
@@ -2006,6 +2015,7 @@ async def _trial_discount_stats(
                     User.status.is_distinct_from('deleted'),
                     SubscriptionCheckout.fulfilled_at >= since,
                     SubscriptionCheckout.fulfilled_at <= now,
+                    SubscriptionCheckout.sale_snapshot['promo_offer_source'].as_string() == 'trial_ending_discount',
                     SubscriptionCheckout.funding_state == 'funded',
                     SubscriptionCheckout.fulfillment_state == 'fulfilled',
                     SubscriptionCheckout.lifecycle_state.in_(('fulfilling', 'ready')),
@@ -2030,13 +2040,14 @@ async def _trial_discount_stats(
     def money(value):
         return settings.format_price(value, round_kopeks=False)
 
-    prefix = 'Тестовые аккаунты' if stands else f'С {since.astimezone(ZoneInfo("Europe/Moscow")):%d.%m.%Y}'
+    first = min((row[1] for row in offers), default=since)
+    prefix = 'Тестовые аккаунты' if stands else f'С {first.astimezone(ZoneInfo("Europe/Moscow")):%d.%m.%Y}'
     note = f'{prefix}: получили {len(delivered)} · купили со скидкой {len(totals)}'
     if totals:
         note += f' · заплатили {money(sum(totals))} · скидок на {money(sum(savings))}'
     note += '.'
     if not stands:
-        if not delivered and not totals:
+        if not offers:
             note = 'Клиенты скидку ещё не получали.'
         elif NotificationSettingsService.get_trial_ending_discount_audience() == 1:
             note += ' Раньше из включавших VPN платили около 27 из 100'
@@ -2087,13 +2098,22 @@ async def _discount_item(db: AsyncSession, item: AutoMessageItem, *, with_count:
     return item
 
 
-def _discount_previews(options: dict) -> list[AutoMessageInsertVariant]:
+def _discount_previews(options: dict, *, short: bool = False) -> list[AutoMessageInsertVariant]:
     from copy import deepcopy
 
     from app.localization.texts import get_texts
     from app.services.monitoring_service import format_trial_discount_lines, format_trial_regular_price_lines
 
     config = NotificationSettingsService.get_trial_ending_discount_settings()
+    if short:
+        return [
+            AutoMessageInsertVariant(
+                text=format_trial_discount_lines(
+                    options, SimpleNamespace(balance_kopeks=0), get_texts('ru'), short=True
+                ),
+                when=f'скидку уже получил в письме «{_discount_context()["carrier_title"]}»',
+            )
+        ]
     result = []
     examples = [(0, True, 'баланса нет'), (5000, True, 'есть баланс')]
     if config['audience'] == 1:

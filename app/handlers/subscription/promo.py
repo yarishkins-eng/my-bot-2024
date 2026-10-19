@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -20,6 +21,7 @@ from app.utils.pricing_utils import (
     format_period_description,
 )
 from app.utils.promo_offer import (
+    active_personal_discount_notice,
     build_promo_offer_hint,
 )
 from app.utils.timezone import format_local_datetime
@@ -222,6 +224,12 @@ async def claim_discount_offer(
             texts.get('DISCOUNT_CLAIM_ERROR', '❌ Не удалось активировать скидку. Попробуйте позже.'),
             show_alert=True,
         )
+        return
+
+    await db.execute(select(User.id).where(User.id == db_user.id).with_for_update())
+    await db.refresh(db_user, attribute_names=['promo_offer_discount_percent', 'promo_offer_discount_expires_at'])
+    if notice := active_personal_discount_notice(db_user):
+        await callback.answer(notice, show_alert=True)
         return
 
     db_user.promo_offer_discount_percent = discount_percent

@@ -75,7 +75,7 @@ from app.utils.cache import cache
 from app.utils.grace import is_grace_eligible, is_in_grace
 from app.utils.message_patch import caption_exceeds_telegram_limit
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
-from app.utils.promo_offer import get_user_active_promo_discount_percent
+from app.utils.promo_offer import get_user_active_promo_discount_percent, has_active_personal_discount
 from app.utils.subscription_utils import (
     resolve_hwid_device_limit_for_payload,
 )
@@ -357,7 +357,7 @@ class TrialDiscountPriceLines(str):  # noqa: SLOT000 -- str subclasses need a di
 
 
 def format_trial_discount_lines(
-    options: dict, user: User, texts, lifetime_bytes: int | None = None, *, claim: bool = False
+    options: dict, user: User, texts, lifetime_bytes: int | None = None, *, claim: bool = False, short: bool = False
 ) -> str:
     from app.services.device_first_checkout_service import device_first_top_up_kopeks
 
@@ -371,7 +371,7 @@ def format_trial_discount_lines(
     month = cells.get(30) or {}
     breakdown = month.get('breakdown') or {}
     offer = breakdown.get('promo_offer') or {}
-    if not month.get('price_kopeks') or not breakdown.get('promo_offer_discount_kopeks') or not offer:
+    if not month.get('price_kopeks') or (breakdown.get('promo_offer_discount_kopeks') or 0) <= 0 or not offer:
         return ''
     english = texts.language.lower().split('-')[0] == 'en'
     deadline = offer.get('expires_at')
@@ -404,6 +404,10 @@ def format_trial_discount_lines(
         saving = (cell.get('breakdown') or {}).get('promo_offer_discount_kopeks')
         if net and saving:
             line = texts.t('TRIAL_DISCOUNT_PRICE').format(term=label, net=money(net), before=money(net + saving))
+            if short and not claim and days == 30:
+                return texts.t('TRIAL_DISCOUNT_STILL_VALID').format(
+                    percent=offer['discount_percent'], until=until, price=line
+                )
             if days == 30 and not claim:
                 if balance >= net:
                     line += f' ({texts.t("TRIAL_DISCOUNT_FUNDED")})'
@@ -1465,7 +1469,7 @@ class MonitoringService:
         lifetime = lifetime if type(lifetime) is int and lifetime >= 0 else None
         try:
             if lifetime is None and config['audience'] == 1:
-                async with asyncio.timeout(3), self.subscription_service.get_api_client() as api:
+                async with asyncio.timeout(3), SubscriptionService().get_api_client() as api:
                     lifetime = await api.get_user_lifetime_traffic_once(panel_uuid)
             prepared = await issuer.prepare_trial_ending_discount(
                 user_id=user.id,
@@ -2397,6 +2401,17 @@ class MonitoringService:
                 if await notification_sent(db, user.id, subscription.id, 'trial_expired_discount'):
                     continue
 
+                await db.refresh(
+                    user, attribute_names=['promo_offer_discount_percent', 'promo_offer_discount_expires_at']
+                )
+                if has_active_personal_discount(user):
+                    logger.info(
+                        'trial_expired_discount_postponed',
+                        user_id=user.id,
+                        percent=user.promo_offer_discount_percent,
+                        expires_at=user.promo_offer_discount_expires_at,
+                    )
+                    continue
                 processed_users.add(user.id)
                 offer = await upsert_discount_offer(
                     db,
@@ -3146,14 +3161,13 @@ class MonitoringService:
             async with db.begin_nested():
                 options = await build_purchase_options(db, user, subscription=subscription)
                 texts = get_texts(language or user.language)
-                discount_lines = format_trial_discount_lines(options, user, texts, lifetime_bytes, claim=claim)
-                if discount_lines:
-                    lines = TrialDiscountPriceLines(discount_lines)
-                    if getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount':
-                        from app.database.models import DiscountOffer
+                offer_id, extra = None, {}
+                if getattr(user, 'promo_offer_discount_source', None) == 'trial_ending_discount':
+                    from app.database.models import DiscountOffer
 
-                        lines.offer_id = await db.scalar(
-                            select(DiscountOffer.id)
+                    row = (
+                        await db.execute(
+                            select(DiscountOffer.id, DiscountOffer.extra_data)
                             .where(
                                 DiscountOffer.user_id == user.id,
                                 DiscountOffer.notification_type == 'trial_ending_discount',
@@ -3162,6 +3176,19 @@ class MonitoringService:
                             )
                             .limit(1)
                         )
+                    ).first()
+                    if row:
+                        offer_id, extra = row
+                short = bool(isinstance(extra, dict) and extra.get('delivered_at'))
+                discount_lines = format_trial_discount_lines(
+                    options, user, texts, lifetime_bytes, claim=claim, short=short
+                )
+                if discount_lines:
+                    lines = TrialDiscountPriceLines(discount_lines)
+                    lines.offer_id = offer_id
+                    logger.info(
+                        'trial_discount_lines', variant='short' if short and not claim else 'full', offer_id=offer_id
+                    )
                     return lines
             if claim:
                 return ''

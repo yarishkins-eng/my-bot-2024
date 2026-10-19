@@ -22,6 +22,7 @@ from app.database.models import DiscountOffer, User
 from app.handlers.subscription.common import _format_text_with_placeholders
 from app.localization.texts import get_texts
 from app.services.promo_offer_service import promo_offer_service
+from app.utils.promo_offer import active_personal_discount_notice
 from app.utils.timezone import format_local_datetime
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
@@ -368,6 +369,11 @@ async def claim_promo_offer(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Invalid offer',
         )
+
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    await db.refresh(user, attribute_names=['promo_offer_discount_percent', 'promo_offer_discount_expires_at'])
+    if notice := active_personal_discount_notice(user):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=notice)
 
     user.promo_offer_discount_percent = discount_percent
     user.promo_offer_discount_source = offer.notification_type

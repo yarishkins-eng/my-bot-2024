@@ -1,4 +1,7 @@
 {
+  "DISCOUNT_CLAIM_ACTIVE": "You already have a −{percent}% discount.",
+  "DISCOUNT_CLAIM_ACTIVE_WITH_EXPIRY": "You already have a −{percent}% discount until {expires_at} (MSK).",
+  "TRIAL_DISCOUNT_STILL_VALID": "🎁 Your −{percent}% discount is still valid{until}: {price}.",
   "ACCESS_DENIED": "❌ دسترسی غیرمجاز",
   "ADDON_INSUFFICIENT_FUNDS_MESSAGE": "⚠️ <b>موجودی ناکافی</b>\n\nهزینه: {required}\nموجودی: {balance}\nکسری: {missing}\n\nروش شارژ را انتخاب کنید.",
   "ADD_COUNTRIES_BUTTON": "🌐 افزودن کشور",

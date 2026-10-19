@@ -23,6 +23,10 @@ class LetterDB:
     def __init__(self):
         self.scalar = AsyncMock(side_effect=[True, None, 91])
 
+    async def execute(self, query):
+        assert [column.key for column in query.selected_columns] == ['id', 'extra_data']
+        return SimpleNamespace(first=lambda: (91, {}))
+
     @asynccontextmanager
     async def begin_nested(self):
         yield

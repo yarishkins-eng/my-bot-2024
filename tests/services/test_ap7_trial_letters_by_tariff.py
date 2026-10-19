@@ -57,6 +57,11 @@ class _SelectionDB:
         selected = self.session.scalars(selection).all()
         return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [self.objects[sid] for sid in selected]))
 
+    async def refresh(self, obj, *, attribute_names):
+        # Delivery objects are controlled fixtures; SQL selection remains real.
+        assert obj in [sub.user for sub in self.objects.values()]
+        assert attribute_names == ['promo_offer_discount_percent', 'promo_offer_discount_expires_at']
+
     def close(self):
         self.session.close()
         self.engine.dispose()
