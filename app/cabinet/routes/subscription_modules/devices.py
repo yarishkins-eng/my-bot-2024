@@ -34,6 +34,7 @@ from app.database.crud.user_device_alias import (
 from app.database.models import Subscription, User
 from app.external.remnawave_api import VPN_USED_MIN_BYTES
 from app.services.subscription_service import SubscriptionService
+from app.utils.device_app import device_app_name
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from ...schemas.subscription import DevicePurchaseRequest
@@ -226,7 +227,6 @@ async def get_devices(
                 platform = device.get('platform') or device.get('platformType') or 'Unknown'
                 model = device.get('deviceModel') or device.get('model') or device.get('name') or 'Unknown'
                 created_at = device.get('updatedAt') or device.get('lastSeen') or device.get('createdAt')
-                app_words = (device.get('userAgent') or '').strip().split('/', 1)[0].split()
 
                 formatted_devices.append(
                     {
@@ -234,7 +234,7 @@ async def get_devices(
                         'platform': platform,
                         'device_model': model,
                         'created_at': created_at,
-                        'app': app_words[0] if app_words else None,
+                        'app': device_app_name(device),
                         # Локальное имя, заданное юзером. None — алиаса нет,
                         # фронт фоллбэчит на platform/device_model.
                         'local_name': aliases.get(hwid) or None,

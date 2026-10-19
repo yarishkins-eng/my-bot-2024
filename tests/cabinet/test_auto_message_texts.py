@@ -155,6 +155,7 @@ _SENDER_OF: dict[str, tuple[str, str, str]] = {
     'trial-started': ('app/utils/funnel_notify.py', 'send_funnel_trial_menu', 'FUNNEL_TRIAL_ACTIVATED'),
     # id: (модуль, функция-отправитель, имя ключа локали ИЛИ имя константы)
     'trial-not-connected': (_MONITORING, '_send_trial_not_connected_notification', 'TRIAL_NOT_CONNECTED_TEXT'),
+    'trial-connect-reminder': (_MONITORING, '_send_trial_connect_reminder', 'TRIAL_CONNECT_REMINDER'),
     'trial-2h': (_MONITORING, '_send_trial_ending_notification', 'TRIAL_ENDING_TEXT'),
     'trial-expired': (_MONITORING, '_send_trial_expired_notification', 'TRIAL_EXPIRED_NOTIFICATION'),
     'trial-discount': (_MONITORING, '_send_trial_expired_discount_notification', 'TRIAL_EXPIRED_DISCOUNT'),

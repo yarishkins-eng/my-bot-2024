@@ -246,6 +246,10 @@ async def _run_reset_under_account_activity(db, *, user_id: int, admin_id: int, 
                 from app.utils.funnel_notify import forget_referral_onboarding
 
                 await forget_referral_onboarding(getattr(current, 'telegram_id', None))
+                from app.utils.trial_connect_reminder import trial_connect_queue
+
+                if panel_ids:
+                    await trial_connect_queue('zrem', *panel_ids)
             except Exception as exc:
                 logger.warning('Не удалось забыть онбординг при сбросе стенда', error=str(exc))
             return result
