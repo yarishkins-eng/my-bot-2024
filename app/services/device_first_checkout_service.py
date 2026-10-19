@@ -5158,6 +5158,20 @@ async def _send_client_ready_message(db: AsyncSession, *, bot, checkout: Subscri
         else '✅ Ваша VPN-подписка готова. Откройте кабинет, чтобы подключиться.'
     )
     text = checkout_ready_message(checkout, user.language, fallback=text)
+    try:
+        if (getattr(checkout, 'target_snapshot', None) or {}).get('is_trial') is not False:
+            end = checkout.fulfilled_end_at
+            if end is not None:
+                if end.tzinfo is None:
+                    end = end.replace(tzinfo=UTC)
+                date = end.astimezone(ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')
+                text = (
+                    '✅ Your VPN subscription is ready — until {date} (Moscow time). Open the cabinet to connect.'
+                    if user.language == 'en'
+                    else '✅ Ваша VPN-подписка готова — до {date} (МСК). Откройте кабинет, чтобы подключиться.'
+                ).format(date=date)
+    except Exception:
+        pass
     await bot.send_message(user.telegram_id, text, reply_markup=_client_ready_keyboard(user))
 
 
