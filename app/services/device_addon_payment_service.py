@@ -11,6 +11,7 @@ import hmac
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from html import escape
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -133,13 +134,23 @@ def _request_amount(*, price_kopeks: int, user: User) -> int:
     return max(shortage, int(settings.PLATEGA_MIN_AMOUNT_KOPEKS)) if shortage else 0
 
 
-def _exact_provider_invoice(attempt: DeviceAddonTopupAttempt, payload: dict[str, Any] | None) -> bool:
+def _provider_invoice_identity_matches(attempt: DeviceAddonTopupAttempt, payload: dict[str, Any] | None) -> bool:
     correlation = (payload or {}).get('payload')
+    amount_currency = PlategaService.parse_amount_currency(payload)
     return (
         _provider_transaction_id(payload) == str(attempt.provider_payment_id or '')
         and _provider_method_code(payload) == int(attempt.provider_method_code)
-        and PlategaService.parse_amount_currency(payload) == (int(attempt.requested_amount_kopeks), 'RUB')
+        and amount_currency is not None
+        and amount_currency[0] > 0
+        and amount_currency[1] == 'RUB'
         and (correlation is None or hmac.compare_digest(str(correlation), f'platega:{attempt.correlation_id}'))
+    )
+
+
+def _exact_provider_invoice(attempt: DeviceAddonTopupAttempt, payload: dict[str, Any] | None) -> bool:
+    return _provider_invoice_identity_matches(attempt, payload) and PlategaService.parse_amount_currency(payload) == (
+        int(attempt.requested_amount_kopeks),
+        'RUB',
     )
 
 
@@ -224,7 +235,7 @@ def _mark_operator_review(
             'device_addon_payment_operator_review '
             f'user_id={payment.user_id} reason={reason} amount_kopeks={int(attempt.requested_amount_kopeks)}'
         )
-        logger.error(
+        logger.warning(
             event,
             user_id=payment.user_id,
             reason=reason,
@@ -602,17 +613,10 @@ async def handle_device_addon_platega_callback(
     expected_payload = f'platega:{payment.correlation_id}'
     callback_payload = str(payload.get('payload') or '')
     provider_id = _provider_transaction_id(payload)
-    amount_currency = PlategaService.parse_amount_currency(payload)
     method_code = _provider_method_code(payload)
     exact_correlation = hmac.compare_digest(callback_payload, expected_payload)
-    payment_details = payload.get('paymentDetails')
-    if not isinstance(payment_details, dict):
-        payment_details = {}
-    amount_present = payment_details.get('amount') is not None or payload.get('amount') is not None
     method_present = payload.get('paymentMethod') is not None or payload.get('paymentMethodCode') is not None
-    financial_mismatch = (amount_present and amount_currency != (int(attempt.requested_amount_kopeks), 'RUB')) or (
-        method_present and method_code != int(attempt.provider_method_code)
-    )
+    financial_mismatch = method_present and method_code != int(attempt.provider_method_code)
     if not exact_correlation or not provider_id:
         _mark_operator_review(
             payment=payment,
@@ -682,7 +686,7 @@ async def _settle_locked(
     amount_kopeks, currency = PlategaService.parse_amount_currency(payload) or (0, '')
     attempt.provider_returned_amount_kopeks = amount_kopeks or None
     attempt.provider_returned_currency = currency or None
-    if not _exact_provider_invoice(attempt, payload):
+    if not _provider_invoice_identity_matches(attempt, payload):
         _mark_operator_review(
             payment=payment,
             attempt=attempt,
@@ -719,6 +723,13 @@ async def _settle_locked(
         await db.commit()
         return attempt
 
+    credited_amount = min(amount_kopeks, int(attempt.requested_amount_kopeks))
+    if amount_kopeks > credited_amount:
+        logger.info(
+            'device_addon_provider_overpayment',
+            attempt_id=attempt.id,
+            excess_kopeks=amount_kopeks - credited_amount,
+        )
     balance_before_kopeks = int(user.balance_kopeks or 0)
     was_first_topup = not bool(user.has_made_first_topup)
     external_id = str(attempt.provider_payment_id)
@@ -752,7 +763,7 @@ async def _settle_locked(
     if transaction is not None and (
         transaction.user_id != user.id
         or transaction.type != TransactionType.DEPOSIT.value
-        or int(transaction.amount_kopeks) != int(attempt.requested_amount_kopeks)
+        or int(transaction.amount_kopeks) != credited_amount
     ):
         _mark_operator_review(
             payment=payment,
@@ -763,11 +774,11 @@ async def _settle_locked(
         await db.commit()
         return attempt
     if transaction is None:
-        user.balance_kopeks = int(user.balance_kopeks or 0) + int(attempt.requested_amount_kopeks)
+        user.balance_kopeks = int(user.balance_kopeks or 0) + credited_amount
         transaction = Transaction(
             user_id=user.id,
             type=TransactionType.DEPOSIT.value,
-            amount_kopeks=attempt.requested_amount_kopeks,
+            amount_kopeks=credited_amount,
             # Имя метода в скобках — по нему карточка владельцу пишет «по СБП», а не «через Platega»
             description=(
                 f'Пополнение через Platega ({settings.get_platega_method_display_name(int(attempt.provider_method_code))})'
@@ -787,6 +798,7 @@ async def _settle_locked(
     payment.paid_at = datetime.now(UTC)
     payment.callback_payload = None
     payment.metadata_json = {
+        **(payment.metadata_json or {}),
         'settlement_mode': 'device_addon_topup_v1',
         'device_addon_attempt_id': attempt.id,
         'balance_credited': True,
@@ -794,7 +806,7 @@ async def _settle_locked(
         'was_first_topup': was_first_topup,
     }
     attempt.deposit_transaction_id = transaction.id
-    attempt.credited_amount_kopeks = attempt.requested_amount_kopeks
+    attempt.credited_amount_kopeks = credited_amount
     attempt.status = 'paid'
     attempt.holds_invoice_slot = False
     attempt.paid_at = datetime.now(UTC)
@@ -1008,7 +1020,8 @@ async def reconcile_device_addon_payment(
         and terminal_binding_exact
         and amount_currency != (int(attempt.requested_amount_kopeks), 'RUB')
     )
-    if not provider_invoice_exact and (financially_settled or not terminal_amount_mismatch):
+    confirmed_identity = status == 'CONFIRMED' and _provider_invoice_identity_matches(attempt, payload)
+    if not (provider_invoice_exact or confirmed_identity) and (financially_settled or not terminal_amount_mismatch):
         if financially_settled:
             attempt.status = 'paid'
             attempt.holds_invoice_slot = False
@@ -1668,6 +1681,63 @@ async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bo
                 attempt.lease_expires_at = None
                 await db.commit()
             logger.error('device_addon_payment_recovery_failed', attempt_id=attempt_id, error=str(error))
+    if bot is not None:
+        from app.services.admin_notification_service import AdminNotificationService
+
+        notifier = AdminNotificationService(bot)
+        candidates = (
+            await db.execute(
+                select(DeviceAddonTopupAttempt.id, DeviceAddonTopupAttempt.platega_payment_id)
+                .join(PlategaPayment, PlategaPayment.id == DeviceAddonTopupAttempt.platega_payment_id)
+                .where(
+                    DeviceAddonTopupAttempt.status == 'operator_review',
+                    or_(
+                        PlategaPayment.metadata_json['addon_review_first_sent'].as_boolean().is_not(True),
+                        and_(
+                            DeviceAddonTopupAttempt.reconcile_attempts >= 24,
+                            PlategaPayment.metadata_json['addon_review_final_sent'].as_boolean().is_not(True),
+                        ),
+                    ),
+                )
+                .order_by(DeviceAddonTopupAttempt.id)
+                .limit(limit)
+            )
+        ).all()
+        for attempt_id, payment_id in candidates:
+            try:
+                payment, user, attempt, _ = await _lock_payment_graph(db, payment_id=payment_id, attempt_id=attempt_id)
+                if attempt.status == 'operator_review':
+                    metadata = dict(payment.metadata_json or {})
+                    who = notifier._owner_who(user)
+                    amount = escape(settings.format_price(int(attempt.requested_amount_kopeks)))
+                    received = attempt.provider_returned_amount_kopeks
+                    invoice = f'Счёт на {amount}'
+                    if received is not None:
+                        invoice += f', Platega прислала {escape(settings.format_price(int(received)))}'
+                    cards = [
+                        (
+                            'addon_review_first_sent',
+                            f'⚠️ Оплата докупки ждёт ручной проверки\n{who}\n{invoice}\n'
+                            'Деньги на баланс не зачислены, устройство не добавлено.\n'
+                            'Где разобрать: Кабинет → Платежи → «Проверить»',
+                        )
+                    ]
+                    if int(attempt.reconcile_attempts or 0) >= 24:
+                        cards.append(
+                            (
+                                'addon_review_final_sent',
+                                f'⚠️ Бот перестал проверять оплату докупки\n{who}, счёт на {amount}\n'
+                                'Бот проверял её сутки и не разобрался. Дальше только вручную: Кабинет → Платежи.',
+                            )
+                        )
+                    for key, text in cards:
+                        if not metadata.get(key) and await notifier.send_admin_notification(text):
+                            metadata[key] = True
+                            payment.metadata_json = dict(metadata)
+                await db.commit()
+            except Exception as error:
+                await db.rollback()
+                logger.warning('device_addon_review_notification_failed', attempt_id=attempt_id, error=str(error))
     return processed
 
 

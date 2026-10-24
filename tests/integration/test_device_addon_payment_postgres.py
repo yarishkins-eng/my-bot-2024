@@ -593,7 +593,7 @@ async def test_first_terminal_observation_with_wrong_provider_id_keeps_invoice_f
     ('mutation', 'expected_attempt_status', 'expected_payment_status'),
     [
         ({'id': 'wrong-provider-id'}, 'operator_review', 'OPERATOR_REVIEW'),
-        ({'paymentDetails': {'amount': '99.99', 'currency': 'RUB'}}, 'terminal', 'CANCELED'),
+        ({'paymentDetails': {'amount': '99.99', 'currency': 'RUB'}}, 'paid', 'CONFIRMED'),
         ({'payload': 'platega:wrong-correlation'}, 'operator_review', 'OPERATOR_REVIEW'),
     ],
     ids=['provider-id', 'amount', 'correlation-payload'],
@@ -619,12 +619,12 @@ async def test_canonical_identity_amount_and_present_payload_must_all_match(
         await db.refresh(old_payment)
         await db.refresh(old_attempt)
         await db.refresh(current_attempt)
-        assert user.balance_kopeks == 0
+        assert user.balance_kopeks == (9999 if expected_attempt_status == 'paid' else 0)
         assert old_payment.status == expected_payment_status
         assert old_attempt.status == expected_attempt_status
         assert old_attempt.holds_invoice_slot is False
         assert current_attempt.status == 'pending'
-        assert await db.scalar(select(func.count(Transaction.id))) == 0
+        assert await db.scalar(select(func.count(Transaction.id))) == (1 if expected_attempt_status == 'paid' else 0)
 
 
 @pytest.mark.parametrize('payment_provider_id', [None, 'conflicting-provider-id'], ids=['missing', 'conflicting'])
@@ -842,13 +842,13 @@ async def test_early_mismatched_webhook_cannot_hide_provider_identity_from_creat
         )
         payment = await db.get(PlategaPayment, attempt.platega_payment_id, populate_existing=True)
 
-        assert attempt.status == 'operator_review'
+        assert attempt.status == 'reconciling'
         assert attempt.holds_invoice_slot is True
-        assert attempt.reconciliation_reason == 'callback_correlation_or_invoice_mismatch'
+        assert attempt.reconciliation_reason == 'canonical_status_unavailable'
         assert attempt.provider_payment_id == provider_id
         assert attempt.payment_url == 'https://pay.example.test/invoice'
         assert payment.platega_transaction_id == provider_id
-        assert payment.status == 'OPERATOR_REVIEW'
+        assert payment.status == 'RECONCILING'
         with pytest.raises(DeviceAddonError) as error:
             await payments.close_device_addon_attempt_without_credit(
                 db,
@@ -946,7 +946,7 @@ async def test_uninformative_create_response_keeps_the_only_invoice_slot(session
         assert error.value.code == 'payment_attempt_active'
 
 
-async def test_exact_mismatched_callback_binds_provider_identity_before_review(sessions, monkeypatch):
+async def test_exact_mismatched_callback_binds_provider_identity_before_canonical_get(sessions, monkeypatch):
     _configure_addon_topup(monkeypatch)
 
     class UninformativeProvider(PlategaService):
@@ -987,7 +987,7 @@ async def test_exact_mismatched_callback_binds_provider_identity_before_review(s
 
         await db.refresh(attempt)
         await db.refresh(local_payment)
-        assert attempt.status == 'operator_review'
+        assert attempt.status == 'reconciling'
         assert attempt.provider_payment_id == provider_id
         assert local_payment.platega_transaction_id == provider_id
         record = await get_payment_record(db, PaymentMethod.PLATEGA, int(local_payment.id))
@@ -1623,7 +1623,7 @@ async def test_admin_manual_check_does_not_credit_when_audit_insert_fails(sessio
         assert bot.session.close.await_count == 0
 
 
-async def test_admin_manual_check_keeps_amount_mismatch_for_operator(sessions, monkeypatch):
+async def test_admin_manual_check_credits_confirmed_amount_mismatch(sessions, monkeypatch):
     class CanonicalProvider(PlategaService):
         def __init__(self):
             self._max_retries = 1
@@ -1662,13 +1662,11 @@ async def test_admin_manual_check_keeps_amount_mismatch_for_operator(sessions, m
         await db.refresh(attempt)
 
         assert response.success is True and response.payment is not None
-        assert response.payment.device_addon_reason_text == (
-            'Сумма у провайдера не совпала — проверьте настройку комиссии Platega.'
-        )
-        assert user.balance_kopeks == 0
-        assert attempt.status == 'operator_review'
-        assert attempt.reconciliation_reason == 'canonical_invoice_mismatch'
-        assert await db.scalar(select(func.count(Transaction.id))) == 0
+        assert response.payment.device_addon_reason_text is None
+        assert user.balance_kopeks == 10_000
+        assert attempt.status == 'paid'
+        assert attempt.reconciliation_reason == 'wallet_credited_purchase_requires_confirmation'
+        assert await db.scalar(select(func.count(Transaction.id))) == 1
 
 
 @pytest.mark.parametrize('provider_status', ['CLOSED_BY_OPERATOR', 'REJECTED_400', 'REJECTED_422'])
@@ -1986,3 +1984,190 @@ async def test_referral_money_helper_replay_cannot_turn_first_payment_into_recur
         assert len(rewards) == 2
         assert buyer.balance_kopeks == 10_100
         assert referrer.balance_kopeks == 1_200
+
+
+async def test_ispr3_client_1079_confirmed_overpayment_credits_invoice_once(sessions):
+    """1079 paid 29 RUB for our 28.33 invoice; the wallet owns only 28.33."""
+    async with sessions() as db:
+        user, _, payment, attempt, current = await _late_payment_graph(db)
+        attempt.requested_amount_kopeks = payment.amount_kopeks = 2833
+        attempt.expected_amount_kopeks = 2833
+        attempt.status = 'operator_review'
+        attempt.reconcile_attempts = 23
+        await db.commit()
+        canonical = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '29.00', 'currency': 'RUB'},
+            'payload': f'platega:{attempt.correlation_id}',
+        }
+        with capture_logs() as logs:
+            await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=canonical)
+        await db.refresh(user)
+        assert user.balance_kopeks == 2833
+        assert attempt.status == 'paid'
+        assert attempt.credited_amount_kopeks == 2833
+        assert attempt.reconciliation_reason == 'wallet_credited_purchase_requires_confirmation'
+        assert payment.status == 'CONFIRMED'
+        assert current.status == 'pending'
+        assert not any(entry['log_level'] == 'error' for entry in logs)
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=canonical)
+        await db.refresh(user)
+        assert user.balance_kopeks == 2833
+        assert await db.scalar(select(func.count(Transaction.id))) == 1
+
+
+@pytest.mark.parametrize('prior_status', ['pending', 'terminal', 'operator_review'])
+@pytest.mark.parametrize(('received', 'credited'), [('29.00', 2833), ('27.00', 2700)])
+async def test_ispr3_confirmed_amounts_and_existing_owned_ledger(sessions, prior_status, received, credited):
+    """A recovered owned ledger with no FK must compare against the actual credit."""
+    async with sessions() as db:
+        user, intent, payment, attempt, _ = await _late_payment_graph(db)
+        attempt.requested_amount_kopeks = payment.amount_kopeks = 2833
+        attempt.expected_amount_kopeks = 2833
+        attempt.status = prior_status
+        transaction = Transaction(
+            user_id=user.id,
+            type=TransactionType.DEPOSIT.value,
+            amount_kopeks=credited,
+            payment_method=PaymentMethod.PLATEGA.value,
+            external_id=attempt.provider_payment_id,
+            device_first_ledger_key=f'device-addon-deposit:{attempt.id}',
+            is_completed=True,
+        )
+        db.add(transaction)
+        user.balance_kopeks = credited
+        await db.commit()
+        assert attempt.deposit_transaction_id is None
+        canonical = {
+            'id': attempt.provider_payment_id,
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': received, 'currency': 'RUB'},
+        }
+        await payments._settle_locked(db, payment=payment, user=user, attempt=attempt, intent=intent, payload=canonical)
+        assert attempt.status == 'paid'
+        assert attempt.deposit_transaction_id == transaction.id
+        assert attempt.credited_amount_kopeks == credited
+        assert user.balance_kopeks == credited
+        assert await db.scalar(select(func.count(Transaction.id))) == 1
+
+
+@pytest.mark.parametrize(
+    ('mutation', 'status'),
+    [
+        ({'id': 'foreign'}, 'CONFIRMED'),
+        ({'paymentMethod': 'CARD'}, 'CONFIRMED'),
+        ({'payload': 'platega:foreign'}, 'CONFIRMED'),
+        ({'paymentDetails': {'amount': '29', 'currency': 'USD'}}, 'CONFIRMED'),
+        ({'paymentDetails': {'amount': '28.333', 'currency': 'RUB'}}, 'CONFIRMED'),
+        ({'paymentDetails': {'amount': '0', 'currency': 'RUB'}}, 'CONFIRMED'),
+        ({}, 'CHARGEBACKED'),
+        ({}, 'FAILED'),
+        ({}, 'CANCELED'),
+        ({}, 'EXPIRED'),
+    ],
+)
+async def test_ispr3_unsafe_identity_or_nonconfirmed_never_credits(sessions, mutation, status):
+    async with sessions() as db:
+        user, _, payment, _, attempt = await _late_payment_graph(db)
+        payload = {
+            'id': attempt.provider_payment_id,
+            'status': status,
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': '29.00', 'currency': 'RUB'},
+        }
+        payload.update(mutation)
+        await reconcile_device_addon_payment(db, attempt_id=attempt.id, payload=payload)
+        await db.refresh(user)
+        assert user.balance_kopeks == 0
+        assert await db.scalar(select(func.count(Transaction.id))) == 0
+        if status in {'FAILED', 'CANCELED', 'EXPIRED'}:
+            assert attempt.status == 'terminal'
+            assert attempt.reconciliation_reason == f'provider_terminal:{status.lower()}:canonical_invoice_mismatch'
+
+
+@pytest.mark.parametrize('source', ['create_without_id', 'callback', 'recovery', 'manual'])
+async def test_ispr3_review_cards_are_owner_only_durable_escaped_and_once(sessions, monkeypatch, source):
+    from app.services.admin_notification_service import AdminNotificationService
+
+    send = AsyncMock(return_value=True)
+    monkeypatch.setattr(AdminNotificationService, 'send_admin_notification', send)
+    async with sessions() as db:
+        user, intent, payment, attempt, current = await _late_payment_graph(db)
+        user.telegram_id = None
+        user.email = 'owner<&>@example.test'
+        attempt.status = 'pending'
+        if source == 'create_without_id':
+            attempt.provider_payment_id = payment.platega_transaction_id = None
+        current.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        await db.commit()
+        with capture_logs() as logs:
+            if source == 'callback':
+                await payments.handle_device_addon_platega_callback(
+                    db,
+                    payment=payment,
+                    payload={
+                        'id': attempt.provider_payment_id,
+                        'payload': f'platega:{attempt.correlation_id}',
+                        'status': 'CONFIRMED',
+                        'paymentMethod': 'CARD',
+                    },
+                )
+            else:
+                payments._mark_operator_review(payment=payment, attempt=attempt, intent=intent, reason=source)
+                await db.commit()
+        assert all(entry['log_level'] != 'error' for entry in logs)
+        attempt.provider_returned_amount_kopeks = None if source == 'create_without_id' else 2900
+        attempt.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        await db.commit()
+        bot = MagicMock()
+        await payments.recover_device_addon_payments(db, bot=bot)
+        await payments.recover_device_addon_payments(db, bot=bot)
+        send.assert_awaited_once()
+        who = 'owner&lt;&amp;&gt;@example.test'
+        amount = settings.format_price(10_000)
+        invoice = f'Счёт на {amount}'
+        if source != 'create_without_id':
+            invoice += f', Platega прислала {settings.format_price(2900)}'
+        assert send.await_args.args == (
+            f'⚠️ Оплата докупки ждёт ручной проверки\n{who}\n{invoice}\n'
+            'Деньги на баланс не зачислены, устройство не добавлено.\n'
+            'Где разобрать: Кабинет → Платежи → «Проверить»',
+        )
+        assert send.await_args.kwargs == {}
+        attempt.reconcile_attempts = 24
+        await db.commit()
+        await payments.recover_device_addon_payments(db, bot=bot)
+        await payments.recover_device_addon_payments(db, bot=bot)
+        assert send.await_count == 2
+        assert send.await_args.args == (
+            f'⚠️ Бот перестал проверять оплату докупки\n{who}, счёт на {amount}\n'
+            'Бот проверял её сутки и не разобрался. Дальше только вручную: Кабинет → Платежи.',
+        )
+        await db.refresh(payment)
+        assert payment.metadata_json['addon_review_first_sent'] is True
+        assert payment.metadata_json['addon_review_final_sent'] is True
+
+
+async def test_ispr3_failed_card_delivery_does_not_persist_sent_marker(sessions, monkeypatch):
+    from app.services.admin_notification_service import AdminNotificationService
+
+    send = AsyncMock(side_effect=[False, True, True])
+    monkeypatch.setattr(AdminNotificationService, 'send_admin_notification', send)
+    async with sessions() as db:
+        _, _, payment, attempt, current = await _late_payment_graph(db)
+        attempt.status = 'operator_review'
+        attempt.reconcile_attempts = 24
+        current.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        await db.commit()
+        await payments.recover_device_addon_payments(db, bot=MagicMock())
+        await db.refresh(payment)
+        assert not payment.metadata_json.get('addon_review_first_sent')
+        assert payment.metadata_json['addon_review_final_sent'] is True
+        await payments.recover_device_addon_payments(db, bot=MagicMock())
+        await payments.recover_device_addon_payments(db, bot=MagicMock())
+        assert send.await_count == 3
+        await db.refresh(payment)
+        assert payment.metadata_json['addon_review_first_sent'] is True
