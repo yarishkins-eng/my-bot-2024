@@ -278,6 +278,8 @@ async def test_upgrade_at_renewal_costs_the_same_as_addon_then_renewal(current, 
     free = max(0, base - current)
     chargeable = max(0, add - free)
     addon_kopeks = int(5_000 * chargeable * days_left / 30)
+    if chargeable:
+        addon_kopeks = service.round_device_first_quote_kopeks(max(100, addon_kopeks))
     renew_after_addon = await PricingEngine().calculate_tariff_purchase_price(
         tariff, 30, device_limit=wanted, user=None
     )
