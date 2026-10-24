@@ -2171,3 +2171,151 @@ async def test_ispr3_failed_card_delivery_does_not_persist_sent_marker(sessions,
         assert send.await_count == 3
         await db.refresh(payment)
         assert payment.metadata_json['addon_review_first_sent'] is True
+
+
+@pytest.mark.parametrize(('configured_min', 'provider_min'), [(10000, 100), (100, 1000), (None, 100)])
+async def test_ispr3_invoice_matches_cabinet_effective_minimum_and_kopeck_balance(
+    sessions,
+    monkeypatch,
+    configured_min,
+    provider_min,
+):
+    from app.database.models import PaymentMethodConfig
+    from app.services.device_addon_service import calculate_device_addon
+    from app.services.payment_method_config_service import get_effective_amount_limits
+
+    _configure_addon_topup(monkeypatch)
+    monkeypatch.setattr(settings, 'PLATEGA_MIN_AMOUNT_KOPEKS', provider_min)
+    provider = MagicMock()
+    provider.create_device_addon_payment = AsyncMock(
+        return_value={
+            'id': str(uuid.uuid4()),
+            'redirect': 'https://pay.example.test/invoice',
+        }
+    )
+    provider.get_transaction = AsyncMock(return_value=None)
+
+    class Provider(PlategaService):
+        def __init__(self):
+            self._max_retries = 1
+
+        async def create_device_addon_payment(self, **kwargs):
+            return await provider.create_device_addon_payment(**kwargs)
+
+        async def get_transaction(self, transaction_id):
+            return await provider.get_transaction(transaction_id)
+
+    monkeypatch.setattr(payments, 'PlategaService', Provider)
+    async with sessions() as db:
+        user, sub, intent = await _active_intent_graph(db)
+        user.balance_kopeks = 123
+        db.add(PaymentMethodConfig(method_id='platega', min_amount_kopeks=configured_min))
+        await db.commit()
+        quote = await calculate_device_addon(db, user=user, subscription_id=sub.id, devices_to_add=1)
+        minimum, _ = get_effective_amount_limits(configured_min, None, provider_min, 10_000_000)
+        expected = max(quote.missing_kopeks, minimum)
+        assert quote.price_kopeks == 5000 and quote.missing_kopeks == 4900
+        attempt = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='b' * 64,
+            method_key='2',
+            expected_amount_kopeks=expected,
+            return_url=None,
+            failed_url=None,
+        )
+        assert attempt.requested_amount_kopeks == expected
+        assert expected % 100 == 0
+        assert provider.create_device_addon_payment.await_args.kwargs['amount'] == expected / 100
+
+
+async def test_ispr3_underpayment_needs_explicit_purchase_and_has_correct_shortage(sessions, monkeypatch):
+    from app.services.device_addon_service import calculate_device_addon, purchase_intent, quote_for_calculation
+
+    _configure_addon_topup(monkeypatch)
+    monkeypatch.setattr(settings, 'PLATEGA_MIN_AMOUNT_KOPEKS', 100)
+    provider_id = str(uuid.uuid4())
+
+    class Provider(PlategaService):
+        def __init__(self):
+            self._max_retries = 1
+
+        async def create_device_addon_payment(self, **kwargs):
+            return {'id': provider_id, 'redirect': 'https://pay.example.test/invoice'}
+
+        async def get_transaction(self, _id):
+            return None
+
+    monkeypatch.setattr(payments, 'PlategaService', Provider)
+    async with sessions() as db:
+        user, sub, intent = await _active_intent_graph(db)
+        attempt = await create_device_addon_topup(
+            db,
+            intent_public_id=intent.public_id,
+            user_id=user.id,
+            idempotency_key=uuid.uuid4().hex,
+            request_hash='b' * 64,
+            method_key='2',
+            expected_amount_kopeks=5000,
+            return_url=None,
+            failed_url=None,
+        )
+        await reconcile_device_addon_payment(
+            db,
+            attempt_id=attempt.id,
+            payload={
+                'id': provider_id,
+                'status': 'CONFIRMED',
+                'paymentMethod': 'SBPQR',
+                'paymentDetails': {'amount': '49.33', 'currency': 'RUB'},
+            },
+        )
+        await db.refresh(user)
+        assert user.balance_kopeks == attempt.credited_amount_kopeks == 4933
+        quote = quote_for_calculation(
+            await calculate_device_addon(db, user=user, subscription_id=sub.id, devices_to_add=1),
+            user_id=user.id,
+        )
+        assert quote['missing_kopeks'] == 100
+        with pytest.raises(DeviceAddonError) as error:
+            await purchase_intent(db, user=user, public_id=intent.public_id, quote_token=quote['quote_token'])
+        assert error.value.code == 'insufficient_funds'
+        assert intent.purchase_state == 'draft'
+        assert sub.device_limit == 1
+
+
+async def test_ispr3_hourly_recovery_credits_amount_review_before_attempt_limit_without_card(sessions, monkeypatch):
+    from app.services.admin_notification_service import AdminNotificationService
+
+    class Provider(PlategaService):
+        def __init__(self):
+            self._max_retries = 1
+
+        async def get_transaction(self, transaction_id):
+            return {
+                'id': transaction_id,
+                'status': 'CONFIRMED',
+                'paymentMethod': 'SBPQR',
+                'paymentDetails': {'amount': '29.00', 'currency': 'RUB'},
+            }
+
+    send = AsyncMock()
+    monkeypatch.setattr(AdminNotificationService, 'send_admin_notification', send)
+    monkeypatch.setattr(payments, 'PlategaService', Provider)
+    async with sessions() as db:
+        user, _, payment, attempt, current = await _late_payment_graph(db)
+        current.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        attempt.requested_amount_kopeks = payment.amount_kopeks = 2833
+        attempt.expected_amount_kopeks = 2833
+        attempt.status = 'operator_review'
+        attempt.reconcile_attempts = 23
+        attempt.next_reconcile_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+        assert await payments.recover_device_addon_payments(db, limit=1, bot=MagicMock()) == 1
+        await db.refresh(attempt)
+        await db.refresh(user)
+        assert attempt.status == 'paid'
+        assert attempt.credited_amount_kopeks == user.balance_kopeks == 2833
+        send.assert_not_awaited()

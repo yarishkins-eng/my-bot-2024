@@ -49,6 +49,7 @@ from app.services.device_first_payment_service import (
     _provider_transaction_id,
     available_platega_methods_for_db,
 )
+from app.services.payment_method_config_service import get_config_by_method_id, get_effective_amount_limits
 from app.services.platega_service import PlategaCreateRejected, PlategaService
 
 
@@ -129,9 +130,8 @@ def _validate_return_surface(return_surface: str) -> None:
         )
 
 
-def _request_amount(*, price_kopeks: int, user: User) -> int:
-    shortage = max(0, int(price_kopeks) - int(user.balance_kopeks or 0))
-    return max(shortage, int(settings.PLATEGA_MIN_AMOUNT_KOPEKS)) if shortage else 0
+def _request_amount(*, missing_kopeks: int, minimum_kopeks: int) -> int:
+    return max(int(missing_kopeks), int(minimum_kopeks))
 
 
 def _provider_invoice_identity_matches(attempt: DeviceAddonTopupAttempt, payload: dict[str, Any] | None) -> bool:
@@ -387,9 +387,16 @@ async def create_device_addon_topup(
         devices_to_add=int(intent.devices_to_add),
         lock=True,
     )
-    requested_amount = _request_amount(price_kopeks=fresh.price_kopeks, user=user)
-    if requested_amount <= 0:
+    if fresh.missing_kopeks <= 0:
         raise DeviceAddonError('funding_not_required', 'Баланс уже покрывает покупку.')
+    config = await get_config_by_method_id(db, 'platega')
+    minimum, _ = get_effective_amount_limits(
+        config.min_amount_kopeks if config else None,
+        config.max_amount_kopeks if config else None,
+        int(settings.PLATEGA_MIN_AMOUNT_KOPEKS),
+        int(settings.PLATEGA_MAX_AMOUNT_KOPEKS),
+    )
+    requested_amount = _request_amount(missing_kopeks=fresh.missing_kopeks, minimum_kopeks=minimum)
     if requested_amount > int(settings.PLATEGA_MAX_AMOUNT_KOPEKS):
         raise DeviceAddonError(
             'provider_amount_out_of_range', 'Сумма недоступна для этого способа оплаты.', status_code=422
@@ -1709,11 +1716,13 @@ async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bo
                 if attempt.status == 'operator_review':
                     metadata = dict(payment.metadata_json or {})
                     who = notifier._owner_who(user)
-                    amount = escape(settings.format_price(int(attempt.requested_amount_kopeks)))
+                    amount = escape(settings.format_price(int(attempt.requested_amount_kopeks), round_kopeks=False))
                     received = attempt.provider_returned_amount_kopeks
                     invoice = f'Счёт на {amount}'
                     if received is not None:
-                        invoice += f', Platega прислала {escape(settings.format_price(int(received)))}'
+                        invoice += (
+                            f', Platega прислала {escape(settings.format_price(int(received), round_kopeks=False))}'
+                        )
                     cards = [
                         (
                             'addon_review_first_sent',

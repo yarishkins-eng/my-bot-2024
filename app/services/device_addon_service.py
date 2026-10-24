@@ -332,7 +332,7 @@ async def calculate_device_addon(
     discount = _apply_addon_discount(user, 'devices', base, days_left)
     price = int(discount['discounted'])
     if discount['percent'] < 100 and price > 0:
-        price = max(100, price)
+        price = ((max(100, price) + 50) // 100) * 100
     panel_uuid = subscription.remnawave_uuid if settings.is_multi_tariff_enabled() else user.remnawave_uuid
     if not panel_uuid:
         # A quote is also the durable binding to the exact Panel subject that
@@ -357,7 +357,7 @@ async def calculate_device_addon(
         discount_percent=int(discount['percent']),
         price_kopeks=price,
         balance_kopeks=balance,
-        missing_kopeks=max(0, price - balance),
+        missing_kopeks=((max(0, price - balance) + 99) // 100) * 100,
         days_left=days_left,
         end_date=end_date,
         tariff_id=subscription.tariff_id,
