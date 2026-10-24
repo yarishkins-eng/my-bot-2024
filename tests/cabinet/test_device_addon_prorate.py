@@ -106,3 +106,78 @@ def test_bot_and_cabinet_formulas_agree() -> None:
     """The bot (calculate_prorated_price) and the cabinet inline math must match."""
     for days in (5, 12, 30, 58, 116, 200, 365, 366):
         assert _bot_quote(2500, days) == _cabinet_quote(2500, 1, days), f'mismatch at {days} days'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('monthly', 'days', 'discounted', 'percent', 'balance', 'price', 'missing'),
+    [
+        (5000, 17, None, 0, 0, 2800, 2800),
+        (5000, 31, None, 0, 0, 5200, 5200),
+        (5000, 29, None, 0, 0, 4800, 4800),
+        (5000, 104, None, 0, 0, 17300, 17300),
+        (5000, 17, None, 0, 2777, 2800, 100),
+        (5000, 17, None, 0, 2800, 2800, 0),
+        (5000, 17, 40, 60, 0, 100, 100),
+        (5000, 17, 2850, 1, 0, 2900, 2900),
+        (5000, 17, 0, 100, 0, 0, 0),
+    ],
+)
+async def test_durable_addon_rounds_price_after_floor_and_shortage_up(
+    monkeypatch,
+    monthly,
+    days,
+    discounted,
+    percent,
+    balance,
+    price,
+    missing,
+):
+    """ISPR-3 changes only durable add-on quotes; legacy prorates above stay exact."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.services import device_addon_payment_service as payments, device_addon_service as addon
+    from app.services.payment_method_config_service import get_effective_amount_limits
+
+    subscription = SimpleNamespace(
+        id=30,
+        status='active',
+        tariff_id=None,
+        device_limit=1,
+        end_date=datetime.now(UTC) + timedelta(days=days),
+    )
+    user = SimpleNamespace(
+        id=206,
+        status='active',
+        restriction_subscription=False,
+        account_erasure_requested_at=None,
+        balance_kopeks=balance,
+        remnawave_uuid='panel',
+        device_addon_generation=0,
+    )
+    monkeypatch.setattr(addon, '_find_subscription', AsyncMock(return_value=subscription))
+    monkeypatch.setattr(addon, '_assert_no_pending_upgrade_invoice', AsyncMock())
+    monkeypatch.setattr('app.services.account_test_reset_service.reset_is_busy', lambda _user: False)
+    monkeypatch.setattr('app.services.public_access_point_service.assert_no_manual_access_point_grant', AsyncMock())
+    monkeypatch.setattr(
+        'app.cabinet.routes.subscription_modules.helpers._resolve_device_addon_price', lambda _: (monthly, 10)
+    )
+    monkeypatch.setattr(
+        'app.cabinet.routes.subscription_modules.helpers._apply_addon_discount',
+        lambda _u, _c, base, _d: {'discounted': base if discounted is None else discounted, 'percent': percent},
+    )
+    calculation = await addon.calculate_device_addon(
+        SimpleNamespace(),
+        user=user,
+        subscription_id=30,
+        devices_to_add=1,
+    )
+    old_quote = addon._quote_payload(calculation, user_id=user.id)
+    old_quote['calculator_revision'] = 'v1'
+    assert not addon._matches_quote(calculation, old_quote, user_id=user.id)
+    assert calculation.price_kopeks == price
+    assert calculation.missing_kopeks == missing
+    for configured, provider in [(None, 100), (10000, 100), (100, 1000)]:
+        minimum, _ = get_effective_amount_limits(configured, None, provider, 10000000)
+        assert payments._request_amount(missing_kopeks=missing, minimum_kopeks=minimum) == max(missing, minimum)

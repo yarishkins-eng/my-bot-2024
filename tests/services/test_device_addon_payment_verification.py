@@ -120,3 +120,45 @@ def test_admin_platega_statuses_describe_device_addon_lifecycle(status: str, exp
     )
 
     assert admin_payments._get_status_info(record) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('received', 'credited'), [('29.00', 2833), ('27.00', 2700)])
+async def test_canonical_settlement_caps_credit_without_postgres(received, credited):
+    """Exercise the actual settlement writer, independently of the PG suite."""
+    from unittest.mock import MagicMock
+
+    from app.database.models import DeviceAddonIntent, DeviceAddonTopupAttempt, PlategaPayment, User
+    from app.services import device_addon_payment_service as payments
+
+    db = MagicMock()
+    db.scalar = AsyncMock(side_effect=[None, None])
+    db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    db.refresh = AsyncMock()
+    user = User(id=17, balance_kopeks=0, device_addon_generation=0)
+    intent = DeviceAddonIntent(id=7, public_id='intent', device_addon_generation=0)
+    attempt = DeviceAddonTopupAttempt(
+        id=9,
+        provider_payment_id='provider',
+        provider_method_code=2,
+        requested_amount_kopeks=2833,
+        correlation_id='correlation',
+    )
+    payment = PlategaPayment(metadata_json={})
+    await payments._settle_locked(
+        db,
+        payment=payment,
+        user=user,
+        attempt=attempt,
+        intent=intent,
+        payload={
+            'id': 'provider',
+            'status': 'CONFIRMED',
+            'paymentMethod': 'SBPQR',
+            'paymentDetails': {'amount': received, 'currency': 'RUB'},
+        },
+    )
+    assert user.balance_kopeks == credited
+    assert db.add.call_args.args[0].amount_kopeks == credited
+    assert attempt.credited_amount_kopeks == credited
