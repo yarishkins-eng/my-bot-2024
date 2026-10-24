@@ -2092,6 +2092,8 @@ async def test_ispr3_unsafe_identity_or_nonconfirmed_never_credits(sessions, mut
 async def test_ispr3_review_cards_are_owner_only_durable_escaped_and_once(sessions, monkeypatch, source):
     from app.services.admin_notification_service import AdminNotificationService
 
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', True)
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_CHAT_ID', 123456)
     send = AsyncMock(return_value=True)
     monkeypatch.setattr(AdminNotificationService, 'send_admin_notification', send)
     async with sessions() as db:
@@ -2134,7 +2136,7 @@ async def test_ispr3_review_cards_are_owner_only_durable_escaped_and_once(sessio
         assert send.await_args.args == (
             f'⚠️ Оплата докупки ждёт ручной проверки\n{who}\n{invoice}\n'
             'Деньги на баланс не зачислены, устройство не добавлено.\n'
-            'Где разобрать: Кабинет → Платежи → «Проверить»',
+            'Где разобрать: Кабинет → Платежи',
         )
         assert send.await_args.kwargs == {}
         attempt.reconcile_attempts = 24
@@ -2154,6 +2156,8 @@ async def test_ispr3_review_cards_are_owner_only_durable_escaped_and_once(sessio
 async def test_ispr3_failed_card_delivery_does_not_persist_sent_marker(sessions, monkeypatch):
     from app.services.admin_notification_service import AdminNotificationService
 
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', True)
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_CHAT_ID', 123456)
     send = AsyncMock(side_effect=[False, True, True])
     monkeypatch.setattr(AdminNotificationService, 'send_admin_notification', send)
     async with sessions() as db:
@@ -2318,4 +2322,65 @@ async def test_ispr3_hourly_recovery_credits_amount_review_before_attempt_limit_
         await db.refresh(user)
         assert attempt.status == 'paid'
         assert attempt.credited_amount_kopeks == user.balance_kopeks == 2833
+        send.assert_not_awaited()
+
+
+@pytest.mark.parametrize('outcome', ['success', 'false', 'exception'])
+async def test_review_send_releases_graph_locks_and_merges_fresh_metadata(sessions, monkeypatch, outcome):
+    from app.services.admin_notification_service import AdminNotificationService
+
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', True)
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_CHAT_ID', 123456)
+    async with sessions() as db:
+        user, _, payment, attempt, current = await _late_payment_graph(db)
+        attempt.status = 'operator_review'
+        attempt.next_reconcile_at = current.next_reconcile_at = datetime.now(UTC) + timedelta(days=2)
+        await db.commit()
+        user_id, attempt_id, payment_id = user.id, attempt.id, payment.id
+        observed_transactions = []
+        lock_probe_completed = []
+
+        async def send(_text):
+            # Record outside assertions: recovery catches delivery exceptions.
+            observed_transactions.append(db.in_transaction())
+            async with sessions() as parallel:
+                for model, entity_id in [
+                    (User, user_id),
+                    (DeviceAddonTopupAttempt, attempt_id),
+                    (PlategaPayment, payment_id),
+                ]:
+                    await parallel.execute(select(model).where(model.id == entity_id).with_for_update(nowait=True))
+                other_payment = await parallel.get(PlategaPayment, payment_id)
+                other_payment.metadata_json = {**(other_payment.metadata_json or {}), 'unrelated_sent': True}
+                await parallel.commit()
+            lock_probe_completed.append(True)
+            if outcome == 'exception':
+                raise RuntimeError('synthetic Telegram failure')
+            return outcome == 'success'
+
+        sender = AsyncMock(side_effect=send)
+        monkeypatch.setattr(AdminNotificationService, 'send_admin_notification', sender)
+        await payments.recover_device_addon_payments(db, bot=MagicMock())
+        sender.assert_awaited_once()
+        assert observed_transactions == [False]
+        assert lock_probe_completed == [True]
+        await db.refresh(payment)
+        assert payment.metadata_json['unrelated_sent'] is True
+        assert bool(payment.metadata_json.get('addon_review_first_sent')) is (outcome == 'success')
+        assert not payment.metadata_json.get('addon_review_final_sent')
+
+
+@pytest.mark.parametrize(('enabled', 'chat_id'), [(False, 123456), (True, None)])
+async def test_disabled_review_notifications_do_not_query_or_lock(sessions, monkeypatch, enabled, chat_id):
+    from app.services.admin_notification_service import AdminNotificationService
+
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', enabled)
+    monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_CHAT_ID', chat_id)
+    send = AsyncMock()
+    monkeypatch.setattr(AdminNotificationService, 'send_admin_notification', send)
+    async with sessions() as db:
+        execute = AsyncMock(side_effect=AssertionError('disabled card pass must not query or lock'))
+        monkeypatch.setattr(db, 'execute', execute)
+        assert await payments.recover_device_addon_payments(db, limit=0, bot=MagicMock()) == 0
+        execute.assert_not_awaited()
         send.assert_not_awaited()

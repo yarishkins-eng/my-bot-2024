@@ -173,6 +173,9 @@ async def test_durable_addon_rounds_price_after_floor_and_shortage_up(
         subscription_id=30,
         devices_to_add=1,
     )
+    old_quote = addon._quote_payload(calculation, user_id=user.id)
+    old_quote['calculator_revision'] = 'v1'
+    assert not addon._matches_quote(calculation, old_quote, user_id=user.id)
     assert calculation.price_kopeks == price
     assert calculation.missing_kopeks == missing
     for configured, provider in [(None, 100), (10000, 100), (100, 1000)]:

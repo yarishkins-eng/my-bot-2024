@@ -1692,6 +1692,8 @@ async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bo
         from app.services.admin_notification_service import AdminNotificationService
 
         notifier = AdminNotificationService(bot)
+        if not notifier.is_enabled:
+            return processed
         candidates = (
             await db.execute(
                 select(DeviceAddonTopupAttempt.id, DeviceAddonTopupAttempt.platega_payment_id)
@@ -1713,6 +1715,7 @@ async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bo
         for attempt_id, payment_id in candidates:
             try:
                 payment, user, attempt, _ = await _lock_payment_graph(db, payment_id=payment_id, attempt_id=attempt_id)
+                cards = []
                 if attempt.status == 'operator_review':
                     metadata = dict(payment.metadata_json or {})
                     who = notifier._owner_who(user)
@@ -1728,7 +1731,7 @@ async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bo
                             'addon_review_first_sent',
                             f'⚠️ Оплата докупки ждёт ручной проверки\n{who}\n{invoice}\n'
                             'Деньги на баланс не зачислены, устройство не добавлено.\n'
-                            'Где разобрать: Кабинет → Платежи → «Проверить»',
+                            'Где разобрать: Кабинет → Платежи',
                         )
                     ]
                     if int(attempt.reconcile_attempts or 0) >= 24:
@@ -1739,11 +1742,13 @@ async def recover_device_addon_payments(db: AsyncSession, *, limit: int = 25, bo
                                 'Бот проверял её сутки и не разобрался. Дальше только вручную: Кабинет → Платежи.',
                             )
                         )
-                    for key, text in cards:
-                        if not metadata.get(key) and await notifier.send_admin_notification(text):
-                            metadata[key] = True
-                            payment.metadata_json = dict(metadata)
+                    cards = [(key, text) for key, text in cards if not metadata.get(key)]
                 await db.commit()
+                for key, text in cards:
+                    if await notifier.send_admin_notification(text):
+                        payment = await db.get(PlategaPayment, payment_id, with_for_update=True, populate_existing=True)
+                        payment.metadata_json = {**(payment.metadata_json or {}), key: True}
+                        await db.commit()
             except Exception as error:
                 await db.rollback()
                 logger.warning('device_addon_review_notification_failed', attempt_id=attempt_id, error=str(error))

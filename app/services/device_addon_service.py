@@ -39,7 +39,7 @@ from app.utils.formatters import format_devices_declension
 
 
 QUOTE_TTL = timedelta(minutes=15)
-CALCULATOR_REVISION = 'v1'
+CALCULATOR_REVISION = 'v2'
 logger = structlog.get_logger(__name__)
 
 # Account merge and test reset must make the same lifecycle decision.  Keep
